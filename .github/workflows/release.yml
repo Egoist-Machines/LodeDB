@@ -45,9 +45,12 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64 }
           - { os: macos-14, target: aarch64 }
-          - { os: macos-13, target: x86_64 }
+          # x86_64 macOS is cross-compiled on the arm64 runner: GitHub's Intel
+          # `macos-13` runners are being retired and can queue indefinitely.
+          - { os: macos-14, target: x86_64 }
           - { os: windows-latest, target: x64 }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30 # fail fast instead of hanging on an unavailable runner
     steps:
       - uses: actions/checkout@v4
       - name: Build abi3 wheel (maturin)
