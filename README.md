@@ -28,7 +28,7 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 - **Batteries included**: a `lodedb` CLI, a loopback dev server, an MCP server, and a
   LangChain `VectorStore` adapter.
 
-> **Enterprise.** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
+> 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
 > deployment. Contact [sales@egoistmachines.com](mailto:sales@egoistmachines.com).
 
@@ -36,21 +36,22 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 
 ```bash
 pip install lodedb
-pip install "lodedb[gpu]"            # + GPU-resident scan (Linux/CUDA)
-pip install "lodedb[mcp,langchain]"  # + MCP server, LangChain adapter
 ```
 
-Wheels bundle the patched TurboVec (Rust) core, so there's nothing to compile and no extra
-dependency to resolve.
+That's it. Prebuilt wheels cover Linux, macOS (Apple Silicon and Intel), and Windows on
+Python 3.11+, and bundle the TurboVec (Rust) core, so there's nothing to compile. Confirm
+the install with `lodedb doctor`. Optional extras:
 
-> **Release status.** Working wheels are published by the
-> [release workflow](.github/workflows/release.yml) on each version tag. The first functional
-> release is pending that initial tag; until it lands, the
-> [PyPI entry](https://pypi.org/project/lodedb/) is a name-reservation placeholder, so build
-> from source (below) in the meantime.
+```bash
+pip install "lodedb[gpu]"            # GPU-resident scan (Linux/CUDA)
+pip install "lodedb[mcp,langchain]"  # MCP server + LangChain adapter
+```
 
-Building from source (contributors, or a platform without a prebuilt wheel) needs a **Rust
-toolchain** and a CBLAS provider (Accelerate on macOS, `libopenblas-dev` on Linux):
+<details>
+<summary><b>Build from source</b> (contributors, or a platform without a wheel)</summary>
+
+Needs a Rust toolchain and a CBLAS provider (Accelerate on macOS, `libopenblas-dev` on
+Linux). [uv](https://docs.astral.sh/uv/) builds and bundles the core for you:
 
 ```bash
 git clone https://github.com/Egoist-Machines/LodeDB && cd LodeDB
@@ -60,6 +61,8 @@ uv sync --extra gpu                     # + GPU-resident scan (Linux/CUDA)
 ```
 
 Run with `uv run` (e.g. `uv run lodedb doctor`).
+
+</details>
 
 ## Quickstart
 
@@ -169,8 +172,6 @@ lodedb benchmark   # local, metrics-only benchmark
 - **GPU is Linux/CUDA-only and opt-in** (`[gpu]`). macOS scans on the CPU; the MPS scan is
   experimental and was slower than NEON on the hardware tested.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
-- **First PyPI release is pending the initial version tag**; wheels bundle the core and
-  publish from the release workflow (see [Install](#install)).
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec
