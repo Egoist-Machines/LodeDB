@@ -46,6 +46,7 @@ class _FakeCupy:
 
     cuda = _FakeCuda()
     float32 = np.float32
+    float16 = np.float16
 
     @staticmethod
     def asarray(value):

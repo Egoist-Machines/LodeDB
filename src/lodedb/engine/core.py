@@ -2001,9 +2001,9 @@ class LodeEngine:
 
         if not _state_uses_direct_turbovec(state):
             return
-        # Mutations invalidate the GPU-resident dequantized copy; the next
-        # eligible batch lazily re-uploads against the new generation.
-        self._gpu_direct_turbovec_sessions.pop(state.index_key, None)
+        # Try to patch the GPU-resident dequantized copy in-place; if it fails,
+        # pop it and the next eligible batch lazily re-uploads against the new generation.
+        gpu_session = self._gpu_direct_turbovec_sessions.get(state.index_key)
         previous = self._turbovec_indexes.get(state.index_key)
         current_chunk_ids = set(state.chunks)
         generation = self._index_generations.get(state.index_key, 0) + 1
@@ -2131,6 +2131,18 @@ class LodeEngine:
             for stable_id, chunk in zip(stable_ids, new_chunks, strict=True):
                 previous.chunk_ids_by_stable_id[int(stable_id)] = str(chunk.chunk_id)
                 previous.document_ids_by_stable_id[int(stable_id)] = str(chunk.document_id)
+        if gpu_session is not None:
+            try:
+                upsert_stable_ids = tuple(int(uid) for uid in stable_ids) if new_chunks else ()
+                gpu_session.patch(
+                    index=previous.index,
+                    removed_ids=removed_stable_ids,
+                    upsert_ids=upsert_stable_ids,
+                )
+            except Exception:
+                # Patch failed (e.g. MemoryError from over-allocation); safely fail closed
+                # and let the next query rebuild the GPU array using safe O(N) allocation
+                self._gpu_direct_turbovec_sessions.pop(state.index_key, None)
         self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
             index=previous.index,
             chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
