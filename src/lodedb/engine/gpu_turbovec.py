@@ -30,9 +30,10 @@ ties by slot order instead, so tie ordering may differ while id sets and
 scores agree).
 
 Resident bytes are fp16 (`rows * dim * 2`) regardless of the index bit
-width, so 2-bit routes get the same GPU path for free. Mutations invalidate
-the resident copy by generation and the next batch re-uploads; incremental
-row patching is a follow-up.
+width, so 2-bit routes get the same GPU path for free. Small mutations patch
+the resident copy in place via `patch()` in O(changed) rows (swap-remove plus
+a batched upsert); if a patch cannot be applied (e.g. capacity exceeded) the
+resident copy is invalidated by generation and the next batch re-uploads.
 """
 
 from __future__ import annotations
@@ -173,7 +174,8 @@ def estimate_gpu_direct_turbovec_memory(
 
     if row_count < 0 or dim <= 0:
         raise ValueError("row_count must be non-negative and dim must be positive")
-    resident_bytes = int(row_count) * int(dim) * 2
+    capacity = max(int(int(row_count) * 1.5), 1024)
+    resident_bytes = capacity * int(dim) * 2
     query_bytes = int(max_batch_size) * int(dim) * 4
     cast_tile_bytes = min(_TILE_TRANSIENT_BYTES, max(int(row_count) * int(dim) * 4, 1))
     if _maybe_import_torch() is not None:
@@ -232,6 +234,7 @@ class GpuDirectTurboVecSession:
     stable_ids: NDArray[np.uint64]
     rotation: NDArray[np.float32]
     device_rows: Any
+    id_to_slot: dict[int, int]
     estimated_gpu_bytes: int
     memory_budget_bytes: int | None
     upload_build_ms: float
@@ -290,21 +293,81 @@ class GpuDirectTurboVecSession:
         if rotation is None:
             raise RuntimeError("TurboVec rotation matrix is unavailable before first add")
         rotation = np.ascontiguousarray(rotation, dtype=np.float32)
+
+        capacity = max(int(rows.shape[0] * 1.5), 1024)
+        ids_alloc = np.empty(capacity, dtype=np.uint64)
+        if rows.shape[0] > 0:
+            ids_alloc[: rows.shape[0]] = ids
+        id_to_slot = {int(uid): slot for slot, uid in enumerate(ids_alloc[: rows.shape[0]])}
+
         cupy = dependencies.cupy
-        device_rows = cupy.asarray(rows.astype(np.float16, copy=False))
+        device_rows = cupy.empty((capacity, rotation.shape[0]), dtype=cupy.float16)
+        if rows.shape[0] > 0:
+            device_rows[: rows.shape[0]] = cupy.asarray(rows.astype(np.float16, copy=False))
         _sync_device(cupy)
+
         return cls(
             dependencies=dependencies,
             generation=int(generation),
             dim=int(rotation.shape[0]),
             row_count=int(rows.shape[0]),
-            stable_ids=ids,
+            stable_ids=ids_alloc,
             rotation=rotation,
             device_rows=device_rows,
+            id_to_slot=id_to_slot,
             estimated_gpu_bytes=admission.estimated_bytes,
             memory_budget_bytes=memory_budget_bytes,
             upload_build_ms=float((time.perf_counter() - started) * 1000.0),
         )
+
+    def patch(
+        self,
+        index: Any,
+        removed_ids: tuple[int, ...],
+        upsert_ids: tuple[int, ...],
+    ) -> None:
+        """Applies incremental mutations in-place to avoid a full O(N) rebuild.
+
+        Simulates swap-remove semantics to match the CPU IdMapIndex slots exactly,
+        and dynamically appends into over-allocated capacity in O(changed) time.
+        """
+
+        if removed_ids:
+            for id_to_remove in removed_ids:
+                uid = int(id_to_remove)
+                slot = self.id_to_slot.get(uid)
+                if slot is not None:
+                    last = self.row_count - 1
+                    if slot != last:
+                        last_uid = int(self.stable_ids[last])
+                        self.stable_ids[slot] = last_uid
+                        self.device_rows[slot] = self.device_rows[last]
+                        self.id_to_slot[last_uid] = slot
+                    del self.id_to_slot[uid]
+                    self.row_count -= 1
+
+        if upsert_ids:
+            upsert_arr = np.asarray(upsert_ids, dtype=np.uint64)
+            upsert_rows = index.reconstruct_rows(upsert_arr)
+            cupy = self.dependencies.cupy
+            upsert_rows_fp16 = cupy.asarray(upsert_rows.astype(np.float16, copy=False))
+            
+            target_slots = []
+            for target_id in upsert_ids:
+                uid = int(target_id)
+                slot = self.id_to_slot.get(uid)
+                if slot is None:
+                    if self.row_count >= self.device_rows.shape[0]:
+                        raise MemoryError("GPU resident memory capacity exceeded during patch")
+                    slot = self.row_count
+                    self.stable_ids[slot] = np.uint64(uid)
+                    self.id_to_slot[uid] = slot
+                    self.row_count += 1
+                target_slots.append(slot)
+                
+            # Batch the GPU write to avoid kernel-launch overhead per row
+            if target_slots:
+                self.device_rows[target_slots] = upsert_rows_fp16
 
     def search_batch(
         self,
