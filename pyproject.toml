@@ -1,0 +1,97 @@
+[build-system]
+requires = ["maturin>=1.12,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lodedb"
+# Static (maturin reads it here); keep in sync with src/lodedb/__init__.py __version__.
+version = "0.1.0"
+description = "Local-first, privacy-by-default embedded vector database. Your data never leaves your machine."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Egoist Machines", email = "oss@egoistmachines.com" }]
+keywords = [
+  "vector-database",
+  "embeddings",
+  "local-first",
+  "privacy",
+  "semantic-search",
+  "rag",
+  "cuda",
+  "gpu-acceleration",
+  "turbovec",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Lean runtime set (see docs/architecture.md). The compact TurboVec CPU core +
+# .tvim/.tvd persistence is the bundled `lodedb._turbovec` extension (compiled
+# into the wheel, see [tool.maturin]), not a PyPI dependency. numpy = embedding/
+# scan I/O; typer = CLI; sentence-transformers = default embedding backend (pulls
+# torch/transformers); pyyaml = loads the bundled route registry. Heavy research
+# deps (faiss/modal/mteb/datasets/matplotlib/sklearn) are deliberately NOT here
+# and are guarded out by tests/test_import_boundary.py.
+dependencies = [
+  "numpy>=2.0.0",
+  "typer>=0.12.0",
+  "sentence-transformers>=3.0.0",
+  "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+# Opt-in GPU-resident exact scan on CUDA hosts (gpu_turbovec); absent CUDA, LodeDB uses
+# the CPU scan. cupy wheels are Linux/CUDA-only, so this resolves to nothing elsewhere.
+gpu = ["cupy-cuda12x>=13.0.0; platform_system == 'Linux'"]
+# Optional stdio MCP server so coding agents can use LodeDB as local memory.
+mcp = ["mcp>=1.0.0"]
+# Optional LangChain VectorStore adapter.
+langchain = ["langchain-core>=0.3.0"]
+# ruff is pinned (not floored) so `ruff format`/`ruff check` are reproducible across
+# contributors and CI — the formatter's output can change between ruff releases.
+dev = ["pytest>=8.3.0", "ruff==0.15.17"]
+
+[project.scripts]
+lodedb = "lodedb.local.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Egoist-Machines/LodeDB"
+Repository = "https://github.com/Egoist-Machines/LodeDB"
+Issues = "https://github.com/Egoist-Machines/LodeDB/issues"
+Changelog = "https://github.com/Egoist-Machines/LodeDB/blob/main/CHANGELOG.md"
+
+[tool.uv]
+package = true
+
+[tool.maturin]
+# Bundle the patched TurboVec (Rust) core into the lodedb wheel as the
+# `lodedb._turbovec` extension: maturin compiles the vendored crate
+# (third_party/turbovec — MIT core + Apache-2.0 local patches: encoded-row
+# export/import, upsert_with_ids, calibration_fitted; see LICENSE + LOCAL_PATCHES.md)
+# and ships the pure-Python lodedb package from src/. The extension is abi3, so
+# one wheel covers all supported Python versions on a platform.
+manifest-path = "third_party/turbovec/turbovec-python/Cargo.toml"
+module-name = "lodedb._turbovec"
+python-source = "src"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The vendored TurboVec crate (third_party/) is upstream MIT code, not ours to lint.
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["lodedb"]

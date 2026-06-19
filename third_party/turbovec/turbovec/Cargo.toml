@@ -1,0 +1,32 @@
+[package]
+name = "turbovec"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Fast vector quantization with 2-4 bit compression and SIMD search"
+license = "MIT"
+repository = "https://github.com/RyanCodrai/turbovec"
+homepage = "https://github.com/RyanCodrai/turbovec"
+readme = "../README.md"
+keywords = ["vector-search", "quantization", "nearest-neighbor", "ann", "simd"]
+categories = ["algorithms", "science", "compression"]
+
+[dependencies]
+ndarray = "0.17"
+rayon = "1.10"
+ordered-float = "4"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+statrs = "0.17"
+faer = "0.20"
+
+# build.rs emits the BLAS link directive directly (openblas on Linux,
+# Accelerate framework on macOS) so downstream binaries don't need to
+# include `extern crate blas_src;` to resolve `cblas_sgemm`.
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { version = "0.17", features = ["blas"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ndarray = { version = "0.17", features = ["blas"] }
+

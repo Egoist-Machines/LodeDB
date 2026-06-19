@@ -1,0 +1,19 @@
+# GitHub Linguist language statistics.
+#
+# Linguist treats `third_party/` as vendored and drops it from the language
+# bar. Because every Rust file in this repo lives under `third_party/turbovec/`
+# (the upstream MIT TurboVec crate plus LodeDB's Apache-2.0 lifecycle/GPU
+# patches), the repo read as "100% Python" and the Rust engine was invisible.
+#
+# The vendored TurboVec core is load-bearing and partly ours (encoded-row
+# delta export/import, `add_encoded`/`remove_many`, calibration fingerprinting,
+# and the PyO3 bindings; see third_party/turbovec/LOCAL_PATCHES.md), so surface
+# the engine *source* in the stats. Upstream tests, examples, build scripts,
+# and the integration shims stay vendored so they do not pad the numbers.
+#
+# Note: there is no C/C++ in this repo. The Python binding is maturin/PyO3
+# (pure Rust). The C++ pybind11 extensions live in the upstream research repo,
+# not in this spin-out.
+
+third_party/turbovec/turbovec/src/**           linguist-vendored=false
+third_party/turbovec/turbovec-python/src/**    linguist-vendored=false

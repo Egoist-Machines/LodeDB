@@ -1,0 +1,509 @@
+"""LodeDB — the local-first, embedded, no-auth vector database SDK.
+
+``LodeDB`` runs the engine in-process in a local profile that:
+
+- binds to loopback only (never a network address);
+- requires no authentication — the user never supplies or sees any credential;
+- keeps telemetry metrics-only (counts / bytes / latency, never payloads);
+- stores vectors in the compact TurboVec format with ``.tvim``/``.tvd``/``.jsd``
+  on-disk persistence.
+
+On CUDA hosts, eligible batched queries can use the optional GPU-resident
+TurboVec scan; otherwise the compact CPU kernel is the source of truth and
+fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
+"""
+
+from __future__ import annotations
+
+import secrets
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from lodedb.engine.core import (
+    EngineDocument,
+    EngineSecurityConfig,
+    LodeEngine,
+)
+from lodedb.engine.index import EngineError, LodeIndex
+from lodedb.engine.route_registry import default_route_registry, load_route_registry
+from lodedb.local.backends import (
+    LocalEmbeddingResolution,
+    build_local_embedding_backend,
+)
+from lodedb.local.presets import LocalModelPreset, resolve_preset
+
+# Fixed local identifier for the single-process client context. It never leaves
+# the process and has no security meaning — the local engine is auth-free.
+_LOCAL_CLIENT_ID = "lodedb-local"
+# The local DB is a single, stable index. Pinning it to the engine's
+# DEFAULT_INDEX_ID makes the persisted snapshot key the bare client hash (the
+# legacy default snapshot name), so reopening the same path binds to the same
+# on-disk state instead of minting a fresh random index id each open.
+_LOCAL_INDEX_ID = "default"
+_LOCAL_BIND_HOST = "127.0.0.1"
+
+
+class LodeSearchHit:
+    """One redacted local search result: ``(score, id, metadata)``.
+
+    Supports tuple-style unpacking (``score, id, metadata``) to match the
+    documented ``search`` return shape, plus attribute access.
+    """
+
+    __slots__ = ("score", "id", "metadata")
+
+    def __init__(self, *, score: float, id: str, metadata: dict[str, Any]) -> None:
+        """Stores the score, document id, and redacted metadata for one hit."""
+
+        self.score = float(score)
+        self.id = str(id)
+        self.metadata = dict(metadata)
+
+    def __iter__(self):
+        """Yields ``(score, id, metadata)`` so hits unpack like the spec tuple."""
+
+        yield self.score
+        yield self.id
+        yield self.metadata
+
+    def __repr__(self) -> str:
+        """Returns a compact, payload-free representation of the hit."""
+
+        return f"LodeSearchHit(score={self.score:.4f}, id={self.id!r}, metadata={self.metadata!r})"
+
+    def __eq__(self, other: object) -> bool:
+        """Compares hits structurally (and to plain ``(score, id, metadata)`` tuples)."""
+
+        if isinstance(other, LodeSearchHit):
+            return (self.score, self.id, self.metadata) == (other.score, other.id, other.metadata)
+        if isinstance(other, tuple) and len(other) == 3:
+            return (self.score, self.id, self.metadata) == other
+        return NotImplemented
+
+
+class LodeDB:
+    """Embedded, local-first vector database. Data stays on your machine.
+
+    Example::
+
+        db = LodeDB(path="./data", model="minilm", device="auto")
+        doc_id = db.add("the quick brown fox", metadata={"topic": "animals"})
+        for score, hit_id, meta in db.search("fox", k=5):
+            ...
+        db.persist()
+
+    All documents, embeddings, and queries stay local: nothing is sent to a
+    server, and no auth is required. Persistence reuses the engine's
+    ``.tvim``/``.tvd``/``.jsd`` on-disk format and replays safely on reopen.
+
+    Raw document text is retained by default in a dedicated on-disk sidecar, so
+    the original text is retrievable by id (``get``/``get_text``/``get_texts``).
+    Telemetry, audit, and the redacted ``.json``/``.jsd`` snapshot stay
+    payload-free regardless; pass ``store_text=False`` to opt out of retaining
+    text entirely::
+
+        db = LodeDB(path="./data")            # store_text=True by default
+        fox = db.add("the quick brown fox")
+        db.get(fox)                   # -> "the quick brown fox"
+        db.get_texts([fox])           # -> {fox: "the quick brown fox"}
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        model: str = "minilm",
+        device: str = "auto",
+        batch_size: int = 32,
+        max_seq_length: int | None = None,
+        chunk_character_limit: int = 900,
+        store_text: bool = True,
+        route_registry_path: str | Path | None = None,
+        _embedding_backend: Any | None = None,
+    ) -> None:
+        """Opens (or creates) an on-disk local index, loading any persisted state.
+
+        ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality).
+        ``device`` is ``"auto"``/``"cpu"``/``"mps"``/``"cuda"`` (embedding only).
+        ``store_text`` controls durable raw-text retention and defaults to
+        ``True``: the original text passed to ``add``/``add_many`` is kept in a
+        dedicated on-disk sidecar so ``get``/``get_text``/``get_texts`` can return
+        it (across reopens too). Pass ``store_text=False`` to opt out of retaining
+        text at all — telemetry, audit, and the redacted snapshot never carry text
+        regardless of this flag. Reopen the same path with the same ``store_text``
+        value you wrote with.
+        ``_embedding_backend`` is an internal hook for tests/fixtures.
+        """
+
+        self.path = Path(path)
+        self.store_text = bool(store_text)
+        self.preset: LocalModelPreset = resolve_preset(model)
+        seq_len = int(max_seq_length) if max_seq_length is not None else 256
+
+        if _embedding_backend is not None:
+            backend = _embedding_backend
+            self.embedding_resolution = LocalEmbeddingResolution(
+                requested_device=device,
+                backend_name=getattr(backend, "name", "injected"),
+                effective_device="injected",
+                fallback_used=False,
+                fallback_reason="",
+            )
+        else:
+            backend, self.embedding_resolution = build_local_embedding_backend(
+                self.preset,
+                device=device,
+                batch_size=batch_size,
+                max_seq_length=seq_len,
+            )
+        self._embedding_backend = backend
+
+        self.path.mkdir(parents=True, exist_ok=True)
+        security = EngineSecurityConfig(
+            bind_host=_LOCAL_BIND_HOST,
+            route_profile=self.preset.route_profile,
+            telemetry_mode="metrics_only",
+            allow_raw_result_text=self.store_text,
+        )
+        self._engine = LodeEngine(
+            security=security,
+            route_registry=(
+                load_route_registry(str(route_registry_path))
+                if route_registry_path is not None
+                else default_route_registry()
+            ),
+            chunk_character_limit=int(chunk_character_limit),
+            persistence_dir=self.path,
+            embedding_backend=backend,
+            route_policy=self.preset.route_policy,
+        )
+        self._index = LodeIndex(
+            self._engine,
+            client_id=_LOCAL_CLIENT_ID,
+            index_id=_LOCAL_INDEX_ID,
+        )
+        # Ensure the (single) local index exists; load-on-open already restored
+        # any persisted state for this client hash via the engine constructor.
+        self._ensure_index()
+        self._auto_id_counter = 0
+
+    # -- public API ---------------------------------------------------------
+
+    def add(
+        self,
+        text: str,
+        *,
+        id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Adds (or replaces) one document and returns its id.
+
+        A missing ``id`` is auto-generated. Reusing an id upserts that document.
+        Persistence (``.tvim``/``.tvd``/``.jsd``) is updated by the engine on
+        every mutation, so a crash after ``add`` is recoverable on reopen.
+        """
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+        document_id = str(id) if id is not None else self._next_auto_id()
+        document = EngineDocument(
+            document_id=document_id,
+            text=text,
+            metadata=_coerce_metadata(metadata),
+        )
+        self._index.upsert_batch((document,))
+        return document_id
+
+    def add_many(
+        self,
+        documents: list[Mapping[str, Any]],
+    ) -> list[str]:
+        """Adds a batch of ``{"text", "id"?, "metadata"?}`` docs; returns the ids.
+
+        Batched embedding is more efficient than repeated ``add`` calls.
+        """
+
+        payload: list[EngineDocument] = []
+        ids: list[str] = []
+        for item in documents:
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("each document needs a non-empty 'text'")
+            document_id = str(item["id"]) if item.get("id") is not None else self._next_auto_id()
+            ids.append(document_id)
+            payload.append(
+                EngineDocument(
+                    document_id=document_id,
+                    text=text,
+                    metadata=_coerce_metadata(item.get("metadata")),
+                )
+            )
+        if payload:
+            self._index.upsert_batch(tuple(payload))
+        return ids
+
+    def search(
+        self,
+        query: str,
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[LodeSearchHit]:
+        """Returns the top-``k`` hits as ``(score, id, metadata)``-style rows.
+
+        ``filter`` is an exact-match metadata/document filter pushed into the
+        TurboVec allowlist by the engine. Raw query text never leaves the
+        process and never appears in telemetry.
+        """
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if k <= 0:
+            raise ValueError("k must be positive")
+        response = self._index.query(
+            query,
+            top_k=int(k),
+            filter=_normalize_filter(filter),
+        )
+        return self._hits_from_result_rows(response.get("results", []))
+
+    def search_many(
+        self,
+        queries: list[str],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[list[LodeSearchHit]]:
+        """Returns top-``k`` hits for each query, preserving query order.
+
+        Batched search is the public SDK path that lets CUDA hosts use the
+        optional GPU-resident TurboVec scan for eligible query batches. Single
+        queries and unavailable GPU dependencies fall back to the compact CPU
+        kernel; raw query text still never appears in telemetry.
+        """
+
+        if not isinstance(queries, list) or not queries:
+            raise ValueError("queries must be a non-empty list of strings")
+        for query in queries:
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("each query must be a non-empty string")
+        if k <= 0:
+            raise ValueError("k must be positive")
+        normalized_filter = _normalize_filter(filter)
+        batches = self._index.query_batch(
+            [
+                {
+                    "query": query,
+                    "top_k": int(k),
+                    "filter": normalized_filter,
+                }
+                for query in queries
+            ]
+        ).get("queries", [])
+        if not isinstance(batches, list):
+            raise RuntimeError("invalid engine response: queries must be a list")
+        out: list[list[LodeSearchHit]] = []
+        for item in batches:
+            if not isinstance(item, Mapping):
+                raise RuntimeError("invalid engine response: query item must be an object")
+            out.append(self._hits_from_result_rows(item.get("results", [])))
+        return out
+
+    def remove(self, id: str) -> bool:
+        """Removes one document by id. Returns True if a document was deleted."""
+
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("id must be a non-empty string")
+        # `delete_documents` reports `document_count` as the number of unique
+        # ids *requested* (not necessarily existing); `deleted_chunks` counts
+        # chunks actually removed, so a positive value means the doc existed.
+        response = self._index.delete_batch((id,))
+        return int(response.get("deleted_chunks", 0) or 0) > 0
+
+    def get(self, id: str) -> str | None:
+        """Returns the stored raw text for a document id, or ``None`` if absent.
+
+        This is the primary retrieval verb; :meth:`get_text` is a synonym. As a
+        deliberate counterpart to ``add``, ``get(hit.id)`` is how an application
+        recovers the original text for a document a search selected — search hits
+        themselves stay payload-free. Available unless the DB was opened with
+        ``store_text=False`` (see :meth:`get_text` for the exact semantics).
+        """
+
+        return self.get_text(id)
+
+    def get_text(self, id: str) -> str | None:
+        """Returns the stored raw text for a document id, or ``None`` if absent.
+
+        Text retention is on by default; if the DB was opened with
+        ``store_text=False`` this raises :class:`ValueError` so opting out is
+        explicit. When text is retained, an unknown id (or one whose text was not
+        stored) returns ``None`` rather than raising, so callers can probe ids
+        ergonomically.
+        Retrieved text is returned only to the caller and never logged or sent to
+        telemetry.
+        """
+
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("id must be a non-empty string")
+        if not self.store_text:
+            raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
+        try:
+            return self._index.get_document_text(id)
+        except EngineError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    def get_texts(self, ids: list[str]) -> dict[str, str]:
+        """Returns a ``{id: text}`` map for the stored ids that have text.
+
+        Requires ``store_text=True``. Ids that are unknown or whose text was not
+        stored are omitted from the returned mapping, so the batch never fails
+        because of one missing id.
+        """
+
+        if not isinstance(ids, list):
+            raise ValueError("ids must be a list of strings")
+        for value in ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("each id must be a non-empty string")
+        if not self.store_text:
+            raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
+        if not ids:
+            return {}
+        return self._index.get_document_texts(ids)
+
+    def persist(self) -> dict[str, Any]:
+        """Flushes durable on-disk state and returns redacted storage stats.
+
+        The engine already persists on every mutation; this is an explicit
+        durability + stats checkpoint. State is reloaded automatically on the
+        next ``LodeDB(path=...)`` open.
+        """
+
+        # A no-op upsert path is avoided; instead surface the engine's current
+        # redacted stats, which include persisted byte accounting.
+        return self._index.stats()
+
+    def count(self) -> int:
+        """Returns the number of documents currently stored."""
+
+        return int(self._index.stats().get("document_count", 0) or 0)
+
+    def stats(self) -> dict[str, Any]:
+        """Returns redacted engine stats (counts, storage bytes, telemetry)."""
+
+        return self._index.stats()
+
+    def close(self) -> None:
+        """Releases engine references. Persisted state remains on disk."""
+
+        self._index = None  # type: ignore[assignment]
+        self._engine = None  # type: ignore[assignment]
+
+    def __enter__(self) -> LodeDB:
+        """Enters a context manager; state is already loaded on open."""
+
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Exits the context manager (state is durable on disk already)."""
+
+        self.close()
+
+    # -- internals ----------------------------------------------------------
+
+    def _ensure_index(self) -> None:
+        """Creates the single local index if it does not already exist."""
+
+        try:
+            self._index.get_index()
+        except Exception:  # noqa: BLE001 - missing index -> create it
+            self._index.create(name="lodedb-local")
+
+    def _next_auto_id(self) -> str:
+        """Returns a unique, collision-resistant auto id for an added document."""
+
+        self._auto_id_counter += 1
+        return f"doc-{secrets.token_hex(8)}-{self._auto_id_counter}"
+
+    def _metadata_for_document(self, document_id: str) -> dict[str, Any]:
+        """Returns redacted metadata for a document id (empty when unavailable)."""
+
+        try:
+            record = self._index.get_document(document_id)
+        except Exception:  # noqa: BLE001 - tolerate races / missing metadata
+            return {}
+        metadata = record.get("metadata", {})
+        return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+    def _hits_from_result_rows(self, rows: Any) -> list[LodeSearchHit]:
+        """Hydrates engine result rows into public payload-free hit objects."""
+
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid engine response: results must be a list")
+        hits: list[LodeSearchHit] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise RuntimeError("invalid engine response: result row must be an object")
+            document_id = str(row["document_id"])
+            hits.append(
+                LodeSearchHit(
+                    score=float(row["score"]),
+                    id=document_id,
+                    metadata=self._metadata_for_document(document_id),
+                )
+            )
+        return hits
+
+
+def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Normalizes the ergonomic local filter into the engine filter schema.
+
+    Accepts either the structured engine form
+    (``{"metadata": {...}, "document_ids": [...]}``) or a flat metadata dict
+    (``{"topic": "physics"}``), which is wrapped as ``{"metadata": {...}}``.
+    Metadata values are stringified to match the engine's string metadata
+    model so a flat ``{"year": 2020}`` filter matches a stored ``"2020"``.
+    """
+
+    if filter is None:
+        return None
+    if not isinstance(filter, Mapping):
+        raise ValueError("filter must be a mapping")
+    structured_keys = {"metadata", "document_ids"}
+    if set(filter) <= structured_keys and any(key in filter for key in structured_keys):
+        out: dict[str, Any] = {}
+        if "metadata" in filter:
+            out["metadata"] = _coerce_metadata(filter["metadata"])
+        if "document_ids" in filter:
+            out["document_ids"] = list(filter["document_ids"])
+        return out
+    # Flat metadata form.
+    return {"metadata": _coerce_metadata(filter)}
+
+
+def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
+    """Coerces metadata values to strings to match the engine's metadata model.
+
+    The engine validates metadata as a string->string map; we stringify
+    scalars so a local caller can pass ints/bools/floats ergonomically.
+    """
+
+    if metadata is None:
+        return {}
+    coerced: dict[str, str] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            raise ValueError("metadata keys must be strings")
+        if isinstance(value, bool):
+            coerced[key] = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            coerced[key] = str(value)
+        else:
+            raise ValueError(
+                f"metadata value for {key!r} must be a string, number, or bool"
+            )
+    return coerced

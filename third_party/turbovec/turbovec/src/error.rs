@@ -1,0 +1,190 @@
+//! Errors returned by the user-facing add and construct paths.
+//!
+//! [`AddError`] is returned by the add paths
+//! ([`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d),
+//! [`IdMapIndex::add_with_ids_2d`](crate::IdMapIndex::add_with_ids_2d),
+//! [`IdMapIndex::add_with_ids`](crate::IdMapIndex::add_with_ids)).
+//!
+//! [`ConstructError`] is returned by the constructors
+//! ([`TurboQuantIndex::new`](crate::TurboQuantIndex::new),
+//! [`TurboQuantIndex::new_lazy`](crate::TurboQuantIndex::new_lazy),
+//! [`IdMapIndex::new`](crate::IdMapIndex::new),
+//! [`IdMapIndex::new_lazy`](crate::IdMapIndex::new_lazy)).
+//!
+//! Both are forms of user input error — wrong shape, wrong dim, wrong
+//! bit_width, or duplicate id — that callers can recover from. Internal
+//! preconditions (e.g. calling the low-level `add(&self, &[f32])` on a
+//! lazy index that hasn't been committed) still panic, since that
+//! signals a contract violation rather than bad input.
+
+use std::error::Error;
+use std::fmt;
+
+// Eq dropped from the derive because `InvalidInputValue` carries an f32,
+// which is not `Eq` (NaN != NaN). PartialEq still works for the
+// finite-input cases tests assert against.
+// `#[non_exhaustive]` so adding error variants in future releases is not a
+// breaking change — downstream `match` on this enum must carry a wildcard arm.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AddError {
+    /// Batch dim does not match the index's already-locked dim.
+    DimMismatch { existing: usize, got: usize },
+
+    /// First-add dim on a lazy index must be a multiple of 8.
+    DimNotMultipleOf8(usize),
+
+    /// First-add dim on a lazy index exceeds [`MAX_DIM`](crate::MAX_DIM).
+    /// Bounds the lazily-built `dim`×`dim` rotation matrix allocation.
+    DimTooLarge { dim: usize, max: usize },
+
+    /// `vectors.len()` is not a whole multiple of `dim`.
+    VectorBufferNotMultipleOfDim { vectors_len: usize, dim: usize },
+
+    /// Number of ids does not equal number of vectors (`vectors.len() / dim`).
+    IdsCountMismatch { expected: usize, got: usize },
+
+    /// External id was already present in the index.
+    IdAlreadyPresent(u64),
+
+    /// A coordinate in the input vectors is not finite (NaN, +Inf, -Inf)
+    /// or has magnitude `>= 1e16`. Either silently corrupts the index:
+    ///   - NaN/Inf: poisons the per-vector scale via `0 * NaN = NaN`,
+    ///     making the slot exist in `len()` but never reachable through
+    ///     `search`.
+    ///   - Huge magnitude: overflows the f32 sum-of-squares in the norm
+    ///     computation to `+Inf`, so `scale[i] = Inf` and the slot
+    ///     incorrectly wins top-k against every query.
+    InvalidInputValue {
+        vector_index: usize,
+        coord_index: usize,
+        value: f32,
+    },
+}
+
+impl fmt::Display for AddError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DimMismatch { existing, got } => {
+                write!(f, "dim mismatch: index dim={existing}, batch dim={got}")
+            }
+            Self::DimNotMultipleOf8(dim) => {
+                write!(f, "dim must be a multiple of 8, got {dim}")
+            }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds maximum {max}")
+            }
+            Self::VectorBufferNotMultipleOfDim { vectors_len, dim } => write!(
+                f,
+                "vector buffer length {vectors_len} not a multiple of dim {dim}",
+            ),
+            Self::IdsCountMismatch { expected, got } => {
+                write!(f, "expected {expected} ids, got {got}")
+            }
+            Self::IdAlreadyPresent(id) => {
+                write!(f, "id {id} already present in index")
+            }
+            Self::InvalidInputValue {
+                vector_index,
+                coord_index,
+                value,
+            } => write!(
+                f,
+                "invalid input value at vector {vector_index}, coord {coord_index}: {value} \
+                 (must be finite and |value| < 1e16 to avoid f32 norm overflow)",
+            ),
+        }
+    }
+}
+
+impl Error for AddError {}
+
+// `#[non_exhaustive]` so adding error variants in future releases is not a
+// breaking change — downstream `match` on this enum must carry a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConstructError {
+    /// `bit_width` must be 2, 3, or 4.
+    BitWidthOutOfRange(usize),
+
+    /// `dim` must be a positive multiple of 8.
+    DimNotPositiveMultipleOf8(usize),
+
+    /// `dim` exceeds [`MAX_DIM`](crate::MAX_DIM). Bounds the lazily-built
+    /// `dim`×`dim` rotation matrix allocation.
+    DimTooLarge { dim: usize, max: usize },
+}
+
+impl fmt::Display for ConstructError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BitWidthOutOfRange(bw) => {
+                write!(f, "bit_width must be 2, 3, or 4, got {bw}")
+            }
+            Self::DimNotPositiveMultipleOf8(dim) => {
+                write!(f, "dim must be a positive multiple of 8, got {dim}")
+            }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl Error for ConstructError {}
+
+/// Errors from the encoded-row export/import surface
+/// ([`IdMapIndex::export_encoded`](crate::IdMapIndex::export_encoded),
+/// [`IdMapIndex::add_encoded`](crate::IdMapIndex::add_encoded)).
+///
+/// Local appliance extension on top of upstream v0.9.0 — see
+/// `LOCAL_PATCHES.md` at the repository root.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum EncodedRowsError {
+    /// The index has no committed dim yet (lazy index before its first
+    /// add); there is no calibrated coordinate system to import into.
+    DimNotCommitted,
+
+    /// An external id was not present in the index.
+    UnknownId(u64),
+
+    /// An external id appeared more than once within one call.
+    DuplicateId(u64),
+
+    /// `codes.len()` is not `ids.len() * bytes_per_vector`.
+    CodesLengthMismatch { expected: usize, got: usize },
+
+    /// Number of scales does not equal the number of ids.
+    ScalesCountMismatch { expected: usize, got: usize },
+
+    /// A scale is NaN or infinite; importing it would poison the slot the
+    /// same way unvalidated float adds used to.
+    NonFiniteScale { index: usize, value: f32 },
+}
+
+impl fmt::Display for EncodedRowsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DimNotCommitted => {
+                write!(f, "index dim is not committed yet (no vectors added)")
+            }
+            Self::UnknownId(id) => write!(f, "id {id} is not present in the index"),
+            Self::DuplicateId(id) => write!(f, "id {id} appears more than once in this call"),
+            Self::CodesLengthMismatch { expected, got } => write!(
+                f,
+                "codes length mismatch: expected {expected} bytes, got {got}"
+            ),
+            Self::ScalesCountMismatch { expected, got } => write!(
+                f,
+                "scales count mismatch: expected {expected}, got {got}"
+            ),
+            Self::NonFiniteScale { index, value } => write!(
+                f,
+                "scale at row {index} is not finite: {value}"
+            ),
+        }
+    }
+}
+
+impl Error for EncodedRowsError {}

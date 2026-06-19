@@ -1,0 +1,50 @@
+{
+  "glove_d200_2bit": {
+    "n": 100000,
+    "dim": 200,
+    "bit_width": 2,
+    "fp32_mb": 76.3,
+    "index_mb": 5.1,
+    "ratio": 14.8
+  },
+  "glove_d200_4bit": {
+    "n": 100000,
+    "dim": 200,
+    "bit_width": 4,
+    "fp32_mb": 76.3,
+    "index_mb": 9.9,
+    "ratio": 7.7
+  },
+  "openai_d1536_2bit": {
+    "n": 100000,
+    "dim": 1536,
+    "bit_width": 2,
+    "fp32_mb": 585.9,
+    "index_mb": 37.0,
+    "ratio": 15.8
+  },
+  "openai_d1536_4bit": {
+    "n": 100000,
+    "dim": 1536,
+    "bit_width": 4,
+    "fp32_mb": 585.9,
+    "index_mb": 73.6,
+    "ratio": 8.0
+  },
+  "openai_d3072_2bit": {
+    "n": 100000,
+    "dim": 3072,
+    "bit_width": 2,
+    "fp32_mb": 1171.9,
+    "index_mb": 73.6,
+    "ratio": 15.9
+  },
+  "openai_d3072_4bit": {
+    "n": 100000,
+    "dim": 3072,
+    "bit_width": 4,
+    "fp32_mb": 1171.9,
+    "index_mb": 146.9,
+    "ratio": 8.0
+  }
+}

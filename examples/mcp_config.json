@@ -1,0 +1,17 @@
+{
+  "_comment": "Register LodeDB as local memory for an MCP-capable coding agent. Because LodeDB currently installs from source via uv (not yet on PyPI), the command runs the CLI through uv against the cloned repo. Replace both absolute paths. Once a packaged release exists, 'command' becomes simply 'lodedb' with args ['mcp', '--path', '<data dir>'].",
+  "mcpServers": {
+    "lodedb": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/absolute/path/to/LodeDB",
+        "lodedb",
+        "mcp",
+        "--path",
+        "/absolute/path/to/your/data"
+      ]
+    }
+  }
+}

@@ -1,0 +1,328 @@
+{
+  "batch": [
+    {
+      "augmented": {
+        "batch_size": 1,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 2964.161837000006,
+        "k": 64,
+        "ms_per_query": 5.915510812000889,
+        "pass_ms_median": 5915.510812000889,
+        "queries_per_sec": 169.04710882638983,
+        "query_count": 1000
+      },
+      "batch_size": 1,
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.24870753400000467,
+        "pass_ms_median": 248.70753400000467,
+        "queries_per_sec": 4020.786921557355,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 16,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 2853.9927170000965,
+        "k": 64,
+        "ms_per_query": 0.41206070900000213,
+        "pass_ms_median": 412.06070900000213,
+        "queries_per_sec": 2426.826868368066,
+        "query_count": 1000
+      },
+      "batch_size": 16,
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.24870753400000467,
+        "pass_ms_median": 248.70753400000467,
+        "queries_per_sec": 4020.786921557355,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 64,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 2815.0502969999707,
+        "k": 64,
+        "ms_per_query": 0.12466228300002058,
+        "pass_ms_median": 124.66228300002058,
+        "queries_per_sec": 8021.6724412133135,
+        "query_count": 1000
+      },
+      "batch_size": 64,
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.24870753400000467,
+        "pass_ms_median": 248.70753400000467,
+        "queries_per_sec": 4020.786921557355,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 256,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 2979.618811000023,
+        "k": 64,
+        "ms_per_query": 0.05764773000009882,
+        "pass_ms_median": 57.64773000009882,
+        "queries_per_sec": 17346.736809901897,
+        "query_count": 1000
+      },
+      "batch_size": 256,
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.24870753400000467,
+        "pass_ms_median": 248.70753400000467,
+        "queries_per_sec": 4020.786921557355,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 1024,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 3048.095238999963,
+        "k": 64,
+        "ms_per_query": 0.050195566999946095,
+        "pass_ms_median": 50.195566999946095,
+        "queries_per_sec": 19922.077979536996,
+        "query_count": 1000
+      },
+      "batch_size": 1024,
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.24870753400000467,
+        "pass_ms_median": 248.70753400000467,
+        "queries_per_sec": 4020.786921557355,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      }
+    }
+  ],
+  "dataset": {
+    "chunk_character_limit": 480,
+    "corpus_count": 1000000,
+    "dim": 384,
+    "embed_seconds": 242.2,
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "name": "govreport-minilm",
+    "queries_path": "/root/data/govreport-minilm-queries.npy",
+    "query_count": 1000,
+    "task": "GovReport10K",
+    "vectors_path": "/root/data/govreport-minilm-corpus.npy"
+  },
+  "machine": {
+    "cpu_count": 32,
+    "machine": "x86_64",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.35",
+    "python": "3.11.9",
+    "rayon_num_threads": "default(all)",
+    "turbovec_native_backend": "avx512bw",
+    "turbovec_native_used": true
+  },
+  "recall": [
+    {
+      "augmented": {
+        "1": 0.95,
+        "16": 1.0,
+        "2": 0.997,
+        "32": 1.0,
+        "4": 0.999,
+        "64": 1.0,
+        "8": 1.0
+      },
+      "bit_width": 4,
+      "n": 100000,
+      "vanilla": {
+        "1": 0.943,
+        "16": 1.0,
+        "2": 0.995,
+        "32": 1.0,
+        "4": 0.999,
+        "64": 1.0,
+        "8": 1.0
+      }
+    },
+    {
+      "augmented": {
+        "1": 0.931,
+        "16": 1.0,
+        "2": 0.996,
+        "32": 1.0,
+        "4": 1.0,
+        "64": 1.0,
+        "8": 1.0
+      },
+      "bit_width": 4,
+      "n": 500000,
+      "vanilla": {
+        "1": 0.927,
+        "16": 1.0,
+        "2": 0.994,
+        "32": 1.0,
+        "4": 1.0,
+        "64": 1.0,
+        "8": 1.0
+      }
+    },
+    {
+      "augmented": {
+        "1": 0.93,
+        "16": 1.0,
+        "2": 0.997,
+        "32": 1.0,
+        "4": 1.0,
+        "64": 1.0,
+        "8": 1.0
+      },
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla": {
+        "1": 0.91,
+        "16": 1.0,
+        "2": 0.995,
+        "32": 1.0,
+        "4": 1.0,
+        "64": 1.0,
+        "8": 1.0
+      }
+    }
+  ],
+  "spec": {
+    "batch_size": 64,
+    "batch_sweep_bit": 4,
+    "batch_sweep_n": 1000000,
+    "batch_sweep_sizes": [
+      1,
+      16,
+      64,
+      256,
+      1024
+    ],
+    "bit_widths": [
+      4
+    ],
+    "chunk_character_limit": 480,
+    "include_gpu": true,
+    "k": 64,
+    "max_corpus": 1000000,
+    "queries": 1000,
+    "repeats": 3,
+    "sizes": [
+      100000,
+      500000,
+      1000000
+    ],
+    "task_name": "GovReport10K"
+  },
+  "speed": [
+    {
+      "augmented": {
+        "batch_size": 64,
+        "gpu_resident_bytes": 76800000,
+        "gpu_resident_upload_build_ms": 280.12123899998187,
+        "k": 64,
+        "ms_per_query": 0.018587483999851884,
+        "pass_ms_median": 18.587483999851884,
+        "queries_per_sec": 53799.64281384014,
+        "query_count": 1000
+      },
+      "bit_width": 4,
+      "n": 100000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.02842934399996011,
+        "pass_ms_median": 28.42934399996011,
+        "queries_per_sec": 35174.92348755578,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      },
+      "vanilla_st": {
+        "k": 64,
+        "ms_per_query": 0.49923335900001575,
+        "pass_ms_median": 499.23335900001575,
+        "queries_per_sec": 2003.0712731277408,
+        "query_count": 1000,
+        "rayon_num_threads": "1"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 64,
+        "gpu_resident_bytes": 384000000,
+        "gpu_resident_upload_build_ms": 1366.8774939999935,
+        "k": 64,
+        "ms_per_query": 0.06514197300009528,
+        "pass_ms_median": 65.14197300009528,
+        "queries_per_sec": 15351.085543548665,
+        "query_count": 1000
+      },
+      "bit_width": 4,
+      "n": 500000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.10440268700000388,
+        "pass_ms_median": 104.40268700000388,
+        "queries_per_sec": 9578.297539410674,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      },
+      "vanilla_st": {
+        "k": 64,
+        "ms_per_query": 2.388177655999982,
+        "pass_ms_median": 2388.177655999982,
+        "queries_per_sec": 418.72931751439495,
+        "query_count": 1000,
+        "rayon_num_threads": "1"
+      }
+    },
+    {
+      "augmented": {
+        "batch_size": 64,
+        "gpu_resident_bytes": 768000000,
+        "gpu_resident_upload_build_ms": 2842.0354600000337,
+        "k": 64,
+        "ms_per_query": 0.12515387399997735,
+        "pass_ms_median": 125.15387399997735,
+        "queries_per_sec": 7990.164171827242,
+        "query_count": 1000
+      },
+      "bit_width": 4,
+      "n": 1000000,
+      "vanilla_mt": {
+        "k": 64,
+        "ms_per_query": 0.2470680260000222,
+        "pass_ms_median": 247.0680260000222,
+        "queries_per_sec": 4047.4682871344517,
+        "query_count": 1000,
+        "rayon_num_threads": "32"
+      },
+      "vanilla_st": {
+        "k": 64,
+        "ms_per_query": 6.386220625000022,
+        "pass_ms_median": 6386.220625000022,
+        "queries_per_sec": 156.58713638631872,
+        "query_count": 1000,
+        "rayon_num_threads": "1"
+      }
+    }
+  ],
+  "wall_seconds": 234.72546699899993
+}

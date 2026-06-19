@@ -1,0 +1,82 @@
+{
+  "machine": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "apple_silicon": true
+  },
+  "model": "minilm",
+  "doc_count": 20000,
+  "query_count": 200,
+  "runs": [
+    {
+      "machine": {
+        "platform": "macOS-26.5.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "apple_silicon": true
+      },
+      "config": {
+        "model": "minilm",
+        "requested_device": "mps",
+        "effective_device": "mps",
+        "embedding_backend": "sentence_transformers",
+        "fallback_used": false,
+        "fallback_reason": "",
+        "doc_count": 20000,
+        "query_count": 200,
+        "top_k": 10,
+        "embed_batch_size": 64
+      },
+      "embedding": {
+        "indexed_docs": 20000,
+        "embed_seconds": 14.3536,
+        "docs_per_second": 1393.38
+      },
+      "cpu_vector_scan": {
+        "note": "TurboVec scan runs on the CPU kernel on Apple Silicon; no GPU vector search on Mac.",
+        "search_only_ms_p50": 0.2511,
+        "search_only_ms_p95": 0.4088,
+        "end_to_end_query_ms_p50": 8.4249,
+        "end_to_end_query_ms_p95": 9.5798
+      },
+      "storage": {},
+      "document_count": 20000,
+      "chunk_count": 20000,
+      "raw_payload_text_present": false
+    },
+    {
+      "machine": {
+        "platform": "macOS-26.5.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "apple_silicon": true
+      },
+      "config": {
+        "model": "minilm",
+        "requested_device": "cpu",
+        "effective_device": "cpu",
+        "embedding_backend": "sentence_transformers",
+        "fallback_used": false,
+        "fallback_reason": "",
+        "doc_count": 20000,
+        "query_count": 200,
+        "top_k": 10,
+        "embed_batch_size": 64
+      },
+      "embedding": {
+        "indexed_docs": 20000,
+        "embed_seconds": 23.9373,
+        "docs_per_second": 835.52
+      },
+      "cpu_vector_scan": {
+        "note": "TurboVec scan runs on the CPU kernel on Apple Silicon; no GPU vector search on Mac.",
+        "search_only_ms_p50": 0.2202,
+        "search_only_ms_p95": 0.2492,
+        "end_to_end_query_ms_p50": 5.7311,
+        "end_to_end_query_ms_p95": 7.6797
+      },
+      "storage": {},
+      "document_count": 20000,
+      "chunk_count": 20000,
+      "raw_payload_text_present": false
+    }
+  ]
+}

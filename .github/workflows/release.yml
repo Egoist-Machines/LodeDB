@@ -1,0 +1,104 @@
+name: release
+
+# On a version tag (vX.Y.Z): build the sdist + native abi3 wheels (Linux / macOS / Windows),
+# publish them to PyPI via Trusted Publishing (OIDC, no stored token), and attach them to a
+# GitHub Release. The patched TurboVec Rust core is bundled into the lodedb wheel (see
+# pyproject [tool.maturin]), so `pip install lodedb` resolves the patched core with nothing
+# to compile and no extra dependency.
+#
+# One-time setup before the first publish: configure a PyPI Trusted Publisher for project
+# `lodedb` (owner: this repo, workflow: release.yml, environment: pypi). Until that exists the
+# publish job fails closed and nothing is uploaded; the build jobs still produce artifacts.
+#
+# Cut a release: bump `version` in pyproject.toml + __version__ in src/lodedb/__init__.py to
+# match, then `git tag vX.Y.Z && git push --tags`. `workflow_dispatch` builds artifacts only
+# (it does not publish).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pyproject version == __init__ __version__ (== tag, on a tag)
+        run: |
+          py=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          init=$(grep -m1 '^__version__' src/lodedb/__init__.py | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "pyproject=$py  __init__=$init  ref=${GITHUB_REF_NAME}"
+          test "$py" = "$init" || { echo "::error::pyproject version ($py) != __init__ __version__ ($init)"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "v$py" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != v$py"; exit 1; }
+          fi
+
+  wheels:
+    needs: version-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: macos-14, target: aarch64 }
+          - { os: macos-13, target: x86_64 }
+          - { os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build abi3 wheel (maturin)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          # manylinux_2_28; auditwheel bundles the OpenBLAS the crate links into the wheel.
+          manylinux: "2_28"
+          before-script-linux: |
+            # CBLAS provider for the vendored TurboVec crate (Linux only; no-op elsewhere).
+            dnf install -y epel-release || true
+            dnf install -y openblas-devel || yum install -y openblas-devel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+
+  sdist:
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    # Only a real tag push publishes; workflow_dispatch stops after the build jobs above.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Create GitHub Release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

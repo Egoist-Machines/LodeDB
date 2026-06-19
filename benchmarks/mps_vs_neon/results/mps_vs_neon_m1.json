@@ -1,0 +1,62 @@
+{
+  "machine": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64"
+  },
+  "mps_available": true,
+  "mps_reason": "",
+  "config": {
+    "n": 100000,
+    "dim": 384,
+    "bit_width": 4,
+    "queries": 1000,
+    "k": 64,
+    "repeats": 3
+  },
+  "build_ms": 554.51,
+  "resident_bytes": 76800000,
+  "speed": [
+    {
+      "batch": 1,
+      "neon_qps": 1124.6,
+      "mps_qps": 94.7,
+      "mps_over_neon": 0.084
+    },
+    {
+      "batch": 16,
+      "neon_qps": 3255.8,
+      "mps_qps": 934.8,
+      "mps_over_neon": 0.287
+    },
+    {
+      "batch": 64,
+      "neon_qps": 5652.6,
+      "mps_qps": 1908.8,
+      "mps_over_neon": 0.338
+    },
+    {
+      "batch": 256,
+      "neon_qps": 4615.1,
+      "mps_qps": 2614.5,
+      "mps_over_neon": 0.567
+    },
+    {
+      "batch": 1024,
+      "neon_qps": 6100.4,
+      "mps_qps": 3245.8,
+      "mps_over_neon": 0.532
+    }
+  ],
+  "recall": {
+    "neon": {
+      "1": 0.737,
+      "8": 0.999,
+      "64": 1.0
+    },
+    "mps_exact": {
+      "1": 0.774,
+      "8": 1.0,
+      "64": 1.0
+    }
+  }
+}

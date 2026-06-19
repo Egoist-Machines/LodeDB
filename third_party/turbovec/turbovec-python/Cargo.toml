@@ -1,0 +1,17 @@
+[package]
+name = "turbovec-python"
+version = "0.8.0"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+name = "_turbovec"
+crate-type = ["cdylib"]
+
+[dependencies]
+turbovec-core = { package = "turbovec", path = "../turbovec" }
+pyo3 = { version = "0.27.0", features = ["extension-module", "abi3-py39"] }
+numpy = "0.27.0"
+
+[build-dependencies]
+pyo3-build-config = "0.27.0"

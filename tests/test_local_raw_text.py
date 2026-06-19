@@ -1,0 +1,281 @@
+"""Tests for durable raw-text retrieval in the local LodeDB SDK.
+
+Raw text is retained by default (``store_text=True``) in a dedicated ``.tvtext``
+sidecar, so the original text is retrievable by id (``get`` / ``get_text`` /
+``get_texts``), durably across reopens. The redacted artifacts stay payload-free
+regardless — telemetry, audit, the ``.json`` snapshot, the ``.jsd`` journal, and
+the ``.tvim``/``.tvd`` vector sidecars never carry raw document text. Opening
+with ``store_text=False`` opts out of retaining text at all.
+
+These exercise the feature with the same deterministic hash backend the rest of
+the local suite uses, so they neither download models nor import torch.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+from pathlib import Path
+
+import pytest
+
+from lodedb.engine.core import audit_persisted_index_snapshots
+from lodedb.engine.document_text_store import DocumentTextStore
+from lodedb.engine.embedding_backends import HashEmbeddingBackend
+from lodedb.local.db import LodeDB
+
+_SECRET = "TOPSECRET document body that must only live in the text sidecar"
+
+
+def _open(tmp_path, *, store_text: bool, dim: int = 384) -> LodeDB:
+    """Opens a LodeDB with an injected deterministic hash backend."""
+
+    return LodeDB(
+        path=tmp_path,
+        model="minilm",
+        store_text=store_text,
+        _embedding_backend=HashEmbeddingBackend(native_dim=dim),
+    )
+
+
+def test_store_text_enabled_by_default(tmp_path):
+    """Text retention is on by default: get works and a sidecar is written."""
+
+    db = LodeDB(
+        path=tmp_path,
+        model="minilm",
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    assert db.store_text is True
+    db.add("default-on document body", id="a")
+    db.persist()
+    assert db.get("a") == "default-on document body"
+    assert glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    db.close()
+
+
+def test_store_text_false_opts_out(tmp_path):
+    """Opening with store_text=False: get_text/get_texts raise and no sidecar is written."""
+
+    db = _open(tmp_path, store_text=False)
+    db.add("plain document body", id="a")
+    db.persist()
+    with pytest.raises(ValueError, match="store_text=True"):
+        db.get_text("a")
+    with pytest.raises(ValueError, match="store_text=True"):
+        db.get_texts(["a"])
+    assert not glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    db.close()
+
+
+def test_get_text_returns_stored_text(tmp_path):
+    """With the opt-in, get_text returns the exact text passed to add."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("the quick brown fox jumps", id="fox", metadata={"topic": "animals"})
+    assert db.get_text("fox") == "the quick brown fox jumps"
+    db.close()
+
+
+def test_get_is_alias_for_get_text(tmp_path):
+    """``get`` is the primary retrieval verb and behaves exactly like ``get_text``."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("the quick brown fox jumps", id="fox")
+    assert db.get("fox") == db.get_text("fox") == "the quick brown fox jumps"
+    assert db.get("absent") is None
+    db.close()
+
+    off = _open(tmp_path, store_text=False)
+    with pytest.raises(ValueError, match="store_text=True"):
+        off.get("fox")
+    off.close()
+
+
+def test_get_text_missing_id_returns_none(tmp_path):
+    """A never-added id returns None (not an error) when the opt-in is on."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("present document", id="here")
+    assert db.get_text("absent") is None
+    db.close()
+
+
+def test_get_texts_batch_omits_missing(tmp_path):
+    """get_texts returns a {id: text} map and omits unknown ids."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add_many(
+        [
+            {"text": "first body", "id": "one"},
+            {"text": "second body", "id": "two"},
+        ]
+    )
+    got = db.get_texts(["one", "two", "missing"])
+    assert got == {"one": "first body", "two": "second body"}
+    assert db.get_texts([]) == {}
+    db.close()
+
+
+def test_add_many_and_auto_ids_store_text(tmp_path):
+    """Auto-generated ids also get their text stored and retrievable."""
+
+    db = _open(tmp_path, store_text=True)
+    ids = db.add_many([{"text": "auto one"}, {"text": "auto two"}])
+    texts = db.get_texts(ids)
+    assert {texts[ids[0]], texts[ids[1]]} == {"auto one", "auto two"}
+    db.close()
+
+
+def test_text_persists_and_reloads_across_reopen(tmp_path):
+    """Stored text survives persist()/close and is retrievable after reopen."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("durable body alpha", id="a", metadata={"k": "a"})
+    db.add("durable body beta", id="b", metadata={"k": "b"})
+    db.persist()
+    db.close()
+
+    reopened = _open(tmp_path, store_text=True)
+    assert reopened.count() == 2
+    assert reopened.get_text("a") == "durable body alpha"
+    assert reopened.get_texts(["a", "b"]) == {
+        "a": "durable body alpha",
+        "b": "durable body beta",
+    }
+    reopened.close()
+
+
+def test_remove_drops_stored_text(tmp_path):
+    """Removing a document also drops its stored text, durably."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("removable body", id="gone")
+    db.add("kept body", id="kept")
+    assert db.remove("gone") is True
+    assert db.get_text("gone") is None
+    assert db.get_text("kept") == "kept body"
+    db.persist()
+    db.close()
+
+    reopened = _open(tmp_path, store_text=True)
+    assert reopened.get_text("gone") is None
+    assert reopened.get_text("kept") == "kept body"
+    reopened.close()
+
+
+def test_upsert_overwrites_stored_text(tmp_path):
+    """Re-adding an id replaces its stored text with the new body."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("original body", id="doc")
+    assert db.get_text("doc") == "original body"
+    db.add("replacement body", id="doc")
+    assert db.get_text("doc") == "replacement body"
+    db.persist()
+    db.close()
+
+    reopened = _open(tmp_path, store_text=True)
+    assert reopened.get_text("doc") == "replacement body"
+    reopened.close()
+
+
+def test_reopen_without_opt_in_ignores_sidecar(tmp_path):
+    """A DB reopened without store_text neither reads nor exposes the sidecar."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("body for later", id="x")
+    db.persist()
+    db.close()
+
+    plain = _open(tmp_path, store_text=False)
+    assert plain.count() == 1  # redacted state still loads
+    with pytest.raises(ValueError, match="store_text=True"):
+        plain.get_text("x")
+    plain.close()
+
+    # The opt-in DB can still read it back afterwards.
+    again = _open(tmp_path, store_text=True)
+    assert again.get_text("x") == "body for later"
+    again.close()
+
+
+def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
+    """Enabling text storage keeps snapshot/journal/telemetry/audit payload-free."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add(_SECRET, id="s", metadata={"topic": "x"})
+    db.search("body", k=3)
+    db.persist()
+
+    # Redacted JSON snapshot and journal deltas carry no raw text.
+    json_path = glob.glob(str(Path(tmp_path) / "*.json"))[0]
+    assert _SECRET not in Path(json_path).read_text(encoding="utf-8")
+    for jsd in glob.glob(str(Path(tmp_path) / "**" / "*.jsd"), recursive=True):
+        assert _SECRET not in Path(jsd).read_bytes().decode("utf-8", "replace")
+
+    # Telemetry and audit events carry no raw text.
+    engine = db._engine
+    assert _SECRET not in json.dumps([dict(m) for m in engine.metrics])
+    assert _SECRET not in json.dumps([dict(a) for a in engine.audit_events])
+
+    # stats stays payload-free and still reports raw_payload_text_present False.
+    stats = db.stats()
+    assert stats["raw_payload_text_present"] is False
+    assert _SECRET not in json.dumps(stats)
+
+    # The dedicated sidecar (and only it) holds the text.
+    tvtext = glob.glob(str(Path(tmp_path) / "*.tvtext"))[0]
+    assert _SECRET in Path(tvtext).read_text(encoding="utf-8")
+    db.close()
+
+
+def test_snapshot_auditor_still_passes_with_text_storage(tmp_path):
+    """The redacted-snapshot auditor passes (it never inspects the text sidecar)."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add(_SECRET, id="s")
+    db.persist()
+    db.close()
+
+    report = audit_persisted_index_snapshots(tmp_path)
+    assert report["status"] == "passed"
+    assert report["raw_document_text_present"] is False
+    assert report["snapshot_count"] == 1
+
+
+def test_corrupt_text_sidecar_fails_closed(tmp_path):
+    """A garbled .tvtext sidecar raises on reopen instead of serving partial text."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("body that will be corrupted", id="c")
+    db.persist()
+    db.close()
+
+    sidecars = glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    assert sidecars, "expected a .tvtext sidecar"
+    Path(sidecars[0]).write_text("not-valid-json {{{", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        _open(tmp_path, store_text=True)
+
+
+def test_text_store_checksum_mismatch_fails_closed(tmp_path):
+    """A tampered (but valid-JSON) sidecar body fails the checksum guard."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add("checksum target body", id="c")
+    db.persist()
+    db.close()
+
+    sidecar = Path(glob.glob(str(Path(tmp_path) / "*.tvtext"))[0])
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    # Mutate the body without updating the recorded checksum.
+    payload["body"]["documents"]["c"] = "tampered body"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    # The store binds to the base `.json` path; its sidecar is `<stem>.tvtext`.
+    base_path = sidecar.with_suffix(".json")
+    store = DocumentTextStore(base_path)
+    assert store.sidecar_path == sidecar
+    with pytest.raises(RuntimeError, match="checksum"):
+        store.load()

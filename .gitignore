@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Environments
+.venv/
+venv/
+.env
+
+# uv
+# (uv.lock IS committed for reproducible builds)
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Rust / maturin build artifacts for the vendored TurboVec crate
+third_party/turbovec/target/
+
+# Local LodeDB data dirs created by examples/benchmarks
+*.tvim
+*.tvd
+*.jsd
+*.tvtext
+/data/
+/.lodedb/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.claude/

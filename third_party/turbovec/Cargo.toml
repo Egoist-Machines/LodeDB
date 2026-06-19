@@ -1,0 +1,12 @@
+[workspace]
+members = ["turbovec", "turbovec-python"]
+# Standalone smoke test crate that lives outside the workspace on purpose —
+# it must mimic a real downstream `cargo add turbovec` user (no inherited
+# workspace settings, no shared lockfile).
+exclude = ["examples/downstream-smoke"]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

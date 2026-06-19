@@ -1,0 +1,13 @@
+__pycache__/
+.cache/
+.venv/
+*.pyc
+*.bak
+*.so
+*.dSYM/
+*.tq
+*.npy
+codebooks.npz
+target/
+evolve/
+evolve_rust/

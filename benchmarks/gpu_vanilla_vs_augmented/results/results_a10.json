@@ -1,0 +1,660 @@
+{
+  "axes": {
+    "memory": [
+      {
+        "augmented_fp16_resident_bytes_per_vector": 3072,
+        "augmented_fp16_resident_total_mb": 307.2,
+        "augmented_resident_vs_vanilla_x": 8.0,
+        "bit_width": 2,
+        "compression_vs_fp32_x": 16.0,
+        "dim": 1536,
+        "fp32_bytes_per_vector": 6144,
+        "fp32_total_mb": 614.4,
+        "row_count": 100000,
+        "vanilla_compact_bytes_per_vector": 384,
+        "vanilla_compact_total_mb": 38.4
+      },
+      {
+        "augmented_fp16_resident_bytes_per_vector": 3072,
+        "augmented_fp16_resident_total_mb": 307.2,
+        "augmented_resident_vs_vanilla_x": 4.0,
+        "bit_width": 4,
+        "compression_vs_fp32_x": 8.0,
+        "dim": 1536,
+        "fp32_bytes_per_vector": 6144,
+        "fp32_total_mb": 614.4,
+        "row_count": 100000,
+        "vanilla_compact_bytes_per_vector": 768,
+        "vanilla_compact_total_mb": 76.8
+      },
+      {
+        "augmented_fp16_resident_bytes_per_vector": 6144,
+        "augmented_fp16_resident_total_mb": 614.4,
+        "augmented_resident_vs_vanilla_x": 8.0,
+        "bit_width": 2,
+        "compression_vs_fp32_x": 16.0,
+        "dim": 3072,
+        "fp32_bytes_per_vector": 12288,
+        "fp32_total_mb": 1228.8,
+        "row_count": 100000,
+        "vanilla_compact_bytes_per_vector": 768,
+        "vanilla_compact_total_mb": 76.8
+      },
+      {
+        "augmented_fp16_resident_bytes_per_vector": 6144,
+        "augmented_fp16_resident_total_mb": 614.4,
+        "augmented_resident_vs_vanilla_x": 4.0,
+        "bit_width": 4,
+        "compression_vs_fp32_x": 8.0,
+        "dim": 3072,
+        "fp32_bytes_per_vector": 12288,
+        "fp32_total_mb": 1228.8,
+        "row_count": 100000,
+        "vanilla_compact_bytes_per_vector": 1536,
+        "vanilla_compact_total_mb": 153.6
+      }
+    ],
+    "recall": [
+      {
+        "augmented": {
+          "1": 0.887,
+          "16": 1.0,
+          "2": 0.969,
+          "32": 1.0,
+          "4": 0.995,
+          "64": 1.0,
+          "8": 0.999
+        },
+        "bit_width": 2,
+        "dataset": "openai-1536",
+        "dim": 1536,
+        "vanilla": {
+          "1": 0.884,
+          "16": 1.0,
+          "2": 0.97,
+          "32": 1.0,
+          "4": 0.996,
+          "64": 1.0,
+          "8": 0.999
+        }
+      },
+      {
+        "augmented": {
+          "1": 0.964,
+          "16": 1.0,
+          "2": 0.996,
+          "32": 1.0,
+          "4": 1.0,
+          "64": 1.0,
+          "8": 1.0
+        },
+        "bit_width": 4,
+        "dataset": "openai-1536",
+        "dim": 1536,
+        "vanilla": {
+          "1": 0.964,
+          "16": 1.0,
+          "2": 0.998,
+          "32": 1.0,
+          "4": 1.0,
+          "64": 1.0,
+          "8": 1.0
+        }
+      },
+      {
+        "augmented": {
+          "1": 0.91,
+          "16": 1.0,
+          "2": 0.983,
+          "32": 1.0,
+          "4": 0.999,
+          "64": 1.0,
+          "8": 1.0
+        },
+        "bit_width": 2,
+        "dataset": "openai-3072",
+        "dim": 3072,
+        "vanilla": {
+          "1": 0.911,
+          "16": 1.0,
+          "2": 0.983,
+          "32": 1.0,
+          "4": 0.999,
+          "64": 1.0,
+          "8": 1.0
+        }
+      },
+      {
+        "augmented": {
+          "1": 0.972,
+          "16": 1.0,
+          "2": 0.999,
+          "32": 1.0,
+          "4": 1.0,
+          "64": 1.0,
+          "8": 1.0
+        },
+        "bit_width": 4,
+        "dataset": "openai-3072",
+        "dim": 3072,
+        "vanilla": {
+          "1": 0.978,
+          "16": 1.0,
+          "2": 0.999,
+          "32": 1.0,
+          "4": 1.0,
+          "64": 1.0,
+          "8": 1.0
+        }
+      },
+      {
+        "augmented": {
+          "1": 0.559,
+          "16": 0.971,
+          "2": 0.722,
+          "32": 0.989,
+          "4": 0.836,
+          "64": 0.998,
+          "8": 0.923
+        },
+        "bit_width": 2,
+        "dataset": "glove-200",
+        "dim": 200,
+        "vanilla": {
+          "1": 0.556,
+          "16": 0.967,
+          "2": 0.72,
+          "32": 0.99,
+          "4": 0.833,
+          "64": 0.997,
+          "8": 0.919
+        }
+      },
+      {
+        "augmented": {
+          "1": 0.844,
+          "16": 1.0,
+          "2": 0.961,
+          "32": 1.0,
+          "4": 0.993,
+          "64": 1.0,
+          "8": 1.0
+        },
+        "bit_width": 4,
+        "dataset": "glove-200",
+        "dim": 200,
+        "vanilla": {
+          "1": 0.834,
+          "16": 1.0,
+          "2": 0.955,
+          "32": 1.0,
+          "4": 0.992,
+          "64": 1.0,
+          "8": 1.0
+        }
+      }
+    ],
+    "speed_batch": [
+      {
+        "augmented": {
+          "batch_size": 1,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1381.6138409999894,
+          "k": 64,
+          "ms_per_query": 3.826750449998599,
+          "pass_ms_median": 3826.750449998599,
+          "queries_per_sec": 261.3183203520277,
+          "query_count": 1000
+        },
+        "batch_size": 1,
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.1176939910000101,
+          "pass_ms_median": 117.6939910000101,
+          "queries_per_sec": 8496.610502399517,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 16,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1403.180400999986,
+          "k": 64,
+          "ms_per_query": 0.28319905900013964,
+          "pass_ms_median": 283.19905900013964,
+          "queries_per_sec": 3531.08517920431,
+          "query_count": 1000
+        },
+        "batch_size": 16,
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.1176939910000101,
+          "pass_ms_median": 117.6939910000101,
+          "queries_per_sec": 8496.610502399517,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1382.666707999988,
+          "k": 64,
+          "ms_per_query": 0.08723436199977641,
+          "pass_ms_median": 87.23436199977641,
+          "queries_per_sec": 11463.372655864247,
+          "query_count": 1000
+        },
+        "batch_size": 64,
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.1176939910000101,
+          "pass_ms_median": 117.6939910000101,
+          "queries_per_sec": 8496.610502399517,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 256,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1380.5281429999923,
+          "k": 64,
+          "ms_per_query": 0.05000579199997901,
+          "pass_ms_median": 50.00579199997901,
+          "queries_per_sec": 19997.68346835542,
+          "query_count": 1000
+        },
+        "batch_size": 256,
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.1176939910000101,
+          "pass_ms_median": 117.6939910000101,
+          "queries_per_sec": 8496.610502399517,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 1024,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1399.4744230000151,
+          "k": 64,
+          "ms_per_query": 0.04160317000003033,
+          "pass_ms_median": 41.60317000003033,
+          "queries_per_sec": 24036.629901021268,
+          "query_count": 1000
+        },
+        "batch_size": 1024,
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.1176939910000101,
+          "pass_ms_median": 117.6939910000101,
+          "queries_per_sec": 8496.610502399517,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      }
+    ],
+    "speed_parity": [
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1632.5362620000305,
+          "k": 64,
+          "ms_per_query": 0.08826641400003155,
+          "pass_ms_median": 88.26641400003155,
+          "queries_per_sec": 11329.337566604243,
+          "query_count": 1000
+        },
+        "bit_width": 2,
+        "dim": 1536,
+        "k": 64,
+        "n": 100000,
+        "queries": 1000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.07117257400000199,
+          "pass_ms_median": 71.17257400000199,
+          "queries_per_sec": 14050.355969983215,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        },
+        "vanilla_st": {
+          "k": 64,
+          "ms_per_query": 1.3533013800000049,
+          "pass_ms_median": 1353.3013800000049,
+          "queries_per_sec": 738.9337030011721,
+          "query_count": 1000,
+          "rayon_num_threads": "1"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1378.4993440000335,
+          "k": 64,
+          "ms_per_query": 0.08706624699993881,
+          "pass_ms_median": 87.06624699993881,
+          "queries_per_sec": 11485.507121958557,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 1536,
+        "k": 64,
+        "n": 100000,
+        "queries": 1000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.11873447599998599,
+          "pass_ms_median": 118.73447599998599,
+          "queries_per_sec": 8422.153646428002,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        },
+        "vanilla_st": {
+          "k": 64,
+          "ms_per_query": 2.486414212999989,
+          "pass_ms_median": 2486.414212999989,
+          "queries_per_sec": 402.1856031756863,
+          "query_count": 1000,
+          "rayon_num_threads": "1"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 614400000,
+          "gpu_resident_upload_build_ms": 2684.184191999975,
+          "k": 64,
+          "ms_per_query": 0.1789072329999044,
+          "pass_ms_median": 178.9072329999044,
+          "queries_per_sec": 5589.488939223236,
+          "query_count": 1000
+        },
+        "bit_width": 2,
+        "dim": 3072,
+        "k": 64,
+        "n": 100000,
+        "queries": 1000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.21414150099997187,
+          "pass_ms_median": 214.14150099997187,
+          "queries_per_sec": 4669.80942661895,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        },
+        "vanilla_st": {
+          "k": 64,
+          "ms_per_query": 2.6862171249999847,
+          "pass_ms_median": 2686.2171249999847,
+          "queries_per_sec": 372.2707262541205,
+          "query_count": 1000,
+          "rayon_num_threads": "1"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 614400000,
+          "gpu_resident_upload_build_ms": 2836.106748999896,
+          "k": 64,
+          "ms_per_query": 0.17828212200015514,
+          "pass_ms_median": 178.28212200015514,
+          "queries_per_sec": 5609.087376686765,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 3072,
+        "k": 64,
+        "n": 100000,
+        "queries": 1000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.35393985500002145,
+          "pass_ms_median": 353.93985500002145,
+          "queries_per_sec": 2825.338785314074,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        },
+        "vanilla_st": {
+          "k": 64,
+          "ms_per_query": 5.123855590999994,
+          "pass_ms_median": 5123.855590999994,
+          "queries_per_sec": 195.16553154942363,
+          "query_count": 1000,
+          "rayon_num_threads": "1"
+        }
+      }
+    ],
+    "speed_scaling": [
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 307200000,
+          "gpu_resident_upload_build_ms": 1403.868934000002,
+          "k": 64,
+          "ms_per_query": 0.08671305900008974,
+          "pass_ms_median": 86.71305900008974,
+          "queries_per_sec": 11532.288348851413,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 100000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.12418937300003563,
+          "pass_ms_median": 124.18937300003563,
+          "queries_per_sec": 8052.218767540707,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 768000000,
+          "gpu_resident_upload_build_ms": 3486.0363940000525,
+          "k": 64,
+          "ms_per_query": 0.1954137890000993,
+          "pass_ms_median": 195.4137890000993,
+          "queries_per_sec": 5117.346145923672,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 250000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.28143709599999056,
+          "pass_ms_median": 281.43709599999056,
+          "queries_per_sec": 3553.191864941761,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 1536000000,
+          "gpu_resident_upload_build_ms": 7409.367411999938,
+          "k": 64,
+          "ms_per_query": 0.3803204609999966,
+          "pass_ms_median": 380.3204609999966,
+          "queries_per_sec": 2629.3615583306964,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 500000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 0.44374819999995907,
+          "pass_ms_median": 443.74819999995907,
+          "queries_per_sec": 2253.5302678412945,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      },
+      {
+        "augmented": {
+          "batch_size": 64,
+          "gpu_resident_bytes": 3072000000,
+          "gpu_resident_upload_build_ms": 14754.380545000004,
+          "k": 64,
+          "ms_per_query": 0.7446029890001,
+          "pass_ms_median": 744.6029890001,
+          "queries_per_sec": 1342.997563497379,
+          "query_count": 1000
+        },
+        "bit_width": 4,
+        "dim": 1536,
+        "n": 1000000,
+        "vanilla_mt": {
+          "k": 64,
+          "ms_per_query": 1.5094121980000637,
+          "pass_ms_median": 1509.4121980000637,
+          "queries_per_sec": 662.509552609272,
+          "query_count": 1000,
+          "rayon_num_threads": "32"
+        }
+      }
+    ],
+    "update": [
+      {
+        "augmented_apply_upsert_ms": 24.3940800000928,
+        "augmented_delta_bytes": 772000,
+        "augmented_delta_export_ms": 0.24534400006359647,
+        "bit_width": 4,
+        "dim": 1536,
+        "persist_speedup_x": 172.8737975618252,
+        "row_count": 100000,
+        "update_count": 1000,
+        "vanilla_apply_ms": 22.30519199997616,
+        "vanilla_full_write_bytes": 78012306,
+        "vanilla_full_write_ms": 42.413549000002604
+      },
+      {
+        "augmented_apply_upsert_ms": 26.752277000014146,
+        "augmented_delta_bytes": 772000,
+        "augmented_delta_export_ms": 0.2436089999946489,
+        "bit_width": 4,
+        "dim": 1536,
+        "persist_speedup_x": 781.7174447750479,
+        "row_count": 500000,
+        "update_count": 1000,
+        "vanilla_apply_ms": 16.329948000020522,
+        "vanilla_full_write_bytes": 390012306,
+        "vanilla_full_write_ms": 190.4334050000216
+      },
+      {
+        "augmented_apply_upsert_ms": 17.36018700000841,
+        "augmented_delta_bytes": 772000,
+        "augmented_delta_export_ms": 0.3096020000157296,
+        "bit_width": 4,
+        "dim": 1536,
+        "persist_speedup_x": 1307.739226424423,
+        "row_count": 1000000,
+        "update_count": 1000,
+        "vanilla_apply_ms": 27.214866000008442,
+        "vanilla_full_write_bytes": 780012306,
+        "vanilla_full_write_ms": 404.87868000002436
+      }
+    ]
+  },
+  "machine": {
+    "cpu_count": 32,
+    "machine": "x86_64",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.35",
+    "python": "3.11.9",
+    "rayon_num_threads": "default(all)",
+    "turbovec_native_backend": "avx512bw",
+    "turbovec_native_used": true
+  },
+  "spec": {
+    "batch_size": 64,
+    "batch_sweep_n": 100000,
+    "batch_sweep_sizes": [
+      1,
+      16,
+      64,
+      256,
+      1024
+    ],
+    "bit_widths": [
+      2,
+      4
+    ],
+    "datasets": [
+      {
+        "bit_widths": [
+          2,
+          4
+        ],
+        "dim": 1536,
+        "name": "openai-1536",
+        "queries_path": "/root/data/openai-1536-queries.npy",
+        "vectors_path": "/root/data/openai-1536-corpus.npy"
+      },
+      {
+        "bit_widths": [
+          2,
+          4
+        ],
+        "dim": 3072,
+        "name": "openai-3072",
+        "queries_path": "/root/data/openai-3072-queries.npy",
+        "vectors_path": "/root/data/openai-3072-corpus.npy"
+      }
+    ],
+    "dims": [
+      1536,
+      3072
+    ],
+    "include_gpu": true,
+    "k": 64,
+    "parity_n": 100000,
+    "queries": 1000,
+    "repeats": 5,
+    "scaling_bit": 4,
+    "scaling_dim": 1536,
+    "scaling_ns": [
+      100000,
+      250000,
+      500000,
+      1000000
+    ],
+    "seed": 0,
+    "update_count": 1000,
+    "update_ns": [
+      100000,
+      500000,
+      1000000
+    ]
+  },
+  "wall_seconds": 684.571846166
+}

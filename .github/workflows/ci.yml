@@ -1,0 +1,76 @@
+name: ci
+
+# Builds the vendored TurboVec crate from source and runs the lean local suite on
+# the platforms LodeDB targets.
+# The crate links a CBLAS provider — OpenBLAS on Linux, the Accelerate framework
+# on macOS. Windows falls through to TurboVec's pure-Rust matrixmultiply path.
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS (Linux CBLAS provider for the vendored TurboVec crate)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync (lean runtime + dev/mcp/langchain extras)
+        run: uv sync --extra dev --extra mcp --extra langchain
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest -q
+
+  # Builds the package in a clean environment and asserts the *patched* TurboVec core is
+  # what got built — not the stock PyPI `turbovec`, which lacks the delta-persistence and
+  # reconstruction APIs. This is the guard for the vendored-dependency install story.
+  smoke:
+    name: patched-core smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS (Linux CBLAS provider for the vendored TurboVec crate)
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync (builds the vendored TurboVec core)
+        run: uv sync
+
+      - name: Assert the patched TurboVec core is present
+        run: |
+          uv run python - <<'PY'
+          from lodedb import local_capability_report
+          b = local_capability_report()["compact_backend"]
+          assert b["available"], f"TurboVec backend unavailable: {b}"
+          assert b["delta_persistence_available"], (
+              "delta persistence missing — stock PyPI turbovec built instead of the patched core?"
+          )
+          assert b["reconstruction_available"], (
+              "exact reconstruction missing — stock PyPI turbovec built instead of the patched core?"
+          )
+          print("patched TurboVec core OK:",
+                {k: b.get(k) for k in ("version", "source_tag",
+                                       "delta_persistence_available", "reconstruction_available")})
+          PY
