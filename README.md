@@ -172,6 +172,10 @@ lodedb benchmark   # local, metrics-only benchmark
 - **GPU is Linux/CUDA-only and opt-in** (`[gpu]`). macOS scans on the CPU; the MPS scan is
   experimental and was slower than NEON on the hardware tested.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
+- **Single-writer per path.** One handle holds the database open for writing at a time; a
+  second open waits for it to close, then fails fast (`ConcurrentWriterError`) after
+  `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s). Run one writer (e.g. the MCP server) and let
+  others read once it closes. Local filesystems only.
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec
