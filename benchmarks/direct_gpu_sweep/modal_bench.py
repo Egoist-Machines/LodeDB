@@ -40,17 +40,9 @@ def _build_image() -> modal.Image:
             _CUPY_DEPENDENCY,
             "datasets>=3.0.0",
         )
-        .add_local_dir(
-            str(repo_root / "third_party" / "turbovec"),
-            remote_path="/root/turbovec-src",
-            copy=True,
-            ignore=["**/target/**", "**/__pycache__/**", "**/*.so", "**/*.pyd", "**/*.dylib"],
-        )
         .run_commands(
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
-            "sh -s -- -y --default-toolchain stable --profile minimal",
-            'PATH="$HOME/.cargo/bin:$PATH" python -m pip install '
-            "--no-deps /root/turbovec-src/turbovec-python",
+            "sh -s -- -y --default-toolchain stable --profile minimal"
         )
         .add_local_file(
             str(repo_root / "pyproject.toml"),
@@ -66,13 +58,28 @@ def _build_image() -> modal.Image:
         .add_local_file(
             str(repo_root / "NOTICE"), remote_path="/root/lodedb-src/NOTICE", copy=True
         )
+        # LodeDB's build backend is maturin: it compiles the vendored crate
+        # third_party/turbovec into the lodedb._turbovec extension, and
+        # turbovec-python depends on the sibling turbovec core via path = "../turbovec".
+        # So the full workspace must live under the build dir (/root/lodedb-src),
+        # exactly as `uv sync` sees it locally and in CI — otherwise maturin errors
+        # with "manifest path third_party/turbovec/turbovec-python/Cargo.toml does not exist".
+        .add_local_dir(
+            str(repo_root / "third_party" / "turbovec"),
+            remote_path="/root/lodedb-src/third_party/turbovec",
+            copy=True,
+            ignore=["**/target/**", "**/__pycache__/**", "**/*.so", "**/*.pyd", "**/*.dylib"],
+        )
         .add_local_dir(
             str(repo_root / "src"),
             remote_path="/root/lodedb-src/src",
             copy=True,
             ignore=["**/*.so", "**/*.pyd", "**/*.dylib", "**/__pycache__/**", "**/*.pyc"],
         )
-        .run_commands("python -m pip install --no-deps /root/lodedb-src")
+        # One build, as CI does: LodeDB plus the bundled lodedb._turbovec extension.
+        .run_commands(
+            'PATH="$HOME/.cargo/bin:$PATH" python -m pip install --no-deps /root/lodedb-src'
+        )
         .env({"PYTHONPATH": _REMOTE_BENCH_DIR})
     )
     return image.add_local_dir(

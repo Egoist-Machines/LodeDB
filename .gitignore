@@ -33,6 +33,8 @@ third_party/turbovec/target/
 /data/
 /.lodedb/
 
+/benchmarks/gpu_patch/
+
 # OS / editor
 .DS_Store
 .idea/
