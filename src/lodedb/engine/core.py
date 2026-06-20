@@ -52,11 +52,16 @@ from lodedb.engine.route_registry import (
 )
 from lodedb.engine.runtime_policy import (
     GpuDirectTurboVecPolicy,
+    MpsDirectTurboVecPolicy,
     TvimDeltaPersistencePolicy,
     gpu_direct_turbovec_max_batch_from_env,
     gpu_direct_turbovec_policy_from_env,
     gpu_direct_turbovec_should_use,
     gpu_memory_budget_bytes_from_env,
+    mps_direct_turbovec_max_batch_from_env,
+    mps_direct_turbovec_policy_from_env,
+    mps_direct_turbovec_should_use,
+    mps_memory_budget_bytes_from_env,
     tvim_delta_persistence_policy_from_env,
 )
 from lodedb.engine.state_journal_store import StateJournalStore
@@ -78,6 +83,7 @@ from lodedb.engine.turbovec_index import (
 # type-only import below keeps annotations precise with no runtime dependency.
 if TYPE_CHECKING:
     from lodedb.engine.gpu_turbovec import GpuDirectTurboVecSession
+    from lodedb.engine.mps_turbovec import MpsDirectTurboVecSession
 
 DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
 # Cap on the per-index in-memory query-latency ring. Latency samples are
@@ -359,6 +365,9 @@ class LodeEngine:
         tvim_delta_persistence_policy: TvimDeltaPersistencePolicy | None = None,
         gpu_direct_turbovec_policy: GpuDirectTurboVecPolicy | None = None,
         gpu_direct_turbovec_max_batch: int | None = None,
+        mps_direct_turbovec_policy: MpsDirectTurboVecPolicy | None = None,
+        mps_direct_turbovec_max_batch: int | None = None,
+        mps_memory_budget_bytes: int | None = None,
     ) -> None:
         """Initializes engine state and optionally loads local persisted indexes."""
 
@@ -408,6 +417,24 @@ class LodeEngine:
             else gpu_direct_turbovec_max_batch_from_env()
         )
         self._gpu_direct_turbovec_sessions: dict[str, GpuDirectTurboVecSession] = {}
+        # Opt-in Apple-GPU (MPS) exact scan; OFF by default (NEON is the default
+        # and faster on measured Apple hardware). Mirrors the CUDA policy shape.
+        self.mps_direct_turbovec_policy = (
+            mps_direct_turbovec_policy
+            if mps_direct_turbovec_policy is not None
+            else mps_direct_turbovec_policy_from_env()
+        )
+        self.mps_direct_turbovec_max_batch = (
+            mps_direct_turbovec_max_batch
+            if mps_direct_turbovec_max_batch is not None
+            else mps_direct_turbovec_max_batch_from_env()
+        )
+        self.mps_memory_budget_bytes = (
+            mps_memory_budget_bytes
+            if mps_memory_budget_bytes is not None
+            else mps_memory_budget_bytes_from_env()
+        )
+        self._mps_direct_turbovec_sessions: dict[str, MpsDirectTurboVecSession] = {}
         self._pending_tvim_deltas: dict[str, dict[str, tuple[int, ...]]] = {}
         self._pending_state_journal_documents: dict[str, dict[str, dict[str, None]]] = {}
         self._turbovec_drift_telemetry: dict[str, dict[str, float]] = {}
@@ -2043,6 +2070,122 @@ class LodeEngine:
             "gpu_resident_upload_build_ms": float(session.upload_build_ms),
         }
 
+    def _try_query_mps_direct_turbovec_batch(
+        self,
+        state: ClientIndexState,
+        *,
+        serving: TurboVecServingIndex,
+        batch: np.ndarray,
+        top_k: int,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Attempts the opt-in MPS-resident exact batch path for one direct-route batch.
+
+        Same shape as :meth:`_try_query_gpu_direct_turbovec_batch`: returns
+        ``(result, telemetry_fields)`` and falls back to ``None`` (CPU) unless the
+        policy is ``required``. Off by default; NEON stays the default on Apple
+        Silicon. Reuses the ``gpu_*`` telemetry fields, tagged with the MPS backend.
+        """
+
+        from lodedb.engine.gpu_turbovec import turbovec_reconstruction_api_available
+        from lodedb.engine.mps_turbovec import (
+            MPS_DIRECT_TURBOVEC_MAX_TOP_K,
+            MpsDirectTurboVecSession,
+            mps_exact_scan_available,
+        )
+
+        policy = self.mps_direct_turbovec_policy
+        if policy == MpsDirectTurboVecPolicy.OFF:
+            return None, {}
+        mps_ok, mps_reason = mps_exact_scan_available()
+        api_available = turbovec_reconstruction_api_available(serving.index)
+        available = bool(mps_ok and api_available)
+        try:
+            should_use = mps_direct_turbovec_should_use(
+                policy=policy,
+                dependency_available=available,
+                query_batch_size=int(batch.shape[0]),
+                maximum_batch_size=self.mps_direct_turbovec_max_batch,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "MPS direct TurboVec serving is required but unavailable: "
+                + (mps_reason or "the loaded TurboVec backend lacks the reconstruction APIs")
+            ) from exc
+        if not should_use:
+            status = "bypassed"
+            reason = ""
+            if int(batch.shape[0]) < 2:
+                reason = "mps_direct_batch_below_minimum"
+            elif (
+                policy == MpsDirectTurboVecPolicy.AUTO
+                and self.mps_direct_turbovec_max_batch is not None
+                and int(batch.shape[0]) > self.mps_direct_turbovec_max_batch
+            ):
+                reason = "mps_direct_batch_above_window"
+            elif not mps_ok:
+                status = "failed_over"
+                reason = mps_reason or "mps_unavailable"
+            elif not api_available:
+                status = "failed_over"
+                reason = "turbovec_reconstruction_api_unavailable"
+            return None, {"gpu_stage_one_status": status, "gpu_fallback_reason": reason}
+        if int(top_k) > MPS_DIRECT_TURBOVEC_MAX_TOP_K:
+            if policy == MpsDirectTurboVecPolicy.REQUIRED:
+                raise RuntimeError(
+                    "MPS direct TurboVec serving is required but the effective "
+                    f"top_k {int(top_k)} exceeds the MPS limit {MPS_DIRECT_TURBOVEC_MAX_TOP_K}"
+                )
+            return None, {
+                "gpu_stage_one_status": "bypassed",
+                "gpu_fallback_reason": "mps_direct_top_k_exceeds_limit",
+            }
+        session = self._mps_direct_turbovec_sessions.get(state.index_key)
+        if (
+            session is None
+            or session.generation != serving.generation
+            or session.memory_budget_bytes != self.mps_memory_budget_bytes
+        ):
+            try:
+                session = MpsDirectTurboVecSession.build(
+                    index=serving.index,
+                    generation=serving.generation,
+                    memory_budget_bytes=self.mps_memory_budget_bytes,
+                )
+            except MemoryError as exc:
+                if policy == MpsDirectTurboVecPolicy.REQUIRED:
+                    raise RuntimeError(
+                        f"MPS direct TurboVec memory admission rejected: {exc}"
+                    ) from exc
+                return None, {
+                    "gpu_stage_one_status": "memory_rejected",
+                    "gpu_fallback_reason": str(exc),
+                }
+            except RuntimeError as exc:
+                if policy == MpsDirectTurboVecPolicy.REQUIRED:
+                    raise
+                return None, {
+                    "gpu_stage_one_status": "failed_over",
+                    "gpu_fallback_reason": f"mps_direct_build_failed: {exc}",
+                }
+            self._mps_direct_turbovec_sessions[state.index_key] = session
+        try:
+            result = session.search_batch(batch, top_k=int(top_k))
+        except Exception as exc:  # noqa: BLE001 - auto policy must fall back visibly.
+            self._mps_direct_turbovec_sessions.pop(state.index_key, None)
+            if policy == MpsDirectTurboVecPolicy.REQUIRED:
+                raise RuntimeError(
+                    f"MPS direct TurboVec batch search failed: {exc}"
+                ) from exc
+            return None, {
+                "gpu_stage_one_status": "failed_over",
+                "gpu_fallback_reason": f"mps_direct_runtime_error: {exc}",
+            }
+        return result, {
+            "gpu_estimated_bytes": int(session.estimated_mps_bytes),
+            "gpu_budget_bytes": int(self.mps_memory_budget_bytes or 0),
+            "gpu_resident_upload_build_ms": float(session.upload_build_ms),
+        }
+
     def _execute_prepared_query_batch(
         self,
         *,
@@ -2055,6 +2198,7 @@ class LodeEngine:
         """Executes prepared direct-route queries, batching multi-query requests."""
 
         from lodedb.engine.gpu_turbovec import GPU_DIRECT_TURBOVEC_BACKEND
+        from lodedb.engine.mps_turbovec import MPS_DIRECT_TURBOVEC_BACKEND
 
         if len(prepared) > 1:
             # One native call scores the whole batch; per-query widths are
@@ -2100,6 +2244,36 @@ class LodeEngine:
                         ),
                         gpu_stage_one_tile_count=int(gpu_batch.tile_count),
                         **gpu_fields,
+                    )
+                    search_latencies[index] = per_query_ms
+                return
+            mps_batch, mps_fields = self._try_query_mps_direct_turbovec_batch(
+                state,
+                serving=serving,
+                batch=batch,
+                top_k=max(per_query_top_k),
+            )
+            if mps_batch is not None:
+                per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(prepared), 1)
+                for index, width in enumerate(per_query_top_k):
+                    take = min(int(width), mps_batch.stable_ids.shape[1])
+                    query_results[index] = _EngineTurboVecQueryResult(
+                        index=serving,
+                        stable_ids=mps_batch.stable_ids[index, :take].reshape(-1),
+                        scores=mps_batch.scores[index, :take].reshape(-1),
+                        native_used=True,
+                        native_backend=MPS_DIRECT_TURBOVEC_BACKEND,
+                        retrieval_mode="direct_turbovec",
+                        fallback_used=False,
+                        compact_route_fallback=False,
+                        stage_one_backend=MPS_DIRECT_TURBOVEC_BACKEND,
+                        gpu_stage_one_status="used",
+                        gpu_query_count=len(prepared),
+                        gpu_copy_back_bytes=int(mps_batch.copy_back_bytes),
+                        gpu_stage_one_search_ms=float(mps_batch.search_ms),
+                        gpu_device_to_host_copy_ms=float(mps_batch.device_to_host_copy_ms),
+                        gpu_stage_one_tile_count=int(mps_batch.tile_count),
+                        **mps_fields,
                     )
                     search_latencies[index] = per_query_ms
                 return
@@ -2156,6 +2330,7 @@ class LodeEngine:
         # Try to patch the GPU-resident dequantized copy in-place; if it fails,
         # pop it and the next eligible batch lazily re-uploads against the new generation.
         gpu_session = self._gpu_direct_turbovec_sessions.get(state.index_key)
+        mps_session = self._mps_direct_turbovec_sessions.get(state.index_key)
         previous = self._turbovec_indexes.get(state.index_key)
         current_chunk_ids = set(state.chunks)
         generation = self._index_generations.get(state.index_key, 0) + 1
@@ -2284,6 +2459,19 @@ class LodeEngine:
                 # Patch failed (e.g. MemoryError from over-allocation); safely fail closed
                 # and let the next query rebuild the GPU array using safe O(N) allocation
                 self._gpu_direct_turbovec_sessions.pop(state.index_key, None)
+        if mps_session is not None:
+            try:
+                mps_upsert_stable_ids = (
+                    tuple(int(uid) for uid in stable_ids) if new_chunks else ()
+                )
+                mps_session.patch(
+                    index=previous.index,
+                    removed_ids=removed_stable_ids,
+                    upsert_ids=mps_upsert_stable_ids,
+                )
+            except Exception:
+                # Fail closed: drop the resident copy so the next batch rebuilds.
+                self._mps_direct_turbovec_sessions.pop(state.index_key, None)
         self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
             index=previous.index,
             chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
@@ -2399,6 +2587,7 @@ class LodeEngine:
         self._index_generations[client_id_hash] = self._index_generations.get(client_id_hash, 0) + 1
         self._turbovec_indexes.pop(client_id_hash, None)
         self._gpu_direct_turbovec_sessions.pop(client_id_hash, None)
+        self._mps_direct_turbovec_sessions.pop(client_id_hash, None)
 
     def _persist_state(self, state: ClientIndexState) -> None:
         """Commits one index generation atomically via its root commit manifest.

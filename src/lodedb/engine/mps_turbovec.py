@@ -14,18 +14,19 @@ calibrated space, queries are rotated on the host (``q @ rotation.T``), and the
 exact dot product reproduces the CPU kernel's calibrated score *without* its
 uint8 LUT quantization error — so recall is ``>=`` the quantized NEON scan. The
 final ordering is deterministic on the host (descending score, ascending stable
-id on ties).
+id on ties), shared with the CUDA path via :mod:`lodedb.engine.turbovec_resident`.
 
-Resident bytes are fp16 (``rows * dim * 2``) regardless of the index bit width,
-drawn from the shared unified-memory pool. This module performs no GPU-memory
-admission (unlike the CUDA path): on unified memory there is no separate VRAM to
-gate against.
+Resident bytes are fp16 (``capacity * dim * 2``) drawn from the shared
+unified-memory pool. The resident copy is over-allocated 1.5x so small mutations
+patch in place (``patch()``, O(changed) rows) instead of rebuilding. There is no
+separate VRAM to gate against, so admission only rejects when an explicit
+``LODEDB_MPS_MEMORY_BUDGET_BYTES`` is set and exceeded.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any
 
@@ -33,8 +34,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from lodedb.engine.gpu_turbovec import turbovec_reconstruction_api_available
+from lodedb.engine.turbovec_resident import deterministic_topk_order, tile_row_count
 
 MPS_DIRECT_TURBOVEC_BACKEND = "mps_torch_exact_direct"
+# Widened (post-filter) top-k requests fall back to the CPU kernel rather than
+# sorting huge candidate sets on device and copying them back.
+MPS_DIRECT_TURBOVEC_MAX_TOP_K = 4096
 # Each scoring tile's (batch x tile) fp32 score block stays under this budget, so
 # the streaming top-k never materializes the full batch x corpus score matrix.
 _TILE_SCORE_BYTES = 64 << 20
@@ -70,6 +75,45 @@ def mps_exact_scan_available() -> tuple[bool, str]:
 
 
 @dataclass(frozen=True)
+class MpsResidentMemoryEstimate:
+    """Reports raw-payload-free MPS resident memory admission accounting."""
+
+    estimated_bytes: int
+    budget_bytes: int | None
+    admitted: bool
+    reason: str
+
+
+def estimate_mps_direct_turbovec_memory(
+    *,
+    row_count: int,
+    dim: int,
+    max_batch_size: int = 64,
+    memory_budget_bytes: int | None = None,
+) -> MpsResidentMemoryEstimate:
+    """Estimates resident + transient MPS bytes and applies an optional budget.
+
+    Unified memory has no separate pool, so admission only rejects when
+    ``memory_budget_bytes`` is set and the estimate exceeds it; otherwise it
+    admits (the estimate is still reported for telemetry).
+    """
+
+    capacity = max(int(row_count * 1.5), 1024)
+    resident = capacity * dim * 2  # fp16 resident rows
+    transient = _TILE_SCORE_BYTES + _TILE_TRANSIENT_BYTES + max(max_batch_size, 1) * dim * 4
+    estimated = int(resident + transient)
+    if memory_budget_bytes is None:
+        return MpsResidentMemoryEstimate(estimated, None, True, "")
+    admitted = estimated <= int(memory_budget_bytes)
+    reason = (
+        ""
+        if admitted
+        else f"estimated {estimated} bytes exceeds MPS budget {int(memory_budget_bytes)} bytes"
+    )
+    return MpsResidentMemoryEstimate(estimated, int(memory_budget_bytes), admitted, reason)
+
+
+@dataclass(frozen=True)
 class MpsDirectTurboVecBatchResult:
     """Carries one MPS batch's stable-id top-k plus raw-payload-free telemetry."""
 
@@ -78,6 +122,7 @@ class MpsDirectTurboVecBatchResult:
     search_ms: float
     device_to_host_copy_ms: float
     tile_count: int
+    copy_back_bytes: int
 
 
 @dataclass
@@ -91,13 +136,25 @@ class MpsDirectTurboVecSession:
     device_rows: Any  # torch.Tensor (fp16) resident on the mps device
     resident_bytes: int
     upload_build_ms: float
+    generation: int = 0
+    id_to_slot: dict[int, int] = field(default_factory=dict)
+    memory_budget_bytes: int | None = None
+    estimated_mps_bytes: int = 0
 
     @classmethod
-    def build(cls, *, index: Any) -> MpsDirectTurboVecSession:
+    def build(
+        cls,
+        *,
+        index: Any,
+        generation: int = 0,
+        memory_budget_bytes: int | None = None,
+        max_batch_size: int = 64,
+    ) -> MpsDirectTurboVecSession:
         """Reconstructs all rows once and uploads the fp16 matrix to the Apple GPU.
 
         Raises ``RuntimeError`` when MPS or the patched reconstruction APIs are
-        missing, so callers can fall back to the CPU scan visibly.
+        missing and ``MemoryError`` when an explicit budget rejects the resident
+        estimate, so callers can fall back to the CPU scan visibly.
         """
 
         available, reason = mps_exact_scan_available()
@@ -114,6 +171,16 @@ class MpsDirectTurboVecSession:
         index_dim = int(index.dim or 0)
         if row_count <= 0 or index_dim <= 0:
             raise RuntimeError("MPS direct TurboVec serving requires a non-empty index")
+        # Admission runs BEFORE the (expensive) full-row reconstruction so a
+        # rejecting budget falls back without decoding the whole corpus.
+        admission = estimate_mps_direct_turbovec_memory(
+            row_count=row_count,
+            dim=index_dim,
+            max_batch_size=max_batch_size,
+            memory_budget_bytes=memory_budget_bytes,
+        )
+        if not admission.admitted:
+            raise MemoryError(admission.reason)
         ids, rows = index.reconstruct_all()
         ids = np.ascontiguousarray(ids, dtype=np.uint64)
         rows = np.ascontiguousarray(rows, dtype=np.float32)
@@ -123,17 +190,91 @@ class MpsDirectTurboVecSession:
         if rotation is None:
             raise RuntimeError("TurboVec rotation matrix is unavailable before first add")
         rotation = np.ascontiguousarray(rotation, dtype=np.float32)
-        device_rows = torch.from_numpy(rows).to(device="mps", dtype=torch.float16)
+
+        # Over-allocate 1.5x so small adds patch in place instead of rebuilding.
+        capacity = max(int(rows.shape[0] * 1.5), 1024)
+        ids_alloc = np.empty(capacity, dtype=np.uint64)
+        if rows.shape[0] > 0:
+            ids_alloc[: rows.shape[0]] = ids
+        id_to_slot = {int(uid): slot for slot, uid in enumerate(ids_alloc[: rows.shape[0]])}
+
+        device_rows = torch.empty(
+            (capacity, int(rotation.shape[0])), dtype=torch.float16, device="mps"
+        )
+        if rows.shape[0] > 0:
+            device_rows[: rows.shape[0]] = torch.from_numpy(rows).to(
+                device="mps", dtype=torch.float16
+            )
         torch.mps.synchronize()
         return cls(
             dim=int(rotation.shape[0]),
             row_count=int(rows.shape[0]),
-            stable_ids=ids,
+            stable_ids=ids_alloc,
             rotation=rotation,
             device_rows=device_rows,
-            resident_bytes=int(rows.shape[0]) * int(rows.shape[1]) * 2,
+            resident_bytes=capacity * int(rotation.shape[0]) * 2,
             upload_build_ms=float((time.perf_counter() - started) * 1000.0),
+            generation=int(generation),
+            id_to_slot=id_to_slot,
+            memory_budget_bytes=memory_budget_bytes,
+            estimated_mps_bytes=int(admission.estimated_bytes),
         )
+
+    def patch(
+        self,
+        index: Any,
+        removed_ids: tuple[int, ...],
+        upsert_ids: tuple[int, ...],
+    ) -> None:
+        """Applies incremental mutations in-place to avoid a full O(N) rebuild.
+
+        Mirrors the CUDA path: swap-remove to match the CPU IdMapIndex slots, then
+        a batched upsert into over-allocated capacity, all in O(changed) rows.
+        Raises ``MemoryError`` if the upsert would exceed capacity, so the caller
+        evicts the session and the next batch rebuilds.
+        """
+
+        torch = import_module("torch")
+        if removed_ids:
+            for id_to_remove in removed_ids:
+                uid = int(id_to_remove)
+                slot = self.id_to_slot.get(uid)
+                if slot is not None:
+                    last = self.row_count - 1
+                    if slot != last:
+                        last_uid = int(self.stable_ids[last])
+                        self.stable_ids[slot] = last_uid
+                        # Clone the source row first to match CUDA's element
+                        # assignment exactly and avoid any aliasing on-device.
+                        self.device_rows[slot] = self.device_rows[last].clone()
+                        self.id_to_slot[last_uid] = slot
+                    del self.id_to_slot[uid]
+                    self.row_count -= 1
+
+        if upsert_ids:
+            upsert_arr = np.asarray(upsert_ids, dtype=np.uint64)
+            upsert_rows = np.ascontiguousarray(index.reconstruct_rows(upsert_arr), dtype=np.float32)
+            upsert_rows_fp16 = torch.from_numpy(upsert_rows).to(
+                device=self.device_rows.device, dtype=torch.float16
+            )
+            target_slots: list[int] = []
+            for target_id in upsert_ids:
+                uid = int(target_id)
+                slot = self.id_to_slot.get(uid)
+                if slot is None:
+                    if self.row_count >= self.device_rows.shape[0]:
+                        raise MemoryError("MPS resident memory capacity exceeded during patch")
+                    slot = self.row_count
+                    self.stable_ids[slot] = np.uint64(uid)
+                    self.id_to_slot[uid] = slot
+                    self.row_count += 1
+                target_slots.append(slot)
+            if target_slots:
+                slot_index = torch.tensor(
+                    target_slots, device=self.device_rows.device, dtype=torch.long
+                )
+                self.device_rows[slot_index] = upsert_rows_fp16
+            torch.mps.synchronize()
 
     def search_batch(
         self,
@@ -164,15 +305,19 @@ class MpsDirectTurboVecSession:
                 search_ms=float((time.perf_counter() - started) * 1000.0),
                 device_to_host_copy_ms=0.0,
                 tile_count=0,
+                copy_back_bytes=0,
             )
         rotated = np.ascontiguousarray(
             np.asarray(query_matrix, dtype=np.float32) @ self.rotation.T
         )
         rows = self.device_rows
         queries = torch.from_numpy(rotated).to(device=rows.device, dtype=torch.float32)
-        score_tile = max(1, _TILE_SCORE_BYTES // max(batch_size * 4, 1))
-        cast_tile = max(1, _TILE_TRANSIENT_BYTES // max(self.dim * 4, 1))
-        tile_rows = max(1, min(score_tile, cast_tile))
+        tile_rows = tile_row_count(
+            batch_size=batch_size,
+            dim=self.dim,
+            score_tile_bytes=_TILE_SCORE_BYTES,
+            transient_bytes=_TILE_TRANSIENT_BYTES,
+        )
         running_scores: Any | None = None
         running_slots: Any | None = None
         tile_count = 0
@@ -201,15 +346,14 @@ class MpsDirectTurboVecSession:
         host_slots = running_slots.to(device="cpu", dtype=torch.int64).numpy()
         host_scores = running_scores.to(device="cpu", dtype=torch.float32).numpy()
         device_to_host_copy_ms = float((time.perf_counter() - copy_started) * 1000.0)
-        stable = self.stable_ids[host_slots]
-        # Deterministic final ordering: descending score, ascending stable id on ties.
-        order = np.lexsort((stable, -host_scores), axis=1)
-        ordered_scores = np.take_along_axis(host_scores, order, axis=1)
-        ordered_ids = np.take_along_axis(stable, order, axis=1)
+        ordered_ids, ordered_scores = deterministic_topk_order(
+            host_slots, host_scores, self.stable_ids
+        )
         return MpsDirectTurboVecBatchResult(
-            stable_ids=np.ascontiguousarray(ordered_ids, dtype=np.uint64),
-            scores=np.ascontiguousarray(ordered_scores, dtype=np.float32),
+            stable_ids=ordered_ids,
+            scores=ordered_scores,
             search_ms=float((time.perf_counter() - started) * 1000.0),
             device_to_host_copy_ms=device_to_host_copy_ms,
             tile_count=tile_count,
+            copy_back_bytes=int(host_slots.nbytes + host_scores.nbytes),
         )

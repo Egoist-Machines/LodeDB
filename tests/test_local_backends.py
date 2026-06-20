@@ -60,6 +60,13 @@ def test_doctor_report_is_honest_about_gpu_scan():
     text = format_capability_report(report)
     assert "TurboVec" in text
     assert "CUDA/CuPy only" in text
+    # The opt-in MPS scan is reported and is never the default.
+    mps_scan = report["mps_vector_scan"]
+    assert mps_scan["opt_in"] is True
+    assert mps_scan["default_enabled"] is False
+    assert "opt-in" in text
+    if is_apple_silicon():
+        assert mps_scan["mps_exact_scan_available"] is True
 
 
 def test_doctor_report_is_honest_about_patched_core():
