@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes yet._
 
+## [0.1.1] - 2026-06-20
+
+### Changed
+
+- **GPU (`[gpu]`) resident copy now patches in place on small mutations** instead of
+  rebuilding the whole dequantized array. Adds and removes apply in O(changed) rows
+  (swap-remove + batched upsert) with a fail-closed rebuild fallback, so syncing a small
+  delta into a large GPU-resident index is dramatically cheaper — e.g. ~560× faster at
+  1,000 changed rows over a 1M-row corpus on an A10 — with identical top-k results.
+
+### Fixed
+
+- **GPU memory admission** now accounts for the 1.5× resident over-allocation, so it no
+  longer under-counts the device memory an index will occupy.
+
 ## [0.1.0] - 2026-06-19
 
 First public release.
@@ -43,5 +58,6 @@ First public release.
 - LodeDB is licensed under Apache-2.0. The vendored TurboVec core
   (`third_party/turbovec/`) is MIT — see [`NOTICE`](NOTICE).
 
-[Unreleased]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Egoist-Machines/LodeDB/releases/tag/v0.1.0
