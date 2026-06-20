@@ -83,6 +83,10 @@ for score, doc_id, meta in db.search("fox", k=5):
 for hits in db.search_many(["fox", "dog"], k=5):   # batched; the GPU can serve this
     print([(h.score, h.id, h.metadata) for h in hits])
 
+# filter by metadata: exact match, plus $gt/$gte/$lt/$lte/$in/$nin/$exists and $and/$or/$not
+db.search("fox", k=5, filter={"topic": "animals"})                      # bare scalar = exact
+db.search("fox", k=5, filter={"$or": [{"topic": "animals"}, {"year": {"$gte": 2020}}]})
+
 db.get(fox)     # -> "the quick brown fox jumps"  (text retained by default)
 db.persist()    # durable .tvim/.tvd/.jsd snapshot; replays on reopen
 ```

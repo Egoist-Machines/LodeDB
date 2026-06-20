@@ -145,6 +145,141 @@ def test_numeric_and_bool_metadata_is_coerced_and_matchable(tmp_path):
     db.close()
 
 
+def _filter_corpus(tmp_path):
+    """Opens a DB with a small year/topic corpus for predicate-filter tests."""
+
+    db = _open(tmp_path)
+    db.add("doc one", id="d2018", metadata={"year": 2018, "topic": "a"})
+    db.add("doc two", id="d2020", metadata={"year": 2020, "topic": "b"})
+    db.add("doc three", id="d2021", metadata={"year": 2021, "topic": "a"})
+    db.add("doc four", id="d2023", metadata={"year": 2023, "topic": "b"})
+    db.add("doc five", id="dnone")  # no metadata at all
+    return db
+
+
+def _ids(db, query="doc", **kwargs):
+    return {hit.id for hit in db.search(query, k=50, **kwargs)}
+
+
+def test_filter_comparison_operators_end_to_end(tmp_path):
+    """Range, IN, and exists predicates filter through the full SDK/engine stack."""
+
+    db = _filter_corpus(tmp_path)
+    assert _ids(db, filter={"year": {"$gte": 2020, "$lt": 2023}}) == {"d2020", "d2021"}
+    assert _ids(db, filter={"year": {"$in": [2018, 2023]}}) == {"d2018", "d2023"}
+    assert _ids(db, filter={"year": {"$exists": True}}) == {"d2018", "d2020", "d2021", "d2023"}
+    # $ne and missing keys: dnone has no "year", so $ne includes it.
+    assert _ids(db, filter={"year": {"$ne": 2020}}) == {"d2018", "d2021", "d2023", "dnone"}
+    db.close()
+
+
+def test_filter_logical_operators_end_to_end(tmp_path):
+    """$and/$or/$not compose field predicates through the full stack."""
+
+    db = _filter_corpus(tmp_path)
+    assert _ids(db, filter={"$or": [{"year": {"$gte": 2023}}, {"topic": "a"}]}) == {
+        "d2018",
+        "d2021",
+        "d2023",
+    }
+    # $not(topic == a) includes the doc with no topic at all.
+    assert _ids(db, filter={"$not": {"topic": "a"}}) == {"d2020", "d2023", "dnone"}
+    assert _ids(db, filter={"$and": [{"topic": "a"}, {"year": {"$gte": 2020}}]}) == {"d2021"}
+    db.close()
+
+
+def test_bool_predicate_filter_matches_sdk_stored(tmp_path):
+    """A bool predicate filter matches SDK-stored lowercase bool metadata."""
+
+    db = _open(tmp_path)
+    db.add("active doc", id="act", metadata={"active": True})
+    db.add("inactive doc", id="inact", metadata={"active": False})
+    assert _ids(db, query="doc", filter={"active": True}) == {"act"}  # bare scalar
+    assert _ids(db, query="doc", filter={"active": {"$eq": True}}) == {"act"}
+    assert _ids(db, query="doc", filter={"active": {"$ne": True}}) == {"inact"}
+    db.close()
+
+
+def test_search_many_applies_predicate_filter(tmp_path):
+    """search_many applies an operator filter uniformly across queries."""
+
+    db = _filter_corpus(tmp_path)
+    batches = db.search_many(["doc", "three"], k=50, filter={"year": {"$gte": 2021}})
+    assert len(batches) == 2
+    assert all({hit.id for hit in row} <= {"d2021", "d2023"} for row in batches)
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "filter_form",
+    [
+        {"keep": "yes"},  # exact-match -> resolved via the posting-index allowlist
+        {"keep": {"$ne": "no"}},  # predicate -> resolved via the compiled-scan allowlist
+    ],
+    ids=["posting", "scan"],
+)
+def test_search_many_filtered_is_exact_when_matches_far_exceed_k(tmp_path, filter_form):
+    """The multi-query batch path returns the exact top-k of the matching subset.
+
+    search_many (>1 query) groups queries by filter and pushes one shared allowlist
+    into the batched scan (top_k stays k, no corpus-wide widening). Exact-match
+    filters resolve through the posting index and predicate filters through a
+    compiled corpus scan; both forms here select the same documents, so this checks
+    that *either* resolution path yields the true top-k of the matches -- no
+    truncation, no over-return -- even when matches far exceed k and non-matching
+    docs are interleaved through the ranking. (The predicate form also exercises
+    the batch filter-grouping signature on a non-hashable nested filter.) Oracle:
+    an unfiltered ranking filtered in Python and truncated to k, independent of the
+    filtered query paths.
+    """
+
+    db = _open(tmp_path)
+    n = 40
+    for i in range(n):
+        db.add(
+            f"document {i} about quick foxes and lazy dogs",
+            id=f"d{i}",
+            metadata={"keep": "yes" if i % 2 == 0 else "no"},
+        )
+    matching = {f"d{i}" for i in range(n) if i % 2 == 0}  # 20 docs, >> k
+    k = 5
+    queries = ["fox", "dog", "quick lazy"]
+    batched = db.search_many(queries, k=k, filter=filter_form)
+    assert len(batched) == len(queries)
+    for query, row in zip(queries, batched, strict=True):
+        got = [hit.id for hit in row]
+        # Independent oracle: rank everything unfiltered, keep matches, take k.
+        ranked = [hit.id for hit in db.search(query, k=n)]
+        expected = [doc_id for doc_id in ranked if doc_id in matching][:k]
+        assert got == expected
+        assert len(got) == k  # selective filter, but matches >> k -> a full top-k
+        assert set(got) <= matching
+    db.close()
+
+
+def test_predicate_filter_survives_persist_and_reopen(tmp_path):
+    """Operator filters work after persist+reopen (storage format is unchanged)."""
+
+    db = _filter_corpus(tmp_path)
+    db.persist()
+    db.close()
+    reopened = _open(tmp_path)
+    assert _ids(reopened, filter={"year": {"$gte": 2021}}) == {"d2021", "d2023"}
+    reopened.close()
+
+
+def test_invalid_filter_grammar_raises(tmp_path):
+    """Malformed predicate grammar raises ValueError at query time."""
+
+    db = _open(tmp_path)
+    db.add("doc", id="d", metadata={"year": 2020})
+    with pytest.raises(ValueError):
+        db.search("doc", k=5, filter={"year": {"$bogus": 1}})
+    with pytest.raises(ValueError):
+        db.search("doc", k=5, filter={"year": {"$in": []}})
+    db.close()
+
+
 def test_remove_returns_true_only_when_document_existed(tmp_path):
     """remove deletes by id and reports whether a document was actually removed."""
 

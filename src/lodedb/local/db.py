@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
+from lodedb.engine._predicate import coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
     EngineSecurityConfig,
@@ -303,9 +304,26 @@ class LodeDB:
     ) -> list[LodeSearchHit]:
         """Returns the top-``k`` hits as ``(score, id, metadata)``-style rows.
 
-        ``filter`` is an exact-match metadata/document filter pushed into the
-        TurboVec allowlist by the engine. Raw query text never leaves the
-        process and never appears in telemetry.
+        ``filter`` narrows results by metadata and is pushed into the TurboVec
+        allowlist by the engine, so ``k`` still returns the true top-``k`` of the
+        matching subset (not a post-filtered slice of an unfiltered top-``k``). It
+        accepts either a flat ``{field: value}`` exact-match map or a Mongo-style
+        predicate:
+
+        - comparison ``$eq`` ``$ne`` ``$gt`` ``$gte`` ``$lt`` ``$lte`` ``$in``
+          ``$nin`` ``$exists`` — e.g. ``{"year": {"$gte": 2020, "$lt": 2025}}``;
+        - composition ``$and`` / ``$or`` / ``$not`` (nestable) — e.g.
+          ``{"$or": [{"topic": "ml"}, {"year": {"$gte": 2023}}]}``.
+
+        A bare scalar is exact-match sugar for ``$eq``, so existing filters are
+        unchanged. Metadata is stored as strings, so the ordered operators
+        (``$gt``/``$gte``/``$lt``/``$lte``) compare numerically only when both the
+        stored value and the operand parse as finite numbers (otherwise
+        lexicographically), whereas ``$eq``/``$ne``/``$in``/``$nin`` always compare
+        as strings — so ``{"price": {"$eq": 9.9}}`` does not match a stored ``9.90``
+        while ``{"price": {"$gte": 9.9, "$lte": 9.9}}`` does. ``$ne``/``$nin`` and
+        ``$exists: False`` also match documents missing the field. Raw query text
+        never leaves the process and never appears in telemetry.
         """
 
         if not isinstance(query, str) or not query.strip():
@@ -331,7 +349,9 @@ class LodeDB:
         Batched search is the public SDK path that lets CUDA hosts use the
         optional GPU-resident TurboVec scan for eligible query batches. Single
         queries and unavailable GPU dependencies fall back to the compact CPU
-        kernel; raw query text still never appears in telemetry.
+        kernel; raw query text still never appears in telemetry. ``filter`` takes
+        the same exact-match-or-predicate grammar as :meth:`search` and is applied
+        identically to every query in the batch.
         """
 
         if not isinstance(queries, list) or not queries:
@@ -533,6 +553,9 @@ def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None
     (``{"topic": "physics"}``), which is wrapped as ``{"metadata": {...}}``.
     Metadata values are stringified to match the engine's string metadata
     model so a flat ``{"year": 2020}`` filter matches a stored ``"2020"``.
+    The metadata may use predicate operators (``$eq``/``$ne``/``$gt``/``$gte``/
+    ``$lt``/``$lte``/``$in``/``$nin``/``$exists`` and ``$and``/``$or``/``$not``);
+    a bare scalar stays exact-match. See ``lodedb.engine._predicate``.
     """
 
     if filter is None:
@@ -543,12 +566,12 @@ def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None
     if set(filter) <= structured_keys and any(key in filter for key in structured_keys):
         out: dict[str, Any] = {}
         if "metadata" in filter:
-            out["metadata"] = _coerce_metadata(filter["metadata"])
+            out["metadata"] = coerce_sdk_filter(filter["metadata"])
         if "document_ids" in filter:
             out["document_ids"] = list(filter["document_ids"])
         return out
-    # Flat metadata form.
-    return {"metadata": _coerce_metadata(filter)}
+    # Flat metadata form (also where a top-level $and/$or/$not lands).
+    return {"metadata": coerce_sdk_filter(filter)}
 
 
 def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:

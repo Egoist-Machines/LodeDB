@@ -37,6 +37,7 @@ from lodedb.engine._commit_manifest import (
     write_commit_manifest,
 )
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
+from lodedb.engine._predicate import compile_metadata_filter, validate_metadata_filter
 from lodedb.engine.document_text_store import (
     DocumentTextStore,
     read_legacy_text_sidecar,
@@ -2575,10 +2576,33 @@ class LodeEngine:
 
         Shared by the single-query and batch paths so filters are pushed into the
         TurboVec scan instead of widening top_k to the corpus and post-filtering.
-        Resolved through the metadata posting index in O(matching docs + chunks).
+        Exact-match filters resolve through the metadata posting index in
+        O(matching docs + chunks). Predicate filters (comparison operators or
+        logical composition) can't be expressed as equality postings, so they
+        resolve via a compiled-predicate corpus scan instead.
         """
 
+        if _is_predicate_filter(query_filter.get("metadata")):
+            return self._scan_filter_allowlist(state, query_filter)
         return self._metadata_posting_index(state).allowlist(query_filter)
+
+    def _scan_filter_allowlist(
+        self, state: ClientIndexState, query_filter: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Resolves a predicate filter to eligible chunk ids by a compiled scan.
+
+        O(corpus), but the predicate is compiled once (operators dispatched,
+        operands pre-parsed -- see ``_predicate.compile_metadata_filter``) and, on
+        the batch path, this runs once per filter group rather than per query.
+        """
+
+        matches = _compile_query_filter(query_filter)
+        document_metadata = state.document_metadata
+        return tuple(
+            str(chunk.chunk_id)
+            for chunk in state.chunks.values()
+            if matches(chunk.document_id, document_metadata.get(chunk.document_id, {}))
+        )
 
     def _sync_direct_turbovec_index(self, state: ClientIndexState) -> tuple[str, ...]:
         """Applies transient full-embedding mutations to a direct TurboVec index.
@@ -3673,12 +3697,14 @@ def _materialize_query_results(
         )
     ]
     filtered: list[dict[str, Any]] = []
+    matches_filter = _compile_query_filter(query_filter)
+    document_metadata = state.document_metadata
     for candidate in candidates:
         document_id = str(candidate["document_id"])
-        if not _document_matches_query_filter(state, document_id, query_filter):
+        if not matches_filter(document_id, document_metadata.get(document_id, {})):
             continue
         if QUERY_INCLUDE_METADATA in include:
-            candidate["metadata"] = dict(state.document_metadata.get(document_id, {}))
+            candidate["metadata"] = dict(document_metadata.get(document_id, {}))
         filtered.append(candidate)
         if len(filtered) >= top_k:
             break
@@ -4151,10 +4177,7 @@ def _validate_query_filter(filter_payload: dict[str, Any] | None) -> dict[str, A
         raise ValueError("filter contains unsupported fields")
     validated: dict[str, Any] = {}
     if "metadata" in filter_payload:
-        metadata = filter_payload["metadata"]
-        if not isinstance(metadata, Mapping) or not metadata:
-            raise ValueError("filter.metadata must be a nonempty object")
-        validated["metadata"] = _validate_metadata(metadata)
+        validated["metadata"] = validate_metadata_filter(filter_payload["metadata"])
     if "document_ids" in filter_payload:
         document_ids = filter_payload["document_ids"]
         if not isinstance(document_ids, list) or not document_ids:
@@ -4189,7 +4212,23 @@ def _filter_signature(query_filter: Mapping[str, Any]) -> tuple[Any, ...]:
 
     metadata = query_filter.get("metadata") or {}
     document_ids = query_filter.get("document_ids") or ()
-    return (tuple(sorted(metadata.items())), tuple(document_ids))
+    return (_hashable_filter(metadata), tuple(document_ids))
+
+
+def _hashable_filter(value: Any) -> Any:
+    """Canonicalizes a (possibly predicate) validated filter into a hashable key.
+
+    Predicate filters nest dicts (operator maps) and lists (``$and``/``$or``),
+    which are unhashable; this maps each dict to a sorted item tuple and each list
+    to a tuple so the batch grouper can key on the filter. Equal filters yield
+    equal keys, so identical filters still collapse into one batch group.
+    """
+
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _hashable_filter(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_filter(item) for item in value)
+    return value
 
 
 def _empty_turbovec_result(index: TurboVecServingIndex) -> _EngineTurboVecQueryResult:
@@ -4215,21 +4254,46 @@ def _normalize_rows_for_engine(matrix: np.ndarray) -> np.ndarray:
     return np.divide(rows, norms, out=np.zeros_like(rows), where=norms > 0)
 
 
-def _document_matches_query_filter(
-    state: ClientIndexState,
-    document_id: str,
+def _is_predicate_filter(metadata: Mapping[str, Any] | None) -> bool:
+    """Returns whether a validated metadata filter uses operators or logical composition.
+
+    Such filters can't be resolved by the exact-match posting index (which only
+    does ``(field, value)`` equality lookups), so they take the compiled-scan
+    path. A flat map of bare-scalar equalities returns False (posting-resolvable).
+    """
+
+    if not metadata:
+        return False
+    return any(
+        key.startswith("$") or isinstance(value, Mapping) for key, value in metadata.items()
+    )
+
+
+def _compile_query_filter(
     query_filter: Mapping[str, Any],
-) -> bool:
-    """Returns whether a document satisfies exact ID and metadata query filters."""
+) -> Callable[[str, Mapping[str, str]], bool]:
+    """Compiles a validated query filter into a reusable per-document matcher.
+
+    Hoists the per-document-invariant work out of the corpus scan / post-filter:
+    the optional ``document_ids`` allowlist becomes one set and the metadata filter
+    is compiled once (operators dispatched, operands pre-parsed). The returned
+    ``(document_id, document_metadata) -> bool`` does no re-walking, set rebuilding,
+    or operand parsing per call.
+    """
 
     document_ids = query_filter.get("document_ids")
-    if document_ids is not None and document_id not in set(document_ids):
-        return False
+    allowed_ids = set(document_ids) if document_ids is not None else None
     metadata = query_filter.get("metadata")
-    if metadata is None:
-        return True
-    document_metadata = state.document_metadata.get(document_id, {})
-    return all(document_metadata.get(str(key)) == str(value) for key, value in metadata.items())
+    metadata_predicate = compile_metadata_filter(metadata) if metadata is not None else None
+
+    def _matches(document_id: str, document_metadata: Mapping[str, str]) -> bool:
+        if allowed_ids is not None and document_id not in allowed_ids:
+            return False
+        if metadata_predicate is None:
+            return True
+        return metadata_predicate(document_metadata)
+
+    return _matches
 
 
 def _document_resource_payload(state: ClientIndexState, document_id: str) -> dict[str, Any]:

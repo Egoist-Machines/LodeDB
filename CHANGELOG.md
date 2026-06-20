@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Metadata filter predicates.** `search`/`search_many` `filter=` now accepts comparison
+  operators (`$eq` / `$ne` / `$gt` / `$gte` / `$lt` / `$lte` / `$in` / `$nin` / `$exists`) and
+  boolean composition (`$and` / `$or` / `$not`) alongside exact match. A bare scalar stays
+  exact-match, so existing filters are unchanged. Ordered comparisons (`$gt`/`$gte`/`$lt`/`$lte`)
+  are numeric when both the stored value and the operand parse as numbers, otherwise
+  lexicographic; equality and membership (`$eq`/`$ne`/`$in`/`$nin`) always compare as strings, so
+  `{"n": {"$eq": 9.9}}` does not match a stored `9.90`. No storage-format change — the predicates
+  evaluate at query time over the existing string metadata.
 - **Single-writer concurrency safety.** A LodeDB handle now holds an exclusive OS advisory
   lock (`<dir>/.lodedb.lock`) for its lifetime, so concurrent processes can no longer corrupt
   the on-disk store. A second open of the same path waits for the first to close — then loads
