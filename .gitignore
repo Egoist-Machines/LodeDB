@@ -30,6 +30,7 @@ third_party/turbovec/target/
 *.tvd
 *.jsd
 *.tvtext
+.lodedb.lock
 /data/
 /.lodedb/
 

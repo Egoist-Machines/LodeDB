@@ -398,8 +398,10 @@ class LodeDB:
         return self._index.stats()
 
     def close(self) -> None:
-        """Releases engine references. Persisted state remains on disk."""
+        """Releases the single-writer lock and engine references; state stays on disk."""
 
+        if self._engine is not None:
+            self._engine.close()
         self._index = None  # type: ignore[assignment]
         self._engine = None  # type: ignore[assignment]
 

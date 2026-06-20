@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import uuid
+import weakref
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.engine.document_text_store import DocumentTextStore
 from lodedb.engine.embedding_backends import (
     EngineEmbeddingBackend,
@@ -326,6 +328,8 @@ class LodeEngine:
         self.route_registry = route_registry
         self.chunk_character_limit = chunk_character_limit
         self.persistence_dir = Path(persistence_dir) if persistence_dir is not None else None
+        # Single-writer lock timeout (seconds), read once at construction.
+        self._persist_lock_timeout = lodedb_lock_timeout_from_env()
         self.embedding_backend = embedding_backend
         self.route_policy = route_policy
         self.gpu_memory_budget_bytes = (
@@ -364,9 +368,48 @@ class LodeEngine:
         self._index_generations: dict[str, int] = {}
         self._audit_events: list[dict[str, Any]] = []
         self._metrics: list[dict[str, Any]] = []
+        self._writer_lock: WriterLock | None = None
         if self.persistence_dir is not None:
             self.persistence_dir.mkdir(parents=True, exist_ok=True)
-            self._load_persisted_indexes()
+            # Acquire the single-writer lock before loading. A second process
+            # opening the same path waits for this handle to close and then fails
+            # fast (ConcurrentWriterError) once the timeout elapses.
+            self._acquire_writer_lock()
+            try:
+                self._load_persisted_indexes()
+            except BaseException:
+                self._release_writer_lock()
+                raise
+
+    def _acquire_writer_lock(self) -> None:
+        """Takes the exclusive single-writer lock for this engine's directory."""
+
+        if self.persistence_dir is None or self._writer_lock is not None:
+            return
+        lock = WriterLock(self.persistence_dir)
+        lock.acquire(self._persist_lock_timeout)
+        self._writer_lock = lock
+        # Best-effort release if the handle is dropped without close(); the OS
+        # also releases the advisory lock when the process exits.
+        self._writer_lock_finalizer = weakref.finalize(self, lock.release)
+
+    def _release_writer_lock(self) -> None:
+        """Releases the single-writer lock so another handle can open the path."""
+
+        lock = self._writer_lock
+        if lock is None:
+            return
+        self._writer_lock = None
+        finalizer = getattr(self, "_writer_lock_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
+            self._writer_lock_finalizer = None
+        lock.release()
+
+    def close(self) -> None:
+        """Releases the single-writer lock; the engine must not persist afterwards."""
+
+        self._release_writer_lock()
 
     @property
     def audit_events(self) -> tuple[dict[str, Any], ...]:

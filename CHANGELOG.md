@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Single-writer concurrency safety.** A LodeDB handle now holds an exclusive OS advisory
+  lock (`<dir>/.lodedb.lock`) for its lifetime, so concurrent processes can no longer corrupt
+  the on-disk store. A second open of the same path waits for the first to close — then loads
+  the accumulated state and composes — and fails fast with `ConcurrentWriterError` once
+  `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s) elapses, the model SQLite uses with a busy
+  timeout. The kernel releases the lock on process exit, so a crash never wedges the path.
+  Local filesystems only (advisory locks are unreliable on NFS/SMB). Live cross-process
+  refresh (a reader auto-seeing another live process's writes) remains out of scope.
 
 ## [0.1.1] - 2026-06-20
 
