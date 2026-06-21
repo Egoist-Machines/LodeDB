@@ -10,6 +10,8 @@ the pre-commit-manifest layout and base-epoch GC.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 
 import pytest
@@ -190,8 +192,24 @@ def test_migrates_from_legacy_layout(tmp_path):
     gen = generation_dir(tmp_path, key)
     shutil.copy(gen / f"g{epoch}.json", tmp_path / f"{key}.json")
     shutil.copy(gen / f"g{epoch}.tvim", tmp_path / f"{key}.tvim")
-    # The legacy layout kept raw text in a top-level <key>.tvtext sidecar.
-    shutil.copy(gen / f"text-g{body['generation']}.tvtext", tmp_path / f"{key}.tvtext")
+    # The v0.1.x layout kept raw text in a single top-level <key>.tvtext sidecar
+    # (schema 1, a checksummed id->text map); synthesize one to drive migration.
+    legacy_body = {
+        "schema_version": 1,
+        "documents": {f"d{i}": f"legacy doc {i}" for i in range(6)},
+    }
+    legacy_blob = json.dumps(legacy_body, sort_keys=True).encode("utf-8")
+    (tmp_path / f"{key}.tvtext").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "body_sha256": hashlib.sha256(legacy_blob).hexdigest(),
+                "body": legacy_body,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     commit_manifest_path(tmp_path, key).unlink()
     shutil.rmtree(gen)
     assert not commit_manifest_path(tmp_path, key).exists()
@@ -222,18 +240,81 @@ def test_migrates_from_legacy_layout(tmp_path):
         final.close()
 
 
+def test_migrates_from_pre_journal_text_sidecar(tmp_path):
+    """A pre-journal single-file text sidecar loads and migrates into the journal.
+
+    The unreleased Stage 2 layout pinned one ``text-g<gen>.tvtext`` file per
+    commit by file sha (root ``tvtext={present, sha256}``). Such a store must
+    still load, and the next write migrates raw text into the base + ``.txd``
+    journal and sweeps the stray single file.
+    """
+
+    seed = _writer(tmp_path)
+    seed.add_many([{"text": f"pre journal doc {i}", "id": f"d{i}"} for i in range(5)])
+    seed.close()
+    key = _index_key(tmp_path)
+    commit_path = commit_manifest_path(tmp_path, key)
+    body = read_commit_manifest(commit_path)
+    epoch = body["base_epoch"]
+    gen = generation_dir(tmp_path, key)
+
+    # Downgrade the journaled raw text to the pre-journal single-file shape.
+    journaled = json.loads((gen / f"g{epoch}.tvtext").read_text(encoding="utf-8"))
+    single_body = {"schema_version": 1, "documents": journaled["body"]["documents"]}
+    single_blob = json.dumps(single_body, sort_keys=True).encode("utf-8")
+    single_file = gen / f"text-g{body['generation']}.tvtext"
+    single_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "body_sha256": hashlib.sha256(single_blob).hexdigest(),
+                "body": single_body,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (gen / f"g{epoch}.tvtext").unlink()
+    shutil.rmtree(gen / f"g{epoch}.tvtext.tvtext-delta")
+    body["tvtext"] = {
+        "present": True,
+        "sha256": hashlib.sha256(single_file.read_bytes()).hexdigest(),
+    }
+    core.write_commit_manifest(commit_path, body, fsync=False)
+
+    # The pre-journal single file loads, then the next write migrates to the journal.
+    migrated = _writer(tmp_path)
+    try:
+        assert migrated.get("d2") == "pre journal doc 2"
+        migrated.add("after", id="after")
+        assert migrated.get("after") == "after"
+    finally:
+        migrated.close()
+
+    # A subsequent writer open heals to the journal and sweeps the stray single file.
+    final = _writer(tmp_path)
+    try:
+        assert final.get("d2") == "pre journal doc 2"  # pre-migration text survived
+        assert final.get("after") == "after"
+        assert any(gen.glob("g*.tvtext")), "journaled raw-text base restored"
+        assert not list(gen.glob("text-g*.tvtext")), "stray pre-journal sidecar swept"
+    finally:
+        final.close()
+
+
 def test_text_rolls_back_with_torn_commit(tmp_path, monkeypatch):
     """A torn commit rolls raw text back with the generation.
 
-    Regression for P1: the raw-text sidecar is generation-addressed and pinned by
-    the root manifest, so a crashed commit's uncommitted replacement text is never
+    Regression for P1: raw text is journaled into the atomic set (a base +
+    ``.txd`` deltas under the epoch, manifest pinned by the root), so a crashed
+    commit's uncommitted ``.txd`` overwrite is dropped on recovery and never
     surfaced by the public ``get`` after rollback.
     """
 
     writer = _writer(tmp_path)
     writer.add("committed text", id="a")
     assert writer.get("a") == "committed text"
-    # Crash at the next commit's root swap, after the new text sidecar is written.
+    # Crash at the next commit's root swap, after the .txd text delta is written.
     monkeypatch.setattr(core, "write_commit_manifest", _boom)
     with pytest.raises(RuntimeError):
         writer.add("UNCOMMITTED REPLACEMENT", id="a")
@@ -244,6 +325,7 @@ def test_text_rolls_back_with_torn_commit(tmp_path, monkeypatch):
     try:
         assert recovered.count() == 1
         assert recovered.get("a") == "committed text"  # not the uncommitted replacement
+        audit_persisted_index_snapshots(tmp_path)  # no corruption / orphan leak
     finally:
         recovered.close()
 

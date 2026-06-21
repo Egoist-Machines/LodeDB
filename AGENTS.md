@@ -22,9 +22,9 @@ tests/                   local SDK suite + import-boundary guard
 - **Privacy / metrics-only:** telemetry and the redacted artifacts (`.json` snapshot, `.jsd`
   journal, `.tvim`/`.tvd` sidecars, audit log) never carry raw documents, queries, chunks,
   embeddings, or credentials — only counts / bytes / latency / ids / timestamps. The one
-  exception is original document text, retained by default in a *separate* `.tvtext` sidecar
-  for `db.get(id)`; pass `store_text=False` to keep no text on disk. No telemetry/redacted
-  path reads that sidecar.
+  exception is original document text, retained by default in a *separate* raw-text store
+  (`g<epoch>.tvtext` base + `.txd` delta journal) for `db.get(id)`; pass `store_text=False` to
+  keep no text on disk. No telemetry/redacted path reads that store.
 - **Lean dependencies:** runtime PyPI deps are `numpy`, `typer`,
   `sentence-transformers`, `pyyaml` (+ extras `[mcp]`, `[langchain]`, `[gpu]`). The patched
   TurboVec core is vendored under `third_party/turbovec/` and bundled into the wheel as
@@ -59,6 +59,9 @@ tests/                   local SDK suite + import-boundary guard
   next warm query (`_sample_pending_drift`), never per commit. Drop only the rows just synced
   (`_discard_direct_turbovec_transient_embeddings(state, synced_ids)`), not every chunk. The
   exception is cold builds/compaction in `build_turbovec_serving_index`, which prepare once.
+  This includes the opt-in raw-text store: a delta commit appends a `.txd` text delta (upserted
+  texts + deleted ids) via `_journal_text`, never rewriting the full `document_id -> text` map —
+  only a base rewrite (cold build/compaction) writes the full `g<epoch>.tvtext` base.
 
 ## Develop
 

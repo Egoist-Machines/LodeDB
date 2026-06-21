@@ -20,7 +20,7 @@ flowchart TB
     MPSS["MPS exact scan<br/>mps_turbovec · experimental"]
   end
   TV["Vendored TurboVec core<br/>third_party/turbovec (MIT)"]
-  DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext)")]
+  DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext · .txd)")]
 
   CLI --> SDK
   MCP --> SDK
@@ -97,8 +97,9 @@ Each index is a per-index generation directory plus a single atomically-swapped 
     `g<epoch>.json.json-delta/`,
   - `g<epoch>.tvim` — the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
     encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
-  - `text-g<gen>.tvtext` — the opt-in raw-text sidecar (`store_text=True`), governed by the
-    same root manifest.
+  - `g<epoch>.tvtext` — the opt-in raw-text base (`store_text=True`): the full
+    `document_id -> text` map, plus its `.txd` text journal under `g<epoch>.tvtext.tvtext-delta/`,
+    governed by the same root manifest.
 
 A commit writes any new artifacts first — bases are generation-addressed and never
 overwritten in place — then atomically swaps `<key>.commit.json`; that swap is the only
@@ -107,7 +108,8 @@ reopen a writer rolls back to it (dropping the uncommitted artifacts) rather tha
 closed, and a lock-free reader loads exactly the generation the root names — consistent
 snapshot isolation, raw text included. Superseded generations are garbage-collected, keeping
 the most recent few for in-flight readers. The redacted artifacts (`.json`/`.jsd`/`.tvim`/
-`.tvd`) never carry raw document or query text; only the `.tvtext` sidecar holds raw text.
+`.tvd`) never carry raw document or query text; only the `.tvtext` base + `.txd` journal hold
+raw text.
 
 `db.persist()` returns durable stats (every mutation already commits atomically); reopening
 the same path replays the committed generation. Stores written before this layout (a
@@ -153,11 +155,13 @@ sidecars, telemetry, and `audit_persisted_index_snapshots` never carry raw docum
 
 Durable page-content retrieval is **on by default**. `LodeDB(...)` (engine flag
 `EngineSecurityConfig.allow_raw_result_text`, default true) retains the original text passed to
-`add`/`add_many` in a dedicated `<index_key>.tvtext` sidecar that maps `document_id -> text`,
-written atomically and checksum-guarded (it fails closed on a corrupt/mismatched file, like the
-other sidecars). The sidecar is deliberately **separate** from the redacted artifacts above —
-none of them read it — so retrieval (`db.get`/`get_text`/`get_texts`, the `lodedb get` CLI
-command, `POST /get`, and the MCP `lodedb_get` tool) never weakens any payload-free guarantee.
-Removing a document drops its stored text. Opening with `store_text=False` opts out entirely:
-no text is retained, the retrieval paths raise/return empty, and any existing sidecar is left
-unread (and cleared on the next persist).
+`add`/`add_many` in a dedicated raw-text store mapping `document_id -> text`: a `g<epoch>.tvtext`
+base plus a `.txd` delta journal, mirroring the state/vector journals so an incremental commit
+journals only the upserted texts and deleted ids (O(changed), not a full-map rewrite) and a load
+replays the deltas onto the base. Every base and segment is checksum-guarded and fails closed on
+a corrupt/mismatched file. The store is deliberately **separate** from the redacted artifacts
+above — none of them read it — so retrieval (`db.get`/`get_text`/`get_texts`, the `lodedb get`
+CLI command, `POST /get`, and the MCP `lodedb_get` tool) never weakens any payload-free
+guarantee. Removing a document journals a delete. Opening with `store_text=False` opts out
+entirely: no text is retained, the retrieval paths raise/return empty, and any existing store is
+left unread (and dropped when its generation is GC'd).

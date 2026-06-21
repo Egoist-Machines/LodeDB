@@ -8,9 +8,9 @@
 - stores vectors in the compact TurboVec format and commits every change
   atomically via a per-index root manifest (``<key>.commit.json``) over
   generation-addressed artifacts under ``<key>.gen/`` (``.json``/``.jsd``
-  state, ``.tvim``/``.tvd`` vectors, and the opt-in ``.tvtext`` raw text), so a
-  crash rolls back to the last committed generation and readers see a
-  consistent snapshot.
+  state, ``.tvim``/``.tvd`` vectors, and the opt-in ``.tvtext``/``.txd`` raw
+  text), so a crash rolls back to the last committed generation and readers see
+  a consistent snapshot.
 
 On CUDA hosts, eligible batched queries can use the optional GPU-resident
 TurboVec scan; otherwise the compact CPU kernel is the source of truth and
@@ -107,8 +107,9 @@ class LodeDB:
     engine's per-index root manifest, so a crash rolls back to the last
     committed generation and reopening the same path replays it safely.
 
-    Raw document text is retained by default in a dedicated on-disk sidecar, so
-    the original text is retrievable by id (``get``/``get_text``/``get_texts``).
+    Raw document text is retained by default in a dedicated on-disk store (a
+    ``.tvtext`` base + ``.txd`` delta journal, committed O(changed) per write),
+    so the original text is retrievable by id (``get``/``get_text``/``get_texts``).
     Telemetry, audit, and the redacted ``.json``/``.jsd`` snapshot stay
     payload-free regardless; pass ``store_text=False`` to opt out of retaining
     text entirely::

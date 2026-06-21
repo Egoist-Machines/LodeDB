@@ -155,6 +155,12 @@ rows that changed (O(changed)), so a 1,000-row commit stays sub-millisecond at a
 The GPU path makes reads fast; the delta makes writes cheap. The on-disk format stays a
 plain snapshot that replays on reopen.
 
+The opt-in raw-text store (`store_text=True`) is journaled the same way: an incremental commit
+appends a small `.txd` text delta instead of rewriting the whole `document_id -> text` map, so
+enabling text retrieval keeps commits O(changed) too. Isolated, the per-commit text write drops
+from a full-map rewrite (~57 ms at 20K docs, ~244 ms at 80K) to a flat **~0.7 ms** regardless of
+corpus size.
+
 ## Benchmarks
 
 All artifacts are metrics-only (counts, bytes, latency), never payloads. Full methodology

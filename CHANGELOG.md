@@ -32,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior (atomic, not power-loss durable) and commit throughput.
 - **Crash-atomic multi-file commits (atomic root manifest).** A commit touches several files
   (JSON state base + `.jsd` journal, `.tvim` vector base + `.tvd` journal, and the opt-in
-  `.tvtext` raw-text sidecar); they are now written as generation-addressed artifacts under a
-  per-index `<key>.gen/` directory and sealed by atomically swapping a single
+  `.tvtext` raw-text base + `.txd` journal); they are now written as generation-addressed
+  artifacts under a per-index `<key>.gen/` directory and sealed by atomically swapping a single
   `<key>.commit.json` root pointer — that swap is the only commit point. Because every
   artifact (including raw text, on by default) is generation-addressed and pinned by the root,
   none is overwritten in place, so a crash (or `kill -9`) mid-commit leaves the previously
@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk. Measured single-doc `add()` latency at 20K docs dropped from ~58 ms to ~15 ms
   (~3.9×), and the gap widens with corpus size since the removed work was O(corpus). The
   deferred layout rebuild lands once on the first query after a write burst.
+- **Raw-text persistence is O(changed) too.** With `store_text=True` (the default), an
+  incremental commit now appends a small `.txd` text delta (the upserted texts + deleted ids
+  of that batch) onto a `g<epoch>.tvtext` base, instead of rewriting the whole
+  `document_id -> text` map every commit; a load replays the deltas onto the base, and the
+  store remains checksum-guarded and fails closed. This removes the last whole-corpus write
+  from the commit path: isolated, the per-commit text write drops from ~57 ms at 20K docs
+  (~244 ms at 80K) to a flat ~0.7 ms regardless of corpus size. Raw text stays in the atomic
+  commit set (base + journal pinned by the root manifest), so it still commits and rolls back
+  with the generation; v0.1.x single-file `.tvtext` sidecars migrate into the journal on the
+  next write.
 
 ## [0.1.1] - 2026-06-20
 
