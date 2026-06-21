@@ -83,6 +83,8 @@ DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
 QUERY_LATENCY_SAMPLE_CAP = 1024
 DEFAULT_INDEX_ID = "default"
 DEFAULT_INDEX_NAME = "Default index"
+# Cap on rows sampled for the (deferred, query-warm) quantization-drift metric.
+_DRIFT_SAMPLE_LIMIT = 16
 ACTIVE_INDEX_STATUS = "ready"
 LEGACY_INDEX_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 QUERY_INCLUDE_METADATA = "metadata"
@@ -405,6 +407,13 @@ class LodeEngine:
         self._pending_tvim_deltas: dict[str, dict[str, tuple[int, ...]]] = {}
         self._pending_state_journal_documents: dict[str, dict[str, dict[str, None]]] = {}
         self._turbovec_drift_telemetry: dict[str, dict[str, float]] = {}
+        # Recently-added rows (id + embedding) awaiting an opportunistic
+        # quantization-drift sample. Sampling needs a search, which needs the
+        # warm SIMD layout, so it is deferred off the commit path to the next
+        # query that warms the layout (see _sample_pending_drift). Embeddings
+        # are buffered here because the transient copies in state.chunks are
+        # zeroed right after the commit.
+        self._pending_drift_samples: dict[str, list[tuple[str, tuple[float, ...]]]] = {}
         self._tvim_persist_telemetry: dict[str, dict[str, float | str]] = {}
         self._state_load_telemetry: dict[str, dict[str, float]] = {}
         self._indexes: dict[str, ClientIndexState] = {}
@@ -1150,7 +1159,7 @@ class LodeEngine:
                 chunk_count=len(state.chunks),
             )
             sync_started = perf_counter()
-            self._sync_direct_turbovec_index(state)
+            synced_chunk_ids = self._sync_direct_turbovec_index(state)
             _log_document_ingest_finalize_progress(
                 event_name,
                 phase="turbovec_sync",
@@ -1159,7 +1168,7 @@ class LodeEngine:
                 chunk_count=len(state.chunks),
                 elapsed_ms=(perf_counter() - sync_started) * 1000.0,
             )
-            _discard_direct_turbovec_transient_embeddings(state)
+            _discard_direct_turbovec_transient_embeddings(state, synced_chunk_ids)
             self._emit(
                 event_name,
                 context.client_id,
@@ -1884,6 +1893,9 @@ class LodeEngine:
             )
         else:
             result = index.search(query_embedding, top_k=top_k)
+        # The search above (re)built the SIMD layout, so any deferred
+        # quantization-drift rows can be sampled cheaply now.
+        self._sample_pending_drift(state)
         return _EngineTurboVecQueryResult(
             index=index,
             stable_ids=result.stable_ids.reshape(-1),
@@ -2127,11 +2139,16 @@ class LodeEngine:
             return cached
         raise RuntimeError("direct TurboVec snapshot is not loaded")
 
-    def _sync_direct_turbovec_index(self, state: ClientIndexState) -> None:
-        """Applies transient full-embedding mutations to a direct TurboVec index."""
+    def _sync_direct_turbovec_index(self, state: ClientIndexState) -> tuple[str, ...]:
+        """Applies transient full-embedding mutations to a direct TurboVec index.
+
+        Returns the chunk ids whose transient full embeddings are now encoded in
+        the index and can therefore be discarded by the caller (the rows added
+        this sync), so the discard is O(changed) rather than O(corpus).
+        """
 
         if not _state_uses_direct_turbovec(state):
-            return
+            return ()
         # Try to patch the GPU-resident dequantized copy in-place; if it fails,
         # pop it and the next eligible batch lazily re-uploads against the new generation.
         gpu_session = self._gpu_direct_turbovec_sessions.get(state.index_key)
@@ -2158,7 +2175,9 @@ class LodeEngine:
             self._turbovec_indexes[state.index_key] = built
             self._index_generations[state.index_key] = generation
             self._pending_tvim_deltas.pop(state.index_key, None)
-            return
+            # A cold rebuild re-encodes every chunk, so every chunk's transient
+            # embedding is now in the index and can be discarded.
+            return tuple(state.chunks)
         removed_stable_ids = tuple(
             int(stable_id)
             for stable_id, chunk_id in previous.chunk_ids_by_stable_id.items()
@@ -2237,28 +2256,15 @@ class LodeEngine:
                 generation=generation,
                 elapsed_ms=(perf_counter() - started) * 1000.0,
             )
-            if hasattr(previous.index, "prepare"):
-                _log_direct_turbovec_update_progress(
-                    progress_label,
-                    phase="prepare",
-                    event="start",
-                    chunk_count=len(new_chunks),
-                    native_dim=state.native_dim,
-                    bit_width=_turbovec_bit_width_for_state(state),
-                    generation=generation,
-                )
-                started = perf_counter()
-                previous.index.prepare()
-                _log_direct_turbovec_update_progress(
-                    progress_label,
-                    phase="prepare",
-                    event="end",
-                    chunk_count=len(new_chunks),
-                    native_dim=state.native_dim,
-                    bit_width=_turbovec_bit_width_for_state(state),
-                    generation=generation,
-                    elapsed_ms=(perf_counter() - started) * 1000.0,
-                )
+            # Do NOT eagerly prepare() here. The add invalidated TurboVec's
+            # derived SIMD "blocked" layout; rebuilding it now (an O(corpus)
+            # repack) only for the next mutation to invalidate it again makes
+            # every incremental commit O(corpus). `search` rebuilds the layout
+            # lazily on the next query, so a burst of commits pays a single
+            # repack at the next query instead of one per commit. (Cold builds
+            # still prepare once in build_turbovec_serving_index; the packed
+            # codes persistence exports come from add_with_ids above, not the
+            # blocked layout.)
             for stable_id, chunk in zip(stable_ids, new_chunks, strict=True):
                 previous.chunk_ids_by_stable_id[int(stable_id)] = str(chunk.chunk_id)
                 previous.document_ids_by_stable_id[int(stable_id)] = str(chunk.document_id)
@@ -2295,45 +2301,58 @@ class LodeEngine:
         pending["removed"] = tuple(pending["removed"]) + tuple(
             int(stable_id) for stable_id in removed_stable_ids
         )
-        self._record_turbovec_drift_telemetry(
-            state,
-            new_chunks=new_chunks,
-            stable_ids=stable_ids if new_chunks else None,
-        )
+        # Buffer the new rows for a deferred, query-warm drift sample rather than
+        # searching here — a per-commit drift search would force the O(corpus)
+        # layout rebuild this method now avoids. _sample_pending_drift consumes
+        # the buffer on the next query that warms the layout.
+        self._buffer_pending_drift(state, new_chunks)
+        return tuple(str(chunk.chunk_id) for chunk in new_chunks)
 
-    def _record_turbovec_drift_telemetry(
-        self,
-        state: ClientIndexState,
-        *,
-        new_chunks: tuple[Any, ...],
-        stable_ids: Any | None,
+    def _buffer_pending_drift(
+        self, state: ClientIndexState, new_chunks: tuple[Any, ...]
     ) -> None:
-        """Samples allowlisted self-scores of new rows as a quantization-drift signal.
+        """Records recently-added rows for a deferred, query-warm drift sample.
 
-        For each sampled newly added chunk the exact self inner product is its
-        embedding norm squared; the TurboVec self-score gap measures how much
-        4-bit quantization moved that row. The mean relative gap is emitted on
-        mutation events so operators can watch encode drift over time.
+        Sampling drift needs a self-score search, which needs the warm SIMD
+        layout, so it is kept off the commit path. The embeddings are buffered
+        here (not read from ``state.chunks``) because the transient copies there
+        are zeroed right after the commit. The buffer keeps only the most recent
+        rows so a long ingest burst stays O(1) in memory.
         """
 
-        if not new_chunks or stable_ids is None:
-            self._turbovec_drift_telemetry[state.index_key] = {
-                "turbovec_drift_sample_rows": 0.0,
-                "turbovec_self_score_drift_ratio": 0.0,
-            }
+        if not new_chunks:
+            return
+        buffer = self._pending_drift_samples.setdefault(state.index_key, [])
+        for chunk in new_chunks:
+            buffer.append((str(chunk.chunk_id), tuple(float(v) for v in chunk.embedding)))
+        if len(buffer) > _DRIFT_SAMPLE_LIMIT:
+            del buffer[:-_DRIFT_SAMPLE_LIMIT]
+
+    def _sample_pending_drift(self, state: ClientIndexState) -> None:
+        """Samples buffered rows' quantization drift; called when the layout is warm.
+
+        Invoked from the query path after a search has (re)built the SIMD
+        layout, so these self-score searches are cheap. For each sampled new row
+        the exact self inner product is its embedding norm squared; the TurboVec
+        self-score gap measures how far 4-bit quantization moved the row. Emits
+        the mean relative gap and clears the buffer.
+        """
+
+        samples = self._pending_drift_samples.get(state.index_key)
+        if not samples:
             return
         serving = self._turbovec_indexes.get(state.index_key)
         if serving is None:
+            self._pending_drift_samples.pop(state.index_key, None)
             return
-        sample_count = min(16, len(new_chunks))
         ratios: list[float] = []
-        for chunk in new_chunks[:sample_count]:
-            embedding = np.asarray(chunk.embedding, dtype=np.float32)
-            expected = float(np.dot(embedding, embedding))
+        for chunk_id, embedding in samples:
+            vector = np.asarray(embedding, dtype=np.float32)
+            expected = float(np.dot(vector, vector))
             result = serving.search(
-                tuple(float(value) for value in embedding),
+                tuple(float(value) for value in vector),
                 top_k=1,
-                allowlist_chunk_ids=(str(chunk.chunk_id),),
+                allowlist_chunk_ids=(chunk_id,),
             )
             if result.scores.size:
                 observed = float(result.scores.reshape(-1)[0])
@@ -2342,6 +2361,7 @@ class LodeEngine:
             "turbovec_drift_sample_rows": float(len(ratios)),
             "turbovec_self_score_drift_ratio": float(np.mean(ratios)) if ratios else 0.0,
         }
+        self._pending_drift_samples.pop(state.index_key, None)
 
     def _turbovec_drift_fields(self, state: ClientIndexState) -> dict[str, float | bool]:
         """Returns drift and calibration-lifecycle telemetry for mutation events.
@@ -3811,11 +3831,24 @@ def _chunks_have_full_embeddings(chunks: tuple[IndexedChunk, ...], *, native_dim
     return True
 
 
-def _discard_direct_turbovec_transient_embeddings(state: ClientIndexState) -> None:
-    """Drops transient full vectors after direct TurboVec has persisted them in `.tvim`."""
+def _discard_direct_turbovec_transient_embeddings(
+    state: ClientIndexState, chunk_ids: tuple[str, ...]
+) -> None:
+    """Drops the transient full vectors of the rows just synced into the index.
 
+    Only those rows still carry a non-zero transient embedding (prior rows were
+    zeroed by their own commit), so this is O(changed), not O(corpus). The
+    encoded codes already live in the index; the redacted ``.json`` state and
+    persistence read the index, not these embeddings.
+    """
+
+    if not chunk_ids:
+        return
     zero = tuple(0.0 for _item in range(state.native_dim))
-    for chunk_id, chunk in list(state.chunks.items()):
+    for chunk_id in chunk_ids:
+        chunk = state.chunks.get(chunk_id)
+        if chunk is None:
+            continue
         state.chunks[chunk_id] = IndexedChunk(
             chunk_id=chunk.chunk_id,
             document_id=chunk.document_id,

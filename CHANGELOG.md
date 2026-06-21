@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new layout on their next write; superseded generations are garbage-collected (the most
   recent few are retained for in-flight readers).
 
+### Changed
+
+- **Incremental commits are O(changed), not O(corpus).** A single-doc commit no longer does
+  three pieces of whole-corpus work on the write path: it no longer eagerly rebuilds
+  TurboVec's SIMD "blocked" layout (the next query rebuilds it lazily, once, amortizing a
+  burst of commits), no longer runs a per-commit quantization-drift self-score search (that
+  drift metric is now sampled opportunistically on the next query that warms the layout), and
+  drops only the transient embeddings of the rows just added rather than re-walking every
+  chunk. Measured single-doc `add()` latency at 20K docs dropped from ~58 ms to ~15 ms
+  (~3.9×), and the gap widens with corpus size since the removed work was O(corpus). The
+  deferred layout rebuild lands once on the first query after a write burst.
+
 ## [0.1.1] - 2026-06-20
 
 ### Changed
