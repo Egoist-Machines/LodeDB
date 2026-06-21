@@ -41,7 +41,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from lodedb.engine._atomic_io import durable_replace, fsync_dir
+from lodedb.engine._atomic_io import durable_replace
 
 COMMIT_MANIFEST_SUFFIX = ".commit.json"
 GEN_DIR_SUFFIX = ".gen"
@@ -125,19 +125,30 @@ def write_commit_manifest(path: str | Path, body: dict[str, Any], *, fsync: bool
 
     The body is checksum-wrapped and the file is published via the durable
     temp + ``os.replace`` path, so the pointer flips all-or-nothing.
+
+    The body embeds both per-store manifests and is serialized **exactly once**
+    per commit: that single ``json.dumps`` is the dominant cost of the write
+    (it dwarfs the file I/O), so the one serialization is reused for both the
+    integrity checksum and the on-disk payload — the wrapper is assembled around
+    it rather than re-dumping the body inside a dict.
     """
 
     path = Path(path)
-    document = {
-        "schema_version": COMMIT_MANIFEST_SCHEMA_VERSION,
-        "body_sha256": _body_sha256(body),
-        "body": body,
-    }
+    body_json = json.dumps(body, sort_keys=True)
+    body_sha = hashlib.sha256(body_json.encode("utf-8")).hexdigest()
+    document_json = (
+        '{"body":'
+        + body_json
+        + ',"body_sha256":'
+        + json.dumps(body_sha)
+        + ',"schema_version":'
+        + str(int(COMMIT_MANIFEST_SCHEMA_VERSION))
+        + "}"
+    )
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    temporary.write_text(document_json, encoding="utf-8")
+    # durable_replace already fsyncs the destination directory in fsync mode.
     durable_replace(temporary, path, fsync=fsync)
-    if fsync:
-        fsync_dir(path.parent)
 
 
 def build_commit_body(
