@@ -185,15 +185,18 @@ lodedb benchmark   # local, metrics-only benchmark
   a time (an exclusive OS advisory lock); a second writer waits for it to close, then fails
   fast (`ConcurrentWriterError`) after `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s).
   **Read-only** handles (`LodeDB.open_readonly(path)` or `read_only=True`; used by
-  `lodedb query`/`get`) take *no* lock, so they can read a committed snapshot **while** a
-  writer is open — they just don't auto-see the writer's in-flight changes (no live
+  `lodedb query`/`get`) take *no* lock, so they read one consistent committed snapshot **while**
+  a writer is open — they just don't auto-see the writer's in-flight changes (no live
   cross-process refresh). Within one process the engine serializes operations under an
   in-process lock, so the threaded `lodedb serve` safely shares one handle. Local filesystems
   only (advisory locks are unreliable on NFS/SMB).
-- **Durability is `fast` by default.** Every commit is *atomic* (temp file + `os.replace`, so
-  a reader never sees a torn file), but not fsync'd. Pass `durability="fsync"` (or
-  `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each file and its directory on
-  commit for power-loss durability, at some commit-throughput cost.
+- **Crash-atomic commits.** A commit spans several files, but it is sealed by atomically
+  swapping one `<key>.commit.json` root pointer over generation-addressed artifacts, so a
+  crash mid-commit rolls back to the last committed generation on reopen (never a torn,
+  half-applied store) and readers always load one consistent generation.
+- **Durability is `fast` by default.** Commits are *atomic* but not fsync'd. Pass
+  `durability="fsync"` (or `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each
+  file and its directory on commit for power-loss durability, at some commit-throughput cost.
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec

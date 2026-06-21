@@ -199,7 +199,7 @@ class TvimDeltaStore:
             kind="delta",
         )
 
-    def has_pending_segments(self) -> bool:
+    def has_pending_segments(self, *, manifest: dict[str, Any] | None = None) -> bool:
         """Returns whether the manifest references delta segments to replay.
 
         A base-only manifest (written by every auto-policy base rewrite)
@@ -207,7 +207,7 @@ class TvimDeltaStore:
         restart from it after only base persists.
         """
 
-        manifest = self._read_manifest_optional()
+        manifest = self._read_manifest_optional() if manifest is None else manifest
         return bool(manifest and manifest.get("deltas"))
 
     def should_compact(
@@ -233,11 +233,18 @@ class TvimDeltaStore:
         base_rows = max(int(manifest.get("base", {}).get("rows", 1)), 1)
         return delta_rows >= base_rows * max_delta_row_fraction
 
-    def replay_onto(self, index: Any) -> dict[str, float]:
-        """Replays manifest deltas onto a freshly loaded base index, failing closed."""
+    def replay_onto(
+        self, index: Any, *, manifest: dict[str, Any] | None = None
+    ) -> dict[str, float]:
+        """Replays manifest deltas onto a freshly loaded base index, failing closed.
+
+        ``manifest`` overrides the on-disk manifest so a load can be driven by
+        the committed copy embedded in the root manifest, ignoring any
+        uncommitted segment a crashed writer left behind.
+        """
 
         started = time.perf_counter()
-        manifest = self._read_manifest()
+        manifest = self._read_manifest() if manifest is None else manifest
         base_entry = manifest.get("base", {})
         recorded_fingerprint = int(base_entry.get("calibration_fingerprint", 0))
         if recorded_fingerprint and hasattr(index, "calibration_fingerprint"):
@@ -288,10 +295,10 @@ class TvimDeltaStore:
             "replayed_removed_rows": float(replayed_removes),
         }
 
-    def validate_base_checksum(self) -> None:
+    def validate_base_checksum(self, *, manifest: dict[str, Any] | None = None) -> None:
         """Fails closed when the base `.tvim` does not match the manifest digest."""
 
-        manifest = self._read_manifest()
+        manifest = self._read_manifest() if manifest is None else manifest
         base_entry = manifest.get("base", {})
         recorded = str(base_entry.get("sha256", ""))
         if recorded and _sha256_file(self.base_path) != recorded:
@@ -322,6 +329,27 @@ class TvimDeltaStore:
         for path in self.delta_dir.glob(f"*{TVIM_DELTA_SEGMENT_SUFFIX}"):
             path.unlink(missing_ok=True)
         self.manifest_path.unlink(missing_ok=True)
+
+    def current_manifest(self) -> dict[str, Any] | None:
+        """Returns the on-disk manifest (for embedding in the root commit manifest)."""
+
+        return self._read_manifest_optional()
+
+    def restore_manifest(self, manifest: dict[str, Any]) -> None:
+        """Heals the on-disk manifest to a committed snapshot, dropping orphans.
+
+        Writer recovery: a crashed commit may have appended a segment and bumped
+        the on-disk manifest past the committed root. Rewriting the manifest to
+        the committed copy and deleting any segment file it does not reference
+        rolls this store back to the last good generation.
+        """
+
+        self.delta_dir.mkdir(parents=True, exist_ok=True)
+        referenced = set(self._manifest_segment_names(manifest))
+        self._write_manifest(manifest)
+        for path in self.delta_dir.glob(f"*{TVIM_DELTA_SEGMENT_SUFFIX}"):
+            if path.name not in referenced:
+                path.unlink(missing_ok=True)
 
     def _validated_segment_path(self, entry: dict[str, Any]) -> Path:
         """Returns a manifest segment's path after existence and checksum checks."""

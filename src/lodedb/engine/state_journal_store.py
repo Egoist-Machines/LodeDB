@@ -222,16 +222,20 @@ class StateJournalStore:
         base_documents = max(int(manifest.get("base", {}).get("document_count", 1)), 1)
         return delta_documents >= base_documents * max_delta_document_fraction
 
-    def replay_onto_payload(self, payload: dict[str, Any]) -> dict[str, float]:
+    def replay_onto_payload(
+        self, payload: dict[str, Any], *, manifest: dict[str, Any] | None = None
+    ) -> dict[str, float]:
         """Replays manifest deltas onto a parsed base payload, failing closed.
 
         Mutates ``payload`` in place to the post-journal state: document
         collections replay per document and the scalar header is replaced by
-        the last delta's header.
+        the last delta's header. ``manifest`` overrides the on-disk manifest so
+        a load can be driven by the committed copy embedded in the root manifest
+        (ignoring any uncommitted segment a crashed writer left behind).
         """
 
         started = time.perf_counter()
-        manifest = self._read_manifest()
+        manifest = self._read_manifest() if manifest is None else manifest
         chunks_by_id: dict[str, dict[str, Any]] = {
             str(row["chunk_id"]): row for row in payload.get("chunks", ())
         }
@@ -306,10 +310,10 @@ class StateJournalStore:
             "json_replayed_deleted_documents": float(replayed_deletes),
         }
 
-    def validate_base_checksum(self) -> None:
+    def validate_base_checksum(self, *, manifest: dict[str, Any] | None = None) -> None:
         """Fails closed when the base JSON does not match the manifest digest."""
 
-        manifest = self._read_manifest()
+        manifest = self._read_manifest() if manifest is None else manifest
         base_entry = manifest.get("base", {})
         recorded = str(base_entry.get("sha256", ""))
         if recorded and _sha256_file(self.base_path) != recorded:
@@ -350,6 +354,27 @@ class StateJournalStore:
         for path in self.journal_dir.glob(f"*{STATE_JOURNAL_SEGMENT_SUFFIX}"):
             path.unlink(missing_ok=True)
         self.manifest_path.unlink(missing_ok=True)
+
+    def current_manifest(self) -> dict[str, Any] | None:
+        """Returns the on-disk manifest (for embedding in the root commit manifest)."""
+
+        return self._read_manifest_optional()
+
+    def restore_manifest(self, manifest: dict[str, Any]) -> None:
+        """Heals the on-disk manifest to a committed snapshot, dropping orphans.
+
+        Writer recovery: a crashed commit may have appended a segment and bumped
+        the on-disk manifest past the committed root. Rewriting the manifest to
+        the committed copy and deleting any segment file it does not reference
+        rolls this store back to the last good generation.
+        """
+
+        self.journal_dir.mkdir(parents=True, exist_ok=True)
+        referenced = set(self._manifest_segment_names(manifest))
+        self._write_manifest(manifest)
+        for path in self.journal_dir.glob(f"*{STATE_JOURNAL_SEGMENT_SUFFIX}"):
+            if path.name not in referenced:
+                path.unlink(missing_ok=True)
 
     def _validated_segment_path(self, entry: dict[str, Any]) -> Path:
         """Returns a manifest segment's path after existence and checksum checks."""

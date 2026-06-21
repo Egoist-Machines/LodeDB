@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `read_only=True`) opens a non-mutating snapshot that takes **no** writer lock, so it can
   read a path while a writer holds it — `lodedb query` and `lodedb get` now use it, so they
   work alongside a running `lodedb serve`/`mcp`. Mutating calls raise `ReadOnlyError`; the
-  path must already exist. A read-only open relies on per-file `os.replace` atomicity and
-  briefly retries if it catches a writer mid multi-file commit.
+  path must already exist. A read-only open loads the single consistent generation named by
+  the atomic commit manifest (below), so it never observes a torn cross-file mix.
 - **In-process operation lock.** The engine now serializes its public operations under a
   reentrant lock, so the threaded `lodedb serve` can safely share one handle across request
   threads (concurrent `add`/`search`/`remove` no longer race on shared state).
@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `serve`/`index`, or `LODEDB_DURABILITY=fsync`) fsyncs each persisted file and its directory
   on commit for power-loss durability. The default `"fast"` keeps the prior atomic-rename
   behavior (atomic, not power-loss durable) and commit throughput.
+- **Crash-atomic multi-file commits (atomic root manifest).** A commit touches several files
+  (JSON state base + `.jsd` journal, `.tvim` vector base + `.tvd` journal); they are now
+  written as generation-addressed artifacts under a per-index `<key>.gen/` directory and
+  sealed by atomically swapping a single `<key>.commit.json` root pointer — that swap is the
+  only commit point. Because bases are generation-addressed they are never overwritten in
+  place, so a crash (or `kill -9`) mid-commit leaves the previously committed generation fully
+  intact and the next open rolls back to it (dropping the uncommitted artifacts) instead of
+  failing closed and stuck. Lock-free readers load exactly the generation the root manifest
+  names — consistent snapshot isolation, no torn cross-file reads. Stores written by v0.1.x
+  load via a legacy fallback and migrate to the new layout on their next write; superseded
+  base generations are garbage-collected (the most recent few are retained for in-flight
+  readers).
 
 ## [0.1.1] - 2026-06-20
 

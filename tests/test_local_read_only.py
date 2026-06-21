@@ -111,33 +111,12 @@ def test_read_only_missing_path_raises(tmp_path):
         )
 
 
-def test_read_only_load_retries_transient_torn_read(tmp_path, monkeypatch):
-    """A read-only load retries a transient cross-file skew, then succeeds."""
+def test_read_only_load_surfaces_corruption(tmp_path, monkeypatch):
+    """A read-only open fails closed on a corrupt load (no silent empty index).
 
-    writer = _writer(tmp_path)
-    writer.add("a", id="a")
-    writer.close()
-
-    real_load = LodeEngine._load_persisted_indexes
-    state = {"calls": 0}
-
-    def flaky(self):
-        state["calls"] += 1
-        if state["calls"] < 3:
-            raise RuntimeError("state journal replay rejected: document count mismatch")
-        return real_load(self)
-
-    monkeypatch.setattr(LodeEngine, "_load_persisted_indexes", flaky)
-    reader = LodeDB(path=tmp_path, model="minilm", read_only=True, _embedding_backend=_be())
-    try:
-        assert state["calls"] == 3  # failed twice, succeeded on the third
-        assert reader.count() == 1
-    finally:
-        reader.close()
-
-
-def test_read_only_load_surfaces_persistent_corruption(tmp_path, monkeypatch):
-    """Genuine corruption still fails closed once retries are exhausted."""
+    Stage 2 reads the consistent generation named by the atomic commit manifest,
+    so there is no torn-read retry that could mask a genuine load failure.
+    """
 
     writer = _writer(tmp_path)
     writer.add("a", id="a")

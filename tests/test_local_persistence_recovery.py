@@ -50,7 +50,8 @@ def test_corrupt_tvim_base_fails_closed(tmp_path):
     """A garbled .tvim base raises on reopen instead of silently losing data."""
 
     _seed(tmp_path)
-    bases = [p for p in Path(tmp_path).glob("*.tvim") if p.is_file()]
+    # The committed vector base lives under the per-index <key>.gen/ directory.
+    bases = [p for p in Path(tmp_path).glob("**/*.tvim") if p.is_file()]
     assert bases, "expected a .tvim base sidecar"
     bases[0].write_bytes(b"corrupt-not-a-real-tvim-sidecar")
     with pytest.raises(RuntimeError):
@@ -61,7 +62,7 @@ def test_missing_tvim_base_fails_closed(tmp_path):
     """A missing .tvim base for a non-empty index raises on reopen."""
 
     _seed(tmp_path)
-    bases = [p for p in Path(tmp_path).glob("*.tvim") if p.is_file()]
+    bases = [p for p in Path(tmp_path).glob("**/*.tvim") if p.is_file()]
     bases[0].unlink()
     with pytest.raises(RuntimeError):
         _reopen(tmp_path)

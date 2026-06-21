@@ -6,6 +6,7 @@ import functools
 import hashlib
 import json
 import re
+import shutil
 import threading
 import uuid
 import weakref
@@ -15,12 +16,25 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from lodedb.engine._atomic_io import durable_replace
+from lodedb.engine._commit_manifest import (
+    COMMIT_MANIFEST_SUFFIX,
+    DEFAULT_EPOCHS_RETAINED,
+    base_json_path,
+    base_tvim_path,
+    build_commit_body,
+    commit_manifest_path,
+    generation_dir,
+    is_commit_manifest_name,
+    list_base_epochs,
+    read_commit_manifest,
+    write_commit_manifest,
+)
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.engine.document_text_store import DocumentTextStore
 from lodedb.engine.embedding_backends import (
@@ -396,6 +410,10 @@ class LodeEngine:
         self._indexes: dict[str, ClientIndexState] = {}
         self._turbovec_indexes: dict[str, TurboVecServingIndex] = {}
         self._index_generations: dict[str, int] = {}
+        # Live base epoch per index key: which ``<key>.gen/g<epoch>.*`` artifacts
+        # the committed root manifest points at. Set on load/commit; absent for a
+        # not-yet-persisted or legacy (pre-commit-manifest) index.
+        self._base_epochs: dict[str, int] = {}
         self._audit_events: list[dict[str, Any]] = []
         self._metrics: list[dict[str, Any]] = []
         # Serializes public operations within one process. The local dev server
@@ -407,12 +425,11 @@ class LodeEngine:
         if self.persistence_dir is not None:
             if self._read_only:
                 # Read-only handles take NO writer lock — they neither block nor
-                # are blocked by a live writer. They load one committed snapshot,
-                # relying on os.replace per-file atomicity. A reader can still
-                # catch a writer mid multi-file commit and see a transient
-                # cross-file skew that fails validation, so the load is retried
-                # briefly before giving up.
-                self._load_persisted_indexes_with_retry()
+                # are blocked by a live writer. Each index loads the single
+                # consistent generation named by its atomic ``<key>.commit.json``
+                # root manifest, so a reader never observes a torn cross-file
+                # mix (no retry needed; that was the Stage 1 stopgap).
+                self._load_persisted_indexes()
             else:
                 self.persistence_dir.mkdir(parents=True, exist_ok=True)
                 # Acquire the single-writer lock before loading. A second process
@@ -466,36 +483,6 @@ class LodeEngine:
             raise RuntimeError(
                 "LodeDB is open read-only; reopen without read_only=True to mutate"
             )
-
-    def _load_persisted_indexes_with_retry(
-        self, *, attempts: int = 6, backoff_s: float = 0.05
-    ) -> None:
-        """Loads snapshots for a read-only handle, retrying a torn cross-file read.
-
-        A read-only handle holds no lock, so it can observe a writer partway
-        through the sequential publishes of a multi-file commit (e.g. the JSON
-        journal ahead of the ``.tvim`` store). That transient skew fails closed
-        on load; since a commit is sub-millisecond, a short bounded retry almost
-        always lands on a consistent generation. Genuine corruption still
-        surfaces — the last error is re-raised once the attempts are exhausted.
-        """
-
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                self._load_persisted_indexes()
-                return
-            except (RuntimeError, OSError, ValueError) as exc:
-                last_error = exc
-                # Drop any partially-loaded state before retrying a clean read.
-                self._indexes.clear()
-                self._turbovec_indexes.clear()
-                self._index_generations.clear()
-                self._gpu_direct_turbovec_sessions.clear()
-                if attempt + 1 < attempts:
-                    sleep(backoff_s)
-        assert last_error is not None
-        raise last_error
 
     @property
     def audit_events(self) -> tuple[dict[str, Any], ...]:
@@ -1789,20 +1776,17 @@ class LodeEngine:
 
         if self.persistence_dir is None:
             return
-        for path in (
-            self._state_path(state.index_key),
-            self._turbovec_snapshot_path(state.index_key),
-        ):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-        # Delta journals sit in sidecar directories beside the base files.
-        StateJournalStore(self._state_path(state.index_key)).remove_all()
-        TvimDeltaStore(self._turbovec_snapshot_path(state.index_key)).remove_all()
+        key = state.index_key
+        # Stage-2 artifacts: the root commit-manifest pointer and the per-index
+        # generation directory holding every base epoch + its journals.
+        self._commit_manifest_path(key).unlink(missing_ok=True)
+        shutil.rmtree(generation_dir(self.persistence_dir, key), ignore_errors=True)
+        self._base_epochs.pop(key, None)
+        # Legacy (pre-commit-manifest) top-level base files and their journals.
+        self._gc_legacy_files(key)
         # The opt-in raw-text sidecar (present only when raw-text storage was
         # enabled) is removed with the rest of the index's local artifacts.
-        self._document_text_store(state.index_key).remove()
+        self._document_text_store(key).remove()
 
     def _index_shape_from_profile(
         self,
@@ -2394,46 +2378,38 @@ class LodeEngine:
         self._gpu_direct_turbovec_sessions.pop(client_id_hash, None)
 
     def _persist_state(self, state: ClientIndexState) -> None:
-        """Writes one client index snapshot locally without raw document or query text.
+        """Commits one index generation atomically via its root commit manifest.
 
-        The redacted ``.json``/``.tvim``/``.jsd`` artifacts never carry raw
-        text. Raw document text, when the opt-in is enabled, is written to its
-        own ``.tvtext`` sidecar here so it stays durable alongside — but
-        separate from — the redacted snapshot.
+        Each commit writes its durable artifacts under the per-index
+        ``<key>.gen/`` directory keyed by base epoch, then atomically swaps the
+        ``<key>.commit.json`` pointer — that swap is the single commit point, so
+        a crash leaves the previously committed generation fully intact. Raw
+        document text, when enabled, is written to its own auxiliary ``.tvtext``
+        sidecar (kept separate from the index's atomic set).
         """
 
         if self.persistence_dir is None:
             return
         self._require_writable()
+        self.persistence_dir.mkdir(parents=True, exist_ok=True)
         self._persist_document_text(state)
-        path = self._state_path(state.index_key)
-        path.parent.mkdir(parents=True, exist_ok=True)
         generation = self._index_generations.get(state.index_key, 0)
         pending_documents = self._pending_state_journal_documents.pop(state.index_key, None)
+        pending_tvim = self._pending_tvim_deltas.pop(state.index_key, None)
         if state.chunks:
-            self._persist_direct_route_snapshots(
+            self._commit_direct_route(
                 state,
-                path=path,
                 generation=generation,
                 pending_documents=pending_documents,
+                pending_tvim=pending_tvim,
             )
-            return
-        # Empty direct index: legacy full JSON rewrite plus sidecar and
-        # journal cleanup so a later cold build starts from a clean layout.
-        self._write_state_json(state, path=path, generation=generation)
-        self._pending_tvim_deltas.pop(state.index_key, None)
-        StateJournalStore(path).remove_all()
-        try:
-            snapshot_path = self._turbovec_snapshot_path(state.index_key)
-            snapshot_path.unlink(missing_ok=True)
-            TvimDeltaStore(snapshot_path).remove_all()
-        except OSError as exc:
-            raise RuntimeError("stale direct TurboVec snapshot removal failed") from exc
+        else:
+            self._commit_empty_index(state, generation=generation)
 
     def _write_state_json(self, state: ClientIndexState, *, path: Path, generation: int) -> int:
-        """Atomically writes the full legacy JSON snapshot and returns its byte size."""
+        """Atomically writes the full JSON state snapshot and returns its byte size."""
 
-        temporary_path = path.with_suffix(".json.tmp")
+        temporary_path = path.with_name(path.name + ".tmp")
         temporary_path.write_text(
             json.dumps(
                 _state_to_payload(
@@ -2474,69 +2450,85 @@ class LodeEngine:
             pending["upserted"].pop(document_id, None)
             pending["deleted"][document_id] = None
 
-    def _persist_direct_route_snapshots(
+    def _delta_append_ok(
+        self,
+        key: str,
+        *,
+        current_epoch: int | None,
+        serving: Any,
+        pending_documents: dict[str, dict[str, None]] | None,
+        pending_tvim: dict[str, Any] | None,
+    ) -> bool:
+        """Returns whether this mutation can append a delta onto the live epoch.
+
+        Delta-append needs the ``auto`` policy, a live base epoch whose
+        journaled artifacts are present and patched-API-capable, an actual
+        change to journal, and neither store due for compaction. Anything else
+        (the ``off`` policy, a cold build, a compaction threshold) falls back to
+        a fresh base at a new epoch. ``pending_tvim is not None`` proves an
+        incremental sync ran this cycle, so the live index is base+deltas
+        consistent; a cold rebuild pops the entry and must rewrite the base.
+        """
+
+        if self.tvim_delta_persistence_policy != TvimDeltaPersistencePolicy.AUTO:
+            return False
+        if current_epoch is None or pending_tvim is None:
+            return False
+        tvim_changed = bool(pending_tvim["upserted"] or pending_tvim["removed"])
+        documents_changed = pending_documents is not None and bool(
+            pending_documents["upserted"] or pending_documents["deleted"]
+        )
+        if not (tvim_changed or documents_changed):
+            return False
+        base_json = self._epoch_json_path(key, current_epoch)
+        base_tvim = self._epoch_tvim_path(key, current_epoch)
+        journal = StateJournalStore(base_json)
+        tvim_store = TvimDeltaStore(base_tvim)
+        return (
+            base_json.exists()
+            and journal.has_manifest()
+            and base_tvim.exists()
+            and tvim_store.has_manifest()
+            and turbovec_delta_api_available(serving.index)
+            and not tvim_store.should_compact()
+            and not journal.should_compact()
+        )
+
+    def _commit_direct_route(
         self,
         state: ClientIndexState,
         *,
-        path: Path,
         generation: int,
         pending_documents: dict[str, dict[str, None]] | None,
+        pending_tvim: dict[str, Any] | None,
     ) -> None:
-        """Persists the JSON state and `.tvim` sidecar for one direct-route index.
+        """Persists a non-empty direct-route index and seals it via the root manifest.
 
-        Under the default ``off`` policy both files are fully rewritten
-        (byte-identical legacy layout, no journal directories). Under ``auto``
-        a mutation batch appends one checksumed document delta to the JSON
-        journal and one encoded-row delta to the `.tvim` store using a single
-        shared decision, so both sidecars journal and compact together. Cold
-        builds, missing manifests, unavailable patched APIs, and either
-        store's compaction threshold fall back visibly to base rewrites of
-        both files.
+        A delta-eligible mutation appends one ``.jsd`` document delta and one
+        ``.tvd`` vector delta onto the live base epoch; otherwise a base rewrite
+        writes a fresh base at a NEW epoch (cold build, compaction, or the
+        non-journaled ``off`` policy). Either way the commit is sealed by the
+        atomic ``<key>.commit.json`` swap, after which base rewrites GC the
+        superseded epochs and any migrated legacy artifacts.
         """
 
+        key = state.index_key
+        fsync = self._fsync_on_commit
         try:
             serving = self._turbovec_index_for_state(state)
-            tvim_path = self._turbovec_snapshot_path(state.index_key)
-            tvim_store = TvimDeltaStore(tvim_path, fsync=self._fsync_on_commit)
-            journal = StateJournalStore(path, fsync=self._fsync_on_commit)
-            pending_tvim = self._pending_tvim_deltas.pop(state.index_key, None)
-            if self.tvim_delta_persistence_policy != TvimDeltaPersistencePolicy.AUTO:
-                json_bytes = self._write_state_json(state, path=path, generation=generation)
-                journal.remove_all()
-                temporary_path = tvim_path.with_name(tvim_path.name + ".tmp")
-                serving.write(temporary_path)
-                durable_replace(temporary_path, tvim_path, fsync=self._fsync_on_commit)
-                if tvim_store.has_manifest():
-                    tvim_store.remove_all()
-                self._tvim_persist_telemetry[state.index_key] = {
-                    "tvim_persist_mode": "full_rewrite",
-                    "tvim_persist_bytes": float(tvim_path.stat().st_size),
-                    "json_persist_mode": "full_rewrite",
-                    "json_persist_bytes": float(json_bytes),
-                }
-                return
-            tvim_changed = pending_tvim is not None and bool(
-                pending_tvim["upserted"] or pending_tvim["removed"]
-            )
-            documents_changed = pending_documents is not None and bool(
-                pending_documents["upserted"] or pending_documents["deleted"]
-            )
-            # `pending_tvim is not None` proves an incremental sync ran this
-            # cycle, so the live index is base+deltas-consistent; cold rebuilds
-            # pop the pending entry and must rewrite both bases.
-            delta_eligible = (
-                pending_tvim is not None
-                and (tvim_changed or documents_changed)
-                and path.exists()
-                and journal.has_manifest()
-                and tvim_path.exists()
-                and tvim_store.has_manifest()
-                and turbovec_delta_api_available(serving.index)
-                and not tvim_store.should_compact()
-                and not journal.should_compact()
-            )
-            if delta_eligible:
-                assert pending_tvim is not None
+            current_epoch = self._base_epochs.get(key)
+            if self._delta_append_ok(
+                key,
+                current_epoch=current_epoch,
+                serving=serving,
+                pending_documents=pending_documents,
+                pending_tvim=pending_tvim,
+            ):
+                assert current_epoch is not None and pending_tvim is not None
+                base_json = self._epoch_json_path(key, current_epoch)
+                base_tvim = self._epoch_tvim_path(key, current_epoch)
+                journal = StateJournalStore(base_json, fsync=fsync)
+                tvim_store = TvimDeltaStore(base_tvim, fsync=fsync)
                 json_write = journal.append_delta(
                     upserted_documents=[
                         _state_journal_document_entry(state, document_id)
@@ -2552,15 +2544,12 @@ class LodeEngine:
                     chunk_count_after=len(state.chunks),
                     generation=generation,
                 )
-                json_mode = "delta_append"
-                json_bytes = float(json_write.file_bytes)
-                json_write_ms = float(json_write.write_ms)
                 # Journal ids in their exact live mutation order (deduped,
                 # order-preserving). swap_remove makes slot layout depend on
-                # removal order, and exactly-tied scores (duplicate chunk
-                # text quantizing to identical codes) are tie-broken by slot
-                # order — sorted replay produced a different tie order than
-                # the live index on GovReport-scale corpora.
+                # removal order, and exactly-tied scores (duplicate chunk text
+                # quantizing to identical codes) are tie-broken by slot order —
+                # sorted replay produced a different tie order than the live
+                # index on GovReport-scale corpora.
                 tvim_write = tvim_store.append_delta(
                     serving.index,
                     upsert_stable_ids=np.asarray(
@@ -2571,26 +2560,55 @@ class LodeEngine:
                     ),
                     generation=generation,
                 )
-                tvim_mode = "delta_append"
-            else:
-                json_started = perf_counter()
-                json_bytes = float(
-                    self._write_state_json(state, path=path, generation=generation)
+                self._write_root_commit_manifest(
+                    state,
+                    epoch=current_epoch,
+                    generation=generation,
+                    journal=journal,
+                    tvim_store=tvim_store,
                 )
-                journal.record_base(
-                    document_count=len(state.document_hashes),
-                    chunk_count=len(state.chunks),
-                )
-                json_write_ms = float((perf_counter() - json_started) * 1000.0)
-                json_mode = "base_rewrite"
-                tvim_write = tvim_store.persist_base(serving.index)
-                tvim_mode = "base_rewrite"
-            self._tvim_persist_telemetry[state.index_key] = {
-                "tvim_persist_mode": tvim_mode,
+                self._tvim_persist_telemetry[key] = {
+                    "tvim_persist_mode": "delta_append",
+                    "tvim_persist_bytes": float(tvim_write.file_bytes),
+                    "tvim_persist_write_ms": float(tvim_write.write_ms),
+                    **tvim_store.storage_file_bytes(),
+                    "json_persist_mode": "delta_append",
+                    "json_persist_bytes": float(json_write.file_bytes),
+                    "json_persist_write_ms": float(json_write.write_ms),
+                    **journal.storage_file_bytes(),
+                }
+                return
+            # Base rewrite at a NEW epoch (cold build, compaction, or off policy).
+            epoch = generation
+            base_json = self._epoch_json_path(key, epoch)
+            base_tvim = self._epoch_tvim_path(key, epoch)
+            base_json.parent.mkdir(parents=True, exist_ok=True)
+            journal = StateJournalStore(base_json, fsync=fsync)
+            tvim_store = TvimDeltaStore(base_tvim, fsync=fsync)
+            json_started = perf_counter()
+            json_bytes = float(self._write_state_json(state, path=base_json, generation=generation))
+            journal.record_base(
+                document_count=len(state.document_hashes),
+                chunk_count=len(state.chunks),
+            )
+            json_write_ms = float((perf_counter() - json_started) * 1000.0)
+            tvim_write = tvim_store.persist_base(serving.index)
+            self._base_epochs[key] = epoch
+            self._write_root_commit_manifest(
+                state,
+                epoch=epoch,
+                generation=generation,
+                journal=journal,
+                tvim_store=tvim_store,
+            )
+            self._gc_after_base_rewrite(key, live_epoch=epoch)
+            self._gc_legacy_files(key)
+            self._tvim_persist_telemetry[key] = {
+                "tvim_persist_mode": "base_rewrite",
                 "tvim_persist_bytes": float(tvim_write.file_bytes),
                 "tvim_persist_write_ms": float(tvim_write.write_ms),
                 **tvim_store.storage_file_bytes(),
-                "json_persist_mode": json_mode,
+                "json_persist_mode": "base_rewrite",
                 "json_persist_bytes": json_bytes,
                 "json_persist_write_ms": json_write_ms,
                 **journal.storage_file_bytes(),
@@ -2598,34 +2616,211 @@ class LodeEngine:
         except (OSError, RuntimeError, ValueError) as exc:
             raise RuntimeError("TurboVec compact snapshot persistence failed") from exc
 
+    def _commit_empty_index(self, state: ClientIndexState, *, generation: int) -> None:
+        """Commits an empty index: a base-only JSON state at a new epoch, no vectors."""
+
+        key = state.index_key
+        epoch = generation
+        try:
+            base_json = self._epoch_json_path(key, epoch)
+            base_json.parent.mkdir(parents=True, exist_ok=True)
+            journal = StateJournalStore(base_json, fsync=self._fsync_on_commit)
+            self._write_state_json(state, path=base_json, generation=generation)
+            journal.record_base(document_count=len(state.document_hashes), chunk_count=0)
+            self._base_epochs[key] = epoch
+            self._write_root_commit_manifest(
+                state,
+                epoch=epoch,
+                generation=generation,
+                journal=journal,
+                tvim_store=None,
+            )
+            self._gc_after_base_rewrite(key, live_epoch=epoch)
+            self._gc_legacy_files(key)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError("empty index snapshot persistence failed") from exc
+        self._tvim_persist_telemetry[key] = {
+            "tvim_persist_mode": "empty",
+            "json_persist_mode": "base_rewrite",
+        }
+
+    def _write_root_commit_manifest(
+        self,
+        state: ClientIndexState,
+        *,
+        epoch: int,
+        generation: int,
+        journal: StateJournalStore,
+        tvim_store: TvimDeltaStore | None,
+    ) -> None:
+        """Seals one committed generation by atomically swapping the root manifest."""
+
+        key = state.index_key
+        tvtext_present, tvtext_sha = self._tvtext_descriptor(key)
+        body = build_commit_body(
+            index_key=key,
+            generation=generation,
+            base_epoch=epoch,
+            document_count=len(state.document_hashes),
+            chunk_count=len(state.chunks),
+            json_manifest=journal.current_manifest(),
+            tvim_manifest=tvim_store.current_manifest() if tvim_store is not None else None,
+            tvim_present=tvim_store is not None,
+            tvtext_present=tvtext_present,
+            tvtext_sha256=tvtext_sha,
+        )
+        write_commit_manifest(self._commit_manifest_path(key), body, fsync=self._fsync_on_commit)
+
+    def _tvtext_descriptor(self, key: str) -> tuple[bool, str | None]:
+        """Returns ``(present, sha256)`` for the auxiliary raw-text sidecar."""
+
+        store = self._document_text_store(key)
+        if store.exists():
+            return True, _sha256_file(store.sidecar_path)
+        return False, None
+
+    def _gc_after_base_rewrite(self, key: str, *, live_epoch: int) -> None:
+        """Removes superseded base epochs, keeping the most recent few for readers."""
+
+        epochs = sorted(list_base_epochs(self.persistence_dir, key), reverse=True)
+        keep = set(epochs[:DEFAULT_EPOCHS_RETAINED]) | {live_epoch}
+        for epoch in epochs:
+            if epoch not in keep:
+                self._remove_epoch_artifacts(key, epoch)
+
+    def _remove_epoch_artifacts(self, key: str, epoch: int) -> None:
+        """Deletes one base epoch's JSON/TurboVec bases and their journal dirs."""
+
+        base_json = self._epoch_json_path(key, epoch)
+        base_tvim = self._epoch_tvim_path(key, epoch)
+        shutil.rmtree(StateJournalStore(base_json).journal_dir, ignore_errors=True)
+        shutil.rmtree(TvimDeltaStore(base_tvim).delta_dir, ignore_errors=True)
+        base_json.unlink(missing_ok=True)
+        base_tvim.unlink(missing_ok=True)
+
+    def _gc_legacy_files(self, key: str) -> None:
+        """Removes pre-commit-manifest top-level artifacts once migrated.
+
+        A no-op when none exist. The auxiliary ``<key>.tvtext`` sidecar is kept
+        — it is still the live raw-text store under the new layout too.
+        """
+
+        legacy_json = self._state_path(key)
+        legacy_tvim = self._turbovec_snapshot_path(key)
+        if not legacy_json.exists() and not legacy_tvim.exists():
+            return
+        shutil.rmtree(StateJournalStore(legacy_json).journal_dir, ignore_errors=True)
+        shutil.rmtree(TvimDeltaStore(legacy_tvim).delta_dir, ignore_errors=True)
+        legacy_json.unlink(missing_ok=True)
+        legacy_tvim.unlink(missing_ok=True)
+
     def _load_persisted_indexes(self) -> None:
-        """Loads persisted client index snapshots from the local engine directory."""
+        """Loads persisted indexes, each from its atomic root commit manifest.
+
+        Stage-2 indexes load the single consistent generation named by
+        ``<key>.commit.json`` (so a lock-free reader never sees a torn cross-file
+        mix). A pre-commit-manifest top-level ``<key>.json`` (v0.1.x) is loaded
+        directly as a fallback and migrates to the new layout on its next write.
+        """
 
         if self.persistence_dir is None:
             return
+        loaded_keys: set[str] = set()
+        for commit_path in sorted(self.persistence_dir.glob(f"*{COMMIT_MANIFEST_SUFFIX}")):
+            key = commit_path.name[: -len(COMMIT_MANIFEST_SUFFIX)]
+            body = read_commit_manifest(commit_path)
+            if body is None:
+                continue
+            if not self._read_only:
+                # Writer recovery: heal the per-store manifests back to the
+                # committed root (dropping any segment a crashed commit left
+                # uncommitted) and GC superseded epochs + migrated legacy files.
+                self._recover_to_commit(key, body)
+            self._load_index_from_commit(key, body)
+            loaded_keys.add(key)
         for path in sorted(self.persistence_dir.glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            journal = StateJournalStore(path)
-            journal_stats: dict[str, float] | None = None
-            if journal.has_manifest():
-                # A journal manifest means document deltas are part of the
-                # persisted state regardless of the current write policy;
-                # replay validates checksums and counts and fails closed.
-                journal.validate_base_checksum()
-                journal_stats = journal.replay_onto_payload(payload)
-            state = _state_from_payload(payload)
-            if journal_stats is not None:
-                self._state_load_telemetry[state.index_key] = dict(journal_stats)
-            self._load_document_text(state)
-            self._indexes[state.index_key] = state
-            generation = int(payload.get("columnar_generation", 0))
-            self._index_generations[state.index_key] = generation
-            self._load_turbovec_snapshot(state, generation=generation)
-            self._emit_state_metric(
-                "index_loaded",
+            if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
+                continue
+            self._load_legacy_index(path)
+
+    def _load_index_from_commit(self, key: str, body: dict[str, Any]) -> None:
+        """Loads one index from the consistent generation named by its root manifest."""
+
+        epoch = int(body["base_epoch"])
+        base_json = self._epoch_json_path(key, epoch)
+        payload = json.loads(base_json.read_text(encoding="utf-8"))
+        journal = StateJournalStore(base_json)
+        json_manifest = body.get("json")
+        journal_stats: dict[str, float] | None = None
+        if json_manifest is not None:
+            journal.validate_base_checksum(manifest=json_manifest)
+            journal_stats = journal.replay_onto_payload(payload, manifest=json_manifest)
+        state = _state_from_payload(payload)
+        if journal_stats is not None:
+            self._state_load_telemetry[state.index_key] = dict(journal_stats)
+        self._load_document_text(state)
+        self._indexes[state.index_key] = state
+        generation = int(body.get("generation", payload.get("columnar_generation", 0)))
+        self._index_generations[state.index_key] = generation
+        self._base_epochs[state.index_key] = epoch
+        if body.get("tvim_present"):
+            self._load_turbovec_snapshot(
                 state,
-                {"chunk_count": len(state.chunks)},
+                generation=generation,
+                path=self._epoch_tvim_path(key, epoch),
+                tvim_manifest=body.get("tvim"),
             )
+        else:
+            # Empty index: no vector base — build an empty serving index.
+            self._load_turbovec_snapshot(
+                state, generation=generation, path=self._epoch_tvim_path(key, epoch)
+            )
+        self._emit_state_metric("index_loaded", state, {"chunk_count": len(state.chunks)})
+
+    def _load_legacy_index(self, path: Path) -> None:
+        """Loads one pre-commit-manifest top-level snapshot (v0.1.x layout)."""
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        journal = StateJournalStore(path)
+        journal_stats: dict[str, float] | None = None
+        if journal.has_manifest():
+            journal.validate_base_checksum()
+            journal_stats = journal.replay_onto_payload(payload)
+        state = _state_from_payload(payload)
+        if journal_stats is not None:
+            self._state_load_telemetry[state.index_key] = dict(journal_stats)
+        self._load_document_text(state)
+        self._indexes[state.index_key] = state
+        generation = int(payload.get("columnar_generation", 0))
+        self._index_generations[state.index_key] = generation
+        self._load_turbovec_snapshot(
+            state, generation=generation, path=self._turbovec_snapshot_path(state.index_key)
+        )
+        self._emit_state_metric("index_loaded", state, {"chunk_count": len(state.chunks)})
+
+    def _recover_to_commit(self, key: str, body: dict[str, Any]) -> None:
+        """Reconciles on-disk state to the committed root before a writer loads it.
+
+        Rewrites each per-store manifest to the committed copy (dropping any
+        segment a crashed commit appended but never committed), re-points the
+        live base epoch, and GCs superseded epochs plus any migrated legacy
+        artifacts. This turns a torn commit into a clean roll-back to the last
+        good generation instead of a fail-closed open.
+        """
+
+        epoch = int(body["base_epoch"])
+        json_manifest = body.get("json")
+        if json_manifest is not None:
+            StateJournalStore(
+                self._epoch_json_path(key, epoch), fsync=self._fsync_on_commit
+            ).restore_manifest(json_manifest)
+        if body.get("tvim_present") and body.get("tvim") is not None:
+            TvimDeltaStore(
+                self._epoch_tvim_path(key, epoch), fsync=self._fsync_on_commit
+            ).restore_manifest(body["tvim"])
+        self._base_epochs[key] = epoch
+        self._gc_after_base_rewrite(key, live_epoch=epoch)
+        self._gc_legacy_files(key)
 
     def _state_path(self, client_id_hash: str) -> Path:
         """Returns the local snapshot path for one hashed index key."""
@@ -2635,11 +2830,46 @@ class LodeEngine:
         return self.persistence_dir / f"{client_id_hash}.json"
 
     def _turbovec_snapshot_path(self, client_id_hash: str) -> Path:
-        """Returns the TurboVec IdMapIndex snapshot sidecar path for one client hash."""
+        """Returns the legacy (pre-commit-manifest) TurboVec sidecar path."""
 
         if self.persistence_dir is None:
             raise ValueError("persistence_dir is not configured")
         return self.persistence_dir / f"{client_id_hash}.tvim"
+
+    def _commit_manifest_path(self, client_id_hash: str) -> Path:
+        """Returns the root commit-manifest pointer path for one index key."""
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        return commit_manifest_path(self.persistence_dir, client_id_hash)
+
+    def _epoch_json_path(self, client_id_hash: str, epoch: int) -> Path:
+        """Returns the JSON state base path for one index key and base epoch."""
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        return base_json_path(self.persistence_dir, client_id_hash, epoch)
+
+    def _epoch_tvim_path(self, client_id_hash: str, epoch: int) -> Path:
+        """Returns the TurboVec base path for one index key and base epoch."""
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        return base_tvim_path(self.persistence_dir, client_id_hash, epoch)
+
+    def _live_base_paths(self, client_id_hash: str) -> tuple[Path, Path]:
+        """Returns the (JSON, TurboVec) base paths for the live committed epoch.
+
+        Falls back to the legacy top-level paths for an index that has not yet
+        migrated to the commit-manifest layout.
+        """
+
+        epoch = self._base_epochs.get(client_id_hash)
+        if epoch is None:
+            return self._state_path(client_id_hash), self._turbovec_snapshot_path(client_id_hash)
+        return self._epoch_json_path(client_id_hash, epoch), self._epoch_tvim_path(
+            client_id_hash, epoch
+        )
 
     @property
     def raw_text_storage_enabled(self) -> bool:
@@ -2702,12 +2932,21 @@ class LodeEngine:
         state: ClientIndexState,
         *,
         generation: int,
+        path: Path | None = None,
+        tvim_manifest: dict[str, Any] | None = None,
     ) -> None:
-        """Loads and validates a direct TurboVec sidecar for one persisted index."""
+        """Loads and validates a direct TurboVec base for one persisted index.
+
+        ``path`` is the resolved base file (the epoch base under the commit
+        manifest, or the legacy top-level sidecar); ``tvim_manifest`` overrides
+        the on-disk delta manifest so the committed segment set is replayed
+        rather than whatever a crashed writer last left on disk.
+        """
 
         if self.persistence_dir is None:
             return
-        path = self._turbovec_snapshot_path(state.index_key)
+        if path is None:
+            path = self._turbovec_snapshot_path(state.index_key)
         if not path.exists():
             if state.chunks:
                 raise RuntimeError("direct TurboVec snapshot is required but missing")
@@ -2727,21 +2966,25 @@ class LodeEngine:
         try:
             store = TvimDeltaStore(path)
             post_load = None
-            if store.has_manifest():
-                store.validate_base_checksum()
+            if tvim_manifest is not None or store.has_manifest():
+                store.validate_base_checksum(manifest=tvim_manifest)
 
-                def post_load(raw_index: Any, _store: TvimDeltaStore = store) -> None:
+                def post_load(
+                    raw_index: Any,
+                    _store: TvimDeltaStore = store,
+                    _manifest: dict[str, Any] | None = tvim_manifest,
+                ) -> None:
                     # Replay APIs are only required when segments exist; a
                     # base-only manifest (every auto base rewrite) must load
                     # on unpatched backends too.
-                    if _store.has_pending_segments() and not turbovec_delta_api_available(
-                        raw_index
-                    ):
+                    if _store.has_pending_segments(
+                        manifest=_manifest
+                    ) and not turbovec_delta_api_available(raw_index):
                         raise RuntimeError(
                             "TurboVec delta manifest present but the loaded backend "
                             "lacks the delta replay APIs"
                         )
-                    _store.replay_onto(raw_index)
+                    _store.replay_onto(raw_index, manifest=_manifest)
 
             loaded = load_turbovec_serving_index(
                 path,
@@ -3486,7 +3729,13 @@ def _discard_direct_turbovec_transient_embeddings(state: ClientIndexState) -> No
 
 
 def audit_persisted_index_snapshots(persistence_dir: str | Path) -> dict[str, Any]:
-    """Validates local index snapshots and returns a raw-payload-free audit manifest."""
+    """Validates local index snapshots and returns a raw-payload-free audit manifest.
+
+    Audits each index at the consistent generation named by its
+    ``<key>.commit.json`` root manifest (epoch-addressed artifacts under
+    ``<key>.gen/``), and falls back to any legacy top-level ``<key>.json`` base
+    written before the commit-manifest layout.
+    """
 
     directory = Path(persistence_dir)
     if not directory.exists():
@@ -3494,73 +3743,32 @@ def audit_persisted_index_snapshots(persistence_dir: str | Path) -> dict[str, An
     if not directory.is_dir():
         raise ValueError(f"index snapshot path is not a directory: {directory}")
     snapshot_rows: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        journal = StateJournalStore(path)
-        journal_audit: dict[str, Any] = {}
-        if journal.has_manifest():
-            # Journal segments are part of the persisted state: validate
-            # their checksums, scan their bodies for raw-payload leaks, and
-            # replay them so the audited counts reflect the served state.
-            journal.validate_base_checksum()
-            for body in journal.iter_segment_bodies():
-                segment_forbidden = _snapshot_forbidden_keys(body)
-                if segment_forbidden:
-                    keys = ", ".join(sorted(segment_forbidden))
-                    raise ValueError(
-                        f"{path.name} journal contains forbidden raw-payload keys: {keys}"
-                    )
-            replay_stats = journal.replay_onto_payload(payload)
-            journal_audit = {
-                **journal.storage_file_bytes(),
-                "json_delta_segments_replayed": replay_stats["json_delta_segments_replayed"],
-            }
-        forbidden_keys = _snapshot_forbidden_keys(payload)
-        if forbidden_keys:
-            keys = ", ".join(sorted(forbidden_keys))
-            raise ValueError(f"{path.name} contains forbidden raw-payload keys: {keys}")
-        if _snapshot_contains_full_float_embeddings(payload):
-            raise ValueError(f"{path.name} contains full float embedding arrays")
-        if _snapshot_contains_per_vector_json_arrays(payload):
-            raise ValueError(f"{path.name} contains per-vector JSON arrays")
-        state = _state_from_payload(payload)
-        if not _is_sha256_hex(path.stem):
-            raise ValueError(f"snapshot filename must be a SHA-256 index key: {path.name}")
-        if state.index_key != path.stem:
-            raise ValueError(f"snapshot index_key does not match filename: {path.name}")
-        tvim_path = directory / f"{state.index_key}.tvim"
-        if not tvim_path.exists() and state.chunks:
-            raise ValueError(f"{path.name} is missing required TurboVec sidecar")
-        sidecar_audit: dict[str, Any] = (
-            {
-                "file_name": tvim_path.name,
-                "file_sha256": _sha256_file(tvim_path),
-                "storage_profile": DIRECT_TURBOVEC_STORAGE_PROFILE,
-                "sidecar_bytes": tvim_path.stat().st_size,
-            }
-            if tvim_path.exists()
-            else {}
-        )
-        tvim_store = TvimDeltaStore(tvim_path)
-        if sidecar_audit and tvim_store.has_manifest():
-            # Delta segments extend the base `.tvim`; account for them so
-            # the audit covers every persisted byte of the direct route.
-            sidecar_audit.update(tvim_store.storage_file_bytes())
+    audited_keys: set[str] = set()
+    for commit_path in sorted(directory.glob(f"*{COMMIT_MANIFEST_SUFFIX}")):
+        key = commit_path.name[: -len(COMMIT_MANIFEST_SUFFIX)]
+        body = read_commit_manifest(commit_path)
+        if body is None:
+            continue
+        epoch = int(body["base_epoch"])
         snapshot_rows.append(
-            {
-                "file_name": path.name,
-                "client_id_hash": state.client_id_hash,
-                "index_id": state.index_id,
-                "index_key": state.index_key,
-                "file_sha256": _sha256_file(path),
-                "document_count": len(state.document_hashes),
-                "chunk_count": len(state.chunks),
-                "embedding_count": len(state.chunks),
-                "json_bytes": path.stat().st_size,
-                "state_journal": journal_audit,
-                "vector_sidecar": sidecar_audit,
-                "raw_payload_text_fields_present": False,
-            }
+            _audit_snapshot_row(
+                base_json_path(directory, key, epoch),
+                tvim_path=base_tvim_path(directory, key, epoch),
+                expected_key=key,
+                file_name=commit_path.name,
+            )
+        )
+        audited_keys.add(key)
+    for path in sorted(directory.glob("*.json")):
+        if is_commit_manifest_name(path.name) or path.stem in audited_keys:
+            continue
+        snapshot_rows.append(
+            _audit_snapshot_row(
+                path,
+                tvim_path=directory / f"{path.stem}.tvim",
+                expected_key=path.stem,
+                file_name=path.name,
+            )
         )
     return {
         "artifact_type": "index_snapshot_audit",
@@ -3572,6 +3780,81 @@ def audit_persisted_index_snapshots(persistence_dir: str | Path) -> dict[str, An
         "raw_client_id_present": False,
         "client_ids_hashed": True,
         "snapshot_files": snapshot_rows,
+    }
+
+
+def _audit_snapshot_row(
+    json_path: Path,
+    *,
+    tvim_path: Path,
+    expected_key: str,
+    file_name: str,
+) -> dict[str, Any]:
+    """Validates one index snapshot (base + journals + vector sidecar) for audit."""
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    journal = StateJournalStore(json_path)
+    journal_audit: dict[str, Any] = {}
+    if journal.has_manifest():
+        # Journal segments are part of the persisted state: validate their
+        # checksums, scan their bodies for raw-payload leaks, and replay them so
+        # the audited counts reflect the served state.
+        journal.validate_base_checksum()
+        for body in journal.iter_segment_bodies():
+            segment_forbidden = _snapshot_forbidden_keys(body)
+            if segment_forbidden:
+                keys = ", ".join(sorted(segment_forbidden))
+                raise ValueError(
+                    f"{file_name} journal contains forbidden raw-payload keys: {keys}"
+                )
+        replay_stats = journal.replay_onto_payload(payload)
+        journal_audit = {
+            **journal.storage_file_bytes(),
+            "json_delta_segments_replayed": replay_stats["json_delta_segments_replayed"],
+        }
+    forbidden_keys = _snapshot_forbidden_keys(payload)
+    if forbidden_keys:
+        keys = ", ".join(sorted(forbidden_keys))
+        raise ValueError(f"{file_name} contains forbidden raw-payload keys: {keys}")
+    if _snapshot_contains_full_float_embeddings(payload):
+        raise ValueError(f"{file_name} contains full float embedding arrays")
+    if _snapshot_contains_per_vector_json_arrays(payload):
+        raise ValueError(f"{file_name} contains per-vector JSON arrays")
+    state = _state_from_payload(payload)
+    if not _is_sha256_hex(expected_key):
+        raise ValueError(f"snapshot index key must be a SHA-256 hash: {file_name}")
+    if state.index_key != expected_key:
+        raise ValueError(f"snapshot index_key does not match its key: {file_name}")
+    if not tvim_path.exists() and state.chunks:
+        raise ValueError(f"{file_name} is missing required TurboVec sidecar")
+    sidecar_audit: dict[str, Any] = (
+        {
+            "file_name": tvim_path.name,
+            "file_sha256": _sha256_file(tvim_path),
+            "storage_profile": DIRECT_TURBOVEC_STORAGE_PROFILE,
+            "sidecar_bytes": tvim_path.stat().st_size,
+        }
+        if tvim_path.exists()
+        else {}
+    )
+    tvim_store = TvimDeltaStore(tvim_path)
+    if sidecar_audit and tvim_store.has_manifest():
+        # Delta segments extend the base `.tvim`; account for them so the audit
+        # covers every persisted byte of the direct route.
+        sidecar_audit.update(tvim_store.storage_file_bytes())
+    return {
+        "file_name": file_name,
+        "client_id_hash": state.client_id_hash,
+        "index_id": state.index_id,
+        "index_key": state.index_key,
+        "file_sha256": _sha256_file(json_path),
+        "document_count": len(state.document_hashes),
+        "chunk_count": len(state.chunks),
+        "embedding_count": len(state.chunks),
+        "json_bytes": json_path.stat().st_size,
+        "state_journal": journal_audit,
+        "vector_sidecar": sidecar_audit,
+        "raw_payload_text_fields_present": False,
     }
 
 
@@ -3926,10 +4209,10 @@ def _persisted_storage_bytes(
             "persisted_total_bytes": 0,
             "persisted_total_bytes_per_embedding": 0.0,
         }
-    json_path = engine._state_path(state.index_key)
+    json_path, tvim_path = engine._live_base_paths(state.index_key)
     # The direct surface persists exactly one binary sidecar: the `.tvim`
     # TurboVec snapshot.
-    sidecar_paths = (engine._turbovec_snapshot_path(state.index_key),)
+    sidecar_paths = (tvim_path,)
     json_bytes = json_path.stat().st_size if json_path.exists() else 0
     sidecar_bytes = sum(path.stat().st_size for path in sidecar_paths if path.exists())
     # Delta journal directories extend the base files under the auto policy;
@@ -3939,7 +4222,7 @@ def _persisted_storage_bytes(
     if journal_store.has_manifest():
         accounting = journal_store.storage_file_bytes()
         json_journal_bytes = accounting["json_delta_bytes"] + accounting["json_manifest_bytes"]
-    tvim_store = TvimDeltaStore(engine._turbovec_snapshot_path(state.index_key))
+    tvim_store = TvimDeltaStore(tvim_path)
     tvim_delta_bytes = 0.0
     if tvim_store.has_manifest():
         accounting = tvim_store.storage_file_bytes()

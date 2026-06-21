@@ -44,6 +44,14 @@ tests/                   local SDK suite + import-boundary guard
   under one reentrant in-process lock (`@_synchronized`) so the threaded `serve` can share a
   handle. Persist every file via `durable_replace` (temp + `os.replace`, with the fsync gated
   on `durability="fsync"`) — never write a persisted artifact in place.
+- **Atomic commits (`engine/_commit_manifest.py`):** an index commits by writing
+  generation-addressed artifacts under `<key>.gen/` and then atomically swapping the
+  `<key>.commit.json` root pointer — that swap is the *only* commit point, so never overwrite a
+  base in place (write a new epoch) and never publish state outside a root-manifest swap. Loads
+  go through the committed root (embedded per-store manifests); writer-open recovery
+  (`_recover_to_commit`) rolls a torn commit back to the last good generation and GCs
+  superseded epochs. A top-level `<key>.json` with no commit manifest is a legacy (v0.1.x)
+  store: load it via the fallback and migrate on next write. Keep this back-compat path.
 
 ## Develop
 
