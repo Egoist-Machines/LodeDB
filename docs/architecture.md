@@ -20,7 +20,7 @@ flowchart TB
     MPSS["MPS exact scan<br/>mps_turbovec · experimental"]
   end
   TV["Vendored TurboVec core<br/>third_party/turbovec (MIT)"]
-  DISK[("On-disk index<br/>.tvim · .tvd · .jsd · .tvtext")]
+  DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext)")]
 
   CLI --> SDK
   MCP --> SDK
@@ -88,13 +88,30 @@ in transitively by `sentence-transformers`, but importing LodeDB does not import
 
 ## Storage
 
-Durable on-disk format:
+Each index is a per-index generation directory plus a single atomically-swapped root pointer:
 
-- `.tvim` — the TurboVec index (quantized vectors + metadata),
-- `.tvd` — the encoded-row delta store,
-- `.jsd` — the state journal.
+- `<key>.commit.json` — the **root commit manifest**: the one file whose atomic swap commits
+  a generation. It pins (with checksums) the consistent set of artifacts for that generation.
+- `<key>.gen/` — generation-addressed artifacts for that index:
+  - `g<epoch>.json` — the redacted JSON state base, plus its `.jsd` document journal under
+    `g<epoch>.json.json-delta/`,
+  - `g<epoch>.tvim` — the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
+    encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
+  - `text-g<gen>.tvtext` — the opt-in raw-text sidecar (`store_text=True`), governed by the
+    same root manifest.
 
-`db.persist()` writes a snapshot; reopening the same path replays it safely.
+A commit writes any new artifacts first — bases are generation-addressed and never
+overwritten in place — then atomically swaps `<key>.commit.json`; that swap is the only
+commit point. A crash mid-commit leaves the previously committed generation fully intact: on
+reopen a writer rolls back to it (dropping the uncommitted artifacts) rather than failing
+closed, and a lock-free reader loads exactly the generation the root names — consistent
+snapshot isolation, raw text included. Superseded generations are garbage-collected, keeping
+the most recent few for in-flight readers. The redacted artifacts (`.json`/`.jsd`/`.tvim`/
+`.tvd`) never carry raw document or query text; only the `.tvtext` sidecar holds raw text.
+
+`db.persist()` returns durable stats (every mutation already commits atomically); reopening
+the same path replays the committed generation. Stores written before this layout (a
+top-level `<key>.json`) load via a legacy fallback and migrate on their next write.
 
 ## Embedding & scan
 

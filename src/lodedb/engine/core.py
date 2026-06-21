@@ -1782,11 +1782,10 @@ class LodeEngine:
         self._commit_manifest_path(key).unlink(missing_ok=True)
         shutil.rmtree(generation_dir(self.persistence_dir, key), ignore_errors=True)
         self._base_epochs.pop(key, None)
-        # Legacy (pre-commit-manifest) top-level base files and their journals.
+        # Legacy (pre-commit-manifest) top-level base files, journals, and the
+        # legacy raw-text sidecar. The generation-addressed text sidecars are
+        # inside the per-index directory removed above.
         self._gc_legacy_files(key)
-        # The opt-in raw-text sidecar (present only when raw-text storage was
-        # enabled) is removed with the rest of the index's local artifacts.
-        self._document_text_store(key).remove()
 
     def _index_shape_from_profile(
         self,
@@ -2381,19 +2380,21 @@ class LodeEngine:
         """Commits one index generation atomically via its root commit manifest.
 
         Each commit writes its durable artifacts under the per-index
-        ``<key>.gen/`` directory keyed by base epoch, then atomically swaps the
-        ``<key>.commit.json`` pointer — that swap is the single commit point, so
-        a crash leaves the previously committed generation fully intact. Raw
-        document text, when enabled, is written to its own auxiliary ``.tvtext``
-        sidecar (kept separate from the index's atomic set).
+        ``<key>.gen/`` directory keyed by base epoch — including the
+        generation-addressed raw-text sidecar — then atomically swaps the
+        ``<key>.commit.json`` pointer. That swap is the single commit point, so a
+        crash leaves the previously committed generation (text included) fully
+        intact.
         """
 
         if self.persistence_dir is None:
             return
         self._require_writable()
         self.persistence_dir.mkdir(parents=True, exist_ok=True)
-        self._persist_document_text(state)
         generation = self._index_generations.get(state.index_key, 0)
+        # Write the generation-addressed text sidecar first; the commit manifest
+        # below pins it, so it commits/rolls back atomically with the index.
+        tvtext = self._persist_document_text(state, generation=generation)
         pending_documents = self._pending_state_journal_documents.pop(state.index_key, None)
         pending_tvim = self._pending_tvim_deltas.pop(state.index_key, None)
         if state.chunks:
@@ -2402,9 +2403,10 @@ class LodeEngine:
                 generation=generation,
                 pending_documents=pending_documents,
                 pending_tvim=pending_tvim,
+                tvtext=tvtext,
             )
         else:
-            self._commit_empty_index(state, generation=generation)
+            self._commit_empty_index(state, generation=generation, tvtext=tvtext)
 
     def _write_state_json(self, state: ClientIndexState, *, path: Path, generation: int) -> int:
         """Atomically writes the full JSON state snapshot and returns its byte size."""
@@ -2501,6 +2503,7 @@ class LodeEngine:
         generation: int,
         pending_documents: dict[str, dict[str, None]] | None,
         pending_tvim: dict[str, Any] | None,
+        tvtext: tuple[bool, str | None],
     ) -> None:
         """Persists a non-empty direct-route index and seals it via the root manifest.
 
@@ -2566,6 +2569,7 @@ class LodeEngine:
                     generation=generation,
                     journal=journal,
                     tvim_store=tvim_store,
+                    tvtext=tvtext,
                 )
                 self._tvim_persist_telemetry[key] = {
                     "tvim_persist_mode": "delta_append",
@@ -2600,6 +2604,7 @@ class LodeEngine:
                 generation=generation,
                 journal=journal,
                 tvim_store=tvim_store,
+                tvtext=tvtext,
             )
             self._gc_after_base_rewrite(key, live_epoch=epoch)
             self._gc_legacy_files(key)
@@ -2616,7 +2621,13 @@ class LodeEngine:
         except (OSError, RuntimeError, ValueError) as exc:
             raise RuntimeError("TurboVec compact snapshot persistence failed") from exc
 
-    def _commit_empty_index(self, state: ClientIndexState, *, generation: int) -> None:
+    def _commit_empty_index(
+        self,
+        state: ClientIndexState,
+        *,
+        generation: int,
+        tvtext: tuple[bool, str | None],
+    ) -> None:
         """Commits an empty index: a base-only JSON state at a new epoch, no vectors."""
 
         key = state.index_key
@@ -2634,6 +2645,7 @@ class LodeEngine:
                 generation=generation,
                 journal=journal,
                 tvim_store=None,
+                tvtext=tvtext,
             )
             self._gc_after_base_rewrite(key, live_epoch=epoch)
             self._gc_legacy_files(key)
@@ -2652,11 +2664,17 @@ class LodeEngine:
         generation: int,
         journal: StateJournalStore,
         tvim_store: TvimDeltaStore | None,
+        tvtext: tuple[bool, str | None],
     ) -> None:
-        """Seals one committed generation by atomically swapping the root manifest."""
+        """Seals one committed generation by atomically swapping the root manifest.
+
+        ``tvtext`` is the ``(present, sha256)`` descriptor of the
+        generation-addressed raw-text sidecar written for this same generation,
+        so text is pinned by — and rolls back with — the committed generation.
+        """
 
         key = state.index_key
-        tvtext_present, tvtext_sha = self._tvtext_descriptor(key)
+        tvtext_present, tvtext_sha = tvtext
         body = build_commit_body(
             index_key=key,
             generation=generation,
@@ -2670,14 +2688,6 @@ class LodeEngine:
             tvtext_sha256=tvtext_sha,
         )
         write_commit_manifest(self._commit_manifest_path(key), body, fsync=self._fsync_on_commit)
-
-    def _tvtext_descriptor(self, key: str) -> tuple[bool, str | None]:
-        """Returns ``(present, sha256)`` for the auxiliary raw-text sidecar."""
-
-        store = self._document_text_store(key)
-        if store.exists():
-            return True, _sha256_file(store.sidecar_path)
-        return False, None
 
     def _gc_after_base_rewrite(self, key: str, *, live_epoch: int) -> None:
         """Removes superseded base epochs, keeping the most recent few for readers."""
@@ -2698,21 +2708,38 @@ class LodeEngine:
         base_json.unlink(missing_ok=True)
         base_tvim.unlink(missing_ok=True)
 
-    def _gc_legacy_files(self, key: str) -> None:
-        """Removes pre-commit-manifest top-level artifacts once migrated.
+    def _gc_tvtext(self, key: str, *, keep: int) -> None:
+        """Removes superseded raw-text sidecars, keeping the most recent ``keep``."""
 
-        A no-op when none exist. The auxiliary ``<key>.tvtext`` sidecar is kept
-        — it is still the live raw-text store under the new layout too.
+        directory = generation_dir(self.persistence_dir, key)
+        if not directory.is_dir():
+            return
+        sidecars: list[tuple[int, Path]] = []
+        for path in directory.glob("text-g*.tvtext"):
+            stem = path.name[len("text-g") : -len(".tvtext")]
+            if stem.isdigit():
+                sidecars.append((int(stem), path))
+        sidecars.sort(reverse=True)
+        for _generation, path in sidecars[keep:]:
+            path.unlink(missing_ok=True)
+
+    def _gc_legacy_files(self, key: str) -> None:
+        """Removes pre-commit-manifest top-level artifacts once migrated (no-op if none).
+
+        Includes the legacy top-level ``<key>.tvtext``: raw text now lives in the
+        per-index ``<key>.gen/`` directory governed by the commit manifest.
         """
 
         legacy_json = self._state_path(key)
         legacy_tvim = self._turbovec_snapshot_path(key)
-        if not legacy_json.exists() and not legacy_tvim.exists():
+        legacy_text = self._legacy_text_sidecar_path(key)
+        if not (legacy_json.exists() or legacy_tvim.exists() or legacy_text.exists()):
             return
         shutil.rmtree(StateJournalStore(legacy_json).journal_dir, ignore_errors=True)
         shutil.rmtree(TvimDeltaStore(legacy_tvim).delta_dir, ignore_errors=True)
         legacy_json.unlink(missing_ok=True)
         legacy_tvim.unlink(missing_ok=True)
+        legacy_text.unlink(missing_ok=True)
 
     def _load_persisted_indexes(self) -> None:
         """Loads persisted indexes, each from its atomic root commit manifest.
@@ -2758,9 +2785,18 @@ class LodeEngine:
         state = _state_from_payload(payload)
         if journal_stats is not None:
             self._state_load_telemetry[state.index_key] = dict(journal_stats)
-        self._load_document_text(state)
-        self._indexes[state.index_key] = state
         generation = int(body.get("generation", payload.get("columnar_generation", 0)))
+        # The raw-text sidecar is pinned by the root manifest at this same
+        # generation, so a torn commit's uncommitted text is never loaded.
+        tvtext = body.get("tvtext") or {}
+        self._load_document_text(
+            state,
+            sidecar_path=(
+                self._text_sidecar_path(key, generation) if tvtext.get("present") else None
+            ),
+            expected_sha=tvtext.get("sha256"),
+        )
+        self._indexes[state.index_key] = state
         self._index_generations[state.index_key] = generation
         self._base_epochs[state.index_key] = epoch
         if body.get("tvim_present"):
@@ -2789,7 +2825,9 @@ class LodeEngine:
         state = _state_from_payload(payload)
         if journal_stats is not None:
             self._state_load_telemetry[state.index_key] = dict(journal_stats)
-        self._load_document_text(state)
+        self._load_document_text(
+            state, sidecar_path=self._legacy_text_sidecar_path(state.index_key)
+        )
         self._indexes[state.index_key] = state
         generation = int(payload.get("columnar_generation", 0))
         self._index_generations[state.index_key] = generation
@@ -2871,6 +2909,39 @@ class LodeEngine:
             client_id_hash, epoch
         )
 
+    def _text_sidecar_path(self, client_id_hash: str, generation: int) -> Path:
+        """Returns the generation-addressed raw-text sidecar path for one index.
+
+        The raw-text sidecar is governed by the same root manifest as the
+        index: each commit writes ``<key>.gen/text-g<gen>.tvtext`` and pins it,
+        so a torn commit rolls text back to the committed generation (rather
+        than leaving an uncommitted overwrite visible to ``get``).
+        """
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        gen_dir = generation_dir(self.persistence_dir, client_id_hash)
+        return gen_dir / f"text-g{int(generation)}.tvtext"
+
+    def _legacy_text_sidecar_path(self, client_id_hash: str) -> Path:
+        """Returns the legacy (pre-commit-manifest) top-level raw-text sidecar path."""
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        return self.persistence_dir / f"{client_id_hash}.tvtext"
+
+    def _live_text_sidecar_path(self, client_id_hash: str) -> Path:
+        """Returns the raw-text sidecar path for the live committed generation.
+
+        Falls back to the legacy top-level sidecar for an unmigrated index.
+        """
+
+        if self._base_epochs.get(client_id_hash) is not None:
+            return self._text_sidecar_path(
+                client_id_hash, self._index_generations.get(client_id_hash, 0)
+            )
+        return self._legacy_text_sidecar_path(client_id_hash)
+
     @property
     def raw_text_storage_enabled(self) -> bool:
         """Returns whether this engine retains raw document text for retrieval.
@@ -2884,11 +2955,6 @@ class LodeEngine:
 
         return bool(self.security.allow_raw_result_text)
 
-    def _document_text_store(self, client_id_hash: str) -> DocumentTextStore:
-        """Returns the opt-in raw-text sidecar store for one client index key."""
-
-        return DocumentTextStore(self._state_path(client_id_hash), fsync=self._fsync_on_commit)
-
     def _capture_document_text(
         self,
         state: ClientIndexState,
@@ -2901,31 +2967,61 @@ class LodeEngine:
         for document in documents:
             state.document_text[document.document_id] = document.text
 
-    def _persist_document_text(self, state: ClientIndexState) -> None:
-        """Writes (or clears) the raw-text sidecar for one index when enabled."""
+    def _persist_document_text(
+        self, state: ClientIndexState, *, generation: int
+    ) -> tuple[bool, str | None]:
+        """Persists the generation-addressed raw-text sidecar; returns its descriptor.
+
+        Returns ``(present, sha256)`` for the root commit manifest to pin. When
+        raw-text storage is disabled (or there is no text), no sidecar is written
+        and the descriptor is ``(False, None)`` so a reader skips text entirely.
+        Old generations' sidecars are GC'd, keeping the most recent few so an
+        in-flight reader on a recent generation still finds its text — and so the
+        previously committed sidecar survives a torn (uncommitted) write.
+        """
 
         if self.persistence_dir is None:
-            return
-        store = self._document_text_store(state.index_key)
-        if self.raw_text_storage_enabled:
-            store.write(state.document_text)
-        else:
-            # A disabled engine never authored text; clear any stale sidecar so
+            return (False, None)
+        if not self.raw_text_storage_enabled:
+            # A disabled engine never authored text; drop any sidecars so
             # toggling the flag off does not silently keep old payloads on disk.
-            store.remove()
+            self._gc_tvtext(state.index_key, keep=0)
+            return (False, None)
+        sidecar = self._text_sidecar_path(state.index_key, generation)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        store = DocumentTextStore(sidecar_path=sidecar, fsync=self._fsync_on_commit)
+        store.write(state.document_text)  # an empty map removes the file
+        self._gc_tvtext(state.index_key, keep=DEFAULT_EPOCHS_RETAINED)
+        if store.exists():
+            return (True, _sha256_file(sidecar))
+        return (False, None)
 
-    def _load_document_text(self, state: ClientIndexState) -> None:
-        """Loads the raw-text sidecar into state when raw-text storage is on.
+    def _load_document_text(
+        self,
+        state: ClientIndexState,
+        *,
+        sidecar_path: Path | None,
+        expected_sha: str | None = None,
+    ) -> None:
+        """Loads the committed raw-text sidecar into state when present.
 
-        Fails closed: a corrupt or checksum-mismatched sidecar raises rather
-        than serving partial text. When raw-text storage is off the sidecar is
-        ignored entirely (and never read), so the redacted load path is
-        unchanged.
+        ``sidecar_path`` is the file the commit manifest pins (or the legacy
+        top-level sidecar); ``None`` means the committed generation has no text.
+        Fails closed if a pinned sidecar is missing or its checksum does not
+        match the commit manifest, rather than serving stale or partial text.
         """
 
         if self.persistence_dir is None or not self.raw_text_storage_enabled:
             return
-        state.document_text = self._document_text_store(state.index_key).load()
+        if sidecar_path is None:
+            return
+        if not sidecar_path.is_file():
+            if expected_sha is None:
+                return  # legacy/no sidecar present: nothing to load
+            raise RuntimeError("committed raw-text sidecar is missing")
+        if expected_sha is not None and _sha256_file(sidecar_path) != expected_sha:
+            raise RuntimeError("committed raw-text sidecar failed manifest checksum")
+        state.document_text = DocumentTextStore(sidecar_path=sidecar_path).load()
 
     def _load_turbovec_snapshot(
         self,
@@ -3756,6 +3852,8 @@ def audit_persisted_index_snapshots(persistence_dir: str | Path) -> dict[str, An
                 tvim_path=base_tvim_path(directory, key, epoch),
                 expected_key=key,
                 file_name=commit_path.name,
+                json_manifest=body.get("json"),
+                tvim_manifest=body.get("tvim"),
             )
         )
         audited_keys.add(key)
@@ -3789,27 +3887,35 @@ def _audit_snapshot_row(
     tvim_path: Path,
     expected_key: str,
     file_name: str,
+    json_manifest: dict[str, Any] | None = None,
+    tvim_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validates one index snapshot (base + journals + vector sidecar) for audit."""
+    """Validates one index snapshot (base + journals + vector sidecar) for audit.
+
+    ``json_manifest``/``tvim_manifest`` are the per-store manifests embedded in
+    the root commit manifest; passing them audits the **committed** generation
+    rather than whatever a crashed writer last left in the on-disk per-store
+    manifests (legacy snapshots pass ``None`` and use their on-disk manifests).
+    """
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     journal = StateJournalStore(json_path)
     journal_audit: dict[str, Any] = {}
-    if journal.has_manifest():
+    if json_manifest is not None or journal.has_manifest():
         # Journal segments are part of the persisted state: validate their
         # checksums, scan their bodies for raw-payload leaks, and replay them so
-        # the audited counts reflect the served state.
-        journal.validate_base_checksum()
-        for body in journal.iter_segment_bodies():
+        # the audited counts reflect the committed served state.
+        journal.validate_base_checksum(manifest=json_manifest)
+        for body in journal.iter_segment_bodies(manifest=json_manifest):
             segment_forbidden = _snapshot_forbidden_keys(body)
             if segment_forbidden:
                 keys = ", ".join(sorted(segment_forbidden))
                 raise ValueError(
                     f"{file_name} journal contains forbidden raw-payload keys: {keys}"
                 )
-        replay_stats = journal.replay_onto_payload(payload)
+        replay_stats = journal.replay_onto_payload(payload, manifest=json_manifest)
         journal_audit = {
-            **journal.storage_file_bytes(),
+            **journal.storage_file_bytes(manifest=json_manifest),
             "json_delta_segments_replayed": replay_stats["json_delta_segments_replayed"],
         }
     forbidden_keys = _snapshot_forbidden_keys(payload)
@@ -3838,10 +3944,10 @@ def _audit_snapshot_row(
         else {}
     )
     tvim_store = TvimDeltaStore(tvim_path)
-    if sidecar_audit and tvim_store.has_manifest():
+    if sidecar_audit and (tvim_manifest is not None or tvim_store.has_manifest()):
         # Delta segments extend the base `.tvim`; account for them so the audit
-        # covers every persisted byte of the direct route.
-        sidecar_audit.update(tvim_store.storage_file_bytes())
+        # covers every persisted byte of the committed direct route.
+        sidecar_audit.update(tvim_store.storage_file_bytes(manifest=tvim_manifest))
     return {
         "file_name": file_name,
         "client_id_hash": state.client_id_hash,
@@ -4230,9 +4336,8 @@ def _persisted_storage_bytes(
     # The opt-in raw-text sidecar is byte-counted (never inspected) so the
     # storage report stays honest about on-disk usage; it is zero unless
     # raw-text storage is enabled and at least one document is stored.
-    raw_text_bytes = int(
-        engine._document_text_store(state.index_key).storage_file_bytes()["raw_text_sidecar_bytes"]
-    )
+    raw_text_path = engine._live_text_sidecar_path(state.index_key)
+    raw_text_bytes = int(raw_text_path.stat().st_size) if raw_text_path.is_file() else 0
     total_bytes = int(
         json_bytes + sidecar_bytes + json_journal_bytes + tvim_delta_bytes + raw_text_bytes
     )

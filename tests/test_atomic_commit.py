@@ -190,6 +190,8 @@ def test_migrates_from_legacy_layout(tmp_path):
     gen = generation_dir(tmp_path, key)
     shutil.copy(gen / f"g{epoch}.json", tmp_path / f"{key}.json")
     shutil.copy(gen / f"g{epoch}.tvim", tmp_path / f"{key}.tvim")
+    # The legacy layout kept raw text in a top-level <key>.tvtext sidecar.
+    shutil.copy(gen / f"text-g{body['generation']}.tvtext", tmp_path / f"{key}.tvtext")
     commit_manifest_path(tmp_path, key).unlink()
     shutil.rmtree(gen)
     assert not commit_manifest_path(tmp_path, key).exists()
@@ -210,12 +212,75 @@ def test_migrates_from_legacy_layout(tmp_path):
     assert generation_dir(tmp_path, key).is_dir()
     assert not (tmp_path / f"{key}.json").exists()
     assert not (tmp_path / f"{key}.tvim").exists()
+    assert not (tmp_path / f"{key}.tvtext").exists()  # legacy text sidecar migrated away
 
     final = _writer(tmp_path)
     try:
         assert final.count() == 7 and final.get("new") == "post-migration"
+        assert final.get("d1") == "legacy doc 1"  # pre-migration text survived
     finally:
         final.close()
+
+
+def test_text_rolls_back_with_torn_commit(tmp_path, monkeypatch):
+    """A torn commit rolls raw text back with the generation.
+
+    Regression for P1: the raw-text sidecar is generation-addressed and pinned by
+    the root manifest, so a crashed commit's uncommitted replacement text is never
+    surfaced by the public ``get`` after rollback.
+    """
+
+    writer = _writer(tmp_path)
+    writer.add("committed text", id="a")
+    assert writer.get("a") == "committed text"
+    # Crash at the next commit's root swap, after the new text sidecar is written.
+    monkeypatch.setattr(core, "write_commit_manifest", _boom)
+    with pytest.raises(RuntimeError):
+        writer.add("UNCOMMITTED REPLACEMENT", id="a")
+    writer.close()
+    monkeypatch.undo()
+
+    recovered = _writer(tmp_path)
+    try:
+        assert recovered.count() == 1
+        assert recovered.get("a") == "committed text"  # not the uncommitted replacement
+    finally:
+        recovered.close()
+
+    reader = _reader(tmp_path)
+    try:
+        assert reader.get("a") == "committed text"
+    finally:
+        reader.close()
+
+
+def test_audit_reflects_committed_generation_after_torn_commit(tmp_path, monkeypatch):
+    """The auditor reports the committed generation, not a torn-ahead on-disk manifest.
+
+    Regression for P2: audit drives validation/replay/accounting from the manifests
+    embedded in the commit manifest, so a crashed delta commit's uncommitted segment
+    is not replayed into the audited counts.
+    """
+
+    writer = _writer(tmp_path)
+    writer.add("only committed doc", id="a")
+    assert writer.count() == 1
+    monkeypatch.setattr(core, "write_commit_manifest", _boom)
+    with pytest.raises(RuntimeError):
+        writer.add("ghost", id="ghost")  # delta append; on-disk journal goes ahead of the root
+    writer.close()
+    monkeypatch.undo()
+
+    # Audit must report the committed count (1), matching what a reopen sees.
+    report = audit_persisted_index_snapshots(tmp_path)
+    assert report["snapshot_count"] == 1
+    assert report["snapshot_files"][0]["document_count"] == 1
+
+    recovered = _writer(tmp_path)
+    try:
+        assert recovered.count() == 1
+    finally:
+        recovered.close()
 
 
 def test_gc_bounds_base_epochs(tmp_path, monkeypatch):

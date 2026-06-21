@@ -319,20 +319,22 @@ class StateJournalStore:
         if recorded and _sha256_file(self.base_path) != recorded:
             raise RuntimeError("state journal base snapshot failed manifest checksum")
 
-    def iter_segment_bodies(self) -> list[dict[str, Any]]:
+    def iter_segment_bodies(
+        self, *, manifest: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         """Returns validated segment bodies in order for audit inspection."""
 
-        manifest = self._read_manifest()
+        manifest = self._read_manifest() if manifest is None else manifest
         bodies: list[dict[str, Any]] = []
         for entry in manifest.get("deltas", []):
             segment = _read_journal_segment(self._validated_segment_path(entry))
             bodies.append(segment["body"])
         return bodies
 
-    def storage_file_bytes(self) -> dict[str, float]:
+    def storage_file_bytes(self, *, manifest: dict[str, Any] | None = None) -> dict[str, float]:
         """Returns manifest/base/delta byte accounting for telemetry."""
 
-        manifest = self._read_manifest_optional() or {}
+        manifest = (self._read_manifest_optional() if manifest is None else manifest) or {}
         base_bytes = float(manifest.get("base", {}).get("file_bytes", 0))
         deltas = manifest.get("deltas", [])
         delta_bytes = float(sum(int(delta.get("file_bytes", 0)) for delta in deltas))

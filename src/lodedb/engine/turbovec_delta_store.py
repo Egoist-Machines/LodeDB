@@ -304,10 +304,10 @@ class TvimDeltaStore:
         if recorded and _sha256_file(self.base_path) != recorded:
             raise RuntimeError("TurboVec base snapshot failed manifest checksum")
 
-    def storage_file_bytes(self) -> dict[str, float]:
+    def storage_file_bytes(self, *, manifest: dict[str, Any] | None = None) -> dict[str, float]:
         """Returns manifest/base/delta byte accounting for telemetry."""
 
-        manifest = self._read_manifest_optional() or {}
+        manifest = (self._read_manifest_optional() if manifest is None else manifest) or {}
         base_bytes = float(manifest.get("base", {}).get("file_bytes", 0))
         deltas = manifest.get("deltas", [])
         delta_bytes = float(sum(int(delta.get("file_bytes", 0)) for delta in deltas))

@@ -31,17 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on commit for power-loss durability. The default `"fast"` keeps the prior atomic-rename
   behavior (atomic, not power-loss durable) and commit throughput.
 - **Crash-atomic multi-file commits (atomic root manifest).** A commit touches several files
-  (JSON state base + `.jsd` journal, `.tvim` vector base + `.tvd` journal); they are now
-  written as generation-addressed artifacts under a per-index `<key>.gen/` directory and
-  sealed by atomically swapping a single `<key>.commit.json` root pointer — that swap is the
-  only commit point. Because bases are generation-addressed they are never overwritten in
-  place, so a crash (or `kill -9`) mid-commit leaves the previously committed generation fully
-  intact and the next open rolls back to it (dropping the uncommitted artifacts) instead of
-  failing closed and stuck. Lock-free readers load exactly the generation the root manifest
-  names — consistent snapshot isolation, no torn cross-file reads. Stores written by v0.1.x
-  load via a legacy fallback and migrate to the new layout on their next write; superseded
-  base generations are garbage-collected (the most recent few are retained for in-flight
-  readers).
+  (JSON state base + `.jsd` journal, `.tvim` vector base + `.tvd` journal, and the opt-in
+  `.tvtext` raw-text sidecar); they are now written as generation-addressed artifacts under a
+  per-index `<key>.gen/` directory and sealed by atomically swapping a single
+  `<key>.commit.json` root pointer — that swap is the only commit point. Because every
+  artifact (including raw text, on by default) is generation-addressed and pinned by the root,
+  none is overwritten in place, so a crash (or `kill -9`) mid-commit leaves the previously
+  committed generation fully intact and the next open rolls back to it (dropping the
+  uncommitted artifacts) instead of failing closed and stuck. Lock-free readers load exactly
+  the generation the root manifest names — consistent snapshot isolation (text included), no
+  torn cross-file reads. Stores written by v0.1.x load via a legacy fallback and migrate to
+  the new layout on their next write; superseded generations are garbage-collected (the most
+  recent few are retained for in-flight readers).
 
 ## [0.1.1] - 2026-06-20
 
