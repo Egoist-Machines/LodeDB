@@ -22,6 +22,9 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 - **Compact storage**: the MIT [TurboVec](#turbovec) core packs vectors into 2/4-bit codes
   and scans them with SIMD CPU kernels.
 - **In-process, on-disk** (`.tvim`/`.tvd`/`.jsd`): no daemon, no account, no API key.
+- **Safe concurrency**: one writer and many lock-free readers per path; every commit is
+  crash-atomic and rolls back to the last committed state on failure, never a torn store.
+  [How it works](#concurrency--durability).
 - **Private by default**: text, ids, and vectors stay local; telemetry is metrics-only
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
@@ -174,6 +177,25 @@ lodedb mcp         # stdio MCP server for agent memory
 lodedb benchmark   # local, metrics-only benchmark
 ```
 
+## Concurrency & durability
+
+- **Single writer, many readers, per path.** One handle holds the path open for *writing* at
+  a time (an exclusive OS advisory lock); a second writer waits for it to close, then fails
+  fast (`ConcurrentWriterError`) after `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s).
+  **Read-only** handles (`LodeDB.open_readonly(path)` or `read_only=True`; used by
+  `lodedb query`/`get`) take *no* lock, so they read one consistent committed snapshot **while**
+  a writer is open — they just don't auto-see the writer's in-flight changes (no live
+  cross-process refresh). Within one process the engine serializes operations under an
+  in-process lock, so the threaded `lodedb serve` safely shares one handle.
+- **Crash-atomic commits.** A commit spans several files, but it is sealed by atomically
+  swapping one `<key>.commit.json` root pointer over generation-addressed artifacts, so a
+  crash mid-commit rolls back to the last committed generation on reopen (never a torn,
+  half-applied store) and readers always load one consistent generation.
+- **Durability is `fast` by default.** Commits are *atomic* but not fsync'd. Pass
+  `durability="fsync"` (or `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each
+  file and its directory on commit for power-loss durability, at some commit-throughput cost.
+- **Local filesystems only** — the OS advisory lock is unreliable on NFS/SMB.
+
 ## Limitations
 
 - **Exact scan, no ANN.** Built for small-to-mid corpora where exact recall matters, not
@@ -181,19 +203,9 @@ lodedb benchmark   # local, metrics-only benchmark
 - **GPU is Linux/CUDA-only and opt-in** (`[gpu]`). macOS scans on the CPU; the MPS scan is
   experimental and was slower than NEON on the hardware tested.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
-- **Single writer, many readers, per path.** One handle holds the path open for *writing* at
-  a time (an exclusive OS advisory lock); a second writer waits for it to close, then fails
-  fast (`ConcurrentWriterError`) after `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s).
-  **Read-only** handles (`LodeDB.open_readonly(path)` or `read_only=True`; used by
-  `lodedb query`/`get`) take *no* lock, so they can read a committed snapshot **while** a
-  writer is open — they just don't auto-see the writer's in-flight changes (no live
-  cross-process refresh). Within one process the engine serializes operations under an
-  in-process lock, so the threaded `lodedb serve` safely shares one handle. Local filesystems
-  only (advisory locks are unreliable on NFS/SMB).
-- **Durability is `fast` by default.** Every commit is *atomic* (temp file + `os.replace`, so
-  a reader never sees a torn file), but not fsync'd. Pass `durability="fsync"` (or
-  `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each file and its directory on
-  commit for power-loss durability, at some commit-throughput cost.
+- **Single writer per path** — one writer at a time (many concurrent readers), with no live
+  cross-process refresh, on local filesystems only. See
+  [Concurrency & durability](#concurrency--durability).
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec

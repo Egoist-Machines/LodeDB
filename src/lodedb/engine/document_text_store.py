@@ -40,18 +40,30 @@ DOCUMENT_TEXT_SCHEMA_VERSION = 1
 class DocumentTextStore:
     """Manages one index's opt-in ``document_id -> raw text`` sidecar file."""
 
-    def __init__(self, base_path: str | Path, *, fsync: bool = False) -> None:
-        """Binds the store to a base ``.json`` path; the sidecar sits beside it.
+    def __init__(
+        self,
+        base_path: str | Path | None = None,
+        *,
+        fsync: bool = False,
+        sidecar_path: str | Path | None = None,
+    ) -> None:
+        """Binds the store to its sidecar file.
 
-        ``fsync`` makes the published sidecar power-loss durable (the engine's
-        ``durability="fsync"`` mode); the default keeps the fast atomic-rename
-        path.
+        Pass ``sidecar_path`` to name the file directly (the engine uses this for
+        the generation-addressed ``<key>.gen/text-g<gen>.tvtext`` artifact that
+        the commit manifest pins); otherwise the sidecar is derived from
+        ``base_path`` as ``<stem>.tvtext`` (the legacy layout). ``fsync`` makes
+        the published sidecar power-loss durable (``durability="fsync"``).
         """
 
-        base = Path(base_path)
-        self.base_path = base
         self._fsync = bool(fsync)
-        self.sidecar_path = base.with_name(base.stem + DOCUMENT_TEXT_SIDECAR_SUFFIX)
+        if sidecar_path is not None:
+            self.sidecar_path = Path(sidecar_path)
+            self.base_path = Path(base_path) if base_path is not None else self.sidecar_path
+        else:
+            base = Path(base_path)
+            self.base_path = base
+            self.sidecar_path = base.with_name(base.stem + DOCUMENT_TEXT_SIDECAR_SUFFIX)
 
     def exists(self) -> bool:
         """Returns whether a raw-text sidecar file is present for this index."""

@@ -50,7 +50,7 @@ def test_store_text_enabled_by_default(tmp_path):
     db.add("default-on document body", id="a")
     db.persist()
     assert db.get("a") == "default-on document body"
-    assert glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    assert glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)
     db.close()
 
 
@@ -64,7 +64,7 @@ def test_store_text_false_opts_out(tmp_path):
         db.get_text("a")
     with pytest.raises(ValueError, match="store_text=True"):
         db.get_texts(["a"])
-    assert not glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    assert not glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)
     db.close()
 
 
@@ -208,9 +208,9 @@ def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
     db.search("body", k=3)
     db.persist()
 
-    # Redacted JSON snapshot and journal deltas carry no raw text.
-    json_path = glob.glob(str(Path(tmp_path) / "*.json"))[0]
-    assert _SECRET not in Path(json_path).read_text(encoding="utf-8")
+    # Redacted JSON snapshot/manifest and journal deltas carry no raw text.
+    for json_file in glob.glob(str(Path(tmp_path) / "**" / "*.json"), recursive=True):
+        assert _SECRET not in Path(json_file).read_text(encoding="utf-8")
     for jsd in glob.glob(str(Path(tmp_path) / "**" / "*.jsd"), recursive=True):
         assert _SECRET not in Path(jsd).read_bytes().decode("utf-8", "replace")
 
@@ -225,7 +225,7 @@ def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
     assert _SECRET not in json.dumps(stats)
 
     # The dedicated sidecar (and only it) holds the text.
-    tvtext = glob.glob(str(Path(tmp_path) / "*.tvtext"))[0]
+    tvtext = glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0]
     assert _SECRET in Path(tvtext).read_text(encoding="utf-8")
     db.close()
 
@@ -252,7 +252,7 @@ def test_corrupt_text_sidecar_fails_closed(tmp_path):
     db.persist()
     db.close()
 
-    sidecars = glob.glob(str(Path(tmp_path) / "*.tvtext"))
+    sidecars = glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)
     assert sidecars, "expected a .tvtext sidecar"
     Path(sidecars[0]).write_text("not-valid-json {{{", encoding="utf-8")
     with pytest.raises(RuntimeError):
@@ -267,15 +267,13 @@ def test_text_store_checksum_mismatch_fails_closed(tmp_path):
     db.persist()
     db.close()
 
-    sidecar = Path(glob.glob(str(Path(tmp_path) / "*.tvtext"))[0])
+    sidecar = Path(glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0])
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     # Mutate the body without updating the recorded checksum.
     payload["body"]["documents"]["c"] = "tampered body"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
 
-    # The store binds to the base `.json` path; its sidecar is `<stem>.tvtext`.
-    base_path = sidecar.with_suffix(".json")
-    store = DocumentTextStore(base_path)
+    store = DocumentTextStore(sidecar_path=sidecar)
     assert store.sidecar_path == sidecar
     with pytest.raises(RuntimeError, match="checksum"):
         store.load()

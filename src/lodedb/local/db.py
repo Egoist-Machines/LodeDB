@@ -5,8 +5,12 @@
 - binds to loopback only (never a network address);
 - requires no authentication — the user never supplies or sees any credential;
 - keeps telemetry metrics-only (counts / bytes / latency, never payloads);
-- stores vectors in the compact TurboVec format with ``.tvim``/``.tvd``/``.jsd``
-  on-disk persistence.
+- stores vectors in the compact TurboVec format and commits every change
+  atomically via a per-index root manifest (``<key>.commit.json``) over
+  generation-addressed artifacts under ``<key>.gen/`` (``.json``/``.jsd``
+  state, ``.tvim``/``.tvd`` vectors, and the opt-in ``.tvtext`` raw text), so a
+  crash rolls back to the last committed generation and readers see a
+  consistent snapshot.
 
 On CUDA hosts, eligible batched queries can use the optional GPU-resident
 TurboVec scan; otherwise the compact CPU kernel is the source of truth and
@@ -99,8 +103,9 @@ class LodeDB:
         db.persist()
 
     All documents, embeddings, and queries stay local: nothing is sent to a
-    server, and no auth is required. Persistence reuses the engine's
-    ``.tvim``/``.tvd``/``.jsd`` on-disk format and replays safely on reopen.
+    server, and no auth is required. Each change commits atomically via the
+    engine's per-index root manifest, so a crash rolls back to the last
+    committed generation and reopening the same path replays it safely.
 
     Raw document text is retained by default in a dedicated on-disk sidecar, so
     the original text is retrievable by id (``get``/``get_text``/``get_texts``).
@@ -243,8 +248,8 @@ class LodeDB:
         """Adds (or replaces) one document and returns its id.
 
         A missing ``id`` is auto-generated. Reusing an id upserts that document.
-        Persistence (``.tvim``/``.tvd``/``.jsd``) is updated by the engine on
-        every mutation, so a crash after ``add`` is recoverable on reopen.
+        The engine commits this mutation atomically before returning, so a crash
+        after ``add`` rolls back cleanly to the last committed state on reopen.
         """
 
         self._require_writable()
