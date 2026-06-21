@@ -43,6 +43,12 @@ _STORE_TEXT_OPTION = typer.Option(
     help="Retain raw text so `lodedb get ID` can return it (default on; "
     "--no-store-text opts out).",
 )
+_DURABILITY_OPTION = typer.Option(
+    None,
+    "--durability",
+    help="fast (default: atomic but not power-loss durable) | fsync (fsync each "
+    "file + dir on commit, durable but slower). Unset reads LODEDB_DURABILITY.",
+)
 
 
 @app.command()
@@ -67,6 +73,7 @@ def index(
     device: str = _DEVICE_OPTION,
     file: Path | None = _FILE_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
+    durability: str | None = _DURABILITY_OPTION,
 ) -> None:
     """Adds documents to the local index (positional texts or --file lines).
 
@@ -84,7 +91,9 @@ def index(
         )
     if not docs:
         raise typer.BadParameter("provide document texts or --file")
-    db = LodeDB(path=path, model=model, device=device, store_text=store_text)
+    db = LodeDB(
+        path=path, model=model, device=device, store_text=store_text, durability=durability
+    )
     ids = db.add_many([{"text": text} for text in docs])
     db.persist()
     typer.echo(
@@ -109,22 +118,31 @@ def query(
     device: str = _DEVICE_OPTION,
     k: int = typer.Option(10, "--k", "-k", help="Number of results."),
 ) -> None:
-    """Searches the local index and prints redacted (score, id, metadata) rows."""
+    """Searches the local index and prints redacted (score, id, metadata) rows.
 
-    db = LodeDB(path=path, model=model, device=device)
-    hits = db.search(text, k=k)
-    typer.echo(
-        json.dumps(
-            {
-                "device": db.embedding_resolution.to_dict(),
-                "results": [
-                    {"score": h.score, "id": h.id, "metadata": h.metadata} for h in hits
-                ],
-            },
-            indent=2,
+    Opens the store read-only, so it can query a path even while a writer (e.g.
+    ``lodedb serve``) holds it.
+    """
+
+    try:
+        db = LodeDB(path=path, model=model, device=device, read_only=True)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        hits = db.search(text, k=k)
+        typer.echo(
+            json.dumps(
+                {
+                    "device": db.embedding_resolution.to_dict(),
+                    "results": [
+                        {"score": h.score, "id": h.id, "metadata": h.metadata} for h in hits
+                    ],
+                },
+                indent=2,
+            )
         )
-    )
-    db.close()
+    finally:
+        db.close()
 
 
 @app.command()
@@ -140,7 +158,10 @@ def get(
     with an error if the id is unknown or was indexed with ``--no-store-text``.
     """
 
-    db = LodeDB(path=path, model=model, device=device, store_text=True)
+    try:
+        db = LodeDB(path=path, model=model, device=device, store_text=True, read_only=True)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     try:
         text = db.get(id)
     finally:
@@ -189,6 +210,7 @@ def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Loopback/private bind host only."),
     port: int = typer.Option(8088, "--port", help="Local port."),
     store_text: bool = _STORE_TEXT_OPTION,
+    durability: str | None = _DURABILITY_OPTION,
 ) -> None:
     """Serves the local index over a minimal loopback HTTP API (no auth).
 
@@ -205,7 +227,13 @@ def serve(
         f"(model={model}, device={resolve_local_device(device)}, path={path})"
     )
     serve_local(
-        path=path, model=model, device=device, host=host, port=port, store_text=store_text
+        path=path,
+        model=model,
+        device=device,
+        host=host,
+        port=port,
+        store_text=store_text,
+        durability=durability,
     )
 
 

@@ -38,6 +38,12 @@ tests/                   local SDK suite + import-boundary guard
 - **Local path stays local:** the local SDK runs in a no-auth, loopback, CPU-scan profile.
   Don't add auth, network, or server requirements to it. The CUDA scan (`[gpu]`) is an
   opt-in extra and must stay lazy — importing LodeDB never requires CuPy.
+- **Concurrency invariants:** a writable handle holds the cross-process single-writer lock
+  (`engine/_filelock.py`) for its lifetime; a `read_only=True` handle takes **no** lock and
+  must never persist (`_persist_state` enforces this). Public `LodeEngine` operations run
+  under one reentrant in-process lock (`@_synchronized`) so the threaded `serve` can share a
+  handle. Persist every file via `durable_replace` (temp + `os.replace`, with the fsync gated
+  on `durability="fsync"`) — never write a persisted artifact in place.
 
 ## Develop
 

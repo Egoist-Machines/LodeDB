@@ -9,21 +9,24 @@ Public surface:
 - :func:`local_capability_report` — the data behind ``lodedb doctor``.
 """
 
+from lodedb.engine._filelock import ConcurrentWriterError
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
     resolve_local_device,
 )
-from lodedb.local.db import LodeDB, LodeSearchHit
+from lodedb.local.db import LodeDB, LodeSearchHit, ReadOnlyError
 from lodedb.local.doctor import local_capability_report
 from lodedb.local.presets import LOCAL_MODEL_PRESETS, LocalModelPreset, resolve_preset
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
+    "ConcurrentWriterError",
     "LodeDB",
     "LodeSearchHit",
     "LocalEmbeddingResolution",
     "LocalModelPreset",
+    "ReadOnlyError",
     "build_local_embedding_backend",
     "local_capability_report",
     "resolve_local_device",

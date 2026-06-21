@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from lodedb.local import (
     LOCAL_MODEL_PRESETS,
+    ConcurrentWriterError,
     LodeDB,
     LodeSearchHit,
+    ReadOnlyError,
     local_capability_report,
 )
 from lodedb.local.cli import app, main
@@ -21,8 +23,10 @@ __version__ = "0.1.1"
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
+    "ConcurrentWriterError",
     "LodeDB",
     "LodeSearchHit",
+    "ReadOnlyError",
     "app",
     "local_capability_report",
     "main",

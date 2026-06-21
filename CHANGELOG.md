@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout. The kernel releases the lock on process exit, so a crash never wedges the path.
   Local filesystems only (advisory locks are unreliable on NFS/SMB). Live cross-process
   refresh (a reader auto-seeing another live process's writes) remains out of scope.
+- **Read-only handles (single writer, many readers).** `LodeDB.open_readonly(path)` (or
+  `read_only=True`) opens a non-mutating snapshot that takes **no** writer lock, so it can
+  read a path while a writer holds it — `lodedb query` and `lodedb get` now use it, so they
+  work alongside a running `lodedb serve`/`mcp`. Mutating calls raise `ReadOnlyError`; the
+  path must already exist. A read-only open relies on per-file `os.replace` atomicity and
+  briefly retries if it catches a writer mid multi-file commit.
+- **In-process operation lock.** The engine now serializes its public operations under a
+  reentrant lock, so the threaded `lodedb serve` can safely share one handle across request
+  threads (concurrent `add`/`search`/`remove` no longer race on shared state).
+- **Configurable durability.** `durability="fsync"` (also `--durability fsync` on
+  `serve`/`index`, or `LODEDB_DURABILITY=fsync`) fsyncs each persisted file and its directory
+  on commit for power-loss durability. The default `"fast"` keeps the prior atomic-rename
+  behavior (atomic, not power-loss durable) and commit throughput.
 
 ## [0.1.1] - 2026-06-20
 

@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from lodedb.engine._atomic_io import durability_from_env, normalize_durability
 from lodedb.engine.core import (
     EngineDocument,
     EngineSecurityConfig,
@@ -82,6 +83,10 @@ class LodeSearchHit:
         return NotImplemented
 
 
+class ReadOnlyError(RuntimeError):
+    """Raised when a mutating call is made on a ``read_only=True`` LodeDB handle."""
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -119,6 +124,8 @@ class LodeDB:
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
         store_text: bool = True,
+        read_only: bool = False,
+        durability: str | None = None,
         route_registry_path: str | Path | None = None,
         _embedding_backend: Any | None = None,
     ) -> None:
@@ -126,6 +133,14 @@ class LodeDB:
 
         ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality).
         ``device`` is ``"auto"``/``"cpu"``/``"mps"``/``"cuda"`` (embedding only).
+        ``read_only=True`` opens a non-mutating snapshot handle that takes **no**
+        writer lock, so it can read a path while another process holds the
+        single-writer lock (e.g. query while ``lodedb serve`` runs); mutating
+        calls raise :class:`ReadOnlyError` and the path must already exist. See
+        :meth:`open_readonly`.
+        ``durability`` is ``"fast"`` (default: atomic but not power-loss durable)
+        or ``"fsync"`` (fsync each file + its directory on commit, trading commit
+        throughput for power-loss durability). Unset reads ``LODEDB_DURABILITY``.
         ``store_text`` controls durable raw-text retention and defaults to
         ``True``: the original text passed to ``add``/``add_many`` is kept in a
         dedicated on-disk sidecar so ``get``/``get_text``/``get_texts`` can return
@@ -138,6 +153,12 @@ class LodeDB:
 
         self.path = Path(path)
         self.store_text = bool(store_text)
+        self.read_only = bool(read_only)
+        # "fast" (atomic rename only) vs "fsync" (power-loss durable). An
+        # explicit arg wins; otherwise LODEDB_DURABILITY, else fast.
+        fsync_on_commit = (
+            durability_from_env() if durability is None else normalize_durability(durability)
+        )
         self.preset: LocalModelPreset = resolve_preset(model)
         seq_len = int(max_seq_length) if max_seq_length is not None else 256
 
@@ -159,7 +180,15 @@ class LodeDB:
             )
         self._embedding_backend = backend
 
-        self.path.mkdir(parents=True, exist_ok=True)
+        if self.read_only:
+            # A read-only handle reads an existing store; it never creates one,
+            # so a missing path is a clear error rather than a silent empty DB.
+            if not self.path.is_dir():
+                raise FileNotFoundError(
+                    f"LodeDB(read_only=True) requires an existing directory: {self.path}"
+                )
+        else:
+            self.path.mkdir(parents=True, exist_ok=True)
         security = EngineSecurityConfig(
             bind_host=_LOCAL_BIND_HOST,
             route_profile=self.preset.route_profile,
@@ -175,6 +204,8 @@ class LodeDB:
             ),
             chunk_character_limit=int(chunk_character_limit),
             persistence_dir=self.path,
+            read_only=self.read_only,
+            fsync_on_commit=fsync_on_commit,
             embedding_backend=backend,
             route_policy=self.preset.route_policy,
         )
@@ -190,6 +221,18 @@ class LodeDB:
 
     # -- public API ---------------------------------------------------------
 
+    @classmethod
+    def open_readonly(cls, path: str | Path, **kwargs: Any) -> LodeDB:
+        """Opens an existing store as a non-mutating, lock-free reader.
+
+        Sugar for ``LodeDB(path, read_only=True, **kwargs)``: it takes no writer
+        lock (so it can read a path while a writer holds it), serves
+        ``search``/``get``/``stats``, and raises :class:`ReadOnlyError` on any
+        mutating call. The path must already exist.
+        """
+
+        return cls(path, read_only=True, **kwargs)
+
     def add(
         self,
         text: str,
@@ -204,6 +247,7 @@ class LodeDB:
         every mutation, so a crash after ``add`` is recoverable on reopen.
         """
 
+        self._require_writable()
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be a non-empty string")
         document_id = str(id) if id is not None else self._next_auto_id()
@@ -224,6 +268,7 @@ class LodeDB:
         Batched embedding is more efficient than repeated ``add`` calls.
         """
 
+        self._require_writable()
         payload: list[EngineDocument] = []
         ids: list[str] = []
         for item in documents:
@@ -313,6 +358,7 @@ class LodeDB:
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
+        self._require_writable()
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
         # `delete_documents` reports `document_count` as the number of unique
@@ -417,12 +463,24 @@ class LodeDB:
 
     # -- internals ----------------------------------------------------------
 
+    def _require_writable(self) -> None:
+        """Raises :class:`ReadOnlyError` if this handle was opened read-only."""
+
+        if self.read_only:
+            raise ReadOnlyError(
+                "this LodeDB handle is read-only; open without read_only=True to modify it"
+            )
+
     def _ensure_index(self) -> None:
-        """Creates the single local index if it does not already exist."""
+        """Binds the single local index, creating it unless this handle is read-only."""
 
         try:
             self._index.get_index()
-        except Exception:  # noqa: BLE001 - missing index -> create it
+        except Exception:  # noqa: BLE001 - missing index
+            if self.read_only:
+                # A read-only handle never creates state: an absent index just
+                # means an empty or not-yet-written store, so reads return nothing.
+                return
             self._index.create(name="lodedb-local")
 
     def _next_auto_id(self) -> str:

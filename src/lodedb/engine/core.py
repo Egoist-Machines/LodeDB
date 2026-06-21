@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
+import threading
 import uuid
 import weakref
 from collections import deque
@@ -13,11 +15,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from lodedb.engine._atomic_io import durable_replace
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.engine.document_text_store import DocumentTextStore
 from lodedb.engine.embedding_backends import (
@@ -294,6 +297,25 @@ class _PreparedQuery:
     route: RouteDecision
 
 
+def _synchronized(method):
+    """Serializes a public engine operation on the per-engine in-process lock.
+
+    The local dev server shares one engine across request threads, and a
+    mutation rebuilds the cached columnar index that a concurrent query reads,
+    so every externally reachable operation (mutations and queries alike) runs
+    under one reentrant lock. This guards in-process threads; the cross-process
+    single-writer guarantee is the separate file lock. The lock favors
+    correctness over read parallelism — see the README concurrency notes.
+    """
+
+    @functools.wraps(method)
+    def _locked(self, *args, **kwargs):
+        with self._op_lock:
+            return method(self, *args, **kwargs)
+
+    return _locked
+
+
 class LodeEngine:
     """OSS engine: create/upsert/delete/query/stats over TurboVec + ``.tvim``/``.tvd``/``.jsd``.
 
@@ -308,6 +330,8 @@ class LodeEngine:
         route_registry: RouteRegistry,
         chunk_character_limit: int = 900,
         persistence_dir: str | Path | None = None,
+        read_only: bool = False,
+        fsync_on_commit: bool = False,
         embedding_backend: EngineEmbeddingBackend | None = None,
         route_policy: EngineRoutePolicy | None = None,
         gpu_memory_budget_bytes: int | None = None,
@@ -328,6 +352,12 @@ class LodeEngine:
         self.route_registry = route_registry
         self.chunk_character_limit = chunk_character_limit
         self.persistence_dir = Path(persistence_dir) if persistence_dir is not None else None
+        # A read-only handle never mutates or persists, and takes no writer lock
+        # (so it neither blocks nor is blocked by a live writer).
+        self._read_only = bool(read_only)
+        # fsync each published file + its directory on commit (power-loss
+        # durability) vs. the default atomic-but-fast rename.
+        self._fsync_on_commit = bool(fsync_on_commit)
         # Single-writer lock timeout (seconds), read once at construction.
         self._persist_lock_timeout = lodedb_lock_timeout_from_env()
         self.embedding_backend = embedding_backend
@@ -368,18 +398,32 @@ class LodeEngine:
         self._index_generations: dict[str, int] = {}
         self._audit_events: list[dict[str, Any]] = []
         self._metrics: list[dict[str, Any]] = []
+        # Serializes public operations within one process. The local dev server
+        # shares one engine across request threads, and a mutation rebuilds the
+        # cached columnar view a concurrent query reads, so reads and writes
+        # alike run under this reentrant lock (see ``@_synchronized``).
+        self._op_lock = threading.RLock()
         self._writer_lock: WriterLock | None = None
         if self.persistence_dir is not None:
-            self.persistence_dir.mkdir(parents=True, exist_ok=True)
-            # Acquire the single-writer lock before loading. A second process
-            # opening the same path waits for this handle to close and then fails
-            # fast (ConcurrentWriterError) once the timeout elapses.
-            self._acquire_writer_lock()
-            try:
-                self._load_persisted_indexes()
-            except BaseException:
-                self._release_writer_lock()
-                raise
+            if self._read_only:
+                # Read-only handles take NO writer lock — they neither block nor
+                # are blocked by a live writer. They load one committed snapshot,
+                # relying on os.replace per-file atomicity. A reader can still
+                # catch a writer mid multi-file commit and see a transient
+                # cross-file skew that fails validation, so the load is retried
+                # briefly before giving up.
+                self._load_persisted_indexes_with_retry()
+            else:
+                self.persistence_dir.mkdir(parents=True, exist_ok=True)
+                # Acquire the single-writer lock before loading. A second process
+                # opening the same path waits for this handle to close and then
+                # fails fast (ConcurrentWriterError) once the timeout elapses.
+                self._acquire_writer_lock()
+                try:
+                    self._load_persisted_indexes()
+                except BaseException:
+                    self._release_writer_lock()
+                    raise
 
     def _acquire_writer_lock(self) -> None:
         """Takes the exclusive single-writer lock for this engine's directory."""
@@ -411,18 +455,63 @@ class LodeEngine:
 
         self._release_writer_lock()
 
+    def _require_writable(self) -> None:
+        """Raises if this engine was opened read-only (mutations are forbidden).
+
+        Defense in depth: the SDK already blocks mutating verbs on a read-only
+        handle, so this should never fire on the normal path.
+        """
+
+        if self._read_only:
+            raise RuntimeError(
+                "LodeDB is open read-only; reopen without read_only=True to mutate"
+            )
+
+    def _load_persisted_indexes_with_retry(
+        self, *, attempts: int = 6, backoff_s: float = 0.05
+    ) -> None:
+        """Loads snapshots for a read-only handle, retrying a torn cross-file read.
+
+        A read-only handle holds no lock, so it can observe a writer partway
+        through the sequential publishes of a multi-file commit (e.g. the JSON
+        journal ahead of the ``.tvim`` store). That transient skew fails closed
+        on load; since a commit is sub-millisecond, a short bounded retry almost
+        always lands on a consistent generation. Genuine corruption still
+        surfaces — the last error is re-raised once the attempts are exhausted.
+        """
+
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                self._load_persisted_indexes()
+                return
+            except (RuntimeError, OSError, ValueError) as exc:
+                last_error = exc
+                # Drop any partially-loaded state before retrying a clean read.
+                self._indexes.clear()
+                self._turbovec_indexes.clear()
+                self._index_generations.clear()
+                self._gpu_direct_turbovec_sessions.clear()
+                if attempt + 1 < attempts:
+                    sleep(backoff_s)
+        assert last_error is not None
+        raise last_error
+
     @property
     def audit_events(self) -> tuple[dict[str, Any], ...]:
         """Returns redacted audit events emitted by endpoint handlers."""
 
-        return tuple(dict(event) for event in self._audit_events)
+        with self._op_lock:
+            return tuple(dict(event) for event in self._audit_events)
 
     @property
     def metrics(self) -> tuple[dict[str, Any], ...]:
         """Returns metrics-only telemetry emitted by endpoint handlers."""
 
-        return tuple(dict(metric) for metric in self._metrics)
+        with self._op_lock:
+            return tuple(dict(metric) for metric in self._metrics)
 
+    @_synchronized
     def create_index(
         self,
         *,
@@ -555,6 +644,7 @@ class LodeEngine:
         )
         return EngineResponse(201, _index_resource_payload(self, state, status="created"))
 
+    @_synchronized
     def list_indexes(self, *, context: EngineRequestContext) -> EngineResponse:
         """Lists redacted index resources owned by the authenticated client."""
 
@@ -569,6 +659,7 @@ class LodeEngine:
         ]
         return EngineResponse(200, {"status": "ok", "indexes": indexes})
 
+    @_synchronized
     def get_index(
         self,
         *,
@@ -582,6 +673,7 @@ class LodeEngine:
             return state
         return EngineResponse(200, _index_resource_payload(self, state))
 
+    @_synchronized
     def update_index(
         self,
         *,
@@ -607,6 +699,7 @@ class LodeEngine:
         self._emit("index_updated", context.client_id, {"index_id": state.index_id})
         return EngineResponse(200, _index_resource_payload(self, state))
 
+    @_synchronized
     def delete_index(
         self,
         *,
@@ -615,6 +708,7 @@ class LodeEngine:
     ) -> EngineResponse:
         """Deletes one authenticated client index and any local snapshot sidecars."""
 
+        self._require_writable()
         state = self._index_for_context(context, index_id=index_id)
         if isinstance(state, EngineResponse):
             return state
@@ -642,6 +736,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def build_documents(
         self,
         *,
@@ -685,6 +780,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def upsert_documents(
         self,
         *,
@@ -1109,6 +1205,7 @@ class LodeEngine:
             )
             return
 
+    @_synchronized
     def delete_documents(
         self,
         *,
@@ -1170,6 +1267,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def query(
         self,
         *,
@@ -1265,6 +1363,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def query_batch(
         self,
         *,
@@ -1437,6 +1536,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def list_documents(
         self,
         *,
@@ -1454,6 +1554,7 @@ class LodeEngine:
         ]
         return EngineResponse(200, {"status": "ok", "documents": documents})
 
+    @_synchronized
     def get_document(
         self,
         *,
@@ -1472,6 +1573,7 @@ class LodeEngine:
             return self._error(404, "document not found", "get_document", context.client_id)
         return EngineResponse(200, _document_resource_payload(state, document_id))
 
+    @_synchronized
     def get_document_text(
         self,
         *,
@@ -1518,6 +1620,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def get_document_texts(
         self,
         *,
@@ -1556,6 +1659,7 @@ class LodeEngine:
         self._emit("document_text_read", context.client_id, {"document_count": len(texts)})
         return EngineResponse(200, {"status": "ok", "documents": texts})
 
+    @_synchronized
     def stats(
         self,
         *,
@@ -1599,6 +1703,7 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
     def audit(
         self,
         *,
@@ -2299,6 +2404,7 @@ class LodeEngine:
 
         if self.persistence_dir is None:
             return
+        self._require_writable()
         self._persist_document_text(state)
         path = self._state_path(state.index_key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2339,7 +2445,7 @@ class LodeEngine:
             ),
             encoding="utf-8",
         )
-        temporary_path.replace(path)
+        durable_replace(temporary_path, path, fsync=self._fsync_on_commit)
         return int(path.stat().st_size)
 
     def _record_pending_state_journal_documents(
@@ -2391,15 +2497,15 @@ class LodeEngine:
         try:
             serving = self._turbovec_index_for_state(state)
             tvim_path = self._turbovec_snapshot_path(state.index_key)
-            tvim_store = TvimDeltaStore(tvim_path)
-            journal = StateJournalStore(path)
+            tvim_store = TvimDeltaStore(tvim_path, fsync=self._fsync_on_commit)
+            journal = StateJournalStore(path, fsync=self._fsync_on_commit)
             pending_tvim = self._pending_tvim_deltas.pop(state.index_key, None)
             if self.tvim_delta_persistence_policy != TvimDeltaPersistencePolicy.AUTO:
                 json_bytes = self._write_state_json(state, path=path, generation=generation)
                 journal.remove_all()
                 temporary_path = tvim_path.with_name(tvim_path.name + ".tmp")
                 serving.write(temporary_path)
-                temporary_path.replace(tvim_path)
+                durable_replace(temporary_path, tvim_path, fsync=self._fsync_on_commit)
                 if tvim_store.has_manifest():
                     tvim_store.remove_all()
                 self._tvim_persist_telemetry[state.index_key] = {
@@ -2551,7 +2657,7 @@ class LodeEngine:
     def _document_text_store(self, client_id_hash: str) -> DocumentTextStore:
         """Returns the opt-in raw-text sidecar store for one client index key."""
 
-        return DocumentTextStore(self._state_path(client_id_hash))
+        return DocumentTextStore(self._state_path(client_id_hash), fsync=self._fsync_on_commit)
 
     def _capture_document_text(
         self,

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import struct
 import time
 from dataclasses import dataclass
@@ -28,6 +27,8 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+from lodedb.engine._atomic_io import durable_replace
 
 TVIM_DELTA_DIR_SUFFIX = ".tvim-delta"
 TVIM_DELTA_MANIFEST_NAME = "manifest.json"
@@ -62,10 +63,16 @@ class TvimDeltaWrite:
 class TvimDeltaStore:
     """Manages the base `.tvim` plus ordered `.tvd` delta segments."""
 
-    def __init__(self, base_path: str | Path) -> None:
-        """Binds the store to the base `.tvim` path; the delta dir sits beside it."""
+    def __init__(self, base_path: str | Path, *, fsync: bool = False) -> None:
+        """Binds the store to the base `.tvim` path; the delta dir sits beside it.
+
+        ``fsync`` makes each published base/segment/manifest power-loss durable
+        (the engine's ``durability="fsync"`` mode); the default keeps the fast
+        atomic-rename path.
+        """
 
         self.base_path = Path(base_path)
+        self._fsync = bool(fsync)
         self.delta_dir = self.base_path.with_name(self.base_path.name + TVIM_DELTA_DIR_SUFFIX)
 
     @property
@@ -86,7 +93,7 @@ class TvimDeltaStore:
         self.base_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.base_path.with_name(self.base_path.name + ".tmp")
         index.write(str(temporary))
-        os.replace(temporary, self.base_path)
+        durable_replace(temporary, self.base_path, fsync=self._fsync)
         file_bytes = self.base_path.stat().st_size
         previous = self._read_manifest_optional()
         next_seq = int(previous.get("next_seq", 0)) if previous else 0
@@ -171,7 +178,7 @@ class TvimDeltaStore:
             handle.write(header_blob)
             for _, array in arrays:
                 handle.write(array.tobytes())
-        os.replace(temporary, segment_path)
+        durable_replace(temporary, segment_path, fsync=self._fsync)
         file_bytes = segment_path.stat().st_size
         manifest["deltas"] = list(manifest.get("deltas", [])) + [
             {
@@ -350,7 +357,7 @@ class TvimDeltaStore:
 
         temporary = self.manifest_path.with_name(self.manifest_path.name + ".tmp")
         temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, self.manifest_path)
+        durable_replace(temporary, self.manifest_path, fsync=self._fsync)
 
     def _manifest_segment_names(self, manifest: dict[str, Any] | None) -> list[str]:
         """Lists delta segment file names referenced by a manifest."""
