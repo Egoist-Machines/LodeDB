@@ -59,9 +59,15 @@ def durability_from_env(env: dict[str, str] | None = None) -> bool:
 
 
 def fsync_path(path: str | Path) -> None:
-    """Flushes one already-written file's contents to stable storage."""
+    """Flushes one already-written file's contents to stable storage.
 
-    fd = os.open(os.fspath(path), os.O_RDONLY)
+    Opened ``O_RDWR``, not ``O_RDONLY``: on Windows ``os.fsync`` maps to
+    ``_commit`` and fails with ``OSError: [Errno 9] Bad file descriptor`` on a
+    read-only descriptor, so the fd must carry write access (POSIX accepts
+    either).
+    """
+
+    fd = os.open(os.fspath(path), os.O_RDWR)
     try:
         os.fsync(fd)
     finally:
