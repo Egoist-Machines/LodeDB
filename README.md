@@ -89,6 +89,15 @@ Reopen with `LodeDB(path="./data")`; no migration step. Original text is kept in
 (384-dim) and `bge` (768-dim), with weights pulled from Hugging Face on first use. More in
 [`examples/`](examples/).
 
+Need to read a store another process is writing to? Open it read-only — it takes no writer
+lock, so it never blocks on (or is blocked by) the writer:
+
+```python
+reader = LodeDB.open_readonly("./data")   # or LodeDB(path="./data", read_only=True)
+reader.search("fox", k=5)                 # reads a committed snapshot
+reader.add("nope")                        # raises ReadOnlyError
+```
+
 ## GPU-resident index
 
 With the `[gpu]` extra on a CUDA host, LodeDB reconstructs the compact index into an fp16
@@ -172,10 +181,19 @@ lodedb benchmark   # local, metrics-only benchmark
 - **GPU is Linux/CUDA-only and opt-in** (`[gpu]`). macOS scans on the CPU; the MPS scan is
   experimental and was slower than NEON on the hardware tested.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
-- **Single-writer per path.** One handle holds the database open for writing at a time; a
-  second open waits for it to close, then fails fast (`ConcurrentWriterError`) after
-  `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s). Run one writer (e.g. the MCP server) and let
-  others read once it closes. Local filesystems only.
+- **Single writer, many readers, per path.** One handle holds the path open for *writing* at
+  a time (an exclusive OS advisory lock); a second writer waits for it to close, then fails
+  fast (`ConcurrentWriterError`) after `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s).
+  **Read-only** handles (`LodeDB.open_readonly(path)` or `read_only=True`; used by
+  `lodedb query`/`get`) take *no* lock, so they can read a committed snapshot **while** a
+  writer is open — they just don't auto-see the writer's in-flight changes (no live
+  cross-process refresh). Within one process the engine serializes operations under an
+  in-process lock, so the threaded `lodedb serve` safely shares one handle. Local filesystems
+  only (advisory locks are unreliable on NFS/SMB).
+- **Durability is `fast` by default.** Every commit is *atomic* (temp file + `os.replace`, so
+  a reader never sees a torn file), but not fsync'd. Pass `durability="fsync"` (or
+  `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each file and its directory on
+  commit for power-loss durability, at some commit-throughput cost.
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec

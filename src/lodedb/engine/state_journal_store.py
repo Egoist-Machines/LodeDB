@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from lodedb.engine._atomic_io import durable_replace
 
 STATE_JOURNAL_DIR_SUFFIX = ".json-delta"
 STATE_JOURNAL_MANIFEST_NAME = "manifest.json"
@@ -67,10 +68,16 @@ class StateJournalWrite:
 class StateJournalStore:
     """Manages the base JSON snapshot plus ordered `.jsd` document deltas."""
 
-    def __init__(self, base_path: str | Path) -> None:
-        """Binds the store to the base `.json` path; the journal dir sits beside it."""
+    def __init__(self, base_path: str | Path, *, fsync: bool = False) -> None:
+        """Binds the store to the base `.json` path; the journal dir sits beside it.
+
+        ``fsync`` makes each published segment and manifest power-loss durable
+        (the engine's ``durability="fsync"`` mode); the default keeps the fast
+        atomic-rename path.
+        """
 
         self.base_path = Path(base_path)
+        self._fsync = bool(fsync)
         self.journal_dir = self.base_path.with_name(
             self.base_path.name + STATE_JOURNAL_DIR_SUFFIX
         )
@@ -171,7 +178,7 @@ class StateJournalStore:
             handle.write(_HEADER_LENGTH.pack(len(header_blob)))
             handle.write(header_blob)
             handle.write(body_blob)
-        os.replace(temporary, segment_path)
+        durable_replace(temporary, segment_path, fsync=self._fsync)
         file_bytes = segment_path.stat().st_size
         manifest["deltas"] = list(manifest.get("deltas", [])) + [
             {
@@ -378,7 +385,7 @@ class StateJournalStore:
 
         temporary = self.manifest_path.with_name(self.manifest_path.name + ".tmp")
         temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, self.manifest_path)
+        durable_replace(temporary, self.manifest_path, fsync=self._fsync)
 
     def _manifest_segment_names(self, manifest: dict[str, Any] | None) -> list[str]:
         """Lists journal segment file names referenced by a manifest."""

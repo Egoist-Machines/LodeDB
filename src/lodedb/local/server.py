@@ -110,16 +110,22 @@ def serve_local(
     host: str = "127.0.0.1",
     port: int = 8088,
     store_text: bool = True,
+    durability: str | None = None,
 ) -> None:
     """Opens an :class:`LodeDB` and serves it on a loopback HTTP loop (blocking).
 
     Raw-text storage is on by default so ``POST /get`` can return a document's
-    original text by id; pass ``store_text=False`` to opt out.
+    original text by id; pass ``store_text=False`` to opt out. ``durability``
+    (``"fast"``/``"fsync"``) controls power-loss durability of each commit; this
+    is the writer that holds the path, so its requests are serialized by the
+    engine's in-process lock.
     """
 
     if not is_private_bind_host(host):
         raise ValueError("LodeDB local server host must be loopback or private network")
-    db = LodeDB(path=path, model=model, device=device, store_text=store_text)
+    db = LodeDB(
+        path=path, model=model, device=device, store_text=store_text, durability=durability
+    )
     handler = build_local_handler(db)
     server = ThreadingHTTPServer((host, port), handler)
     try:

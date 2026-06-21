@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
+
+from lodedb.engine._atomic_io import durable_replace
 
 DOCUMENT_TEXT_SIDECAR_SUFFIX = ".tvtext"
 DOCUMENT_TEXT_SCHEMA_VERSION = 1
@@ -39,11 +40,17 @@ DOCUMENT_TEXT_SCHEMA_VERSION = 1
 class DocumentTextStore:
     """Manages one index's opt-in ``document_id -> raw text`` sidecar file."""
 
-    def __init__(self, base_path: str | Path) -> None:
-        """Binds the store to a base ``.json`` path; the sidecar sits beside it."""
+    def __init__(self, base_path: str | Path, *, fsync: bool = False) -> None:
+        """Binds the store to a base ``.json`` path; the sidecar sits beside it.
+
+        ``fsync`` makes the published sidecar power-loss durable (the engine's
+        ``durability="fsync"`` mode); the default keeps the fast atomic-rename
+        path.
+        """
 
         base = Path(base_path)
         self.base_path = base
+        self._fsync = bool(fsync)
         self.sidecar_path = base.with_name(base.stem + DOCUMENT_TEXT_SIDECAR_SUFFIX)
 
     def exists(self) -> bool:
@@ -73,7 +80,7 @@ class DocumentTextStore:
         }
         temporary = self.sidecar_path.with_name(self.sidecar_path.name + ".tmp")
         temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, self.sidecar_path)
+        durable_replace(temporary, self.sidecar_path, fsync=self._fsync)
         return int(self.sidecar_path.stat().st_size)
 
     def load(self) -> dict[str, str]:
