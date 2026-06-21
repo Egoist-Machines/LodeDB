@@ -1,0 +1,96 @@
+{
+  "artifact_type": "lodedb_batched_retrieval_throughput",
+  "build_seconds": 7.2437,
+  "chunk_count": 50000,
+  "config": {
+    "batch_sizes": [
+      1,
+      16,
+      64,
+      256,
+      1024
+    ],
+    "doc_count": 50000,
+    "embedding_backend": "hash (embedding excluded; isolates retrieval)",
+    "k": 10,
+    "model": "minilm",
+    "native_dim": 384,
+    "query_count": 1024,
+    "repeats": 5
+  },
+  "document_count": 50000,
+  "gpu_available": false,
+  "machine": {
+    "machine": "arm64",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "processor": "arm"
+  },
+  "raw_payload_text_present": false,
+  "rows": [
+    {
+      "batch_size": 1,
+      "gpu_fallback_reason": "",
+      "gpu_stage_one_status": "not_applicable",
+      "k": 10,
+      "label": "cpu_batch_1",
+      "per_call_ms_p50": 0.7023,
+      "per_query_ms": 0.75138,
+      "policy": "off",
+      "queries_per_second": 1330.9,
+      "repeats": 5,
+      "stage_one_backend": ""
+    },
+    {
+      "batch_size": 16,
+      "gpu_fallback_reason": "",
+      "gpu_stage_one_status": "not_applicable",
+      "k": 10,
+      "label": "cpu_batch_16",
+      "per_call_ms_p50": 5.6331,
+      "per_query_ms": 0.33506,
+      "policy": "off",
+      "queries_per_second": 2984.6,
+      "repeats": 5,
+      "stage_one_backend": ""
+    },
+    {
+      "batch_size": 64,
+      "gpu_fallback_reason": "",
+      "gpu_stage_one_status": "not_applicable",
+      "k": 10,
+      "label": "cpu_batch_64",
+      "per_call_ms_p50": 17.4068,
+      "per_query_ms": 0.27425,
+      "policy": "off",
+      "queries_per_second": 3646.2,
+      "repeats": 5,
+      "stage_one_backend": ""
+    },
+    {
+      "batch_size": 256,
+      "gpu_fallback_reason": "",
+      "gpu_stage_one_status": "not_applicable",
+      "k": 10,
+      "label": "cpu_batch_256",
+      "per_call_ms_p50": 66.4513,
+      "per_query_ms": 0.26925,
+      "policy": "off",
+      "queries_per_second": 3714.0,
+      "repeats": 5,
+      "stage_one_backend": ""
+    },
+    {
+      "batch_size": 1024,
+      "gpu_fallback_reason": "",
+      "gpu_stage_one_status": "not_applicable",
+      "k": 10,
+      "label": "cpu_batch_1024",
+      "per_call_ms_p50": 261.5575,
+      "per_query_ms": 0.25759,
+      "policy": "off",
+      "queries_per_second": 3882.1,
+      "repeats": 5,
+      "stage_one_backend": ""
+    }
+  ]
+}
