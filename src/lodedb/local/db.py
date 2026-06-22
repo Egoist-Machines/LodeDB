@@ -39,7 +39,7 @@ from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
 )
-from lodedb.local.presets import LocalModelPreset, resolve_preset
+from lodedb.local.presets import LocalModelPreset, resolve_preset, vector_only_route_policy
 
 # Fixed local identifier for the single-process client context. It never leaves
 # the process and has no security meaning — the local engine is auth-free.
@@ -94,6 +94,15 @@ class ReadOnlyError(RuntimeError):
     """Raised when a mutating call is made on a ``read_only=True`` LodeDB handle."""
 
 
+class VectorOnlyIndexError(RuntimeError):
+    """Raised when a text-in call (``add``/``search``) is made on a vector-only handle.
+
+    A vector-only index (opened with ``vector_dim=`` / :meth:`open_vector_store`)
+    has no embedding model, so text cannot be embedded; use ``add_vectors`` /
+    ``search_by_vector`` with precomputed vectors instead.
+    """
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -128,6 +137,8 @@ class LodeDB:
         path: str | Path,
         *,
         model: str = "minilm",
+        vector_dim: int | None = None,
+        bit_width: int = 4,
         device: str = "auto",
         batch_size: int = 32,
         max_seq_length: int | None = None,
@@ -168,26 +179,54 @@ class LodeDB:
         fsync_on_commit = (
             durability_from_env() if durability is None else normalize_durability(durability)
         )
-        self.preset: LocalModelPreset = resolve_preset(model)
         seq_len = int(max_seq_length) if max_seq_length is not None else 256
+        # vector_dim set => a vector-only index (no embedding model): only the
+        # vector-in verbs work, at the caller's chosen dim. Otherwise a preset
+        # index that embeds text internally.
+        self.vector_only = vector_dim is not None
+        self.preset: LocalModelPreset | None
 
-        if _embedding_backend is not None:
-            backend = _embedding_backend
+        if self.vector_only:
+            if _embedding_backend is not None:
+                raise ValueError("vector_dim and _embedding_backend are mutually exclusive")
+            dim = int(vector_dim)  # type: ignore[arg-type]
+            if not 1 <= dim <= 65536:
+                raise ValueError("vector_dim must be between 1 and 65536")
+            self.preset = None
+            self._vector_dim_value: int | None = dim
+            backend = None
+            self._embedding_backend = None
             self.embedding_resolution = LocalEmbeddingResolution(
                 requested_device=device,
-                backend_name=getattr(backend, "name", "injected"),
-                effective_device="injected",
+                backend_name="none",
+                effective_device="none",
                 fallback_used=False,
-                fallback_reason="",
+                fallback_reason="vector-only index (no embedding model)",
             )
+            route_policy = vector_only_route_policy(dim, bit_width=int(bit_width))
+            route_profile = route_policy.profile
         else:
-            backend, self.embedding_resolution = build_local_embedding_backend(
-                self.preset,
-                device=device,
-                batch_size=batch_size,
-                max_seq_length=seq_len,
-            )
-        self._embedding_backend = backend
+            self.preset = resolve_preset(model)
+            self._vector_dim_value = None
+            if _embedding_backend is not None:
+                backend = _embedding_backend
+                self.embedding_resolution = LocalEmbeddingResolution(
+                    requested_device=device,
+                    backend_name=getattr(backend, "name", "injected"),
+                    effective_device="injected",
+                    fallback_used=False,
+                    fallback_reason="",
+                )
+            else:
+                backend, self.embedding_resolution = build_local_embedding_backend(
+                    self.preset,
+                    device=device,
+                    batch_size=batch_size,
+                    max_seq_length=seq_len,
+                )
+            self._embedding_backend = backend
+            route_policy = self.preset.route_policy
+            route_profile = self.preset.route_profile
 
         if self.read_only:
             # A read-only handle reads an existing store; it never creates one,
@@ -200,7 +239,7 @@ class LodeDB:
             self.path.mkdir(parents=True, exist_ok=True)
         security = EngineSecurityConfig(
             bind_host=_LOCAL_BIND_HOST,
-            route_profile=self.preset.route_profile,
+            route_profile=route_profile,
             telemetry_mode="metrics_only",
             allow_raw_result_text=self.store_text,
         )
@@ -216,7 +255,7 @@ class LodeDB:
             read_only=self.read_only,
             fsync_on_commit=fsync_on_commit,
             embedding_backend=backend,
-            route_policy=self.preset.route_policy,
+            route_policy=route_policy,
         )
         self._index = LodeIndex(
             self._engine,
@@ -242,6 +281,31 @@ class LodeDB:
 
         return cls(path, read_only=True, **kwargs)
 
+    @classmethod
+    def open_vector_store(
+        cls,
+        path: str | Path,
+        *,
+        vector_dim: int,
+        bit_width: int = 4,
+        **kwargs: Any,
+    ) -> LodeDB:
+        """Opens (or creates) a bring-your-own-vectors index at a chosen dimension.
+
+        Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
+        The index has **no internal embedding model**: only ``add_vectors`` /
+        ``add_vectors_many`` / ``search_by_vector`` / ``search_many_by_vector``
+        work, and the text-in verbs (``add``/``search``) raise
+        :class:`VectorOnlyIndexError`. Vectors must have dimension ``vector_dim``
+        (any value your own embedder produces, e.g. 1536 or 3072), so this is the
+        path for plugging LodeDB in as the vector backend behind a system that owns
+        its embedder. The dimension and a redacted ``model="external"`` identity are
+        persisted and re-enforced on reopen. Install without ``sentence-transformers``
+        is fine for a vector-only workload (the embedder is imported lazily).
+        """
+
+        return cls(path, vector_dim=vector_dim, bit_width=bit_width, **kwargs)
+
     def add(
         self,
         text: str,
@@ -257,6 +321,7 @@ class LodeDB:
         """
 
         self._require_writable()
+        self._require_text_capable()
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be a non-empty string")
         document_id = str(id) if id is not None else self._next_auto_id()
@@ -278,6 +343,7 @@ class LodeDB:
         """
 
         self._require_writable()
+        self._require_text_capable()
         payload: list[EngineDocument] = []
         ids: list[str] = []
         for item in documents:
@@ -328,7 +394,7 @@ class LodeDB:
 
         self._require_writable()
         document_id = str(id) if id is not None else self._next_auto_id()
-        prepared = _prepare_vector(vector, self.preset.native_dim, normalize=normalize)
+        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
         self._index.upsert_vectors_batch(
             (
                 EngineVectorDocument(
@@ -365,7 +431,7 @@ class LodeDB:
             payload.append(
                 EngineVectorDocument(
                     document_id=document_id,
-                    vector=_prepare_vector(vector, self.preset.native_dim, normalize=normalize),
+                    vector=_prepare_vector(vector, self._vector_dim, normalize=normalize),
                     metadata=_coerce_metadata(item.get("metadata")),
                 )
             )
@@ -404,6 +470,7 @@ class LodeDB:
         never leaves the process and never appears in telemetry.
         """
 
+        self._require_text_capable()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if k <= 0:
@@ -433,6 +500,7 @@ class LodeDB:
         identically to every query in the batch.
         """
 
+        self._require_text_capable()
         if not isinstance(queries, list) or not queries:
             raise ValueError("queries must be a non-empty list of strings")
         for query in queries:
@@ -481,7 +549,7 @@ class LodeDB:
 
         if k <= 0:
             raise ValueError("k must be positive")
-        prepared = _prepare_vector(vector, self.preset.native_dim, normalize=normalize)
+        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
         response = self._index.query_vector(
             prepared,
             top_k=int(k),
@@ -511,7 +579,7 @@ class LodeDB:
         normalized_filter = _normalize_filter(filter)
         items = [
             {
-                "vector": _prepare_vector(vector, self.preset.native_dim, normalize=normalize),
+                "vector": _prepare_vector(vector, self._vector_dim, normalize=normalize),
                 "top_k": int(k),
                 "filter": normalized_filter,
                 "include": ("metadata",),
@@ -707,12 +775,34 @@ class LodeDB:
 
     # -- internals ----------------------------------------------------------
 
+    @property
+    def _vector_dim(self) -> int:
+        """The embedding dimension this index accepts.
+
+        The preset's native dim in normal mode, or the caller's ``vector_dim`` in
+        a vector-only index.
+        """
+
+        if self._vector_dim_value is not None:
+            return self._vector_dim_value
+        assert self.preset is not None  # preset mode always has a preset
+        return self.preset.native_dim
+
     def _require_writable(self) -> None:
         """Raises :class:`ReadOnlyError` if this handle was opened read-only."""
 
         if self.read_only:
             raise ReadOnlyError(
                 "this LodeDB handle is read-only; open without read_only=True to modify it"
+            )
+
+    def _require_text_capable(self) -> None:
+        """Raises :class:`VectorOnlyIndexError` on a vector-only (no-embedder) handle."""
+
+        if self.vector_only:
+            raise VectorOnlyIndexError(
+                "this index is vector-only (no embedding model); use add_vectors / "
+                "add_vectors_many / search_by_vector / search_many_by_vector"
             )
 
     def _ensure_index(self) -> None:
