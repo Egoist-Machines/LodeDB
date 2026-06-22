@@ -161,6 +161,10 @@ enabling text retrieval keeps commits O(changed) too. Isolated, the per-commit t
 from a full-map rewrite (~57 ms at 20K docs, ~244 ms at 80K) to a flat **~0.7 ms** regardless of
 corpus size.
 
+And the rest of an incremental `add()` is O(changed) too: a single-doc update no longer rebuilds
+the whole index layout or rewrites the full text map on the commit path, so write latency stays
+flat as the corpus grows instead of climbing with it.
+
 ## Benchmarks
 
 All artifacts are metrics-only (counts, bytes, latency), never payloads. Full methodology
