@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
-from lodedb.engine._predicate import coerce_sdk_filter, compile_metadata_filter
+from lodedb.engine._predicate import coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
     EngineSecurityConfig,
@@ -698,40 +698,20 @@ class LodeDB:
 
         ``filter`` takes the same exact-match-or-predicate grammar as
         :meth:`search` (``$eq``/``$in``/``$gte``/``$and``/``$or``/… plus a
-        ``document_ids`` allowlist) and is evaluated against stored metadata.
-        The match currently runs in-process over the enumerated records (the
-        engine-side pushdown is tracked as a follow-up in
-        ``docs/research-prompts/``), so the result set is exact and complete.
+        ``document_ids`` allowlist). It is resolved engine-side through the
+        per-field planner in O(matches), not by scanning the corpus, so this stays
+        flat as the corpus grows while the match set stays small.
         """
 
         try:
-            raw = self._index.list_documents()
+            raw = self._index.list_documents(filter=_normalize_filter(filter))
         except EngineError as exc:
             # A read-only handle on a not-yet-written path has no index yet;
             # that is an empty store, not an error.
             if exc.status_code == 404:
                 return []
             raise
-        records = [_public_document_record(record) for record in raw]
-        if filter is None:
-            return records
-        normalized = _normalize_filter(filter) or {}
-        allow_ids: set[str] | None = None
-        if "document_ids" in normalized:
-            allow_ids = {str(value) for value in normalized["document_ids"]}
-        predicate = (
-            compile_metadata_filter(normalized["metadata"])
-            if "metadata" in normalized
-            else None
-        )
-        out: list[dict[str, Any]] = []
-        for record in records:
-            if allow_ids is not None and record["id"] not in allow_ids:
-                continue
-            if predicate is not None and not predicate(record["metadata"]):
-                continue
-            out.append(record)
-        return out
+        return [_public_document_record(record) for record in raw]
 
     def persist(self) -> dict[str, Any]:
         """Flushes durable on-disk state and returns redacted storage stats.
@@ -745,10 +725,17 @@ class LodeDB:
         # redacted stats, which include persisted byte accounting.
         return self._index.stats()
 
-    def count(self) -> int:
-        """Returns the number of documents currently stored."""
+    def count(self, *, filter: Mapping[str, Any] | None = None) -> int:
+        """Returns the number of documents stored, optionally matching a filter.
 
-        return int(self._index.stats().get("document_count", 0) or 0)
+        With ``filter`` (the same grammar as :meth:`search` / :meth:`list_documents`)
+        returns the count of matching documents, resolved engine-side through the
+        per-field planner in O(matches) without materializing any record.
+        """
+
+        if filter is None:
+            return int(self._index.stats().get("document_count", 0) or 0)
+        return self._index.count_documents(filter=_normalize_filter(filter))
 
     def stats(self) -> dict[str, Any]:
         """Returns redacted engine stats (counts, storage bytes, telemetry)."""

@@ -337,11 +337,27 @@ class LodeIndex:
 
         return self.delete_batch(document_ids)
 
-    def list_documents(self) -> list[dict[str, Any]]:
-        """Lists redacted document records for this index."""
+    def list_documents(
+        self,
+        *,
+        filter: Mapping[str, Any] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lists redacted document records for this index (optionally filtered).
+
+        ``filter`` resolves the matching set through the engine's planner in
+        O(matches); ``after``/``limit`` page a stable-id keyset cursor.
+        """
 
         response = self._unwrap(
-            self.engine.list_documents(context=self._context(), index_id=self.index_id)
+            self.engine.list_documents(
+                context=self._context(),
+                index_id=self.index_id,
+                filter=dict(filter) if filter is not None else None,
+                after=after,
+                limit=limit,
+            )
         )
         documents = response.get("documents", [])
         if not isinstance(documents, list):
@@ -351,6 +367,18 @@ class LodeIndex:
                 response=response,
             )
         return [dict(item) for item in documents]
+
+    def count_documents(self, *, filter: Mapping[str, Any] | None = None) -> int:
+        """Returns the document count for this index (optionally filtered)."""
+
+        response = self._unwrap(
+            self.engine.count_documents(
+                context=self._context(),
+                index_id=self.index_id,
+                filter=dict(filter) if filter is not None else None,
+            )
+        )
+        return int(response.get("count", 0) or 0)
 
     def get_document(self, document_id: str) -> dict[str, Any]:
         """Returns one redacted document record for this index."""

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from lodedb.engine import _filter_plan
 from lodedb.engine._atomic_io import durable_replace
 from lodedb.engine._commit_manifest import (
     COMMIT_MANIFEST_SUFFIX,
@@ -364,17 +365,21 @@ class _MetadataPostingIndex:
     nothing to the write/commit path.
     """
 
-    __slots__ = ("generation", "_postings", "_chunks_by_document")
+    __slots__ = ("generation", "_postings", "_chunks_by_document", "_fields", "_all_docs")
 
     def __init__(
         self,
         generation: int,
         postings: dict[tuple[str, str], set[str]],
         chunks_by_document: dict[str, list[str]],
+        fields: dict[str, _filter_plan.FieldIndex],
+        all_docs: set[str],
     ) -> None:
         self.generation = generation
         self._postings = postings
         self._chunks_by_document = chunks_by_document
+        self._fields = fields
+        self._all_docs = all_docs
 
     def allowlist(self, query_filter: Mapping[str, Any]) -> tuple[str, ...]:
         """Returns the eligible chunk ids for a validated metadata/document filter."""
@@ -397,6 +402,35 @@ class _MetadataPostingIndex:
             document_set = set(self._chunks_by_document)
         chunk_ids: list[str] = []
         for document_id in document_set:
+            chunk_ids.extend(self._chunks_by_document.get(document_id, ()))
+        return tuple(chunk_ids)
+
+    def document_allowlist(self, query_filter: Mapping[str, Any]) -> set[str]:
+        """Resolves a validated filter to the matching document-id set, no scan.
+
+        Uses set operations and bisect over the per-field value indexes
+        (``_filter_plan``), so resolution is O(matches + log V) rather than the
+        O(corpus) compiled-matcher scan. Handles the full predicate grammar and
+        the ``document_ids`` allowlist, and is shared by filtered search (then
+        expanded to chunk ids) and filtered enumeration / count.
+        """
+
+        metadata = query_filter.get("metadata")
+        if metadata:
+            document_set = _filter_plan.resolve(metadata, self._fields, self._all_docs)
+        else:
+            document_set = set(self._all_docs)
+        document_ids = query_filter.get("document_ids")
+        if document_ids is not None:
+            requested = {str(document_id) for document_id in document_ids}
+            document_set &= requested
+        return document_set
+
+    def chunk_allowlist(self, query_filter: Mapping[str, Any]) -> tuple[str, ...]:
+        """Returns eligible chunk ids for a validated filter via the planner."""
+
+        chunk_ids: list[str] = []
+        for document_id in self.document_allowlist(query_filter):
             chunk_ids.extend(self._chunks_by_document.get(document_id, ()))
         return tuple(chunk_ids)
 
@@ -1840,17 +1874,63 @@ class LodeEngine:
         *,
         context: EngineRequestContext,
         index_id: str | None = None,
+        filter: dict[str, Any] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
     ) -> EngineResponse:
-        """Lists redacted document records for one authenticated client index."""
+        """Lists redacted document records for one authenticated client index.
+
+        With ``filter`` (a validated metadata / ``document_ids`` filter), only the
+        matching documents are materialized, resolved through the per-field
+        planner in O(matches) rather than scanning the corpus. ``after``/``limit``
+        provide a stable-id keyset cursor for streaming large result sets.
+        """
 
         state = self._index_for_context(context, index_id=index_id, operation="list_documents")
         if isinstance(state, EngineResponse):
             return state
-        documents = [
-            _document_resource_payload(state, document_id)
-            for document_id in sorted(state.document_hashes)
-        ]
+        if filter is None:
+            document_ids = sorted(state.document_hashes)
+        else:
+            try:
+                query_filter = _validate_query_filter(filter)
+            except ValueError as exc:
+                return self._error(400, str(exc), "list_documents", context.client_id)
+            index = self._metadata_posting_index(state)
+            document_ids = sorted(index.document_allowlist(query_filter))
+        if after is not None:
+            cursor = str(after)
+            document_ids = [document_id for document_id in document_ids if document_id > cursor]
+        if limit is not None:
+            document_ids = document_ids[: max(0, int(limit))]
+        documents = [_document_resource_payload(state, document_id) for document_id in document_ids]
         return EngineResponse(200, {"status": "ok", "documents": documents})
+
+    @_synchronized
+    def count_documents(
+        self,
+        *,
+        context: EngineRequestContext,
+        index_id: str | None = None,
+        filter: dict[str, Any] | None = None,
+    ) -> EngineResponse:
+        """Returns the document count, optionally for a filter, materializing nothing.
+
+        ``count_documents(filter=...)`` resolves the matching document set through
+        the planner and returns its size, without building any record payload.
+        """
+
+        state = self._index_for_context(context, index_id=index_id, operation="count_documents")
+        if isinstance(state, EngineResponse):
+            return state
+        if filter is None:
+            return EngineResponse(200, {"status": "ok", "count": len(state.document_hashes)})
+        try:
+            query_filter = _validate_query_filter(filter)
+        except ValueError as exc:
+            return self._error(400, str(exc), "count_documents", context.client_id)
+        count = len(self._metadata_posting_index(state).document_allowlist(query_filter))
+        return EngineResponse(200, {"status": "ok", "count": count})
 
     @_synchronized
     def get_document(
@@ -2744,14 +2824,20 @@ class LodeEngine:
         cached = self._metadata_posting_indexes.get(state.index_key)
         if cached is not None and cached.generation == generation:
             return cached
-        postings: dict[tuple[str, str], set[str]] = {}
-        for document_id, metadata in state.document_metadata.items():
-            for key, value in metadata.items():
-                postings.setdefault((str(key), str(value)), set()).add(str(document_id))
+        # Build the per-field value indexes once; the exact-match (key, value)
+        # postings are derived from them (shared doc sets, read-only use), so the
+        # metadata is scanned a single time for both the fast exact path and the
+        # predicate planner.
+        fields, all_docs = _filter_plan.build_field_indexes(state.document_metadata)
+        postings: dict[tuple[str, str], set[str]] = {
+            (key, value): docs
+            for key, field in fields.items()
+            for value, docs in field.value_docs.items()
+        }
         chunks_by_document: dict[str, list[str]] = {}
         for chunk_id, chunk in state.chunks.items():
             chunks_by_document.setdefault(str(chunk.document_id), []).append(str(chunk_id))
-        index = _MetadataPostingIndex(generation, postings, chunks_by_document)
+        index = _MetadataPostingIndex(generation, postings, chunks_by_document, fields, all_docs)
         self._metadata_posting_indexes[state.index_key] = index
         return index
 
@@ -2768,9 +2854,13 @@ class LodeEngine:
         resolve via a compiled-predicate corpus scan instead.
         """
 
+        index = self._metadata_posting_index(state)
         if _is_predicate_filter(query_filter.get("metadata")):
-            return self._scan_filter_allowlist(state, query_filter)
-        return self._metadata_posting_index(state).allowlist(query_filter)
+            # Predicate filters resolve through the per-field planner (set ops +
+            # bisect, O(matches + log V)) instead of the O(corpus) compiled scan.
+            # _scan_filter_allowlist is retained as the parity oracle in tests.
+            return index.chunk_allowlist(query_filter)
+        return index.allowlist(query_filter)
 
     def _scan_filter_allowlist(
         self, state: ClientIndexState, query_filter: Mapping[str, Any]
