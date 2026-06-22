@@ -167,3 +167,10 @@ CLI command, `POST /get`, and the MCP `lodedb_get` tool) never weakens any paylo
 guarantee. Removing a document journals a delete. Opening with `store_text=False` opts out
 entirely: no text is retained, the retrieval paths raise/return empty, and any existing store is
 left unread (and dropped when its generation is GC'd).
+
+Hybrid lexical search keeps this boundary intact. The BM25 inverted index behind `mode="hybrid"`
+and `mode="lexical"` is payload-derived, so it is rebuilt in memory from the raw-text store on the
+first such query of a generation and discarded when the generation advances. It is never written
+to the `.json`/`.jsd`/`.tvim`/`.tvd` artifacts or to telemetry, which stays metrics-only (counts,
+bytes, latency, never tokens or terms). Because it is rebuilt from the raw-text store, hybrid and
+lexical search require `store_text=True`.

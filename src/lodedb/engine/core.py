@@ -37,6 +37,11 @@ from lodedb.engine._commit_manifest import (
     write_commit_manifest,
 )
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
+from lodedb.engine._lexical import (
+    Bm25Index,
+    build_chunk_texts,
+    reciprocal_rank_fusion,
+)
 from lodedb.engine._predicate import compile_metadata_filter, validate_metadata_filter
 from lodedb.engine.document_text_store import (
     DocumentTextStore,
@@ -99,6 +104,25 @@ _DRIFT_SAMPLE_LIMIT = 16
 ACTIVE_INDEX_STATUS = "ready"
 LEGACY_INDEX_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 QUERY_INCLUDE_METADATA = "metadata"
+# Retrieval modes for ``query``/``query_batch``. ``vector`` is the default and
+# leaves the existing scan untouched. ``hybrid`` fuses the vector scan with a
+# lexical BM25 ranker via Reciprocal Rank Fusion; ``lexical`` returns the BM25
+# ranking alone. The lexical and hybrid modes are a pure-Python CPU post-step
+# that requires retained raw text (the BM25 index is rebuilt from it).
+RETRIEVAL_MODE_VECTOR = "vector"
+RETRIEVAL_MODE_HYBRID = "hybrid"
+RETRIEVAL_MODE_LEXICAL = "lexical"
+RETRIEVAL_MODES = frozenset(
+    {RETRIEVAL_MODE_VECTOR, RETRIEVAL_MODE_HYBRID, RETRIEVAL_MODE_LEXICAL}
+)
+_LEXICAL_MODES = frozenset({RETRIEVAL_MODE_HYBRID, RETRIEVAL_MODE_LEXICAL})
+# A lexical/hybrid query pulls a widened candidate pool from each ranker before
+# fusing, so the fused top-k is not capped by either ranker's own top-k. The
+# pool is ``max(k * factor, floor)`` chunks; RRF (c=60) gives negligible weight
+# past a few dozen ranks, so a bounded widening is sufficient and keeps the
+# lexical pass O(matching chunks).
+_LEXICAL_POOL_FACTOR = 5
+_LEXICAL_POOL_FLOOR = 50
 PROJECTION_INITIAL_SOURCE = "initial_identity_prefix"
 PROJECTION_REFIT_SOURCE_INT8 = "int8_rerank"
 PROJECTION_REFIT_SOURCE_TRANSIENT_FLOAT = "transient_full_float"
@@ -151,6 +175,9 @@ class EngineQuery:
     route_drifted: bool = False
     route_failed: bool = False
     high_risk: bool = False
+    # Retrieval mode: ``vector`` (default), ``hybrid`` (BM25 + RRF), or
+    # ``lexical`` (BM25 only). See ``RETRIEVAL_MODES``.
+    mode: str = RETRIEVAL_MODE_VECTOR
 
 
 @dataclass(frozen=True)
@@ -329,6 +356,7 @@ class _PreparedQuery:
     query_filter: dict[str, Any]
     includes: tuple[str, ...]
     route: RouteDecision
+    mode: str = RETRIEVAL_MODE_VECTOR
 
 
 class _MetadataPostingIndex:
@@ -377,6 +405,39 @@ class _MetadataPostingIndex:
         for document_id in document_set:
             chunk_ids.extend(self._chunks_by_document.get(document_id, ()))
         return tuple(chunk_ids)
+
+
+class _LexicalServingIndex:
+    """Generation-keyed BM25 index over the corpus chunks for hybrid retrieval.
+
+    Built lazily from the retained raw document text on the first lexical or
+    hybrid query of a generation and reused after that, exactly like the
+    metadata posting index and the resident GPU session — so it never touches
+    the write/commit path. It is held in memory only: a BM25 inverted index is
+    payload-derived and must never reach the redacted artifacts or telemetry.
+    """
+
+    __slots__ = ("generation", "bm25", "_position_by_chunk_id")
+
+    def __init__(self, generation: int, bm25: Bm25Index, chunk_ids: list[str]) -> None:
+        self.generation = generation
+        self.bm25 = bm25
+        # chunk id -> position into the BM25 unit space, so a metadata allowlist
+        # (a set of chunk ids) maps to the positions BM25 may score, keeping the
+        # lexical ranker constrained to the same subset as the vector ranker.
+        self._position_by_chunk_id: dict[str, int] = {
+            chunk_id: position for position, chunk_id in enumerate(chunk_ids)
+        }
+
+    def allowed_positions(self, allowed_chunk_ids: tuple[str, ...]) -> set[int]:
+        """Maps an allowlist of chunk ids to BM25 unit positions (drops unknown ids)."""
+
+        position_by_chunk_id = self._position_by_chunk_id
+        return {
+            position_by_chunk_id[chunk_id]
+            for chunk_id in allowed_chunk_ids
+            if chunk_id in position_by_chunk_id
+        }
 
 
 @dataclass(frozen=True)
@@ -536,6 +597,10 @@ class LodeEngine:
         # Generation-keyed metadata posting index per index key, for O(matches)
         # filter allowlists. Rebuilt lazily when the generation advances.
         self._metadata_posting_indexes: dict[str, _MetadataPostingIndex] = {}
+        # Generation-keyed in-memory BM25 index per index key, for lexical/hybrid
+        # retrieval. Built lazily from retained raw text on the first lexical
+        # query of a generation; never persisted (a BM25 index is payload-derived).
+        self._lexical_indexes: dict[str, _LexicalServingIndex] = {}
         # Live base epoch per index key: which ``<key>.gen/g<epoch>.*`` artifacts
         # the committed root manifest points at. Set on load/commit; absent for a
         # not-yet-persisted or legacy (pre-commit-manifest) index.
@@ -828,6 +893,7 @@ class LodeEngine:
         self._pending_tvim_deltas.pop(state.index_key, None)
         self._pending_state_journal_documents.pop(state.index_key, None)
         self._metadata_posting_indexes.pop(state.index_key, None)
+        self._lexical_indexes.pop(state.index_key, None)
         self._delete_persisted_state(state)
         self._emit(
             "index_deleted",
@@ -1399,8 +1465,12 @@ class LodeEngine:
         try:
             query_filter = _validate_query_filter(query.filter)
             includes = _validate_query_includes(query.include)
+            mode = _validate_query_mode(query.mode)
         except ValueError as exc:
             return self._error(400, str(exc), "query", context.client_id)
+        lexical_unavailable = self._require_lexical_capable(mode)
+        if lexical_unavailable is not None:
+            return self._error(400, lexical_unavailable, "query", context.client_id)
 
         started_at = perf_counter()
         route = self.route_registry.select_route(
@@ -1416,13 +1486,23 @@ class LodeEngine:
         query_embedding_latency_ms = (perf_counter() - embedding_started) * 1000.0
         try:
             search_started = perf_counter()
-            query_result = self._query_serving_index(
-                state,
-                route=route,
-                query_embedding=query_embedding,
-                query_filter=query_filter,
-                top_k=query.top_k,
-            )
+            if mode == RETRIEVAL_MODE_VECTOR:
+                query_result = self._query_serving_index(
+                    state,
+                    route=route,
+                    query_embedding=query_embedding,
+                    query_filter=query_filter,
+                    top_k=query.top_k,
+                )
+            else:
+                query_result = self._query_serving_index_hybrid(
+                    state,
+                    query_embedding=query_embedding,
+                    query_text=query.text,
+                    query_filter=query_filter,
+                    top_k=query.top_k,
+                    mode=mode,
+                )
             query_search_latency_ms = (perf_counter() - search_started) * 1000.0
         except RuntimeError as exc:
             return self._error(503, str(exc), "query", context.client_id)
@@ -1504,8 +1584,12 @@ class LodeEngine:
             try:
                 query_filter = _validate_query_filter(item.filter)
                 includes = _validate_query_includes(item.include)
+                mode = _validate_query_mode(item.mode)
             except ValueError as exc:
                 return self._error(400, str(exc), "query_batch", context.client_id)
+            lexical_unavailable = self._require_lexical_capable(mode)
+            if lexical_unavailable is not None:
+                return self._error(400, lexical_unavailable, "query_batch", context.client_id)
             route = self.route_registry.select_route(
                 model=state.model,
                 provider=state.provider,
@@ -1520,6 +1604,7 @@ class LodeEngine:
                     query_filter=query_filter,
                     includes=includes,
                     route=route,
+                    mode=mode,
                 )
             )
 
@@ -2259,9 +2344,40 @@ class LodeEngine:
         query_results: list[_EngineTurboVecQueryResult | None],
         search_latencies: list[float],
     ) -> None:
-        """Executes prepared direct-route queries, batching multi-query requests."""
+        """Executes prepared direct-route queries, batching multi-query requests.
 
-        if len(prepared) > 1:
+        Lexical and hybrid queries run individually as a CPU post-step (they
+        share no native batch); the remaining pure-vector queries keep the
+        batched group path, so ``search_many`` with a mix of modes still batches
+        the vector queries and preserves request order for every result.
+        """
+
+        lexical_positions = [
+            position
+            for position, prepared_item in enumerate(prepared)
+            if prepared_item.mode != RETRIEVAL_MODE_VECTOR
+        ]
+        for position in lexical_positions:
+            prepared_item = prepared[position]
+            started = perf_counter()
+            query_results[position] = self._query_serving_index_hybrid(
+                state,
+                query_embedding=query_embeddings[position],
+                query_text=prepared_item.query.text,
+                query_filter=prepared_item.query_filter,
+                top_k=prepared_item.query.top_k,
+                mode=prepared_item.mode,
+            )
+            search_latencies[position] = (perf_counter() - started) * 1000.0
+
+        vector_positions = [
+            position
+            for position, prepared_item in enumerate(prepared)
+            if prepared_item.mode == RETRIEVAL_MODE_VECTOR
+        ]
+        if not vector_positions:
+            return
+        if len(vector_positions) > 1:
             serving = self._turbovec_index_for_state(state)
             batch = np.asarray(query_embeddings, dtype=np.float32)
             # Group queries that share an identical filter and run each group as
@@ -2270,10 +2386,10 @@ class LodeEngine:
             # top_k widths are sliced from the group's shared top-k, valid because
             # the kernel's ordering is deterministic for any prefix width.
             groups: dict[tuple[Any, ...], list[int]] = {}
-            for position, prepared_item in enumerate(prepared):
-                groups.setdefault(_filter_signature(prepared_item.query_filter), []).append(
-                    position
-                )
+            for position in vector_positions:
+                groups.setdefault(
+                    _filter_signature(prepared[position].query_filter), []
+                ).append(position)
             for positions in groups.values():
                 self._run_direct_batch_group(
                     state=state,
@@ -2285,18 +2401,17 @@ class LodeEngine:
                     search_latencies=search_latencies,
                 )
             return
-        for index, (prepared_item, query_embedding) in enumerate(
-            zip(prepared, query_embeddings, strict=True)
-        ):
-            started = perf_counter()
-            query_results[index] = self._query_serving_index(
-                state,
-                route=prepared_item.route,
-                query_embedding=query_embedding,
-                query_filter=prepared_item.query_filter,
-                top_k=prepared_item.query.top_k,
-            )
-            search_latencies[index] = (perf_counter() - started) * 1000.0
+        position = vector_positions[0]
+        prepared_item = prepared[position]
+        started = perf_counter()
+        query_results[position] = self._query_serving_index(
+            state,
+            route=prepared_item.route,
+            query_embedding=query_embeddings[position],
+            query_filter=prepared_item.query_filter,
+            top_k=prepared_item.query.top_k,
+        )
+        search_latencies[position] = (perf_counter() - started) * 1000.0
         return
 
     def _run_direct_batch_group(
@@ -2568,6 +2683,179 @@ class LodeEngine:
         index = _MetadataPostingIndex(generation, postings, chunks_by_document)
         self._metadata_posting_indexes[state.index_key] = index
         return index
+
+    def _lexical_serving_index(self, state: ClientIndexState) -> _LexicalServingIndex:
+        """Returns the generation-current BM25 index, building it lazily from raw text.
+
+        Keyed by the same generation as the serving index (so any mutation
+        rebuilds it on the next lexical query), and built from the retained raw
+        document text re-chunked the same way ingest chunks it, so BM25 shares
+        the exact chunk id space the vector scan ranks over. The index is held in
+        memory only and never persisted: a BM25 inverted index is payload-derived.
+        Callers must have verified raw text retention is on (see
+        :meth:`_require_lexical_capable`); this assumes it.
+        """
+
+        generation = self._index_generations.get(state.index_key, 0)
+        cached = self._lexical_indexes.get(state.index_key)
+        if cached is not None and cached.generation == generation:
+            return cached
+        chunk_ids, chunk_texts = build_chunk_texts(
+            state.document_text,
+            state.document_chunk_ids,
+            chunk_text,
+            self.chunk_character_limit,
+        )
+        bm25 = Bm25Index(chunk_ids, chunk_texts)
+        index = _LexicalServingIndex(generation, bm25, chunk_ids)
+        self._lexical_indexes[state.index_key] = index
+        return index
+
+    def _require_lexical_capable(self, mode: str) -> str | None:
+        """Returns an actionable error message when a lexical mode is unavailable.
+
+        Lexical and hybrid retrieval rebuild a BM25 index from the retained raw
+        text, so they require ``store_text=True`` (the engine's
+        ``allow_raw_result_text``). Returns ``None`` when the mode is serviceable.
+        """
+
+        if mode in _LEXICAL_MODES and not self.raw_text_storage_enabled:
+            return (
+                f"mode={mode!r} requires retained document text; open LodeDB with "
+                "store_text=True (the BM25 index is rebuilt from the raw-text store)"
+            )
+        return None
+
+    def _lexical_chunk_ranking(
+        self,
+        state: ClientIndexState,
+        *,
+        query_text: str,
+        limit: int,
+        allowed_chunk_ids: tuple[str, ...] | None,
+    ) -> list[str]:
+        """Returns BM25-ranked chunk ids for one query, constrained to the allowlist."""
+
+        lexical = self._lexical_serving_index(state)
+        allowed_positions = (
+            lexical.allowed_positions(allowed_chunk_ids)
+            if allowed_chunk_ids is not None
+            else None
+        )
+        if allowed_positions is not None and not allowed_positions:
+            return []
+        ranked = lexical.bm25.rank(
+            query_text, limit=limit, allowed_indices=allowed_positions
+        )
+        return [chunk_id for chunk_id, _score in ranked]
+
+    def _vector_chunk_ranking(
+        self,
+        vector_result: _EngineTurboVecQueryResult,
+    ) -> list[str]:
+        """Returns the vector scan's chunk ids in rank order (best first)."""
+
+        chunk_ids_by_stable_id = vector_result.index.chunk_ids_by_stable_id
+        return [
+            chunk_ids_by_stable_id[int(stable_id)]
+            for stable_id in vector_result.stable_ids
+        ]
+
+    def _fused_query_result(
+        self,
+        *,
+        serving: TurboVecServingIndex,
+        vector_chunk_ids: list[str],
+        lexical_chunk_ids: list[str],
+        mode: str,
+        base_result: _EngineTurboVecQueryResult,
+    ) -> _EngineTurboVecQueryResult:
+        """Fuses the vector and lexical chunk rankings into a result for materialization.
+
+        ``hybrid`` fuses both rankings with RRF; ``lexical`` uses the BM25 order
+        alone (still expressed as an RRF-style descending score so the public row
+        shape is unchanged). The fused chunk ids are mapped back to stable ids so
+        the existing :func:`_materialize_query_results` collapses chunks to
+        documents exactly as the vector path does.
+        """
+
+        if mode == RETRIEVAL_MODE_LEXICAL:
+            fused = reciprocal_rank_fusion((lexical_chunk_ids,))
+        else:
+            fused = reciprocal_rank_fusion((vector_chunk_ids, lexical_chunk_ids))
+        reverse = serving._stable_id_by_chunk_id  # type: ignore[attr-defined]
+        stable_ids: list[int] = []
+        scores: list[float] = []
+        for chunk_id, score in fused:
+            stable_id = reverse.get(chunk_id)
+            if stable_id is None:
+                continue
+            stable_ids.append(int(stable_id))
+            scores.append(float(score))
+        return _EngineTurboVecQueryResult(
+            index=serving,
+            stable_ids=np.asarray(stable_ids, dtype=np.uint64),
+            scores=np.asarray(scores, dtype=np.float32),
+            native_used=base_result.native_used,
+            native_backend=base_result.native_backend,
+            retrieval_mode=mode,
+            fallback_used=base_result.fallback_used,
+            compact_route_fallback=base_result.compact_route_fallback,
+        )
+
+    def _query_serving_index_hybrid(
+        self,
+        state: ClientIndexState,
+        *,
+        query_embedding: tuple[float, ...],
+        query_text: str,
+        query_filter: Mapping[str, Any],
+        top_k: int,
+        mode: str,
+    ) -> _EngineTurboVecQueryResult:
+        """Runs a lexical or hybrid query as a pure-CPU post-step over the vector scan.
+
+        Pulls a widened candidate pool from each ranker (so the fused top-k is not
+        capped by either ranker's own top-k), constrains BOTH rankers to the same
+        metadata allowlist, fuses with RRF, and returns a result whose stable ids
+        carry the fused chunk order for the shared materialization step. The
+        vector scan itself is untouched: this never enters the GPU/MPS or kernel
+        paths and adds nothing to the write/commit path.
+        """
+
+        serving = self._turbovec_index_for_state(state)
+        pool = max(top_k * _LEXICAL_POOL_FACTOR, _LEXICAL_POOL_FLOOR)
+        allowed_chunk_ids: tuple[str, ...] | None = None
+        if query_filter:
+            allowed_chunk_ids = self._build_filter_allowlist(state, query_filter)
+            if not allowed_chunk_ids:
+                return _empty_turbovec_result(serving)
+
+        if mode == RETRIEVAL_MODE_LEXICAL:
+            vector_chunk_ids: list[str] = []
+            base_result = _empty_turbovec_result(serving)
+        else:
+            base_result = self._query_direct_turbovec_index(
+                state,
+                query_embedding=query_embedding,
+                top_k=pool,
+                query_filter=query_filter,
+            )
+            vector_chunk_ids = self._vector_chunk_ranking(base_result)
+
+        lexical_chunk_ids = self._lexical_chunk_ranking(
+            state,
+            query_text=query_text,
+            limit=pool,
+            allowed_chunk_ids=allowed_chunk_ids,
+        )
+        return self._fused_query_result(
+            serving=serving,
+            vector_chunk_ids=vector_chunk_ids,
+            lexical_chunk_ids=lexical_chunk_ids,
+            mode=mode,
+            base_result=base_result,
+        )
 
     def _build_filter_allowlist(
         self, state: ClientIndexState, query_filter: Mapping[str, Any]
@@ -4205,6 +4493,22 @@ def _validate_query_includes(include: tuple[str, ...]) -> tuple[str, ...]:
             raise ValueError("include may only contain metadata")
         cleaned.append(value)
     return tuple(dict.fromkeys(cleaned))
+
+
+def _validate_query_mode(mode: Any) -> str:
+    """Validates the retrieval mode and returns the canonical lowercase value."""
+
+    if mode is None:
+        return RETRIEVAL_MODE_VECTOR
+    if not isinstance(mode, str):
+        raise ValueError("mode must be a string")
+    value = mode.strip().lower()
+    if not value:
+        return RETRIEVAL_MODE_VECTOR
+    if value not in RETRIEVAL_MODES:
+        allowed = ", ".join(sorted(RETRIEVAL_MODES))
+        raise ValueError(f"mode must be one of: {allowed}")
+    return value
 
 
 def _filter_signature(query_filter: Mapping[str, Any]) -> tuple[Any, ...]:

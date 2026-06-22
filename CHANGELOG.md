@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Hybrid lexical + vector search (BM25 + RRF).** `search`/`search_many` take a `mode`
+  parameter: `"vector"` (default, unchanged), `"hybrid"`, and `"lexical"`. Hybrid runs an
+  Okapi BM25 ranker alongside the vector scan and fuses the two ranked lists with Reciprocal
+  Rank Fusion, so exact tokens the embedding misses (error codes like `E1234`, serials like
+  `ABC-123`, dates like `2024-01-15`) are recovered when they appear in the document body. The
+  tokenizer keeps code-like tokens whole. A `filter` constrains both rankers, so filtered
+  hybrid returns the true top-k of the matching subset. Lexical ranking and fusion are a
+  pure-Python CPU post-step (the vector kernel, GPU, and MPS paths are untouched), the BM25
+  index is rebuilt in memory from the retained raw text and never persisted or sent to
+  telemetry, and the on-disk format is unchanged. `mode="hybrid"`/`"lexical"` require
+  `store_text=True` and raise a clear error otherwise; a persisted, journaled postings store
+  is a planned follow-up.
 
 ## [0.1.2] - 2026-06-22
 

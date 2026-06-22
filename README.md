@@ -87,6 +87,9 @@ for hits in db.search_many(["fox", "dog"], k=5):   # batched; the GPU can serve 
 db.search("fox", k=5, filter={"topic": "animals"})                      # bare scalar = exact
 db.search("fox", k=5, filter={"$or": [{"topic": "animals"}, {"year": {"$gte": 2020}}]})
 
+# hybrid search: vector recall plus exact lexical matches the embedding misses
+db.search("E1234", k=5, mode="hybrid")     # surfaces error codes, serials, dates in the body
+
 db.get(fox)     # -> "the quick brown fox jumps"  (text retained by default)
 db.persist()    # durable .tvim/.tvd/.jsd snapshot; replays on reopen
 ```
@@ -104,6 +107,29 @@ reader = LodeDB.open_readonly("./data")   # or LodeDB(path="./data", read_only=T
 reader.search("fox", k=5)                 # reads a committed snapshot
 reader.add("nope")                        # raises ReadOnlyError
 ```
+
+## Hybrid search
+
+Vector search alone misses exact tokens the embedding does not capture: error codes
+(`E1234`), serial numbers (`ABC-123`), dates (`2024-01-15`). Pass `mode="hybrid"` to run a
+lexical BM25 ranker alongside the vector scan and fuse the two ranked lists with Reciprocal
+Rank Fusion. The lexical ranker matches those tokens exactly, so a document whose body carries
+the code is recovered even when the embedding ranks it nowhere near the top.
+
+```python
+db.add("the turbine tripped and reported fault code E1234 overnight", metadata={"unit": "t3"})
+
+db.search("E1234", k=5)                 # mode="vector" (default): may miss the exact code
+db.search("E1234", k=5, mode="hybrid")  # BM25 + RRF: surfaces it in the top-k
+db.search("E1234", k=5, mode="lexical") # BM25 ranking alone, no vector scan
+```
+
+Hybrid is a pure-CPU post-step over the same vector scan, so it changes no kernel or on-disk
+format. A `filter` constrains both rankers, so `mode="hybrid"` with a filter returns the true
+top-k of the matching subset. The BM25 index is rebuilt in memory from the retained raw text,
+so `mode="hybrid"`/`"lexical"` require `store_text=True` (the default); they raise a clear
+error under `store_text=False`. The tokenizer lowercases and splits on punctuation but keeps
+code-like tokens whole, so `ABC-123` and `2024-01-15` stay findable as single tokens.
 
 ## GPU-resident index
 
@@ -221,6 +247,9 @@ lodedb benchmark   # local, metrics-only benchmark
   faster on the measured M1, so the MPS scan stays off by default until newer Apple GPUs are
   re-measured.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
+- **Hybrid search requires retained text and is rebuilt in memory.** `mode="hybrid"`/`"lexical"`
+  need `store_text=True` and rebuild the BM25 index lazily after a mutation; a persisted,
+  journaled postings store is a planned follow-up.
 - **Single writer per path.** One writer at a time (many concurrent readers), with no live
   cross-process refresh, on local filesystems only. See
   [Concurrency & durability](#concurrency--durability).
