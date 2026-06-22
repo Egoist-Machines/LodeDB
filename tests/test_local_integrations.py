@@ -39,3 +39,24 @@ def test_langchain_vectorstore_roundtrip(tmp_path):
     assert store.delete(["a"]) is True
     assert store.delete([]) is False
     db.close()
+
+
+def test_langchain_vectorstore_predicate_filter(tmp_path):
+    """The LangChain adapter passes predicate filters straight through to LodeDB."""
+
+    pytest.importorskip("langchain_core")  # needs lodedb[langchain]
+
+    from lodedb.local.integrations.langchain import LodeDBVectorStore
+
+    db = LodeDB(
+        path=tmp_path, model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384)
+    )
+    store = LodeDBVectorStore(db)
+    store.add_texts(
+        ["alpha document", "beta document", "gamma document"],
+        metadatas=[{"year": 2019}, {"year": 2021}, {"year": 2023}],
+        ids=["a", "b", "c"],
+    )
+    docs = store.similarity_search("document", k=10, filter={"year": {"$gte": 2021}})
+    assert {d.metadata["id"] for d in docs} == {"b", "c"}
+    db.close()
