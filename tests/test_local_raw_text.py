@@ -1,8 +1,9 @@
 """Tests for durable raw-text retrieval in the local LodeDB SDK.
 
 Raw text is retained by default (``store_text=True``) in a dedicated ``.tvtext``
-sidecar, so the original text is retrievable by id (``get`` / ``get_text`` /
-``get_texts``), durably across reopens. The redacted artifacts stay payload-free
+base plus a ``.txd`` delta journal, so the original text is retrievable by id
+(``get`` / ``get_text`` / ``get_texts``), durably across reopens and committed
+O(changed) per write. The redacted artifacts stay payload-free
 regardless — telemetry, audit, the ``.json`` snapshot, the ``.jsd`` journal, and
 the ``.tvim``/``.tvd`` vector sidecars never carry raw document text. Opening
 with ``store_text=False`` opts out of retaining text at all.
@@ -75,6 +76,32 @@ def test_get_text_returns_stored_text(tmp_path):
     db.add("the quick brown fox jumps", id="fox", metadata={"topic": "animals"})
     assert db.get_text("fox") == "the quick brown fox jumps"
     db.close()
+
+
+def test_text_commit_is_o_changed(tmp_path):
+    """An incremental text commit appends a .txd delta, never rewriting the base."""
+
+    db = _open(tmp_path, store_text=True)
+    db.add_many([{"text": f"base body {i}", "id": f"b{i}"} for i in range(12)])  # cold base
+    base_files = glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True)
+    assert base_files, "expected a raw-text base"
+    base = Path(sorted(base_files)[-1])
+    base_bytes = base.read_bytes()
+
+    db.add("one small delta", id="delta")  # a single-doc incremental commit
+    # The base map is untouched; the change lands in a small .txd delta segment.
+    assert base.read_bytes() == base_bytes, "base must not be rewritten on a delta commit"
+    deltas = glob.glob(str(Path(tmp_path) / "**" / "*.txd"), recursive=True)
+    assert deltas, "expected a .txd text delta segment"
+    assert db.get("delta") == "one small delta"
+    db.close()
+
+    reopened = _open(tmp_path, store_text=True)
+    try:  # replaying base + delta reconstructs every document's text
+        assert reopened.get("b5") == "base body 5"
+        assert reopened.get("delta") == "one small delta"
+    finally:
+        reopened.close()
 
 
 def test_get_is_alias_for_get_text(tmp_path):
@@ -260,20 +287,24 @@ def test_corrupt_text_sidecar_fails_closed(tmp_path):
 
 
 def test_text_store_checksum_mismatch_fails_closed(tmp_path):
-    """A tampered (but valid-JSON) sidecar body fails the checksum guard."""
+    """A tampered (but valid-JSON) text base body fails the checksum guard."""
 
     db = _open(tmp_path, store_text=True)
     db.add("checksum target body", id="c")
     db.persist()
     db.close()
 
-    sidecar = Path(glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0])
-    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    # The journaled raw-text base is a checksummed id->text map at g<epoch>.tvtext.
+    base = Path(sorted(glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True))[-1])
+    payload = json.loads(base.read_text(encoding="utf-8"))
     # Mutate the body without updating the recorded checksum.
     payload["body"]["documents"]["c"] = "tampered body"
-    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    base.write_text(json.dumps(payload), encoding="utf-8")
 
-    store = DocumentTextStore(sidecar_path=sidecar)
-    assert store.sidecar_path == sidecar
+    # Loading the tampered base through its store fails closed on the checksum.
     with pytest.raises(RuntimeError, match="checksum"):
-        store.load()
+        DocumentTextStore(base).load()
+
+    # And reopening the DB fails closed rather than serving the tampered text.
+    with pytest.raises(RuntimeError, match="checksum"):
+        _open(tmp_path, store_text=True)

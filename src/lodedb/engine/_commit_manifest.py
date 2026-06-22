@@ -15,6 +15,8 @@ at which a full base was last written):
     <key>.gen/g<epoch>.json.json-delta/  its ``.jsd`` document journal
     <key>.gen/g<epoch>.tvim            TurboVec vector base
     <key>.gen/g<epoch>.tvim.tvim-delta/  its ``.tvd`` vector journal
+    <key>.gen/g<epoch>.tvtext          opt-in raw-text base (full id->text map)
+    <key>.gen/g<epoch>.tvtext.tvtext-delta/  its ``.txd`` raw-text journal
 
 and a single top-level pointer:
 
@@ -29,9 +31,12 @@ intact; recovery just re-points at it and deletes the unreferenced artifacts.
 A lock-free reader reads the root manifest once and loads exactly the artifacts
 it names — a consistent generation, never a torn cross-file mix.
 
-The opt-in raw-text sidecar (``<key>.tvtext``) stays a single atomically
-replaced file beside the index; it is auxiliary (text keyed by id, queried by
-id) and intentionally not part of the index's atomic set.
+The opt-in raw-text store (``store_text=True``) is part of this atomic set: it
+has its own base + ``.txd`` delta journal under the same ``<key>.gen/`` epoch
+and its manifest is embedded in the root, so raw text (visible via the public
+``get`` API) commits and rolls back with exactly the generation the root names —
+never leaking an uncommitted overwrite. It remains a separate store: no
+telemetry/redacted/audit path reads it.
 """
 
 from __future__ import annotations
@@ -76,6 +81,12 @@ def base_tvim_path(persistence_dir: str | Path, index_key: str, epoch: int) -> P
     """Returns the TurboVec vector base path for one index key and base epoch."""
 
     return generation_dir(persistence_dir, index_key) / f"g{int(epoch)}.tvim"
+
+
+def base_tvtext_path(persistence_dir: str | Path, index_key: str, epoch: int) -> Path:
+    """Returns the raw-text base path for one index key and base epoch."""
+
+    return generation_dir(persistence_dir, index_key) / f"g{int(epoch)}.tvtext"
 
 
 def is_commit_manifest_name(name: str) -> bool:
@@ -161,10 +172,15 @@ def build_commit_body(
     json_manifest: dict[str, Any] | None,
     tvim_manifest: dict[str, Any] | None,
     tvim_present: bool,
-    tvtext_present: bool,
-    tvtext_sha256: str | None,
+    tvtext_manifest: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Assembles a root-manifest body capturing one consistent committed generation."""
+    """Assembles a root-manifest body capturing one consistent committed generation.
+
+    ``tvtext_manifest`` is the raw-text journal manifest (base + delta segments)
+    for this committed generation, or ``None`` when raw-text storage is disabled
+    or the index holds no text. It is pinned by the root exactly like the JSON
+    and TurboVec manifests, so raw text commits and rolls back atomically.
+    """
 
     return {
         "index_key": index_key,
@@ -175,7 +191,7 @@ def build_commit_body(
         "json": json_manifest,
         "tvim": tvim_manifest,
         "tvim_present": bool(tvim_present),
-        "tvtext": {"present": bool(tvtext_present), "sha256": tvtext_sha256},
+        "tvtext": tvtext_manifest,
     }
 
 
