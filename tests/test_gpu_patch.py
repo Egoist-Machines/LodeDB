@@ -106,6 +106,7 @@ def test_gpu_incremental_patch_in_place(tmp_path, fake_gpu_dependencies, monkeyp
     # The session's resident stable IDs must exactly match the CPU index's IDs
     # (extension-agnostic: no reliance on a mock-only `.vectors` attribute).
     serving = db._engine._turbovec_indexes[state_key]
+    assert session_after_add.generation == serving.generation
     expected_ids = set(serving.chunk_ids_by_stable_id.keys())
     resident_ids = {int(x) for x in session_after_add.stable_ids[: session_after_add.row_count]}
     assert resident_ids == expected_ids
@@ -118,7 +119,10 @@ def test_gpu_incremental_patch_in_place(tmp_path, fake_gpu_dependencies, monkeyp
     session_after_remove = sessions[state_key]
     assert id(session_after_remove) == session_id_before
     assert session_after_remove.row_count == 2
+    serving = db._engine._turbovec_indexes[state_key]
+    assert session_after_remove.generation == serving.generation
 
     # Run another batched search to confirm everything still queries correctly
     results_after = db.search_many(["second", "third"], k=1)
     assert len(results_after) == 2
+    assert sessions[state_key] is session_before

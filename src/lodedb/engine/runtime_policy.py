@@ -22,6 +22,21 @@ class GpuDirectTurboVecPolicy(StrEnum):
     REQUIRED = "required"
 
 
+class MpsDirectTurboVecPolicy(StrEnum):
+    """Names Apple-GPU (MPS) exact batch serving policies for direct TurboVec.
+
+    Defaults to ``off``: unlike CUDA (which beats the CPU kernel at every batch
+    >= 2), the MPS scan was slower than the NEON CPU scan at every batch size on
+    the Apple hardware measured (see ``benchmarks/mps_vs_neon/``), so NEON stays
+    the default. ``auto`` opts a host into the MPS scan for eligible batches;
+    ``required`` fails closed.
+    """
+
+    AUTO = "auto"
+    OFF = "off"
+    REQUIRED = "required"
+
+
 # There is no default GPU-direct batch cap. An earlier crossover (CPU faster
 # from ~batch 32 up) was an artifact of the slow ``cupy.argpartition`` top-k;
 # after the 2026-06-13 ``torch.topk`` swap the GPU-resident scan amortizes and
@@ -167,6 +182,103 @@ def _parse_gpu_direct_turbovec_policy(value: str | None) -> GpuDirectTurboVecPol
         allowed = ", ".join(policy.value for policy in GpuDirectTurboVecPolicy)
         raise ValueError(
             f"LODEDB_GPU_DIRECT_TURBOVEC must be one of: {allowed}"
+        ) from exc
+
+
+def mps_direct_turbovec_policy_from_env(
+    env: Mapping[str, str] | None = None,
+) -> MpsDirectTurboVecPolicy:
+    """Returns the Apple-GPU (MPS) direct TurboVec serving policy from the environment.
+
+    Defaults to ``off`` (NEON is the default and faster on measured Apple
+    hardware). ``LODEDB_MPS_DIRECT_TURBOVEC=auto`` opts eligible batches into the
+    MPS scan with visible CPU fallback; ``required`` fails closed.
+    """
+
+    source = os.environ if env is None else env
+    return _parse_mps_direct_turbovec_policy(
+        source.get("LODEDB_MPS_DIRECT_TURBOVEC", "off")
+    )
+
+
+def mps_direct_turbovec_max_batch_from_env(env: Mapping[str, str] | None = None) -> int | None:
+    """Returns the optional MPS-direct ``auto`` batch cap, or None for no cap."""
+
+    source = os.environ if env is None else env
+    value = source.get("LODEDB_MPS_DIRECT_MAX_BATCH")
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError("LODEDB_MPS_DIRECT_MAX_BATCH must be an integer") from exc
+    if parsed <= 0:
+        raise ValueError("LODEDB_MPS_DIRECT_MAX_BATCH must be positive")
+    return parsed
+
+
+def mps_memory_budget_bytes_from_env(env: Mapping[str, str] | None = None) -> int | None:
+    """Returns a positive MPS resident memory budget in bytes, or None when unset.
+
+    Unified memory has no separate VRAM pool, so there is no auto budget: a
+    resident copy is admitted unless ``LODEDB_MPS_MEMORY_BUDGET_BYTES`` is set and
+    the estimate exceeds it.
+    """
+
+    source = os.environ if env is None else env
+    value = source.get("LODEDB_MPS_MEMORY_BUDGET_BYTES")
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError("LODEDB_MPS_MEMORY_BUDGET_BYTES must be an integer") from exc
+    if parsed <= 0:
+        raise ValueError("LODEDB_MPS_MEMORY_BUDGET_BYTES must be positive")
+    return parsed
+
+
+def mps_direct_turbovec_should_use(
+    *,
+    policy: MpsDirectTurboVecPolicy,
+    dependency_available: bool,
+    query_batch_size: int,
+    minimum_batch_size: int = 2,
+    maximum_batch_size: int | None = None,
+) -> bool:
+    """Returns whether the MPS-resident direct TurboVec path should handle a batch.
+
+    Single queries stay on the CPU kernel without raising even under
+    ``required``; ``required`` fails closed for eligible batches when MPS is
+    unavailable. ``maximum_batch_size`` bounds the ``auto`` window only.
+    """
+
+    if query_batch_size < minimum_batch_size:
+        return False
+    if policy == MpsDirectTurboVecPolicy.OFF:
+        return False
+    if (
+        policy == MpsDirectTurboVecPolicy.AUTO
+        and maximum_batch_size is not None
+        and query_batch_size > maximum_batch_size
+    ):
+        return False
+    if dependency_available:
+        return True
+    if policy == MpsDirectTurboVecPolicy.REQUIRED:
+        raise RuntimeError("MPS direct TurboVec serving is required but unavailable")
+    return False
+
+
+def _parse_mps_direct_turbovec_policy(value: str | None) -> MpsDirectTurboVecPolicy:
+    """Parses and validates an MPS direct TurboVec serving policy string."""
+
+    try:
+        return MpsDirectTurboVecPolicy(str(value or "off"))
+    except ValueError as exc:
+        allowed = ", ".join(policy.value for policy in MpsDirectTurboVecPolicy)
+        raise ValueError(
+            f"LODEDB_MPS_DIRECT_TURBOVEC must be one of: {allowed}"
         ) from exc
 
 

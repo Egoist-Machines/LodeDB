@@ -8,8 +8,8 @@ rather than reimplementing any capability logic. Reports, honestly:
   availability;
 - the compact (TurboVec) backend status and inferred native dispatch;
 - whether the GPU-resident vector-scan path exists — which is **CUDA/CuPy
-  only**; on Apple Silicon it is always reported as unavailable, and embedding
-  is the only accelerated stage.
+  only**; on Apple Silicon that CUDA path is unavailable, but an opt-in Metal
+  (MPS) exact scan is reported separately (off by default; NEON is the default).
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ def _gpu_vector_scan_status() -> dict[str, Any]:
         reason = "CUDA + CuPy present"
     elif is_apple_silicon():
         reason = (
-            "Apple Silicon: GPU vector scan is CUDA/CuPy-only and not implemented "
-            "on Metal; the TurboVec scan runs on the CPU kernel here. Embedding is "
-            "the only stage accelerated on this machine."
+            "Apple Silicon: the CUDA/CuPy GPU vector scan is unavailable here; an "
+            "opt-in Metal (MPS) exact scan is available instead (see mps_vector_scan). "
+            "NEON is the default and was faster on measured Apple hardware."
         )
     else:
         missing = []
@@ -61,6 +61,28 @@ def _gpu_vector_scan_status() -> dict[str, Any]:
         "cuda_available": cuda,
         "cupy_present": cupy_present,
         "reason": reason,
+    }
+
+
+def _mps_vector_scan_status() -> dict[str, Any]:
+    """Returns honest opt-in Apple-GPU (MPS) exact-scan availability.
+
+    The MPS scan is opt-in and never the default: NEON is the default on Apple
+    Silicon and was faster across batch sizes on the hardware measured.
+    """
+
+    from lodedb.engine.mps_turbovec import mps_exact_scan_available
+
+    available, reason = mps_exact_scan_available()
+    return {
+        "mps_exact_scan_available": available,
+        "opt_in": True,
+        "default_enabled": False,
+        "reason": (
+            reason
+            or "available; opt-in via LODEDB_MPS_DIRECT_TURBOVEC=auto|required "
+            "(NEON is the default and faster on measured Apple hardware)"
+        ),
     }
 
 
@@ -90,6 +112,7 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
             "inferred_native_dispatch": turbovec_native_backend_from_flags(cpu_flags),
         },
         "gpu_vector_scan": _gpu_vector_scan_status(),
+        "mps_vector_scan": _mps_vector_scan_status(),
     }
 
 
@@ -100,6 +123,7 @@ def format_capability_report(report: dict[str, Any]) -> str:
     emb = report["embedding"]
     backend = report["compact_backend"]
     gpu = report["gpu_vector_scan"]
+    mps_scan = report["mps_vector_scan"]
     lines = [
         "LodeDB doctor — local capability report",
         "=" * 42,
@@ -136,5 +160,10 @@ def format_capability_report(report: dict[str, Any]) -> str:
         "GPU-resident vector scan (CUDA/CuPy only)",
         f"  available              : {gpu['gpu_vector_scan_available']}",
         f"  reason                 : {gpu['reason']}",
+        "",
+        "Apple GPU exact scan (MPS, opt-in)",
+        f"  available              : {mps_scan['mps_exact_scan_available']}",
+        f"  default enabled        : {mps_scan['default_enabled']}",
+        f"  reason                 : {mps_scan['reason']}",
     ]
     return "\n".join(lines)

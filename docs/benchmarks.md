@@ -72,8 +72,8 @@ and `memory_copy` (host→device transfer) — are in
 ## Laptop: embedding throughput + CPU scan latency
 
 On Apple Silicon, embedding runs on the GPU (Metal/MPS); the TurboVec scan runs on the CPU
-SIMD kernel (NEON) by default. (An opt-in Apple-GPU scan is experimental — see "Apple-GPU
-(MPS) vector scan" below; the CUDA launch sweep is the section above.)
+SIMD kernel (NEON) by default. (A first-class opt-in Apple-GPU scan exists but stays off by
+default; see "Apple-GPU (MPS) vector scan" below. The CUDA launch sweep is the section above.)
 
 **Machine** (`recorded`): Apple M1, macOS 26.5.1 (arm64); TurboVec native backend `neon`.
 **Setup** (`measured`): `minilm` (all-MiniLM-L6-v2, 384-dim, 4-bit), 20,000 docs, 200 queries,
@@ -100,14 +100,15 @@ actually a touch faster end-to-end here, because MPS pays a per-call dispatch ov
 doesn't amortize over one query. Pick the embed device for your workload and re-measure on
 your own hardware — these are single-run numbers on one machine.
 
-### Apple-GPU (MPS) vector scan — opt-in, experimental
+### Apple-GPU (MPS) vector scan — first-class opt-in, off by default
 
-An opt-in MPS exact scan exists (`lodedb.engine.mps_turbovec`), mirroring the CUDA path:
-dequantized fp16 rows resident on the Apple GPU, scored with a batched matmul + `torch.topk`.
-It is **recall-correct** (exact scoring; R@1 ≥ the NEON scan), but on the M1 it is **slower than
-the NEON CPU scan at every batch size** (0.08× at batch 1 → 0.53× at batch 1024), so NEON stays
-the default on Mac. The gap narrows as batch grows, so a stronger Apple GPU (M-series Pro/Max,
-M5+) could move the crossover — re-measure with
+The MPS exact scan (`lodedb.engine.mps_turbovec`) is selectable via
+`LODEDB_MPS_DIRECT_TURBOVEC=auto|required`: dequantized fp16 rows live resident on the Apple GPU
+and are scored with a batched matmul + `torch.topk`. It is **recall-correct** (exact scoring;
+R@1 >= the NEON scan), but on the measured M1 it is **slower than the NEON CPU scan at every
+batch size** (0.08x at batch 1 -> 0.53x at batch 1024), so NEON stays the default on Mac. The gap
+narrows as batch grows, so a stronger Apple GPU (M-series Pro/Max, M5+) could move the crossover;
+re-measure with
 [`benchmarks/mps_vs_neon/`](../benchmarks/mps_vs_neon).
 
 ## Reference: augmented exact scan vs. vanilla CPU scan

@@ -325,11 +325,13 @@ class GpuDirectTurboVecSession:
         index: Any,
         removed_ids: tuple[int, ...],
         upsert_ids: tuple[int, ...],
+        generation: int,
     ) -> None:
         """Applies incremental mutations in-place to avoid a full O(N) rebuild.
 
         Simulates swap-remove semantics to match the CPU IdMapIndex slots exactly,
-        and dynamically appends into over-allocated capacity in O(changed) time.
+        dynamically appends into over-allocated capacity in O(changed) time, and
+        advances the resident generation only after the patch succeeds.
         """
 
         if removed_ids:
@@ -368,6 +370,7 @@ class GpuDirectTurboVecSession:
             # Batch the GPU write to avoid kernel-launch overhead per row
             if target_slots:
                 self.device_rows[target_slots] = upsert_rows_fp16
+        self.generation = int(generation)
 
     def search_batch(
         self,

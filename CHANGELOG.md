@@ -43,6 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   torn cross-file reads. Stores written by v0.1.x load via a legacy fallback and migrate to
   the new layout on their next write; superseded generations are garbage-collected (the most
   recent few are retained for in-flight readers).
+- **First-class opt-in Apple-GPU (MPS) exact scan.** The Metal/MPS resident scan is now a
+  selectable route at CUDA-level capability, off by default: in-place `patch()` on small
+  mutations (O(changed) swap-remove + batched upsert), an `MpsDirectTurboVecPolicy`
+  (`LODEDB_MPS_DIRECT_TURBOVEC`, default `off`), engine dispatch for batched `search_many`,
+  an optional `LODEDB_MPS_MEMORY_BUDGET_BYTES` guard, and honest `lodedb doctor` reporting.
+  MPS uses shared resident-scan helper code for deterministic top-k ordering and tile sizing;
+  CUDA extraction onto those helpers remains a hardware-verified follow-up. **NEON remains the
+  default on Apple Silicon** — the MPS scan was slower than NEON at every batch size on the
+  measured M1, so it is opt-in and off by default; any future default flip is gated on per-chip
+  `benchmarks/mps_vs_neon` crossover data, especially for newer Apple GPUs such as M5.
 
 ### Changed
 

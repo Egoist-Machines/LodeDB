@@ -135,8 +135,10 @@ Other in-process vector databases stay CPU-bound. Alibaba's
 Cohere 768-dim): the same class as the TurboVec CPU scan, and a different regime from ours,
 so read it as the CPU-class baseline. The GPU-resident path is what clears it.
 
-**Scope.** GPU search is Linux/CUDA-only and opt-in (`[gpu]`). macOS scans on the CPU (the
-MPS scan is experimental). See [docs/benchmarks.md](docs/benchmarks.md) and
+**Scope.** GPU search is Linux/CUDA-only and opt-in (`[gpu]`). macOS scans on the CPU by
+default; a first-class opt-in MPS exact scan exists (`LODEDB_MPS_DIRECT_TURBOVEC`) but NEON
+stays the default. On the measured M1 it was slower than NEON at every batch size; newer Apple
+GPUs should be re-measured before any default change. See [docs/benchmarks.md](docs/benchmarks.md) and
 [docs/architecture.md](docs/architecture.md).
 
 ## Delta persistence
@@ -210,8 +212,10 @@ lodedb benchmark   # local, metrics-only benchmark
 
 - **Exact scan, no ANN.** Built for small-to-mid corpora where exact recall matters, not
   billion-scale.
-- **GPU is Linux/CUDA-only and opt-in** (`[gpu]`). macOS scans on the CPU; the MPS scan is
-  experimental and was slower than NEON on the hardware tested.
+- **GPU-resident scan is Linux/CUDA-only and opt-in** (`[gpu]`). macOS has a first-class,
+  opt-in Metal (MPS) exact scan (`LODEDB_MPS_DIRECT_TURBOVEC=auto`); NEON is the default and was
+  faster on the measured M1, so the MPS scan stays off by default until newer Apple GPUs are
+  re-measured.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
 - **Single writer per path** — one writer at a time (many concurrent readers), with no live
   cross-process refresh, on local filesystems only. See

@@ -60,6 +60,17 @@ def test_doctor_report_is_honest_about_gpu_scan():
     text = format_capability_report(report)
     assert "TurboVec" in text
     assert "CUDA/CuPy only" in text
+    # The opt-in MPS scan is reported honestly: present, opt-in, never the
+    # default, and always carrying a reason. Whether it is *available* depends on
+    # torch plus a usable Metal device — absent on headless/virtualized CI
+    # runners even on Apple Silicon — so availability is not asserted here; the
+    # _mps_only-gated dispatch tests cover the available path on real Metal.
+    mps_scan = report["mps_vector_scan"]
+    assert mps_scan["opt_in"] is True
+    assert mps_scan["default_enabled"] is False
+    assert isinstance(mps_scan["mps_exact_scan_available"], bool)
+    assert mps_scan["reason"]
+    assert "opt-in" in text
 
 
 def test_doctor_report_is_honest_about_patched_core():
