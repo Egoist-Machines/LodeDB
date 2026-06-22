@@ -301,6 +301,13 @@ class _EngineTurboVecQueryResult:
     fallback_used: bool = False
     stage_one_backend: str = ""
     compact_route_fallback: bool = False
+    # The ``gpu_*`` fields below are the SHARED resident-scan telemetry namespace,
+    # populated by both the CUDA path and the opt-in Apple-GPU (MPS) path via
+    # ``_try_query_resident_direct_batch``. The name is historical (CUDA shipped
+    # first) and intentionally kept stable -- it is the recorded key across the GPU
+    # benchmark history and harnesses. Which backend produced a row is disambiguated
+    # by ``stage_one_backend`` (e.g. ``mps_torch_exact_direct``), so on Apple Silicon
+    # ``gpu_estimated_bytes`` reports MPS unified-memory bytes.
     gpu_stage_one_status: str = "not_applicable"
     gpu_estimated_bytes: int = 0
     gpu_budget_bytes: int = 0
@@ -4483,6 +4490,8 @@ def sanitize_observability_fields(fields: dict[str, Any]) -> dict[str, Any]:
             "native_backend",
             "retrieval_mode",
             "stage_one_backend",
+            # Shared resident-scan telemetry namespace (CUDA + MPS); see
+            # _EngineTurboVecQueryResult. Keep both backends' string statuses here.
             "gpu_stage_one_status",
             "gpu_fallback_reason",
         }:
