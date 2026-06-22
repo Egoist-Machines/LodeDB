@@ -293,27 +293,45 @@ def run_graph_bench(
     # Precompute node embeddings once and index via vector-in (fast build).
     node_vectors = [list(vec) for vec in backend.embed_documents(tuple(labels))]
 
-    kg = KnowledgeGraph(workdir / "kg", model=model, device=device)
-
-    build_started = time.perf_counter()
-    for i in range(node_count):
-        kg.add_node(
-            id=f"n{i}",
-            type=_TOPICS[i % len(_TOPICS)],
-            embedding=node_vectors[i],
-            properties={"idx": i},
+    # Per-node build rate on a small sample (the pre-finding-06 behavior: one
+    # index commit per add_node), for the speedup comparison.
+    sample = min(200, node_count)
+    kg_sample = KnowledgeGraph(workdir / "kg_sample", model=model, device=device)
+    sample_started = time.perf_counter()
+    for i in range(sample):
+        kg_sample.add_node(
+            id=f"s{i}", type=_TOPICS[i % len(_TOPICS)], embedding=node_vectors[i]
         )
+    per_node_build_ms = (time.perf_counter() - sample_started) * 1000.0
+    kg_sample.close()
+
+    # Batched build of the full graph via add_nodes/add_edges (one commit per batch).
+    kg = KnowledgeGraph(workdir / "kg", model=model, device=device)
+    build_started = time.perf_counter()
+    kg.add_nodes(
+        [
+            {
+                "id": f"n{i}",
+                "type": _TOPICS[i % len(_TOPICS)],
+                "embedding": node_vectors[i],
+                "properties": {"idx": i},
+            }
+            for i in range(node_count)
+        ]
+    )
     node_build_ms = (time.perf_counter() - build_started) * 1000.0
 
     rng = random.Random(7)
     edge_count = node_count * avg_degree
-    edge_started = time.perf_counter()
+    edge_items: list[dict[str, Any]] = []
     for _ in range(edge_count):
         a = rng.randrange(node_count)
         b = rng.randrange(node_count)
         if a == b:
             continue
-        kg.add_edge(f"n{a}", "rel", f"n{b}")
+        edge_items.append({"src": f"n{a}", "relation": "rel", "dst": f"n{b}"})
+    edge_started = time.perf_counter()
+    kg.add_edges(edge_items)
     edge_build_ms = (time.perf_counter() - edge_started) * 1000.0
 
     # k-hop traversal latency from random seeds.
@@ -348,6 +366,15 @@ def run_graph_bench(
         "edge_build_ms": round(edge_build_ms, 2),
         "node_build_nodes_per_s": round(node_count / (node_build_ms / 1000.0), 2)
         if node_build_ms
+        else 0.0,
+        "per_node_build_sample": sample,
+        "per_node_build_nodes_per_s": round(sample / (per_node_build_ms / 1000.0), 2)
+        if per_node_build_ms
+        else 0.0,
+        "build_speedup_batched_over_per_node": round(
+            (node_count / node_build_ms) / (sample / per_node_build_ms), 2
+        )
+        if node_build_ms and per_node_build_ms
         else 0.0,
         "edge_build_edges_per_s": round(stats["edges"] / (edge_build_ms / 1000.0), 2)
         if edge_build_ms
