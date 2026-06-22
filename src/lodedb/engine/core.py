@@ -2472,6 +2472,7 @@ class LodeEngine:
                     index=previous.index,
                     removed_ids=removed_stable_ids,
                     upsert_ids=upsert_stable_ids,
+                    generation=generation,
                 )
             except Exception:
                 # Patch failed (e.g. MemoryError from over-allocation); safely fail closed
@@ -2486,6 +2487,7 @@ class LodeEngine:
                     index=previous.index,
                     removed_ids=removed_stable_ids,
                     upsert_ids=mps_upsert_stable_ids,
+                    generation=generation,
                 )
             except Exception:
                 # Fail closed: drop the resident copy so the next batch rebuilds.

@@ -17,7 +17,7 @@ flowchart TB
     SCAN{{"Vector scan router"}}
     CPU["CPU SIMD scan<br/>TurboVec (default)"]
     GPU["GPU-resident fp16 scan<br/>gpu_turbovec · (gpu extra) · CUDA"]
-    MPSS["MPS exact scan<br/>mps_turbovec · experimental"]
+    MPSS["MPS exact scan<br/>mps_turbovec · first-class opt-in · off by default"]
   end
   TV["Vendored TurboVec core<br/>third_party/turbovec (MIT)"]
   DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext · .txd)")]
@@ -69,7 +69,7 @@ src/lodedb/
     state_journal_store.py      #   durable state journal (.jsd)
     embedding_backends.py       #   Hash / SentenceTransformer backends
     gpu_turbovec.py      #   optional CUDA batched exact scan (lazy; `[gpu]` extra)
-    mps_turbovec.py      #   opt-in Apple-GPU (MPS) exact scan (lazy, experimental)
+    mps_turbovec.py      #   first-class opt-in Apple-GPU (MPS) exact scan (lazy, off by default)
     route_registry.py, route_profiles.py, runtime_policy.py   #   route policy
 third_party/turbovec/    # vendored MIT compact core + Apache-2.0 lifecycle patches
 ```
@@ -127,9 +127,11 @@ keeps a streaming top-k on device. `LodeDB.search_many(...)` is the public SDK p
 hit this route. Single queries, missing GPU dependencies, memory rejection, and explicit
 `off` policy use the compact CPU SIMD scan as source of truth/fallback.
 
-On Apple Silicon, MPS accelerates embedding only. Vector search on Mac defaults to the CPU
-TurboVec kernel (NEON on Apple Silicon); the MPS exact scan is experimental and not the
-launch path.
+On Apple Silicon, MPS accelerates embedding by default. Vector search on Mac defaults to the CPU
+TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
+batched `search_many` via `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`, but it stays off by default:
+on the measured M1 it was slower than NEON at every batch size, and newer Apple GPUs should be
+re-measured before any default change.
 
 Vector-scan routing (what the launch sweep in `benchmarks/direct_gpu_sweep/` asserts):
 

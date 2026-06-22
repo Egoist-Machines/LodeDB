@@ -44,8 +44,9 @@ def test_mps_patch_upsert_matches_full_rebuild():
     # Mutate the index, then patch only the changed rows into the resident copy.
     new_ids = np.arange(n + 1, n + m + 1, dtype=np.uint64)
     index.add_with_ids(extra, new_ids)
-    session.patch(index, removed_ids=(), upsert_ids=tuple(int(i) for i in new_ids))
+    session.patch(index, removed_ids=(), upsert_ids=tuple(int(i) for i in new_ids), generation=1)
     assert session.row_count == n + m
+    assert session.generation == 1
 
     rebuilt = MpsDirectTurboVecSession.build(index=index)
     patched_ids = session.search_batch(queries, top_k=k).stable_ids
@@ -67,9 +68,10 @@ def test_mps_patch_remove_keeps_survivors_consistent():
 
     session = MpsDirectTurboVecSession.build(index=index)
     removed = (5, 50, 123, 400)
-    session.patch(index, removed_ids=removed, upsert_ids=())
+    session.patch(index, removed_ids=removed, upsert_ids=(), generation=1)
 
     assert session.row_count == n - len(removed)
+    assert session.generation == 1
     resident = set(int(i) for i in session.stable_ids[: session.row_count])
     assert resident.isdisjoint(removed)
     assert len(resident) == n - len(removed)

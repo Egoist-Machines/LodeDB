@@ -1,11 +1,11 @@
-"""Backend-agnostic helpers shared by the GPU-resident scan sessions.
+"""Backend-agnostic helpers for resident scan sessions.
 
 Pure NumPy (no cupy / torch): the deterministic top-k ordering and the score-tile
-sizing are identical for the CUDA and MPS resident scans, so they live here to
-stay in lockstep. The MPS session (:mod:`lodedb.engine.mps_turbovec`) uses them.
-The shipped CUDA session (:mod:`lodedb.engine.gpu_turbovec`) keeps its own inline
-copies for now — refactoring it to share these needs CUDA-hardware verification
-and is a separate, Modal/CI-gated change.
+sizing mirror the CUDA resident-scan contract. The MPS session
+(:mod:`lodedb.engine.mps_turbovec`) uses them. The shipped CUDA session
+(:mod:`lodedb.engine.gpu_turbovec`) keeps its own inline copies for now; refactoring
+it to share these needs CUDA-hardware verification and is a separate, Modal/CI-gated
+change.
 """
 
 from __future__ import annotations

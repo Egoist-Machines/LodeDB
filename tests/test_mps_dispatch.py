@@ -113,6 +113,7 @@ def test_mps_required_dispatch_builds_and_patches_in_place(tmp_path, monkeypatch
         assert after_add is before
         assert after_add.row_count == 3
         serving = db._engine._turbovec_indexes[key]
+        assert after_add.generation == serving.generation
         resident = {int(x) for x in after_add.stable_ids[: after_add.row_count]}
         assert resident == set(serving.chunk_ids_by_stable_id)
 
@@ -120,8 +121,11 @@ def test_mps_required_dispatch_builds_and_patches_in_place(tmp_path, monkeypatch
         after_remove = sessions[key]
         assert after_remove is before
         assert after_remove.row_count == 2
+        serving = db._engine._turbovec_indexes[key]
+        assert after_remove.generation == serving.generation
 
         assert len(db.search_many(["second", "third"], k=1)) == 2
+        assert sessions[key] is before
     finally:
         db.close()
 

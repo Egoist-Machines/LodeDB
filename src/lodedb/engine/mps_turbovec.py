@@ -14,7 +14,8 @@ calibrated space, queries are rotated on the host (``q @ rotation.T``), and the
 exact dot product reproduces the CPU kernel's calibrated score *without* its
 uint8 LUT quantization error — so recall is ``>=`` the quantized NEON scan. The
 final ordering is deterministic on the host (descending score, ascending stable
-id on ties), shared with the CUDA path via :mod:`lodedb.engine.turbovec_resident`.
+id on ties), implemented via :mod:`lodedb.engine.turbovec_resident` to mirror the
+CUDA path's ordering contract.
 
 Resident bytes are fp16 (``capacity * dim * 2``) drawn from the shared
 unified-memory pool. The resident copy is over-allocated 1.5x so small mutations
@@ -244,6 +245,7 @@ class MpsDirectTurboVecSession:
         index: Any,
         removed_ids: tuple[int, ...],
         upsert_ids: tuple[int, ...],
+        generation: int,
     ) -> None:
         """Applies incremental mutations in-place to avoid a full O(N) rebuild.
 
@@ -254,7 +256,8 @@ class MpsDirectTurboVecSession:
         that ``device_rows[slot]`` stays paired with ``stable_ids[slot]``, so the
         served top-k matches a from-scratch rebuild (asserted by the patch parity
         tests). Raises ``MemoryError`` if the upsert would exceed capacity, so the
-        caller evicts the session and the next batch rebuilds.
+        caller evicts the session and the next batch rebuilds. The resident
+        generation advances only after the patch succeeds.
         """
 
         torch = import_module("torch")
@@ -298,6 +301,7 @@ class MpsDirectTurboVecSession:
                 )
                 self.device_rows[slot_index] = upsert_rows_fp16
             torch.mps.synchronize()
+        self.generation = int(generation)
 
     def search_batch(
         self,
