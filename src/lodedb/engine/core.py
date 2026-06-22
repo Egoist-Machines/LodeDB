@@ -330,6 +330,54 @@ class _PreparedQuery:
     route: RouteDecision
 
 
+class _MetadataPostingIndex:
+    """Generation-keyed posting index that resolves a filter to chunk ids fast.
+
+    Maps each ``(metadata_key, value)`` pair to the documents carrying it and
+    each document to its chunk ids, so a filtered allowlist is built in
+    O(matching documents + their chunks) instead of scanning the whole corpus.
+    It is cached per index generation (rebuilt lazily on the first filtered
+    query after a mutation, exactly like the resident GPU session), so it adds
+    nothing to the write/commit path.
+    """
+
+    __slots__ = ("generation", "_postings", "_chunks_by_document")
+
+    def __init__(
+        self,
+        generation: int,
+        postings: dict[tuple[str, str], set[str]],
+        chunks_by_document: dict[str, list[str]],
+    ) -> None:
+        self.generation = generation
+        self._postings = postings
+        self._chunks_by_document = chunks_by_document
+
+    def allowlist(self, query_filter: Mapping[str, Any]) -> tuple[str, ...]:
+        """Returns the eligible chunk ids for a validated metadata/document filter."""
+
+        document_set: set[str] | None = None
+        metadata = query_filter.get("metadata")
+        if metadata:
+            for key, value in metadata.items():
+                posting = self._postings.get((str(key), str(value)))
+                if not posting:
+                    return ()
+                document_set = set(posting) if document_set is None else (document_set & posting)
+                if not document_set:
+                    return ()
+        document_ids = query_filter.get("document_ids")
+        if document_ids is not None:
+            requested = {str(document_id) for document_id in document_ids}
+            document_set = requested if document_set is None else (document_set & requested)
+        if document_set is None:  # empty filter: callers guard, but match-all is correct
+            document_set = set(self._chunks_by_document)
+        chunk_ids: list[str] = []
+        for document_id in document_set:
+            chunk_ids.extend(self._chunks_by_document.get(document_id, ()))
+        return tuple(chunk_ids)
+
+
 @dataclass(frozen=True)
 class _ResidentDirectBackend:
     """Describes one resident-scan backend (GPU/MPS) for the shared batch dispatcher.
@@ -484,6 +532,9 @@ class LodeEngine:
         self._indexes: dict[str, ClientIndexState] = {}
         self._turbovec_indexes: dict[str, TurboVecServingIndex] = {}
         self._index_generations: dict[str, int] = {}
+        # Generation-keyed metadata posting index per index key, for O(matches)
+        # filter allowlists. Rebuilt lazily when the generation advances.
+        self._metadata_posting_indexes: dict[str, _MetadataPostingIndex] = {}
         # Live base epoch per index key: which ``<key>.gen/g<epoch>.*`` artifacts
         # the committed root manifest points at. Set on load/commit; absent for a
         # not-yet-persisted or legacy (pre-commit-manifest) index.
@@ -554,9 +605,7 @@ class LodeEngine:
         """
 
         if self._read_only:
-            raise RuntimeError(
-                "LodeDB is open read-only; reopen without read_only=True to mutate"
-            )
+            raise RuntimeError("LodeDB is open read-only; reopen without read_only=True to mutate")
 
     @property
     def audit_events(self) -> tuple[dict[str, Any], ...]:
@@ -777,6 +826,7 @@ class LodeEngine:
         self._mark_index_changed(state.index_key)
         self._pending_tvim_deltas.pop(state.index_key, None)
         self._pending_state_journal_documents.pop(state.index_key, None)
+        self._metadata_posting_indexes.pop(state.index_key, None)
         self._delete_persisted_state(state)
         self._emit(
             "index_deleted",
@@ -1697,9 +1747,7 @@ class LodeEngine:
         ever returns text to the local caller.
         """
 
-        state = self._index_for_context(
-            context, index_id=index_id, operation="get_document_texts"
-        )
+        state = self._index_for_context(context, index_id=index_id, operation="get_document_texts")
         if isinstance(state, EngineResponse):
             return state
         if not self.raw_text_storage_enabled:
@@ -1934,23 +1982,11 @@ class LodeEngine:
         if query_filter:
             # Push the document/metadata filter into the native allowlist so
             # filtered queries rank only eligible rows instead of widening
-            # top_k to the full corpus and sorting everything.
-            allowed_chunk_ids = tuple(
-                str(chunk.chunk_id)
-                for chunk in state.chunks.values()
-                if _document_matches_query_filter(state, chunk.document_id, query_filter)
-            )
+            # top_k to the full corpus and sorting everything. The batch path
+            # (`_run_direct_batch_group`) shares this same allowlist strategy.
+            allowed_chunk_ids = self._build_filter_allowlist(state, query_filter)
             if not allowed_chunk_ids:
-                return _EngineTurboVecQueryResult(
-                    index=index,
-                    stable_ids=np.empty(0, dtype=np.uint64),
-                    scores=np.empty(0, dtype=np.float32),
-                    native_used=index.native_used,
-                    native_backend=index.native_backend,
-                    retrieval_mode="direct_turbovec",
-                    fallback_used=False,
-                    compact_route_fallback=False,
-                )
+                return _empty_turbovec_result(index)
             result = index.search(
                 query_embedding,
                 top_k=top_k,
@@ -1979,6 +2015,7 @@ class LodeEngine:
         serving: TurboVecServingIndex,
         batch: np.ndarray,
         top_k: int,
+        allowlist_stable_ids: np.ndarray | None = None,
     ) -> tuple[Any | None, dict[str, Any]]:
         """Attempts the GPU-resident exact batch path for one direct-route batch.
 
@@ -2023,7 +2060,12 @@ class LodeEngine:
             estimated_bytes=lambda session: int(session.estimated_gpu_bytes),
         )
         return self._try_query_resident_direct_batch(
-            backend, state, serving=serving, batch=batch, top_k=top_k
+            backend,
+            state,
+            serving=serving,
+            batch=batch,
+            top_k=top_k,
+            allowlist_stable_ids=allowlist_stable_ids,
         )
 
     def _try_query_resident_direct_batch(
@@ -2034,6 +2076,7 @@ class LodeEngine:
         serving: TurboVecServingIndex,
         batch: np.ndarray,
         top_k: int,
+        allowlist_stable_ids: np.ndarray | None = None,
     ) -> tuple[Any | None, dict[str, Any]]:
         """Backend-agnostic engine for one resident (GPU/MPS) direct-route batch.
 
@@ -2129,7 +2172,9 @@ class LodeEngine:
                 }
             backend.sessions[state.index_key] = session
         try:
-            result = session.search_batch(batch, top_k=int(top_k))
+            result = session.search_batch(
+                batch, top_k=int(top_k), allowlist_stable_ids=allowlist_stable_ids
+            )
         except Exception as exc:  # noqa: BLE001 - auto policy must fall back visibly.
             backend.sessions.pop(state.index_key, None)
             if policy == policy_type.REQUIRED:
@@ -2153,6 +2198,7 @@ class LodeEngine:
         serving: TurboVecServingIndex,
         batch: np.ndarray,
         top_k: int,
+        allowlist_stable_ids: np.ndarray | None = None,
     ) -> tuple[Any | None, dict[str, Any]]:
         """Attempts the opt-in MPS-resident exact batch path for one direct-route batch.
 
@@ -2195,7 +2241,12 @@ class LodeEngine:
             estimated_bytes=lambda session: int(session.estimated_mps_bytes),
         )
         return self._try_query_resident_direct_batch(
-            backend, state, serving=serving, batch=batch, top_k=top_k
+            backend,
+            state,
+            serving=serving,
+            batch=batch,
+            top_k=top_k,
+            allowlist_stable_ids=allowlist_stable_ids,
         )
 
     def _execute_prepared_query_batch(
@@ -2209,108 +2260,29 @@ class LodeEngine:
     ) -> None:
         """Executes prepared direct-route queries, batching multi-query requests."""
 
-        from lodedb.engine.gpu_turbovec import GPU_DIRECT_TURBOVEC_BACKEND
-        from lodedb.engine.mps_turbovec import MPS_DIRECT_TURBOVEC_BACKEND
-
         if len(prepared) > 1:
-            # One native call scores the whole batch; per-query widths are
-            # sliced from the shared top-k, which is valid because the
-            # kernel's ordering is deterministic for any prefix width.
             serving = self._turbovec_index_for_state(state)
-            per_query_top_k = [
-                _search_top_k_for_filter(
-                    state, prepared_item.query.top_k, prepared_item.query_filter
-                )
-                for prepared_item in prepared
-            ]
             batch = np.asarray(query_embeddings, dtype=np.float32)
-            started = perf_counter()
-            gpu_batch, gpu_fields = self._try_query_gpu_direct_turbovec_batch(
-                state,
-                serving=serving,
-                batch=batch,
-                top_k=max(per_query_top_k),
-            )
-            if gpu_batch is not None:
-                per_query_ms = ((perf_counter() - started) * 1000.0) / max(
-                    len(prepared), 1
+            # Group queries that share an identical filter and run each group as
+            # one batched native call with a single shared allowlist. The common
+            # ``search_many(filter=...)`` shape collapses to one group; per-query
+            # top_k widths are sliced from the group's shared top-k, valid because
+            # the kernel's ordering is deterministic for any prefix width.
+            groups: dict[tuple[Any, ...], list[int]] = {}
+            for position, prepared_item in enumerate(prepared):
+                groups.setdefault(_filter_signature(prepared_item.query_filter), []).append(
+                    position
                 )
-                for index, width in enumerate(per_query_top_k):
-                    take = min(int(width), gpu_batch.stable_ids.shape[1])
-                    query_results[index] = _EngineTurboVecQueryResult(
-                        index=serving,
-                        stable_ids=gpu_batch.stable_ids[index, :take].reshape(-1),
-                        scores=gpu_batch.scores[index, :take].reshape(-1),
-                        native_used=True,
-                        native_backend=GPU_DIRECT_TURBOVEC_BACKEND,
-                        retrieval_mode="direct_turbovec",
-                        fallback_used=False,
-                        compact_route_fallback=False,
-                        stage_one_backend=GPU_DIRECT_TURBOVEC_BACKEND,
-                        gpu_stage_one_status="used",
-                        gpu_query_count=len(prepared),
-                        gpu_copy_back_bytes=int(gpu_batch.copy_back_bytes),
-                        gpu_stage_one_search_ms=float(gpu_batch.search_ms),
-                        gpu_device_to_host_copy_ms=float(
-                            gpu_batch.device_to_host_copy_ms
-                        ),
-                        gpu_stage_one_tile_count=int(gpu_batch.tile_count),
-                        **gpu_fields,
-                    )
-                    search_latencies[index] = per_query_ms
-                return
-            mps_batch, mps_fields = self._try_query_mps_direct_turbovec_batch(
-                state,
-                serving=serving,
-                batch=batch,
-                top_k=max(per_query_top_k),
-            )
-            if mps_batch is not None:
-                per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(prepared), 1)
-                for index, width in enumerate(per_query_top_k):
-                    take = min(int(width), mps_batch.stable_ids.shape[1])
-                    query_results[index] = _EngineTurboVecQueryResult(
-                        index=serving,
-                        stable_ids=mps_batch.stable_ids[index, :take].reshape(-1),
-                        scores=mps_batch.scores[index, :take].reshape(-1),
-                        native_used=True,
-                        native_backend=MPS_DIRECT_TURBOVEC_BACKEND,
-                        retrieval_mode="direct_turbovec",
-                        fallback_used=False,
-                        compact_route_fallback=False,
-                        stage_one_backend=MPS_DIRECT_TURBOVEC_BACKEND,
-                        gpu_stage_one_status="used",
-                        gpu_query_count=len(prepared),
-                        gpu_copy_back_bytes=int(mps_batch.copy_back_bytes),
-                        gpu_stage_one_search_ms=float(mps_batch.search_ms),
-                        gpu_device_to_host_copy_ms=float(mps_batch.device_to_host_copy_ms),
-                        gpu_stage_one_tile_count=int(mps_batch.tile_count),
-                        **mps_fields,
-                    )
-                    search_latencies[index] = per_query_ms
-                return
-            batch_result = serving.search_batch(batch, top_k=max(per_query_top_k))
-            per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(prepared), 1)
-            # Surface whichever resident backend (GPU or MPS) bypassed or failed over,
-            # so the "why this batch fell back to NEON" status/reason stays visible on
-            # the CPU rows. At most one backend is active per host (CUDA is unavailable
-            # wherever MPS is), so the inactive one contributes ``{}``; MPS takes
-            # precedence on the (degenerate) overlap since it is probed last.
-            resident_fallback_fields = {**gpu_fields, **mps_fields}
-            for index, width in enumerate(per_query_top_k):
-                take = min(int(width), batch_result.stable_ids.shape[1])
-                query_results[index] = _EngineTurboVecQueryResult(
-                    index=serving,
-                    stable_ids=batch_result.stable_ids[index, :take].reshape(-1),
-                    scores=batch_result.scores[index, :take].reshape(-1),
-                    native_used=batch_result.native_used,
-                    native_backend=batch_result.native_backend,
-                    retrieval_mode="direct_turbovec",
-                    fallback_used=False,
-                    compact_route_fallback=False,
-                    **resident_fallback_fields,
+            for positions in groups.values():
+                self._run_direct_batch_group(
+                    state=state,
+                    serving=serving,
+                    batch=batch,
+                    positions=positions,
+                    prepared=prepared,
+                    query_results=query_results,
+                    search_latencies=search_latencies,
                 )
-                search_latencies[index] = per_query_ms
             return
         for index, (prepared_item, query_embedding) in enumerate(
             zip(prepared, query_embeddings, strict=True)
@@ -2326,6 +2298,243 @@ class LodeEngine:
             search_latencies[index] = (perf_counter() - started) * 1000.0
         return
 
+    def _run_direct_batch_group(
+        self,
+        *,
+        state: ClientIndexState,
+        serving: TurboVecServingIndex,
+        batch: np.ndarray,
+        positions: list[int],
+        prepared: tuple[_PreparedQuery, ...],
+        query_results: list[_EngineTurboVecQueryResult | None],
+        search_latencies: list[float],
+    ) -> None:
+        """Runs one filter-homogeneous slice of a batch as a single native call.
+
+        Every query in ``positions`` shares ``query_filter``. A filtered group
+        pushes one shared allowlist into the scan (no top_k widening); an
+        unfiltered group keeps the resident GPU/MPS fast path. Per-query widths
+        are sliced from the group's shared top-k and written back at their
+        original positions, preserving batch order.
+        """
+
+        from lodedb.engine.gpu_turbovec import GPU_DIRECT_TURBOVEC_BACKEND
+        from lodedb.engine.mps_turbovec import MPS_DIRECT_TURBOVEC_BACKEND
+
+        query_filter = prepared[positions[0]].query_filter
+        group_batch = np.ascontiguousarray(batch[positions])
+        shared_top_k = max(prepared[position].query.top_k for position in positions)
+        started = perf_counter()
+
+        if query_filter:
+            allowed_chunk_ids = self._build_filter_allowlist(state, query_filter)
+            if not allowed_chunk_ids:
+                elapsed_ms = (perf_counter() - started) * 1000.0
+                for position in positions:
+                    query_results[position] = _empty_turbovec_result(serving)
+                    search_latencies[position] = elapsed_ms / len(positions)
+                return
+            # Try the resident (GPU/MPS) allowlist scan first; when no resident
+            # backend is admitted, the CPU SIMD kernel honours the same allowlist
+            # inside the scan -- either way top_k stays k, never the corpus size.
+            resident = self._try_resident_allowlist_batch(
+                state,
+                serving=serving,
+                group_batch=group_batch,
+                top_k=shared_top_k,
+                allowed_chunk_ids=allowed_chunk_ids,
+            )
+            if resident is not None:
+                resident_batch, backend, fields = resident
+                self._scatter_resident_batch_group(
+                    positions=positions,
+                    prepared=prepared,
+                    serving=serving,
+                    query_results=query_results,
+                    search_latencies=search_latencies,
+                    resident_batch=resident_batch,
+                    backend=backend,
+                    fields=fields,
+                    started=started,
+                )
+                return
+            batch_result = serving.search_batch(
+                group_batch, top_k=shared_top_k, allowlist_chunk_ids=allowed_chunk_ids
+            )
+            self._scatter_cpu_batch_group(
+                positions=positions,
+                prepared=prepared,
+                serving=serving,
+                query_results=query_results,
+                search_latencies=search_latencies,
+                batch_result=batch_result,
+                started=started,
+                extra_fields={
+                    "gpu_stage_one_status": "bypassed",
+                    "gpu_fallback_reason": "filtered_batch_cpu_allowlist",
+                },
+            )
+            return
+
+        gpu_batch, gpu_fields = self._try_query_gpu_direct_turbovec_batch(
+            state, serving=serving, batch=group_batch, top_k=shared_top_k
+        )
+        if gpu_batch is not None:
+            self._scatter_resident_batch_group(
+                positions=positions,
+                prepared=prepared,
+                serving=serving,
+                query_results=query_results,
+                search_latencies=search_latencies,
+                resident_batch=gpu_batch,
+                backend=GPU_DIRECT_TURBOVEC_BACKEND,
+                fields=gpu_fields,
+                started=started,
+            )
+            return
+        mps_batch, mps_fields = self._try_query_mps_direct_turbovec_batch(
+            state, serving=serving, batch=group_batch, top_k=shared_top_k
+        )
+        if mps_batch is not None:
+            self._scatter_resident_batch_group(
+                positions=positions,
+                prepared=prepared,
+                serving=serving,
+                query_results=query_results,
+                search_latencies=search_latencies,
+                resident_batch=mps_batch,
+                backend=MPS_DIRECT_TURBOVEC_BACKEND,
+                fields=mps_fields,
+                started=started,
+            )
+            return
+        # Surface whichever resident backend bypassed/failed over so the "why this
+        # batch fell back to the CPU kernel" status stays visible on the CPU rows.
+        resident_fallback_fields = {**gpu_fields, **mps_fields}
+        batch_result = serving.search_batch(group_batch, top_k=shared_top_k)
+        self._scatter_cpu_batch_group(
+            positions=positions,
+            prepared=prepared,
+            serving=serving,
+            query_results=query_results,
+            search_latencies=search_latencies,
+            batch_result=batch_result,
+            started=started,
+            extra_fields=resident_fallback_fields,
+        )
+
+    def _try_resident_allowlist_batch(
+        self,
+        state: ClientIndexState,
+        *,
+        serving: TurboVecServingIndex,
+        group_batch: np.ndarray,
+        top_k: int,
+        allowed_chunk_ids: tuple[str, ...],
+    ) -> tuple[Any, str, dict[str, Any]] | None:
+        """Resident (GPU/MPS) allowlist scan for a filtered group.
+
+        Returns ``(batch_result, backend_label, telemetry_fields)`` when a
+        resident backend served the filtered batch, else ``None`` so the caller
+        falls back to the CPU allowlist kernel. The resident scan honours the
+        allowlist via a per-tile ``-inf`` score mask, so top_k stays k and a
+        filtered batch never widens past the resident cap.
+        """
+
+        from lodedb.engine.gpu_turbovec import GPU_DIRECT_TURBOVEC_BACKEND
+        from lodedb.engine.mps_turbovec import MPS_DIRECT_TURBOVEC_BACKEND
+
+        allowed_stable_ids = serving.stable_ids_for_chunks(allowed_chunk_ids)
+        if allowed_stable_ids.size == 0:
+            return None
+        gpu_batch, gpu_fields = self._try_query_gpu_direct_turbovec_batch(
+            state,
+            serving=serving,
+            batch=group_batch,
+            top_k=top_k,
+            allowlist_stable_ids=allowed_stable_ids,
+        )
+        if gpu_batch is not None:
+            return gpu_batch, GPU_DIRECT_TURBOVEC_BACKEND, gpu_fields
+        mps_batch, mps_fields = self._try_query_mps_direct_turbovec_batch(
+            state,
+            serving=serving,
+            batch=group_batch,
+            top_k=top_k,
+            allowlist_stable_ids=allowed_stable_ids,
+        )
+        if mps_batch is not None:
+            return mps_batch, MPS_DIRECT_TURBOVEC_BACKEND, mps_fields
+        return None
+
+    def _scatter_resident_batch_group(
+        self,
+        *,
+        positions: list[int],
+        prepared: tuple[_PreparedQuery, ...],
+        serving: TurboVecServingIndex,
+        query_results: list[_EngineTurboVecQueryResult | None],
+        search_latencies: list[float],
+        resident_batch: Any,
+        backend: str,
+        fields: dict[str, Any],
+        started: float,
+    ) -> None:
+        """Writes one resident (GPU/MPS) group result back at original positions."""
+
+        per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(positions), 1)
+        for local_index, position in enumerate(positions):
+            take = min(int(prepared[position].query.top_k), resident_batch.stable_ids.shape[1])
+            query_results[position] = _EngineTurboVecQueryResult(
+                index=serving,
+                stable_ids=resident_batch.stable_ids[local_index, :take].reshape(-1),
+                scores=resident_batch.scores[local_index, :take].reshape(-1),
+                native_used=True,
+                native_backend=backend,
+                retrieval_mode="direct_turbovec",
+                fallback_used=False,
+                compact_route_fallback=False,
+                stage_one_backend=backend,
+                gpu_stage_one_status="used",
+                gpu_query_count=len(positions),
+                gpu_copy_back_bytes=int(resident_batch.copy_back_bytes),
+                gpu_stage_one_search_ms=float(resident_batch.search_ms),
+                gpu_device_to_host_copy_ms=float(resident_batch.device_to_host_copy_ms),
+                gpu_stage_one_tile_count=int(resident_batch.tile_count),
+                **fields,
+            )
+            search_latencies[position] = per_query_ms
+
+    def _scatter_cpu_batch_group(
+        self,
+        *,
+        positions: list[int],
+        prepared: tuple[_PreparedQuery, ...],
+        serving: TurboVecServingIndex,
+        query_results: list[_EngineTurboVecQueryResult | None],
+        search_latencies: list[float],
+        batch_result: Any,
+        started: float,
+        extra_fields: dict[str, Any],
+    ) -> None:
+        """Writes one CPU-kernel group result back at original positions."""
+
+        per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(positions), 1)
+        for local_index, position in enumerate(positions):
+            take = min(int(prepared[position].query.top_k), batch_result.stable_ids.shape[1])
+            query_results[position] = _EngineTurboVecQueryResult(
+                index=serving,
+                stable_ids=batch_result.stable_ids[local_index, :take].reshape(-1),
+                scores=batch_result.scores[local_index, :take].reshape(-1),
+                native_used=batch_result.native_used,
+                native_backend=batch_result.native_backend,
+                retrieval_mode="direct_turbovec",
+                fallback_used=False,
+                compact_route_fallback=False,
+                **extra_fields,
+            )
+            search_latencies[position] = per_query_ms
+
     def _turbovec_index_for_state(self, state: ClientIndexState) -> TurboVecServingIndex:
         """Returns a current TurboVec IdMapIndex view for one client state."""
 
@@ -2334,6 +2543,42 @@ class LodeEngine:
         if cached is not None and cached.generation == generation:
             return cached
         raise RuntimeError("direct TurboVec snapshot is not loaded")
+
+    def _metadata_posting_index(self, state: ClientIndexState) -> _MetadataPostingIndex:
+        """Returns the generation-current metadata posting index, building it lazily.
+
+        Keyed by the same generation as the serving index, so any mutation (which
+        advances the generation) transparently invalidates it; the rebuild is an
+        O(corpus) pass that happens on the first filtered query of a generation
+        and is then reused, never touching the write/commit path.
+        """
+
+        generation = self._index_generations.get(state.index_key, 0)
+        cached = self._metadata_posting_indexes.get(state.index_key)
+        if cached is not None and cached.generation == generation:
+            return cached
+        postings: dict[tuple[str, str], set[str]] = {}
+        for document_id, metadata in state.document_metadata.items():
+            for key, value in metadata.items():
+                postings.setdefault((str(key), str(value)), set()).add(str(document_id))
+        chunks_by_document: dict[str, list[str]] = {}
+        for chunk_id, chunk in state.chunks.items():
+            chunks_by_document.setdefault(str(chunk.document_id), []).append(str(chunk_id))
+        index = _MetadataPostingIndex(generation, postings, chunks_by_document)
+        self._metadata_posting_indexes[state.index_key] = index
+        return index
+
+    def _build_filter_allowlist(
+        self, state: ClientIndexState, query_filter: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Returns the chunk ids eligible under a query filter (the native allowlist).
+
+        Shared by the single-query and batch paths so filters are pushed into the
+        TurboVec scan instead of widening top_k to the corpus and post-filtering.
+        Resolved through the metadata posting index in O(matching docs + chunks).
+        """
+
+        return self._metadata_posting_index(state).allowlist(query_filter)
 
     def _sync_direct_turbovec_index(self, state: ClientIndexState) -> tuple[str, ...]:
         """Applies transient full-embedding mutations to a direct TurboVec index.
@@ -2393,9 +2638,7 @@ class LodeEngine:
             started = perf_counter()
         if removed_stable_ids and hasattr(previous.index, "remove_many"):
             removed_count = int(
-                previous.index.remove_many(
-                    np.asarray(removed_stable_ids, dtype=np.uint64)
-                )
+                previous.index.remove_many(np.asarray(removed_stable_ids, dtype=np.uint64))
             )
             if removed_count != len(removed_stable_ids):
                 raise RuntimeError(
@@ -2480,9 +2723,7 @@ class LodeEngine:
                 self._gpu_direct_turbovec_sessions.pop(state.index_key, None)
         if mps_session is not None:
             try:
-                mps_upsert_stable_ids = (
-                    tuple(int(uid) for uid in stable_ids) if new_chunks else ()
-                )
+                mps_upsert_stable_ids = tuple(int(uid) for uid in stable_ids) if new_chunks else ()
                 mps_session.patch(
                     index=previous.index,
                     removed_ids=removed_stable_ids,
@@ -2520,9 +2761,7 @@ class LodeEngine:
         self._buffer_pending_drift(state, new_chunks)
         return tuple(str(chunk.chunk_id) for chunk in new_chunks)
 
-    def _buffer_pending_drift(
-        self, state: ClientIndexState, new_chunks: tuple[Any, ...]
-    ) -> None:
+    def _buffer_pending_drift(self, state: ClientIndexState, new_chunks: tuple[Any, ...]) -> None:
         """Records recently-added rows for a deferred, query-warm drift sample.
 
         Sampling drift needs a self-score search, which needs the warm SIMD
@@ -3276,9 +3515,7 @@ class LodeEngine:
             return
         if not text_manifest:
             return
-        state.document_text = self._text_store(state.index_key, epoch).load(
-            manifest=text_manifest
-        )
+        state.document_text = self._text_store(state.index_key, epoch).load(manifest=text_manifest)
 
     def _load_pre_journal_text(
         self, state: ClientIndexState, *, generation: int, expected_sha: str | None
@@ -3544,11 +3781,7 @@ def _max_query_result_int(
     """Returns the maximum integer telemetry value across a query result batch."""
 
     return max(
-        (
-            int(getattr(result, field_name, 0))
-            for result in query_results
-            if result is not None
-        ),
+        (int(getattr(result, field_name, 0)) for result in query_results if result is not None),
         default=0,
     )
 
@@ -3561,9 +3794,7 @@ def _sum_query_result_int(
     """Returns the summed integer telemetry value across a query result batch."""
 
     return sum(
-        int(getattr(result, field_name, 0))
-        for result in query_results
-        if result is not None
+        int(getattr(result, field_name, 0)) for result in query_results if result is not None
     )
 
 
@@ -3575,11 +3806,7 @@ def _max_query_result_float(
     """Returns the maximum floating-point telemetry value across a query result batch."""
 
     return max(
-        (
-            float(getattr(result, field_name, 0.0))
-            for result in query_results
-            if result is not None
-        ),
+        (float(getattr(result, field_name, 0.0)) for result in query_results if result is not None),
         default=0.0,
     )
 
@@ -3606,8 +3833,7 @@ def _validate_direct_turbovec_snapshot(
 
     if index.dim != state.native_dim:
         raise ValueError(
-            f"direct TurboVec snapshot dim {index.dim} does not match native_dim "
-            f"{state.native_dim}"
+            f"direct TurboVec snapshot dim {index.dim} does not match native_dim {state.native_dim}"
         )
     expected_bit_width = _turbovec_bit_width_for_state(state)
     if index.bit_width != expected_bit_width:
@@ -3958,16 +4184,27 @@ def _validate_query_includes(include: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(cleaned))
 
 
-def _search_top_k_for_filter(
-    state: ClientIndexState,
-    top_k: int,
-    query_filter: Mapping[str, Any],
-) -> int:
-    """Returns a larger candidate count when filtering may discard top results."""
+def _filter_signature(query_filter: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Returns a hashable key grouping batch queries that share an identical filter."""
 
-    if query_filter:
-        return max(top_k, len(state.chunks))
-    return top_k
+    metadata = query_filter.get("metadata") or {}
+    document_ids = query_filter.get("document_ids") or ()
+    return (tuple(sorted(metadata.items())), tuple(document_ids))
+
+
+def _empty_turbovec_result(index: TurboVecServingIndex) -> _EngineTurboVecQueryResult:
+    """Returns an empty direct-TurboVec result (filter matched no eligible rows)."""
+
+    return _EngineTurboVecQueryResult(
+        index=index,
+        stable_ids=np.empty(0, dtype=np.uint64),
+        scores=np.empty(0, dtype=np.float32),
+        native_used=index.native_used,
+        native_backend=index.native_backend,
+        retrieval_mode="direct_turbovec",
+        fallback_used=False,
+        compact_route_fallback=False,
+    )
 
 
 def _normalize_rows_for_engine(matrix: np.ndarray) -> np.ndarray:
@@ -4201,9 +4438,7 @@ def _audit_snapshot_row(
             segment_forbidden = _snapshot_forbidden_keys(body)
             if segment_forbidden:
                 keys = ", ".join(sorted(segment_forbidden))
-                raise ValueError(
-                    f"{file_name} journal contains forbidden raw-payload keys: {keys}"
-                )
+                raise ValueError(f"{file_name} journal contains forbidden raw-payload keys: {keys}")
         replay_stats = journal.replay_onto_payload(payload, manifest=json_manifest)
         journal_audit = {
             **journal.storage_file_bytes(manifest=json_manifest),
