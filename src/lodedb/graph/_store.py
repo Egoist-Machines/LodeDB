@@ -96,12 +96,20 @@ class TopologyStore:
     def upsert_node(self, node: Node) -> None:
         """Inserts or replaces a node by id."""
 
+        self.upsert_nodes((node,))
+
+    def upsert_nodes(self, nodes: Iterable[Node]) -> None:
+        """Inserts or replaces many nodes in one transaction (executemany)."""
+
+        rows = [(n.id, n.type, n.label, json.dumps(n.properties)) for n in nodes]
+        if not rows:
+            return
         with self._conn:
-            self._conn.execute(
+            self._conn.executemany(
                 "INSERT INTO nodes (id, type, label, properties) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET type=excluded.type, label=excluded.label, "
                 "properties=excluded.properties",
-                (node.id, node.type, node.label, json.dumps(node.properties)),
+                rows,
             )
 
     def get_node(self, node_id: str) -> Node | None:
@@ -111,6 +119,27 @@ class TopologyStore:
             "SELECT id, type, label, properties FROM nodes WHERE id = ?", (node_id,)
         ).fetchone()
         return _node_from_row(row) if row is not None else None
+
+    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
+        """Returns the nodes for ``node_ids`` (chunked IN; missing ids omitted).
+
+        The batched read behind k-hop and hybrid retrieval: one query per
+        ``_IN_CHUNK`` ids instead of one round-trip per visited node.
+        """
+
+        ids = [str(value) for value in node_ids]
+        if not ids:
+            return []
+        found: list[Node] = []
+        for start in range(0, len(ids), _IN_CHUNK):
+            batch = ids[start : start + _IN_CHUNK]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"SELECT id, type, label, properties FROM nodes WHERE id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            found.extend(_node_from_row(row) for row in rows)
+        return found
 
     def remove_node(self, node_id: str) -> tuple[bool, list[str]]:
         """Removes a node and all incident edges.
@@ -153,12 +182,22 @@ class TopologyStore:
     def upsert_edge(self, edge: Edge) -> None:
         """Inserts or replaces an edge by id."""
 
+        self.upsert_edges((edge,))
+
+    def upsert_edges(self, edges: Iterable[Edge]) -> None:
+        """Inserts or replaces many edges in one transaction (executemany)."""
+
+        rows = [
+            (e.id, e.src, e.relation, e.dst, json.dumps(e.properties)) for e in edges
+        ]
+        if not rows:
+            return
         with self._conn:
-            self._conn.execute(
+            self._conn.executemany(
                 "INSERT INTO edges (id, src, relation, dst, properties) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET src=excluded.src, relation=excluded.relation, "
                 "dst=excluded.dst, properties=excluded.properties",
-                (edge.id, edge.src, edge.relation, edge.dst, json.dumps(edge.properties)),
+                rows,
             )
 
     def get_edge(self, edge_id: str) -> Edge | None:

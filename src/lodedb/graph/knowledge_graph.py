@@ -25,8 +25,10 @@ edge "facts" for semantic edge search.
 
 from __future__ import annotations
 
+import logging
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,67 @@ from ._store import Edge, Node, TopologyStore
 
 _NODE_PREFIX = "n:"
 _EDGE_PREFIX = "e:"
+
+logger = logging.getLogger("lodedb.graph")
+
+
+class _IngestBuffer:
+    """Collects add_node/add_edge calls inside a :meth:`KnowledgeGraph.ingest`
+    block so they can flush as one batched write per kind (one index commit each)."""
+
+    def __init__(self) -> None:
+        self.nodes: list[dict[str, Any]] = []
+        self.edges: list[dict[str, Any]] = []
+
+    def add_node(
+        self,
+        *,
+        id: str | None = None,
+        type: str = "",
+        label: str = "",
+        properties: Mapping[str, Any] | None = None,
+        embedding: Sequence[float] | None = None,
+    ) -> str:
+        """Buffers a node; returns its id (auto-assigned when not given)."""
+
+        node_id = str(id) if id is not None else f"node-{secrets.token_hex(8)}"
+        self.nodes.append(
+            {
+                "id": node_id,
+                "type": type,
+                "label": label,
+                "properties": properties,
+                "embedding": embedding,
+            }
+        )
+        return node_id
+
+    def add_edge(
+        self,
+        src: str,
+        relation: str,
+        dst: str,
+        *,
+        id: str | None = None,
+        properties: Mapping[str, Any] | None = None,
+        fact: str | None = None,
+        embedding: Sequence[float] | None = None,
+    ) -> str:
+        """Buffers an edge; returns its id (derived from the triple when not given)."""
+
+        edge_id = str(id) if id is not None else f"{src}:{relation}:{dst}"
+        self.edges.append(
+            {
+                "src": src,
+                "relation": relation,
+                "dst": dst,
+                "id": edge_id,
+                "properties": properties,
+                "fact": fact,
+                "embedding": embedding,
+            }
+        )
+        return edge_id
 
 
 @dataclass
@@ -169,6 +232,128 @@ class KnowledgeGraph:
             self._index_edge(edge, fact=fact, embedding=embedding)
         return edge_id
 
+    def add_nodes(self, nodes: list[Mapping[str, Any]]) -> list[str]:
+        """Adds or replaces many nodes in one batch.
+
+        One SQLite transaction plus a single index commit per kind (text label vs
+        precomputed embedding), versus one index commit per node with
+        :meth:`add_node`. Each item is ``{"id"?, "type"?, "label"?, "properties"?,
+        "embedding"?}``. Returns the ids in input order.
+
+        Note: unlike :meth:`add_node`, this does not clear a stale index entry for a
+        node that loses its label/embedding (bulk load is for new content); use
+        :meth:`add_node` or :meth:`reindex` to reconcile such removals.
+        """
+
+        self._require_writable()
+        node_objs: list[Node] = []
+        ids: list[str] = []
+        text_docs: list[dict[str, Any]] = []
+        vector_docs: list[dict[str, Any]] = []
+        for item in nodes:
+            raw_id = item.get("id")
+            node_id = str(raw_id) if raw_id is not None else f"node-{secrets.token_hex(8)}"
+            node = Node(
+                id=node_id,
+                type=str(item.get("type", "")),
+                label=str(item.get("label", "")),
+                properties=dict(item.get("properties") or {}),
+            )
+            node_objs.append(node)
+            ids.append(node_id)
+            metadata = {"kind": "node", "type": node.type, "node_id": node.id}
+            embedding = item.get("embedding")
+            if embedding is not None:
+                vector_docs.append(
+                    {"vector": embedding, "id": _NODE_PREFIX + node.id, "metadata": metadata}
+                )
+            elif node.label.strip():
+                text_docs.append(
+                    {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
+                )
+        self._store.upsert_nodes(node_objs)
+        if text_docs:
+            self._db.add_many(text_docs)
+        if vector_docs:
+            self._db.add_vectors_many(vector_docs)
+        return ids
+
+    def add_edges(self, edges: list[Mapping[str, Any]]) -> list[str]:
+        """Adds or replaces many edges in one batch.
+
+        One SQLite transaction plus, when ``index_edges`` is on, one index commit
+        per kind. Each item is ``{"src", "relation", "dst", "id"?, "properties"?,
+        "fact"?, "embedding"?}``. Returns the ids in input order.
+        """
+
+        self._require_writable()
+        edge_objs: list[Edge] = []
+        ids: list[str] = []
+        text_docs: list[dict[str, Any]] = []
+        vector_docs: list[dict[str, Any]] = []
+        for item in edges:
+            src = str(item["src"])
+            relation = str(item["relation"])
+            dst = str(item["dst"])
+            raw_id = item.get("id")
+            edge_id = str(raw_id) if raw_id is not None else f"{src}:{relation}:{dst}"
+            edge_objs.append(
+                Edge(
+                    id=edge_id,
+                    src=src,
+                    relation=relation,
+                    dst=dst,
+                    properties=dict(item.get("properties") or {}),
+                )
+            )
+            ids.append(edge_id)
+            if self.index_edges:
+                metadata = {
+                    "kind": "edge",
+                    "relation": relation,
+                    "src": src,
+                    "dst": dst,
+                    "edge_id": edge_id,
+                }
+                embedding = item.get("embedding")
+                fact = item.get("fact")
+                if embedding is not None:
+                    vector_docs.append(
+                        {"vector": embedding, "id": _EDGE_PREFIX + edge_id, "metadata": metadata}
+                    )
+                elif fact and str(fact).strip():
+                    text_docs.append(
+                        {"text": fact, "id": _EDGE_PREFIX + edge_id, "metadata": metadata}
+                    )
+        self._store.upsert_edges(edge_objs)
+        if text_docs:
+            self._db.add_many(text_docs)
+        if vector_docs:
+            self._db.add_vectors_many(vector_docs)
+        return ids
+
+    @contextmanager
+    def ingest(self) -> Iterator[_IngestBuffer]:
+        """Buffers add_node/add_edge calls and flushes them as batched writes on exit.
+
+        Inside the block, use the yielded buffer's ``add_node``/``add_edge`` (same
+        arguments as the graph's own). On exit they are applied via
+        :meth:`add_nodes` / :meth:`add_edges`, so a bulk load pays one SQLite
+        transaction and one index commit per kind instead of one commit per entity::
+
+            with kg.ingest() as batch:
+                for row in rows:
+                    batch.add_node(id=row.id, label=row.text)
+        """
+
+        self._require_writable()
+        buffer = _IngestBuffer()
+        yield buffer
+        if buffer.nodes:
+            self.add_nodes(buffer.nodes)
+        if buffer.edges:
+            self.add_edges(buffer.edges)
+
     def remove_node(self, node_id: str) -> bool:
         """Removes a node and its incident edges from both stores.
 
@@ -222,34 +407,45 @@ class KnowledgeGraph:
         k: int = 1,
         direction: str = "both",
         relation: str | None = None,
+        max_nodes: int | None = None,
     ) -> Subgraph:
         """Expands the ``k``-hop neighbourhood around ``seeds`` over the topology.
 
         This is the deterministic, complete-set traversal (BFS) that a top-``k``
         similarity search cannot express: every node within ``k`` hops and every
-        edge traversed is returned.
+        edge traversed is returned. ``max_nodes`` optionally caps the visited set
+        (a budget for dense graphs); when it truncates, a warning is logged so the
+        cap is never silent and the result is a partial subgraph.
         """
 
         seed_ids = [str(seeds)] if isinstance(seeds, str) else [str(value) for value in seeds]
         visited: set[str] = set(seed_ids)
         frontier: set[str] = set(seed_ids)
         edges_seen: dict[str, Edge] = {}
+        truncated = False
         for _hop in range(max(0, int(k))):
-            if not frontier:
+            if not frontier or truncated:
                 break
             next_frontier: set[str] = set()
             for edge in self._store.edges_for(frontier, direction=direction, relation=relation):
                 edges_seen[edge.id] = edge
                 for endpoint in (edge.src, edge.dst):
-                    if endpoint not in visited:
-                        visited.add(endpoint)
-                        next_frontier.add(endpoint)
+                    if endpoint in visited:
+                        continue
+                    if max_nodes is not None and len(visited) >= max_nodes:
+                        truncated = True
+                        continue
+                    visited.add(endpoint)
+                    next_frontier.add(endpoint)
             frontier = next_frontier
-        nodes: dict[str, Node] = {}
-        for node_id in visited:
-            node = self._store.get_node(node_id)
-            if node is not None:
-                nodes[node_id] = node
+        if truncated:
+            logger.warning(
+                "k_hop truncated at max_nodes=%s (visited %d nodes); subgraph is partial",
+                max_nodes,
+                len(visited),
+            )
+        # Batched read: one query per _IN_CHUNK ids, not one round-trip per node.
+        nodes = {node.id: node for node in self._store.get_nodes(visited)}
         return Subgraph(nodes=nodes, edges=list(edges_seen.values()))
 
     # -- semantic retrieval -------------------------------------------------
@@ -278,10 +474,13 @@ class KnowledgeGraph:
             entity_type=node_type,
             extra_filter=filter,
         )
+        hit_node_ids = [
+            hit.metadata.get("node_id") or _strip(hit.id, _NODE_PREFIX) for hit in hits
+        ]
+        nodes_by_id = {node.id: node for node in self._store.get_nodes(hit_node_ids)}
         out: list[tuple[float, Node]] = []
-        for hit in hits:
-            node_id = hit.metadata.get("node_id") or _strip(hit.id, _NODE_PREFIX)
-            node = self._store.get_node(node_id)
+        for hit, node_id in zip(hits, hit_node_ids, strict=True):
+            node = nodes_by_id.get(node_id)
             if node is not None:
                 out.append((hit.score, node))
         return out
