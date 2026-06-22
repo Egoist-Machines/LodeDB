@@ -17,6 +17,7 @@ O(changed) commit path, lean deps) and `docs/architecture.md`.
 | 03 | [arbitrary-dim-vector-only-index](03-arbitrary-dim-vector-only-index.md) | A bring-your-own-vectors index mode (any dim, no internal embedder) for Graphiti/cognee/Letta | High — the memory-systems integration unlock |
 | 04 | [durable-vector-rebuildable-index](04-durable-vector-rebuildable-index.md) | Make the graph's semantic index fully rebuildable even for vector-in nodes | Medium |
 | 05 | [batched-metadata-hydration](05-batched-metadata-hydration.md) | Remove the per-hit `get_document` N+1 in search result hydration | Medium |
+| 06 | [graph-bulk-load-and-batched-reads](06-graph-bulk-load-and-batched-reads.md) | Batch graph node/edge ingest (one commit) + batched `get_node` in traversal | Medium — measured: node build 122/s, hybrid p50 183ms |
 
 Quantify candidate fixes with `benchmarks/graph_memory/` (vector-in throughput,
 filter-predicate latency by selectivity, graph traversal) on Modal A10/L40S.

@@ -57,9 +57,51 @@ embedding device as noted. Provenance: `measured`.
 | k-hop p50 (deg 8, 2 hops) | 3.32 ms |
 | hybrid `search_subgraph` p50 | 15.8 ms |
 
-### Full — GovReport, 50k docs/nodes, deg 16, Modal A10
+### Full — GovReport (17.5k docs, full train split), Modal A10 (CUDA embedding)
 
-_Populated by `modal run ...::main_a10` (`results/results_a10.json`)._
+Full JSON in `results/results_a10.json`. `minilm` (384-d), CPU TurboVec scan.
+
+**vector-in** (docs capped to one chunk for exact parity):
+
+| metric | text-in | vector-in |
+|---|---|---|
+| ingest throughput | 811 docs/s | **6,609 docs/s** (8.1×) |
+| search p50 | 5.16 ms | **0.63 ms** (8×) |
+| top-k overlap (mean / min) | — | **0.9996 / 0.90** |
+
+The few <1.0 overlaps are top-k **boundary ties** (equal scores ordered differently),
+not divergence — the indexes are byte-identical.
+
+**filters** (p50, k=10, 256 queries):
+
+| predicate | p50 | vs `$eq` |
+|---|---|---|
+| `no_filter` | 7.5 ms | — |
+| `eq_topic` (`$eq`, posting allowlist) | 14.0 ms | 1.0× |
+| `and_topic_year` (`$and`) | 34.1 ms | 2.4× |
+| `in_topic_3` (`$in`) | 37.2 ms | 2.6× |
+| `exists_topic` (`$exists`) | 47.0 ms | 3.3× |
+| `ne_topic` (`$ne`) | 51.8 ms | 3.7× |
+| `gte_year` (`$gte`) | 56.6 ms | 4.0× |
+| `range_year` (`$gte`+`$lt`) | 73.0 ms | 5.2× |
+
+Exact `$eq`/`$in` ride the posting-index allowlist; ordered/negation predicates are
+3–5× slower (per-candidate evaluation) — the gradient that motivates the filter
+planner in `docs/research-prompts/01`.
+
+**graph** (17.5k nodes, 280k edges, avg degree 16, 2 hops):
+
+| op | p50 | p95 | avg subgraph |
+|---|---|---|---|
+| node build | 122 nodes/s | — | per-node commit bound → batch (`research-prompts/06`) |
+| edge build | 10,719 edges/s | — | — |
+| k-hop | 18.4 ms | 24.4 ms | 1,021 nodes |
+| hybrid `search_subgraph` | 182.6 ms | 451.6 ms | 7,838 nodes |
+
+This is a **dense random graph** (degree 16): a 2-hop neighbourhood reaches ~45% of
+all nodes, so this is the stress-case upper bound, not a typical sparse KG. Hybrid
+latency is dominated by per-node topology fetches over that large frontier — see
+`docs/research-prompts/06` (graph bulk-load + batched reads).
 
 ## Notes
 
