@@ -11,7 +11,7 @@ import threading
 import uuid
 import weakref
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from ipaddress import ip_address
@@ -321,6 +321,33 @@ class _PreparedQuery:
     query_filter: dict[str, Any]
     includes: tuple[str, ...]
     route: RouteDecision
+
+
+@dataclass(frozen=True)
+class _ResidentDirectBackend:
+    """Describes one resident-scan backend (GPU/MPS) for the shared batch dispatcher.
+
+    Captures only what differs between the CUDA and Apple-GPU direct paths so
+    :meth:`LodeEngine._try_query_resident_direct_batch` can drive both. ``kind`` is
+    the human label used in ``required`` error messages; ``reason_prefix`` namespaces
+    the visible fallback reasons (``gpu_direct_*`` / ``mps_direct_*``). ``build_session``
+    and ``estimated_bytes`` close over the backend's session class and serving index.
+    """
+
+    kind: str
+    reason_prefix: str
+    policy: Any
+    dependency_available: bool
+    api_available: bool
+    unavailable_reason: str
+    default_unavailable_reason: str
+    should_use: Callable[..., bool]
+    max_batch: int | None
+    max_top_k: int
+    sessions: dict[str, Any]
+    memory_budget_bytes: int | None
+    build_session: Callable[[], Any]
+    estimated_bytes: Callable[[Any], int]
 
 
 def _synchronized(method):
@@ -1948,14 +1975,11 @@ class LodeEngine:
     ) -> tuple[Any | None, dict[str, Any]]:
         """Attempts the GPU-resident exact batch path for one direct-route batch.
 
-        Returns ``(result, telemetry_fields)``: on success the fields carry
-        admission accounting for the "used" rows; on fallback the result is
-        ``None`` and the fields annotate the CPU rows with a visible
-        status/reason. ``required`` raises instead of falling back (except
-        for single queries, which stay CPU by design); ``off`` returns empty
-        fields so CPU rows keep today's defaults. The resident session is
-        generation-keyed: mutations invalidate it and the next batch
-        re-uploads lazily.
+        Thin CUDA adapter: probes CuPy, builds a :class:`_ResidentDirectBackend`,
+        and delegates to :meth:`_try_query_resident_direct_batch` (which documents
+        the ``(result, telemetry_fields)`` contract and the ``off``/``auto``/
+        ``required`` semantics). ``off`` short-circuits here so the CuPy probe never
+        runs on the default-on path when an operator has explicitly disabled it.
         """
 
         from lodedb.engine.gpu_turbovec import (
@@ -1968,21 +1992,72 @@ class LodeEngine:
         policy = self.gpu_direct_turbovec_policy
         if policy == GpuDirectTurboVecPolicy.OFF:
             return None, {}
+        # Probe CuPy only once policy is on (the dependency import is not free).
         dependencies = gpu_direct_turbovec_dependencies()
-        api_available = turbovec_reconstruction_api_available(serving.index)
-        available = bool(dependencies.available and api_available)
+        backend = _ResidentDirectBackend(
+            kind="GPU",
+            reason_prefix="gpu_direct",
+            policy=policy,
+            dependency_available=bool(dependencies.available),
+            api_available=turbovec_reconstruction_api_available(serving.index),
+            unavailable_reason=dependencies.unavailable_reason or "",
+            default_unavailable_reason="gpu_dependencies_unavailable",
+            should_use=gpu_direct_turbovec_should_use,
+            max_batch=self.gpu_direct_turbovec_max_batch,
+            max_top_k=GPU_DIRECT_TURBOVEC_MAX_TOP_K,
+            sessions=self._gpu_direct_turbovec_sessions,
+            memory_budget_bytes=self.gpu_memory_budget_bytes,
+            build_session=lambda: GpuDirectTurboVecSession.build(
+                index=serving.index,
+                generation=serving.generation,
+                dependencies=dependencies,
+                memory_budget_bytes=self.gpu_memory_budget_bytes,
+            ),
+            estimated_bytes=lambda session: int(session.estimated_gpu_bytes),
+        )
+        return self._try_query_resident_direct_batch(
+            backend, state, serving=serving, batch=batch, top_k=top_k
+        )
+
+    def _try_query_resident_direct_batch(
+        self,
+        backend: _ResidentDirectBackend,
+        state: ClientIndexState,
+        *,
+        serving: TurboVecServingIndex,
+        batch: np.ndarray,
+        top_k: int,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Backend-agnostic engine for one resident (GPU/MPS) direct-route batch.
+
+        Shared by :meth:`_try_query_gpu_direct_turbovec_batch` and
+        :meth:`_try_query_mps_direct_turbovec_batch`, which pass a
+        :class:`_ResidentDirectBackend` describing the device specifics. Returns
+        ``(result, telemetry_fields)``: on success the fields carry admission
+        accounting for the "used" rows; on fallback the result is ``None`` and the
+        fields annotate the CPU rows with a visible status/reason. ``required`` raises
+        instead of falling back (except single queries, which stay CPU by design).
+        The resident session is generation-keyed: a mutation or budget change
+        invalidates it and the next batch re-uploads lazily.
+        """
+
+        policy = backend.policy
+        policy_type = type(policy)
+        if policy == policy_type.OFF:
+            return None, {}
+        available = bool(backend.dependency_available and backend.api_available)
         try:
-            should_use = gpu_direct_turbovec_should_use(
+            should_use = backend.should_use(
                 policy=policy,
                 dependency_available=available,
                 query_batch_size=int(batch.shape[0]),
-                maximum_batch_size=self.gpu_direct_turbovec_max_batch,
+                maximum_batch_size=backend.max_batch,
             )
         except RuntimeError as exc:
             raise RuntimeError(
-                "GPU direct TurboVec serving is required but unavailable: "
+                f"{backend.kind} direct TurboVec serving is required but unavailable: "
                 + (
-                    dependencies.unavailable_reason
+                    backend.unavailable_reason
                     or "the loaded TurboVec backend lacks the reconstruction APIs"
                 )
             ) from exc
@@ -1990,83 +2065,77 @@ class LodeEngine:
             status = "bypassed"
             reason = ""
             if int(batch.shape[0]) < 2:
-                reason = "gpu_direct_batch_below_minimum"
+                reason = f"{backend.reason_prefix}_batch_below_minimum"
             elif (
-                policy == GpuDirectTurboVecPolicy.AUTO
-                and self.gpu_direct_turbovec_max_batch is not None
-                and int(batch.shape[0]) > self.gpu_direct_turbovec_max_batch
+                policy == policy_type.AUTO
+                and backend.max_batch is not None
+                and int(batch.shape[0]) > backend.max_batch
             ):
-                # Auto flips to the CPU kernel above the GPU-favorable window:
+                # Auto flips to the CPU kernel above the resident-favorable window:
                 # the shared-top-k scan is faster at large batch.
-                reason = "gpu_direct_batch_above_window"
-            elif not dependencies.available:
+                reason = f"{backend.reason_prefix}_batch_above_window"
+            elif not backend.dependency_available:
                 status = "failed_over"
-                reason = dependencies.unavailable_reason or "gpu_dependencies_unavailable"
-            elif not api_available:
+                reason = backend.unavailable_reason or backend.default_unavailable_reason
+            elif not backend.api_available:
                 status = "failed_over"
                 reason = "turbovec_reconstruction_api_unavailable"
             return None, {"gpu_stage_one_status": status, "gpu_fallback_reason": reason}
-        if int(top_k) > GPU_DIRECT_TURBOVEC_MAX_TOP_K:
+        if int(top_k) > backend.max_top_k:
             # Widened post-filter top-k requests would sort and copy back
             # huge candidate sets; the CPU kernel handles them instead.
-            if policy == GpuDirectTurboVecPolicy.REQUIRED:
+            if policy == policy_type.REQUIRED:
                 raise RuntimeError(
-                    "GPU direct TurboVec serving is required but the effective "
-                    f"top_k {int(top_k)} exceeds the GPU limit "
-                    f"{GPU_DIRECT_TURBOVEC_MAX_TOP_K}"
+                    f"{backend.kind} direct TurboVec serving is required but the effective "
+                    f"top_k {int(top_k)} exceeds the {backend.kind} limit {backend.max_top_k}"
                 )
             return None, {
                 "gpu_stage_one_status": "bypassed",
-                "gpu_fallback_reason": "gpu_direct_top_k_exceeds_limit",
+                "gpu_fallback_reason": f"{backend.reason_prefix}_top_k_exceeds_limit",
             }
-        session = self._gpu_direct_turbovec_sessions.get(state.index_key)
+        session = backend.sessions.get(state.index_key)
         if (
             session is None
             or session.generation != serving.generation
             # A budget change forces re-admission, matching the V1 session
             # cache: a lowered budget must evict an oversized resident copy.
-            or session.memory_budget_bytes != self.gpu_memory_budget_bytes
+            or session.memory_budget_bytes != backend.memory_budget_bytes
         ):
             try:
-                session = GpuDirectTurboVecSession.build(
-                    index=serving.index,
-                    generation=serving.generation,
-                    dependencies=dependencies,
-                    memory_budget_bytes=self.gpu_memory_budget_bytes,
-                )
+                session = backend.build_session()
             except MemoryError as exc:
-                if policy == GpuDirectTurboVecPolicy.REQUIRED:
+                if policy == policy_type.REQUIRED:
                     raise RuntimeError(
-                        f"GPU direct TurboVec memory admission rejected: {exc}"
+                        f"{backend.kind} direct TurboVec memory admission rejected: {exc}"
                     ) from exc
                 return None, {
                     "gpu_stage_one_status": "memory_rejected",
                     "gpu_fallback_reason": str(exc),
-                    "gpu_budget_bytes": int(self.gpu_memory_budget_bytes or 0),
+                    "gpu_budget_bytes": int(backend.memory_budget_bytes or 0),
                 }
             except RuntimeError as exc:
-                if policy == GpuDirectTurboVecPolicy.REQUIRED:
+                if policy == policy_type.REQUIRED:
                     raise
                 return None, {
                     "gpu_stage_one_status": "failed_over",
-                    "gpu_fallback_reason": f"gpu_direct_build_failed: {exc}",
+                    "gpu_fallback_reason": f"{backend.reason_prefix}_build_failed: {exc}",
                 }
-            self._gpu_direct_turbovec_sessions[state.index_key] = session
+            backend.sessions[state.index_key] = session
         try:
             result = session.search_batch(batch, top_k=int(top_k))
         except Exception as exc:  # noqa: BLE001 - auto policy must fall back visibly.
-            self._gpu_direct_turbovec_sessions.pop(state.index_key, None)
-            if policy == GpuDirectTurboVecPolicy.REQUIRED:
+            backend.sessions.pop(state.index_key, None)
+            if policy == policy_type.REQUIRED:
                 raise RuntimeError(
-                    f"GPU direct TurboVec batch search failed: {exc}"
+                    f"{backend.kind} direct TurboVec batch search failed: {exc}"
                 ) from exc
             return None, {
                 "gpu_stage_one_status": "failed_over",
-                "gpu_fallback_reason": f"gpu_direct_runtime_error: {exc}",
+                "gpu_fallback_reason": f"{backend.reason_prefix}_runtime_error: {exc}",
             }
         return result, {
-            "gpu_estimated_bytes": int(session.estimated_gpu_bytes),
-            "gpu_budget_bytes": int(self.gpu_memory_budget_bytes or 0),
+            "gpu_estimated_bytes": int(backend.estimated_bytes(session)),
+            "gpu_budget_bytes": int(backend.memory_budget_bytes or 0),
             "gpu_resident_upload_build_ms": float(session.upload_build_ms),
         }
 
@@ -2080,10 +2149,10 @@ class LodeEngine:
     ) -> tuple[Any | None, dict[str, Any]]:
         """Attempts the opt-in MPS-resident exact batch path for one direct-route batch.
 
-        Same shape as :meth:`_try_query_gpu_direct_turbovec_batch`: returns
-        ``(result, telemetry_fields)`` and falls back to ``None`` (CPU) unless the
-        policy is ``required``. Off by default; NEON stays the default on Apple
-        Silicon. Reuses the ``gpu_*`` telemetry fields, tagged with the MPS backend.
+        Thin Apple-GPU adapter: probes Metal, builds a :class:`_ResidentDirectBackend`,
+        and delegates to :meth:`_try_query_resident_direct_batch`. Off by default;
+        NEON stays the default on Apple Silicon. Reuses the ``gpu_*`` telemetry
+        fields, disambiguated from the CUDA path by ``stage_one_backend``.
         """
 
         from lodedb.engine.gpu_turbovec import turbovec_reconstruction_api_available
@@ -2096,95 +2165,31 @@ class LodeEngine:
         policy = self.mps_direct_turbovec_policy
         if policy == MpsDirectTurboVecPolicy.OFF:
             return None, {}
+        # Probe Metal only once policy is on, mirroring the GPU adapter.
         mps_ok, mps_reason = mps_exact_scan_available()
-        api_available = turbovec_reconstruction_api_available(serving.index)
-        available = bool(mps_ok and api_available)
-        try:
-            should_use = mps_direct_turbovec_should_use(
-                policy=policy,
-                dependency_available=available,
-                query_batch_size=int(batch.shape[0]),
-                maximum_batch_size=self.mps_direct_turbovec_max_batch,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "MPS direct TurboVec serving is required but unavailable: "
-                + (mps_reason or "the loaded TurboVec backend lacks the reconstruction APIs")
-            ) from exc
-        if not should_use:
-            status = "bypassed"
-            reason = ""
-            if int(batch.shape[0]) < 2:
-                reason = "mps_direct_batch_below_minimum"
-            elif (
-                policy == MpsDirectTurboVecPolicy.AUTO
-                and self.mps_direct_turbovec_max_batch is not None
-                and int(batch.shape[0]) > self.mps_direct_turbovec_max_batch
-            ):
-                reason = "mps_direct_batch_above_window"
-            elif not mps_ok:
-                status = "failed_over"
-                reason = mps_reason or "mps_unavailable"
-            elif not api_available:
-                status = "failed_over"
-                reason = "turbovec_reconstruction_api_unavailable"
-            return None, {"gpu_stage_one_status": status, "gpu_fallback_reason": reason}
-        if int(top_k) > MPS_DIRECT_TURBOVEC_MAX_TOP_K:
-            if policy == MpsDirectTurboVecPolicy.REQUIRED:
-                raise RuntimeError(
-                    "MPS direct TurboVec serving is required but the effective "
-                    f"top_k {int(top_k)} exceeds the MPS limit {MPS_DIRECT_TURBOVEC_MAX_TOP_K}"
-                )
-            return None, {
-                "gpu_stage_one_status": "bypassed",
-                "gpu_fallback_reason": "mps_direct_top_k_exceeds_limit",
-            }
-        session = self._mps_direct_turbovec_sessions.get(state.index_key)
-        if (
-            session is None
-            or session.generation != serving.generation
-            or session.memory_budget_bytes != self.mps_memory_budget_bytes
-        ):
-            try:
-                session = MpsDirectTurboVecSession.build(
-                    index=serving.index,
-                    generation=serving.generation,
-                    memory_budget_bytes=self.mps_memory_budget_bytes,
-                )
-            except MemoryError as exc:
-                if policy == MpsDirectTurboVecPolicy.REQUIRED:
-                    raise RuntimeError(
-                        f"MPS direct TurboVec memory admission rejected: {exc}"
-                    ) from exc
-                return None, {
-                    "gpu_stage_one_status": "memory_rejected",
-                    "gpu_fallback_reason": str(exc),
-                }
-            except RuntimeError as exc:
-                if policy == MpsDirectTurboVecPolicy.REQUIRED:
-                    raise
-                return None, {
-                    "gpu_stage_one_status": "failed_over",
-                    "gpu_fallback_reason": f"mps_direct_build_failed: {exc}",
-                }
-            self._mps_direct_turbovec_sessions[state.index_key] = session
-        try:
-            result = session.search_batch(batch, top_k=int(top_k))
-        except Exception as exc:  # noqa: BLE001 - auto policy must fall back visibly.
-            self._mps_direct_turbovec_sessions.pop(state.index_key, None)
-            if policy == MpsDirectTurboVecPolicy.REQUIRED:
-                raise RuntimeError(
-                    f"MPS direct TurboVec batch search failed: {exc}"
-                ) from exc
-            return None, {
-                "gpu_stage_one_status": "failed_over",
-                "gpu_fallback_reason": f"mps_direct_runtime_error: {exc}",
-            }
-        return result, {
-            "gpu_estimated_bytes": int(session.estimated_mps_bytes),
-            "gpu_budget_bytes": int(self.mps_memory_budget_bytes or 0),
-            "gpu_resident_upload_build_ms": float(session.upload_build_ms),
-        }
+        backend = _ResidentDirectBackend(
+            kind="MPS",
+            reason_prefix="mps_direct",
+            policy=policy,
+            dependency_available=bool(mps_ok),
+            api_available=turbovec_reconstruction_api_available(serving.index),
+            unavailable_reason=mps_reason or "",
+            default_unavailable_reason="mps_unavailable",
+            should_use=mps_direct_turbovec_should_use,
+            max_batch=self.mps_direct_turbovec_max_batch,
+            max_top_k=MPS_DIRECT_TURBOVEC_MAX_TOP_K,
+            sessions=self._mps_direct_turbovec_sessions,
+            memory_budget_bytes=self.mps_memory_budget_bytes,
+            build_session=lambda: MpsDirectTurboVecSession.build(
+                index=serving.index,
+                generation=serving.generation,
+                memory_budget_bytes=self.mps_memory_budget_bytes,
+            ),
+            estimated_bytes=lambda session: int(session.estimated_mps_bytes),
+        )
+        return self._try_query_resident_direct_batch(
+            backend, state, serving=serving, batch=batch, top_k=top_k
+        )
 
     def _execute_prepared_query_batch(
         self,
@@ -2279,6 +2284,12 @@ class LodeEngine:
                 return
             batch_result = serving.search_batch(batch, top_k=max(per_query_top_k))
             per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(prepared), 1)
+            # Surface whichever resident backend (GPU or MPS) bypassed or failed over,
+            # so the "why this batch fell back to NEON" status/reason stays visible on
+            # the CPU rows. At most one backend is active per host (CUDA is unavailable
+            # wherever MPS is), so the inactive one contributes ``{}``; MPS takes
+            # precedence on the (degenerate) overlap since it is probed last.
+            resident_fallback_fields = {**gpu_fields, **mps_fields}
             for index, width in enumerate(per_query_top_k):
                 take = min(int(width), batch_result.stable_ids.shape[1])
                 query_results[index] = _EngineTurboVecQueryResult(
@@ -2290,7 +2301,7 @@ class LodeEngine:
                     retrieval_mode="direct_turbovec",
                     fallback_used=False,
                     compact_route_fallback=False,
-                    **gpu_fields,
+                    **resident_fallback_fields,
                 )
                 search_latencies[index] = per_query_ms
             return

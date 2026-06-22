@@ -100,7 +100,26 @@ def estimate_mps_direct_turbovec_memory(
 
     capacity = max(int(row_count * 1.5), 1024)
     resident = capacity * dim * 2  # fp16 resident rows
-    transient = _TILE_SCORE_BYTES + _TILE_TRANSIENT_BYTES + max(max_batch_size, 1) * dim * 4
+    # Transient scratch is bounded by the ACTUAL corpus, not the per-tile budget
+    # ceiling. search_batch streams over <= row_count rows in tiles whose height is
+    # capped so the (batch x tile) fp32 score block stays under _TILE_SCORE_BYTES and
+    # the fp16->fp32 row cast under _TILE_TRANSIENT_BYTES; a small index never fills a
+    # full tile, so charging the ceiling would make any sub-ceiling budget reject
+    # trivially-small indexes.
+    batch = max(int(max_batch_size), 1)
+    tile_height = min(
+        tile_row_count(
+            batch_size=batch,
+            dim=dim,
+            score_tile_bytes=_TILE_SCORE_BYTES,
+            transient_bytes=_TILE_TRANSIENT_BYTES,
+        ),
+        max(int(row_count), 1),
+    )
+    score_block = batch * tile_height * 4  # (batch x tile) fp32 scores
+    cast_tile = tile_height * dim * 4  # fp16 -> fp32 row cast for one tile
+    rotated_queries = batch * dim * 4  # host-rotated query block resident on device
+    transient = score_block + cast_tile + rotated_queries
     estimated = int(resident + transient)
     if memory_budget_bytes is None:
         return MpsResidentMemoryEstimate(estimated, None, True, "")
@@ -228,10 +247,14 @@ class MpsDirectTurboVecSession:
     ) -> None:
         """Applies incremental mutations in-place to avoid a full O(N) rebuild.
 
-        Mirrors the CUDA path: swap-remove to match the CPU IdMapIndex slots, then
-        a batched upsert into over-allocated capacity, all in O(changed) rows.
-        Raises ``MemoryError`` if the upsert would exceed capacity, so the caller
-        evicts the session and the next batch rebuilds.
+        Mirrors the CUDA path: swap-remove then a batched upsert into the
+        over-allocated capacity, all in O(changed) rows. The session keeps its own
+        ``slot -> stable id`` map (``stable_ids`` / ``id_to_slot``) independent of
+        the CPU ``IdMapIndex``'s internal slots; the only invariant maintained is
+        that ``device_rows[slot]`` stays paired with ``stable_ids[slot]``, so the
+        served top-k matches a from-scratch rebuild (asserted by the patch parity
+        tests). Raises ``MemoryError`` if the upsert would exceed capacity, so the
+        caller evicts the session and the next batch rebuilds.
         """
 
         torch = import_module("torch")

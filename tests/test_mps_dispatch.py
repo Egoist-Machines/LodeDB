@@ -9,7 +9,10 @@ from __future__ import annotations
 import pytest
 
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.engine.mps_turbovec import mps_exact_scan_available
+from lodedb.engine.mps_turbovec import (
+    estimate_mps_direct_turbovec_memory,
+    mps_exact_scan_available,
+)
 from lodedb.engine.runtime_policy import (
     MpsDirectTurboVecPolicy,
     mps_direct_turbovec_policy_from_env,
@@ -54,6 +57,29 @@ def test_mps_should_use_rules():
     assert use(auto, True, 8, maximum_batch_size=4) is False  # auto window flip
     with pytest.raises(RuntimeError):  # required fails closed when unavailable
         use(required, False, 8)
+
+
+def test_mps_memory_estimate_is_corpus_bounded_not_tile_ceiling():
+    """A small index's estimate reflects the real corpus, not the 64+128 MiB tile cap.
+
+    The earlier estimate always charged the full per-tile budget ceiling, so any
+    sub-ceiling ``LODEDB_MPS_MEMORY_BUDGET_BYTES`` would reject even a tiny index.
+    """
+
+    est = estimate_mps_direct_turbovec_memory(row_count=600, dim=384, max_batch_size=64)
+    # 600 rows is a few MB, far under the old ~192 MiB tile-budget ceiling.
+    assert est.estimated_bytes < 16 * 1024 * 1024
+    # A 64 MiB budget (which the ceiling estimate always rejected) now admits it.
+    admitted = estimate_mps_direct_turbovec_memory(
+        row_count=600, dim=384, max_batch_size=64, memory_budget_bytes=64 * 1024 * 1024
+    )
+    assert admitted.admitted is True
+    # A budget below the genuine resident+transient cost still rejects (fail-closed).
+    rejected = estimate_mps_direct_turbovec_memory(
+        row_count=600, dim=384, max_batch_size=64, memory_budget_bytes=64 * 1024
+    )
+    assert rejected.admitted is False
+    assert "exceeds MPS budget" in rejected.reason
 
 
 # --- engine dispatch: MPS device required ----------------------------------
@@ -131,5 +157,38 @@ def test_mps_off_by_default_keeps_batch_on_cpu(tmp_path):
             db.add(f"doc {i}", id=f"d{i}")
         db.search_many(["doc 1", "doc 2"], k=3)
         assert not db._engine._mps_direct_turbovec_sessions
+    finally:
+        db.close()
+
+
+@_mps_only
+def test_mps_auto_bypass_reason_is_visible_on_cpu_fallback_rows(tmp_path, monkeypatch):
+    """When MPS auto bypasses a batch, the NEON rows still carry the MPS bypass reason.
+
+    Regression test: the CPU-fallback rows previously attached only the (empty) GPU
+    telemetry and dropped the MPS status/reason, hiding why the batch fell back. With
+    CUDA forced off, the MPS reason is the only resident-scan telemetry, so it must
+    survive onto the emitted ``query_batch_completed`` event.
+    """
+
+    # Force CUDA off so MPS is the only resident path contributing telemetry.
+    monkeypatch.setenv("LODEDB_GPU_DIRECT_TURBOVEC", "off")
+    monkeypatch.setenv("LODEDB_MPS_DIRECT_TURBOVEC", "auto")
+    # max-batch 1 means any batch >= 2 is above the auto window -> bypassed.
+    monkeypatch.setenv("LODEDB_MPS_DIRECT_MAX_BATCH", "1")
+    db = _open(tmp_path)
+    try:
+        for i in range(8):
+            db.add(f"doc {i}", id=f"d{i}")
+        db.search_many(["doc 1", "doc 2"], k=2)  # batch of 2 -> bypassed -> NEON
+        assert not db._engine._mps_direct_turbovec_sessions  # bypassed before any build
+        batch_events = [
+            event
+            for event in db._engine.audit_events
+            if event["event"] == "query_batch_completed"
+        ]
+        assert batch_events
+        assert batch_events[-1]["gpu_stage_one_status"] == "bypassed"
+        assert batch_events[-1]["gpu_fallback_reason"] == "mps_direct_batch_above_window"
     finally:
         db.close()
