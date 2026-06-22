@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.1.2] - 2026-06-22
+
 ### Added
 
 - **Metadata filter predicates.** `search`/`search_many` `filter=` now accepts comparison
@@ -64,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Filtered multi-query search pushes a shared allowlist into the batch scan.** `search_many`
+  (and `query_batch`) with a `filter=` no longer widens each query's effective `top_k` to the
+  corpus and post-filters; it groups queries by identical filter and pushes one shared allowlist
+  into a single batched native scan, so `top_k` stays `k`. A generation-keyed metadata posting
+  index resolves a filter to chunk ids in O(matching docs) instead of scanning the corpus, rebuilt
+  lazily on the first filtered query after a mutation (no write/commit overhead). The GPU/MPS
+  resident scans honour the allowlist via a per-tile score mask, so filtered batches stay on the
+  resident path above the 4096-row cap instead of falling back to the CPU kernel. Measured locally
+  (20k docs, batch 32, 1%-selective filter), filtered `search_many` dropped from ~335 ms to ~4 ms,
+  matching unfiltered latency.
 - **Incremental commits are O(changed), not O(corpus).** A single-doc commit no longer does
   three pieces of whole-corpus work on the write path: it no longer eagerly rebuilds
   TurboVec's SIMD "blocked" layout (the next query rebuilds it lazily, once, amortizing a
@@ -133,6 +147,7 @@ First public release.
 - LodeDB is licensed under Apache-2.0. The vendored TurboVec core
   (`third_party/turbovec/`) is MIT — see [`NOTICE`](NOTICE).
 
-[Unreleased]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Egoist-Machines/LodeDB/releases/tag/v0.1.0

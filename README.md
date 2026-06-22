@@ -96,7 +96,7 @@ Reopen with `LodeDB(path="./data")`; no migration step. Original text is kept in
 (384-dim) and `bge` (768-dim), with weights pulled from Hugging Face on first use. More in
 [`examples/`](examples/).
 
-Need to read a store another process is writing to? Open it read-only — it takes no writer
+Need to read a store another process is writing to? Open it read-only. It takes no writer
 lock, so it never blocks on (or is blocked by) the writer:
 
 ```python
@@ -200,7 +200,7 @@ lodedb benchmark   # local, metrics-only benchmark
   fast (`ConcurrentWriterError`) after `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s).
   **Read-only** handles (`LodeDB.open_readonly(path)` or `read_only=True`; used by
   `lodedb query`/`get`) take *no* lock, so they read one consistent committed snapshot **while**
-  a writer is open — they just don't auto-see the writer's in-flight changes (no live
+  a writer is open. They just don't auto-see the writer's in-flight changes (no live
   cross-process refresh). Within one process the engine serializes operations under an
   in-process lock, so the threaded `lodedb serve` safely shares one handle.
 - **Crash-atomic commits.** A commit spans several files, but it is sealed by atomically
@@ -210,7 +210,7 @@ lodedb benchmark   # local, metrics-only benchmark
 - **Durability is `fast` by default.** Commits are *atomic* but not fsync'd. Pass
   `durability="fsync"` (or `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each
   file and its directory on commit for power-loss durability, at some commit-throughput cost.
-- **Local filesystems only** — the OS advisory lock is unreliable on NFS/SMB.
+- **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Limitations
 
@@ -221,7 +221,7 @@ lodedb benchmark   # local, metrics-only benchmark
   faster on the measured M1, so the MPS scan stays off by default until newer Apple GPUs are
   re-measured.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
-- **Single writer per path** — one writer at a time (many concurrent readers), with no live
+- **Single writer per path.** One writer at a time (many concurrent readers), with no live
   cross-process refresh, on local filesystems only. See
   [Concurrency & durability](#concurrency--durability).
 - **Model weights download from Hugging Face** on first use, then cache locally.
