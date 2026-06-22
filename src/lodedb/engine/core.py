@@ -141,8 +141,29 @@ class EngineDocument:
 
 
 @dataclass(frozen=True)
+class EngineVectorDocument:
+    """Stores one pre-embedded document supplied to the local engine (vector-in).
+
+    Unlike :class:`EngineDocument`, the caller supplies the embedding vector
+    directly and there is no text: the engine skips chunking and embedding and
+    stores the vector as a single chunk. The vector must match the index's
+    ``native_dim`` and is expected to be L2-normalized (the SDK normalizes by
+    default) so cosine scoring stays comparable with the text path.
+    """
+
+    document_id: str
+    vector: tuple[float, ...]
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class EngineQuery:
-    """Stores one retrieval query supplied to the local engine."""
+    """Stores one retrieval query supplied to the local engine.
+
+    Exactly one of ``text`` or ``embedding`` carries the query: when
+    ``embedding`` is set (vector-in search) the engine skips embedding and uses
+    it directly; otherwise ``text`` is embedded with the index backend.
+    """
 
     text: str
     top_k: int = 10
@@ -151,6 +172,7 @@ class EngineQuery:
     route_drifted: bool = False
     route_failed: bool = False
     high_risk: bool = False
+    embedding: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -930,6 +952,50 @@ class LodeEngine:
             },
         )
 
+    @_synchronized
+    def upsert_vectors(
+        self,
+        *,
+        context: EngineRequestContext,
+        vectors: tuple[EngineVectorDocument, ...],
+        index_id: str | None = None,
+    ) -> EngineResponse:
+        """Upserts pre-embedded documents (vector-in), skipping chunking/embedding.
+
+        The caller supplies embedding vectors directly; each is stored as a
+        single chunk and **no** raw text is captured. Vectors must match the
+        index ``native_dim``. Reuses the same atomic-commit + O(changed) direct
+        TurboVec sync path as :meth:`upsert_documents`, so vector-in inherits
+        crash-atomic commits and incremental persistence unchanged.
+        """
+
+        state = self._index_for_context(context, index_id=index_id, operation="upsert_vectors")
+        if isinstance(state, EngineResponse):
+            return state
+        result = self._ingest_vectors(
+            context=context,
+            state=state,
+            vectors=vectors,
+            operation="upsert_vectors",
+        )
+        if isinstance(result, EngineResponse):
+            return result
+        # Deliberately no _capture_document_text: vector-in documents carry no
+        # raw text, so get()/get_text() return None for them by design.
+        self._finalize_document_ingest(
+            context=context,
+            state=state,
+            result=result,
+            event_name="vectors_upserted",
+        )
+        return EngineResponse(
+            200,
+            {
+                "status": "upserted",
+                **_document_ingest_response_payload(state, result),
+            },
+        )
+
     def _build_initial_documents(
         self,
         *,
@@ -1250,6 +1316,97 @@ class LodeEngine:
         )
         return result
 
+    def _ingest_vectors(
+        self,
+        *,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        vectors: tuple[EngineVectorDocument, ...],
+        operation: str,
+    ) -> dict[str, float | int] | EngineResponse:
+        """Validates and applies pre-embedded documents without embedding/chunking.
+
+        Mirrors the apply half of :meth:`_ingest_documents` but treats each
+        supplied vector as a single, already-embedded chunk: it validates the
+        whole batch up front (so a bad vector fails atomically with nothing
+        applied), writes one :class:`IndexedChunk` per document carrying the
+        caller's vector as its transient embedding, and journals the mutation.
+        The shared :meth:`_finalize_document_ingest` then runs the same direct
+        TurboVec sync + atomic commit the text path uses.
+        """
+
+        if not vectors:
+            return self._error(
+                400, "at least one vector document is required", operation, context.client_id
+            )
+        native_dim = state.native_dim
+        # Validate + coerce the whole batch first; only then mutate state, so a
+        # rejected vector never leaves the index half-updated.
+        planned: list[tuple[str, str, tuple[float, ...], dict[str, str]]] = []
+        for vector_doc in vectors:
+            document_id = str(vector_doc.document_id).strip()
+            if not document_id:
+                return self._error(
+                    400, "vector document id must be non-blank", operation, context.client_id
+                )
+            array = np.asarray(vector_doc.vector, dtype=np.float32)
+            if array.ndim != 1 or array.shape[0] != native_dim:
+                return self._error(
+                    400,
+                    f"vector dimension {tuple(array.shape)} does not match index "
+                    f"native_dim {native_dim}",
+                    operation,
+                    context.client_id,
+                )
+            if not bool(np.all(np.isfinite(array))):
+                return self._error(
+                    400, "vector must contain only finite values", operation, context.client_id
+                )
+            try:
+                metadata = _validate_metadata(vector_doc.metadata)
+            except ValueError as exc:
+                return self._error(400, str(exc), operation, context.client_id)
+            content_hash = _vector_content_hash(array)
+            planned.append((document_id, content_hash, tuple(array.tolist()), metadata))
+
+        result: dict[str, float | int] = {
+            "document_count": len(vectors),
+            "embedded_chunks": 0,
+            "reused_chunks": 0,
+            "deleted_chunks": 0,
+            "embedding_time_ms": 0.0,
+            "embedding_batch_size": 0,
+        }
+        upserted_ids: list[str] = []
+        for document_id, content_hash, embedding, metadata in planned:
+            upserted_ids.append(document_id)
+            if state.document_hashes.get(document_id) == content_hash:
+                # Identical vector already stored: a metadata-only refresh, no
+                # re-encode (parallels the unchanged-document branch of the text path).
+                result["reused_chunks"] += 1
+                state.document_metadata[document_id] = dict(metadata)
+                state.updated_at = _utc_now_iso(context.now)
+                continue
+            chunk_id = _chunk_id_for_hash(document_id, chunk_hash=content_hash, occurrence=0)
+            state.chunks[chunk_id] = IndexedChunk(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                content_hash=content_hash,
+                embedding=embedding,
+            )
+            result["embedded_chunks"] += 1
+            result["deleted_chunks"] += _delete_orphaned_document_chunks(
+                state, document_id, [chunk_id]
+            )
+            state.document_hashes[document_id] = content_hash
+            state.document_chunk_ids[document_id] = (chunk_id,)
+            state.document_metadata[document_id] = dict(metadata)
+            state.updated_at = _utc_now_iso(context.now)
+        self._record_pending_state_journal_documents(
+            state, upserted_document_ids=tuple(upserted_ids)
+        )
+        return result
+
     def _finalize_document_ingest(
         self,
         *,
@@ -1394,7 +1551,7 @@ class LodeEngine:
             return state
         if query.top_k <= 0:
             return self._error(400, "top_k must be positive", "query", context.client_id)
-        if _is_blank(query.text):
+        if query.embedding is None and _is_blank(query.text):
             return self._error(400, "query text is required", "query", context.client_id)
         try:
             query_filter = _validate_query_filter(query.filter)
@@ -1411,9 +1568,24 @@ class LodeEngine:
             failed=query.route_failed,
             high_risk=query.high_risk,
         )
-        embedding_started = perf_counter()
-        query_embedding = self._embedding_backend_for_state(state).embed_query(query.text)
-        query_embedding_latency_ms = (perf_counter() - embedding_started) * 1000.0
+        if query.embedding is not None:
+            # Vector-in search: the caller supplied the query embedding, so skip
+            # the embedder entirely and validate the dimension here for a clean
+            # 400 (rather than a deep RuntimeError -> 503 from the scan kernel).
+            if len(query.embedding) != state.native_dim:
+                return self._error(
+                    400,
+                    f"query vector dimension {len(query.embedding)} does not match index "
+                    f"native_dim {state.native_dim}",
+                    "query",
+                    context.client_id,
+                )
+            query_embedding = tuple(query.embedding)
+            query_embedding_latency_ms = 0.0
+        else:
+            embedding_started = perf_counter()
+            query_embedding = self._embedding_backend_for_state(state).embed_query(query.text)
+            query_embedding_latency_ms = (perf_counter() - embedding_started) * 1000.0
         try:
             search_started = perf_counter()
             query_result = self._query_serving_index(
@@ -1499,8 +1671,16 @@ class LodeEngine:
         for item in queries:
             if item.top_k <= 0:
                 return self._error(400, "top_k must be positive", "query_batch", context.client_id)
-            if _is_blank(item.text):
+            if item.embedding is None and _is_blank(item.text):
                 return self._error(400, "query text is required", "query_batch", context.client_id)
+            if item.embedding is not None and len(item.embedding) != state.native_dim:
+                return self._error(
+                    400,
+                    f"query vector dimension {len(item.embedding)} does not match index "
+                    f"native_dim {state.native_dim}",
+                    "query_batch",
+                    context.client_id,
+                )
             try:
                 query_filter = _validate_query_filter(item.filter)
                 includes = _validate_query_includes(item.include)
@@ -1531,8 +1711,14 @@ class LodeEngine:
         search_latencies: list[float] = [0.0 for _item in prepared]
         query_embeddings: list[tuple[float, ...]] = []
         for prepared_item in prepared:
+            item_query = prepared_item.query
+            if item_query.embedding is not None:
+                # Vector-in: dimension already validated above; use it directly.
+                query_embeddings.append(tuple(item_query.embedding))
+                embedding_latencies.append(0.0)
+                continue
             embedding_started = perf_counter()
-            query_embeddings.append(backend.embed_query(prepared_item.query.text))
+            query_embeddings.append(backend.embed_query(item_query.text))
             embedding_latencies.append((perf_counter() - embedding_started) * 1000.0)
         try:
             self._execute_prepared_query_batch(
@@ -4059,6 +4245,17 @@ def normalized_chunk_hash(text: str) -> str:
     """Hashes normalized chunk text so harmless whitespace changes can reuse embeddings."""
 
     return sha256_text(" ".join(text.split()))
+
+
+def _vector_content_hash(vector: np.ndarray) -> str:
+    """Hashes a float32 embedding so re-adding an identical vector is a no-op.
+
+    The vector-in counterpart to :func:`sha256_text` over document text: it lets
+    :meth:`LodeEngine._ingest_vectors` detect an unchanged vector and skip the
+    re-encode, keeping repeated upserts of the same vector O(1).
+    """
+
+    return hashlib.sha256(np.asarray(vector, dtype=np.float32).tobytes()).hexdigest()
 
 
 def _chunks_by_hash_occurrence(chunks: list[IndexedChunk]) -> dict[str, list[IndexedChunk]]:

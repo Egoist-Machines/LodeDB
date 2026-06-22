@@ -11,6 +11,7 @@ from lodedb.engine.core import (
     EngineDocument,
     EngineQuery,
     EngineRequestContext,
+    EngineVectorDocument,
     LodeEngine,
     _validate_metadata,
     normalize_index_id,
@@ -201,6 +202,58 @@ class LodeIndex:
         """Queries this index with a public batch request and preserves request order."""
 
         payload = tuple(_query_from_item(item) for item in queries)
+        return self._unwrap(
+            self.engine.query_batch(
+                context=self._context(),
+                index_id=self.index_id,
+                queries=payload,
+            )
+        )
+
+    def upsert_vectors_batch(
+        self,
+        vectors: Iterable[Mapping[str, Any] | EngineVectorDocument],
+    ) -> dict[str, Any]:
+        """Upserts a batch of pre-embedded (vector-in) documents through this index."""
+
+        payload = tuple(_vector_document_from_item(item) for item in vectors)
+        return self._unwrap(
+            self.engine.upsert_vectors(
+                context=self._context(),
+                vectors=payload,
+                index_id=self.index_id,
+            )
+        )
+
+    def query_vector(
+        self,
+        vector: Iterable[float],
+        *,
+        top_k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Queries this index with a precomputed embedding vector (vector-in)."""
+
+        return self._unwrap(
+            self.engine.query(
+                context=self._context(),
+                index_id=self.index_id,
+                query=EngineQuery(
+                    text="",
+                    top_k=top_k,
+                    filter=dict(filter) if filter is not None else None,
+                    embedding=tuple(float(value) for value in vector),
+                ),
+            )
+        )
+
+    def query_vectors_batch(
+        self,
+        items: Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Queries this index with a batch of precomputed embedding vectors."""
+
+        payload = tuple(_query_vector_from_item(item) for item in items)
         return self._unwrap(
             self.engine.query_batch(
                 context=self._context(),
@@ -413,6 +466,79 @@ def _document_from_item(item: Mapping[str, Any] | EngineDocument) -> EngineDocum
         document_id=_required_text(item.get("document_id"), "document_id"),
         text=_required_text(item.get("text"), "text"),
         metadata=safe_metadata,
+    )
+
+
+def _vector_document_from_item(
+    item: Mapping[str, Any] | EngineVectorDocument,
+) -> EngineVectorDocument:
+    """Normalizes one direct-Python vector-document mapping into an engine vector doc."""
+
+    if isinstance(item, EngineVectorDocument):
+        return item
+    if not isinstance(item, Mapping):
+        raise EngineError(
+            "vector document must be a mapping or EngineVectorDocument",
+            status_code=400,
+            response={"status": "error", "error": "invalid vector document"},
+        )
+    vector = item.get("vector")
+    if vector is None:
+        raise EngineError(
+            "vector document requires a 'vector'",
+            status_code=400,
+            response={"status": "error", "error": "vector is required"},
+        )
+    metadata = item.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise EngineError(
+            "document metadata must be a mapping",
+            status_code=400,
+            response={"status": "error", "error": "invalid metadata"},
+        )
+    try:
+        safe_metadata = _validate_metadata(metadata)
+    except ValueError as exc:
+        raise EngineError(
+            str(exc),
+            status_code=400,
+            response={"status": "error", "error": str(exc)},
+        ) from exc
+    return EngineVectorDocument(
+        document_id=_required_text(item.get("document_id"), "document_id"),
+        vector=tuple(float(value) for value in vector),
+        metadata=safe_metadata,
+    )
+
+
+def _query_vector_from_item(item: Mapping[str, Any]) -> EngineQuery:
+    """Normalizes one direct-Python vector-query mapping into an engine query."""
+
+    if not isinstance(item, Mapping):
+        raise EngineError(
+            "query must be a mapping",
+            status_code=400,
+            response={"status": "error", "error": "invalid query"},
+        )
+    vector = item.get("vector")
+    if vector is None:
+        raise EngineError(
+            "vector query requires a 'vector'",
+            status_code=400,
+            response={"status": "error", "error": "vector is required"},
+        )
+    top_k = item.get("top_k", 10)
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise EngineError(
+            "top_k must be an integer",
+            status_code=400,
+            response={"status": "error", "error": "top_k must be an integer"},
+        )
+    return EngineQuery(
+        text="",
+        top_k=top_k,
+        filter=dict(item["filter"]) if "filter" in item and item["filter"] is not None else None,
+        embedding=tuple(float(value) for value in vector),
     )
 
 

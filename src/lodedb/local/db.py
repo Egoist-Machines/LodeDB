@@ -19,16 +19,18 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import math
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
-from lodedb.engine._predicate import coerce_sdk_filter
+from lodedb.engine._predicate import coerce_sdk_filter, compile_metadata_filter
 from lodedb.engine.core import (
     EngineDocument,
     EngineSecurityConfig,
+    EngineVectorDocument,
     LodeEngine,
 )
 from lodedb.engine.index import EngineError, LodeIndex
@@ -295,6 +297,82 @@ class LodeDB:
             self._index.upsert_batch(tuple(payload))
         return ids
 
+    def add_vectors(
+        self,
+        vector: Sequence[float],
+        *,
+        id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> str:
+        """Adds (or replaces) one document from a precomputed embedding vector.
+
+        The *vector-in* counterpart to :meth:`add`: the caller supplies the
+        embedding directly (e.g. from their own model), and LodeDB stores it
+        verbatim without embedding or chunking any text — so this is how an
+        external system (or a graph layer that embeds once) reuses its own
+        vectors. The vector must have the index's embedding dimension
+        (``minilm`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
+        L2-normalized by default so cosine scores stay comparable with the text
+        path and with self-embedded documents in the same index; pass
+        ``normalize=False`` if your vectors are already unit-norm.
+
+        No raw text is retained for a vector-in document, so :meth:`get` returns
+        ``None`` for it. Reusing an ``id`` upserts; an identical vector is a
+        no-op re-encode. The mutation commits atomically before returning.
+
+        Note: vectors added here are compared by similarity against everything
+        else in the index, so only mix vectors produced by the *same* embedding
+        model (mixing models in one index makes scores meaningless).
+        """
+
+        self._require_writable()
+        document_id = str(id) if id is not None else self._next_auto_id()
+        prepared = _prepare_vector(vector, self.preset.native_dim, normalize=normalize)
+        self._index.upsert_vectors_batch(
+            (
+                EngineVectorDocument(
+                    document_id=document_id,
+                    vector=prepared,
+                    metadata=_coerce_metadata(metadata),
+                ),
+            )
+        )
+        return document_id
+
+    def add_vectors_many(
+        self,
+        documents: list[Mapping[str, Any]],
+        *,
+        normalize: bool = True,
+    ) -> list[str]:
+        """Adds a batch of ``{"vector", "id"?, "metadata"?}`` precomputed-vector docs.
+
+        Vector-in counterpart to :meth:`add_many`. Each ``vector`` must match the
+        index embedding dimension and is L2-normalized by default (see
+        :meth:`add_vectors`). Returns the ids in input order.
+        """
+
+        self._require_writable()
+        payload: list[EngineVectorDocument] = []
+        ids: list[str] = []
+        for item in documents:
+            vector = item.get("vector")
+            if vector is None:
+                raise ValueError("each document needs a 'vector'")
+            document_id = str(item["id"]) if item.get("id") is not None else self._next_auto_id()
+            ids.append(document_id)
+            payload.append(
+                EngineVectorDocument(
+                    document_id=document_id,
+                    vector=_prepare_vector(vector, self.preset.native_dim, normalize=normalize),
+                    metadata=_coerce_metadata(item.get("metadata")),
+                )
+            )
+        if payload:
+            self._index.upsert_vectors_batch(tuple(payload))
+        return ids
+
     def search(
         self,
         query: str,
@@ -381,6 +459,71 @@ class LodeDB:
             out.append(self._hits_from_result_rows(item.get("results", [])))
         return out
 
+    def search_by_vector(
+        self,
+        vector: Sequence[float],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> list[LodeSearchHit]:
+        """Returns the top-``k`` hits for a precomputed query embedding vector.
+
+        The *vector-in* counterpart to :meth:`search`: the caller supplies the
+        query embedding directly, so no text is embedded. The vector must have
+        the index embedding dimension and is L2-normalized by default to match
+        how stored vectors are normalized. ``filter`` takes the same
+        exact-match-or-predicate grammar as :meth:`search` and is pushed into
+        the TurboVec allowlist identically.
+        """
+
+        if k <= 0:
+            raise ValueError("k must be positive")
+        prepared = _prepare_vector(vector, self.preset.native_dim, normalize=normalize)
+        response = self._index.query_vector(
+            prepared,
+            top_k=int(k),
+            filter=_normalize_filter(filter),
+        )
+        return self._hits_from_result_rows(response.get("results", []))
+
+    def search_many_by_vector(
+        self,
+        vectors: list[Sequence[float]],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> list[list[LodeSearchHit]]:
+        """Returns top-``k`` hits for each precomputed query vector, preserving order.
+
+        Batched vector-in search; like :meth:`search_many` it is the path that
+        lets CUDA hosts use the GPU-resident scan for eligible batches.
+        """
+
+        if not isinstance(vectors, list) or not vectors:
+            raise ValueError("vectors must be a non-empty list")
+        if k <= 0:
+            raise ValueError("k must be positive")
+        normalized_filter = _normalize_filter(filter)
+        items = [
+            {
+                "vector": _prepare_vector(vector, self.preset.native_dim, normalize=normalize),
+                "top_k": int(k),
+                "filter": normalized_filter,
+            }
+            for vector in vectors
+        ]
+        batches = self._index.query_vectors_batch(items).get("queries", [])
+        if not isinstance(batches, list):
+            raise RuntimeError("invalid engine response: queries must be a list")
+        out: list[list[LodeSearchHit]] = []
+        for item in batches:
+            if not isinstance(item, Mapping):
+                raise RuntimeError("invalid engine response: query item must be an object")
+            out.append(self._hits_from_result_rows(item.get("results", [])))
+        return out
+
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
@@ -446,6 +589,77 @@ class LodeDB:
         if not ids:
             return {}
         return self._index.get_document_texts(ids)
+
+    def get_document(self, id: str) -> dict[str, Any] | None:
+        """Returns one document's redacted record by id, or ``None`` if absent.
+
+        The record is payload-free — ``{"id", "metadata", "chunk_count",
+        "content_hash"}`` — with **no** text and **no** vectors. This is the
+        by-id metadata read a graph / knowledge-graph layer uses to resolve an
+        edge's endpoints (or a node's attributes) without issuing a similarity
+        search; use :meth:`get`/:meth:`get_text` to recover the raw text.
+        """
+
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("id must be a non-empty string")
+        try:
+            record = self._index.get_document(id)
+        except EngineError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return _public_document_record(record)
+
+    def list_documents(
+        self,
+        *,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Returns the **complete** set of document records, optionally filtered.
+
+        Unlike :meth:`search`, this is enumeration, not ranking: it returns
+        *every* matching document — no ``k`` cap, no query vector, no scoring —
+        which is the primitive a graph / knowledge-graph layer needs for
+        deterministic traversal ("all edges whose ``src`` is X", "all nodes of
+        ``type`` Person"). Each record is the payload-free
+        ``{"id", "metadata", "chunk_count", "content_hash"}``.
+
+        ``filter`` takes the same exact-match-or-predicate grammar as
+        :meth:`search` (``$eq``/``$in``/``$gte``/``$and``/``$or``/… plus a
+        ``document_ids`` allowlist) and is evaluated against stored metadata.
+        The match currently runs in-process over the enumerated records (the
+        engine-side pushdown is tracked as a follow-up in
+        ``docs/research-prompts/``), so the result set is exact and complete.
+        """
+
+        try:
+            raw = self._index.list_documents()
+        except EngineError as exc:
+            # A read-only handle on a not-yet-written path has no index yet;
+            # that is an empty store, not an error.
+            if exc.status_code == 404:
+                return []
+            raise
+        records = [_public_document_record(record) for record in raw]
+        if filter is None:
+            return records
+        normalized = _normalize_filter(filter) or {}
+        allow_ids: set[str] | None = None
+        if "document_ids" in normalized:
+            allow_ids = {str(value) for value in normalized["document_ids"]}
+        predicate = (
+            compile_metadata_filter(normalized["metadata"])
+            if "metadata" in normalized
+            else None
+        )
+        out: list[dict[str, Any]] = []
+        for record in records:
+            if allow_ids is not None and record["id"] not in allow_ids:
+                continue
+            if predicate is not None and not predicate(record["metadata"]):
+                continue
+            out.append(record)
+        return out
 
     def persist(self) -> dict[str, Any]:
         """Flushes durable on-disk state and returns redacted storage stats.
@@ -574,6 +788,23 @@ def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None
     return {"metadata": coerce_sdk_filter(filter)}
 
 
+def _public_document_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Projects an engine document record into the public, payload-free shape.
+
+    The engine returns ``document_id``; the public SDK uses ``id`` everywhere
+    (``add(id=...)``, ``LodeSearchHit.id``, ``get(id)``), so the key is renamed
+    for consistency. Only redacted fields are surfaced — never text or vectors.
+    """
+
+    metadata = record.get("metadata", {})
+    return {
+        "id": str(record.get("document_id", "")),
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+        "chunk_count": int(record.get("chunk_count", 0) or 0),
+        "content_hash": str(record.get("content_hash", "")),
+    }
+
+
 def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
     """Coerces metadata values to strings to match the engine's metadata model.
 
@@ -596,3 +827,35 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
                 f"metadata value for {key!r} must be a string, number, or bool"
             )
     return coerced
+
+
+def _prepare_vector(
+    vector: Sequence[float],
+    dim: int,
+    *,
+    normalize: bool,
+) -> tuple[float, ...]:
+    """Validates a precomputed embedding and (optionally) L2-normalizes it.
+
+    Enforces the index dimension and finiteness at the SDK boundary so callers
+    get a clean ``ValueError`` instead of a deep engine/kernel error. When
+    ``normalize`` is set, the vector is scaled to unit norm so cosine scores
+    match the text path (which normalizes embeddings on write and query).
+    """
+
+    try:
+        values = [float(component) for component in vector]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vector must be a sequence of numbers") from exc
+    if len(values) != dim:
+        raise ValueError(f"vector must have dimension {dim}, got {len(values)}")
+    if not all(math.isfinite(component) for component in values):
+        raise ValueError("vector must contain only finite values")
+    if normalize:
+        norm = math.sqrt(sum(component * component for component in values))
+        if norm == 0.0:
+            raise ValueError(
+                "cannot normalize a zero vector; pass a non-zero vector or normalize=False"
+            )
+        values = [component / norm for component in values]
+    return tuple(values)
