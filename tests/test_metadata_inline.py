@@ -1,4 +1,4 @@
-"""Finding 05: search hydrates metadata inline, with no per-hit get_document N+1.
+"""Search hydrates metadata inline, with no per-hit get_document N+1.
 
 The engine inlines redacted metadata in result rows when the query opts in via
 include=("metadata",), which all search verbs now do. So `_hits_from_result_rows`

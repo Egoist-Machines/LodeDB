@@ -1,4 +1,4 @@
-"""Tests for the lodedb.graph knowledge-graph layer (Phase 0).
+"""Tests for the lodedb.graph knowledge-graph layer.
 
 Topology operations (CRUD, traversal, cascade removal, reindex, persistence) are
 asserted directly. Semantic retrieval is exercised through the vector-in path

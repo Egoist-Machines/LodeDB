@@ -1,4 +1,4 @@
-"""Tests for the public enumeration surface (Phase 1).
+"""Tests for the public enumeration surface.
 
 ``LodeDB.list_documents()`` and ``get_document()`` expose the engine's
 payload-free document records on the SDK, with a ``filter=`` complete-set

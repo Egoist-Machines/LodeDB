@@ -1,4 +1,4 @@
-"""Tests for the vector-in API (Phase 2).
+"""Tests for the vector-in API.
 
 ``add_vectors`` / ``search_by_vector`` (and their batch forms) let callers store
 and query precomputed embeddings, bypassing the internal embedder while reusing

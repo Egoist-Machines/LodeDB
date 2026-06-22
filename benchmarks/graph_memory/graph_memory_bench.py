@@ -12,8 +12,8 @@ Three sub-benchmarks, all driven from the same loaded corpus:
    return the same hits, isolating the embedding cost vector-in removes.
 2. ``filters`` — search latency across predicate selectivities: exact ``$eq``
    (posting-allowlist pushdown) vs ``$gte`` / ``$ne`` / ``$exists`` (which today
-   evaluate the predicate per candidate). Quantifies the filter-planner
-   opportunity in ``docs/research-prompts/``.
+   are resolved by the per-field planner). Compares the planner against a
+   per-document scan.
 3. ``graph`` — a synthetic knowledge graph over the corpus: k-hop traversal
    latency (SQLite topology) and hybrid ``search_subgraph`` latency (semantic
    seed + structural expansion) at scale.
@@ -293,8 +293,8 @@ def run_graph_bench(
     # Precompute node embeddings once and index via vector-in (fast build).
     node_vectors = [list(vec) for vec in backend.embed_documents(tuple(labels))]
 
-    # Per-node build rate on a small sample (the pre-finding-06 behavior: one
-    # index commit per add_node), for the speedup comparison.
+    # Per-node build rate on a small sample (one index commit per add_node), for
+    # the speedup comparison against the batched add_nodes path.
     sample = min(200, node_count)
     kg_sample = KnowledgeGraph(workdir / "kg_sample", model=model, device=device)
     sample_started = time.perf_counter()

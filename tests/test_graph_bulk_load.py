@@ -1,4 +1,4 @@
-"""Finding 06: graph bulk-load and batched topology reads.
+"""Graph bulk-load and batched topology reads.
 
 `add_nodes`/`add_edges` (and the `ingest()` buffer) write a batch in one SQLite
 transaction plus one index commit per kind, instead of one commit per entity.

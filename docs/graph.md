@@ -41,9 +41,9 @@ rec = db.get_document("edge:alice-worksAt-acme")   # or None if absent
 `$or`, `$not`, plus a `document_ids` allowlist). Records are payload-free and never
 contain text or vectors.
 
-> Scale note. Filtered enumeration currently matches in-process over enumerated
-> records. Pushing it into the engine's posting index, so it runs in O(matches),
-> is tracked in [`research-prompts/02`](research-prompts/02-engine-side-filtered-enumeration.md).
+> Filtered enumeration and `count(filter=)` resolve engine-side through the
+> per-field index in O(matches), not by scanning the corpus, so they stay flat as
+> the corpus grows while the match set stays small.
 
 ## 2. Vector-in: bring your own embeddings
 
@@ -79,10 +79,11 @@ A few properties to keep in mind:
 - **One model per index.** Only mix vectors from the same embedding model in one
   index. Mixing models makes similarity meaningless.
 
-> Today vector-in requires the index's preset dimension. A
-> bring-your-own-dimension, no-embedder index (for 1536-d or 3072-d frameworks like
-> Graphiti and cognee) is the integration unlock tracked in
-> [`research-prompts/03`](research-prompts/03-arbitrary-dim-vector-only-index.md).
+> By default vector-in uses the index's preset dimension. For an external embedder
+> at any dimension, open a vector-only index with
+> `LodeDB.open_vector_store(path, vector_dim=1536)` (or `LodeDB(path, vector_dim=N)`):
+> it has no internal embedding model, accepts vectors of that dimension, and rejects
+> the text-in verbs. See "Using LodeDB as a memory-system backend" below.
 
 ## 3. `lodedb.graph.KnowledgeGraph`
 
@@ -122,10 +123,11 @@ also index edge "facts" for `semantic_edges`. `reindex()` rebuilds the LodeDB
 index from the SQLite source of truth, using enumeration to drop orphans, which
 makes the index a derived, throwaway artifact.
 
-> Caveat. `reindex()` rebuilds a node's entry by re-embedding its `label`, so a
-> node indexed with a precomputed `embedding` and no label is not faithfully
-> rebuilt today. Durable vector retention is the fix, scoped in
-> [`research-prompts/04`](research-prompts/04-durable-vector-rebuildable-index.md).
+> `reindex()` rebuilds a labelled node from its `label`. For vector-in nodes, open
+> the graph with `retain_vectors=True`: the topology store then keeps each node's
+> vector, so `reindex()` reconstructs vector-in nodes faithfully too. Nodes with
+> neither a label nor a retained vector are reported as unrebuildable rather than
+> rebuilt incorrectly.
 
 ### Why hybrid, not LodeDB-only
 
@@ -152,17 +154,12 @@ modal run benchmarks/graph_memory/modal_bench.py::smoke
 modal run benchmarks/graph_memory/modal_bench.py::main_a10
 ```
 
-## Integration roadmap (memory systems)
+## Using LodeDB as a memory-system backend
 
-The strategic framing is to treat knowledge-graph memory as an integration target,
-not a LodeDB subsystem: LodeDB as the pluggable vector backend inside an existing
-graph-memory framework. The prerequisites that gated it are now in place (public
-enumeration, by-id read, and vector-in). The remaining unlock is an arbitrary-dim
-vector-only index for frameworks that own their embedder, scoped in
-[`research-prompts/03`](research-prompts/03-arbitrary-dim-vector-only-index.md).
-When the integrations roadmap (`docs/integrations.md`, PR #8) lands, add a row:
-"knowledge-graph memory: LodeDB as the vector backend for Graphiti/cognee;
-prereqs satisfied: enumeration, by-id read, vector-in."
-
-See [`research-prompts/`](research-prompts/) and [`research-findings/`](research-findings/)
-for the optimization follow-ups surfaced while building this stack.
+LodeDB fits as the pluggable vector backend inside an existing graph-memory
+framework rather than as a graph subsystem of its own. The pieces that enable this
+are in place: public enumeration and by-id reads, vector-in at the preset
+dimension, and an arbitrary-dimension vector-only index
+(`LodeDB.open_vector_store`) for frameworks such as Graphiti, cognee, and Letta
+that own their embedder. The local-first, exact, crash-atomic storage and the
+O(changed) delta persistence suit the incremental fact accrual those systems do.

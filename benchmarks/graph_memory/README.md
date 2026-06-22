@@ -15,8 +15,8 @@ benchmark provenance rules (`benchmarks/README.md`).
    that vector-in removes.
 2. **`filters`.** `search` latency across predicate kinds and selectivities: exact
    `$eq` and `$in` (posting-allowlist pushdown) versus `$gte`, range, `$ne`, and
-   `$exists` (predicate evaluation). Quantifies the filter-planner opportunity in
-   `docs/research-prompts/01`.
+   `$exists` (predicate evaluation). Compares the per-field filter planner against
+   a per-document scan.
 3. **`graph`.** A synthetic knowledge graph over the corpus (`lodedb.graph`):
    node and edge build throughput, k-hop traversal latency (SQLite topology), and
    hybrid `search_subgraph` latency (semantic seed plus structural expansion).
@@ -60,8 +60,8 @@ embedding device as noted. Provenance: `measured`.
 ### Full: GovReport (17.5k docs, full train split), Modal A10 (CUDA embedding)
 
 Full JSON in `results/results_a10.json`. `minilm` (384-d), CPU TurboVec scan. This
-is the post-findings run; the "baseline" columns are v0.1.2 before the
-optimizations, shown for the metrics they changed.
+are the current numbers; the "baseline" columns are the pre-optimization v0.1.2
+figures, shown for the metrics that changed.
 
 vector-in (docs capped to one chunk for exact parity):
 
@@ -71,8 +71,8 @@ vector-in (docs capped to one chunk for exact parity):
 | search p50, text / vector | 6.4 ms / 0.9 ms |
 | top-k overlap | 1.0 (exact parity) |
 
-filters (p50, k=10, 256 queries): the per-field planner (finding 01) versus the
-prior O(corpus) compiled-matcher scan.
+filters (p50, k=10, 256 queries): the per-field planner versus the prior
+O(corpus) compiled-matcher scan.
 
 | predicate | baseline (scan) | planner | speedup |
 |---|---|---|---|
@@ -89,19 +89,19 @@ they drop 2 to 4x at 17.5k docs and the gap widens with corpus size.
 
 graph (17.5k nodes, 280k edges, avg degree 16, 2 hops):
 
-| op | baseline | with findings |
+| op | baseline | optimized |
 |---|---|---|
 | node build | 122 nodes/s (per-node `add_node`) | 4,526 nodes/s (`add_nodes`), about 24x |
 | k-hop p50 | 18.4 ms | 16.4 ms |
 | hybrid `search_subgraph` p50 | 182.6 ms | 175.0 ms |
 
-The batched `add_nodes` / `add_edges` (finding 06) lifts build from the per-node
-commit rate toward the `add_vectors_many` ceiling. Traversal now uses a batched
-`get_nodes`; on this dense 2-hop stress case (a frontier of about 7.8k nodes,
-roughly 45% of the graph) latency stays frontier-bound, so the read-batching gain
-is modest. The metadata-inline win (finding 05) is not visible here: the bench
-queries at k=10 (ten per-hit reads), so it shows at high k, where the finding
-measured a 57% drop at k=100, and is covered by a unit test.
+The batched `add_nodes` / `add_edges` lift build from the per-node commit rate
+toward the `add_vectors_many` ceiling. Traversal now uses a batched `get_nodes`;
+on this dense 2-hop stress case (a frontier of about 7.8k nodes, roughly 45% of
+the graph) latency stays frontier-bound, so the read-batching gain is modest. The
+metadata-inline optimization is not visible here: the bench queries at k=10 (ten
+per-hit reads), so it shows at high k (a measured 57% drop at k=100) and is
+covered by a unit test.
 
 ## Notes
 

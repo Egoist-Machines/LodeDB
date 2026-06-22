@@ -1,4 +1,4 @@
-"""Finding 02: engine-side filtered enumeration and count (O(matches), not O(corpus)).
+"""Engine-side filtered enumeration and count (O(matches), not O(corpus)).
 
 `list_documents(filter=)` and the new `count(filter=)` resolve the matching set
 through the per-field planner instead of materializing every record and filtering

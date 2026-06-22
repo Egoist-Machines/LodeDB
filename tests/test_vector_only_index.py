@@ -1,4 +1,4 @@
-"""Finding 03: a bring-your-own-vectors index at an arbitrary dimension.
+"""A bring-your-own-vectors index at an arbitrary dimension.
 
 `LodeDB.open_vector_store(path, vector_dim=N)` (or `LodeDB(path, vector_dim=N)`)
 creates an index with no internal embedding model, pinned to a caller-chosen dim

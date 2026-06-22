@@ -1,4 +1,4 @@
-"""Finding 04: a vector-in knowledge graph is faithfully rebuildable.
+"""A vector-in knowledge graph is faithfully rebuildable via reindex().
 
 With ``retain_vectors=True`` the topology store keeps each node's raw vector, so
 ``reindex()`` reconstructs the semantic index for vector-in nodes (not just

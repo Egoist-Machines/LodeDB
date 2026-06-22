@@ -1,4 +1,4 @@
-"""Finding 01: the filter planner resolves a validated filter to the same set as
+"""The filter planner resolves a validated filter to the same set as
 the per-document compiled matcher (the _predicate oracle), for every operator.
 
 `_filter_plan.resolve` replaces the O(corpus) compiled-matcher scan on the search
