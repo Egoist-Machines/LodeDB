@@ -85,6 +85,24 @@ class TurboVecServingIndex:
     native_used: bool
     build_seconds: float
 
+    def __post_init__(self) -> None:
+        # Reverse map for O(matches) chunk-id -> stable-id allowlist resolution
+        # (the forward map alone forces an O(corpus) scan per filtered query).
+        object.__setattr__(
+            self,
+            "_stable_id_by_chunk_id",
+            {chunk_id: stable_id for stable_id, chunk_id in self.chunk_ids_by_stable_id.items()},
+        )
+
+    def stable_ids_for_chunks(self, chunk_ids: tuple[str, ...]) -> NDArray[np.uint64]:
+        """Returns the active stable ids for chunk ids, in O(len(chunk_ids))."""
+
+        reverse: dict[str, int] = self._stable_id_by_chunk_id  # type: ignore[attr-defined]
+        return np.ascontiguousarray(
+            [reverse[chunk_id] for chunk_id in chunk_ids if chunk_id in reverse],
+            dtype=np.uint64,
+        )
+
     def search(
         self,
         query_embedding: tuple[float, ...],
@@ -101,10 +119,7 @@ class TurboVecServingIndex:
             raise ValueError("query dimension does not match TurboVec index")
         kwargs: dict[str, Any] = {}
         if allowlist_chunk_ids:
-            allowed = _allowlist_stable_ids(
-                allowlist_chunk_ids,
-                chunk_ids_by_stable_id=self.chunk_ids_by_stable_id,
-            )
+            allowed = self.stable_ids_for_chunks(allowlist_chunk_ids)
             if allowed.size == 0:
                 return TurboVecSearchResult(
                     stable_ids=np.empty((1, 0), dtype=np.uint64),
@@ -136,12 +151,15 @@ class TurboVecServingIndex:
         query_embeddings: NDArray[np.float32],
         *,
         top_k: int,
+        allowlist_chunk_ids: tuple[str, ...] = (),
     ) -> TurboVecSearchResult:
-        """Searches a whole query batch in one native call (no allowlist support).
+        """Searches a whole query batch in one native call, with one shared allowlist.
 
         One call amortizes the per-query LUT/dispatch overhead the vendored
-        kernel pays on entry; the binding already accepts 2D query batches.
-        Result rows align with input query rows.
+        kernel pays on entry; the binding accepts a 2D query batch together with
+        a single ``allowlist`` applied to every row, so a filtered batch ranks
+        only eligible rows inside the SIMD scan instead of widening top_k to the
+        whole corpus and post-filtering. Result rows align with input query rows.
         """
 
         if top_k <= 0:
@@ -149,7 +167,20 @@ class TurboVecServingIndex:
         queries = np.ascontiguousarray(query_embeddings, dtype=np.float32)
         if queries.ndim != 2 or queries.shape[1] != self.dim:
             raise ValueError("query batch must be 2D and match the TurboVec dimension")
+        kwargs: dict[str, Any] = {}
+        if allowlist_chunk_ids:
+            allowed = self.stable_ids_for_chunks(allowlist_chunk_ids)
+            if allowed.size == 0:
+                return TurboVecSearchResult(
+                    stable_ids=np.empty((queries.shape[0], 0), dtype=np.uint64),
+                    scores=np.empty((queries.shape[0], 0), dtype=np.float32),
+                    native_backend=self.native_backend,
+                    native_used=self.native_used,
+                )
+            kwargs["allowlist"] = allowed
         effective_top_k = min(int(top_k), int(len(self.index)))
+        if "allowlist" in kwargs:
+            effective_top_k = min(effective_top_k, int(kwargs["allowlist"].size))
         if effective_top_k <= 0:
             return TurboVecSearchResult(
                 stable_ids=np.empty((queries.shape[0], 0), dtype=np.uint64),
@@ -157,7 +188,7 @@ class TurboVecServingIndex:
                 native_backend=self.native_backend,
                 native_used=self.native_used,
             )
-        scores, stable_ids = self.index.search(queries, k=effective_top_k)
+        scores, stable_ids = self.index.search(queries, k=effective_top_k, **kwargs)
         return TurboVecSearchResult(
             stable_ids=np.asarray(stable_ids, dtype=np.uint64),
             scores=np.asarray(scores, dtype=np.float32),
@@ -537,22 +568,6 @@ def _chunk_embedding_matrix(chunks: tuple[Any, ...], *, native_dim: int) -> NDAr
     if matrix.ndim != 2 or matrix.shape[1] != native_dim:
         raise ValueError("chunk embeddings do not match native_dim")
     return np.ascontiguousarray(matrix, dtype=np.float32)
-
-
-def _allowlist_stable_ids(
-    chunk_ids: tuple[str, ...],
-    *,
-    chunk_ids_by_stable_id: dict[int, str],
-) -> NDArray[np.uint64]:
-    """Converts chunk-id allowlists into active TurboVec stable IDs."""
-
-    allowed_chunks = set(chunk_ids)
-    stable_ids = [
-        stable_id
-        for stable_id, chunk_id in chunk_ids_by_stable_id.items()
-        if chunk_id in allowed_chunks
-    ]
-    return np.ascontiguousarray(stable_ids, dtype=np.uint64)
 
 
 def _stable_uint64_for_text(value: str) -> int:

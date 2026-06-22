@@ -308,13 +308,17 @@ class MpsDirectTurboVecSession:
         query_matrix: NDArray[np.float32],
         *,
         top_k: int,
+        allowlist_stable_ids: NDArray[np.uint64] | None = None,
     ) -> MpsDirectTurboVecBatchResult:
         """Scores one query batch exactly against the resident rows on the Apple GPU.
 
         Queries are rotated on the host with the deterministic rotation, scored in
         fp32 against bounded fp16->fp32 row tiles, top-k selected on device with a
         running streaming merge (never materializing the full batch x corpus score
-        matrix), then ordered deterministically on the host.
+        matrix), then ordered deterministically on the host. When
+        ``allowlist_stable_ids`` is given, non-allowed slots are masked to ``-inf``
+        before each tile's top-k so the result is the exact filtered top-k -- no
+        top_k widening, so a filtered batch stays on the GPU.
         """
 
         if query_matrix.ndim != 2 or query_matrix.shape[1] != self.dim:
@@ -324,7 +328,20 @@ class MpsDirectTurboVecSession:
         torch = import_module("torch")
         started = time.perf_counter()
         batch_size = int(query_matrix.shape[0])
+        rows = self.device_rows
+        allowed_mask = None
         take = min(int(top_k), self.row_count)
+        if allowlist_stable_ids is not None:
+            allowed_slots = [
+                slot
+                for slot in (self.id_to_slot.get(int(sid)) for sid in allowlist_stable_ids)
+                if slot is not None and slot < self.row_count
+            ]
+            take = min(int(top_k), len(allowed_slots))
+            if take > 0:
+                mask_np = np.zeros(self.row_count, dtype=bool)
+                mask_np[allowed_slots] = True
+                allowed_mask = torch.from_numpy(mask_np).to(device=rows.device)
         if take == 0:
             return MpsDirectTurboVecBatchResult(
                 stable_ids=np.zeros((batch_size, 0), dtype=np.uint64),
@@ -334,10 +351,7 @@ class MpsDirectTurboVecSession:
                 tile_count=0,
                 copy_back_bytes=0,
             )
-        rotated = np.ascontiguousarray(
-            np.asarray(query_matrix, dtype=np.float32) @ self.rotation.T
-        )
-        rows = self.device_rows
+        rotated = np.ascontiguousarray(np.asarray(query_matrix, dtype=np.float32) @ self.rotation.T)
         queries = torch.from_numpy(rotated).to(device=rows.device, dtype=torch.float32)
         tile_rows = tile_row_count(
             batch_size=batch_size,
@@ -352,6 +366,10 @@ class MpsDirectTurboVecSession:
             stop = min(start + tile_rows, self.row_count)
             tile = rows[start:stop].to(torch.float32)
             tile_scores = queries @ tile.T
+            if allowed_mask is not None:
+                tile_scores = tile_scores.masked_fill(
+                    ~allowed_mask[start:stop].unsqueeze(0), float("-inf")
+                )
             tile_take = min(int(take), stop - start)
             tile_values, tile_slots = torch.topk(
                 tile_scores, tile_take, dim=1, largest=True, sorted=False

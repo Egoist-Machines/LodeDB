@@ -146,8 +146,7 @@ def turbovec_reconstruction_api_available(index: Any) -> bool:
     """
 
     return all(
-        hasattr(index, name)
-        for name in ("reconstruct_all", "reconstruct_rows", "rotation_matrix")
+        hasattr(index, name) for name in ("reconstruct_all", "reconstruct_rows", "rotation_matrix")
     )
 
 
@@ -353,7 +352,7 @@ class GpuDirectTurboVecSession:
             upsert_rows = index.reconstruct_rows(upsert_arr)
             cupy = self.dependencies.cupy
             upsert_rows_fp16 = cupy.asarray(upsert_rows.astype(np.float16, copy=False))
-            
+
             target_slots = []
             for target_id in upsert_ids:
                 uid = int(target_id)
@@ -366,7 +365,7 @@ class GpuDirectTurboVecSession:
                     self.id_to_slot[uid] = slot
                     self.row_count += 1
                 target_slots.append(slot)
-                
+
             # Batch the GPU write to avoid kernel-launch overhead per row
             if target_slots:
                 self.device_rows[target_slots] = upsert_rows_fp16
@@ -377,13 +376,17 @@ class GpuDirectTurboVecSession:
         query_matrix: NDArray[np.float32],
         *,
         top_k: int,
+        allowlist_stable_ids: NDArray[np.uint64] | None = None,
     ) -> GpuDirectTurboVecBatchResult:
         """Scores one query batch exactly against the resident rows.
 
         Queries are rotated on the host with the deterministic rotation
         (cheap at batch scale), scored in fp32 against bounded fp16→fp32
         row tiles, top-k selected on device, and ordered deterministically
-        on host by descending score with ascending-stable-id tie-break.
+        on host by descending score with ascending-stable-id tie-break. When
+        ``allowlist_stable_ids`` is given, non-allowed slots are masked to
+        ``-inf`` before the device top-k so the result is the exact filtered
+        top-k -- no top_k widening, so a filtered batch stays on the GPU.
         """
 
         if query_matrix.ndim != 2 or query_matrix.shape[1] != self.dim:
@@ -392,7 +395,18 @@ class GpuDirectTurboVecSession:
             raise ValueError("top_k must be positive")
         started = time.perf_counter()
         batch_size = int(query_matrix.shape[0])
+        allowed_mask = None
         take = min(int(top_k), self.row_count)
+        if allowlist_stable_ids is not None:
+            allowed_slots = [
+                slot
+                for slot in (self.id_to_slot.get(int(sid)) for sid in allowlist_stable_ids)
+                if slot is not None and slot < self.row_count
+            ]
+            take = min(int(top_k), len(allowed_slots))
+            if take > 0:
+                allowed_mask = np.zeros(self.row_count, dtype=bool)
+                allowed_mask[allowed_slots] = True
         if take == 0:
             return GpuDirectTurboVecBatchResult(
                 stable_ids=np.zeros((batch_size, 0), dtype=np.uint64),
@@ -402,16 +416,14 @@ class GpuDirectTurboVecSession:
                 copy_back_bytes=0,
                 tile_count=0,
             )
-        rotated = np.ascontiguousarray(
-            np.asarray(query_matrix, dtype=np.float32) @ self.rotation.T
-        )
+        rotated = np.ascontiguousarray(np.asarray(query_matrix, dtype=np.float32) @ self.rotation.T)
         if _maybe_import_torch() is not None:
-            host_slots, host_scores, tile_count, device_to_host_copy_ms = (
-                self._tiled_top_k_torch(rotated, take=take, batch_size=batch_size)
+            host_slots, host_scores, tile_count, device_to_host_copy_ms = self._tiled_top_k_torch(
+                rotated, take=take, batch_size=batch_size, allowed_mask=allowed_mask
             )
         else:
-            host_slots, host_scores, tile_count, device_to_host_copy_ms = (
-                self._full_top_k_cupy(rotated, take=take, batch_size=batch_size)
+            host_slots, host_scores, tile_count, device_to_host_copy_ms = self._full_top_k_cupy(
+                rotated, take=take, batch_size=batch_size, allowed_mask=allowed_mask
             )
         copy_back_bytes = int(host_slots.nbytes + host_scores.nbytes)
         stable = self.stable_ids[host_slots]
@@ -435,6 +447,7 @@ class GpuDirectTurboVecSession:
         *,
         take: int,
         batch_size: int,
+        allowed_mask: NDArray[np.bool_] | None = None,
     ) -> tuple[NDArray[np.int64], NDArray[np.float32], int, float]:
         """Streams a memory-bounded exact top-k with torch, never building full B×N scores.
 
@@ -446,13 +459,18 @@ class GpuDirectTurboVecSession:
         global top-k row is necessarily within its own tile's top-k, so the union
         of per-tile top-k contains the global top-k. Exact-score ties at the
         boundary resolve arbitrarily (as the full path does); the caller applies
-        the deterministic host tie-break.
+        the deterministic host tie-break. ``allowed_mask`` masks non-allowed slots
+        to ``-inf`` per tile (``take`` is capped at the allowed count, so no
+        ``-inf`` row can survive into the result).
         """
 
         torch = import_module("torch")
         rows = torch.from_dlpack(self.device_rows)
         device = rows.device
         queries = torch.from_numpy(rotated).to(device=device, dtype=torch.float32)
+        mask_device = (
+            torch.from_numpy(allowed_mask).to(device=device) if allowed_mask is not None else None
+        )
         score_tile = max(1, _TILE_SCORE_BYTES // max(batch_size * 4, 1))
         cast_tile = max(1, _TILE_TRANSIENT_BYTES // max(self.dim * 4, 1))
         tile_rows = max(1, min(score_tile, cast_tile))
@@ -463,6 +481,10 @@ class GpuDirectTurboVecSession:
             stop = min(start + tile_rows, self.row_count)
             tile = rows[start:stop].to(torch.float32)
             tile_scores = queries @ tile.T
+            if mask_device is not None:
+                tile_scores = tile_scores.masked_fill(
+                    ~mask_device[start:stop].unsqueeze(0), float("-inf")
+                )
             tile_take = min(int(take), stop - start)
             tile_values, tile_slots = torch.topk(
                 tile_scores, tile_take, dim=1, largest=True, sorted=False
@@ -492,8 +514,13 @@ class GpuDirectTurboVecSession:
         *,
         take: int,
         batch_size: int,
+        allowed_mask: NDArray[np.bool_] | None = None,
     ) -> tuple[NDArray[np.int64], NDArray[np.float32], int, float]:
-        """Fallback top-k: full B×N CuPy score matrix + argpartition (torch absent only)."""
+        """Fallback top-k: full B×N CuPy score matrix + argpartition (torch absent only).
+
+        ``allowed_mask`` masks non-allowed slots to ``-inf`` before the partition;
+        ``take`` is capped at the allowed count so no masked row can be selected.
+        """
 
         cupy = self.dependencies.cupy
         device_queries = cupy.asarray(rotated)
@@ -505,6 +532,9 @@ class GpuDirectTurboVecSession:
             tile = self.device_rows[start:stop].astype(cupy.float32)
             scores[:, start:stop] = device_queries @ tile.T
             tile_count += 1
+        if allowed_mask is not None:
+            blocked = cupy.asarray(~allowed_mask)
+            scores[:, blocked] = cupy.float32("-inf")
         _sync_device(cupy)
         copy_started = time.perf_counter()
         top_slots = cupy.argpartition(-scores, int(take) - 1, axis=1)[:, : int(take)]
