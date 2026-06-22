@@ -143,6 +143,7 @@ class KnowledgeGraph:
         index_edges: bool = False,
         store_text: bool = True,
         read_only: bool = False,
+        retain_vectors: bool = False,
         _embedding_backend: Any | None = None,
         **lodedb_kwargs: Any,
     ) -> None:
@@ -152,12 +153,19 @@ class KnowledgeGraph:
         ``path/index`` (the LodeDB semantic index). ``model``/``device`` and any
         extra ``lodedb_kwargs`` are forwarded to the underlying :class:`LodeDB`.
         ``index_edges=True`` also indexes edge facts for semantic edge search.
+
+        ``retain_vectors=True`` keeps a copy of each node's precomputed embedding
+        in the topology store (the source of truth), so :meth:`reindex` can
+        faithfully rebuild the semantic index for vector-in nodes too, not just
+        labelled ones. It trades roughly 4 bytes per dimension per node of extra
+        on-disk space for that rebuildability; leave it off for label-only graphs.
         """
 
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.index_edges = bool(index_edges)
         self.read_only = bool(read_only)
+        self.retain_vectors = bool(retain_vectors)
         self._store = TopologyStore(self.path / "topology.sqlite3")
         self._db = LodeDB(
             self.path / "index",
@@ -250,6 +258,7 @@ class KnowledgeGraph:
         ids: list[str] = []
         text_docs: list[dict[str, Any]] = []
         vector_docs: list[dict[str, Any]] = []
+        retained_vectors: list[tuple[str, Sequence[float]]] = []
         for item in nodes:
             raw_id = item.get("id")
             node_id = str(raw_id) if raw_id is not None else f"node-{secrets.token_hex(8)}"
@@ -267,11 +276,15 @@ class KnowledgeGraph:
                 vector_docs.append(
                     {"vector": embedding, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
+                if self.retain_vectors:
+                    retained_vectors.append((node.id, embedding))
             elif node.label.strip():
                 text_docs.append(
                     {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
         self._store.upsert_nodes(node_objs)
+        if self.retain_vectors and retained_vectors:
+            self._store.set_node_vectors(retained_vectors)
         if text_docs:
             self._db.add_many(text_docs)
         if vector_docs:
@@ -553,16 +566,18 @@ class KnowledgeGraph:
     def reindex(self) -> dict[str, int]:
         """Rebuilds the LodeDB semantic index from the SQLite source of truth.
 
-        Drops index documents for entities that no longer exist (orphans from a
-        crash between the two stores, or from out-of-band topology edits) and
-        re-embeds every node by its ``label``. This is what makes the index
-        *rebuildable* and dissolves cross-store consistency worries.
+        Drops index documents for entities no longer in the topology (orphans from
+        a crash between the two stores, or out-of-band edits), then re-creates each
+        node's index entry: from its retained vector when ``retain_vectors`` kept
+        one (so vector-in nodes rebuild faithfully), else from its ``label``. This
+        is what makes the index a derived, throwaway artifact.
 
-        Note: nodes originally indexed with a caller-supplied ``embedding``
-        (vector-in) are re-indexed by ``label`` here, since the raw vector is not
-        retained in the topology store; re-supply such embeddings yourself if you
-        rely on them (see ``docs/research-prompts/`` for the durable-vector
-        follow-up). Labelled nodes rebuild fully.
+        Nodes with neither a retained vector nor a label cannot be rebuilt; they
+        are counted in ``unrebuildable`` and a warning is logged, never a silent
+        corruption. Open the graph with ``retain_vectors=True`` to make vector-in
+        nodes rebuildable. Returns counts: ``reindexed_nodes`` (labels + vectors),
+        ``reindexed_labels``, ``reindexed_vectors``, ``unrebuildable``,
+        ``removed_orphans``.
         """
 
         self._require_writable()
@@ -573,18 +588,47 @@ class KnowledgeGraph:
             if record["id"] not in wanted_node_docs:
                 self._db.remove(record["id"])
                 removed += 1
-        reindexed = 0
+        retained = dict(self._store.iter_node_vectors()) if self.retain_vectors else {}
+        label_docs: list[dict[str, Any]] = []
+        vector_docs: list[dict[str, Any]] = []
+        unrebuildable = 0
         for node in self._store.iter_nodes():
-            if node.label.strip():
-                self._index_node(node)
-                reindexed += 1
+            metadata = {"kind": "node", "type": node.type, "node_id": node.id}
+            vector = retained.get(node.id)
+            if vector is not None:
+                vector_docs.append(
+                    {"vector": vector, "id": _NODE_PREFIX + node.id, "metadata": metadata}
+                )
+            elif node.label.strip():
+                label_docs.append(
+                    {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
+                )
+            else:
+                unrebuildable += 1
+        if label_docs:
+            self._db.add_many(label_docs)
+        if vector_docs:
+            self._db.add_vectors_many(vector_docs)
         if self.index_edges:
             wanted_edge_docs = {_EDGE_PREFIX + edge.id for edge in self._store.iter_edges()}
             for record in self._db.list_documents(filter={"kind": "edge"}):
                 if record["id"] not in wanted_edge_docs:
                     self._db.remove(record["id"])
                     removed += 1
-        return {"reindexed_nodes": reindexed, "removed_orphans": removed}
+        if unrebuildable:
+            logger.warning(
+                "reindex: %d node(s) have neither a retained vector nor a label and "
+                "were not rebuilt; open with retain_vectors=True to make vector-in "
+                "nodes rebuildable",
+                unrebuildable,
+            )
+        return {
+            "reindexed_nodes": len(label_docs) + len(vector_docs),
+            "reindexed_labels": len(label_docs),
+            "reindexed_vectors": len(vector_docs),
+            "unrebuildable": unrebuildable,
+            "removed_orphans": removed,
+        }
 
     def stats(self) -> dict[str, Any]:
         """Returns node/edge counts and the underlying index document count."""
@@ -630,11 +674,17 @@ class KnowledgeGraph:
         metadata = {"kind": "node", "type": node.type, "node_id": node.id}
         if embedding is not None:
             self._db.add_vectors(embedding, id=doc_id, metadata=metadata)
+            if self.retain_vectors:
+                self._store.set_node_vectors([(node.id, embedding)])
         elif node.label.strip():
             self._db.add(node.label, id=doc_id, metadata=metadata)
+            if self.retain_vectors:
+                self._store.remove_node_vector(node.id)
         else:
             # No semantic content: make sure any stale index doc is cleared.
             self._db.remove(doc_id)
+            if self.retain_vectors:
+                self._store.remove_node_vector(node.id)
 
     def _index_edge(
         self,

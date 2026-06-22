@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable, Iterator
+from array import array
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,10 @@ CREATE TABLE IF NOT EXISTS edges (
     relation    TEXT NOT NULL,
     dst         TEXT NOT NULL,
     properties  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS node_vectors (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    vector  BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
@@ -140,6 +145,49 @@ class TopologyStore:
             ).fetchall()
             found.extend(_node_from_row(row) for row in rows)
         return found
+
+    def set_node_vectors(self, items: Iterable[tuple[str, Sequence[float]]]) -> None:
+        """Persists raw float32 node vectors (opt-in), so the semantic index is
+        rebuildable from this source-of-truth store, including vector-in nodes."""
+
+        rows = [
+            (str(node_id), array("f", [float(value) for value in vector]).tobytes())
+            for node_id, vector in items
+        ]
+        if not rows:
+            return
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO node_vectors (node_id, vector) VALUES (?, ?) "
+                "ON CONFLICT(node_id) DO UPDATE SET vector=excluded.vector",
+                rows,
+            )
+
+    def get_node_vector(self, node_id: str) -> list[float] | None:
+        """Returns a node's retained raw vector, or ``None`` if none is stored."""
+
+        row = self._conn.execute(
+            "SELECT vector FROM node_vectors WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        values = array("f")
+        values.frombytes(row["vector"])
+        return list(values)
+
+    def iter_node_vectors(self) -> Iterator[tuple[str, list[float]]]:
+        """Iterates over all retained ``(node_id, vector)`` pairs."""
+
+        for row in self._conn.execute("SELECT node_id, vector FROM node_vectors").fetchall():
+            values = array("f")
+            values.frombytes(row["vector"])
+            yield str(row["node_id"]), list(values)
+
+    def remove_node_vector(self, node_id: str) -> None:
+        """Drops a node's retained vector (e.g. when it switches to label indexing)."""
+
+        with self._conn:
+            self._conn.execute("DELETE FROM node_vectors WHERE node_id = ?", (str(node_id),))
 
     def remove_node(self, node_id: str) -> tuple[bool, list[str]]:
         """Removes a node and all incident edges.
