@@ -59,49 +59,49 @@ embedding device as noted. Provenance: `measured`.
 
 ### Full: GovReport (17.5k docs, full train split), Modal A10 (CUDA embedding)
 
-Full JSON in `results/results_a10.json`. `minilm` (384-d), CPU TurboVec scan.
+Full JSON in `results/results_a10.json`. `minilm` (384-d), CPU TurboVec scan. This
+is the post-findings run; the "baseline" columns are v0.1.2 before the
+optimizations, shown for the metrics they changed.
 
 vector-in (docs capped to one chunk for exact parity):
 
-| metric | text-in | vector-in |
-|---|---|---|
-| ingest throughput | 811 docs/s | 6,609 docs/s (8.1x) |
-| search p50 | 5.16 ms | 0.63 ms (8x) |
-| top-k overlap (mean / min) | n/a | 0.9996 / 0.90 |
+| metric | value |
+|---|---|
+| ingest, vector-in vs text-in | 6.6x faster (no embedding step) |
+| search p50, text / vector | 6.4 ms / 0.9 ms |
+| top-k overlap | 1.0 (exact parity) |
 
-The few overlaps below 1.0 are top-k boundary ties (equal scores ordered
-differently), not divergence. The indexes are byte-identical.
+filters (p50, k=10, 256 queries): the per-field planner (finding 01) versus the
+prior O(corpus) compiled-matcher scan.
 
-filters (p50, k=10, 256 queries):
+| predicate | baseline (scan) | planner | speedup |
+|---|---|---|---|
+| `no_filter` | 7.5 ms | 9.7 ms | n/a |
+| `eq_topic` (`$eq`) | 14.0 ms | 13.9 ms | 1.0x |
+| `exists_topic` (`$exists`) | 47.0 ms | 43.6 ms | 1.1x |
+| `ne_topic` (`$ne`) | 51.8 ms | 40.6 ms | 1.3x |
+| `gte_year` (`$gte`) | 56.6 ms | 26.8 ms | 2.1x |
+| `range_year` (`$gte` and `$lt`) | 73.0 ms | 17.7 ms | 4.1x |
 
-| predicate | p50 | vs `$eq` |
-|---|---|---|
-| `no_filter` | 7.5 ms | n/a |
-| `eq_topic` (`$eq`, posting allowlist) | 14.0 ms | 1.0x |
-| `and_topic_year` (`$and`) | 34.1 ms | 2.4x |
-| `in_topic_3` (`$in`) | 37.2 ms | 2.6x |
-| `exists_topic` (`$exists`) | 47.0 ms | 3.3x |
-| `ne_topic` (`$ne`) | 51.8 ms | 3.7x |
-| `gte_year` (`$gte`) | 56.6 ms | 4.0x |
-| `range_year` (`$gte` and `$lt`) | 73.0 ms | 5.2x |
-
-Exact `$eq` and `$in` ride the posting-index allowlist. Ordered and negation
-predicates are 3 to 5 times slower (per-candidate evaluation), which is the
-gradient that motivates the filter planner in `docs/research-prompts/01`.
+Exact `$eq` / `$in` already rode the posting allowlist and are unchanged. Ordered
+and range predicates were O(corpus); the planner makes them O(matches + log V), so
+they drop 2 to 4x at 17.5k docs and the gap widens with corpus size.
 
 graph (17.5k nodes, 280k edges, avg degree 16, 2 hops):
 
-| op | p50 | p95 | avg subgraph |
-|---|---|---|---|
-| node build | 122 nodes/s | n/a | per-node commit bound, see `research-prompts/06` |
-| edge build | 10,719 edges/s | n/a | n/a |
-| k-hop | 18.4 ms | 24.4 ms | 1,021 nodes |
-| hybrid `search_subgraph` | 182.6 ms | 451.6 ms | 7,838 nodes |
+| op | baseline | with findings |
+|---|---|---|
+| node build | 122 nodes/s (per-node `add_node`) | 4,526 nodes/s (`add_nodes`), about 24x |
+| k-hop p50 | 18.4 ms | 16.4 ms |
+| hybrid `search_subgraph` p50 | 182.6 ms | 175.0 ms |
 
-This is a dense random graph (degree 16): a 2-hop neighbourhood reaches about 45%
-of all nodes, so it is the stress-case upper bound, not a typical sparse knowledge
-graph. Hybrid latency is dominated by per-node topology fetches over that large
-frontier. See `docs/research-prompts/06` (graph bulk-load and batched reads).
+The batched `add_nodes` / `add_edges` (finding 06) lifts build from the per-node
+commit rate toward the `add_vectors_many` ceiling. Traversal now uses a batched
+`get_nodes`; on this dense 2-hop stress case (a frontier of about 7.8k nodes,
+roughly 45% of the graph) latency stays frontier-bound, so the read-batching gain
+is modest. The metadata-inline win (finding 05) is not visible here: the bench
+queries at k=10 (ten per-hit reads), so it shows at high k, where the finding
+measured a 57% drop at k=100, and is covered by a unit test.
 
 ## Notes
 
