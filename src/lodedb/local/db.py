@@ -412,6 +412,7 @@ class LodeDB:
             query,
             top_k=int(k),
             filter=_normalize_filter(filter),
+            include=("metadata",),
         )
         return self._hits_from_result_rows(response.get("results", []))
 
@@ -446,6 +447,7 @@ class LodeDB:
                     "query": query,
                     "top_k": int(k),
                     "filter": normalized_filter,
+                    "include": ("metadata",),
                 }
                 for query in queries
             ]
@@ -484,6 +486,7 @@ class LodeDB:
             prepared,
             top_k=int(k),
             filter=_normalize_filter(filter),
+            include=("metadata",),
         )
         return self._hits_from_result_rows(response.get("results", []))
 
@@ -511,6 +514,7 @@ class LodeDB:
                 "vector": _prepare_vector(vector, self.preset.native_dim, normalize=normalize),
                 "top_k": int(k),
                 "filter": normalized_filter,
+                "include": ("metadata",),
             }
             for vector in vectors
         ]
@@ -749,11 +753,20 @@ class LodeDB:
             if not isinstance(row, Mapping):
                 raise RuntimeError("invalid engine response: result row must be an object")
             document_id = str(row["document_id"])
+            # The engine inlines redacted metadata when the query opts in via
+            # include=("metadata",), which the search verbs now do. Fall back to a
+            # by-id read only when a row lacks it, so any other caller stays correct.
+            row_metadata = row.get("metadata")
+            metadata = (
+                dict(row_metadata)
+                if isinstance(row_metadata, Mapping)
+                else self._metadata_for_document(document_id)
+            )
             hits.append(
                 LodeSearchHit(
                     score=float(row["score"]),
                     id=document_id,
-                    metadata=self._metadata_for_document(document_id),
+                    metadata=metadata,
                 )
             )
         return hits

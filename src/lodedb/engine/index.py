@@ -231,6 +231,7 @@ class LodeIndex:
         *,
         top_k: int = 10,
         filter: Mapping[str, Any] | None = None,
+        include: Iterable[str] = (),
     ) -> dict[str, Any]:
         """Queries this index with a precomputed embedding vector (vector-in)."""
 
@@ -242,6 +243,7 @@ class LodeIndex:
                     text="",
                     top_k=top_k,
                     filter=dict(filter) if filter is not None else None,
+                    include=tuple(include),
                     embedding=tuple(float(value) for value in vector),
                 ),
             )
@@ -534,10 +536,12 @@ def _query_vector_from_item(item: Mapping[str, Any]) -> EngineQuery:
             status_code=400,
             response={"status": "error", "error": "top_k must be an integer"},
         )
+    include = item.get("include", ())
     return EngineQuery(
         text="",
         top_k=top_k,
         filter=dict(item["filter"]) if "filter" in item and item["filter"] is not None else None,
+        include=tuple(str(value) for value in include),
         embedding=tuple(float(value) for value in vector),
     )
 
