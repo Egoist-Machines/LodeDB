@@ -83,3 +83,34 @@ def resolve_preset(model: str) -> LocalModelPreset:
         known = ", ".join(sorted(LOCAL_MODEL_PRESETS))
         raise ValueError(f"unknown local model preset {model!r}; choose one of: {known}")
     return LOCAL_MODEL_PRESETS[key]
+
+
+VECTOR_ONLY_ROUTE_PROFILE = "vector-only"
+
+
+def vector_only_route_policy(native_dim: int, *, bit_width: int = 4) -> EngineRoutePolicy:
+    """Returns a route policy for a bring-your-own-vectors index (no embedder).
+
+    Unlike the preset profiles, this is built on demand at a caller-chosen
+    dimension and is not registered in the client route-policy manifest. It pins a
+    stable, redacted identity (``model="external"``, ``task="vector-only"``) that
+    the engine persists in the snapshot header and re-enforces on reopen, so a
+    vector-only index stays self-consistent and cannot be silently reopened as a
+    preset index (or vice versa) without the dim/identity round-trip catching it.
+    The ``turbovec_direct`` backend keeps the TurboVec-availability guard and the
+    O(changed) commit path identical to the preset routes.
+    """
+
+    return EngineRoutePolicy(
+        profile=VECTOR_ONLY_ROUTE_PROFILE,
+        label="External vectors (bring-your-own)",
+        client_note="caller-supplied embeddings; no internal embedding model",
+        model="external",
+        provider="external",
+        task="vector-only",
+        native_dim=int(native_dim),
+        method_template=f"direct_turbovec_full{int(native_dim)}_bw{int(bit_width)}",
+        experimental=False,
+        index_backend="turbovec_direct",
+        turbovec_bit_width=int(bit_width),
+    )
