@@ -51,6 +51,13 @@ pip install "lodedb[gpu]"                       # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[mcp,langchain,llama-index]" # MCP server + LangChain/LlamaIndex adapters
 ```
 
+Using LodeDB as memory for a coding assistant? After installing the `mcp` extra, register its
+server in one step (details under [Use as an MCP server](#use-as-an-mcp-server)):
+
+```bash
+lodedb mcp install --client claude-code        # or: claude-desktop | cursor | lm-studio | codex | all
+```
+
 <details>
 <summary><b>Windows: NVIDIA GPU embeddings</b></summary>
 
@@ -306,8 +313,30 @@ the server with `--exclude-text` to return metrics only (this also withdraws `lo
 `--no-store-text` to keep no text on disk at all. `lodedb_stats` is always metrics-only and raw
 query text never leaves the process.
 
+### One command
+
+`lodedb mcp install` writes the correct entry to a client's config for you, so you do not have to
+find the file or hand-write the JSON/TOML:
+
+```bash
+lodedb mcp install --client claude-code        # or: claude-desktop | cursor | lm-studio | codex | all
+lodedb mcp install --client cursor --path ./data --model bge
+```
+
+It resolves the launch command for your environment, so `command` and `args` are correct even when
+`lodedb` is not on `PATH` (it falls back to the `uv run --project ...` form, then an absolute path to
+the entry point), and it resolves `--path` to an absolute path so the server opens the right
+directory wherever the client starts it. The edit is idempotent (an existing `lodedb` entry is
+updated, never duplicated) and never touches other servers in the file. It passes through the same
+options as `lodedb mcp` (`--path`, `--model`, `--device`, `--exclude-text`, `--no-store-text`);
+`--dry-run` prints the entry and target file without writing, and `lodedb mcp uninstall --client
+<client>` removes it again. Override the config location with `--config <path>` (Claude Desktop and
+LM Studio paths differ per OS), and use `--project <dir>` to write Cursor's project-level
+`.cursor/mcp.json`. For Claude Code it runs `claude mcp add`; for the others it edits the config file
+directly.
+
 <details>
-<summary><b>Register with a coding agent</b> (Claude Code, Claude Desktop, Cursor, LM Studio, Codex)</summary>
+<summary><b>Register by hand</b> (Claude Code, Claude Desktop, Cursor, LM Studio, Codex)</summary>
 
 The `lodedb` command must be on the host's `PATH`; if you installed into a virtual environment
 (including a `uv` project) where it isn't, use the `uv run` form at the bottom.

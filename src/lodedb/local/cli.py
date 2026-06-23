@@ -291,8 +291,17 @@ def serve(
     )
 
 
-@app.command()
+mcp_app = typer.Typer(
+    invoke_without_command=True,
+    no_args_is_help=False,
+    help="Serve LodeDB over MCP (stdio), or `install`/`uninstall` it for a coding assistant.",
+)
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.callback(invoke_without_command=True)
 def mcp(
+    ctx: typer.Context,
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
@@ -305,9 +314,15 @@ def mcp(
     by default, so an agent can rank and answer in one call; pass ``--exclude-text`` to return
     metrics only (this also withdraws the get-by-id tool) or ``--no-store-text`` to keep no
     text on disk at all (search then falls back to a vector scan).
-    Register with a coding agent, e.g.:
+    Register with a coding agent in one step with ``lodedb mcp install --client <client>``, or
+    by hand, e.g.:
     {"mcpServers": {"lodedb": {"command": "lodedb", "args": ["mcp", "--path", "./data"]}}}
     """
+
+    # `lodedb mcp` with no subcommand serves the stdio server (back-compat); a subcommand
+    # (install/uninstall) handles its own work and these serve options are ignored.
+    if ctx.invoked_subcommand is not None:
+        return
 
     from lodedb.local.mcp_server import build_mcp_server
 
@@ -315,6 +330,182 @@ def mcp(
         path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
     )
     server.run(transport="stdio")
+
+
+_CLIENT_OPTION = typer.Option(
+    ...,
+    "--client",
+    "-c",
+    help="claude-code | claude-desktop | cursor | lm-studio | codex | all.",
+)
+_CONFIG_OPTION = typer.Option(
+    None,
+    "--config",
+    help="Override the client's config file path (per-OS default is used otherwise).",
+)
+_PROJECT_OPTION = typer.Option(
+    None,
+    "--project",
+    help="Cursor only: write the project-level ./.cursor/mcp.json under this directory "
+    "(default: the global ~/.cursor/mcp.json).",
+)
+_PREFER_UV_OPTION = typer.Option(
+    False,
+    "--prefer-uv",
+    help="Force the `uv run --project <root>` launch form even if a `lodedb` is on PATH "
+    "(use when the PATH `lodedb` is a different environment than this checkout).",
+)
+_DRY_RUN_OPTION = typer.Option(
+    False, "--dry-run", help="Print what would be written or run, without changing anything."
+)
+
+
+@mcp_app.command("install")
+def mcp_install(
+    client: str = _CLIENT_OPTION,
+    path: Path = _PATH_OPTION,
+    model: str = _MODEL_OPTION,
+    device: str = _DEVICE_OPTION,
+    store_text: bool = _STORE_TEXT_OPTION,
+    exclude_text: bool = _EXCLUDE_TEXT_OPTION,
+    config: Path | None = _CONFIG_OPTION,
+    project: Path | None = _PROJECT_OPTION,
+    prefer_uv: bool = _PREFER_UV_OPTION,
+    dry_run: bool = _DRY_RUN_OPTION,
+) -> None:
+    """Register the LodeDB MCP server with a coding assistant in one step.
+
+    Writes the correct ``command``/``args`` entry for ``--client`` to that host's config —
+    even when ``lodedb`` is not on ``PATH`` (it falls back to the ``uv run --project`` form,
+    then an absolute path to the entry point). The edit is idempotent (an existing ``lodedb``
+    entry is updated, never duplicated) and leaves other servers untouched. For
+    ``claude-code`` it runs ``claude mcp add``; the others edit the JSON/TOML config directly.
+    Passes through the ``lodedb mcp`` options (``--path``, ``--model``, ``--device``,
+    ``--exclude-text``, ``--no-store-text``). ``--dry-run`` prints without writing.
+    """
+
+    _run_mcp_install(
+        action="install",
+        client=client,
+        path=path,
+        model=model,
+        device=device,
+        store_text=store_text,
+        exclude_text=exclude_text,
+        config=config,
+        project=project,
+        prefer_uv=prefer_uv,
+        dry_run=dry_run,
+    )
+
+
+@mcp_app.command("uninstall")
+def mcp_uninstall(
+    client: str = _CLIENT_OPTION,
+    config: Path | None = _CONFIG_OPTION,
+    project: Path | None = _PROJECT_OPTION,
+    dry_run: bool = _DRY_RUN_OPTION,
+) -> None:
+    """Remove the LodeDB MCP server entry from a coding assistant's config.
+
+    The inverse of ``install``: drops the ``lodedb`` server from ``--client``'s config
+    (or runs ``claude mcp remove lodedb`` for ``claude-code``) and leaves every other
+    server in place. ``--dry-run`` prints without changing anything.
+    """
+
+    _run_mcp_install(
+        action="uninstall",
+        client=client,
+        config=config,
+        project=project,
+        dry_run=dry_run,
+    )
+
+
+def _run_mcp_install(
+    *,
+    action: str,
+    client: str,
+    config: Path | None,
+    project: Path | None,
+    dry_run: bool,
+    path: Path = Path("./data"),
+    model: str = "minilm",
+    device: str = "auto",
+    store_text: bool = True,
+    exclude_text: bool = False,
+    prefer_uv: bool = False,
+) -> None:
+    """Shared driver for ``mcp install``/``mcp uninstall``: resolves, applies, and prints."""
+
+    from lodedb.local.mcp_install import (
+        MCPInstallError,
+        MCPOptions,
+        expand_clients,
+        install_client,
+        resolve_server_invocation,
+    )
+
+    targets = expand_clients(client.strip().lower())
+    if config is not None and len(targets) > 1:
+        raise typer.BadParameter("--config cannot be combined with --client all")
+
+    # Resolve the data path to an absolute path against the install-time working
+    # directory: a coding assistant launches the MCP server with its *own* CWD, so a
+    # relative `--path` in the written entry would point somewhere unintended (and
+    # silently open an empty store). Resolving here makes the entry work wherever the
+    # client starts it.
+    options = MCPOptions(
+        path=str(path.expanduser().resolve()),
+        model=model,
+        device=device,
+        store_text=store_text,
+        exclude_text=exclude_text,
+    )
+    # Resolve once so every client in `all` gets the same launch command, and so the
+    # chosen form can be reported up front.
+    invocation = resolve_server_invocation(prefer_uv=prefer_uv)
+    if action == "install":
+        typer.echo(f"Launch command: {invocation.command} (resolved via {invocation.how})")
+
+    failures = 0
+    for target in targets:
+        try:
+            result = install_client(
+                target,
+                action=action,
+                options=options,
+                invocation=invocation,
+                config_path=config,
+                project=project,
+                dry_run=dry_run,
+            )
+        except MCPInstallError as exc:
+            failures += 1
+            typer.echo(f"[{target}] skipped: {exc}")
+            continue
+        _print_client_result(result)
+
+    if failures:
+        raise typer.Exit(code=1)
+
+
+def _print_client_result(result) -> None:
+    """Prints a one-client install/uninstall outcome (entry + destination)."""
+
+    from lodedb.local.mcp_install import SERVER_NAME
+
+    header = f"[{result.client}]"
+    if result.method == "cli":
+        typer.echo(f"{header} {result.note}")
+        if result.cli_command is not None and (result.dry_run or result.action == "install"):
+            typer.echo("  command: " + " ".join(result.cli_command))
+        return
+
+    typer.echo(f"{header} {result.note}")
+    typer.echo(f"  file: {result.path}")
+    if result.entry is not None:
+        typer.echo("  entry: " + json.dumps({SERVER_NAME: result.entry}))
 
 
 def main() -> None:
