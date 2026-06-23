@@ -188,15 +188,18 @@ class EngineVectorDocument:
     """Stores one pre-embedded document supplied to the local engine (vector-in).
 
     Unlike :class:`EngineDocument`, the caller supplies the embedding vector
-    directly and there is no text: the engine skips chunking and embedding and
-    stores the vector as a single chunk. The vector must match the index's
-    ``native_dim`` and is expected to be L2-normalized (the SDK normalizes by
-    default) so cosine scoring stays comparable with the text path.
+    directly: the engine skips chunking and embedding and stores the vector as a
+    single chunk. ``text`` is optional retained payload text only; when present
+    and raw-text storage is enabled it is stored in the dedicated text sidecar,
+    never in the redacted snapshot or metadata. The vector must match the
+    index's ``native_dim`` and is expected to be L2-normalized (the SDK
+    normalizes by default) so cosine scoring stays comparable with the text path.
     """
 
     document_id: str
     vector: tuple[float, ...]
     metadata: dict[str, str] = field(default_factory=dict)
+    text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1107,10 +1110,12 @@ class LodeEngine:
         """Upserts pre-embedded documents (vector-in), skipping chunking/embedding.
 
         The caller supplies embedding vectors directly; each is stored as a
-        single chunk and **no** raw text is captured. Vectors must match the
-        index ``native_dim``. Reuses the same atomic-commit + O(changed) direct
-        TurboVec sync path as :meth:`upsert_documents`, so vector-in inherits
-        crash-atomic commits and incremental persistence unchanged.
+        single chunk. If a vector document carries optional ``text``, that text
+        is captured only in the raw-text sidecar when enabled; it is never
+        embedded, chunked, or written to redacted metadata. Vectors must match
+        the index ``native_dim``. Reuses the same atomic-commit + O(changed)
+        direct TurboVec sync path as :meth:`upsert_documents`, so vector-in
+        inherits crash-atomic commits and incremental persistence unchanged.
         """
 
         state = self._index_for_context(context, index_id=index_id, operation="upsert_vectors")
@@ -1124,8 +1129,7 @@ class LodeEngine:
         )
         if isinstance(result, EngineResponse):
             return result
-        # Deliberately no _capture_document_text: vector-in documents carry no
-        # raw text, so get()/get_text() return None for them by design.
+        self._capture_vector_document_text(state, vectors)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1137,6 +1141,92 @@ class LodeEngine:
             {
                 "status": "upserted",
                 **_document_ingest_response_payload(state, result),
+            },
+        )
+
+    @_synchronized
+    def update_document_payload(
+        self,
+        *,
+        context: EngineRequestContext,
+        document_id: str,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+        index_id: str | None = None,
+    ) -> EngineResponse:
+        """Updates an existing document's metadata and/or retained raw text.
+
+        This is intentionally narrow: it does not alter vectors or chunk
+        membership, and it never embeds. It exists for adapters that maintain
+        host-framework payloads beside precomputed vectors, such as mem0's
+        payload-only entity-link updates.
+        """
+
+        state = self._index_for_context(
+            context, index_id=index_id, operation="update_document_payload"
+        )
+        if isinstance(state, EngineResponse):
+            return state
+        document_id = str(document_id).strip()
+        if not document_id:
+            return self._error(
+                400, "document_id is required", "update_document_payload", context.client_id
+            )
+        if document_id not in state.document_hashes:
+            return self._error(
+                404, "document not found", "update_document_payload", context.client_id
+            )
+
+        changed = False
+        if metadata is not None:
+            try:
+                state.document_metadata[document_id] = _validate_metadata(metadata)
+            except ValueError as exc:
+                return self._error(400, str(exc), "update_document_payload", context.client_id)
+            self._metadata_posting_indexes.pop(state.index_key, None)
+            changed = True
+
+        if text is not None or clear_text:
+            if not self.raw_text_storage_enabled:
+                return self._error(
+                    400,
+                    "raw document text storage is not enabled for this index",
+                    "update_document_payload",
+                    context.client_id,
+                )
+            if clear_text:
+                state.document_text.pop(document_id, None)
+            else:
+                if not isinstance(text, str):
+                    return self._error(
+                        400,
+                        "text must be a string",
+                        "update_document_payload",
+                        context.client_id,
+                    )
+                state.document_text[document_id] = text
+            changed = True
+
+        if changed:
+            state.updated_at = _utc_now_iso(context.now)
+            self._record_pending_state_journal_documents(
+                state, upserted_document_ids=(document_id,)
+            )
+            # Run the incremental TurboVec sync even though no vectors changed: it is
+            # also what marks this commit delta-eligible (it sets the pending TVIM
+            # delta that _delta_append_ok requires), so _persist_state appends an
+            # O(changed) journal delta instead of rewriting the full O(corpus) base.
+            self._sync_direct_turbovec_index(state)
+            self._persist_state(state)
+
+        return EngineResponse(
+            200,
+            {
+                "status": "updated",
+                "document_id": document_id,
+                "metadata_updated": metadata is not None,
+                "text_updated": text is not None or clear_text,
             },
         )
 
@@ -4490,6 +4580,21 @@ class LodeEngine:
             return
         for document in documents:
             state.document_text[document.document_id] = document.text
+
+    def _capture_vector_document_text(
+        self,
+        state: ClientIndexState,
+        documents: tuple[EngineVectorDocument, ...],
+    ) -> None:
+        """Records optional vector-in payload text without embedding it."""
+
+        if not self.raw_text_storage_enabled:
+            return
+        for document in documents:
+            if document.text is None:
+                state.document_text.pop(document.document_id, None)
+            else:
+                state.document_text[document.document_id] = document.text
 
     def _capture_lexical_tokens(
         self,

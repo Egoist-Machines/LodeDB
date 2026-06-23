@@ -227,6 +227,27 @@ class LodeIndex:
             )
         )
 
+    def update_document_payload(
+        self,
+        document_id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+    ) -> dict[str, Any]:
+        """Updates an existing document's metadata and/or retained raw text."""
+
+        return self._unwrap(
+            self.engine.update_document_payload(
+                context=self._context(),
+                index_id=self.index_id,
+                document_id=_required_text(document_id, "document_id"),
+                metadata=metadata,
+                text=text,
+                clear_text=clear_text,
+            )
+        )
+
     def query_vector(
         self,
         vector: Iterable[float],
@@ -540,6 +561,7 @@ def _vector_document_from_item(
         document_id=_required_text(item.get("document_id"), "document_id"),
         vector=tuple(float(value) for value in vector),
         metadata=safe_metadata,
+        text=_optional_text(item.get("text"), "text"),
     )
 
 
@@ -664,6 +686,20 @@ def _required_text(value: Any, name: str) -> str:
             response={"status": "error", "error": f"{name} is required"},
         )
     return stripped
+
+
+def _optional_text(value: Any, name: str) -> str | None:
+    """Returns an optional string for vector-in retained payload text."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise EngineError(
+            f"{name} must be a string",
+            status_code=400,
+            response={"status": "error", "error": f"{name} must be a string"},
+        )
+    return value
 
 
 def _required_bool(value: Any, name: str) -> bool:

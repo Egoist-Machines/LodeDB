@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node text and `query.query_str` with the graph's own model, mapping
   `DEFAULT`/`HYBRID`/`SEMANTIC_HYBRID`/`SPARSE`/`TEXT_SEARCH` the same way the vector-store
   adapter does.
+- **mem0 `VectorStore` adapter** (`lodedb[mem0]`). `LodeDBVectorStore` in
+  `lodedb.local.integrations.mem0` implements mem0's `VectorStoreBase` against LodeDB's
+  vector-in API, plus a `register_mem0_provider()` helper so `Memory.from_config({"vector_store":
+  {"provider": "lodedb", ...}})` resolves it from mem0's runtime factory. mem0 owns the
+  embeddings; LodeDB stores and searches the vectors locally and persists changed rows
+  incrementally. The full mem0 payload JSON is retained in LodeDB's raw-text sidecar, so raw
+  memory text and list-valued fields (such as `linked_memory_ids`) never leak into the redacted,
+  scalar-only metadata used for `user_id`/`agent_id`/`run_id` filtering. mem0's filter grammar
+  (`eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in`/`nin`, plus `AND`/`OR`/`NOT`) translates into LodeDB's
+  predicate grammar; `keyword_search` runs BM25 over the retained payload text and `search_batch`
+  uses the vector-in batch query path. cosine similarity only.
 
 ### Documentation
 
