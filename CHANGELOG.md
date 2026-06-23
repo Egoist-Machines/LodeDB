@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw text and without requiring `store_text=True`. The `.tvlex` sidecar holds payload-derived
   terms only and, like the raw-text sidecar, never reaches the redacted `.json`/`.jsd`/`.tvim`/
   `.tvd` artifacts or telemetry; `index_text` defaults to off, leaving the standard layout
-  unchanged. A lexical query with neither flag set raises a clear error.
+  unchanged. A lexical query with neither flag set raises a clear error. The same `mode` is
+  exposed on the knowledge-graph search API (`semantic_nodes` / `semantic_edges` /
+  `search_subgraph`), so exact tokens in node labels and edge facts are recoverable there too.
 
 ## [0.1.2] - 2026-06-22
 
