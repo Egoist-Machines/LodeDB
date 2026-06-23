@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reinstall command, and `lodedb doctor --fix` runs the reinstall so embeddings use an NVIDIA
   GPU.
 
+- **LlamaIndex `VectorStore` adapter** (`lodedb[llama-index]`). `LodeDBVectorStore` in
+  `lodedb.local.integrations.llama_index` wraps the LodeDB SDK as a LlamaIndex
+  `BasePydanticVectorStore`, joining the existing LangChain adapter. It is *text-path* —
+  LodeDB embeds text internally (`is_embedding_query=False`), so LlamaIndex's own
+  `embed_model` is not used. Query modes map onto the SDK's retrieval modes:
+  `VectorStoreQueryMode.DEFAULT` to vector search, `HYBRID`/`SEMANTIC_HYBRID` to the BM25 + RRF
+  hybrid, and `SPARSE`/`TEXT_SEARCH` to lexical (BM25) search. Metadata filters translate the
+  LlamaIndex `FilterOperator` comparisons (`==` `!=` `>` `>=` `<` `<=` `in` `nin`, plus
+  `is_empty`) and `FilterCondition` composition (`and` / `or` / `not`, nestable) into LodeDB's
+  predicate grammar. `get_nodes` and filter-based `delete_nodes` are served by metadata
+  enumeration, and `delete(ref_doc_id)` / `doc_ids` scoping resolve through durable metadata so
+  they survive a reopen. `add` / `query` / `delete`, `node_ids` scoping, and async shims round
+  out the surface; operations LodeDB cannot honor (full-precision vector reads, `MMR`/learned
+  query modes, substring/list filter operators) raise clearly.
+
 ### Documentation
 
 - **MCP server setup.** Added a "Use as an MCP server" README section covering the exposed

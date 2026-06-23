@@ -60,3 +60,273 @@ def test_langchain_vectorstore_predicate_filter(tmp_path):
     docs = store.similarity_search("document", k=10, filter={"year": {"$gte": 2021}})
     assert {d.metadata["id"] for d in docs} == {"b", "c"}
     db.close()
+
+
+# -- LlamaIndex adapter -----------------------------------------------------
+
+
+def _llama_db(tmp_path):
+    """Opens a LodeDB with a deterministic hash backend (no model download)."""
+
+    return LodeDB(
+        path=tmp_path, model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384)
+    )
+
+
+def _llama_nodes():
+    """Four TextNodes: two share source docA, one has docB, one carries an exact token."""
+
+    from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
+
+    n1 = TextNode(id_="n1", text="the quick brown fox", metadata={"topic": "animals", "year": 2019})
+    n1.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id="docA")
+    n2 = TextNode(id_="n2", text="a lazy dog sleeps", metadata={"topic": "animals", "year": 2021})
+    n2.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id="docA")
+    n3 = TextNode(
+        id_="n3", text="quantum field theory", metadata={"topic": "physics", "year": 2023}
+    )
+    n3.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id="docB")
+    n4 = TextNode(id_="n4", text="request failed with error E1234", metadata={"topic": "logs"})
+    return n1, n2, n3, n4
+
+
+def test_llama_index_vectorstore_roundtrip(tmp_path):
+    """add / query / get_nodes round-trip text, metadata, and the SOURCE relationship."""
+
+    pytest.importorskip("llama_index.core")  # needs lodedb[llama-index]
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)
+    store = LodeDBVectorStore(db)
+    assert store.is_embedding_query is False  # text-path: LodeDB embeds query_str
+
+    n1, n2, n3, n4 = _llama_nodes()
+    assert store.add([n1, n2, n3, n4]) == ["n1", "n2", "n3", "n4"]
+
+    res = store.query(VectorStoreQuery(query_str="fox", similarity_top_k=10))
+    assert set(res.ids) == {"n1", "n2", "n3", "n4"}
+    assert all(isinstance(s, float) for s in res.similarities)
+
+    # get_nodes reconstructs text + metadata + SOURCE, and preserves requested order.
+    nodes = store.get_nodes(node_ids=["n3", "n1"])
+    assert [n.node_id for n in nodes] == ["n3", "n1"]
+    assert nodes[1].get_content() == "the quick brown fox"
+    assert nodes[1].metadata["topic"] == "animals"
+    assert nodes[1].ref_doc_id == "docA"
+    # The reserved ref-doc key is not leaked into user-facing metadata.
+    assert all(k.startswith("_lodedb_") is False for k in nodes[1].metadata)
+
+    # doc_ids scoping resolves through stored metadata (docA -> n1, n2).
+    by_doc = store.query(
+        VectorStoreQuery(query_str="anything", similarity_top_k=10, doc_ids=["docA"])
+    )
+    assert set(by_doc.ids) == {"n1", "n2"}
+
+    db.close()
+
+
+def test_llama_index_vectorstore_delete_is_durable(tmp_path):
+    """delete(ref_doc_id) resolves through durable metadata, so it survives a reopen."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)
+    store = LodeDBVectorStore(db)
+    store.add(list(_llama_nodes()))
+    db.close()
+
+    # Reopen as a fresh handle (new session, empty in-memory state) and delete by ref doc.
+    db2 = _llama_db(tmp_path)
+    store2 = LodeDBVectorStore(db2)
+    store2.delete("docA")
+    remaining = store2.query(VectorStoreQuery(query_str="anything", similarity_top_k=10))
+    assert set(remaining.ids) == {"n3", "n4"}
+    db2.close()
+
+
+def test_llama_index_vectorstore_filters(tmp_path):
+    """MetadataFilters translate across operators and AND/OR/NOT (incl. nested)."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.vector_stores.types import (
+        FilterCondition,
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
+        VectorStoreQuery,
+    )
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)
+    store = LodeDBVectorStore(db)
+    store.add(list(_llama_nodes()))
+
+    def ids(filters):
+        return {n.node_id for n in store.get_nodes(filters=filters)}
+
+    # Ordered comparison (numeric over string metadata).
+    gte = MetadataFilters(
+        filters=[MetadataFilter(key="year", value=2021, operator=FilterOperator.GTE)]
+    )
+    assert ids(gte) == {"n2", "n3"}
+
+    # IN membership.
+    in_topic = MetadataFilters(
+        filters=[MetadataFilter(key="topic", value=["physics", "logs"], operator=FilterOperator.IN)]
+    )
+    assert ids(in_topic) == {"n3", "n4"}
+
+    # OR composition.
+    or_filter = MetadataFilters(
+        filters=[
+            MetadataFilter(key="topic", value="logs", operator=FilterOperator.EQ),
+            MetadataFilter(key="year", value=2023, operator=FilterOperator.GTE),
+        ],
+        condition=FilterCondition.OR,
+    )
+    assert ids(or_filter) == {"n3", "n4"}
+
+    # NOT means "none of these match".
+    not_physics = MetadataFilters(
+        filters=[MetadataFilter(key="topic", value="physics", operator=FilterOperator.EQ)],
+        condition=FilterCondition.NOT,
+    )
+    assert ids(not_physics) == {"n1", "n2", "n4"}
+
+    # IS_EMPTY: n4 has no "year" metadata.
+    empty_year = MetadataFilters(
+        filters=[MetadataFilter(key="year", value=None, operator=FilterOperator.IS_EMPTY)]
+    )
+    assert ids(empty_year) == {"n4"}
+
+    # Nested: animals AND (year < 2020 OR year >= 2023) -> just n1.
+    nested = MetadataFilters(
+        filters=[
+            MetadataFilter(key="topic", value="animals", operator=FilterOperator.EQ),
+            MetadataFilters(
+                filters=[
+                    MetadataFilter(key="year", value=2020, operator=FilterOperator.LT),
+                    MetadataFilter(key="year", value=2023, operator=FilterOperator.GTE),
+                ],
+                condition=FilterCondition.OR,
+            ),
+        ],
+        condition=FilterCondition.AND,
+    )
+    assert ids(nested) == {"n1"}
+
+    # Filters also flow through the query() path (set is filter-determined for a wide top-k).
+    physics = MetadataFilters(
+        filters=[MetadataFilter(key="topic", value="physics", operator=FilterOperator.EQ)]
+    )
+    res = store.query(VectorStoreQuery(query_str="science", similarity_top_k=10, filters=physics))
+    assert set(res.ids) == {"n3"}
+
+    db.close()
+
+
+def test_llama_index_vectorstore_hybrid_and_lexical(tmp_path):
+    """Hybrid/lexical modes recover an exact token the embedding would miss."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)  # store_text=True by default -> lexical source available
+    store = LodeDBVectorStore(db)
+    store.add(list(_llama_nodes()))
+
+    lexical = store.query(
+        VectorStoreQuery(
+            query_str="E1234", similarity_top_k=3, mode=VectorStoreQueryMode.TEXT_SEARCH
+        )
+    )
+    assert lexical.ids and lexical.ids[0] == "n4"
+
+    hybrid = store.query(
+        VectorStoreQuery(query_str="E1234", similarity_top_k=4, mode=VectorStoreQueryMode.HYBRID)
+    )
+    assert "n4" in hybrid.ids
+
+    db.close()
+
+
+def test_llama_index_vectorstore_delete_nodes(tmp_path):
+    """delete_nodes removes by explicit ids or by filter; an empty call is a no-op."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.vector_stores.types import FilterOperator, MetadataFilter, MetadataFilters
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)
+    store = LodeDBVectorStore(db)
+    store.add(list(_llama_nodes()))
+
+    # No-op safety: neither argument must not wipe the store.
+    store.delete_nodes()
+    assert {n.node_id for n in store.get_nodes()} == {"n1", "n2", "n3", "n4"}
+
+    # By explicit ids.
+    store.delete_nodes(node_ids=["n1"])
+    assert {n.node_id for n in store.get_nodes()} == {"n2", "n3", "n4"}
+
+    # By filter.
+    logs = MetadataFilters(
+        filters=[MetadataFilter(key="topic", value="logs", operator=FilterOperator.EQ)]
+    )
+    store.delete_nodes(filters=logs)
+    assert {n.node_id for n in store.get_nodes()} == {"n2", "n3"}
+
+    db.close()
+
+
+def test_llama_index_vectorstore_unsupported(tmp_path):
+    """The adapter rejects the operations LodeDB cannot honor, loudly."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.schema import TextNode
+    from llama_index.core.vector_stores.types import (
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
+        VectorStoreQuery,
+        VectorStoreQueryMode,
+    )
+
+    from lodedb.local.integrations.llama_index import LodeDBVectorStore
+
+    db = _llama_db(tmp_path)
+    store = LodeDBVectorStore(db)
+
+    # Empty/non-text node cannot be embedded.
+    with pytest.raises(ValueError):
+        store.add([TextNode(id_="empty", text="   ")])
+
+    # MMR / learned modes need full-precision vectors LodeDB does not expose.
+    with pytest.raises(NotImplementedError):
+        store.query(VectorStoreQuery(query_str="x", mode=VectorStoreQueryMode.MMR))
+
+    # Text-path needs a query string, not an embedding-only query.
+    with pytest.raises(ValueError):
+        store.query(VectorStoreQuery(query_embedding=[0.0] * 384, similarity_top_k=1))
+
+    # Substring/list filter operators have no LodeDB metadata equivalent.
+    contains = MetadataFilters(
+        filters=[MetadataFilter(key="topic", value="ani", operator=FilterOperator.CONTAINS)]
+    )
+    with pytest.raises(NotImplementedError):
+        store.get_nodes(filters=contains)
+
+    # No full-precision vector read.
+    with pytest.raises(NotImplementedError):
+        store.get("n1")
+
+    db.close()

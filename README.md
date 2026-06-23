@@ -29,7 +29,7 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
 - **Batteries included**: a `lodedb` CLI, a loopback dev server, an
-  [MCP server](#use-as-an-mcp-server), and a LangChain `VectorStore` adapter.
+  [MCP server](#use-as-an-mcp-server), and LangChain and LlamaIndex `VectorStore` adapters.
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
@@ -46,8 +46,8 @@ Python 3.11+, and bundle the TurboVec (Rust) core, so there's nothing to compile
 the install with `lodedb doctor`. Optional extras:
 
 ```bash
-pip install "lodedb[gpu]"            # GPU-resident scan (Linux/CUDA)
-pip install "lodedb[mcp,langchain]"  # MCP server + LangChain adapter
+pip install "lodedb[gpu]"                       # GPU-resident scan (Linux/CUDA)
+pip install "lodedb[mcp,langchain,llama-index]" # MCP server + LangChain/LlamaIndex adapters
 ```
 
 <details>
@@ -85,8 +85,8 @@ Linux). [uv](https://docs.astral.sh/uv/) builds and bundles the core for you:
 ```bash
 git clone https://github.com/Egoist-Machines/LodeDB && cd LodeDB
 uv sync                                 # builds + bundles the TurboVec core via maturin
-uv sync --extra mcp --extra langchain   # + MCP server, LangChain adapter
-uv sync --extra gpu                     # + GPU-resident scan (Linux/CUDA)
+uv sync --extra mcp --extra langchain --extra llama-index  # + MCP server, LC/LlamaIndex adapters
+uv sync --extra gpu                                         # + GPU-resident scan (Linux/CUDA)
 ```
 
 Run with `uv run` (e.g. `uv run lodedb doctor`).
