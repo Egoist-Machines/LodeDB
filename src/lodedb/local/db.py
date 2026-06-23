@@ -19,8 +19,9 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import math
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from lodedb.engine._predicate import coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
     EngineSecurityConfig,
+    EngineVectorDocument,
     LodeEngine,
 )
 from lodedb.engine.index import EngineError, LodeIndex
@@ -37,7 +39,7 @@ from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
 )
-from lodedb.local.presets import LocalModelPreset, resolve_preset
+from lodedb.local.presets import LocalModelPreset, resolve_preset, vector_only_route_policy
 
 # Fixed local identifier for the single-process client context. It never leaves
 # the process and has no security meaning — the local engine is auth-free.
@@ -98,6 +100,15 @@ class ReadOnlyError(RuntimeError):
     """Raised when a mutating call is made on a ``read_only=True`` LodeDB handle."""
 
 
+class VectorOnlyIndexError(RuntimeError):
+    """Raised when a text-in call (``add``/``search``) is made on a vector-only handle.
+
+    A vector-only index (opened with ``vector_dim=`` / :meth:`open_vector_store`)
+    has no embedding model, so text cannot be embedded; use ``add_vectors`` /
+    ``search_by_vector`` with precomputed vectors instead.
+    """
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -132,6 +143,8 @@ class LodeDB:
         path: str | Path,
         *,
         model: str = "minilm",
+        vector_dim: int | None = None,
+        bit_width: int = 4,
         device: str = "auto",
         batch_size: int = 32,
         max_seq_length: int | None = None,
@@ -183,26 +196,54 @@ class LodeDB:
         fsync_on_commit = (
             durability_from_env() if durability is None else normalize_durability(durability)
         )
-        self.preset: LocalModelPreset = resolve_preset(model)
         seq_len = int(max_seq_length) if max_seq_length is not None else 256
+        # vector_dim set => a vector-only index (no embedding model): only the
+        # vector-in verbs work, at the caller's chosen dim. Otherwise a preset
+        # index that embeds text internally.
+        self.vector_only = vector_dim is not None
+        self.preset: LocalModelPreset | None
 
-        if _embedding_backend is not None:
-            backend = _embedding_backend
+        if self.vector_only:
+            if _embedding_backend is not None:
+                raise ValueError("vector_dim and _embedding_backend are mutually exclusive")
+            dim = int(vector_dim)  # type: ignore[arg-type]
+            if not 1 <= dim <= 65536:
+                raise ValueError("vector_dim must be between 1 and 65536")
+            self.preset = None
+            self._vector_dim_value: int | None = dim
+            backend = None
+            self._embedding_backend = None
             self.embedding_resolution = LocalEmbeddingResolution(
                 requested_device=device,
-                backend_name=getattr(backend, "name", "injected"),
-                effective_device="injected",
+                backend_name="none",
+                effective_device="none",
                 fallback_used=False,
-                fallback_reason="",
+                fallback_reason="vector-only index (no embedding model)",
             )
+            route_policy = vector_only_route_policy(dim, bit_width=int(bit_width))
+            route_profile = route_policy.profile
         else:
-            backend, self.embedding_resolution = build_local_embedding_backend(
-                self.preset,
-                device=device,
-                batch_size=batch_size,
-                max_seq_length=seq_len,
-            )
-        self._embedding_backend = backend
+            self.preset = resolve_preset(model)
+            self._vector_dim_value = None
+            if _embedding_backend is not None:
+                backend = _embedding_backend
+                self.embedding_resolution = LocalEmbeddingResolution(
+                    requested_device=device,
+                    backend_name=getattr(backend, "name", "injected"),
+                    effective_device="injected",
+                    fallback_used=False,
+                    fallback_reason="",
+                )
+            else:
+                backend, self.embedding_resolution = build_local_embedding_backend(
+                    self.preset,
+                    device=device,
+                    batch_size=batch_size,
+                    max_seq_length=seq_len,
+                )
+            self._embedding_backend = backend
+            route_policy = self.preset.route_policy
+            route_profile = self.preset.route_profile
 
         if self.read_only:
             # A read-only handle reads an existing store; it never creates one,
@@ -215,7 +256,7 @@ class LodeDB:
             self.path.mkdir(parents=True, exist_ok=True)
         security = EngineSecurityConfig(
             bind_host=_LOCAL_BIND_HOST,
-            route_profile=self.preset.route_profile,
+            route_profile=route_profile,
             telemetry_mode="metrics_only",
             allow_raw_result_text=self.store_text,
             persist_lexical_index=self.index_text,
@@ -232,7 +273,7 @@ class LodeDB:
             read_only=self.read_only,
             fsync_on_commit=fsync_on_commit,
             embedding_backend=backend,
-            route_policy=self.preset.route_policy,
+            route_policy=route_policy,
         )
         self._index = LodeIndex(
             self._engine,
@@ -258,6 +299,31 @@ class LodeDB:
 
         return cls(path, read_only=True, **kwargs)
 
+    @classmethod
+    def open_vector_store(
+        cls,
+        path: str | Path,
+        *,
+        vector_dim: int,
+        bit_width: int = 4,
+        **kwargs: Any,
+    ) -> LodeDB:
+        """Opens (or creates) a bring-your-own-vectors index at a chosen dimension.
+
+        Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
+        The index has **no internal embedding model**: only ``add_vectors`` /
+        ``add_vectors_many`` / ``search_by_vector`` / ``search_many_by_vector``
+        work, and the text-in verbs (``add``/``search``) raise
+        :class:`VectorOnlyIndexError`. Vectors must have dimension ``vector_dim``
+        (any value your own embedder produces, e.g. 1536 or 3072), so this is the
+        path for plugging LodeDB in as the vector backend behind a system that owns
+        its embedder. The dimension and a redacted ``model="external"`` identity are
+        persisted and re-enforced on reopen. Install without ``sentence-transformers``
+        is fine for a vector-only workload (the embedder is imported lazily).
+        """
+
+        return cls(path, vector_dim=vector_dim, bit_width=bit_width, **kwargs)
+
     def add(
         self,
         text: str,
@@ -273,6 +339,7 @@ class LodeDB:
         """
 
         self._require_writable()
+        self._require_text_capable()
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be a non-empty string")
         document_id = str(id) if id is not None else self._next_auto_id()
@@ -294,6 +361,7 @@ class LodeDB:
         """
 
         self._require_writable()
+        self._require_text_capable()
         payload: list[EngineDocument] = []
         ids: list[str] = []
         for item in documents:
@@ -311,6 +379,82 @@ class LodeDB:
             )
         if payload:
             self._index.upsert_batch(tuple(payload))
+        return ids
+
+    def add_vectors(
+        self,
+        vector: Sequence[float],
+        *,
+        id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> str:
+        """Adds (or replaces) one document from a precomputed embedding vector.
+
+        The *vector-in* counterpart to :meth:`add`: the caller supplies the
+        embedding directly (e.g. from their own model), and LodeDB stores it
+        verbatim without embedding or chunking any text — so this is how an
+        external system (or a graph layer that embeds once) reuses its own
+        vectors. The vector must have the index's embedding dimension
+        (``minilm`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
+        L2-normalized by default so cosine scores stay comparable with the text
+        path and with self-embedded documents in the same index; pass
+        ``normalize=False`` if your vectors are already unit-norm.
+
+        No raw text is retained for a vector-in document, so :meth:`get` returns
+        ``None`` for it. Reusing an ``id`` upserts; an identical vector is a
+        no-op re-encode. The mutation commits atomically before returning.
+
+        Note: vectors added here are compared by similarity against everything
+        else in the index, so only mix vectors produced by the *same* embedding
+        model (mixing models in one index makes scores meaningless).
+        """
+
+        self._require_writable()
+        document_id = str(id) if id is not None else self._next_auto_id()
+        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        self._index.upsert_vectors_batch(
+            (
+                EngineVectorDocument(
+                    document_id=document_id,
+                    vector=prepared,
+                    metadata=_coerce_metadata(metadata),
+                ),
+            )
+        )
+        return document_id
+
+    def add_vectors_many(
+        self,
+        documents: list[Mapping[str, Any]],
+        *,
+        normalize: bool = True,
+    ) -> list[str]:
+        """Adds a batch of ``{"vector", "id"?, "metadata"?}`` precomputed-vector docs.
+
+        Vector-in counterpart to :meth:`add_many`. Each ``vector`` must match the
+        index embedding dimension and is L2-normalized by default (see
+        :meth:`add_vectors`). Returns the ids in input order.
+        """
+
+        self._require_writable()
+        payload: list[EngineVectorDocument] = []
+        ids: list[str] = []
+        for item in documents:
+            vector = item.get("vector")
+            if vector is None:
+                raise ValueError("each document needs a 'vector'")
+            document_id = str(item["id"]) if item.get("id") is not None else self._next_auto_id()
+            ids.append(document_id)
+            payload.append(
+                EngineVectorDocument(
+                    document_id=document_id,
+                    vector=_prepare_vector(vector, self._vector_dim, normalize=normalize),
+                    metadata=_coerce_metadata(item.get("metadata")),
+                )
+            )
+        if payload:
+            self._index.upsert_vectors_batch(tuple(payload))
         return ids
 
     def search(
@@ -367,6 +511,7 @@ class LodeDB:
         never leaves the process and never appears in telemetry.
         """
 
+        self._require_text_capable()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if k <= 0:
@@ -377,6 +522,7 @@ class LodeDB:
             top_k=int(k),
             filter=_normalize_filter(filter),
             mode=resolved_mode,
+            include=("metadata",),
         )
         return self._hits_from_result_rows(response.get("results", []))
 
@@ -407,6 +553,7 @@ class LodeDB:
         BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
         """
 
+        self._require_text_capable()
         if not isinstance(queries, list) or not queries:
             raise ValueError("queries must be a non-empty list of strings")
         for query in queries:
@@ -423,10 +570,78 @@ class LodeDB:
                     "top_k": int(k),
                     "filter": normalized_filter,
                     "mode": resolved_mode,
+                    "include": ("metadata",),
                 }
                 for query in queries
             ]
         ).get("queries", [])
+        if not isinstance(batches, list):
+            raise RuntimeError("invalid engine response: queries must be a list")
+        out: list[list[LodeSearchHit]] = []
+        for item in batches:
+            if not isinstance(item, Mapping):
+                raise RuntimeError("invalid engine response: query item must be an object")
+            out.append(self._hits_from_result_rows(item.get("results", [])))
+        return out
+
+    def search_by_vector(
+        self,
+        vector: Sequence[float],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> list[LodeSearchHit]:
+        """Returns the top-``k`` hits for a precomputed query embedding vector.
+
+        The *vector-in* counterpart to :meth:`search`: the caller supplies the
+        query embedding directly, so no text is embedded. The vector must have
+        the index embedding dimension and is L2-normalized by default to match
+        how stored vectors are normalized. ``filter`` takes the same
+        exact-match-or-predicate grammar as :meth:`search` and is pushed into
+        the TurboVec allowlist identically.
+        """
+
+        if k <= 0:
+            raise ValueError("k must be positive")
+        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        response = self._index.query_vector(
+            prepared,
+            top_k=int(k),
+            filter=_normalize_filter(filter),
+            include=("metadata",),
+        )
+        return self._hits_from_result_rows(response.get("results", []))
+
+    def search_many_by_vector(
+        self,
+        vectors: list[Sequence[float]],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> list[list[LodeSearchHit]]:
+        """Returns top-``k`` hits for each precomputed query vector, preserving order.
+
+        Batched vector-in search; like :meth:`search_many` it is the path that
+        lets CUDA hosts use the GPU-resident scan for eligible batches.
+        """
+
+        if not isinstance(vectors, list) or not vectors:
+            raise ValueError("vectors must be a non-empty list")
+        if k <= 0:
+            raise ValueError("k must be positive")
+        normalized_filter = _normalize_filter(filter)
+        items = [
+            {
+                "vector": _prepare_vector(vector, self._vector_dim, normalize=normalize),
+                "top_k": int(k),
+                "filter": normalized_filter,
+                "include": ("metadata",),
+            }
+            for vector in vectors
+        ]
+        batches = self._index.query_vectors_batch(items).get("queries", [])
         if not isinstance(batches, list):
             raise RuntimeError("invalid engine response: queries must be a list")
         out: list[list[LodeSearchHit]] = []
@@ -502,6 +717,57 @@ class LodeDB:
             return {}
         return self._index.get_document_texts(ids)
 
+    def get_document(self, id: str) -> dict[str, Any] | None:
+        """Returns one document's redacted record by id, or ``None`` if absent.
+
+        The record is payload-free — ``{"id", "metadata", "chunk_count",
+        "content_hash"}`` — with **no** text and **no** vectors. This is the
+        by-id metadata read a graph / knowledge-graph layer uses to resolve an
+        edge's endpoints (or a node's attributes) without issuing a similarity
+        search; use :meth:`get`/:meth:`get_text` to recover the raw text.
+        """
+
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("id must be a non-empty string")
+        try:
+            record = self._index.get_document(id)
+        except EngineError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return _public_document_record(record)
+
+    def list_documents(
+        self,
+        *,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Returns the **complete** set of document records, optionally filtered.
+
+        Unlike :meth:`search`, this is enumeration, not ranking: it returns
+        *every* matching document — no ``k`` cap, no query vector, no scoring —
+        which is the primitive a graph / knowledge-graph layer needs for
+        deterministic traversal ("all edges whose ``src`` is X", "all nodes of
+        ``type`` Person"). Each record is the payload-free
+        ``{"id", "metadata", "chunk_count", "content_hash"}``.
+
+        ``filter`` takes the same exact-match-or-predicate grammar as
+        :meth:`search` (``$eq``/``$in``/``$gte``/``$and``/``$or``/… plus a
+        ``document_ids`` allowlist). It is resolved engine-side through the
+        per-field planner in O(matches), not by scanning the corpus, so this stays
+        flat as the corpus grows while the match set stays small.
+        """
+
+        try:
+            raw = self._index.list_documents(filter=_normalize_filter(filter))
+        except EngineError as exc:
+            # A read-only handle on a not-yet-written path has no index yet;
+            # that is an empty store, not an error.
+            if exc.status_code == 404:
+                return []
+            raise
+        return [_public_document_record(record) for record in raw]
+
     def persist(self) -> dict[str, Any]:
         """Flushes durable on-disk state and returns redacted storage stats.
 
@@ -514,10 +780,17 @@ class LodeDB:
         # redacted stats, which include persisted byte accounting.
         return self._index.stats()
 
-    def count(self) -> int:
-        """Returns the number of documents currently stored."""
+    def count(self, *, filter: Mapping[str, Any] | None = None) -> int:
+        """Returns the number of documents stored, optionally matching a filter.
 
-        return int(self._index.stats().get("document_count", 0) or 0)
+        With ``filter`` (the same grammar as :meth:`search` / :meth:`list_documents`)
+        returns the count of matching documents, resolved engine-side through the
+        per-field planner in O(matches) without materializing any record.
+        """
+
+        if filter is None:
+            return int(self._index.stats().get("document_count", 0) or 0)
+        return self._index.count_documents(filter=_normalize_filter(filter))
 
     def stats(self) -> dict[str, Any]:
         """Returns redacted engine stats (counts, storage bytes, telemetry)."""
@@ -543,6 +816,19 @@ class LodeDB:
         self.close()
 
     # -- internals ----------------------------------------------------------
+
+    @property
+    def _vector_dim(self) -> int:
+        """The embedding dimension this index accepts.
+
+        The preset's native dim in normal mode, or the caller's ``vector_dim`` in
+        a vector-only index.
+        """
+
+        if self._vector_dim_value is not None:
+            return self._vector_dim_value
+        assert self.preset is not None  # preset mode always has a preset
+        return self.preset.native_dim
 
     def _require_writable(self) -> None:
         """Raises :class:`ReadOnlyError` if this handle was opened read-only."""
@@ -575,6 +861,15 @@ class LodeDB:
                 "or store_text=True (the BM25 index is rebuilt from the retained raw text)"
             )
         return value
+
+    def _require_text_capable(self) -> None:
+        """Raises :class:`VectorOnlyIndexError` on a vector-only (no-embedder) handle."""
+
+        if self.vector_only:
+            raise VectorOnlyIndexError(
+                "this index is vector-only (no embedding model); use add_vectors / "
+                "add_vectors_many / search_by_vector / search_many_by_vector"
+            )
 
     def _ensure_index(self) -> None:
         """Binds the single local index, creating it unless this handle is read-only."""
@@ -614,11 +909,20 @@ class LodeDB:
             if not isinstance(row, Mapping):
                 raise RuntimeError("invalid engine response: result row must be an object")
             document_id = str(row["document_id"])
+            # The engine inlines redacted metadata when the query opts in via
+            # include=("metadata",), which the search verbs now do. Fall back to a
+            # by-id read only when a row lacks it, so any other caller stays correct.
+            row_metadata = row.get("metadata")
+            metadata = (
+                dict(row_metadata)
+                if isinstance(row_metadata, Mapping)
+                else self._metadata_for_document(document_id)
+            )
             hits.append(
                 LodeSearchHit(
                     score=float(row["score"]),
                     id=document_id,
-                    metadata=self._metadata_for_document(document_id),
+                    metadata=metadata,
                 )
             )
         return hits
@@ -653,6 +957,23 @@ def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None
     return {"metadata": coerce_sdk_filter(filter)}
 
 
+def _public_document_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Projects an engine document record into the public, payload-free shape.
+
+    The engine returns ``document_id``; the public SDK uses ``id`` everywhere
+    (``add(id=...)``, ``LodeSearchHit.id``, ``get(id)``), so the key is renamed
+    for consistency. Only redacted fields are surfaced — never text or vectors.
+    """
+
+    metadata = record.get("metadata", {})
+    return {
+        "id": str(record.get("document_id", "")),
+        "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+        "chunk_count": int(record.get("chunk_count", 0) or 0),
+        "content_hash": str(record.get("content_hash", "")),
+    }
+
+
 def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
     """Coerces metadata values to strings to match the engine's metadata model.
 
@@ -675,3 +996,35 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
                 f"metadata value for {key!r} must be a string, number, or bool"
             )
     return coerced
+
+
+def _prepare_vector(
+    vector: Sequence[float],
+    dim: int,
+    *,
+    normalize: bool,
+) -> tuple[float, ...]:
+    """Validates a precomputed embedding and (optionally) L2-normalizes it.
+
+    Enforces the index dimension and finiteness at the SDK boundary so callers
+    get a clean ``ValueError`` instead of a deep engine/kernel error. When
+    ``normalize`` is set, the vector is scaled to unit norm so cosine scores
+    match the text path (which normalizes embeddings on write and query).
+    """
+
+    try:
+        values = [float(component) for component in vector]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vector must be a sequence of numbers") from exc
+    if len(values) != dim:
+        raise ValueError(f"vector must have dimension {dim}, got {len(values)}")
+    if not all(math.isfinite(component) for component in values):
+        raise ValueError("vector must contain only finite values")
+    if normalize:
+        norm = math.sqrt(sum(component * component for component in values))
+        if norm == 0.0:
+            raise ValueError(
+                "cannot normalize a zero vector; pass a non-zero vector or normalize=False"
+            )
+        values = [component / norm for component in values]
+    return tuple(values)

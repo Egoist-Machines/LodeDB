@@ -1,0 +1,126 @@
+{
+  "dataset": "govreport",
+  "device": "cuda",
+  "document_count": 17517,
+  "filters": {
+    "cases": {
+      "and_topic_year": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 10.6186,
+        "p50_ms": 10.5158,
+        "p95_ms": 11.0651
+      },
+      "eq_topic": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 14.0795,
+        "p50_ms": 13.8813,
+        "p95_ms": 14.4246
+      },
+      "exists_topic": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 43.9122,
+        "p50_ms": 43.608,
+        "p95_ms": 45.6979
+      },
+      "gte_year": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 26.969,
+        "p50_ms": 26.7892,
+        "p95_ms": 27.7095
+      },
+      "in_topic_3": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 21.4058,
+        "p50_ms": 21.2424,
+        "p95_ms": 22.3228
+      },
+      "ne_topic": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 40.9328,
+        "p50_ms": 40.6199,
+        "p95_ms": 42.4852
+      },
+      "no_filter": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 9.6599,
+        "p50_ms": 9.6517,
+        "p95_ms": 9.8381
+      },
+      "range_year": {
+        "avg_result_count": 10.0,
+        "count": 256,
+        "mean_ms": 17.868,
+        "p50_ms": 17.6718,
+        "p95_ms": 18.7257
+      }
+    },
+    "document_count": 17517,
+    "query_count": 256
+  },
+  "graph": {
+    "avg_degree": 16,
+    "build_speedup_batched_over_per_node": 24.43,
+    "edge_build_edges_per_s": 29350.63,
+    "edge_build_ms": 9544.63,
+    "edge_count_actual": 280141,
+    "edge_count_requested": 280272,
+    "hops": 2,
+    "hybrid_avg_subgraph_nodes": 7840.29,
+    "hybrid_latency": {
+      "count": 256,
+      "mean_ms": 220.8948,
+      "p50_ms": 174.9785,
+      "p95_ms": 418.107
+    },
+    "khop_avg_subgraph_nodes": 1020.57,
+    "khop_latency": {
+      "count": 256,
+      "mean_ms": 20.3508,
+      "p50_ms": 16.4374,
+      "p95_ms": 25.6552
+    },
+    "node_build_ms": 3870.36,
+    "node_build_nodes_per_s": 4525.94,
+    "node_count": 17517,
+    "per_node_build_nodes_per_s": 185.25,
+    "per_node_build_sample": 200
+  },
+  "model": "minilm",
+  "provenance": "measured",
+  "query_count": 256,
+  "suite": "graph_memory",
+  "vector_in": {
+    "doc_char_cap": 900,
+    "doc_embed_ms": 26225.25,
+    "document_count": 17517,
+    "embedding_device": "cuda",
+    "ingest_speedup_vectorin_over_textin": 6.639,
+    "native_dim": 384,
+    "query_count": 256,
+    "search_text_latency": {
+      "count": 256,
+      "mean_ms": 6.3652,
+      "p50_ms": 6.3577,
+      "p95_ms": 6.4555
+    },
+    "search_vector_latency": {
+      "count": 256,
+      "mean_ms": 0.8883,
+      "p50_ms": 0.8888,
+      "p95_ms": 0.9055
+    },
+    "textin_ingest_docs_per_s": 902.83,
+    "textin_ingest_ms": 19402.38,
+    "topk_overlap_mean": 1.0,
+    "topk_overlap_min": 1.0,
+    "vectorin_ingest_docs_per_s": 5993.48,
+    "vectorin_ingest_ms": 2922.67
+  }
+}
