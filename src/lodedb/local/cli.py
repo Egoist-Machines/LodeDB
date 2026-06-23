@@ -43,6 +43,13 @@ _STORE_TEXT_OPTION = typer.Option(
     help="Retain raw text so `lodedb get ID` can return it (default on; "
     "--no-store-text opts out).",
 )
+_EXCLUDE_TEXT_OPTION = typer.Option(
+    False,
+    "--exclude-text",
+    help="MCP only: redact document text from the server. `lodedb_search` returns "
+    "metrics only and the get-by-id tool is withdrawn, while text stays on disk for "
+    "hybrid search. By default (text retained) search returns each hit's text.",
+)
 _DURABILITY_OPTION = typer.Option(
     None,
     "--durability",
@@ -243,17 +250,22 @@ def mcp(
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
+    exclude_text: bool = _EXCLUDE_TEXT_OPTION,
 ) -> None:
     """Serve LodeDB as local agent memory over the Model Context Protocol (stdio).
 
-    The ``lodedb_get`` tool returns a memory's original text by id and is exposed by
-    default; pass ``--no-store-text`` to opt out. Register with a coding agent, e.g.:
+    ``lodedb_search`` returns each hit's stored text by default, so an agent can rank
+    and answer in one call; pass ``--exclude-text`` to return metrics only (this also
+    withdraws the get-by-id tool) or ``--no-store-text`` to keep no text on disk at all.
+    Register with a coding agent, e.g.:
     {"mcpServers": {"lodedb": {"command": "lodedb", "args": ["mcp", "--path", "./data"]}}}
     """
 
     from lodedb.local.mcp_server import build_mcp_server
 
-    server, _db = build_mcp_server(path, model=model, device=device, store_text=store_text)
+    server, _db = build_mcp_server(
+        path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
+    )
     server.run(transport="stdio")
 
 

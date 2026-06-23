@@ -2,9 +2,12 @@
 
 Lets coding agents (Claude Code, Cursor, etc.) use LodeDB as a local, on-disk
 vector store / memory over the Model Context Protocol. It reuses the LodeDB SDK
-and adds **no** storage logic of its own. Data stays on the machine. The search and
-stats tools surface only metrics (scores, ids, counts, bytes) — never document or query
-text; the get-by-id tool returns a memory's stored text only when text retention is on.
+and adds **no** storage logic of its own. Data stays on the machine. By default the search
+tool returns each hit's stored text next to its score, id, and metadata, so an agent can
+rank and answer in one call, and the get-by-id tool returns a memory's text by id. The stats
+tool is always metrics-only (counts, bytes) and raw query text never leaves the process.
+Start the server with ``--exclude-text`` (or ``store_text=False``) to redact text: the search
+tool then returns metrics only and the get-by-id tool is withdrawn.
 
 Optional dependency: ``pip install 'lodedb[mcp]'``. Run via ``lodedb mcp`` (stdio),
 e.g. as an MCP server entry in a coding agent's config.
@@ -39,13 +42,23 @@ def _search(
     query: str,
     k: int = 10,
     filter: dict[str, Any] | None = None,
+    *,
+    include_text: bool = False,
 ) -> list[dict[str, Any]]:
-    """Returns the top-k hits as ``[{score, id, metadata}]`` (no raw text)."""
+    """Returns the top-k hits as ``[{score, id, metadata}]``.
 
-    return [
-        {"score": hit.score, "id": hit.id, "metadata": hit.metadata}
-        for hit in db.search(query, k=k, filter=filter)
-    ]
+    With ``include_text`` each row also carries the hit's stored ``text`` (read
+    from the same raw-text store as :meth:`LodeDB.get`), so a caller can rank and
+    read in one pass. The caller sets it only when text retention is on.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for hit in db.search(query, k=k, filter=filter):
+        row: dict[str, Any] = {"score": hit.score, "id": hit.id, "metadata": hit.metadata}
+        if include_text:
+            row["text"] = db.get(hit.id)
+        rows.append(row)
+    return rows
 
 
 def _get(db: LodeDB, id: str) -> dict[str, Any]:
@@ -74,14 +87,19 @@ def build_mcp_server(
     device: str = "auto",
     name: str = "lodedb",
     store_text: bool = True,
+    exclude_text: bool = False,
     _embedding_backend: Any | None = None,
 ):
     """Builds a FastMCP server exposing LodeDB tools over one on-disk DB.
 
     Returns ``(server, db)``. Raises a clear :class:`ImportError` if the ``mcp``
-    SDK is not installed (``pip install 'lodedb[mcp]'``). By default the server
-    exposes a ``lodedb_get`` tool that returns a memory's original text by id; pass
-    ``store_text=False`` to stop retaining text and omit the tool.
+    SDK is not installed (``pip install 'lodedb[mcp]'``).
+
+    Text retention is on by default, so ``lodedb_search`` returns each hit's stored
+    text and a ``lodedb_get`` tool returns a memory's text by id. Pass
+    ``exclude_text=True`` to redact text from this server (search returns metrics
+    only and ``lodedb_get`` is omitted) while still retaining it on disk for hybrid
+    search, or ``store_text=False`` to keep no text on disk at all (same redaction).
     """
 
     try:
@@ -98,6 +116,9 @@ def build_mcp_server(
         store_text=store_text,
         _embedding_backend=_embedding_backend,
     )
+    # Text is exposed when it is retained and not explicitly redacted; this gates
+    # both the inline text in search results and the get-by-id tool.
+    include_text = store_text and not exclude_text
     server = FastMCP(name)
 
     @server.tool()
@@ -110,17 +131,37 @@ def build_mcp_server(
 
         return _add(db, text, id=id, metadata=metadata)
 
-    @server.tool()
-    def lodedb_search(
-        query: str,
-        k: int = 10,
-        filter: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Semantic search over local memory. Returns [{score, id, metadata}]."""
+    if include_text:
 
-        return _search(db, query, k=k, filter=filter)
+        @server.tool()
+        def lodedb_search(
+            query: str,
+            k: int = 10,
+            filter: dict[str, Any] | None = None,
+        ) -> list[dict[str, Any]]:
+            """Semantic search over local memory. Returns [{score, id, metadata, text}].
 
-    if store_text:
+            Each hit carries its stored text, so an agent can rank and answer in one call.
+            """
+
+            return _search(db, query, k=k, filter=filter, include_text=True)
+
+    else:
+
+        @server.tool()
+        def lodedb_search(
+            query: str,
+            k: int = 10,
+            filter: dict[str, Any] | None = None,
+        ) -> list[dict[str, Any]]:
+            """Semantic search over local memory. Returns [{score, id, metadata}].
+
+            Text is redacted on this server (started with --exclude-text or no retention).
+            """
+
+            return _search(db, query, k=k, filter=filter, include_text=False)
+
+    if include_text:
 
         @server.tool()
         def lodedb_get(id: str) -> dict[str, Any]:

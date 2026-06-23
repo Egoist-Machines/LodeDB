@@ -107,3 +107,36 @@ def test_lodedb_get_registered_only_when_store_text_enabled(tmp_path):
     finally:
         db_on.close()
         db_off.close()
+
+
+def test_search_helper_inlines_text_only_when_requested(tmp_path):
+    """_search carries each hit's stored text under include_text, and omits it otherwise."""
+
+    db = _db(tmp_path, store_text=True)
+    _add(db, "the quick brown fox", id="fox", metadata={"topic": "animals"})
+
+    [with_text] = _search(db, "fox", k=1, include_text=True)
+    assert with_text["id"] == "fox"
+    assert with_text["text"] == "the quick brown fox"
+
+    [redacted] = _search(db, "fox", k=1)
+    assert "text" not in redacted
+    db.close()
+
+
+def test_exclude_text_redacts_server_even_with_store_text_on(tmp_path):
+    """exclude_text withdraws lodedb_get even though raw text is retained on disk."""
+
+    pytest.importorskip("mcp")  # needs lodedb[mcp]
+    server, db = build_mcp_server(
+        tmp_path,
+        store_text=True,
+        exclude_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    try:
+        names = _tool_names(server)
+        assert "lodedb_search" in names
+        assert "lodedb_get" not in names
+    finally:
+        db.close()

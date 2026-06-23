@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **MCP search returns document text.** The `lodedb mcp` server's `lodedb_search` tool now
+  returns each hit's stored text alongside the score, id, and metadata, so an agent can rank
+  and answer in a single call instead of chaining a follow-up get-by-id. Pass `--exclude-text`
+  to redact text from the server (search returns metrics only and the get-by-id tool is
+  withdrawn) while keeping it on disk for hybrid search, or `--no-store-text` to retain no text
+  at all. The stats tool stays metrics-only and raw query text never leaves the process.
+
+### Documentation
+
+- **MCP server setup.** Added a "Use as an MCP server" README section covering the exposed
+  tools and host wiring for Claude Code/Desktop, Cursor, and LM Studio.
+- **Windows GPU embeddings.** Documented that PyPI serves the CPU-only PyTorch build on
+  Windows by default, with the CUDA-index reinstall (`cu121`/`cu124`/...) needed to run
+  embeddings on an NVIDIA GPU.
 
 ## [0.2.0] - 2026-06-23
 
