@@ -140,6 +140,8 @@ class KnowledgeGraph:
         *,
         model: str = "minilm",
         device: str = "auto",
+        vector_dim: int | None = None,
+        bit_width: int = 4,
         index_edges: bool = False,
         store_text: bool = True,
         read_only: bool = False,
@@ -154,6 +156,15 @@ class KnowledgeGraph:
         extra ``lodedb_kwargs`` are forwarded to the underlying :class:`LodeDB`.
         ``index_edges=True`` also indexes edge facts for semantic edge search.
 
+        ``vector_dim`` opens the semantic index as a *vector-only* index at that
+        dimension (any value your own embedder produces, e.g. 384, 768, 1536) with
+        **no internal embedding model**: nodes (and edges) are indexed only by a
+        caller-supplied ``embedding``, label/fact text becomes topology-only, and
+        semantic retrieval takes a precomputed query vector. This is the
+        bring-your-own-embeddings path for a framework that owns its embedder, so
+        ``model``/``device`` are ignored. ``bit_width`` sets the TurboVec
+        quantization width for that index.
+
         ``retain_vectors=True`` keeps a copy of each node's precomputed embedding
         in the topology store (the source of truth), so :meth:`reindex` can
         faithfully rebuild the semantic index for vector-in nodes too, not just
@@ -166,16 +177,30 @@ class KnowledgeGraph:
         self.index_edges = bool(index_edges)
         self.read_only = bool(read_only)
         self.retain_vectors = bool(retain_vectors)
+        self.vector_only = vector_dim is not None
         self._store = TopologyStore(self.path / "topology.sqlite3")
-        self._db = LodeDB(
-            self.path / "index",
-            model=model,
-            device=device,
-            store_text=store_text,
-            read_only=read_only,
-            _embedding_backend=_embedding_backend,
-            **lodedb_kwargs,
-        )
+        if self.vector_only:
+            # Bring-your-own-vectors: the semantic index has no embedder, so nodes and
+            # edges are indexed by a caller-supplied embedding at an arbitrary dimension
+            # and label/fact text is topology-only (kept in SQLite, not embedded).
+            self._db = LodeDB(
+                self.path / "index",
+                vector_dim=int(vector_dim),
+                bit_width=int(bit_width),
+                store_text=False,
+                read_only=read_only,
+                **lodedb_kwargs,
+            )
+        else:
+            self._db = LodeDB(
+                self.path / "index",
+                model=model,
+                device=device,
+                store_text=store_text,
+                read_only=read_only,
+                _embedding_backend=_embedding_backend,
+                **lodedb_kwargs,
+            )
 
     # -- mutation -----------------------------------------------------------
 
@@ -278,7 +303,7 @@ class KnowledgeGraph:
                 )
                 if self.retain_vectors:
                     retained_vectors.append((node.id, embedding))
-            elif node.label.strip():
+            elif not self.vector_only and node.label.strip():
                 text_docs.append(
                     {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
@@ -334,7 +359,7 @@ class KnowledgeGraph:
                     vector_docs.append(
                         {"vector": embedding, "id": _EDGE_PREFIX + edge_id, "metadata": metadata}
                     )
-                elif fact and str(fact).strip():
+                elif not self.vector_only and fact and str(fact).strip():
                     text_docs.append(
                         {"text": fact, "id": _EDGE_PREFIX + edge_id, "metadata": metadata}
                     )
@@ -412,6 +437,27 @@ class KnowledgeGraph:
         """Returns edges incident to ``node_id`` (out/in/both, optional relation)."""
 
         return self._store.neighbors(str(node_id), direction=direction, relation=relation)
+
+    def list_nodes(self) -> list[Node]:
+        """Returns every node in the graph (complete-set enumeration).
+
+        The deterministic counterpart to :meth:`semantic_nodes`: no ranking, no
+        ``k`` cap, just the full node set from the source-of-truth topology store.
+        This is the primitive a property-graph view needs ("every node", or every
+        node whose property matches) that a top-``k`` similarity search cannot
+        express on its own.
+        """
+
+        return list(self._store.iter_nodes())
+
+    def list_edges(self) -> list[Edge]:
+        """Returns every edge in the graph (complete-set enumeration).
+
+        Like :meth:`list_nodes`, full enumeration over the topology store — the
+        primitive behind an "all triplets" / "all edges of relation R" view.
+        """
+
+        return list(self._store.iter_edges())
 
     def k_hop(
         self,
@@ -625,7 +671,7 @@ class KnowledgeGraph:
                 vector_docs.append(
                     {"vector": vector, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
-            elif node.label.strip():
+            elif not self.vector_only and node.label.strip():
                 label_docs.append(
                     {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
@@ -702,7 +748,7 @@ class KnowledgeGraph:
             self._db.add_vectors(embedding, id=doc_id, metadata=metadata)
             if self.retain_vectors:
                 self._store.set_node_vectors([(node.id, embedding)])
-        elif node.label.strip():
+        elif not self.vector_only and node.label.strip():
             self._db.add(node.label, id=doc_id, metadata=metadata)
             if self.retain_vectors:
                 self._store.remove_node_vector(node.id)
@@ -731,7 +777,7 @@ class KnowledgeGraph:
         }
         if embedding is not None:
             self._db.add_vectors(embedding, id=doc_id, metadata=metadata)
-        elif fact and fact.strip():
+        elif not self.vector_only and fact and fact.strip():
             self._db.add(fact, id=doc_id, metadata=metadata)
         else:
             self._db.remove(doc_id)

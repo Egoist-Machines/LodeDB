@@ -31,8 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (lean runtime + dev/mcp/langchain extras)
-        run: uv sync --extra dev --extra mcp --extra langchain
+      - name: Sync (lean runtime + dev/mcp/langchain/llama-index extras)
+        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index
 
       - name: Lint
         run: uv run ruff check .

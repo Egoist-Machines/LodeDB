@@ -31,7 +31,7 @@ third_party/turbovec/target/
 *.jsd
 *.tvtext
 .lodedb.lock
-/data/
+/data*/
 /.lodedb/
 
 /benchmarks/gpu_patch/

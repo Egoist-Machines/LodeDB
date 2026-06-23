@@ -25,6 +25,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reinstall command, and `lodedb doctor --fix` runs the reinstall so embeddings use an NVIDIA
   GPU.
 
+- **LlamaIndex `VectorStore` adapter** (`lodedb[llama-index]`). `LodeDBVectorStore` in
+  `lodedb.local.integrations.llama_index` wraps the LodeDB SDK as a LlamaIndex
+  `BasePydanticVectorStore`, joining the existing LangChain adapter. It is *text-path* —
+  LodeDB embeds text internally (`is_embedding_query=False`), so LlamaIndex's own
+  `embed_model` is not used. Query modes map onto the SDK's retrieval modes:
+  `VectorStoreQueryMode.DEFAULT` to vector search, `HYBRID`/`SEMANTIC_HYBRID` to the BM25 + RRF
+  hybrid, and `SPARSE`/`TEXT_SEARCH` to lexical (BM25) search. Metadata filters translate the
+  LlamaIndex `FilterOperator` comparisons (`==` `!=` `>` `>=` `<` `<=` `in` `nin`, plus
+  `is_empty`) and `FilterCondition` composition (`and` / `or` / `not`, nestable) into LodeDB's
+  predicate grammar. `get_nodes` and filter-based `delete_nodes` are served by metadata
+  enumeration, and `delete(ref_doc_id)` / `doc_ids` scoping resolve through durable metadata so
+  they survive a reopen. `add` / `query` / `delete`, `node_ids` scoping, and async shims round
+  out the surface; operations LodeDB cannot honor (full-precision vector reads, `MMR`/learned
+  query modes, substring/list filter operators) raise clearly.
+- **LlamaIndex `PropertyGraphStore` adapter** (`lodedb[llama-index]`). `LodeDBPropertyGraphStore`
+  in `lodedb.local.integrations.llama_index_graph` wraps `lodedb.graph.KnowledgeGraph` as a
+  LlamaIndex `PropertyGraphStore`, so `PropertyGraphIndex` can use LodeDB's hybrid graph layer
+  (SQLite topology + LodeDB semantic index). `EntityNode`/`ChunkNode` map to typed graph nodes
+  (node properties round-trip as JSON), and `Relation` to directed, typed edges; `get` /
+  `get_triplets` / `get_rel_map` traverse the topology, while `vector_query` runs semantic node
+  search. `supports_vector_queries` is true; `structured_query` (Cypher) is not supported.
+  `KnowledgeGraph` gains `list_nodes` / `list_edges` complete-set enumeration (to back the
+  adapter's topology reads) and a **vector-only mode** (`KnowledgeGraph(vector_dim=D)`) that
+  indexes nodes and edges by caller-supplied embeddings at an arbitrary dimension with no
+  internal embedder. The adapter detects that mode and stores LlamaIndex node embeddings /
+  queries by `query.query_embedding`, so the high-level `PropertyGraphIndex` works with **any**
+  `embed_model` (set `D` to the embedder's dimension). In the default text-path mode it embeds
+  node text and `query.query_str` with the graph's own model, mapping
+  `DEFAULT`/`HYBRID`/`SEMANTIC_HYBRID`/`SPARSE`/`TEXT_SEARCH` the same way the vector-store
+  adapter does.
+
 ### Documentation
 
 - **MCP server setup.** Added a "Use as an MCP server" README section covering the exposed

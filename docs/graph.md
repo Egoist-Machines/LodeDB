@@ -150,6 +150,43 @@ relevant" step is how Zep/Graphiti and cognee are built. LodeDB is a strong loca
 exact, crash-atomic vector half of that pairing, and its O(changed) delta
 persistence matches the incremental fact accrual seen in agent memory.
 
+## Using the graph from LlamaIndex
+
+`LodeDBPropertyGraphStore` (in `lodedb.local.integrations.llama_index_graph`, optional
+`lodedb[llama-index]`) wraps a `KnowledgeGraph` as a LlamaIndex
+`PropertyGraphStore`, so LlamaIndex's `PropertyGraphIndex` can use the layer above as
+its graph store:
+
+```python
+from lodedb.graph import KnowledgeGraph
+from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+store = LodeDBPropertyGraphStore(KnowledgeGraph(path="./kg"))
+```
+
+LlamaIndex `EntityNode`/`ChunkNode` map to typed graph nodes (node properties
+round-trip as JSON) and `Relation` to directed, typed edges. `get` / `get_triplets` /
+`get_rel_map` traverse the topology; `structured_query` (Cypher) is not supported, and
+`KnowledgeGraph` exposes `list_nodes()` / `list_edges()` to back the adapter's
+complete-set reads.
+
+There are two embedding modes:
+
+- **Text-path (default).** LodeDB embeds node text (an entity's name, a chunk's text)
+  and `query.query_str` with the graph's own model; `vector_query` maps
+  `DEFAULT`/`HYBRID`/`SPARSE` the same way the vector-store adapter does. LlamaIndex's
+  `embed_model` is not used.
+- **Vector-only (bring your own embeddings).** Open the graph with a `vector_dim` and the
+  semantic index has no embedder: the adapter stores each node's own `embedding` and
+  `vector_query` searches by `query.query_embedding`. This is what LlamaIndex's high-level
+  `PropertyGraphIndex` / `VectorContextRetriever` use, so it works with **any** `embed_model`
+  — set the dimension to the embedder's:
+
+  ```python
+  # match your embed_model's dimension (e.g. 1536); nodes and queries stay in one space
+  store = LodeDBPropertyGraphStore.from_path("./kg", vector_dim=1536)
+  ```
+
 ## Benchmarks
 
 `benchmarks/graph_memory/` measures all three capabilities (metrics only):

@@ -209,3 +209,31 @@ def test_read_only_graph_blocks_writes(tmp_path):
 
     with pytest.raises(ReadOnlyError):
         reader.add_node(id="b", label="b")
+
+
+def test_vector_only_graph(tmp_path):
+    """A vector-only graph (no embedder) indexes nodes by caller embeddings at any dim."""
+
+    kg = KnowledgeGraph(path=tmp_path, vector_dim=8)
+    assert kg.vector_only is True
+    kg.add_node(id="a", type="X", embedding=_onehot(0, dim=8))
+    kg.add_node(id="b", type="X", embedding=_onehot(3, dim=8))
+    kg.add_edge("a", "links", "b")
+
+    # Semantic search by a precomputed query vector (deterministic via one-hot).
+    assert kg.semantic_nodes(embedding=_onehot(3, dim=8), k=2)[0][1].id == "b"
+
+    # Topology and enumeration still work.
+    assert {e.dst for e in kg.neighbors("a", direction="out")} == {"b"}
+    assert {n.id for n in kg.list_nodes()} == {"a", "b"}
+
+    # A label-only node (no embedding) is topology-only, not searchable, and raises nothing.
+    kg.add_node(id="c", type="X", label="some text")
+    assert kg.get_node("c") is not None
+    assert "c" not in {n.id for _s, n in kg.semantic_nodes(embedding=_onehot(0, dim=8), k=5)}
+    kg.close()
+
+    # Reopen at the same dimension and the persisted vectors are still searchable.
+    reopened = KnowledgeGraph(path=tmp_path, vector_dim=8)
+    assert reopened.semantic_nodes(embedding=_onehot(3, dim=8), k=1)[0][1].id == "b"
+    reopened.close()
