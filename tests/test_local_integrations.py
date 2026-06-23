@@ -330,3 +330,136 @@ def test_llama_index_vectorstore_unsupported(tmp_path):
         store.get("n1")
 
     db.close()
+
+
+# -- LlamaIndex PropertyGraphStore adapter ----------------------------------
+
+
+def _llama_kg(tmp_path):
+    """Opens a KnowledgeGraph with a deterministic hash backend (no model download)."""
+
+    from lodedb.graph import KnowledgeGraph
+
+    return KnowledgeGraph(
+        path=tmp_path, model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384)
+    )
+
+
+def test_llama_index_property_graph_roundtrip(tmp_path):
+    """upsert / get / get_triplets / get_rel_map / vector_query / delete round-trip."""
+
+    pytest.importorskip("llama_index.core")  # needs lodedb[llama-index]
+    from llama_index.core.graph_stores.types import ChunkNode, EntityNode, Relation
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+    kg = _llama_kg(tmp_path)
+    store = LodeDBPropertyGraphStore(kg)
+    assert store.supports_vector_queries is True
+    assert store.supports_structured_queries is False
+
+    alice = EntityNode(name="alice", label="PERSON", properties={"role": "engineer", "level": 3})
+    acme = EntityNode(name="acme", label="ORG")
+    chunk = ChunkNode(text="Alice works at Acme on the search team.", id_="c1")
+    store.upsert_nodes([alice, acme, chunk])
+    store.upsert_relations(
+        [
+            Relation(
+                label="WORKS_AT", source_id="alice", target_id="acme", properties={"since": 2020}
+            ),
+            Relation(label="MENTIONS", source_id="c1", target_id="alice"),
+        ]
+    )
+
+    # get by id reconstructs the right subclass; JSON properties keep their types.
+    got = store.get(ids=["alice"])
+    assert len(got) == 1 and isinstance(got[0], EntityNode)
+    assert got[0].name == "alice" and got[0].label == "PERSON"
+    assert got[0].properties == {"role": "engineer", "level": 3}  # int kept, reserved key stripped
+    chunks = store.get(ids=["c1"])
+    assert isinstance(chunks[0], ChunkNode) and chunks[0].text.startswith("Alice works at Acme")
+
+    # get by property (any key matches).
+    assert {n.id for n in store.get(properties={"role": "engineer"})} == {"alice"}
+
+    # triplets touching alice (source or target).
+    touching = {(t[0].id, t[1].id, t[2].id) for t in store.get_triplets(entity_names=["alice"])}
+    assert ("alice", "WORKS_AT", "acme") in touching
+    assert ("c1", "MENTIONS", "alice") in touching
+
+    # relation-name filter enumerates all edges of that type.
+    works = store.get_triplets(relation_names=["WORKS_AT"])
+    assert {(t[0].id, t[2].id) for t in works} == {("alice", "acme")}
+
+    # rel map expands from a seed node over the topology.
+    rel_map = store.get_rel_map([EntityNode(name="alice", label="PERSON")], depth=2)
+    assert any(t[2].id == "acme" for t in rel_map)
+
+    # vector_query, text-path: top-k over the indexed node text.
+    nodes, scores = store.vector_query(
+        VectorStoreQuery(query_str="who is the engineer?", similarity_top_k=3)
+    )
+    assert "alice" in {n.id for n in nodes}
+    assert all(isinstance(s, float) for s in scores)
+
+    # delete by id removes the node and its incident edges.
+    store.delete(ids=["acme"])
+    assert store.get(ids=["acme"]) == []
+    assert store.get_triplets(relation_names=["WORKS_AT"]) == []
+
+    kg.close()
+
+
+def test_llama_index_property_graph_hybrid_and_embedding(tmp_path):
+    """vector_query honors hybrid mode (query_str) and a pure embedding query."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.graph_stores.types import ChunkNode
+    from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
+
+    from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+    kg = _llama_kg(tmp_path)  # store_text=True by default -> lexical source available
+    store = LodeDBPropertyGraphStore(kg)
+    store.upsert_nodes(
+        [
+            ChunkNode(text="request failed with error E1234", id_="c1"),
+            ChunkNode(text="the cat sat on the mat", id_="c2"),
+        ]
+    )
+
+    # Hybrid recovers the exact token via the query string.
+    nodes, _ = store.vector_query(
+        VectorStoreQuery(query_str="E1234", similarity_top_k=2, mode=VectorStoreQueryMode.HYBRID)
+    )
+    assert "c1" in {n.id for n in nodes}
+
+    # Pure embedding query (what the high-level VectorContextRetriever passes).
+    by_vec, _ = store.vector_query(
+        VectorStoreQuery(query_embedding=[1.0] * 384, similarity_top_k=2)
+    )
+    assert {n.id for n in by_vec} <= {"c1", "c2"}
+
+    kg.close()
+
+
+def test_llama_index_property_graph_unsupported(tmp_path):
+    """Structured queries and unsupported vector modes raise; empty get_triplets is []."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
+
+    from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+    kg = _llama_kg(tmp_path)
+    store = LodeDBPropertyGraphStore(kg)
+
+    with pytest.raises(NotImplementedError):
+        store.structured_query("MATCH (n) RETURN n")
+    with pytest.raises(NotImplementedError):
+        store.vector_query(VectorStoreQuery(query_str="x", mode=VectorStoreQueryMode.MMR))
+    # No filters -> no triplets (matching LlamaIndex's reference store).
+    assert store.get_triplets() == []
+
+    kg.close()

@@ -150,6 +150,31 @@ relevant" step is how Zep/Graphiti and cognee are built. LodeDB is a strong loca
 exact, crash-atomic vector half of that pairing, and its O(changed) delta
 persistence matches the incremental fact accrual seen in agent memory.
 
+## Using the graph from LlamaIndex
+
+`LodeDBPropertyGraphStore` (in `lodedb.local.integrations.llama_index_graph`, optional
+`lodedb[llama-index]`) wraps a `KnowledgeGraph` as a LlamaIndex
+`PropertyGraphStore`, so LlamaIndex's `PropertyGraphIndex` can use the layer above as
+its graph store:
+
+```python
+from lodedb.graph import KnowledgeGraph
+from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+store = LodeDBPropertyGraphStore(KnowledgeGraph(path="./kg"))
+```
+
+LlamaIndex `EntityNode`/`ChunkNode` map to typed graph nodes (node properties
+round-trip as JSON) and `Relation` to directed, typed edges. `get` / `get_triplets` /
+`get_rel_map` traverse the topology; `vector_query` runs semantic node search and is
+text-path (it embeds `query.query_str` with the graph's own model, mapping
+`DEFAULT`/`HYBRID`/`SPARSE` the same way the vector-store adapter does). When only a
+precomputed `query_embedding` is supplied (LlamaIndex's high-level
+`VectorContextRetriever`), it is used directly and is meaningful only when LlamaIndex's
+`embed_model` matches the graph's model and dimension. `structured_query` (Cypher) is
+not supported. To back the adapter's complete-set reads, `KnowledgeGraph` exposes
+`list_nodes()` / `list_edges()`.
+
 ## Benchmarks
 
 `benchmarks/graph_memory/` measures all three capabilities (metrics only):

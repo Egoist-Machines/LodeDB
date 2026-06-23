@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they survive a reopen. `add` / `query` / `delete`, `node_ids` scoping, and async shims round
   out the surface; operations LodeDB cannot honor (full-precision vector reads, `MMR`/learned
   query modes, substring/list filter operators) raise clearly.
+- **LlamaIndex `PropertyGraphStore` adapter** (`lodedb[llama-index]`). `LodeDBPropertyGraphStore`
+  in `lodedb.local.integrations.llama_index_graph` wraps `lodedb.graph.KnowledgeGraph` as a
+  LlamaIndex `PropertyGraphStore`, so `PropertyGraphIndex` can use LodeDB's hybrid graph layer
+  (SQLite topology + LodeDB semantic index). `EntityNode`/`ChunkNode` map to typed graph nodes
+  (node properties round-trip as JSON), and `Relation` to directed, typed edges; `get` /
+  `get_triplets` / `get_rel_map` traverse the topology, while `vector_query` runs semantic node
+  search (text-path, with the same `DEFAULT`/`HYBRID`/`SPARSE` mode mapping as the vector-store
+  adapter). `supports_vector_queries` is true; `structured_query` (Cypher) is not supported.
+  `KnowledgeGraph` gains `list_nodes` / `list_edges` complete-set enumeration to back the
+  adapter's topology reads.
 
 ### Documentation
 

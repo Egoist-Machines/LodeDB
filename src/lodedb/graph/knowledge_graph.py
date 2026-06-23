@@ -413,6 +413,27 @@ class KnowledgeGraph:
 
         return self._store.neighbors(str(node_id), direction=direction, relation=relation)
 
+    def list_nodes(self) -> list[Node]:
+        """Returns every node in the graph (complete-set enumeration).
+
+        The deterministic counterpart to :meth:`semantic_nodes`: no ranking, no
+        ``k`` cap, just the full node set from the source-of-truth topology store.
+        This is the primitive a property-graph view needs ("every node", or every
+        node whose property matches) that a top-``k`` similarity search cannot
+        express on its own.
+        """
+
+        return list(self._store.iter_nodes())
+
+    def list_edges(self) -> list[Edge]:
+        """Returns every edge in the graph (complete-set enumeration).
+
+        Like :meth:`list_nodes`, full enumeration over the topology store — the
+        primitive behind an "all triplets" / "all edges of relation R" view.
+        """
+
+        return list(self._store.iter_edges())
+
     def k_hop(
         self,
         seeds: str | Sequence[str],

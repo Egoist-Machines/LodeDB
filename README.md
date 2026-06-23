@@ -29,7 +29,8 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
 - **Batteries included**: a `lodedb` CLI, a loopback dev server, an
-  [MCP server](#use-as-an-mcp-server), and LangChain and LlamaIndex `VectorStore` adapters.
+  [MCP server](#use-as-an-mcp-server), and LangChain and LlamaIndex adapters (a `VectorStore`,
+  plus a LlamaIndex `PropertyGraphStore`).
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
