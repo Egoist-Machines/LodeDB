@@ -40,8 +40,7 @@ _STORE_TEXT_OPTION = typer.Option(
     True,
     "--store-text/--no-store-text",
     "-t",
-    help="Retain raw text so `lodedb get ID` can return it (default on; "
-    "--no-store-text opts out).",
+    help="Retain raw text so `lodedb get ID` can return it (default on; --no-store-text opts out).",
 )
 _EXCLUDE_TEXT_OPTION = typer.Option(
     False,
@@ -139,15 +138,11 @@ def index(
     docs: list[str] = list(texts or [])
     if file is not None:
         docs.extend(
-            line.strip()
-            for line in file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
+            line.strip() for line in file.read_text(encoding="utf-8").splitlines() if line.strip()
         )
     if not docs:
         raise typer.BadParameter("provide document texts or --file")
-    db = LodeDB(
-        path=path, model=model, device=device, store_text=store_text, durability=durability
-    )
+    db = LodeDB(path=path, model=model, device=device, store_text=store_text, durability=durability)
     ids = db.add_many([{"text": text} for text in docs])
     db.persist()
     typer.echo(
@@ -291,8 +286,13 @@ def serve(
     )
 
 
-@app.command()
-def mcp(
+mcp_app = typer.Typer(help="MCP server commands.")
+app.add_typer(mcp_app, name="mcp", invoke_without_command=True)
+
+
+@mcp_app.callback(invoke_without_command=True)
+def mcp_default(
+    ctx: typer.Context,
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
@@ -305,16 +305,44 @@ def mcp(
     by default, so an agent can rank and answer in one call; pass ``--exclude-text`` to return
     metrics only (this also withdraws the get-by-id tool) or ``--no-store-text`` to keep no
     text on disk at all (search then falls back to a vector scan).
-    Register with a coding agent, e.g.:
-    {"mcpServers": {"lodedb": {"command": "lodedb", "args": ["mcp", "--path", "./data"]}}}
+
+    Register LodeDB with a coding agent by running: ``lodedb mcp install``
     """
+    if ctx.invoked_subcommand is None:
+        from lodedb.local.mcp_server import build_mcp_server
 
-    from lodedb.local.mcp_server import build_mcp_server
+        server, _db = build_mcp_server(
+            path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
+        )
+        server.run(transport="stdio")
 
-    server, _db = build_mcp_server(
-        path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
+
+_CLIENT_OPTION = typer.Option(
+    "all",
+    "--client",
+    help="claude-code | claude-desktop | codex | cursor | lm-studio | all",
+)
+_DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="Prints without writing.")
+_CONFIG_OPTION = typer.Option(None, "--config", help="Override standard config file path.")
+
+
+@mcp_app.command("install")
+def mcp_install_cmd(
+    ctx: typer.Context,
+    client: str = _CLIENT_OPTION,
+    dry_run: bool = _DRY_RUN_OPTION,
+    config: Path | None = _CONFIG_OPTION,
+) -> None:
+    """Registers LodeDB's MCP server with a coding assistant in one step."""
+    from lodedb.local.mcp_install import install
+
+    parent_params = ctx.parent.params if ctx.parent else {}
+    install(
+        client=client,
+        dry_run=dry_run,
+        config_override=config,
+        **parent_params,
     )
-    server.run(transport="stdio")
 
 
 def main() -> None:
