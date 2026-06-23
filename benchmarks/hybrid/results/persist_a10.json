@@ -1,0 +1,158 @@
+{
+  "baseline_store_text": {
+    "bytes_lexical_sidecar": 0,
+    "bytes_total": 49663390,
+    "cold_build_ms": 4482.609755,
+    "document_count": 20200,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 17.388290589999983,
+      "p50_ms": 11.471359000001513,
+      "p95_ms": 15.1950369999998
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "avx512bw",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 82.13450179999988,
+        "p50_ms": 53.48277599999918,
+        "p95_ms": 629.3251949999999
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.35870285,
+        "p50_ms": 9.386684999999062,
+        "p95_ms": 10.127672999999504
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 49.138157849999594,
+        "p50_ms": 12.409545000000577,
+        "p95_ms": 744.7242029999987
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1069.6894550000006
+  },
+  "commit_overhead": {
+    "absolute_ms": 9.122090280000158,
+    "baseline_mean_ms": 17.388290589999983,
+    "note": "store_text held True; the delta is the additive cost of index_text",
+    "relative_pct": 52.461110152174925,
+    "with_index_text_mean_ms": 26.51038087000014
+  },
+  "config": {
+    "dim": 384,
+    "incremental": 200,
+    "ingest_batch": 2000,
+    "plant_every": 50,
+    "planted_token_count": 134,
+    "query_batch": 64,
+    "query_count": 20,
+    "scale": 20000,
+    "top_k": 10
+  },
+  "index_text_no_store_text": {
+    "bytes_lexical_sidecar": 25539863,
+    "bytes_total": 56996919,
+    "cold_build_ms": 4906.076339000002,
+    "document_count": 20200,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 22.57466867500021,
+      "p50_ms": 11.074061999998719,
+      "p95_ms": 14.89035800000238
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "avx512bw",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 81.64173830000045,
+        "p50_ms": 57.24876400000056,
+        "p95_ms": 496.86584100000175
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.858297400000282,
+        "p50_ms": 9.8473150000018,
+        "p95_ms": 10.363978000000884
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 19.011195399999536,
+        "p50_ms": 14.393308999999022,
+        "p95_ms": 95.70612999999639
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1407.3424460000012
+  },
+  "machine": {
+    "cuda_available": true,
+    "gpu_name": "NVIDIA A10",
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35",
+    "python": "3.11.9"
+  },
+  "with_index_text": {
+    "bytes_lexical_sidecar": 25539863,
+    "bytes_total": 75234178,
+    "cold_build_ms": 5120.140413999998,
+    "document_count": 20200,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 26.51038087000014,
+      "p50_ms": 12.44794800000193,
+      "p95_ms": 15.616204000000522
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "avx512bw",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 76.32925034999953,
+        "p50_ms": 54.782184999996986,
+        "p95_ms": 485.81541699999775
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.699483199999648,
+        "p50_ms": 9.672324999996817,
+        "p95_ms": 10.418502000000274
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 18.41321279999999,
+        "p50_ms": 13.461670999998177,
+        "p95_ms": 97.36167999999878
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1381.128871999998
+  }
+}
