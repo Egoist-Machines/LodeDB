@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.2.0] - 2026-06-23
+
 ### Added
+
+- **Knowledge-graph and memory backend.** New `lodedb.graph.KnowledgeGraph` layer: graph topology
+  (nodes, typed edges, properties) in an embedded SQLite sidecar with the semantic index in LodeDB,
+  `neighbors` / `k_hop` traversal, and `search_subgraph` (semantic seeds plus k-hop expansion). The
+  SDK gained a vector-in path (`add_vectors` / `add_vectors_many` / `search_by_vector` /
+  `search_many_by_vector`) for precomputed embeddings, a vector-only index
+  (`LodeDB(vector_dim=...)` / `open_vector_store`, no embedding model), metadata enumeration
+  (`list_documents` / `count`), a selectivity-ordered predicate filter planner, and inline metadata
+  on search results. See `docs/graph.md`.
 
 - **Hybrid lexical + vector search (BM25 + RRF).** `search`/`search_many` take a `mode`
   parameter: `"vector"` (default, unchanged), `"hybrid"`, and `"lexical"`. Hybrid runs an
