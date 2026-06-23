@@ -190,6 +190,74 @@ def test_search_many_hybrid_with_filter_matches_single(tmp_path):
     db.close()
 
 
+def test_search_many_hybrid_large_batch_matches_single_and_batches(tmp_path):
+    """A larger hybrid batch equals repeated single search (ids + scores) and batches.
+
+    Exercises the batched-vector hybrid path: several hybrid queries share the
+    (empty) filter, so their vector component runs through one grouped scan and
+    each fuses on the CPU. The result must still be byte-for-byte the repeated
+    single-query result, and the batched group path must actually have run.
+    """
+
+    db = _open(tmp_path)
+    _seed_with_exact_token(db, token="E1234")
+    db.add("the second device used serial ABC-123 in its label", id="serial-doc")
+    db.add("log mentions both E1234 and ABC-123 on 2024-01-15", id="multi")
+
+    engine = db._engine  # noqa: SLF001 - test introspection of the batched path
+    calls = {"batched_group": 0}
+    original = engine._run_batched_hybrid_group  # noqa: SLF001
+
+    def _spy(*args, **kwargs):
+        calls["batched_group"] += 1
+        return original(*args, **kwargs)
+
+    engine._run_batched_hybrid_group = _spy  # noqa: SLF001
+    try:
+        queries = ["E1234", "ABC-123", "foxes", "2024-01-15", "turbine recovered"]
+        batched = db.search_many(queries, k=4, mode="hybrid")
+    finally:
+        engine._run_batched_hybrid_group = original  # noqa: SLF001
+    singles = [db.search(query, k=4, mode="hybrid") for query in queries]
+
+    assert [[hit.id for hit in row] for row in batched] == [
+        [hit.id for hit in row] for row in singles
+    ]
+    for batch_row, single_row in zip(batched, singles, strict=True):
+        assert [round(hit.score, 9) for hit in batch_row] == [
+            round(hit.score, 9) for hit in single_row
+        ]
+    # The grouped batched-vector hybrid path actually ran (not the per-query path).
+    assert calls["batched_group"] == 1
+    db.close()
+
+
+def test_search_many_mixed_modes_matches_single(tmp_path):
+    """A batch mixing vector, hybrid, and lexical queries matches repeated singles."""
+
+    db = _open(tmp_path)
+    _seed_with_exact_token(db, token="E1234")
+    db.add("the second device used serial ABC-123 in its label", id="serial-doc")
+
+    specs = [
+        ("E1234", "hybrid"),
+        ("turbine recovered", "vector"),
+        ("ABC-123", "hybrid"),
+        ("E1234", "lexical"),
+        ("foxes", "vector"),
+    ]
+    queries = [text for text, _ in specs]
+    # search_many takes one mode for the batch, so compare per-mode batches to the
+    # single calls of the same mode at the same positions.
+    for mode in ("hybrid", "vector", "lexical"):
+        batched = db.search_many(queries, k=4, mode=mode)
+        singles = [db.search(query, k=4, mode=mode) for query in queries]
+        assert [[hit.id for hit in row] for row in batched] == [
+            [hit.id for hit in row] for row in singles
+        ], mode
+    db.close()
+
+
 # -- store_text=False -------------------------------------------------------
 
 
@@ -255,6 +323,130 @@ def test_hybrid_top_k_not_capped_by_vector_pool(tmp_path):
         db.add(f"noise document {i} with no codes at all", id=f"n{i}", metadata={"topic": "misc"})
     ids = {hit.id for hit in db.search("E1234", k=5, mode="hybrid")}
     assert {"c1", "c2"} <= ids
+    db.close()
+
+
+# -- incremental in-memory BM25 index ---------------------------------------
+
+
+def _open_lexical(tmp_path, *, source: str):
+    """Opens a DB whose lexical source is the raw-text path or the token path."""
+
+    if source == "store_text":
+        return LodeDB(
+            path=tmp_path, store_text=True,
+            _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        )
+    return LodeDB(
+        path=tmp_path, index_text=True, store_text=False,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+
+
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_index_incremental_add_is_searchable_without_full_rebuild(tmp_path, source):
+    """A small add after a warm lexical index folds in incrementally and is found."""
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(20):
+        db.add(f"base body number {i} with token{i}", id=f"b{i}", metadata={"topic": "base"})
+    # Warm the lexical index (full build on this first query).
+    assert db.search("token1", k=3, mode="lexical")
+
+    import lodedb.engine._lexical as lx
+
+    builds = {"count": 0}
+    original_build = lx.Bm25Index._build
+
+    def _spy_build(self, *args, **kwargs):
+        builds["count"] += 1
+        return original_build(self, *args, **kwargs)
+
+    lx.Bm25Index._build = _spy_build
+    try:
+        db.add("a freshly added doc carrying ABC-123 serial", id="late", metadata={"topic": "ops"})
+        late = db.search("ABC-123", k=5, mode="lexical")
+    finally:
+        lx.Bm25Index._build = original_build
+
+    assert [hit.id for hit in late] == ["late"]
+    # The small add did NOT trigger a full O(total tokens) rebuild.
+    assert builds["count"] == 0
+    db.close()
+
+
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_index_incremental_delete_drops_doc(tmp_path, source):
+    """Deleting a doc removes it from the in-memory index on the next query."""
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(20):
+        db.add(f"base body number {i} with token{i}", id=f"b{i}")
+    db.add("removable entry citing E1234 fault", id="gone")
+    assert [hit.id for hit in db.search("E1234", k=5, mode="lexical")] == ["gone"]
+    assert db.remove("gone") is True
+    assert db.search("E1234", k=5, mode="lexical") == []
+    db.close()
+
+
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_incremental_served_equals_full_rebuild(tmp_path, source):
+    """The incrementally-served ranking equals what a forced full rebuild gives.
+
+    Build a base, warm the index, then add and remove docs (incremental folds),
+    capture the served hybrid ranking, force a full rebuild by clearing the
+    in-memory index cache, and assert the rebuilt ranking matches ids and scores.
+    """
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(16):
+        db.add(f"base body number {i} with token{i}", id=f"b{i}")
+    db.search("token0", k=3, mode="lexical")  # warm
+
+    db.add("first carrier citing fault E1234 here", id="c1")
+    db.add("second note also mentioning ABC-123 serial", id="c2")
+    db.remove("b0")
+    db.add("third upserted body for token3 again", id="b3")  # re-upsert existing id
+
+    query = "E1234 ABC-123 token3 token5"
+    served = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
+
+    # Force a full rebuild: drop the cached (incrementally updated) index so the
+    # next query builds it from scratch over the same final corpus.
+    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
+    rebuilt = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
+
+    assert served == rebuilt
+    db.close()
+
+
+def test_lexical_incremental_large_delta_full_rebuilds(tmp_path):
+    """A delta above the incremental fraction falls back to a full rebuild."""
+
+    db = _open_lexical(tmp_path, source="store_text")
+    for i in range(8):
+        db.add(f"doc {i} alpha token{i}", id=f"d{i}")
+    db.search("alpha", k=3, mode="lexical")  # warm
+
+    import lodedb.engine._lexical as lx
+
+    builds = {"count": 0}
+    original_build = lx.Bm25Index._build
+
+    def _spy_build(self, *args, **kwargs):
+        builds["count"] += 1
+        return original_build(self, *args, **kwargs)
+
+    lx.Bm25Index._build = _spy_build
+    try:
+        # Add 5 docs to a corpus of 8 -> 5/13 > 0.25 -> a full rebuild is taken.
+        for i in range(5):
+            db.add(f"new doc {i} beta token{i}", id=f"e{i}")
+        db.search("beta", k=3, mode="lexical")
+    finally:
+        lx.Bm25Index._build = original_build
+
+    assert builds["count"] >= 1  # a full rebuild ran for the large delta
     db.close()
 
 

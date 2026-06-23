@@ -18,8 +18,10 @@ Three pieces:
   inside code-like tokens, so ``E1234``, ``ABC-123``, and ``2024-01-15`` survive
   as single findable tokens. This is the whole point of the feature: the
   embedding cannot see an exact code, but the lexical index can.
-- :class:`Bm25Index` — a classic Okapi BM25 inverted index over a fixed unit
-  space (LodeDB indexes chunks), scoring a tokenized query into a ranked list.
+- :class:`Bm25Index` — a classic Okapi BM25 inverted index over a unit space
+  (LodeDB indexes chunks), scoring a tokenized query into a ranked list; it
+  supports both a one-shot bulk build and incremental add/remove of single
+  units so a small mutation does not force a full rebuild.
 - :func:`reciprocal_rank_fusion` — fuses ranked id lists with RRF, which needs
   no score normalization and therefore composes cleanly with the vector scores.
 
@@ -78,21 +80,36 @@ def tokenize(text: str) -> list[str]:
 
 
 class Bm25Index:
-    """In-memory Okapi BM25 inverted index over a fixed unit (chunk) id space.
+    """In-memory Okapi BM25 inverted index over a unit (chunk) id space.
 
-    Built once per index generation from raw unit texts and reused for every
-    lexical query of that generation; it is never persisted. ``unit_ids`` and
-    ``texts`` are positionally aligned; ids may repeat callers' chunk ids
-    verbatim (they are returned unchanged from :meth:`rank`).
+    Scores a tokenized query into a ranked unit-id list and is never persisted.
+    Two ways to populate it produce an observationally identical index (same
+    :meth:`rank` output) for the same set of units:
+
+    - a one-shot bulk build (:meth:`__init__` from texts, or
+      :meth:`from_token_lists` from pre-tokenized units), used for the initial
+      construction so it stays O(total tokens); and
+    - incremental :meth:`add_unit` / :meth:`remove_unit`, used to fold a small
+      chunk-level delta into an already-built index without rescanning the rest
+      of the corpus.
+
+    Unit positions are stable: a position assigned to a unit id never moves while
+    that id is present, so a metadata allowlist expressed as a set of positions
+    stays valid across incremental updates (a removed position is simply never
+    re-used while the index lives). ``rank`` returns the caller's unit ids
+    verbatim. Positions are an internal detail; ids are the stable external key.
     """
 
     __slots__ = (
-        "_unit_ids",
         "_postings",
         "_doc_freq",
         "_doc_len",
-        "_avgdl",
+        "_unit_id_by_pos",
+        "_pos_by_unit_id",
+        "_terms_by_pos",
         "_n",
+        "_total_len",
+        "_next_pos",
         "_k1",
         "_b",
     )
@@ -150,33 +167,114 @@ class Bm25Index:
     ) -> None:
         """Builds the postings, document lengths, and corpus stats from token lists.
 
-        Shared by :meth:`__init__` (which tokenizes texts first) and
-        :meth:`from_token_lists` (which receives tokens directly), so both paths
-        produce a byte-for-byte identical index for the same tokens.
+        Assigns positions ``0..N-1`` to the units in order and populates every
+        per-position map. Shared by :meth:`__init__` (which tokenizes texts
+        first) and :meth:`from_token_lists` (which receives tokens directly), so
+        both bulk paths and a sequence of :meth:`add_unit` calls over the same
+        units produce an index that ranks identically.
         """
 
-        self._unit_ids: tuple[str, ...] = tuple(str(unit_id) for unit_id in unit_ids)
         self._k1 = float(k1)
         self._b = float(b)
-        # term -> {unit_index: term_frequency}
-        postings: dict[str, dict[int, int]] = {}
-        doc_len: list[int] = []
-        total_len = 0
-        for index, tokens in enumerate(token_lists):
-            doc_len.append(len(tokens))
-            total_len += len(tokens)
-            if not tokens:
+        # term -> {pos: term_frequency}; df is the count of distinct posts.
+        self._postings: dict[str, dict[int, int]] = {}
+        self._doc_freq: dict[str, int] = {}
+        self._doc_len: dict[int, int] = {}
+        self._unit_id_by_pos: dict[int, str] = {}
+        self._pos_by_unit_id: dict[str, int] = {}
+        # Distinct terms per position, so a unit can be removed by walking only
+        # its own terms instead of scanning the whole vocabulary.
+        self._terms_by_pos: dict[int, tuple[str, ...]] = {}
+        self._n = 0
+        self._total_len = 0
+        self._next_pos = 0
+        for unit_id, tokens in zip(unit_ids, token_lists, strict=True):
+            self._add_at(str(unit_id), tokens)
+
+    def _add_at(self, unit_id: str, tokens: Sequence[str]) -> None:
+        """Inserts ``unit_id`` (assumed absent) at a fresh position.
+
+        The single insertion primitive shared by the bulk build and
+        :meth:`add_unit`; it never checks for an existing id, so callers that
+        support upsert must :meth:`remove_unit` first.
+        """
+
+        pos = self._next_pos
+        self._next_pos += 1
+        length = len(tokens)
+        self._doc_len[pos] = length
+        self._total_len += length
+        self._n += 1
+        self._unit_id_by_pos[pos] = unit_id
+        self._pos_by_unit_id[unit_id] = pos
+        if not tokens:
+            self._terms_by_pos[pos] = ()
+            return
+        counts: dict[str, int] = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+        for token, frequency in counts.items():
+            posting = self._postings.get(token)
+            if posting is None:
+                self._postings[token] = {pos: frequency}
+                self._doc_freq[token] = 1
+            else:
+                posting[pos] = frequency
+                self._doc_freq[token] += 1
+        self._terms_by_pos[pos] = tuple(counts)
+
+    def add_unit(self, unit_id: str, tokens: Sequence[str]) -> None:
+        """Adds (or upserts) one unit's tokens, keeping corpus stats current.
+
+        If ``unit_id`` is already present it is :meth:`remove_unit`-ed first, so
+        a re-add replaces the old tokens rather than double-counting. The new
+        unit takes a fresh, never-reused position; existing positions do not
+        move, so a previously computed position allowlist stays valid.
+        """
+
+        unit_id = str(unit_id)
+        if unit_id in self._pos_by_unit_id:
+            self.remove_unit(unit_id)
+        self._add_at(unit_id, tokens)
+
+    def remove_unit(self, unit_id: str) -> None:
+        """Removes one unit and its postings; a no-op if the id is absent.
+
+        Walks only the unit's own distinct terms (via ``_terms_by_pos``) to
+        decrement document frequencies and drop posting entries, so removal is
+        O(distinct terms in the unit), not O(vocabulary).
+        """
+
+        unit_id = str(unit_id)
+        pos = self._pos_by_unit_id.pop(unit_id, None)
+        if pos is None:
+            return
+        for term in self._terms_by_pos.pop(pos, ()):
+            posting = self._postings.get(term)
+            if posting is None:
                 continue
-            counts: dict[str, int] = {}
-            for token in tokens:
-                counts[token] = counts.get(token, 0) + 1
-            for token, frequency in counts.items():
-                postings.setdefault(token, {})[index] = frequency
-        self._postings = postings
-        self._doc_freq = {term: len(posting) for term, posting in postings.items()}
-        self._doc_len = doc_len
-        self._n = len(self._unit_ids)
-        self._avgdl = (total_len / self._n) if self._n else 0.0
+            posting.pop(pos, None)
+            if posting:
+                self._doc_freq[term] = len(posting)
+            else:
+                # Last document for this term: drop the term from the vocabulary
+                # so its df/idf vanish exactly as in a fresh build without it.
+                del self._postings[term]
+                del self._doc_freq[term]
+        self._total_len -= self._doc_len.pop(pos, 0)
+        del self._unit_id_by_pos[pos]
+        self._n -= 1
+
+    @property
+    def unit_ids(self) -> frozenset[str]:
+        """Returns the set of currently indexed unit ids."""
+
+        return frozenset(self._pos_by_unit_id)
+
+    def position_of(self, unit_id: str) -> int | None:
+        """Returns the stable position for ``unit_id``, or ``None`` if absent."""
+
+        return self._pos_by_unit_id.get(str(unit_id))
 
     def __len__(self) -> int:
         """Returns the number of indexed units."""
@@ -203,9 +301,10 @@ class Bm25Index:
         Only units with a positive BM25 score are returned, so a unit that
         shares no query term is never ranked (a zero-overlap unit must not enter
         fusion just because the corpus is small). ``allowed_indices`` restricts
-        scoring to a metadata-filtered subset (positions into the build-time
-        ``unit_ids``); ``limit`` caps the returned list. Ties break on unit id so
-        the order is deterministic and matches the vector path's tie discipline.
+        scoring to a metadata-filtered subset (stable unit positions, e.g. from
+        :meth:`position_of`); ``limit`` caps the returned list. Ties break on
+        unit id so the order is deterministic and matches the vector path's tie
+        discipline.
         """
 
         if self._n == 0:
@@ -217,7 +316,8 @@ class Bm25Index:
         scores: dict[int, float] = {}
         k1 = self._k1
         b = self._b
-        avgdl = self._avgdl or 1.0
+        avgdl = (self._total_len / self._n) if self._n else 1.0
+        avgdl = avgdl or 1.0
         for term in set(query_terms):
             posting = self._postings.get(term)
             if not posting:
@@ -225,22 +325,23 @@ class Bm25Index:
             idf = self._idf(term)
             if idf <= 0.0:
                 continue
-            for unit_index, term_frequency in posting.items():
-                if allowed_indices is not None and unit_index not in allowed_indices:
+            for pos, term_frequency in posting.items():
+                if allowed_indices is not None and pos not in allowed_indices:
                     continue
-                length = self._doc_len[unit_index]
+                length = self._doc_len[pos]
                 denominator = term_frequency + k1 * (1.0 - b + b * (length / avgdl))
                 if denominator <= 0.0:
                     continue
                 contribution = idf * (term_frequency * (k1 + 1.0)) / denominator
-                scores[unit_index] = scores.get(unit_index, 0.0) + contribution
+                scores[pos] = scores.get(pos, 0.0) + contribution
+        unit_id_by_pos = self._unit_id_by_pos
         ranked = sorted(
             scores.items(),
-            key=lambda item: (-item[1], self._unit_ids[item[0]]),
+            key=lambda item: (-item[1], unit_id_by_pos[item[0]]),
         )
         if limit is not None:
             ranked = ranked[:limit]
-        return [(self._unit_ids[index], score) for index, score in ranked]
+        return [(unit_id_by_pos[pos], score) for pos, score in ranked]
 
 
 def reciprocal_rank_fusion(

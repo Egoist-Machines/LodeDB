@@ -127,6 +127,12 @@ _LEXICAL_MODES = frozenset({RETRIEVAL_MODE_HYBRID, RETRIEVAL_MODE_LEXICAL})
 # lexical pass O(matching chunks).
 _LEXICAL_POOL_FACTOR = 5
 _LEXICAL_POOL_FLOOR = 50
+# When the cached BM25 index is stale by only a small chunk-level delta, fold
+# just the added/removed units in place instead of a full O(total tokens)
+# rebuild. Above this fraction of the corpus a full rebuild is cheaper than
+# touching the postings one unit at a time, so the incremental path is bounded
+# to genuinely small changes (the common incremental-``add`` case).
+_LEXICAL_INCREMENTAL_MAX_FRACTION = 0.25
 PROJECTION_INITIAL_SOURCE = "initial_identity_prefix"
 PROJECTION_REFIT_SOURCE_INT8 = "int8_rerank"
 PROJECTION_REFIT_SOURCE_TRANSIENT_FLOAT = "transient_full_float"
@@ -423,34 +429,38 @@ class _MetadataPostingIndex:
 class _LexicalServingIndex:
     """Generation-keyed BM25 index over the corpus chunks for hybrid retrieval.
 
-    Built lazily from the retained raw document text on the first lexical or
-    hybrid query of a generation and reused after that, exactly like the
-    metadata posting index and the resident GPU session — so it never touches
-    the write/commit path. It is held in memory only: a BM25 inverted index is
-    payload-derived and must never reach the redacted artifacts or telemetry.
+    Built lazily on the first lexical or hybrid query of a generation and reused
+    after that, exactly like the metadata posting index and the resident GPU
+    session — so it never touches the write/commit path. When a later generation
+    differs from the cached one by only a small chunk-level delta, the delta is
+    folded into the existing :class:`Bm25Index` in place and the cached
+    generation is re-stamped, instead of rebuilding from scratch. It is held in
+    memory only: a BM25 inverted index is payload-derived and must never reach
+    the redacted artifacts or telemetry.
     """
 
-    __slots__ = ("generation", "bm25", "_position_by_chunk_id")
+    __slots__ = ("generation", "bm25")
 
-    def __init__(self, generation: int, bm25: Bm25Index, chunk_ids: list[str]) -> None:
+    def __init__(self, generation: int, bm25: Bm25Index) -> None:
         self.generation = generation
+        # The BM25 index owns the chunk-id -> stable-position mapping, so a
+        # metadata allowlist (a set of chunk ids) maps to the positions BM25 may
+        # score, keeping the lexical ranker constrained to the same subset as the
+        # vector ranker. Reading positions from the index (rather than a snapshot
+        # taken at build time) keeps the allowlist correct after an in-place
+        # incremental update reassigns positions for added units.
         self.bm25 = bm25
-        # chunk id -> position into the BM25 unit space, so a metadata allowlist
-        # (a set of chunk ids) maps to the positions BM25 may score, keeping the
-        # lexical ranker constrained to the same subset as the vector ranker.
-        self._position_by_chunk_id: dict[str, int] = {
-            chunk_id: position for position, chunk_id in enumerate(chunk_ids)
-        }
 
     def allowed_positions(self, allowed_chunk_ids: tuple[str, ...]) -> set[int]:
         """Maps an allowlist of chunk ids to BM25 unit positions (drops unknown ids)."""
 
-        position_by_chunk_id = self._position_by_chunk_id
-        return {
-            position_by_chunk_id[chunk_id]
-            for chunk_id in allowed_chunk_ids
-            if chunk_id in position_by_chunk_id
-        }
+        position_of = self.bm25.position_of
+        positions: set[int] = set()
+        for chunk_id in allowed_chunk_ids:
+            position = position_of(chunk_id)
+            if position is not None:
+                positions.add(position)
+        return positions
 
 
 @dataclass(frozen=True)
@@ -2362,35 +2372,66 @@ class LodeEngine:
     ) -> None:
         """Executes prepared direct-route queries, batching multi-query requests.
 
-        Lexical and hybrid queries run individually as a CPU post-step (they
-        share no native batch); the remaining pure-vector queries keep the
-        batched group path, so ``search_many`` with a mix of modes still batches
-        the vector queries and preserves request order for every result.
+        Three partitions by mode. Pure-vector queries keep the batched group
+        path. Hybrid queries that share a filter (two or more in a group) run
+        their VECTOR component through the same batched group scan -- widened to
+        the lexical pool -- and then fuse with BM25 + RRF per query on the CPU, so
+        a batch of hybrid queries finally rides the GPU/MPS vector scan instead of
+        scanning one query at a time. A lone hybrid query (the only one in its
+        filter group) and every lexical query run on the individual CPU post-step
+        path, keeping single-query parity exact. Request order is preserved for
+        every result regardless of partition.
         """
 
-        lexical_positions = [
-            position
-            for position, prepared_item in enumerate(prepared)
-            if prepared_item.mode != RETRIEVAL_MODE_VECTOR
-        ]
-        for position in lexical_positions:
-            prepared_item = prepared[position]
-            started = perf_counter()
-            query_results[position] = self._query_serving_index_hybrid(
-                state,
-                query_embedding=query_embeddings[position],
-                query_text=prepared_item.query.text,
-                query_filter=prepared_item.query_filter,
-                top_k=prepared_item.query.top_k,
-                mode=prepared_item.mode,
-            )
-            search_latencies[position] = (perf_counter() - started) * 1000.0
+        lexical_positions: list[int] = []
+        hybrid_positions: list[int] = []
+        vector_positions: list[int] = []
+        for position, prepared_item in enumerate(prepared):
+            if prepared_item.mode == RETRIEVAL_MODE_VECTOR:
+                vector_positions.append(position)
+            elif prepared_item.mode == RETRIEVAL_MODE_HYBRID:
+                hybrid_positions.append(position)
+            else:
+                lexical_positions.append(position)
 
-        vector_positions = [
-            position
-            for position, prepared_item in enumerate(prepared)
-            if prepared_item.mode == RETRIEVAL_MODE_VECTOR
-        ]
+        # Lexical-only queries have no vector component to batch; run each as the
+        # individual CPU post-step (BM25 alone).
+        for position in lexical_positions:
+            self._run_individual_hybrid(
+                state, prepared=prepared, query_embeddings=query_embeddings,
+                position=position, query_results=query_results,
+                search_latencies=search_latencies,
+            )
+
+        # Hybrid queries: group by filter so a filter-homogeneous group of two or
+        # more rides one batched vector scan; a singleton group falls back to the
+        # individual path so its result is byte-for-byte the single-query result.
+        if hybrid_positions:
+            serving = self._turbovec_index_for_state(state)
+            batch = np.asarray(query_embeddings, dtype=np.float32)
+            hybrid_groups: dict[tuple[Any, ...], list[int]] = {}
+            for position in hybrid_positions:
+                hybrid_groups.setdefault(
+                    _filter_signature(prepared[position].query_filter), []
+                ).append(position)
+            for positions in hybrid_groups.values():
+                if len(positions) < 2:
+                    self._run_individual_hybrid(
+                        state, prepared=prepared, query_embeddings=query_embeddings,
+                        position=positions[0], query_results=query_results,
+                        search_latencies=search_latencies,
+                    )
+                    continue
+                self._run_batched_hybrid_group(
+                    state=state,
+                    serving=serving,
+                    batch=batch,
+                    positions=positions,
+                    prepared=prepared,
+                    query_results=query_results,
+                    search_latencies=search_latencies,
+                )
+
         if not vector_positions:
             return
         if len(vector_positions) > 1:
@@ -2430,7 +2471,31 @@ class LodeEngine:
         search_latencies[position] = (perf_counter() - started) * 1000.0
         return
 
-    def _run_direct_batch_group(
+    def _run_individual_hybrid(
+        self,
+        state: ClientIndexState,
+        *,
+        prepared: tuple[_PreparedQuery, ...],
+        query_embeddings: tuple[tuple[float, ...], ...],
+        position: int,
+        query_results: list[_EngineTurboVecQueryResult | None],
+        search_latencies: list[float],
+    ) -> None:
+        """Runs one lexical/hybrid position on the individual CPU post-step path."""
+
+        prepared_item = prepared[position]
+        started = perf_counter()
+        query_results[position] = self._query_serving_index_hybrid(
+            state,
+            query_embedding=query_embeddings[position],
+            query_text=prepared_item.query.text,
+            query_filter=prepared_item.query_filter,
+            top_k=prepared_item.query.top_k,
+            mode=prepared_item.mode,
+        )
+        search_latencies[position] = (perf_counter() - started) * 1000.0
+
+    def _run_batched_hybrid_group(
         self,
         *,
         state: ClientIndexState,
@@ -2441,21 +2506,97 @@ class LodeEngine:
         query_results: list[_EngineTurboVecQueryResult | None],
         search_latencies: list[float],
     ) -> None:
+        """Batches the vector component of a filter-homogeneous hybrid group, then fuses.
+
+        Every position in ``positions`` is ``mode='hybrid'`` and shares the same
+        filter. Their vector scan runs as one grouped (GPU/MPS or CPU) call via
+        :meth:`_run_direct_batch_group`, each widened to that position's lexical
+        pool, so the group is scanned once at ``max`` pool width and each position
+        sliced to its own pool. The pool-wide vector result is then fused per
+        position with the BM25 + RRF pass, constrained to the same metadata
+        allowlist the scan used, so each fused result equals the single-query
+        result for the same pool width on the same kernel.
+        """
+
+        query_filter = prepared[positions[0]].query_filter
+        allowed_chunk_ids: tuple[str, ...] | None = None
+        if query_filter:
+            allowed_chunk_ids = self._build_filter_allowlist(state, query_filter)
+            if not allowed_chunk_ids:
+                # A filter that matches nothing constrains both rankers to empty,
+                # exactly as the single hybrid path returns for an empty allowlist.
+                for position in positions:
+                    query_results[position] = _empty_turbovec_result(serving)
+                    search_latencies[position] = 0.0
+                return
+
+        widths = {
+            position: self._lexical_pool_width(prepared[position].query.top_k)
+            for position in positions
+        }
+        # Run the vector component for the whole group in one batched scan; this
+        # writes a pool-wide direct_turbovec result at each position.
+        self._run_direct_batch_group(
+            state=state,
+            serving=serving,
+            batch=batch,
+            positions=positions,
+            prepared=prepared,
+            query_results=query_results,
+            search_latencies=search_latencies,
+            widths=widths,
+        )
+        # Fuse each position's pool-wide vector result with its BM25 ranking.
+        for position in positions:
+            base_result = query_results[position]
+            if base_result is None:  # defensive: scan always writes a result
+                base_result = _empty_turbovec_result(serving)
+            fuse_started = perf_counter()
+            query_results[position] = self._fuse_precomputed_vector_result(
+                state,
+                serving=serving,
+                base_result=base_result,
+                query_text=prepared[position].query.text,
+                allowed_chunk_ids=allowed_chunk_ids,
+                pool=widths[position],
+                mode=RETRIEVAL_MODE_HYBRID,
+            )
+            search_latencies[position] += (perf_counter() - fuse_started) * 1000.0
+
+    def _run_direct_batch_group(
+        self,
+        *,
+        state: ClientIndexState,
+        serving: TurboVecServingIndex,
+        batch: np.ndarray,
+        positions: list[int],
+        prepared: tuple[_PreparedQuery, ...],
+        query_results: list[_EngineTurboVecQueryResult | None],
+        search_latencies: list[float],
+        widths: dict[int, int] | None = None,
+    ) -> None:
         """Runs one filter-homogeneous slice of a batch as a single native call.
 
         Every query in ``positions`` shares ``query_filter``. A filtered group
         pushes one shared allowlist into the scan (no top_k widening); an
-        unfiltered group keeps the resident GPU/MPS fast path. Per-query widths
-        are sliced from the group's shared top-k and written back at their
-        original positions, preserving batch order.
+        unfiltered group keeps the resident GPU/MPS fast path. ``widths`` maps
+        each position to the number of rows that position wants from the scan,
+        defaulting to its own ``query.top_k`` (so a pure-vector batch is
+        byte-for-byte unchanged); a hybrid caller passes the widened lexical pool
+        width so the vector component of the hybrid query rides this same batched
+        scan. The group's shared scan width is ``max(widths.values())`` and each
+        position is sliced to its own width, written back at its original
+        position to preserve batch order.
         """
 
         from lodedb.engine.gpu_turbovec import GPU_DIRECT_TURBOVEC_BACKEND
         from lodedb.engine.mps_turbovec import MPS_DIRECT_TURBOVEC_BACKEND
 
+        if widths is None:
+            widths = {position: prepared[position].query.top_k for position in positions}
         query_filter = prepared[positions[0]].query_filter
         group_batch = np.ascontiguousarray(batch[positions])
-        shared_top_k = max(prepared[position].query.top_k for position in positions)
+        shared_top_k = max(widths[position] for position in positions)
         started = perf_counter()
 
         if query_filter:
@@ -2480,7 +2621,7 @@ class LodeEngine:
                 resident_batch, backend, fields = resident
                 self._scatter_resident_batch_group(
                     positions=positions,
-                    prepared=prepared,
+                    widths=widths,
                     serving=serving,
                     query_results=query_results,
                     search_latencies=search_latencies,
@@ -2495,7 +2636,7 @@ class LodeEngine:
             )
             self._scatter_cpu_batch_group(
                 positions=positions,
-                prepared=prepared,
+                widths=widths,
                 serving=serving,
                 query_results=query_results,
                 search_latencies=search_latencies,
@@ -2514,7 +2655,7 @@ class LodeEngine:
         if gpu_batch is not None:
             self._scatter_resident_batch_group(
                 positions=positions,
-                prepared=prepared,
+                widths=widths,
                 serving=serving,
                 query_results=query_results,
                 search_latencies=search_latencies,
@@ -2530,7 +2671,7 @@ class LodeEngine:
         if mps_batch is not None:
             self._scatter_resident_batch_group(
                 positions=positions,
-                prepared=prepared,
+                widths=widths,
                 serving=serving,
                 query_results=query_results,
                 search_latencies=search_latencies,
@@ -2546,7 +2687,7 @@ class LodeEngine:
         batch_result = serving.search_batch(group_batch, top_k=shared_top_k)
         self._scatter_cpu_batch_group(
             positions=positions,
-            prepared=prepared,
+            widths=widths,
             serving=serving,
             query_results=query_results,
             search_latencies=search_latencies,
@@ -2603,7 +2744,7 @@ class LodeEngine:
         self,
         *,
         positions: list[int],
-        prepared: tuple[_PreparedQuery, ...],
+        widths: dict[int, int],
         serving: TurboVecServingIndex,
         query_results: list[_EngineTurboVecQueryResult | None],
         search_latencies: list[float],
@@ -2612,11 +2753,17 @@ class LodeEngine:
         fields: dict[str, Any],
         started: float,
     ) -> None:
-        """Writes one resident (GPU/MPS) group result back at original positions."""
+        """Writes one resident (GPU/MPS) group result back at original positions.
+
+        Each position is sliced to ``widths[position]`` rows from the shared
+        (wider) scan; a pure-vector caller passes its ``top_k`` and a hybrid
+        caller passes the widened lexical pool width, so the same group scan
+        serves both without rerunning the kernel.
+        """
 
         per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(positions), 1)
         for local_index, position in enumerate(positions):
-            take = min(int(prepared[position].query.top_k), resident_batch.stable_ids.shape[1])
+            take = min(int(widths[position]), resident_batch.stable_ids.shape[1])
             query_results[position] = _EngineTurboVecQueryResult(
                 index=serving,
                 stable_ids=resident_batch.stable_ids[local_index, :take].reshape(-1),
@@ -2641,7 +2788,7 @@ class LodeEngine:
         self,
         *,
         positions: list[int],
-        prepared: tuple[_PreparedQuery, ...],
+        widths: dict[int, int],
         serving: TurboVecServingIndex,
         query_results: list[_EngineTurboVecQueryResult | None],
         search_latencies: list[float],
@@ -2649,11 +2796,15 @@ class LodeEngine:
         started: float,
         extra_fields: dict[str, Any],
     ) -> None:
-        """Writes one CPU-kernel group result back at original positions."""
+        """Writes one CPU-kernel group result back at original positions.
+
+        Each position is sliced to ``widths[position]`` rows from the shared
+        (wider) scan, mirroring :meth:`_scatter_resident_batch_group`.
+        """
 
         per_query_ms = ((perf_counter() - started) * 1000.0) / max(len(positions), 1)
         for local_index, position in enumerate(positions):
-            take = min(int(prepared[position].query.top_k), batch_result.stable_ids.shape[1])
+            take = min(int(widths[position]), batch_result.stable_ids.shape[1])
             query_results[position] = _EngineTurboVecQueryResult(
                 index=serving,
                 stable_ids=batch_result.stable_ids[local_index, :take].reshape(-1),
@@ -2703,12 +2854,21 @@ class LodeEngine:
     def _lexical_serving_index(self, state: ClientIndexState) -> _LexicalServingIndex:
         """Returns the generation-current BM25 index, building it lazily for the mode.
 
-        Keyed by the same generation as the serving index (so any mutation
-        rebuilds it on the next lexical query). When lexical-index persistence is
-        on, it is built from the persisted per-chunk token lists with no raw-text
-        dependency and no re-tokenization; otherwise it is rebuilt from the
-        retained raw document text re-chunked the same way ingest chunks it. Both
-        share the exact chunk id space the vector scan ranks over. The index is
+        Keyed by the same generation as the serving index. When lexical-index
+        persistence is on, the index is built from the persisted per-chunk token
+        lists with no raw-text dependency and no re-tokenization; otherwise it is
+        built from the retained raw document text re-chunked the same way ingest
+        chunks it. Both share the exact chunk id space the vector scan ranks over.
+
+        On a generation miss the corpus is diffed against the cached index's unit
+        set: when only a small chunk-level delta changed (under
+        :data:`_LEXICAL_INCREMENTAL_MAX_FRACTION` of the corpus), the added and
+        removed chunks are folded into the cached :class:`Bm25Index` in place and
+        its generation re-stamped, so a single ``add`` no longer triggers a full
+        O(total tokens) rebuild. The raw-text path tokenizes only the added
+        chunks; unchanged chunks keep their postings. A larger delta (or a cold
+        cache) does a full bulk build. Either way the served index is observably
+        identical to a fresh build over the same final unit set. The index is
         held in memory only — a BM25 inverted index is payload-derived. Callers
         must have verified the mode is serviceable (see
         :meth:`_require_lexical_capable`); this assumes it.
@@ -2718,12 +2878,15 @@ class LodeEngine:
         cached = self._lexical_indexes.get(state.index_key)
         if cached is not None and cached.generation == generation:
             return cached
-        if self.lexical_index_enabled and state.document_tokens:
+
+        use_tokens = bool(self.lexical_index_enabled and state.document_tokens)
+        if use_tokens:
             chunk_ids, token_lists = build_chunk_token_lists(
                 state.document_tokens,
                 state.document_chunk_ids,
             )
-            bm25 = Bm25Index.from_token_lists(chunk_ids, token_lists)
+            tokens_by_chunk_id = dict(zip(chunk_ids, token_lists, strict=True))
+            text_by_chunk_id: dict[str, str] = {}
         else:
             chunk_ids, chunk_texts = build_chunk_texts(
                 state.document_text,
@@ -2731,8 +2894,38 @@ class LodeEngine:
                 chunk_text,
                 self.chunk_character_limit,
             )
+            text_by_chunk_id = dict(zip(chunk_ids, chunk_texts, strict=True))
+            tokens_by_chunk_id = {}
+
+        if cached is not None:
+            current = set(chunk_ids)
+            existing = cached.bm25.unit_ids
+            added = current - existing
+            removed = existing - current
+            corpus_size = max(len(current), len(existing))
+            within_budget = corpus_size > 0 and (
+                len(added) + len(removed)
+                <= _LEXICAL_INCREMENTAL_MAX_FRACTION * corpus_size
+            )
+            if within_budget:
+                bm25 = cached.bm25
+                for chunk_id in removed:
+                    bm25.remove_unit(chunk_id)
+                for chunk_id in added:
+                    tokens = (
+                        tokens_by_chunk_id[chunk_id]
+                        if use_tokens
+                        else tokenize(text_by_chunk_id[chunk_id])
+                    )
+                    bm25.add_unit(chunk_id, tokens)
+                cached.generation = generation
+                return cached
+
+        if use_tokens:
+            bm25 = Bm25Index.from_token_lists(chunk_ids, token_lists)
+        else:
             bm25 = Bm25Index(chunk_ids, chunk_texts)
-        index = _LexicalServingIndex(generation, bm25, chunk_ids)
+        index = _LexicalServingIndex(generation, bm25)
         self._lexical_indexes[state.index_key] = index
         return index
 
@@ -2855,7 +3048,7 @@ class LodeEngine:
         """
 
         serving = self._turbovec_index_for_state(state)
-        pool = max(top_k * _LEXICAL_POOL_FACTOR, _LEXICAL_POOL_FLOOR)
+        pool = self._lexical_pool_width(top_k)
         allowed_chunk_ids: tuple[str, ...] | None = None
         if query_filter:
             allowed_chunk_ids = self._build_filter_allowlist(state, query_filter)
@@ -2863,7 +3056,6 @@ class LodeEngine:
                 return _empty_turbovec_result(serving)
 
         if mode == RETRIEVAL_MODE_LEXICAL:
-            vector_chunk_ids: list[str] = []
             base_result = _empty_turbovec_result(serving)
         else:
             base_result = self._query_direct_turbovec_index(
@@ -2872,8 +3064,55 @@ class LodeEngine:
                 top_k=pool,
                 query_filter=query_filter,
             )
-            vector_chunk_ids = self._vector_chunk_ranking(base_result)
+        return self._fuse_precomputed_vector_result(
+            state,
+            serving=serving,
+            base_result=base_result,
+            query_text=query_text,
+            allowed_chunk_ids=allowed_chunk_ids,
+            pool=pool,
+            mode=mode,
+        )
 
+    @staticmethod
+    def _lexical_pool_width(top_k: int) -> int:
+        """Returns the widened candidate-pool width pulled from each ranker.
+
+        ``max(top_k * factor, floor)`` chunks, so the fused top-k is not capped by
+        either ranker's own top-k. Shared by the single and batched hybrid paths
+        so both widen the vector scan identically (the batched path must scan at
+        this width for its per-query fusion to match the single path exactly).
+        """
+
+        return max(top_k * _LEXICAL_POOL_FACTOR, _LEXICAL_POOL_FLOOR)
+
+    def _fuse_precomputed_vector_result(
+        self,
+        state: ClientIndexState,
+        *,
+        serving: TurboVecServingIndex,
+        base_result: _EngineTurboVecQueryResult,
+        query_text: str,
+        allowed_chunk_ids: tuple[str, ...] | None,
+        pool: int,
+        mode: str,
+    ) -> _EngineTurboVecQueryResult:
+        """Fuses an already-computed vector result with the BM25 + RRF lexical pass.
+
+        The single hybrid path computes ``base_result`` one query at a time; the
+        batched path computes it for many queries in one grouped (GPU/MPS) scan
+        and calls this per query. Both then run the identical lexical ranking
+        (constrained to the same ``allowed_chunk_ids`` the vector scan was, so the
+        metadata allowlist governs both rankers) and RRF fusion, so a batched
+        hybrid query returns byte-for-byte the same ranking and scores as the
+        repeated single query for the same pool width on the same kernel. For
+        ``lexical`` mode ``base_result`` is the empty vector result and only the
+        BM25 order contributes.
+        """
+
+        vector_chunk_ids = (
+            [] if mode == RETRIEVAL_MODE_LEXICAL else self._vector_chunk_ranking(base_result)
+        )
         lexical_chunk_ids = self._lexical_chunk_ranking(
             state,
             query_text=query_text,

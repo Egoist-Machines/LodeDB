@@ -186,6 +186,118 @@ def test_from_token_lists_empty_is_safe():
     assert index.rank("anything") == []
 
 
+# -- incremental add/remove -------------------------------------------------
+
+
+def _ranks_equal(left: Bm25Index, right: Bm25Index, queries) -> bool:
+    """Returns True iff two indexes rank every query to identical ids and scores."""
+
+    for query in queries:
+        left_ranked = [(uid, round(score, 12)) for uid, score in left.rank(query)]
+        right_ranked = [(uid, round(score, 12)) for uid, score in right.rank(query)]
+        if left_ranked != right_ranked:
+            return False
+    return True
+
+
+def test_incremental_add_matches_bulk_build():
+    """Adding units one by one equals a bulk build over the same final set."""
+
+    units = {
+        "u1": "the turbine reported fault code e1234 overnight",
+        "u2": "quick brown foxes and lazy dogs at noon",
+        "u3": "quarterly revenue and operating costs with e1234",
+        "u4": "common token common token rare token",
+        "u5": "another e1234 mention for good measure here",
+    }
+    bulk = Bm25Index(list(units), list(units.values()))
+    incremental = Bm25Index([], [])
+    # Insert out of order to prove ranking does not depend on insertion order.
+    for unit_id in ["u3", "u1", "u5", "u2", "u4"]:
+        incremental.add_unit(unit_id, tokenize(units[unit_id]))
+    assert len(incremental) == len(bulk) == 5
+    assert _ranks_equal(
+        bulk, incremental,
+        ["e1234", "e1234 revenue", "common rare", "foxes", "turbine", "zzz"],
+    )
+
+
+def test_incremental_add_remove_reupsert_matches_bulk_build():
+    """A churn of add/remove/no-op/re-upsert lands on the same index as a fresh build."""
+
+    final = {
+        "u1": "the turbine reported fault code e1234 overnight",
+        "u2": "quick brown foxes and lazy dogs at noon",
+        "u4": "common token common token rare token",
+        "u5": "another e1234 mention for good measure here",
+    }
+    bulk = Bm25Index(list(final), list(final.values()))
+
+    incremental = Bm25Index([], [])
+    incremental.add_unit("u3", tokenize("quarterly revenue and operating costs e1234"))
+    incremental.add_unit("u1", tokenize(final["u1"]))
+    incremental.add_unit("u2", tokenize(final["u2"]))
+    incremental.remove_unit("u3")  # remove a previously added unit
+    incremental.add_unit("u4", tokenize(final["u4"]))
+    incremental.add_unit("u5", tokenize("WRONG tokens that will be overwritten"))
+    incremental.remove_unit("does-not-exist")  # no-op
+    incremental.add_unit("u5", tokenize(final["u5"]))  # re-upsert replaces tokens
+
+    assert len(incremental) == len(bulk) == 4
+    assert incremental.unit_ids == bulk.unit_ids == frozenset(final)
+    assert _ranks_equal(
+        bulk, incremental,
+        ["e1234", "e1234 revenue", "common rare", "foxes", "turbine", "measure", "zzz"],
+    )
+
+
+def test_incremental_remove_of_absent_id_is_noop():
+    """Removing an id that was never added changes nothing."""
+
+    index = Bm25Index(["u1", "u2"], ["alpha beta", "gamma delta"])
+    before = index.rank("alpha gamma")
+    index.remove_unit("never-added")
+    assert len(index) == 2
+    assert index.rank("alpha gamma") == before
+
+
+def test_incremental_reupsert_replaces_not_accumulates():
+    """Re-adding an id replaces its tokens rather than double-counting them."""
+
+    replaced = Bm25Index([], [])
+    replaced.add_unit("u1", tokenize("first version with alpha"))
+    replaced.add_unit("u1", tokenize("second version with beta only"))
+    # The unit no longer matches the old token and now matches the new one,
+    # and its length/postings equal a fresh single-unit build of the new text.
+    fresh = Bm25Index(["u1"], ["second version with beta only"])
+    assert len(replaced) == 1
+    assert _ranks_equal(fresh, replaced, ["alpha", "beta", "second", "version"])
+
+
+def test_incremental_remove_drops_term_from_vocabulary():
+    """Removing the last document carrying a term makes that term vanish (df=0)."""
+
+    index = Bm25Index(["u1", "u2"], ["unique-zztoken here", "common words only"])
+    assert [uid for uid, _ in index.rank("unique-zztoken")] == ["u1"]
+    index.remove_unit("u1")
+    # No document carries the term now, so it ranks to nothing exactly as a build
+    # without u1 would (the term left the vocabulary, not merely emptied posting).
+    rebuilt = Bm25Index(["u2"], ["common words only"])
+    assert index.rank("unique-zztoken") == rebuilt.rank("unique-zztoken") == []
+
+
+def test_incremental_position_is_stable_for_present_units():
+    """A unit's stable position does not move when other units are added/removed."""
+
+    index = Bm25Index(["keep"], ["alpha beta keep"])
+    pos = index.position_of("keep")
+    index.add_unit("other", tokenize("gamma delta"))
+    index.remove_unit("other")
+    index.add_unit("third", tokenize("epsilon"))
+    assert index.position_of("keep") == pos  # unchanged across the churn
+    assert index.position_of("missing") is None
+
+
 # -- build_chunk_token_lists ------------------------------------------------
 
 
