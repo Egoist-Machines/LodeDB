@@ -420,8 +420,179 @@ def test_lexical_incremental_served_equals_full_rebuild(tmp_path, source):
     db.close()
 
 
-def test_lexical_incremental_large_delta_full_rebuilds(tmp_path):
-    """A delta above the incremental fraction falls back to a full rebuild."""
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_single_mutation_folds_and_equals_rebuild(tmp_path, source):
+    """One small mutation is O(changed): no full rebuild, and equal to a rebuild.
+
+    Combines the two O(changed) guarantees on a single small add: the bulk build
+    entry (``Bm25Index._build``) is not called, and the served hybrid ranking
+    (ids and scores) equals what a forced full rebuild over the same corpus gives.
+    """
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(30):
+        db.add(f"base body number {i} with token{i}", id=f"b{i}")
+    db.search("token1", k=3, mode="lexical")  # warm (full build here)
+
+    import lodedb.engine._lexical as lx
+
+    builds = {"count": 0}
+    original_build = lx.Bm25Index._build
+
+    def _spy_build(self, *args, **kwargs):
+        builds["count"] += 1
+        return original_build(self, *args, **kwargs)
+
+    lx.Bm25Index._build = _spy_build
+    try:
+        db.add("a freshly added doc carrying ABC-123 serial", id="late")
+        query = "ABC-123 token5 token9"
+        served = [
+            (hit.id, round(hit.score, 9))
+            for hit in db.search(query, k=10, mode="hybrid")
+        ]
+        # The single small add folded in via replace_group, not a bulk rebuild.
+        assert builds["count"] == 0
+    finally:
+        lx.Bm25Index._build = original_build
+
+    # The incrementally-served ranking equals a fresh full build over the corpus.
+    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
+    rebuilt = [
+        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
+    ]
+    assert served == rebuilt
+    db.close()
+
+
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_reupsert_changed_chunk_ids_reconciles(tmp_path, source):
+    """Re-upserting a doc with edited text (new chunk ids) replaces its old chunks.
+
+    Editing a document's text changes its content-derived chunk ids, so the old
+    chunks must leave the index and the new ones enter. ``replace_group`` does
+    this from the document id alone (the caller never tracks old chunk ids); the
+    folded result must equal a fresh build, and the stale text must not rank.
+    """
+
+    long_a = " ".join(f"alpha-{i} carrier zztoken" for i in range(120))
+    long_b = " ".join(f"beta-{i} carrier yytoken e1234" for i in range(120))
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(10):
+        db.add(f"filler doc {i} token{i}", id=f"f{i}")
+    db.add(long_a, id="edited")
+    # The first version's exclusive token is findable (the doc chunks into
+    # several chunks, all carrying the id "edited").
+    first = db.search("zztoken", k=10, mode="lexical")
+    assert first and {hit.id for hit in first} == {"edited"}
+
+    # Re-upsert the same id with different text -> different (content-hashed)
+    # chunk ids and a different chunk count.
+    db.add(long_b, id="edited")
+
+    import lodedb.engine._lexical as lx
+
+    builds = {"count": 0}
+    original_build = lx.Bm25Index._build
+
+    def _spy_build(self, *args, **kwargs):
+        builds["count"] += 1
+        return original_build(self, *args, **kwargs)
+
+    lx.Bm25Index._build = _spy_build
+    try:
+        query = "zztoken yytoken e1234 token3"
+        served = [
+            (hit.id, round(hit.score, 9))
+            for hit in db.search(query, k=10, mode="hybrid")
+        ]
+        assert builds["count"] == 0  # a single re-upsert is O(changed), not a rebuild
+    finally:
+        lx.Bm25Index._build = original_build
+
+    # The stale version's exclusive token no longer ranks; the new one does.
+    assert db.search("zztoken", k=10, mode="lexical") == []
+    after = db.search("yytoken", k=10, mode="lexical")
+    assert after and {hit.id for hit in after} == {"edited"}
+
+    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
+    rebuilt = [
+        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
+    ]
+    assert served == rebuilt
+    db.close()
+
+
+@pytest.mark.parametrize("source", ["store_text", "index_text"])
+def test_lexical_add_then_delete_before_query_reconciles(tmp_path, source):
+    """Add then delete the same id before any query: later-wins drops it cleanly.
+
+    With no lexical query between the two mutations, the changed-document mirror
+    must reconcile later-wins (the delete clears the pending upsert), so the
+    document is absent from the next served ranking and the served result equals
+    a fresh full build.
+    """
+
+    db = _open_lexical(tmp_path, source=source)
+    for i in range(12):
+        db.add(f"base body number {i} with token{i}", id=f"b{i}")
+    db.search("token0", k=3, mode="lexical")  # warm
+
+    # Add then delete the same id with no intervening query.
+    db.add("ephemeral doc citing E1234 fault and ABC-123", id="ephemeral")
+    assert db.remove("ephemeral") is True
+
+    # Also exercise the reverse (delete then re-add a base id before any query).
+    assert db.remove("b1") is True
+    db.add("b1 rewritten body for token1 again", id="b1")
+
+    import lodedb.engine._lexical as lx
+
+    builds = {"count": 0}
+    original_build = lx.Bm25Index._build
+
+    def _spy_build(self, *args, **kwargs):
+        builds["count"] += 1
+        return original_build(self, *args, **kwargs)
+
+    lx.Bm25Index._build = _spy_build
+    try:
+        query = "E1234 ABC-123 token1 token5"
+        served = [
+            (hit.id, round(hit.score, 9))
+            for hit in db.search(query, k=10, mode="hybrid")
+        ]
+        assert builds["count"] == 0
+    finally:
+        lx.Bm25Index._build = original_build
+
+    # The added-then-deleted doc never enters the served ranking.
+    assert all(hit_id != "ephemeral" for hit_id, _ in served)
+    assert db.search("ephemeral", k=5, mode="lexical") == []
+
+    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
+    rebuilt = [
+        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
+    ]
+    assert served == rebuilt
+    db.close()
+
+
+def test_lexical_incremental_large_delta_full_rebuilds(tmp_path, monkeypatch):
+    """Many small mutations with no query cross the bound -> exactly one rebuild.
+
+    The pending changed-document set is bounded at mutation time, so a long run
+    of writes without an intervening lexical query is capped: once it exceeds
+    ``max(_LEXICAL_REBUILD_FLOOR, fraction * corpus)`` the next query rebuilds in
+    full rather than folding a document at a time. The floor is lowered here so
+    the crossing is reached in a few writes; the rebuilt result must still equal
+    a fresh build over the final corpus.
+    """
+
+    import lodedb.engine.core as core
+
+    monkeypatch.setattr(core, "_LEXICAL_REBUILD_FLOOR", 3)
 
     db = _open_lexical(tmp_path, source="store_text")
     for i in range(8):
@@ -437,16 +608,24 @@ def test_lexical_incremental_large_delta_full_rebuilds(tmp_path):
         builds["count"] += 1
         return original_build(self, *args, **kwargs)
 
-    lx.Bm25Index._build = _spy_build
-    try:
-        # Add 5 docs to a corpus of 8 -> 5/13 > 0.25 -> a full rebuild is taken.
-        for i in range(5):
-            db.add(f"new doc {i} beta token{i}", id=f"e{i}")
-        db.search("beta", k=3, mode="lexical")
-    finally:
-        lx.Bm25Index._build = original_build
+    monkeypatch.setattr(lx.Bm25Index, "_build", _spy_build)
+    # 5 changed docs > max(floor=3, 0.25*corpus) -> the key is flagged for a full
+    # rebuild at record time; no lexical query runs until all five have landed.
+    for i in range(5):
+        db.add(f"new doc {i} beta token{i}", id=f"e{i}")
+    served = [
+        (hit.id, round(hit.score, 9))
+        for hit in db.search("beta token3", k=10, mode="hybrid")
+    ]
+    assert builds["count"] == 1  # exactly one full rebuild for the bounded delta
 
-    assert builds["count"] >= 1  # a full rebuild ran for the large delta
+    # The rebuilt-from-crossing result equals a fresh build over the same corpus.
+    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a fresh full build
+    fresh = [
+        (hit.id, round(hit.score, 9))
+        for hit in db.search("beta token3", k=10, mode="hybrid")
+    ]
+    assert served == fresh
     db.close()
 
 

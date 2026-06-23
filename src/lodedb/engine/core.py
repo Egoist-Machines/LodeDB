@@ -128,11 +128,18 @@ _LEXICAL_MODES = frozenset({RETRIEVAL_MODE_HYBRID, RETRIEVAL_MODE_LEXICAL})
 _LEXICAL_POOL_FACTOR = 5
 _LEXICAL_POOL_FLOOR = 50
 # When the cached BM25 index is stale by only a small chunk-level delta, fold
-# just the added/removed units in place instead of a full O(total tokens)
-# rebuild. Above this fraction of the corpus a full rebuild is cheaper than
-# touching the postings one unit at a time, so the incremental path is bounded
-# to genuinely small changes (the common incremental-``add`` case).
+# just the changed documents in place instead of a full O(total tokens) rebuild.
+# Changed-document ids are tracked at mutation time; once their count exceeds a
+# fraction of the corpus a full rebuild is cheaper than touching the postings a
+# document at a time, so the incremental path is bounded to genuinely small
+# changes (the common incremental-``add`` case).
 _LEXICAL_INCREMENTAL_MAX_FRACTION = 0.25
+# Floor on the pending changed-document count before a full rebuild is forced,
+# so a tiny corpus does not rebuild on its first few writes (a 4-doc corpus
+# would otherwise hit the fraction at one change). The pending sets are bounded
+# at record time by max(this floor, the fraction of the corpus), so a long run
+# of writes with no intervening hybrid query cannot grow them without bound.
+_LEXICAL_REBUILD_FLOOR = 64
 PROJECTION_INITIAL_SOURCE = "initial_identity_prefix"
 PROJECTION_REFIT_SOURCE_INT8 = "int8_rerank"
 PROJECTION_REFIT_SOURCE_TRANSIENT_FLOAT = "transient_full_float"
@@ -432,8 +439,9 @@ class _LexicalServingIndex:
     Built lazily on the first lexical or hybrid query of a generation and reused
     after that, exactly like the metadata posting index and the resident GPU
     session — so it never touches the write/commit path. When a later generation
-    differs from the cached one by only a small chunk-level delta, the delta is
-    folded into the existing :class:`Bm25Index` in place and the cached
+    differs from the cached one, only the documents changed since the cache was
+    last stamped (tracked at mutation time) are folded into the existing
+    :class:`Bm25Index` via document-group replace/remove and the cached
     generation is re-stamped, instead of rebuilding from scratch. It is held in
     memory only: a BM25 inverted index is payload-derived and must never reach
     the redacted artifacts or telemetry.
@@ -624,6 +632,15 @@ class LodeEngine:
         # retrieval. Built lazily from retained raw text on the first lexical
         # query of a generation; never persisted (a BM25 index is payload-derived).
         self._lexical_indexes: dict[str, _LexicalServingIndex] = {}
+        # Documents changed since the cached lexical index was last stamped, per
+        # index key: ``{"upserted": set, "deleted": set}``. Accumulated at
+        # mutation time (later-wins) so the next lexical/hybrid query folds in
+        # only those documents (O(changed)) instead of diffing the whole corpus.
+        self._pending_lexical_documents: dict[str, dict[str, set[str]]] = {}
+        # Index keys whose pending lexical delta grew past the rebuild bound, so
+        # the next lexical/hybrid query must do one full rebuild rather than a
+        # document-at-a-time fold. Set at record time; cleared on rebuild.
+        self._lexical_full_rebuild: set[str] = set()
         # Live base epoch per index key: which ``<key>.gen/g<epoch>.*`` artifacts
         # the committed root manifest points at. Set on load/commit; absent for a
         # not-yet-persisted or legacy (pre-commit-manifest) index.
@@ -917,6 +934,8 @@ class LodeEngine:
         self._pending_state_journal_documents.pop(state.index_key, None)
         self._metadata_posting_indexes.pop(state.index_key, None)
         self._lexical_indexes.pop(state.index_key, None)
+        self._pending_lexical_documents.pop(state.index_key, None)
+        self._lexical_full_rebuild.discard(state.index_key)
         self._delete_persisted_state(state)
         self._emit(
             "index_deleted",
@@ -2851,6 +2870,41 @@ class LodeEngine:
         self._metadata_posting_indexes[state.index_key] = index
         return index
 
+    def _lexical_document_units(
+        self, state: ClientIndexState, document_id: str
+    ) -> list[tuple[str, list[str]]]:
+        """Returns one document's ``(chunk_id, tokens)`` units for an incremental fold.
+
+        Used only by the O(changed) incremental path of
+        :meth:`_lexical_serving_index`, so it materializes a single changed
+        document's chunks: on the persisted-token path it zips the captured
+        per-chunk tokens against the recorded chunk ids; on the raw-text path it
+        re-chunks the document's stored text the same way ingest does and
+        tokenizes only those chunks (so tokenization stays on the query, never on
+        the write path). A document with no stored tokens/text contributes no
+        units, which :meth:`Bm25Index.replace_group` treats as a removal.
+        """
+
+        chunk_ids = state.document_chunk_ids.get(document_id, ())
+        if not chunk_ids:
+            return []
+        if self.lexical_index_enabled and state.document_tokens:
+            chunks = state.document_tokens.get(document_id)
+            if not chunks:
+                return []
+            return [
+                (str(chunk_id), [str(token) for token in tokens])
+                for chunk_id, tokens in zip(chunk_ids, chunks, strict=False)
+            ]
+        text = state.document_text.get(document_id)
+        if text is None:
+            return []
+        pieces = chunk_text(text, self.chunk_character_limit)
+        return [
+            (str(chunk_id), tokenize(piece))
+            for chunk_id, piece in zip(chunk_ids, pieces, strict=False)
+        ]
+
     def _lexical_serving_index(self, state: ClientIndexState) -> _LexicalServingIndex:
         """Returns the generation-current BM25 index, building it lazily for the mode.
 
@@ -2860,73 +2914,62 @@ class LodeEngine:
         built from the retained raw document text re-chunked the same way ingest
         chunks it. Both share the exact chunk id space the vector scan ranks over.
 
-        On a generation miss the corpus is diffed against the cached index's unit
-        set: when only a small chunk-level delta changed (under
-        :data:`_LEXICAL_INCREMENTAL_MAX_FRACTION` of the corpus), the added and
-        removed chunks are folded into the cached :class:`Bm25Index` in place and
-        its generation re-stamped, so a single ``add`` no longer triggers a full
-        O(total tokens) rebuild. The raw-text path tokenizes only the added
-        chunks; unchanged chunks keep their postings. A larger delta (or a cold
-        cache) does a full bulk build. Either way the served index is observably
-        identical to a fresh build over the same final unit set. The index is
-        held in memory only — a BM25 inverted index is payload-derived. Callers
-        must have verified the mode is serviceable (see
+        On a generation miss only the documents changed since the cache was last
+        stamped (tracked at mutation time in ``_pending_lexical_documents``) are
+        folded into the cached :class:`Bm25Index`: each deleted document's group
+        is dropped and each upserted document's group is replaced, so the work is
+        O(changed documents), not O(corpus). The raw-text path tokenizes only the
+        changed documents' chunks; unchanged chunks keep their postings. When the
+        pending delta grew past the rebuild bound (``_lexical_full_rebuild``) or
+        the cache is cold, a full bulk build runs instead. Either way the served
+        index is observably identical to a fresh build over the same final unit
+        set. The index is held in memory only — a BM25 inverted index is
+        payload-derived. Callers must have verified the mode is serviceable (see
         :meth:`_require_lexical_capable`); this assumes it.
         """
 
-        generation = self._index_generations.get(state.index_key, 0)
-        cached = self._lexical_indexes.get(state.index_key)
+        key = state.index_key
+        generation = self._index_generations.get(key, 0)
+        cached = self._lexical_indexes.get(key)
         if cached is not None and cached.generation == generation:
+            return cached
+
+        if cached is not None and key not in self._lexical_full_rebuild:
+            pending = self._pending_lexical_documents.get(key)
+            upserted = pending["upserted"] if pending is not None else set()
+            deleted = pending["deleted"] if pending is not None else set()
+            bm25 = cached.bm25
+            for document_id in deleted:
+                bm25.remove_group(document_id)
+            for document_id in upserted:
+                bm25.replace_group(
+                    document_id, self._lexical_document_units(state, document_id)
+                )
+            self._pending_lexical_documents.pop(key, None)
+            cached.generation = generation
             return cached
 
         use_tokens = bool(self.lexical_index_enabled and state.document_tokens)
         if use_tokens:
-            chunk_ids, token_lists = build_chunk_token_lists(
+            chunk_ids, token_lists, group_ids = build_chunk_token_lists(
                 state.document_tokens,
                 state.document_chunk_ids,
             )
-            tokens_by_chunk_id = dict(zip(chunk_ids, token_lists, strict=True))
-            text_by_chunk_id: dict[str, str] = {}
+            bm25 = Bm25Index.from_token_lists(
+                chunk_ids, token_lists, group_ids=group_ids
+            )
         else:
-            chunk_ids, chunk_texts = build_chunk_texts(
+            chunk_ids, chunk_texts, group_ids = build_chunk_texts(
                 state.document_text,
                 state.document_chunk_ids,
                 chunk_text,
                 self.chunk_character_limit,
             )
-            text_by_chunk_id = dict(zip(chunk_ids, chunk_texts, strict=True))
-            tokens_by_chunk_id = {}
-
-        if cached is not None:
-            current = set(chunk_ids)
-            existing = cached.bm25.unit_ids
-            added = current - existing
-            removed = existing - current
-            corpus_size = max(len(current), len(existing))
-            within_budget = corpus_size > 0 and (
-                len(added) + len(removed)
-                <= _LEXICAL_INCREMENTAL_MAX_FRACTION * corpus_size
-            )
-            if within_budget:
-                bm25 = cached.bm25
-                for chunk_id in removed:
-                    bm25.remove_unit(chunk_id)
-                for chunk_id in added:
-                    tokens = (
-                        tokens_by_chunk_id[chunk_id]
-                        if use_tokens
-                        else tokenize(text_by_chunk_id[chunk_id])
-                    )
-                    bm25.add_unit(chunk_id, tokens)
-                cached.generation = generation
-                return cached
-
-        if use_tokens:
-            bm25 = Bm25Index.from_token_lists(chunk_ids, token_lists)
-        else:
-            bm25 = Bm25Index(chunk_ids, chunk_texts)
+            bm25 = Bm25Index(chunk_ids, chunk_texts, group_ids=group_ids)
         index = _LexicalServingIndex(generation, bm25)
-        self._lexical_indexes[state.index_key] = index
+        self._lexical_indexes[key] = index
+        self._pending_lexical_documents.pop(key, None)
+        self._lexical_full_rebuild.discard(key)
         return index
 
     def _require_lexical_capable(self, mode: str) -> str | None:
@@ -3483,24 +3526,78 @@ class LodeEngine:
         upserted_document_ids: tuple[str, ...] = (),
         deleted_document_ids: tuple[str, ...] = (),
     ) -> None:
-        """Accumulates direct-route document changes for the next journal append.
+        """Accumulates document changes for the next journal append and lexical fold.
 
         Later mentions win within one batch window: an upsert clears a prior
-        pending delete for the same document and vice versa, so replay applies
-        only the final outcome. Standard-cascade routes are never tracked.
+        pending delete for the same document and vice versa, so replay (and the
+        next lexical fold) applies only the final outcome. The direct-route
+        journal is tracked only on direct-route states (standard cascade is
+        never journaled); the lexical changed-document mirror is tracked whenever
+        a lexical/hybrid index could be served, independent of the storage route.
         """
 
-        if not _state_uses_direct_turbovec(state):
+        if _state_uses_direct_turbovec(state):
+            pending = self._pending_state_journal_documents.setdefault(
+                state.index_key, {"upserted": {}, "deleted": {}}
+            )
+            for document_id in upserted_document_ids:
+                pending["deleted"].pop(document_id, None)
+                pending["upserted"][document_id] = None
+            for document_id in deleted_document_ids:
+                pending["upserted"].pop(document_id, None)
+                pending["deleted"][document_id] = None
+
+        if not (self.lexical_index_enabled or self.raw_text_storage_enabled):
             return
-        pending = self._pending_state_journal_documents.setdefault(
-            state.index_key, {"upserted": {}, "deleted": {}}
+        self._record_pending_lexical_documents(
+            state,
+            upserted_document_ids=upserted_document_ids,
+            deleted_document_ids=deleted_document_ids,
         )
+
+    def _record_pending_lexical_documents(
+        self,
+        state: ClientIndexState,
+        *,
+        upserted_document_ids: tuple[str, ...],
+        deleted_document_ids: tuple[str, ...],
+    ) -> None:
+        """Mirrors changed-document ids into the O(changed) lexical fold sets.
+
+        Same later-wins reconciliation as the journal accumulator: an upsert id
+        clears a pending lexical delete and joins ``"upserted"``; a delete id
+        clears a pending lexical upsert and joins ``"deleted"``. The combined set
+        size is then bounded by ``max(_LEXICAL_REBUILD_FLOOR, fraction of the
+        corpus)``; once it is exceeded the index key is marked for a full rebuild
+        and the pending sets are cleared, so a long run of writes with no
+        intervening hybrid query cannot grow the sets without bound.
+        """
+
+        key = state.index_key
+        if key in self._lexical_full_rebuild:
+            # Already destined for a full rebuild; tracking individual documents
+            # would be wasted work (and bounded-out again immediately).
+            return
+        pending = self._pending_lexical_documents.setdefault(
+            key, {"upserted": set(), "deleted": set()}
+        )
+        upserted = pending["upserted"]
+        deleted = pending["deleted"]
         for document_id in upserted_document_ids:
-            pending["deleted"].pop(document_id, None)
-            pending["upserted"][document_id] = None
+            document_id = str(document_id)
+            deleted.discard(document_id)
+            upserted.add(document_id)
         for document_id in deleted_document_ids:
-            pending["upserted"].pop(document_id, None)
-            pending["deleted"][document_id] = None
+            document_id = str(document_id)
+            upserted.discard(document_id)
+            deleted.add(document_id)
+        bound = max(
+            _LEXICAL_REBUILD_FLOOR,
+            int(_LEXICAL_INCREMENTAL_MAX_FRACTION * max(len(state.document_chunk_ids), 1)),
+        )
+        if len(upserted) + len(deleted) > bound:
+            self._lexical_full_rebuild.add(key)
+            self._pending_lexical_documents.pop(key, None)
 
     def _delta_append_ok(
         self,

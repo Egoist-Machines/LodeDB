@@ -98,6 +98,15 @@ class Bm25Index:
     stays valid across incremental updates (a removed position is simply never
     re-used while the index lives). ``rank`` returns the caller's unit ids
     verbatim. Positions are an internal detail; ids are the stable external key.
+
+    Each unit also belongs to a document *group* (its ``group_id``), so a whole
+    document's chunks can be replaced or removed in one call without the caller
+    tracking the old chunk ids. :meth:`replace_group` and :meth:`remove_group`
+    fold a single document's edit into an already-built index in O(that group's
+    units); they leave an index that ranks identically (ids and scores) to a
+    fresh bulk build over the final unit set. A unit that is added with no
+    explicit group is its own group, so the per-unit :meth:`add_unit` /
+    :meth:`remove_unit` API is unchanged.
     """
 
     __slots__ = (
@@ -107,6 +116,8 @@ class Bm25Index:
         "_unit_id_by_pos",
         "_pos_by_unit_id",
         "_terms_by_pos",
+        "_group_by_pos",
+        "_positions_by_group",
         "_n",
         "_total_len",
         "_next_pos",
@@ -119,19 +130,28 @@ class Bm25Index:
         unit_ids: Sequence[str],
         texts: Sequence[str],
         *,
+        group_ids: Sequence[str] | None = None,
         k1: float = BM25_K1,
         b: float = BM25_B,
     ) -> None:
         """Builds the inverted index, document lengths, and corpus statistics.
 
         ``unit_ids`` and ``texts`` are positionally aligned; each text is
-        tokenized with :func:`tokenize`. To build from already-tokenized units
-        (e.g. a persisted postings store), use :meth:`from_token_lists`.
+        tokenized with :func:`tokenize`. ``group_ids`` (if given) aligns with
+        ``unit_ids`` and assigns each unit's document group; it defaults to each
+        unit being its own group. To build from already-tokenized units (e.g. a
+        persisted postings store), use :meth:`from_token_lists`.
         """
 
         if len(unit_ids) != len(texts):
             raise ValueError("unit_ids and texts must be the same length")
-        self._build(unit_ids, [tokenize(text) for text in texts], k1=k1, b=b)
+        self._build(
+            unit_ids,
+            [tokenize(text) for text in texts],
+            group_ids=group_ids,
+            k1=k1,
+            b=b,
+        )
 
     @classmethod
     def from_token_lists(
@@ -139,6 +159,7 @@ class Bm25Index:
         unit_ids: Sequence[str],
         token_lists: Sequence[Sequence[str]],
         *,
+        group_ids: Sequence[str] | None = None,
         k1: float = BM25_K1,
         b: float = BM25_B,
     ) -> Bm25Index:
@@ -146,15 +167,23 @@ class Bm25Index:
 
         ``unit_ids`` and ``token_lists`` are positionally aligned; each inner
         sequence is one unit's tokens in document order (duplicates preserved, as
-        :func:`tokenize` produces). This is the constructor for a persisted
-        lexical index: the tokens were captured at ingest time, so the on-disk
-        store rebuilds an identical index with no raw text and no regex pass.
+        :func:`tokenize` produces). ``group_ids`` (if given) aligns with
+        ``unit_ids`` and assigns each unit's document group, defaulting to each
+        unit being its own group. This is the constructor for a persisted lexical
+        index: the tokens were captured at ingest time, so the on-disk store
+        rebuilds an identical index with no raw text and no regex pass.
         """
 
         if len(unit_ids) != len(token_lists):
             raise ValueError("unit_ids and token_lists must be the same length")
         index = cls.__new__(cls)
-        index._build(unit_ids, [list(tokens) for tokens in token_lists], k1=k1, b=b)
+        index._build(
+            unit_ids,
+            [list(tokens) for tokens in token_lists],
+            group_ids=group_ids,
+            k1=k1,
+            b=b,
+        )
         return index
 
     def _build(
@@ -162,16 +191,19 @@ class Bm25Index:
         unit_ids: Sequence[str],
         token_lists: list[list[str]],
         *,
+        group_ids: Sequence[str] | None = None,
         k1: float,
         b: float,
     ) -> None:
         """Builds the postings, document lengths, and corpus stats from token lists.
 
         Assigns positions ``0..N-1`` to the units in order and populates every
-        per-position map. Shared by :meth:`__init__` (which tokenizes texts
-        first) and :meth:`from_token_lists` (which receives tokens directly), so
-        both bulk paths and a sequence of :meth:`add_unit` calls over the same
-        units produce an index that ranks identically.
+        per-position map. ``group_ids`` (if given) aligns with ``unit_ids`` and
+        assigns each unit's document group; when ``None`` each unit is its own
+        group. Shared by :meth:`__init__` (which tokenizes texts first) and
+        :meth:`from_token_lists` (which receives tokens directly), so both bulk
+        paths and a sequence of :meth:`add_unit` calls over the same units
+        produce an index that ranks identically.
         """
 
         self._k1 = float(k1)
@@ -185,18 +217,34 @@ class Bm25Index:
         # Distinct terms per position, so a unit can be removed by walking only
         # its own terms instead of scanning the whole vocabulary.
         self._terms_by_pos: dict[int, tuple[str, ...]] = {}
+        # Document-group membership: a unit's group (pos -> group id) and the
+        # reverse index (group id -> set of positions) so a whole document's
+        # chunks can be replaced or removed in O(that group's units).
+        self._group_by_pos: dict[int, str] = {}
+        self._positions_by_group: dict[str, set[int]] = {}
         self._n = 0
         self._total_len = 0
         self._next_pos = 0
-        for unit_id, tokens in zip(unit_ids, token_lists, strict=True):
-            self._add_at(str(unit_id), tokens)
+        if group_ids is None:
+            for unit_id, tokens in zip(unit_ids, token_lists, strict=True):
+                unit_id = str(unit_id)
+                self._add_at(unit_id, tokens, unit_id)
+        else:
+            if len(group_ids) != len(unit_ids):
+                raise ValueError("group_ids must align with unit_ids")
+            for unit_id, tokens, group_id in zip(
+                unit_ids, token_lists, group_ids, strict=True
+            ):
+                self._add_at(str(unit_id), tokens, str(group_id))
 
-    def _add_at(self, unit_id: str, tokens: Sequence[str]) -> None:
-        """Inserts ``unit_id`` (assumed absent) at a fresh position.
+    def _add_at(self, unit_id: str, tokens: Sequence[str], group_id: str) -> None:
+        """Inserts ``unit_id`` (assumed absent) at a fresh position in ``group_id``.
 
         The single insertion primitive shared by the bulk build and
         :meth:`add_unit`; it never checks for an existing id, so callers that
-        support upsert must :meth:`remove_unit` first.
+        support upsert must :meth:`remove_unit` first. The unit joins document
+        group ``group_id`` (both group maps recorded) so the whole group can
+        later be replaced or removed without the caller tracking chunk ids.
         """
 
         pos = self._next_pos
@@ -207,6 +255,8 @@ class Bm25Index:
         self._n += 1
         self._unit_id_by_pos[pos] = unit_id
         self._pos_by_unit_id[unit_id] = pos
+        self._group_by_pos[pos] = group_id
+        self._positions_by_group.setdefault(group_id, set()).add(pos)
         if not tokens:
             self._terms_by_pos[pos] = ()
             return
@@ -223,32 +273,34 @@ class Bm25Index:
                 self._doc_freq[token] += 1
         self._terms_by_pos[pos] = tuple(counts)
 
-    def add_unit(self, unit_id: str, tokens: Sequence[str]) -> None:
+    def add_unit(
+        self, unit_id: str, tokens: Sequence[str], group_id: str | None = None
+    ) -> None:
         """Adds (or upserts) one unit's tokens, keeping corpus stats current.
 
         If ``unit_id`` is already present it is :meth:`remove_unit`-ed first, so
         a re-add replaces the old tokens rather than double-counting. The new
         unit takes a fresh, never-reused position; existing positions do not
         move, so a previously computed position allowlist stays valid.
+        ``group_id`` assigns the unit's document group and defaults to
+        ``unit_id`` (so a unit added with no explicit group is its own group).
         """
 
         unit_id = str(unit_id)
         if unit_id in self._pos_by_unit_id:
             self.remove_unit(unit_id)
-        self._add_at(unit_id, tokens)
+        self._add_at(unit_id, tokens, unit_id if group_id is None else str(group_id))
 
-    def remove_unit(self, unit_id: str) -> None:
-        """Removes one unit and its postings; a no-op if the id is absent.
+    def _remove_at(self, pos: int) -> None:
+        """Removes the unit at ``pos`` and undoes all of its bookkeeping.
 
-        Walks only the unit's own distinct terms (via ``_terms_by_pos``) to
-        decrement document frequencies and drop posting entries, so removal is
-        O(distinct terms in the unit), not O(vocabulary).
+        The single removal primitive: it drops the unit's postings and document
+        frequencies (walking only its own distinct terms, so it is O(distinct
+        terms in the unit), not O(vocabulary)), its length and corpus totals, and
+        its unit-id and group maps. Both :meth:`remove_unit` and
+        :meth:`remove_group` resolve ids to positions and delegate here.
         """
 
-        unit_id = str(unit_id)
-        pos = self._pos_by_unit_id.pop(unit_id, None)
-        if pos is None:
-            return
         for term in self._terms_by_pos.pop(pos, ()):
             posting = self._postings.get(term)
             if posting is None:
@@ -262,8 +314,59 @@ class Bm25Index:
                 del self._postings[term]
                 del self._doc_freq[term]
         self._total_len -= self._doc_len.pop(pos, 0)
-        del self._unit_id_by_pos[pos]
+        unit_id = self._unit_id_by_pos.pop(pos, None)
+        if unit_id is not None:
+            self._pos_by_unit_id.pop(unit_id, None)
+        group_id = self._group_by_pos.pop(pos, None)
+        if group_id is not None:
+            positions = self._positions_by_group.get(group_id)
+            if positions is not None:
+                positions.discard(pos)
+                if not positions:
+                    del self._positions_by_group[group_id]
         self._n -= 1
+
+    def remove_unit(self, unit_id: str) -> None:
+        """Removes one unit and its postings; a no-op if the id is absent.
+
+        Looks the unit's stable position up and delegates to :meth:`_remove_at`,
+        which walks only the unit's own distinct terms, so removal is O(distinct
+        terms in the unit), not O(vocabulary).
+        """
+
+        pos = self._pos_by_unit_id.get(str(unit_id))
+        if pos is None:
+            return
+        self._remove_at(pos)
+
+    def remove_group(self, group_id: str) -> None:
+        """Removes every unit in document group ``group_id``; a no-op if absent.
+
+        Walks only the group's own positions (O(that group's units)), so a whole
+        document's chunks drop without the caller tracking the old chunk ids.
+        """
+
+        positions = self._positions_by_group.get(str(group_id))
+        if not positions:
+            return
+        for pos in tuple(positions):
+            self._remove_at(pos)
+
+    def replace_group(
+        self, group_id: str, units: Sequence[tuple[str, Sequence[str]]]
+    ) -> None:
+        """Replaces document group ``group_id`` with ``units`` (``(unit_id, tokens)``).
+
+        Drops the group's current units (:meth:`remove_group`) then adds each
+        given unit into that group, so an edited document's chunks replace its
+        old chunks in O(old + new units). Passing an empty ``units`` removes the
+        group (drops its old units and adds nothing).
+        """
+
+        group_id = str(group_id)
+        self.remove_group(group_id)
+        for unit_id, tokens in units:
+            self.add_unit(unit_id, tokens, group_id)
 
     @property
     def unit_ids(self) -> frozenset[str]:
@@ -400,18 +503,21 @@ def build_chunk_texts(
     document_chunk_ids: Mapping[str, Sequence[str]],
     chunker,  # noqa: ANN001 - callable(text, limit) -> sequence of chunk strings
     chunk_character_limit: int,
-) -> tuple[list[str], list[str]]:
-    """Reconstructs ``(chunk_ids, chunk_texts)`` from stored document texts.
+) -> tuple[list[str], list[str], list[str]]:
+    """Reconstructs ``(chunk_ids, chunk_texts, group_ids)`` from stored document texts.
 
     Re-chunks each stored document with the same ``chunker`` the ingest path uses
     and zips the result against the document's recorded chunk ids, so the lexical
     index shares the exact chunk id space the vector scan ranks over. A document
     whose stored text is absent (e.g. text retention off for it) contributes no
-    chunks. Returns two positionally aligned lists ready for :class:`Bm25Index`.
+    chunks. ``group_ids`` carries the owning document id per chunk so the index
+    can be built with document-group membership. Returns three positionally
+    aligned lists ready for :class:`Bm25Index`.
     """
 
     chunk_ids: list[str] = []
     chunk_texts: list[str] = []
+    group_ids: list[str] = []
     for document_id, ids in document_chunk_ids.items():
         text = document_texts.get(document_id)
         if text is None:
@@ -423,25 +529,29 @@ def build_chunk_texts(
         for chunk_id, piece in zip(ids, pieces, strict=False):
             chunk_ids.append(str(chunk_id))
             chunk_texts.append(piece)
-    return chunk_ids, chunk_texts
+            group_ids.append(str(document_id))
+    return chunk_ids, chunk_texts, group_ids
 
 
 def build_chunk_token_lists(
     document_tokens: Mapping[str, Sequence[Sequence[str]]],
     document_chunk_ids: Mapping[str, Sequence[str]],
-) -> tuple[list[str], list[list[str]]]:
-    """Flattens persisted per-document token lists into ``(chunk_ids, token_lists)``.
+) -> tuple[list[str], list[list[str]], list[str]]:
+    """Flattens per-document token lists into ``(chunk_ids, token_lists, group_ids)``.
 
     The counterpart to :func:`build_chunk_texts` for the persisted lexical index:
     each document's stored per-chunk token lists are zipped against its recorded
     chunk ids, so the lexical index shares the exact chunk id space the vector
     scan ranks over without re-chunking or re-tokenizing any raw text. A document
-    with no stored tokens contributes no chunks. Returns two positionally aligned
-    lists ready for :meth:`Bm25Index.from_token_lists`.
+    with no stored tokens contributes no chunks. ``group_ids`` carries the owning
+    document id per chunk so the index can be built with document-group
+    membership. Returns three positionally aligned lists ready for
+    :meth:`Bm25Index.from_token_lists`.
     """
 
     chunk_ids: list[str] = []
     token_lists: list[list[str]] = []
+    group_ids: list[str] = []
     for document_id, ids in document_chunk_ids.items():
         chunks = document_tokens.get(document_id)
         if not chunks:
@@ -452,4 +562,5 @@ def build_chunk_token_lists(
         for chunk_id, tokens in zip(ids, chunks, strict=False):
             chunk_ids.append(str(chunk_id))
             token_lists.append([str(token) for token in tokens])
-    return chunk_ids, token_lists
+            group_ids.append(str(document_id))
+    return chunk_ids, token_lists, group_ids

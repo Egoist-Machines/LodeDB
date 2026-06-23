@@ -298,6 +298,132 @@ def test_incremental_position_is_stable_for_present_units():
     assert index.position_of("missing") is None
 
 
+# -- document groups (replace_group / remove_group) -------------------------
+
+
+_GROUP_QUERIES = [
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "e1234",
+    "abc-123",
+    "alpha beta gamma",
+    "zzz-absent",
+]
+
+
+def _bulk(units):
+    """Builds a grouped bulk index from ``{group: {chunk_id: text}}``."""
+
+    unit_ids: list[str] = []
+    texts: list[str] = []
+    group_ids: list[str] = []
+    for group_id, chunks in units.items():
+        for chunk_id, text in chunks.items():
+            unit_ids.append(chunk_id)
+            texts.append(text)
+            group_ids.append(group_id)
+    return Bm25Index(unit_ids, texts, group_ids=group_ids)
+
+
+def test_default_group_is_unit_id():
+    """A unit added with no explicit group is its own group, removable by id."""
+
+    index = Bm25Index([], [])
+    index.add_unit("u1", tokenize("alpha beta"))
+    index.add_unit("u2", tokenize("gamma delta"))
+    # Each unit is its own group, so removing the group named by its id drops it.
+    index.remove_group("u1")
+    assert index.unit_ids == frozenset({"u2"})
+    assert [uid for uid, _ in index.rank("alpha")] == []
+
+
+def test_replace_then_remove_group_ranks_like_fresh_bulk_build():
+    """Bulk-build, then replace/remove whole document groups; rank equals a fresh build.
+
+    The core invariant: an index built bulk with ``group_ids`` and then mutated
+    with ``replace_group``/``remove_group`` ranks identically (ids and scores) to
+    a fresh bulk build over the final unit set, regardless of how it got there.
+    """
+
+    base = {
+        "docA": {"a#0": "alpha beta gamma", "a#1": "alpha alpha delta"},
+        "docB": {"b#0": "gamma e1234 note", "b#1": "delta delta beta"},
+        "docC": {"c#0": "epsilon only here", "c#1": "abc-123 serial line"},
+    }
+    index = _bulk(base)
+
+    # Replace docA's two chunks with three differently-tokened, differently-id'd
+    # chunks (a re-upsert whose chunk ids changed), drop docB entirely, and leave
+    # docC untouched.
+    index.replace_group(
+        "docA",
+        [
+            ("a#7", tokenize("alpha rewritten")),
+            ("a#8", tokenize("beta gamma e1234")),
+            ("a#9", tokenize("delta epsilon")),
+        ],
+    )
+    index.remove_group("docB")
+
+    final = {
+        "docA": {
+            "a#7": "alpha rewritten",
+            "a#8": "beta gamma e1234",
+            "a#9": "delta epsilon",
+        },
+        "docC": {"c#0": "epsilon only here", "c#1": "abc-123 serial line"},
+    }
+    fresh = _bulk(final)
+
+    assert index.unit_ids == fresh.unit_ids
+    assert _ranks_equal(index, fresh, _GROUP_QUERIES)
+
+
+def test_remove_group_is_noop_when_absent():
+    """Removing a group that was never present changes nothing."""
+
+    index = _bulk({"docA": {"a#0": "alpha beta"}})
+    before = index.rank("alpha beta")
+    index.remove_group("does-not-exist")
+    assert len(index) == 1
+    assert index.rank("alpha beta") == before
+
+
+def test_replace_group_with_empty_units_drops_the_group():
+    """``replace_group`` with no units removes the document's chunks."""
+
+    index = _bulk({"docA": {"a#0": "alpha"}, "docB": {"b#0": "beta"}})
+    index.replace_group("docA", [])
+    assert index.unit_ids == frozenset({"b#0"})
+    assert _ranks_equal(index, _bulk({"docB": {"b#0": "beta"}}), _GROUP_QUERIES)
+
+
+def test_replace_group_on_incremental_index_matches_bulk():
+    """Groups assigned via add_unit then replaced rank like a fresh grouped build."""
+
+    index = Bm25Index([], [])
+    index.add_unit("a#0", tokenize("alpha beta"), "docA")
+    index.add_unit("a#1", tokenize("gamma"), "docA")
+    index.add_unit("b#0", tokenize("delta epsilon"), "docB")
+    index.replace_group("docA", [("a#2", tokenize("alpha gamma e1234"))])
+
+    fresh = _bulk(
+        {"docA": {"a#2": "alpha gamma e1234"}, "docB": {"b#0": "delta epsilon"}}
+    )
+    assert index.unit_ids == fresh.unit_ids
+    assert _ranks_equal(index, fresh, _GROUP_QUERIES)
+
+
+def test_group_ids_length_mismatch_raises():
+    """A group_ids sequence that does not align with unit_ids is rejected."""
+
+    with pytest.raises(ValueError, match="group_ids must align"):
+        Bm25Index(["u1", "u2"], ["a", "b"], group_ids=["only-one"])
+
+
 # -- build_chunk_token_lists ------------------------------------------------
 
 
@@ -312,9 +438,13 @@ def test_build_chunk_token_lists_zips_ids_with_tokens():
         "doc-a": ["a#0", "a#1"],
         "doc-b": ["b#0"],
     }
-    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    chunk_ids, token_lists, group_ids = build_chunk_token_lists(
+        document_tokens, document_chunk_ids
+    )
     assert chunk_ids == ["a#0", "a#1", "b#0"]
     assert token_lists == [["alpha", "beta"], ["gamma"], ["delta"]]
+    # The owning document id rides along per chunk so the index can group by it.
+    assert group_ids == ["doc-a", "doc-a", "doc-b"]
 
 
 def test_build_chunk_token_lists_skips_documents_without_tokens():
@@ -322,9 +452,12 @@ def test_build_chunk_token_lists_skips_documents_without_tokens():
 
     document_tokens = {"doc-a": [["alpha"]]}
     document_chunk_ids = {"doc-a": ["a#0"], "doc-missing": ["m#0"]}
-    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    chunk_ids, token_lists, group_ids = build_chunk_token_lists(
+        document_tokens, document_chunk_ids
+    )
     assert chunk_ids == ["a#0"]
     assert token_lists == [["alpha"]]
+    assert group_ids == ["doc-a"]
 
 
 def test_build_chunk_token_lists_aligns_on_shorter_on_mismatch():
@@ -332,9 +465,12 @@ def test_build_chunk_token_lists_aligns_on_shorter_on_mismatch():
 
     document_tokens = {"doc-a": [["alpha"], ["beta"], ["gamma"]]}
     document_chunk_ids = {"doc-a": ["a#0", "a#1"]}  # one fewer id than token lists
-    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    chunk_ids, token_lists, group_ids = build_chunk_token_lists(
+        document_tokens, document_chunk_ids
+    )
     assert chunk_ids == ["a#0", "a#1"]
     assert token_lists == [["alpha"], ["beta"]]
+    assert group_ids == ["doc-a", "doc-a"]
 
 
 def test_build_chunk_token_lists_feeds_bm25():
@@ -342,8 +478,10 @@ def test_build_chunk_token_lists_feeds_bm25():
 
     document_tokens = {"doc": [tokenize("fault code e1234 logged")]}
     document_chunk_ids = {"doc": ["doc#0"]}
-    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
-    index = Bm25Index.from_token_lists(chunk_ids, token_lists)
+    chunk_ids, token_lists, group_ids = build_chunk_token_lists(
+        document_tokens, document_chunk_ids
+    )
+    index = Bm25Index.from_token_lists(chunk_ids, token_lists, group_ids=group_ids)
     assert [unit_id for unit_id, _ in index.rank("e1234")] == ["doc#0"]
 
 
