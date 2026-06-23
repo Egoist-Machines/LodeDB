@@ -16,11 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ABC-123`, dates like `2024-01-15`) are recovered when they appear in the document body. The
   tokenizer keeps code-like tokens whole. A `filter` constrains both rankers, so filtered
   hybrid returns the true top-k of the matching subset. Lexical ranking and fusion are a
-  pure-Python CPU post-step (the vector kernel, GPU, and MPS paths are untouched), the BM25
-  index is rebuilt in memory from the retained raw text and never persisted or sent to
-  telemetry, and the on-disk format is unchanged. `mode="hybrid"`/`"lexical"` require
-  `store_text=True` and raise a clear error otherwise; a persisted, journaled postings store
-  is a planned follow-up.
+  pure-Python CPU post-step (the vector kernel, GPU, and MPS paths are untouched), and the
+  serving BM25 index lives in memory and is never sent to telemetry. By default it is rebuilt
+  from the retained raw text, so `mode="hybrid"`/`"lexical"` work whenever `store_text=True`
+  (the default). The new `LodeDB(..., index_text=True)` flag instead persists the index: the
+  per-chunk terms are captured at `add` time into a dedicated `.tvlex` base plus a `.lxd` delta
+  journal (checksum-guarded, committed O(changed) per write, pinned by the same root commit
+  manifest as the index), so hybrid and lexical search survive a reopen without rebuilding from
+  raw text and without requiring `store_text=True`. The `.tvlex` sidecar holds payload-derived
+  terms only and, like the raw-text sidecar, never reaches the redacted `.json`/`.jsd`/`.tvim`/
+  `.tvd` artifacts or telemetry; `index_text` defaults to off, leaving the standard layout
+  unchanged. A lexical query with neither flag set raises a clear error.
 
 ## [0.1.2] - 2026-06-22
 

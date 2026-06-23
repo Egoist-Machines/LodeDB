@@ -7,8 +7,11 @@ fusion order. No engine, embedding backend, or TurboVec dependency is involved.
 
 from __future__ import annotations
 
+import pytest
+
 from lodedb.engine._lexical import (
     Bm25Index,
+    build_chunk_token_lists,
     fuse_unit_rankings,
     reciprocal_rank_fusion,
     tokenize,
@@ -146,6 +149,90 @@ def test_bm25_deterministic_tie_break_on_unit_id():
     index = Bm25Index(["b", "a"], ["solo", "solo"])
     ranked = index.rank("solo")
     assert [unit_id for unit_id, _ in ranked] == ["a", "b"]
+
+
+# -- from_token_lists -------------------------------------------------------
+
+
+def test_from_token_lists_matches_text_constructor():
+    """Building from pre-tokenized lists equals tokenizing the same texts."""
+
+    texts = [
+        "the turbine reported fault code e1234 overnight",
+        "quick brown foxes and lazy dogs",
+        "quarterly revenue and operating costs",
+    ]
+    unit_ids = ["u1", "u2", "u3"]
+    from_text = Bm25Index(unit_ids, texts)
+    from_tokens = Bm25Index.from_token_lists(unit_ids, [tokenize(t) for t in texts])
+    # Identical rankings and scores for the same query: the two paths share the
+    # postings-building logic, so a persisted index serves exactly the live one.
+    assert from_tokens.rank("e1234 revenue") == from_text.rank("e1234 revenue")
+    assert len(from_tokens) == len(from_text) == 3
+
+
+def test_from_token_lists_length_mismatch_raises():
+    """A unit_ids/token_lists length mismatch is rejected like the text path."""
+
+    with pytest.raises(ValueError, match="same length"):
+        Bm25Index.from_token_lists(["u1", "u2"], [["only", "one"]])
+
+
+def test_from_token_lists_empty_is_safe():
+    """An empty pre-tokenized corpus builds an empty, safe index."""
+
+    index = Bm25Index.from_token_lists([], [])
+    assert len(index) == 0
+    assert index.rank("anything") == []
+
+
+# -- build_chunk_token_lists ------------------------------------------------
+
+
+def test_build_chunk_token_lists_zips_ids_with_tokens():
+    """Per-document token lists flatten to chunk-aligned (ids, token_lists)."""
+
+    document_tokens = {
+        "doc-a": [["alpha", "beta"], ["gamma"]],
+        "doc-b": [["delta"]],
+    }
+    document_chunk_ids = {
+        "doc-a": ["a#0", "a#1"],
+        "doc-b": ["b#0"],
+    }
+    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    assert chunk_ids == ["a#0", "a#1", "b#0"]
+    assert token_lists == [["alpha", "beta"], ["gamma"], ["delta"]]
+
+
+def test_build_chunk_token_lists_skips_documents_without_tokens():
+    """A document with no stored tokens contributes no chunks (defensive)."""
+
+    document_tokens = {"doc-a": [["alpha"]]}
+    document_chunk_ids = {"doc-a": ["a#0"], "doc-missing": ["m#0"]}
+    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    assert chunk_ids == ["a#0"]
+    assert token_lists == [["alpha"]]
+
+
+def test_build_chunk_token_lists_aligns_on_shorter_on_mismatch():
+    """A count mismatch aligns on the shorter side rather than mislabeling."""
+
+    document_tokens = {"doc-a": [["alpha"], ["beta"], ["gamma"]]}
+    document_chunk_ids = {"doc-a": ["a#0", "a#1"]}  # one fewer id than token lists
+    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    assert chunk_ids == ["a#0", "a#1"]
+    assert token_lists == [["alpha"], ["beta"]]
+
+
+def test_build_chunk_token_lists_feeds_bm25():
+    """The flattened output builds a working BM25 index over the chunk id space."""
+
+    document_tokens = {"doc": [tokenize("fault code e1234 logged")]}
+    document_chunk_ids = {"doc": ["doc#0"]}
+    chunk_ids, token_lists = build_chunk_token_lists(document_tokens, document_chunk_ids)
+    index = Bm25Index.from_token_lists(chunk_ids, token_lists)
+    assert [unit_id for unit_id, _ in index.rank("e1234")] == ["doc#0"]
 
 
 # -- RRF --------------------------------------------------------------------

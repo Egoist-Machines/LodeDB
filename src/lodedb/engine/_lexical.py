@@ -105,10 +105,56 @@ class Bm25Index:
         k1: float = BM25_K1,
         b: float = BM25_B,
     ) -> None:
-        """Builds the inverted index, document lengths, and corpus statistics."""
+        """Builds the inverted index, document lengths, and corpus statistics.
+
+        ``unit_ids`` and ``texts`` are positionally aligned; each text is
+        tokenized with :func:`tokenize`. To build from already-tokenized units
+        (e.g. a persisted postings store), use :meth:`from_token_lists`.
+        """
 
         if len(unit_ids) != len(texts):
             raise ValueError("unit_ids and texts must be the same length")
+        self._build(unit_ids, [tokenize(text) for text in texts], k1=k1, b=b)
+
+    @classmethod
+    def from_token_lists(
+        cls,
+        unit_ids: Sequence[str],
+        token_lists: Sequence[Sequence[str]],
+        *,
+        k1: float = BM25_K1,
+        b: float = BM25_B,
+    ) -> Bm25Index:
+        """Builds the index from already-tokenized units, skipping re-tokenization.
+
+        ``unit_ids`` and ``token_lists`` are positionally aligned; each inner
+        sequence is one unit's tokens in document order (duplicates preserved, as
+        :func:`tokenize` produces). This is the constructor for a persisted
+        lexical index: the tokens were captured at ingest time, so the on-disk
+        store rebuilds an identical index with no raw text and no regex pass.
+        """
+
+        if len(unit_ids) != len(token_lists):
+            raise ValueError("unit_ids and token_lists must be the same length")
+        index = cls.__new__(cls)
+        index._build(unit_ids, [list(tokens) for tokens in token_lists], k1=k1, b=b)
+        return index
+
+    def _build(
+        self,
+        unit_ids: Sequence[str],
+        token_lists: list[list[str]],
+        *,
+        k1: float,
+        b: float,
+    ) -> None:
+        """Builds the postings, document lengths, and corpus stats from token lists.
+
+        Shared by :meth:`__init__` (which tokenizes texts first) and
+        :meth:`from_token_lists` (which receives tokens directly), so both paths
+        produce a byte-for-byte identical index for the same tokens.
+        """
+
         self._unit_ids: tuple[str, ...] = tuple(str(unit_id) for unit_id in unit_ids)
         self._k1 = float(k1)
         self._b = float(b)
@@ -116,8 +162,7 @@ class Bm25Index:
         postings: dict[str, dict[int, int]] = {}
         doc_len: list[int] = []
         total_len = 0
-        for index, text in enumerate(texts):
-            tokens = tokenize(text)
+        for index, tokens in enumerate(token_lists):
             doc_len.append(len(tokens))
             total_len += len(tokens)
             if not tokens:
@@ -278,3 +323,32 @@ def build_chunk_texts(
             chunk_ids.append(str(chunk_id))
             chunk_texts.append(piece)
     return chunk_ids, chunk_texts
+
+
+def build_chunk_token_lists(
+    document_tokens: Mapping[str, Sequence[Sequence[str]]],
+    document_chunk_ids: Mapping[str, Sequence[str]],
+) -> tuple[list[str], list[list[str]]]:
+    """Flattens persisted per-document token lists into ``(chunk_ids, token_lists)``.
+
+    The counterpart to :func:`build_chunk_texts` for the persisted lexical index:
+    each document's stored per-chunk token lists are zipped against its recorded
+    chunk ids, so the lexical index shares the exact chunk id space the vector
+    scan ranks over without re-chunking or re-tokenizing any raw text. A document
+    with no stored tokens contributes no chunks. Returns two positionally aligned
+    lists ready for :meth:`Bm25Index.from_token_lists`.
+    """
+
+    chunk_ids: list[str] = []
+    token_lists: list[list[str]] = []
+    for document_id, ids in document_chunk_ids.items():
+        chunks = document_tokens.get(document_id)
+        if not chunks:
+            continue
+        # Defensive zip: the chunker is deterministic, so the recorded ids and
+        # the captured token lists agree in count; align on the shorter anyway so
+        # a mismatch never mislabels a chunk's tokens.
+        for chunk_id, tokens in zip(ids, chunks, strict=False):
+            chunk_ids.append(str(chunk_id))
+            token_lists.append([str(token) for token in tokens])
+    return chunk_ids, token_lists

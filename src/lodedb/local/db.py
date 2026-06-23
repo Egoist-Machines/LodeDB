@@ -49,8 +49,9 @@ _LOCAL_CLIENT_ID = "lodedb-local"
 _LOCAL_INDEX_ID = "default"
 _LOCAL_BIND_HOST = "127.0.0.1"
 # Retrieval modes accepted by ``search``/``search_many``. ``vector`` is the
-# default; ``hybrid`` (BM25 + RRF) and ``lexical`` (BM25 only) require retained
-# raw text (``store_text=True``) because the BM25 index is rebuilt from it.
+# default; ``hybrid`` (BM25 + RRF) and ``lexical`` (BM25 only) need a lexical
+# source: a persisted postings store (``index_text=True``) or retained raw text
+# (``store_text=True``) the BM25 index is rebuilt from.
 _LEXICAL_SEARCH_MODES = frozenset({"hybrid", "lexical"})
 _SEARCH_MODES = frozenset({"vector"}) | _LEXICAL_SEARCH_MODES
 
@@ -136,6 +137,7 @@ class LodeDB:
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
         store_text: bool = True,
+        index_text: bool = False,
         read_only: bool = False,
         durability: str | None = None,
         route_registry_path: str | Path | None = None,
@@ -160,11 +162,21 @@ class LodeDB:
         text at all — telemetry, audit, and the redacted snapshot never carry text
         regardless of this flag. Reopen the same path with the same ``store_text``
         value you wrote with.
+        ``index_text`` controls durable lexical-index persistence and defaults to
+        ``False``: when ``True``, the per-chunk tokens of each added document are
+        kept in a dedicated ``.tvlex`` sidecar (base + ``.lxd`` journal, committed
+        O(changed) per write), so ``mode="hybrid"``/``"lexical"`` survive a reopen
+        without rebuilding from raw text and without requiring ``store_text=True``.
+        The sidecar holds payload-derived terms only and, like the raw-text
+        sidecar, never reaches telemetry, audit, or the redacted snapshot. The
+        default leaves the on-disk layout byte-for-byte unchanged. Reopen the same
+        path with the same ``index_text`` value you wrote with.
         ``_embedding_backend`` is an internal hook for tests/fixtures.
         """
 
         self.path = Path(path)
         self.store_text = bool(store_text)
+        self.index_text = bool(index_text)
         self.read_only = bool(read_only)
         # "fast" (atomic rename only) vs "fsync" (power-loss durable). An
         # explicit arg wins; otherwise LODEDB_DURABILITY, else fast.
@@ -206,6 +218,7 @@ class LodeDB:
             route_profile=self.preset.route_profile,
             telemetry_mode="metrics_only",
             allow_raw_result_text=self.store_text,
+            persist_lexical_index=self.index_text,
         )
         self._engine = LodeEngine(
             security=security,
@@ -322,11 +335,13 @@ class LodeDB:
           is the difference between a usable and a useless answer.
         - ``"lexical"`` — the BM25 ranking alone (no vector scan).
 
-        ``"hybrid"`` and ``"lexical"`` rebuild an in-memory BM25 index from the
-        retained raw text, so they require opening LodeDB with ``store_text=True``
-        (the default); requesting them with ``store_text=False`` raises
-        :class:`ValueError`. The index lives in memory, is rebuilt lazily after a
-        mutation, and never changes the on-disk format.
+        ``"hybrid"`` and ``"lexical"`` build an in-memory BM25 index from a
+        lexical source, so they require opening LodeDB with either
+        ``index_text=True`` (a durable postings store that survives reopens
+        without raw text) or ``store_text=True`` (the index rebuilt from the
+        retained raw text, the default); requesting them with neither raises
+        :class:`ValueError`. The serving index lives in memory, is rebuilt lazily
+        after a mutation, and never changes the on-disk format.
 
         ``filter`` narrows results by metadata and is pushed into the TurboVec
         allowlist by the engine, so ``k`` still returns the true top-``k`` of the
@@ -385,9 +400,9 @@ class LodeDB:
         ``"lexical"``) and applies to every query in the batch;
         ``search_many(mode="hybrid")`` returns the same result as the
         corresponding repeated single :meth:`search` call. ``"hybrid"`` and
-        ``"lexical"`` require ``store_text=True``. Vector queries in a batch keep
-        the batched scan; hybrid and lexical queries run as individual CPU
-        post-steps.
+        ``"lexical"`` require a lexical source (``index_text=True`` or
+        ``store_text=True``). Vector queries in a batch keep the batched scan;
+        hybrid and lexical queries run as individual CPU post-steps.
         """
 
         if not isinstance(queries, list) or not queries:
@@ -536,12 +551,13 @@ class LodeDB:
             )
 
     def _resolve_mode(self, mode: str) -> str:
-        """Validates a search mode and enforces the lexical store_text requirement.
+        """Validates a search mode and enforces the lexical-source requirement.
 
         Returns the canonical lowercase mode. Raises :class:`ValueError` for an
-        unknown mode, or when a lexical/hybrid mode is requested on a handle
-        opened with ``store_text=False`` (the BM25 index is rebuilt from the
-        retained raw text, so there is nothing to build it from otherwise).
+        unknown mode, or when a lexical/hybrid mode is requested on a handle that
+        has no lexical source — neither ``index_text=True`` (a persisted BM25
+        postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
+        retained raw text), so there is nothing to build the index from.
         """
 
         if not isinstance(mode, str):
@@ -550,10 +566,11 @@ class LodeDB:
         if value not in _SEARCH_MODES:
             allowed = ", ".join(sorted(_SEARCH_MODES))
             raise ValueError(f"mode must be one of: {allowed}")
-        if value in _LEXICAL_SEARCH_MODES and not self.store_text:
+        if value in _LEXICAL_SEARCH_MODES and not (self.index_text or self.store_text):
             raise ValueError(
-                f"mode={value!r} requires opening LodeDB with store_text=True "
-                "(the lexical BM25 index is rebuilt from the retained raw text)"
+                f"mode={value!r} requires a lexical source: open LodeDB with "
+                "index_text=True (persists the BM25 postings, durable across reopens) "
+                "or store_text=True (the BM25 index is rebuilt from the retained raw text)"
             )
         return value
 

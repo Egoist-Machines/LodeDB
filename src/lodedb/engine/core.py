@@ -27,6 +27,7 @@ from lodedb.engine._commit_manifest import (
     DEFAULT_EPOCHS_RETAINED,
     base_json_path,
     base_tvim_path,
+    base_tvlex_path,
     base_tvtext_path,
     build_commit_body,
     commit_manifest_path,
@@ -40,7 +41,9 @@ from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.engine._lexical import (
     Bm25Index,
     build_chunk_texts,
+    build_chunk_token_lists,
     reciprocal_rank_fusion,
+    tokenize,
 )
 from lodedb.engine._predicate import compile_metadata_filter, validate_metadata_filter
 from lodedb.engine.document_text_store import (
@@ -51,6 +54,7 @@ from lodedb.engine.embedding_backends import (
     EngineEmbeddingBackend,
     HashEmbeddingBackend,
 )
+from lodedb.engine.lexical_index_store import LexicalIndexStore
 from lodedb.engine.route_registry import (
     SUPPORTED_ROUTE_CLASSES,
     RouteDecision,
@@ -137,6 +141,7 @@ class EngineSecurityConfig:
     route_profile: str = ""
     telemetry_mode: str = "metrics_only"
     allow_raw_result_text: bool = False
+    persist_lexical_index: bool = False
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,14 @@ class ClientIndexState:
     # the ``.jsd`` journal, telemetry, or audit output). Default builds leave
     # it empty so the raw-payload-free guarantees of every other path hold.
     document_text: dict[str, str] = field(default_factory=dict)
+    # Opt-in persisted lexical postings keyed by document id: per-document, the
+    # per-chunk token lists (aligned with ``document_chunk_ids``) captured at
+    # ingest time. Populated only when the engine runs with
+    # ``EngineSecurityConfig.persist_lexical_index`` and held in its own
+    # ``.tvlex`` sidecar (never the redacted ``.json`` snapshot, the ``.jsd``
+    # journal, telemetry, or audit output). Default builds leave it empty so the
+    # raw-payload-free guarantees of every other path hold.
+    document_tokens: dict[str, list[list[str]]] = field(default_factory=dict)
     embedded_chunk_count: int = 0
     cache_reuse_count: int = 0
     delete_count: int = 0
@@ -944,6 +957,7 @@ class LodeEngine:
         if isinstance(result, EngineResponse):
             return result
         self._capture_document_text(state, documents)
+        self._capture_lexical_tokens(state, documents)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -982,6 +996,7 @@ class LodeEngine:
         if isinstance(result, EngineResponse):
             return result
         self._capture_document_text(state, documents)
+        self._capture_lexical_tokens(state, documents)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1419,6 +1434,7 @@ class LodeEngine:
             state.document_chunk_ids.pop(document_id, None)
             state.document_metadata.pop(document_id, None)
             state.document_text.pop(document_id, None)
+            state.document_tokens.pop(document_id, None)
         self._record_pending_state_journal_documents(
             state,
             deleted_document_ids=unique_document_ids,
@@ -2685,14 +2701,16 @@ class LodeEngine:
         return index
 
     def _lexical_serving_index(self, state: ClientIndexState) -> _LexicalServingIndex:
-        """Returns the generation-current BM25 index, building it lazily from raw text.
+        """Returns the generation-current BM25 index, building it lazily for the mode.
 
         Keyed by the same generation as the serving index (so any mutation
-        rebuilds it on the next lexical query), and built from the retained raw
-        document text re-chunked the same way ingest chunks it, so BM25 shares
-        the exact chunk id space the vector scan ranks over. The index is held in
-        memory only and never persisted: a BM25 inverted index is payload-derived.
-        Callers must have verified raw text retention is on (see
+        rebuilds it on the next lexical query). When lexical-index persistence is
+        on, it is built from the persisted per-chunk token lists with no raw-text
+        dependency and no re-tokenization; otherwise it is rebuilt from the
+        retained raw document text re-chunked the same way ingest chunks it. Both
+        share the exact chunk id space the vector scan ranks over. The index is
+        held in memory only — a BM25 inverted index is payload-derived. Callers
+        must have verified the mode is serviceable (see
         :meth:`_require_lexical_capable`); this assumes it.
         """
 
@@ -2700,13 +2718,20 @@ class LodeEngine:
         cached = self._lexical_indexes.get(state.index_key)
         if cached is not None and cached.generation == generation:
             return cached
-        chunk_ids, chunk_texts = build_chunk_texts(
-            state.document_text,
-            state.document_chunk_ids,
-            chunk_text,
-            self.chunk_character_limit,
-        )
-        bm25 = Bm25Index(chunk_ids, chunk_texts)
+        if self.lexical_index_enabled and state.document_tokens:
+            chunk_ids, token_lists = build_chunk_token_lists(
+                state.document_tokens,
+                state.document_chunk_ids,
+            )
+            bm25 = Bm25Index.from_token_lists(chunk_ids, token_lists)
+        else:
+            chunk_ids, chunk_texts = build_chunk_texts(
+                state.document_text,
+                state.document_chunk_ids,
+                chunk_text,
+                self.chunk_character_limit,
+            )
+            bm25 = Bm25Index(chunk_ids, chunk_texts)
         index = _LexicalServingIndex(generation, bm25, chunk_ids)
         self._lexical_indexes[state.index_key] = index
         return index
@@ -2714,15 +2739,21 @@ class LodeEngine:
     def _require_lexical_capable(self, mode: str) -> str | None:
         """Returns an actionable error message when a lexical mode is unavailable.
 
-        Lexical and hybrid retrieval rebuild a BM25 index from the retained raw
-        text, so they require ``store_text=True`` (the engine's
-        ``allow_raw_result_text``). Returns ``None`` when the mode is serviceable.
+        Lexical and hybrid retrieval build a BM25 index from either the persisted
+        lexical postings (``index_text=True``) or the retained raw text
+        (``store_text=True``), so a serviceable mode needs at least one of those.
+        Returns ``None`` when the mode is serviceable.
         """
 
-        if mode in _LEXICAL_MODES and not self.raw_text_storage_enabled:
+        if (
+            mode in _LEXICAL_MODES
+            and not self.lexical_index_enabled
+            and not self.raw_text_storage_enabled
+        ):
             return (
-                f"mode={mode!r} requires retained document text; open LodeDB with "
-                "store_text=True (the BM25 index is rebuilt from the raw-text store)"
+                f"mode={mode!r} requires a lexical source; open LodeDB with "
+                "index_text=True (persists the BM25 postings) or store_text=True "
+                "(the BM25 index is rebuilt from the raw-text store)"
             )
         return None
 
@@ -3272,6 +3303,14 @@ class LodeEngine:
         if self.raw_text_storage_enabled:
             text_store = self._text_store(key, current_epoch)
             text_compaction_due = text_store.has_manifest() and text_store.should_compact()
+        # The lexical-postings journal shares the epoch too; compact it alongside
+        # the index when its delta backlog is due.
+        lexical_compaction_due = False
+        if self.lexical_index_enabled:
+            lexical_store = self._lexical_index_store(key, current_epoch)
+            lexical_compaction_due = (
+                lexical_store.has_manifest() and lexical_store.should_compact()
+            )
         return (
             base_json.exists()
             and journal.has_manifest()
@@ -3281,6 +3320,7 @@ class LodeEngine:
             and not tvim_store.should_compact()
             and not journal.should_compact()
             and not text_compaction_due
+            and not lexical_compaction_due
         )
 
     def _commit_direct_route(
@@ -3355,6 +3395,12 @@ class LodeEngine:
                     pending_documents=pending_documents,
                     base_rewrite=False,
                 )
+                lexical_manifest = self._journal_lexical(
+                    state,
+                    epoch=current_epoch,
+                    pending_documents=pending_documents,
+                    base_rewrite=False,
+                )
                 self._write_root_commit_manifest(
                     state,
                     epoch=current_epoch,
@@ -3362,6 +3408,7 @@ class LodeEngine:
                     journal=journal,
                     tvim_store=tvim_store,
                     text_manifest=text_manifest,
+                    lexical_manifest=lexical_manifest,
                 )
                 self._tvim_persist_telemetry[key] = {
                     "tvim_persist_mode": "delta_append",
@@ -3393,6 +3440,9 @@ class LodeEngine:
             text_manifest = self._journal_text(
                 state, epoch=epoch, pending_documents=None, base_rewrite=True
             )
+            lexical_manifest = self._journal_lexical(
+                state, epoch=epoch, pending_documents=None, base_rewrite=True
+            )
             self._write_root_commit_manifest(
                 state,
                 epoch=epoch,
@@ -3400,6 +3450,7 @@ class LodeEngine:
                 journal=journal,
                 tvim_store=tvim_store,
                 text_manifest=text_manifest,
+                lexical_manifest=lexical_manifest,
             )
             self._gc_after_base_rewrite(key, live_epoch=epoch)
             self._gc_legacy_files(key)
@@ -3433,8 +3484,12 @@ class LodeEngine:
             self._write_state_json(state, path=base_json, generation=generation)
             journal.record_base(document_count=len(state.document_hashes), chunk_count=0)
             self._base_epochs[key] = epoch
-            # An empty index holds no documents, so it holds no raw text either.
+            # An empty index holds no documents, so it holds no raw text or
+            # lexical postings either.
             text_manifest = self._journal_text(
+                state, epoch=epoch, pending_documents=None, base_rewrite=True
+            )
+            lexical_manifest = self._journal_lexical(
                 state, epoch=epoch, pending_documents=None, base_rewrite=True
             )
             self._write_root_commit_manifest(
@@ -3444,6 +3499,7 @@ class LodeEngine:
                 journal=journal,
                 tvim_store=None,
                 text_manifest=text_manifest,
+                lexical_manifest=lexical_manifest,
             )
             self._gc_after_base_rewrite(key, live_epoch=epoch)
             self._gc_legacy_files(key)
@@ -3463,13 +3519,18 @@ class LodeEngine:
         journal: StateJournalStore,
         tvim_store: TvimDeltaStore | None,
         text_manifest: dict[str, Any] | None,
+        lexical_manifest: dict[str, Any] | None = None,
     ) -> None:
         """Seals one committed generation by atomically swapping the root manifest.
 
         ``text_manifest`` is the raw-text journal manifest (base + ``.txd``
         deltas) written for this same generation, so text is pinned by — and
         rolls back with — the committed generation; ``None`` when raw-text
-        storage is off or the index holds no text.
+        storage is off or the index holds no text. ``lexical_manifest`` is the
+        analogous lexical-postings journal manifest (base + ``.lxd`` deltas),
+        ``None`` when lexical-index persistence is off or the index holds no
+        tokens. Both pin their sidecar to this generation, so each commits and
+        rolls back atomically with it.
         """
 
         key = state.index_key
@@ -3483,6 +3544,7 @@ class LodeEngine:
             tvim_manifest=tvim_store.current_manifest() if tvim_store is not None else None,
             tvim_present=tvim_store is not None,
             tvtext_manifest=text_manifest,
+            tvlex_manifest=lexical_manifest,
         )
         write_commit_manifest(self._commit_manifest_path(key), body, fsync=self._fsync_on_commit)
 
@@ -3496,13 +3558,14 @@ class LodeEngine:
                 self._remove_epoch_artifacts(key, epoch)
 
     def _remove_epoch_artifacts(self, key: str, epoch: int) -> None:
-        """Deletes one base epoch's JSON/TurboVec/text bases and their journal dirs."""
+        """Deletes one base epoch's JSON/TurboVec/text/lexical bases and journal dirs."""
 
         base_json = self._epoch_json_path(key, epoch)
         base_tvim = self._epoch_tvim_path(key, epoch)
         shutil.rmtree(StateJournalStore(base_json).journal_dir, ignore_errors=True)
         shutil.rmtree(TvimDeltaStore(base_tvim).delta_dir, ignore_errors=True)
         self._text_store(key, epoch).remove_all()
+        self._lexical_index_store(key, epoch).remove_all()
         base_json.unlink(missing_ok=True)
         base_tvim.unlink(missing_ok=True)
 
@@ -3595,6 +3658,11 @@ class LodeEngine:
             self._load_pre_journal_text(
                 state, generation=generation, expected_sha=tvtext.get("sha256")
             )
+        # The lexical-postings journal is pinned by the root at the same epoch, so
+        # a torn commit's uncommitted postings are never loaded.
+        tvlex = body.get("tvlex")
+        if isinstance(tvlex, dict) and "base" in tvlex:
+            self._load_lexical(state, epoch=epoch, lexical_manifest=tvlex)
         self._indexes[state.index_key] = state
         self._index_generations[state.index_key] = generation
         self._base_epochs[state.index_key] = epoch
@@ -3664,6 +3732,11 @@ class LodeEngine:
             # .txd segment a crashed commit appended but never committed).
             self._text_store(key, epoch).restore_manifest(tvtext)
             self._sweep_pre_journal_text_sidecars(key)
+        tvlex = body.get("tvlex")
+        if isinstance(tvlex, dict) and "base" in tvlex:
+            # Heal the lexical-postings journal back to the committed manifest
+            # (dropping any .lxd segment a crashed commit never committed).
+            self._lexical_index_store(key, epoch).restore_manifest(tvlex)
         self._base_epochs[key] = epoch
         self._gc_after_base_rewrite(key, live_epoch=epoch)
         self._gc_legacy_files(key)
@@ -3738,6 +3811,27 @@ class LodeEngine:
             self._text_base_path(client_id_hash, epoch), fsync=self._fsync_on_commit
         )
 
+    def _lexical_base_path(self, client_id_hash: str, epoch: int) -> Path:
+        """Returns the lexical-index base path for one index key and base epoch.
+
+        The lexical-index store is governed by the same root manifest as the
+        index: each base epoch holds a ``<key>.gen/g<epoch>.tvlex`` full
+        ``document_id -> token lists`` map plus a ``.lxd`` delta journal, and the
+        root pins its manifest, so a torn commit rolls the postings back to the
+        committed generation (rather than leaving an uncommitted overwrite).
+        """
+
+        if self.persistence_dir is None:
+            raise ValueError("persistence_dir is not configured")
+        return base_tvlex_path(self.persistence_dir, client_id_hash, epoch)
+
+    def _lexical_index_store(self, client_id_hash: str, epoch: int) -> LexicalIndexStore:
+        """Returns the journaled lexical-index store for one index key and base epoch."""
+
+        return LexicalIndexStore(
+            self._lexical_base_path(client_id_hash, epoch), fsync=self._fsync_on_commit
+        )
+
     def _legacy_text_sidecar_path(self, client_id_hash: str) -> Path:
         """Returns the legacy (pre-commit-manifest) top-level raw-text sidecar path."""
 
@@ -3758,6 +3852,21 @@ class LodeEngine:
 
         return bool(self.security.allow_raw_result_text)
 
+    @property
+    def lexical_index_enabled(self) -> bool:
+        """Returns whether this engine persists the lexical (BM25) postings.
+
+        Off by default; turning it on (``EngineSecurityConfig.persist_lexical_index``)
+        is the explicit opt-in documented in the README/architecture notes. It
+        captures each document's per-chunk tokens at ingest time and keeps them
+        in a dedicated ``.tvlex`` sidecar (base + ``.lxd`` journal), so hybrid and
+        lexical search survive a reopen without re-tokenizing or even retaining
+        the raw text. Like the raw-text sidecar, it never touches telemetry,
+        audit, the redacted ``.json`` snapshot, or query result rows.
+        """
+
+        return bool(self.security.persist_lexical_index)
+
     def _capture_document_text(
         self,
         state: ClientIndexState,
@@ -3769,6 +3878,29 @@ class LodeEngine:
             return
         for document in documents:
             state.document_text[document.document_id] = document.text
+
+    def _capture_lexical_tokens(
+        self,
+        state: ClientIndexState,
+        documents: tuple[EngineDocument, ...],
+    ) -> None:
+        """Records each document's per-chunk tokens when lexical-index persistence is on.
+
+        Tokens are captured here, at ingest time, while the raw text is in hand,
+        so the persisted lexical index is genuinely independent of
+        ``store_text``: it is built from these tokens on reopen with no raw-text
+        dependency and no re-tokenization. The per-chunk token lists align with
+        the document's recorded ``document_chunk_ids`` because both come from the
+        same deterministic chunker.
+        """
+
+        if not self.lexical_index_enabled:
+            return
+        for document in documents:
+            state.document_tokens[document.document_id] = [
+                tokenize(chunk)
+                for chunk in chunk_text(document.text, self.chunk_character_limit)
+            ]
 
     def _journal_text(
         self,
@@ -3808,6 +3940,46 @@ class LodeEngine:
             )
         return store.current_manifest()
 
+    def _journal_lexical(
+        self,
+        state: ClientIndexState,
+        *,
+        epoch: int,
+        pending_documents: dict[str, dict[str, None]] | None,
+        base_rewrite: bool,
+    ) -> dict[str, Any] | None:
+        """Journals the lexical postings for this commit; returns the manifest the root pins.
+
+        The exact parallel of :meth:`_journal_text` over the per-chunk token
+        lists captured at ingest. On a base rewrite the full
+        ``document_id -> token lists`` map is written as a fresh base at this
+        epoch; on a delta append only the upserted token lists and deleted ids of
+        this batch are journaled (O(changed)). Returns the lexical journal
+        manifest for the root to embed, or ``None`` when lexical-index
+        persistence is disabled or the index holds no tokens.
+        """
+
+        if self.persistence_dir is None or not self.lexical_index_enabled:
+            return None
+        store = self._lexical_index_store(state.index_key, epoch)
+        if base_rewrite or not store.has_manifest():
+            if not state.document_tokens:
+                return None
+            store.record_base(state.document_tokens)
+        else:
+            upserted = {
+                document_id: state.document_tokens[document_id]
+                for document_id in (pending_documents or {}).get("upserted", {})
+                if document_id in state.document_tokens
+            }
+            deleted = list((pending_documents or {}).get("deleted", {}))
+            store.append_delta(
+                upserted=upserted,
+                deleted=deleted,
+                document_count_after=len(state.document_tokens),
+            )
+        return store.current_manifest()
+
     def _load_document_text(
         self,
         state: ClientIndexState,
@@ -3828,6 +4000,29 @@ class LodeEngine:
         if not text_manifest:
             return
         state.document_text = self._text_store(state.index_key, epoch).load(manifest=text_manifest)
+
+    def _load_lexical(
+        self,
+        state: ClientIndexState,
+        *,
+        epoch: int,
+        lexical_manifest: dict[str, Any] | None,
+    ) -> None:
+        """Loads the committed lexical-postings journal into state when present.
+
+        ``lexical_manifest`` is the journal manifest the root commit pins (base +
+        ``.lxd`` deltas); ``None`` means the committed generation has no persisted
+        postings. Fails closed if a pinned base/segment is missing or fails its
+        checksum, rather than serving a stale or partial index.
+        """
+
+        if self.persistence_dir is None or not self.lexical_index_enabled:
+            return
+        if not lexical_manifest:
+            return
+        state.document_tokens = self._lexical_index_store(state.index_key, epoch).load(
+            manifest=lexical_manifest
+        )
 
     def _load_pre_journal_text(
         self, state: ClientIndexState, *, generation: int, expected_sha: str | None

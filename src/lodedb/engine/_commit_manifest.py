@@ -17,6 +17,8 @@ at which a full base was last written):
     <key>.gen/g<epoch>.tvim.tvim-delta/  its ``.tvd`` vector journal
     <key>.gen/g<epoch>.tvtext          opt-in raw-text base (full id->text map)
     <key>.gen/g<epoch>.tvtext.tvtext-delta/  its ``.txd`` raw-text journal
+    <key>.gen/g<epoch>.tvlex           opt-in lexical-index base (id->token lists)
+    <key>.gen/g<epoch>.tvlex.tvlex-delta/  its ``.lxd`` lexical-index journal
 
 and a single top-level pointer:
 
@@ -87,6 +89,12 @@ def base_tvtext_path(persistence_dir: str | Path, index_key: str, epoch: int) ->
     """Returns the raw-text base path for one index key and base epoch."""
 
     return generation_dir(persistence_dir, index_key) / f"g{int(epoch)}.tvtext"
+
+
+def base_tvlex_path(persistence_dir: str | Path, index_key: str, epoch: int) -> Path:
+    """Returns the lexical-index base path for one index key and base epoch."""
+
+    return generation_dir(persistence_dir, index_key) / f"g{int(epoch)}.tvlex"
 
 
 def is_commit_manifest_name(name: str) -> bool:
@@ -173,13 +181,19 @@ def build_commit_body(
     tvim_manifest: dict[str, Any] | None,
     tvim_present: bool,
     tvtext_manifest: dict[str, Any] | None,
+    tvlex_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assembles a root-manifest body capturing one consistent committed generation.
 
     ``tvtext_manifest`` is the raw-text journal manifest (base + delta segments)
     for this committed generation, or ``None`` when raw-text storage is disabled
-    or the index holds no text. It is pinned by the root exactly like the JSON
-    and TurboVec manifests, so raw text commits and rolls back atomically.
+    or the index holds no text. ``tvlex_manifest`` is the analogous lexical-index
+    (BM25 postings) journal manifest, or ``None`` when lexical-index persistence
+    is disabled or the index holds no tokens. Both are pinned by the root exactly
+    like the JSON and TurboVec manifests, so the text sidecar and the lexical
+    sidecar commit and roll back atomically with the generation. ``tvlex`` is an
+    optional key read via ``.get`` (like ``tvtext``), so an older reader that
+    does not know it ignores it.
     """
 
     return {
@@ -192,6 +206,7 @@ def build_commit_body(
         "tvim": tvim_manifest,
         "tvim_present": bool(tvim_present),
         "tvtext": tvtext_manifest,
+        "tvlex": tvlex_manifest,
     }
 
 
