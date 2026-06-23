@@ -288,9 +288,12 @@ pip install "lodedb[mcp]"
 It exposes `lodedb_add`, `lodedb_search`, `lodedb_remove`, and `lodedb_stats`, plus
 `lodedb_get` when text is available. `lodedb_search` returns each hit's stored text alongside
 the score, id, and metadata, so a model can rank and answer in a single call rather than
-chaining a follow-up lookup. Start the server with `--exclude-text` to return metrics only
-(this also withdraws `lodedb_get`), or `--no-store-text` to keep no text on disk at all.
-`lodedb_stats` is always metrics-only and raw query text never leaves the process.
+chaining a follow-up lookup. It runs [hybrid search](#hybrid-search) (BM25 lexical + vector,
+fused with RRF) by default when text is retained, so exact tokens like error codes and serials
+surface next to semantic matches; with no text retained it falls back to a vector scan. Start
+the server with `--exclude-text` to return metrics only (this also withdraws `lodedb_get`), or
+`--no-store-text` to keep no text on disk at all. `lodedb_stats` is always metrics-only and raw
+query text never leaves the process.
 
 ### Claude Code, Claude Desktop, Cursor
 

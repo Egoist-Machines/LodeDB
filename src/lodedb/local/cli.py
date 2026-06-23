@@ -254,9 +254,10 @@ def mcp(
 ) -> None:
     """Serve LodeDB as local agent memory over the Model Context Protocol (stdio).
 
-    ``lodedb_search`` returns each hit's stored text by default, so an agent can rank
-    and answer in one call; pass ``--exclude-text`` to return metrics only (this also
-    withdraws the get-by-id tool) or ``--no-store-text`` to keep no text on disk at all.
+    ``lodedb_search`` runs hybrid (BM25 + vector) search and returns each hit's stored text
+    by default, so an agent can rank and answer in one call; pass ``--exclude-text`` to return
+    metrics only (this also withdraws the get-by-id tool) or ``--no-store-text`` to keep no
+    text on disk at all (search then falls back to a vector scan).
     Register with a coding agent, e.g.:
     {"mcpServers": {"lodedb": {"command": "lodedb", "args": ["mcp", "--path", "./data"]}}}
     """
