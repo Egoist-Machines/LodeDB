@@ -1,0 +1,625 @@
+{
+  "dataset": "synthetic",
+  "device": "cuda",
+  "document_count": 500,
+  "embedding": {
+    "doc_embed_ms_warm": 241.2,
+    "effective_device": "cuda",
+    "native_dim": 384,
+    "note": "one fixed model across all backends; baselines receive these vectors, LodeDB text-path adapters re-embed and the runner subtracts this time for store-only",
+    "query_embed_ms_warm": 140.76
+  },
+  "incremental_count": 20,
+  "model": "minilm",
+  "provenance": "measured",
+  "query_count": 32,
+  "suite": "memory_integrations",
+  "suites": {
+    "langchain": {
+      "backends": [
+        {
+          "backend": "lodedb",
+          "footprint_bytes": 464249,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 549206,
+            "is_delta_persistence": true,
+            "mean_ms": 9.4561,
+            "p50_ms": 9.2364,
+            "p95_ms": 11.0092
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": true,
+            "store_only_docs_per_s": 3226.3,
+            "store_only_ms": 154.98,
+            "total_ms": 396.17
+          },
+          "persist": {
+            "full_dump_ms": 73.41
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.2319,
+            "p50_ms": 0.2134,
+            "p95_ms": 0.2587,
+            "recall_at_k": 0.9187
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 290.27,
+            "surviving_documents": 520
+          },
+          "role": "lodedb"
+        },
+        {
+          "backend": "inmemory",
+          "footprint_bytes": 5557742,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 5780032,
+            "is_delta_persistence": false,
+            "mean_ms": 251.2896,
+            "p50_ms": 249.3232,
+            "p95_ms": 257.5062
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 99095.3,
+            "store_only_ms": 5.05,
+            "total_ms": 5.05
+          },
+          "persist": {
+            "full_dump_ms": 290.59
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 7.3057,
+            "p50_ms": 7.199,
+            "p95_ms": 7.7244,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 89.69,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "faiss",
+          "footprint_bytes": 890146,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 923226,
+            "is_delta_persistence": false,
+            "mean_ms": 2.5777,
+            "p50_ms": 2.4595,
+            "p95_ms": 2.7963
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 1333.5,
+            "store_only_ms": 374.97,
+            "total_ms": 374.97
+          },
+          "persist": {
+            "full_dump_ms": 2.14
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.0817,
+            "p50_ms": 0.0747,
+            "p95_ms": 0.1055,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 2.25,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "chroma",
+          "footprint_bytes": 2035876,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 2760228,
+            "is_delta_persistence": true,
+            "mean_ms": 8.4914,
+            "p50_ms": 5.4106,
+            "p95_ms": 7.1673
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 400.8,
+            "store_only_ms": 1247.62,
+            "total_ms": 1247.62
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 4.0189,
+            "p50_ms": 3.2488,
+            "p95_ms": 4.7769,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 7.36,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "qdrant",
+          "footprint_bytes": 2101768,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 2187784,
+            "is_delta_persistence": true,
+            "mean_ms": 0.6009,
+            "p50_ms": 0.5132,
+            "p95_ms": 0.7075
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 331.7,
+            "store_only_ms": 1507.5,
+            "total_ms": 1507.5
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.919,
+            "p50_ms": 0.8654,
+            "p95_ms": 1.088,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 42.89,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        }
+      ],
+      "default_backend": "inmemory",
+      "document_count": 500,
+      "framework": "langchain",
+      "interface": "langchain_core.vectorstores.VectorStore",
+      "query_count": 32,
+      "workflow": "rag"
+    },
+    "llamaindex": {
+      "backends": [
+        {
+          "backend": "lodedb",
+          "footprint_bytes": 440749,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 524766,
+            "is_delta_persistence": true,
+            "mean_ms": 8.4823,
+            "p50_ms": 8.3525,
+            "p95_ms": 9.6933
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": true,
+            "store_only_docs_per_s": 3171.1,
+            "store_only_ms": 157.67,
+            "total_ms": 398.87
+          },
+          "persist": {
+            "full_dump_ms": 74.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.2293,
+            "p50_ms": 0.2166,
+            "p95_ms": 0.2415,
+            "recall_at_k": 0.9187
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 290.58,
+            "surviving_documents": 520
+          },
+          "role": "lodedb"
+        },
+        {
+          "backend": "simple",
+          "footprint_bytes": 4340969,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 4514603,
+            "is_delta_persistence": false,
+            "mean_ms": 611.8317,
+            "p50_ms": 619.9686,
+            "p95_ms": 626.1436
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 20754.0,
+            "store_only_ms": 24.09,
+            "total_ms": 24.09
+          },
+          "persist": {
+            "full_dump_ms": 591.16
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 9.461,
+            "p50_ms": 9.4543,
+            "p95_ms": 9.6109,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 1087.72,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "faiss",
+          "footprint_bytes": 768045,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 798765,
+            "is_delta_persistence": false,
+            "mean_ms": 1.0181,
+            "p50_ms": 0.8284,
+            "p95_ms": 1.2436
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 23876.5,
+            "store_only_ms": 20.94,
+            "total_ms": 20.94
+          },
+          "persist": {
+            "full_dump_ms": 0.47
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.0594,
+            "p50_ms": 0.0538,
+            "p95_ms": 0.0612,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 0.42,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "chroma",
+          "footprint_bytes": 3661988,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 4386340,
+            "is_delta_persistence": true,
+            "mean_ms": 7.7716,
+            "p50_ms": 5.4677,
+            "p95_ms": 7.7839
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 1017.2,
+            "store_only_ms": 491.55,
+            "total_ms": 491.55
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 4.9573,
+            "p50_ms": 3.6021,
+            "p95_ms": 4.8444,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 7.2,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        },
+        {
+          "backend": "qdrant",
+          "footprint_bytes": 2359812,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 2449924,
+            "is_delta_persistence": true,
+            "mean_ms": 0.6391,
+            "p50_ms": 0.6109,
+            "p95_ms": 0.8987
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 2212.7,
+            "store_only_ms": 225.97,
+            "total_ms": 225.97
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.9777,
+            "p50_ms": 0.9327,
+            "p95_ms": 1.098,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 32.22,
+            "surviving_documents": 520
+          },
+          "role": "baseline"
+        }
+      ],
+      "default_backend": "simple",
+      "document_count": 500,
+      "framework": "llamaindex",
+      "interface": "llama_index.core.vector_stores.types.BasePydanticVectorStore",
+      "query_count": 32,
+      "workflow": "rag"
+    },
+    "mem0": {
+      "backends": [
+        {
+          "backend": "lodedb",
+          "filtered_query": {
+            "count": 32,
+            "filter": "user_id=u0",
+            "mean_ms": 0.3507,
+            "p50_ms": 0.306,
+            "p95_ms": 0.3959,
+            "recall_at_k": 0.9594
+          },
+          "footprint_bytes": 462222,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 1224384,
+            "is_delta_persistence": true,
+            "mean_ms": 3.4172,
+            "p50_ms": 3.1405,
+            "p95_ms": 3.866
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 1811.6,
+            "store_only_ms": 276.01,
+            "total_ms": 276.01
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.2839,
+            "p50_ms": 0.2686,
+            "p95_ms": 0.2973,
+            "recall_at_k": 0.9187
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 290.32,
+            "surviving_documents": 520
+          },
+          "role": "lodedb",
+          "update": {
+            "count": 64,
+            "mean_ms": 4.1468,
+            "p50_ms": 3.98,
+            "p95_ms": 5.7577
+          }
+        },
+        {
+          "backend": "qdrant",
+          "filtered_query": {
+            "count": 32,
+            "filter": "user_id=u0",
+            "mean_ms": 4.774,
+            "p50_ms": 4.7178,
+            "p95_ms": 5.1372,
+            "recall_at_k": 1.0
+          },
+          "footprint_bytes": 2101805,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 2200109,
+            "is_delta_persistence": true,
+            "mean_ms": 0.5333,
+            "p50_ms": 0.5051,
+            "p95_ms": 0.6303
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 1766.5,
+            "store_only_ms": 283.05,
+            "total_ms": 283.05
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.8125,
+            "p50_ms": 0.7837,
+            "p95_ms": 0.8771,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 33.63,
+            "surviving_documents": 520
+          },
+          "role": "baseline",
+          "update": {
+            "count": 64,
+            "mean_ms": 0.6013,
+            "p50_ms": 0.5845,
+            "p95_ms": 0.7877
+          }
+        },
+        {
+          "backend": "faiss",
+          "filtered_query": {
+            "count": 32,
+            "filter": "user_id=u0",
+            "mean_ms": 0.1067,
+            "p50_ms": 0.1041,
+            "p95_ms": 0.1186,
+            "recall_at_k": 0.1812
+          },
+          "footprint_bytes": 890270,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 925921,
+            "is_delta_persistence": true,
+            "mean_ms": 4.186,
+            "p50_ms": 4.0142,
+            "p95_ms": 5.0156
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 43926.3,
+            "store_only_ms": 11.38,
+            "total_ms": 11.38
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 0.0826,
+            "p50_ms": 0.0746,
+            "p95_ms": 0.0897,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 1.42,
+            "surviving_documents": 520
+          },
+          "role": "baseline",
+          "update": {
+            "count": 64,
+            "mean_ms": 9.8116,
+            "p50_ms": 9.4673,
+            "p95_ms": 10.8614
+          }
+        },
+        {
+          "backend": "chroma",
+          "filtered_query": {
+            "count": 32,
+            "filter": "user_id=u0",
+            "mean_ms": 3.903,
+            "p50_ms": 3.8178,
+            "p95_ms": 4.169,
+            "recall_at_k": 1.0
+          },
+          "footprint_bytes": 1667236,
+          "incremental_add": {
+            "count": 20,
+            "footprint_bytes_after": 2393908,
+            "is_delta_persistence": true,
+            "mean_ms": 6.2972,
+            "p50_ms": 6.3429,
+            "p95_ms": 6.9219
+          },
+          "ingest": {
+            "documents": 500,
+            "embeds_on_ingest": false,
+            "store_only_docs_per_s": 2782.8,
+            "store_only_ms": 179.67,
+            "total_ms": 179.67
+          },
+          "persist": {
+            "full_dump_ms": 0.0
+          },
+          "query": {
+            "count": 32,
+            "k": 10,
+            "mean_ms": 4.1685,
+            "p50_ms": 3.2321,
+            "p95_ms": 4.9055,
+            "recall_at_k": 1.0
+          },
+          "reopen": {
+            "durable": true,
+            "expected_documents": 520,
+            "reopen_ms": 10.27,
+            "surviving_documents": 520
+          },
+          "role": "baseline",
+          "update": {
+            "count": 64,
+            "mean_ms": 7.6591,
+            "p50_ms": 5.5997,
+            "p95_ms": 6.7681
+          }
+        }
+      ],
+      "document_count": 500,
+      "filter_user_share": 0.1,
+      "framework": "mem0",
+      "interface": "mem0.vector_stores.base.VectorStoreBase",
+      "n_users": 10,
+      "query_count": 32,
+      "workflow": "agent_memory"
+    }
+  },
+  "top_k": 10
+}

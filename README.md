@@ -8,6 +8,22 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
+**A drop-in, durable memory backend for LangChain, LlamaIndex, and mem0.** Point any of them
+at LodeDB instead of its default store. Over 17.5k documents (measured on a Modal A10), per
+framework default:
+
+| vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
+|---|---|---|---|
+| On-disk footprint | **7.0× smaller** | **5.3× smaller** | **4.6× smaller** |
+| Query latency (p50) | **404× faster** | **502× faster** | **29× faster** |
+| Durable add of one memory | **620× faster** | **1,341× faster** | both ms-scale |
+
+The in-memory defaults rewrite the whole store to persist one new memory (about 10 to 22
+seconds at this corpus size) and scan in pure Python; LodeDB appends an O(changed) delta
+(about 16 ms) and keeps queries sub-millisecond, at 0.95 recall@10 (4-bit quantized) versus
+the defaults' exact 1.00. [Full benchmark, all backends (FAISS, Chroma, Qdrant), and
+method.](benchmarks/memory_integrations)
+
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the
 GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
