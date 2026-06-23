@@ -45,10 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (SQLite topology + LodeDB semantic index). `EntityNode`/`ChunkNode` map to typed graph nodes
   (node properties round-trip as JSON), and `Relation` to directed, typed edges; `get` /
   `get_triplets` / `get_rel_map` traverse the topology, while `vector_query` runs semantic node
-  search (text-path, with the same `DEFAULT`/`HYBRID`/`SPARSE` mode mapping as the vector-store
-  adapter). `supports_vector_queries` is true; `structured_query` (Cypher) is not supported.
-  `KnowledgeGraph` gains `list_nodes` / `list_edges` complete-set enumeration to back the
-  adapter's topology reads.
+  search. `supports_vector_queries` is true; `structured_query` (Cypher) is not supported.
+  `KnowledgeGraph` gains `list_nodes` / `list_edges` complete-set enumeration (to back the
+  adapter's topology reads) and a **vector-only mode** (`KnowledgeGraph(vector_dim=D)`) that
+  indexes nodes and edges by caller-supplied embeddings at an arbitrary dimension with no
+  internal embedder. The adapter detects that mode and stores LlamaIndex node embeddings /
+  queries by `query.query_embedding`, so the high-level `PropertyGraphIndex` works with **any**
+  `embed_model` (set `D` to the embedder's dimension). In the default text-path mode it embeds
+  node text and `query.query_str` with the graph's own model, mapping
+  `DEFAULT`/`HYBRID`/`SEMANTIC_HYBRID`/`SPARSE`/`TEXT_SEARCH` the same way the vector-store
+  adapter does.
 
 ### Documentation
 

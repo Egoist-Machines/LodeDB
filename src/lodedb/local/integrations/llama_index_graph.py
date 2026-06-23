@@ -15,19 +15,23 @@ metadata they round-trip with their original types. A :class:`Relation` maps to 
 typed edge ``(source_id) -[label]-> (target_id)`` whose id is derived from that triple (so
 re-upserting the same relation upserts).
 
-**Text-path.** Like the vector-store adapter, node text is embedded by LodeDB's own model
-(`KnowledgeGraph(model=...)`); LlamaIndex's ``embed_model`` is not used for storage, so a node's
-precomputed ``embedding`` is ignored and the node is (re)embedded from its name/text.
+**Two embedding modes.** By default the wrapped :class:`KnowledgeGraph` is *text-path*: node
+text (an entity's name, a chunk's text) is embedded by LodeDB's own model, LlamaIndex's
+``embed_model`` is not used, and a node's precomputed ``embedding`` is ignored. Open the graph
+as *vector-only* instead (``KnowledgeGraph(vector_dim=D)``, or
+``LodeDBPropertyGraphStore.from_path(path, vector_dim=D)``) to bring your own embeddings: then
+:meth:`upsert_nodes` stores each node's ``embedding`` directly at dimension ``D`` and
+:meth:`vector_query` searches by a precomputed query vector. This is the mode that makes
+LlamaIndex's high-level ``PropertyGraphIndex`` work with **any** ``embed_model`` — set ``D`` to
+the embedder's dimension (e.g. 1536) so node and query embeddings stay in the same space.
 
-**Semantic queries.** ``supports_vector_queries`` is True. :meth:`vector_query` prefers
-``query.query_str`` (the fully text-path route: LodeDB embeds the query with its own model) and
-maps ``VectorStoreQueryMode`` the same way the vector-store adapter does (``DEFAULT`` ->
-vector, ``HYBRID``/``SEMANTIC_HYBRID`` -> BM25 + RRF, ``SPARSE``/``TEXT_SEARCH`` -> lexical).
-When only ``query.query_embedding`` is supplied — which is what LlamaIndex's high-level
-``VectorContextRetriever`` does — it is used directly against the index; that is meaningful
-only when LlamaIndex's ``embed_model`` matches the KG's model and dimension (minilm -> 384,
-bge -> 768), because LodeDB compares it against node-text embeddings it produced with the KG
-model. ``supports_structured_queries`` is False: :meth:`structured_query` (Cypher) raises.
+**Semantic queries.** ``supports_vector_queries`` is True. In text-path mode
+:meth:`vector_query` prefers ``query.query_str`` (LodeDB embeds the query with its own model)
+and maps ``VectorStoreQueryMode`` the same way the vector-store adapter does (``DEFAULT`` ->
+vector, ``HYBRID``/``SEMANTIC_HYBRID`` -> BM25 + RRF, ``SPARSE``/``TEXT_SEARCH`` -> lexical). In
+vector-only mode it uses ``query.query_embedding`` (a pure vector lookup), which is exactly what
+LlamaIndex's high-level ``VectorContextRetriever`` supplies. ``supports_structured_queries`` is
+False: :meth:`structured_query` (Cypher) raises.
 
 **Traversal.** :meth:`get_rel_map` expands the graph from seed nodes over the SQLite adjacency,
 and :meth:`get_triplets` / :meth:`get` enumerate the topology, so these are deterministic
@@ -84,9 +88,23 @@ class LodeDBPropertyGraphStore(PropertyGraphStore):
         self._kg = kg
 
     @classmethod
-    def from_path(cls, path: str, *, model: str = "minilm", device: str = "auto", **kwargs: Any):
-        """Opens a :class:`KnowledgeGraph` at ``path`` and wraps it (examples/tests)."""
+    def from_path(
+        cls,
+        path: str,
+        *,
+        model: str = "minilm",
+        device: str = "auto",
+        vector_dim: int | None = None,
+        **kwargs: Any,
+    ):
+        """Opens a :class:`KnowledgeGraph` at ``path`` and wraps it (examples/tests).
 
+        Pass ``vector_dim`` to open a bring-your-own-embeddings (vector-only) graph at that
+        dimension; otherwise the graph is text-path and embeds node text with ``model``.
+        """
+
+        if vector_dim is not None:
+            return cls(KnowledgeGraph(path=path, vector_dim=vector_dim, **kwargs))
         return cls(KnowledgeGraph(path=path, model=model, device=device, **kwargs))
 
     @property
@@ -281,14 +299,14 @@ class LodeDBPropertyGraphStore(PropertyGraphStore):
     ) -> tuple[list[LabelledNode], list[float]]:
         """Returns the top-``k`` nodes for ``query``, with their scores.
 
-        Prefers ``query.query_str`` (text-path; LodeDB embeds the query and honors the mapped
-        ``query.mode``); falls back to ``query.query_embedding`` for a pure vector lookup when
-        no query string is given (see the module docstring on matching the embedding model).
+        In text-path mode it prefers ``query.query_str`` (LodeDB embeds the query and honors the
+        mapped ``query.mode``); a vector-only graph uses ``query.query_embedding`` directly (what
+        LlamaIndex's ``VectorContextRetriever`` supplies). See the module docstring.
         """
 
         lode_mode = self._resolve_mode(query.mode)
         k = int(query.similarity_top_k or 1)
-        if query.query_str and query.query_str.strip():
+        if not self._kg.vector_only and query.query_str and query.query_str.strip():
             results = self._kg.semantic_nodes(query.query_str, k=k, mode=lode_mode)
         elif query.query_embedding is not None:
             if lode_mode != "vector":
@@ -297,6 +315,11 @@ class LodeDBPropertyGraphStore(PropertyGraphStore):
                     "embedding-only query can only run a pure vector search."
                 )
             results = self._kg.semantic_nodes(embedding=query.query_embedding, k=k)
+        elif self._kg.vector_only:
+            raise ValueError(
+                "LodeDBPropertyGraphStore: this is a vector-only graph, so vector_query needs "
+                "query.query_embedding (there is no internal model to embed query.query_str)."
+            )
         else:
             raise ValueError(
                 "LodeDBPropertyGraphStore.vector_query needs query.query_str or "
@@ -325,28 +348,34 @@ class LodeDBPropertyGraphStore(PropertyGraphStore):
 
     # -- internals ----------------------------------------------------------
 
-    @staticmethod
-    def _node_to_kg(node: LabelledNode) -> dict[str, Any]:
-        """Builds :meth:`KnowledgeGraph.add_nodes` args for one LlamaIndex node (text-path)."""
+    def _node_to_kg(self, node: LabelledNode) -> dict[str, Any]:
+        """Builds :meth:`KnowledgeGraph.add_nodes` args for one LlamaIndex node.
+
+        Text-path by default (the node is embedded from its name/text); in a vector-only
+        graph the node's precomputed ``embedding`` is stored directly instead.
+        """
 
         properties = dict(node.properties or {})
         if isinstance(node, ChunkNode):
             properties[_KIND_KEY] = _CHUNK
-            return {
+            item: dict[str, Any] = {
                 "id": node.id,
                 "type": node.label,
                 "label": node.text,
                 "properties": properties,
             }
-        # EntityNode (or a bare LabelledNode): embed by the entity name.
-        properties[_KIND_KEY] = _ENTITY
-        name = getattr(node, "name", node.id)
-        return {
-            "id": node.id,
-            "type": node.label,
-            "label": name,
-            "properties": properties,
-        }
+        else:
+            # EntityNode (or a bare LabelledNode): embed by the entity name.
+            properties[_KIND_KEY] = _ENTITY
+            item = {
+                "id": node.id,
+                "type": node.label,
+                "label": getattr(node, "name", node.id),
+                "properties": properties,
+            }
+        if self._kg.vector_only and node.embedding is not None:
+            item["embedding"] = list(node.embedding)
+        return item
 
     @staticmethod
     def _node_from_kg(node: Node) -> LabelledNode:

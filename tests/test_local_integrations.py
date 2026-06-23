@@ -463,3 +463,84 @@ def test_llama_index_property_graph_unsupported(tmp_path):
     assert store.get_triplets() == []
 
     kg.close()
+
+
+def test_llama_index_property_graph_vector_only(tmp_path):
+    """A vector-only graph stores LlamaIndex node embeddings and queries by embedding.
+
+    This is the path that makes the high-level PropertyGraphIndex work with any embed_model:
+    nodes carry their own embeddings (here dim 8) and the query is a precomputed vector.
+    """
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.graph_stores.types import EntityNode
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+    def onehot(i: int) -> list[float]:
+        vector = [0.0] * 8
+        vector[i] = 1.0
+        return vector
+
+    store = LodeDBPropertyGraphStore.from_path(str(tmp_path / "kg"), vector_dim=8)
+    assert store.client.vector_only is True
+
+    store.upsert_nodes(
+        [
+            EntityNode(name="a", label="X", embedding=onehot(0)),
+            EntityNode(name="b", label="X", embedding=onehot(3)),
+        ]
+    )
+
+    # Query by a precomputed embedding (what VectorContextRetriever passes); deterministic
+    # via one-hot vectors.
+    nodes, scores = store.vector_query(
+        VectorStoreQuery(query_embedding=onehot(3), similarity_top_k=2)
+    )
+    assert nodes[0].id == "b"
+    assert all(isinstance(s, float) for s in scores)
+
+    # Topology / get still work; reconstructed nodes are EntityNodes.
+    assert {n.id for n in store.get(ids=["a", "b"])} == {"a", "b"}
+
+    # A text query has nothing to embed in a vector-only graph.
+    with pytest.raises(ValueError):
+        store.vector_query(VectorStoreQuery(query_str="hello", similarity_top_k=1))
+
+    store.client.close()
+
+
+def test_llama_index_property_graph_high_level_retriever(tmp_path):
+    """End-to-end: LlamaIndex's VectorContextRetriever drives a vector-only graph.
+
+    Proves the high-level PropertyGraphIndex retrieval path "just works" with any embed_model:
+    the retriever embeds the query, vector_query finds the seed, and get_rel_map returns its
+    relational context.
+    """
+
+    pytest.importorskip("llama_index.core")
+    vector_mod = pytest.importorskip(
+        "llama_index.core.indices.property_graph.sub_retrievers.vector"
+    )
+    from llama_index.core.embeddings import MockEmbedding
+    from llama_index.core.graph_stores.types import EntityNode, Relation
+
+    from lodedb.local.integrations.llama_index_graph import LodeDBPropertyGraphStore
+
+    emb = MockEmbedding(embed_dim=8)  # arbitrary dim; the graph is opened to match
+    store = LodeDBPropertyGraphStore.from_path(str(tmp_path / "kg"), vector_dim=8)
+    alice = EntityNode(name="alice", label="X")
+    alice.embedding = emb.get_text_embedding("alice")
+    acme = EntityNode(name="acme", label="X")
+    acme.embedding = emb.get_text_embedding("acme")
+    store.upsert_nodes([alice, acme])
+    store.upsert_relations([Relation(label="WORKS_AT", source_id="alice", target_id="acme")])
+
+    retriever = vector_mod.VectorContextRetriever(
+        graph_store=store, embed_model=emb, similarity_top_k=2, include_text=False
+    )
+    results = retriever.retrieve("who is alice?")
+    assert results  # the seed's relational context (alice -[WORKS_AT]-> acme)
+
+    store.client.close()

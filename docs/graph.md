@@ -166,14 +166,26 @@ store = LodeDBPropertyGraphStore(KnowledgeGraph(path="./kg"))
 
 LlamaIndex `EntityNode`/`ChunkNode` map to typed graph nodes (node properties
 round-trip as JSON) and `Relation` to directed, typed edges. `get` / `get_triplets` /
-`get_rel_map` traverse the topology; `vector_query` runs semantic node search and is
-text-path (it embeds `query.query_str` with the graph's own model, mapping
-`DEFAULT`/`HYBRID`/`SPARSE` the same way the vector-store adapter does). When only a
-precomputed `query_embedding` is supplied (LlamaIndex's high-level
-`VectorContextRetriever`), it is used directly and is meaningful only when LlamaIndex's
-`embed_model` matches the graph's model and dimension. `structured_query` (Cypher) is
-not supported. To back the adapter's complete-set reads, `KnowledgeGraph` exposes
-`list_nodes()` / `list_edges()`.
+`get_rel_map` traverse the topology; `structured_query` (Cypher) is not supported, and
+`KnowledgeGraph` exposes `list_nodes()` / `list_edges()` to back the adapter's
+complete-set reads.
+
+There are two embedding modes:
+
+- **Text-path (default).** LodeDB embeds node text (an entity's name, a chunk's text)
+  and `query.query_str` with the graph's own model; `vector_query` maps
+  `DEFAULT`/`HYBRID`/`SPARSE` the same way the vector-store adapter does. LlamaIndex's
+  `embed_model` is not used.
+- **Vector-only (bring your own embeddings).** Open the graph with a `vector_dim` and the
+  semantic index has no embedder: the adapter stores each node's own `embedding` and
+  `vector_query` searches by `query.query_embedding`. This is what LlamaIndex's high-level
+  `PropertyGraphIndex` / `VectorContextRetriever` use, so it works with **any** `embed_model`
+  — set the dimension to the embedder's:
+
+  ```python
+  # match your embed_model's dimension (e.g. 1536); nodes and queries stay in one space
+  store = LodeDBPropertyGraphStore.from_path("./kg", vector_dim=1536)
+  ```
 
 ## Benchmarks
 
