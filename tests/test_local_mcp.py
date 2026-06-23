@@ -13,6 +13,7 @@ from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB
 from lodedb.local.mcp_server import (
     _add,
+    _default_search_mode,
     _get,
     _remove,
     _search,
@@ -107,3 +108,62 @@ def test_lodedb_get_registered_only_when_store_text_enabled(tmp_path):
     finally:
         db_on.close()
         db_off.close()
+
+
+def test_search_helper_inlines_text_only_when_requested(tmp_path):
+    """_search carries each hit's stored text under include_text, and omits it otherwise."""
+
+    db = _db(tmp_path, store_text=True)
+    _add(db, "the quick brown fox", id="fox", metadata={"topic": "animals"})
+
+    [with_text] = _search(db, "fox", k=1, include_text=True)
+    assert with_text["id"] == "fox"
+    assert with_text["text"] == "the quick brown fox"
+
+    [redacted] = _search(db, "fox", k=1)
+    assert "text" not in redacted
+    db.close()
+
+
+def test_exclude_text_redacts_server_even_with_store_text_on(tmp_path):
+    """exclude_text withdraws lodedb_get even though raw text is retained on disk."""
+
+    pytest.importorskip("mcp")  # needs lodedb[mcp]
+    server, db = build_mcp_server(
+        tmp_path,
+        store_text=True,
+        exclude_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    try:
+        names = _tool_names(server)
+        assert "lodedb_search" in names
+        assert "lodedb_get" not in names
+    finally:
+        db.close()
+
+
+def test_default_search_mode_prefers_hybrid_when_lexical_source_available(tmp_path):
+    """The server defaults to hybrid when text is retained, and vector when it is not."""
+
+    db_text = _db(tmp_path / "text", store_text=True)
+    db_no_text = _db(tmp_path / "notext", store_text=False)
+    try:
+        assert _default_search_mode(db_text) == "hybrid"
+        assert _default_search_mode(db_no_text) == "vector"
+    finally:
+        db_text.close()
+        db_no_text.close()
+
+
+def test_search_helper_runs_hybrid_and_recovers_exact_token(tmp_path):
+    """_search forwards mode=hybrid, so an exact lexical token outranks an unrelated doc."""
+
+    db = _db(tmp_path, store_text=True)
+    _add(db, "the turbine reported fault code E1234 overnight", id="t3")
+    _add(db, "a lazy dog sleeps all day", id="dog")
+
+    hits = _search(db, "E1234", k=2, mode="hybrid", include_text=True)
+    assert hits[0]["id"] == "t3"
+    assert "E1234" in hits[0]["text"]
+    db.close()

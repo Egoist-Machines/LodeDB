@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **MCP search returns document text and defaults to hybrid.** The `lodedb mcp` server's
+  `lodedb_search` tool now returns each hit's stored text alongside the score, id, and
+  metadata, so an agent can rank and answer in a single call instead of chaining a follow-up
+  get-by-id. It also runs hybrid (BM25 lexical + vector) ranking by default when a lexical
+  source is available, recovering exact tokens like error codes and serials, and falls back to
+  a vector scan otherwise. Pass `--exclude-text` to redact text from the server (search returns
+  metrics only and the get-by-id tool is withdrawn) while keeping it on disk for hybrid search,
+  or `--no-store-text` to retain no text at all. The stats tool stays metrics-only and raw
+  query text never leaves the process.
+
+- **`lodedb doctor` detects CPU-only PyTorch on Windows.** PyPI serves the CPU-only torch
+  wheel on Windows by default (and no package metadata can redirect torch to the CUDA index),
+  so embeddings silently run on the CPU. `doctor` now flags this and prints the CUDA-index
+  reinstall command, and `lodedb doctor --fix` runs the reinstall so embeddings use an NVIDIA
+  GPU.
+
+### Documentation
+
+- **MCP server setup.** Added a "Use as an MCP server" README section covering the exposed
+  tools and host wiring for Claude Code/Desktop, Cursor, and LM Studio.
+- **Windows GPU embeddings.** README documents the CPU-only-torch default on Windows and the
+  `lodedb doctor --fix` (or manual CUDA-index) reinstall.
 
 ## [0.2.0] - 2026-06-23
 

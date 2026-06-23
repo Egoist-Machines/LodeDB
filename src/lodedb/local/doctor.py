@@ -14,6 +14,8 @@ rather than reimplementing any capability logic. Reports, honestly:
 
 from __future__ import annotations
 
+import platform
+import shutil
 from typing import Any
 
 from lodedb.engine.turbovec_index import (
@@ -25,8 +27,41 @@ from lodedb.local.backends import (
     is_apple_silicon,
     resolve_local_device,
     torch_cuda_available,
+    torch_cuda_build_version,
     torch_mps_available,
 )
+
+# Windows PyPI serves a CPU-only torch wheel by default; this index has the CUDA builds.
+# cu121 is a broadly driver-compatible default; other toolkits live at /whl/cu124, etc.
+_PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
+
+
+def _windows_gpu_embedding_hint() -> dict[str, Any] | None:
+    """On Windows with a CPU-only PyTorch, returns how to switch to a CUDA build.
+
+    PyPI serves the CPU-only torch wheel on Windows by default, so ``pip install lodedb``
+    leaves embeddings on the CPU even on an NVIDIA machine, and no package metadata can
+    redirect torch to the CUDA index. Returns ``None`` when it does not apply: off Windows,
+    when torch is absent, or when torch is already a CUDA build.
+    """
+
+    if platform.system() != "Windows":
+        return None
+    try:
+        import torch  # noqa: F401  (presence check; a broken install is a different problem)
+    except ImportError:
+        return None
+    if torch_cuda_build_version() is not None:
+        return None  # already a CUDA build
+    nvidia_detected = shutil.which("nvidia-smi") is not None
+    return {
+        "torch_cuda_build": False,
+        "nvidia_smi_detected": nvidia_detected,
+        "index_url": _PYTORCH_CUDA_INDEX,
+        "command": (
+            f"pip install torch --force-reinstall --no-deps --index-url {_PYTORCH_CUDA_INDEX}"
+        ),
+    }
 
 
 def _gpu_vector_scan_status() -> dict[str, Any]:
@@ -113,6 +148,7 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
         },
         "gpu_vector_scan": _gpu_vector_scan_status(),
         "mps_vector_scan": _mps_vector_scan_status(),
+        "windows_gpu_hint": _windows_gpu_embedding_hint(),
     }
 
 
@@ -166,4 +202,16 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  default enabled        : {mps_scan['default_enabled']}",
         f"  reason                 : {mps_scan['reason']}",
     ]
+    hint = report.get("windows_gpu_hint")
+    if hint:
+        gpu_state = "detected" if hint["nvidia_smi_detected"] else "if you have one"
+        lines += [
+            "",
+            "Windows GPU embeddings",
+            "  PyTorch build          : CPU-only (no CUDA)",
+            f"  NVIDIA GPU             : {gpu_state}",
+            f"  to embed on the GPU    : {hint['command']}",
+            "    or run `lodedb doctor --fix`; see https://pytorch.org/get-started/locally/",
+            "    for the index matching your CUDA version (cu121, cu124, ...).",
+        ]
     return "\n".join(lines)

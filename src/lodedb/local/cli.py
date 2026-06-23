@@ -43,6 +43,13 @@ _STORE_TEXT_OPTION = typer.Option(
     help="Retain raw text so `lodedb get ID` can return it (default on; "
     "--no-store-text opts out).",
 )
+_EXCLUDE_TEXT_OPTION = typer.Option(
+    False,
+    "--exclude-text",
+    help="MCP only: redact document text from the server. `lodedb_search` returns "
+    "metrics only and the get-by-id tool is withdrawn, while text stays on disk for "
+    "hybrid search. By default (text retained) search returns each hit's text.",
+)
 _DURABILITY_OPTION = typer.Option(
     None,
     "--durability",
@@ -55,14 +62,61 @@ _DURABILITY_OPTION = typer.Option(
 def doctor(
     device: str = typer.Option("auto", "--device", "-d", help="Device to report resolution for."),
     json_out: bool = typer.Option(False, "--json", help="Emit the raw capability JSON."),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="If PyTorch is a CPU-only build on Windows, reinstall the CUDA build so "
+        "embeddings can run on an NVIDIA GPU.",
+    ),
 ) -> None:
-    """Reports local capabilities: embedding device, backend, CUDA GPU scan."""
+    """Reports local capabilities: embedding device, backend, CUDA GPU scan.
+
+    With ``--fix``, reinstalls the CUDA PyTorch build when this is a CPU-only torch on
+    Windows: PyPI serves CPU-only torch there and no package metadata can redirect it, so
+    it is the one thing the report cannot resolve on its own.
+    """
 
     report = local_capability_report(device=device)
     if json_out:
         typer.echo(json.dumps(report, indent=2, sort_keys=True))
     else:
         typer.echo(format_capability_report(report))
+    if fix:
+        _fix_windows_torch(report.get("windows_gpu_hint"))
+
+
+def _fix_windows_torch(hint: dict | None) -> None:
+    """Reinstalls the CUDA PyTorch build when doctor flagged a CPU-only torch on Windows."""
+
+    if not hint:
+        typer.echo("\nNothing to fix: --fix only applies to a CPU-only PyTorch on Windows.")
+        return
+
+    import subprocess
+    import sys
+
+    args = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "torch",
+        "--force-reinstall",
+        "--no-deps",
+        "--index-url",
+        hint["index_url"],
+    ]
+    typer.echo("\nReinstalling the CUDA PyTorch build:\n  " + " ".join(args))
+    result = subprocess.run(args)  # noqa: S603 - fixed args, user opted in via --fix
+    if result.returncode != 0:
+        typer.echo(
+            "\nCould not run pip automatically (a uv-managed venv may not include pip). "
+            "Reinstall with your package manager, e.g.:\n"
+            f"  {hint['command']}\n"
+            f"  uv pip install torch --reinstall --index-url {hint['index_url']}"
+        )
+        return
+    typer.echo("\nDone. Re-run `lodedb doctor` to confirm the embedding device resolves to cuda.")
 
 
 @app.command()
@@ -243,17 +297,23 @@ def mcp(
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
+    exclude_text: bool = _EXCLUDE_TEXT_OPTION,
 ) -> None:
     """Serve LodeDB as local agent memory over the Model Context Protocol (stdio).
 
-    The ``lodedb_get`` tool returns a memory's original text by id and is exposed by
-    default; pass ``--no-store-text`` to opt out. Register with a coding agent, e.g.:
+    ``lodedb_search`` runs hybrid (BM25 + vector) search and returns each hit's stored text
+    by default, so an agent can rank and answer in one call; pass ``--exclude-text`` to return
+    metrics only (this also withdraws the get-by-id tool) or ``--no-store-text`` to keep no
+    text on disk at all (search then falls back to a vector scan).
+    Register with a coding agent, e.g.:
     {"mcpServers": {"lodedb": {"command": "lodedb", "args": ["mcp", "--path", "./data"]}}}
     """
 
     from lodedb.local.mcp_server import build_mcp_server
 
-    server, _db = build_mcp_server(path, model=model, device=device, store_text=store_text)
+    server, _db = build_mcp_server(
+        path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
+    )
     server.run(transport="stdio")
 
 

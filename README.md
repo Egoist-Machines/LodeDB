@@ -28,8 +28,8 @@ Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 - **Private by default**: text, ids, and vectors stay local; telemetry is metrics-only
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
-- **Batteries included**: a `lodedb` CLI, a loopback dev server, an MCP server, and a
-  LangChain `VectorStore` adapter.
+- **Batteries included**: a `lodedb` CLI, a loopback dev server, an
+  [MCP server](#use-as-an-mcp-server), and a LangChain `VectorStore` adapter.
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
@@ -49,6 +49,32 @@ the install with `lodedb doctor`. Optional extras:
 pip install "lodedb[gpu]"            # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[mcp,langchain]"  # MCP server + LangChain adapter
 ```
+
+<details>
+<summary><b>Windows: NVIDIA GPU embeddings</b></summary>
+
+On Windows, PyPI serves the CPU-only PyTorch build by default, so `pip install lodedb` (and
+`uv`) leave embeddings on the CPU even on a CUDA machine, and no package metadata can override
+which torch wheel pip resolves. `lodedb doctor` detects this and prints the fix; `lodedb doctor
+--fix` reinstalls the CUDA build for you:
+
+```bash
+lodedb doctor          # flags a CPU-only PyTorch on Windows and prints the command
+lodedb doctor --fix    # reinstalls the CUDA build so embeddings use your NVIDIA GPU
+```
+
+Or reinstall manually, picking the index for your CUDA version (`cu121`, `cu124`, ...) from the
+[PyTorch install guide](https://pytorch.org/get-started/locally/):
+
+```bash
+pip install torch --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu121
+uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu121   # with uv
+```
+
+This is Windows-only: the default Linux PyPI wheel already bundles CUDA, and macOS uses CPU
+or MPS.
+
+</details>
 
 <details>
 <summary><b>Build from source</b> (contributors, or a platform without a wheel)</summary>
@@ -257,6 +283,60 @@ lodedb serve       # loopback dev server (127.0.0.1, no auth)
 lodedb mcp         # stdio MCP server for agent memory
 lodedb benchmark   # local, metrics-only benchmark
 ```
+
+## Use as an MCP server
+
+LodeDB ships a [Model Context Protocol](https://modelcontextprotocol.io) server, so an agent
+can use a local on-disk database as long-term memory or a RAG store. It runs over stdio, adds
+no storage logic of its own, and your data stays on the machine. Install the extra and point
+your host at `lodedb mcp`:
+
+```bash
+pip install "lodedb[mcp]"
+```
+
+It exposes `lodedb_add`, `lodedb_search`, `lodedb_remove`, and `lodedb_stats`, plus
+`lodedb_get` when text is available. `lodedb_search` returns each hit's stored text alongside
+the score, id, and metadata, so a model can rank and answer in a single call rather than
+chaining a follow-up lookup. It runs [hybrid search](#hybrid-search) (BM25 lexical + vector,
+fused with RRF) by default when text is retained, so exact tokens like error codes and serials
+surface next to semantic matches; with no text retained it falls back to a vector scan. Start
+the server with `--exclude-text` to return metrics only (this also withdraws `lodedb_get`), or
+`--no-store-text` to keep no text on disk at all. `lodedb_stats` is always metrics-only and raw
+query text never leaves the process.
+
+<details>
+<summary><b>Register with a coding agent</b> (Claude Code, Claude Desktop, Cursor, LM Studio, Codex)</summary>
+
+The `lodedb` command must be on the host's `PATH`; if you installed into a virtual environment
+(including a `uv` project) where it isn't, use the `uv run` form at the bottom.
+
+**Claude Code, Claude Desktop, Cursor, LM Studio**: add the stdio entry to the host's MCP
+config (`claude_desktop_config.json`, `.cursor/mcp.json`, or LM Studio's `mcp.json`), or run
+`claude mcp add lodedb -- lodedb mcp --path ./data`:
+
+```json
+{ "mcpServers": { "lodedb": { "command": "lodedb", "args": ["mcp", "--path", "./data"] } } }
+```
+
+**Codex**: add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.lodedb]
+command = "lodedb"
+args = ["mcp", "--path", "./data"]
+```
+
+**From a virtual environment (uv)**, when `lodedb` is not on `PATH`:
+
+```json
+{ "mcpServers": { "lodedb": { "command": "uv",
+  "args": ["run", "--project", "/path/to/LodeDB", "lodedb", "mcp", "--path", "/path/to/data"] } } }
+```
+
+See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste starting point.
+
+</details>
 
 ## Concurrency & durability
 

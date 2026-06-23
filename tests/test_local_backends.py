@@ -73,6 +73,58 @@ def test_doctor_report_is_honest_about_gpu_scan():
     assert "opt-in" in text
 
 
+def test_torch_cuda_build_version_returns_none_or_str():
+    """The build-version probe returns None (CPU build or torch absent) or a version string."""
+
+    from lodedb.local.backends import torch_cuda_build_version
+
+    value = torch_cuda_build_version()
+    assert value is None or isinstance(value, str)
+
+
+def test_windows_gpu_hint_absent_off_windows(monkeypatch):
+    """No Windows GPU hint is emitted on non-Windows platforms."""
+
+    import lodedb.local.doctor as doctor
+
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Darwin")
+    assert doctor._windows_gpu_embedding_hint() is None
+    assert local_capability_report(device="auto")["windows_gpu_hint"] is None
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch not installed")
+def test_windows_gpu_hint_present_for_cpu_torch_on_windows(monkeypatch):
+    """On Windows with a CPU-only torch build, the hint carries the CUDA reinstall command."""
+
+    import lodedb.local.doctor as doctor
+
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(doctor, "torch_cuda_build_version", lambda: None)
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "C:\\nvidia-smi.exe")
+
+    hint = doctor._windows_gpu_embedding_hint()
+    assert hint is not None
+    assert hint["torch_cuda_build"] is False
+    assert hint["nvidia_smi_detected"] is True
+    assert "download.pytorch.org/whl/cu" in hint["command"]
+
+    report = local_capability_report(device="auto")
+    text = format_capability_report(report)
+    assert "Windows GPU embeddings" in text
+    assert "force-reinstall" in text
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch not installed")
+def test_windows_gpu_hint_absent_for_cuda_torch_build(monkeypatch):
+    """No hint when torch is already a CUDA build, even on Windows."""
+
+    import lodedb.local.doctor as doctor
+
+    monkeypatch.setattr(doctor.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(doctor, "torch_cuda_build_version", lambda: "12.1")
+    assert doctor._windows_gpu_embedding_hint() is None
+
+
 def test_doctor_report_is_honest_about_patched_core():
     """doctor reports whether the patched TurboVec APIs are actually present.
 

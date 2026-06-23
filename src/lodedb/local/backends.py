@@ -78,6 +78,22 @@ def torch_cuda_available() -> bool:
         return False
 
 
+def torch_cuda_build_version() -> str | None:
+    """Returns the CUDA version PyTorch was built against (e.g. ``"12.1"``), else ``None``.
+
+    ``None`` means torch is not importable *or* it is a CPU-only build: a CPU-only wheel
+    reports ``torch.version.cuda is None`` even on a CUDA-capable machine, which is the
+    default ``pip install torch`` on Windows. Distinct from :func:`torch_cuda_available`,
+    which probes for a usable *device* at runtime.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        return None
+    return getattr(getattr(torch, "version", None), "cuda", None)
+
+
 def resolve_local_device(requested: str) -> str:
     """Resolves an ``auto`` device request to a concrete device for this machine.
 
