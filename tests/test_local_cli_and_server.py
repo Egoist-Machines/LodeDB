@@ -49,6 +49,20 @@ def test_cli_doctor_text_and_json():
     assert "gpu_vector_scan" in report
 
 
+def test_cli_doctor_fix_is_no_op_when_nothing_to_fix(monkeypatch):
+    """`lodedb doctor --fix` prints a clear no-op message when there is no CPU torch to fix.
+
+    The hint is forced absent so the test never shells out to pip on any platform.
+    """
+
+    import lodedb.local.doctor as doctor
+
+    monkeypatch.setattr(doctor, "_windows_gpu_embedding_hint", lambda: None)
+    result = runner.invoke(app, ["doctor", "--fix"])
+    assert result.exit_code == 0, result.output
+    assert "Nothing to fix" in result.output
+
+
 def test_cli_help_lists_all_commands():
     """The CLI exposes serve | index | query | benchmark | doctor."""
 

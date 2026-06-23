@@ -52,19 +52,26 @@ pip install "lodedb[mcp,langchain]"  # MCP server + LangChain adapter
 
 ### Windows: NVIDIA GPU embeddings
 
-On Windows, PyPI serves the CPU-only PyTorch build by default, so `pip install` (and `uv`)
-leave embeddings on the CPU even on a CUDA machine. To embed on the GPU, reinstall PyTorch
-from the CUDA index that matches your toolkit:
+On Windows, PyPI serves the CPU-only PyTorch build by default, so `pip install lodedb` (and
+`uv`) leave embeddings on the CPU even on a CUDA machine, and no package metadata can override
+which torch wheel pip resolves. `lodedb doctor` detects this and prints the fix; `lodedb doctor
+--fix` reinstalls the CUDA build for you:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+lodedb doctor          # flags a CPU-only PyTorch on Windows and prints the command
+lodedb doctor --fix    # reinstalls the CUDA build so embeddings use your NVIDIA GPU
+```
+
+Or reinstall manually, picking the index for your CUDA version (`cu121`, `cu124`, ...) from the
+[PyTorch install guide](https://pytorch.org/get-started/locally/):
+
+```bash
+pip install torch --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu121
 uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu121   # with uv
 ```
 
-Pick the index for your CUDA version (`cu121`, `cu124`, ...) from the
-[PyTorch install guide](https://pytorch.org/get-started/locally/), then run `lodedb doctor`
-to confirm the embedding device resolves to `cuda`. This is Windows-only: the default Linux
-PyPI wheel already bundles CUDA, and macOS uses CPU or MPS.
+This is Windows-only: the default Linux PyPI wheel already bundles CUDA, and macOS uses CPU
+or MPS.
 
 <details>
 <summary><b>Build from source</b> (contributors, or a platform without a wheel)</summary>

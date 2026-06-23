@@ -19,13 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `--no-store-text` to retain no text at all. The stats tool stays metrics-only and raw
   query text never leaves the process.
 
+- **`lodedb doctor` detects CPU-only PyTorch on Windows.** PyPI serves the CPU-only torch
+  wheel on Windows by default (and no package metadata can redirect torch to the CUDA index),
+  so embeddings silently run on the CPU. `doctor` now flags this and prints the CUDA-index
+  reinstall command, and `lodedb doctor --fix` runs the reinstall so embeddings use an NVIDIA
+  GPU.
+
 ### Documentation
 
 - **MCP server setup.** Added a "Use as an MCP server" README section covering the exposed
   tools and host wiring for Claude Code/Desktop, Cursor, and LM Studio.
-- **Windows GPU embeddings.** Documented that PyPI serves the CPU-only PyTorch build on
-  Windows by default, with the CUDA-index reinstall (`cu121`/`cu124`/...) needed to run
-  embeddings on an NVIDIA GPU.
+- **Windows GPU embeddings.** README documents the CPU-only-torch default on Windows and the
+  `lodedb doctor --fix` (or manual CUDA-index) reinstall.
 
 ## [0.2.0] - 2026-06-23
 
