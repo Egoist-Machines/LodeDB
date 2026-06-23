@@ -173,6 +173,7 @@ class LodeIndex:
         top_k: int = 10,
         filter: Mapping[str, Any] | None = None,
         include: Iterable[str] = (),
+        mode: str = "vector",
         route_drifted: bool = False,
         route_failed: bool = False,
         high_risk: bool = False,
@@ -188,6 +189,7 @@ class LodeIndex:
                     top_k=top_k,
                     filter=dict(filter) if filter is not None else None,
                     include=tuple(include),
+                    mode=str(mode),
                     route_drifted=_required_bool(route_drifted, "route_drifted"),
                     route_failed=_required_bool(route_failed, "route_failed"),
                     high_risk=_required_bool(high_risk, "high_risk"),
@@ -599,11 +601,19 @@ def _query_from_item(item: Mapping[str, Any] | EngineQuery) -> EngineQuery:
             status_code=400,
             response={"status": "error", "error": "top_k must be an integer"},
         )
+    mode = item.get("mode", "vector")
+    if not isinstance(mode, str):
+        raise EngineError(
+            "mode must be a string",
+            status_code=400,
+            response={"status": "error", "error": "mode must be a string"},
+        )
     return EngineQuery(
         text=_required_text(item.get("query"), "query"),
         top_k=top_k,
         filter=dict(item["filter"]) if "filter" in item and item["filter"] is not None else None,
         include=tuple(str(value) for value in include),
+        mode=mode,
         route_drifted=_mapping_bool(item, "route_drifted"),
         route_failed=_mapping_bool(item, "route_failed"),
         high_risk=_mapping_bool(item, "high_risk"),

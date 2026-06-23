@@ -20,7 +20,7 @@ flowchart TB
     MPSS["MPS exact scan<br/>mps_turbovec · first-class opt-in · off by default"]
   end
   TV["Vendored TurboVec core<br/>third_party/turbovec (MIT)"]
-  DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext · .txd)")]
+  DISK[("On-disk index<br/>commit manifest + per-gen dir<br/>(.json · .tvim · .jsd · .tvd · .tvtext · .txd · .tvlex · .lxd)")]
 
   CLI --> SDK
   MCP --> SDK
@@ -99,7 +99,10 @@ Each index is a per-index generation directory plus a single atomically-swapped 
     encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
   - `g<epoch>.tvtext` — the opt-in raw-text base (`store_text=True`): the full
     `document_id -> text` map, plus its `.txd` text journal under `g<epoch>.tvtext.tvtext-delta/`,
-    governed by the same root manifest.
+    governed by the same root manifest,
+  - `g<epoch>.tvlex` — the opt-in lexical-index base (`index_text=True`): the full
+    `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
+    `g<epoch>.tvlex.tvlex-delta/`, governed by the same root manifest.
 
 A commit writes any new artifacts first — bases are generation-addressed and never
 overwritten in place — then atomically swaps `<key>.commit.json`; that swap is the only
@@ -109,7 +112,7 @@ closed, and a lock-free reader loads exactly the generation the root names — c
 snapshot isolation, raw text included. Superseded generations are garbage-collected, keeping
 the most recent few for in-flight readers. The redacted artifacts (`.json`/`.jsd`/`.tvim`/
 `.tvd`) never carry raw document or query text; only the `.tvtext` base + `.txd` journal hold
-raw text.
+raw text, and only the `.tvlex` base + `.lxd` journal hold payload-derived lexical terms.
 
 `db.persist()` returns durable stats (every mutation already commits atomically); reopening
 the same path replays the committed generation. Stores written before this layout (a
@@ -167,3 +170,24 @@ CLI command, `POST /get`, and the MCP `lodedb_get` tool) never weakens any paylo
 guarantee. Removing a document journals a delete. Opening with `store_text=False` opts out
 entirely: no text is retained, the retrieval paths raise/return empty, and any existing store is
 left unread (and dropped when its generation is GC'd).
+
+Hybrid lexical search keeps this boundary intact. The BM25 inverted index behind `mode="hybrid"`
+and `mode="lexical"` is payload-derived, so the serving index is built in memory on the first such
+query of a generation and discarded when the generation advances. It is never written to the
+`.json`/`.jsd`/`.tvim`/`.tvd` artifacts or to telemetry, which stays metrics-only (counts, bytes,
+latency, never tokens or terms).
+
+That serving index needs a source. By default it is rebuilt from the raw-text store, so hybrid and
+lexical search work whenever `store_text=True`. Opening with `index_text=True` adds a durable
+source: the per-chunk tokens of each document are captured at `add` time and kept in a dedicated
+lexical sidecar mapping `document_id -> per-chunk token lists`, a `g<epoch>.tvlex` base plus a
+`.lxd` delta journal. This mirrors the `.tvtext`/`.txd` raw-text pattern exactly: an incremental
+commit journals only the upserted token lists and deleted ids (O(changed), not a full-map
+rewrite), a load replays the deltas onto the base, every base and segment is checksum-guarded and
+fails closed on a corrupt/mismatched file, and the manifest is pinned by the same root commit so
+the sidecar commits and rolls back atomically with the generation. Because the tokens are captured
+at ingest, the lexical sidecar is independent of `store_text`: hybrid and lexical search survive a
+reopen rebuilt purely from the persisted terms, with no raw text and no re-tokenization. Like the
+raw-text store it is deliberately separate from the redacted artifacts above and never reaches
+telemetry, so persisting the lexical index weakens no payload-free guarantee. A lexical query with
+neither `index_text=True` nor `store_text=True` raises a clear error.

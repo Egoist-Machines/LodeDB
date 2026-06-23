@@ -87,6 +87,9 @@ for hits in db.search_many(["fox", "dog"], k=5):   # batched; the GPU can serve 
 db.search("fox", k=5, filter={"topic": "animals"})                      # bare scalar = exact
 db.search("fox", k=5, filter={"$or": [{"topic": "animals"}, {"year": {"$gte": 2020}}]})
 
+# hybrid search: vector recall plus exact lexical matches the embedding misses
+db.search("E1234", k=5, mode="hybrid")     # surfaces error codes, serials, dates in the body
+
 db.get(fox)     # -> "the quick brown fox jumps"  (text retained by default)
 db.persist()    # durable .tvim/.tvd/.jsd snapshot; replays on reopen
 ```
@@ -103,6 +106,68 @@ lock, so it never blocks on (or is blocked by) the writer:
 reader = LodeDB.open_readonly("./data")   # or LodeDB(path="./data", read_only=True)
 reader.search("fox", k=5)                 # reads a committed snapshot
 reader.add("nope")                        # raises ReadOnlyError
+```
+
+## Hybrid search
+
+Vector search alone misses exact tokens the embedding does not capture: error codes
+(`E1234`), serial numbers (`ABC-123`), dates (`2024-01-15`). Pass `mode="hybrid"` to run a
+lexical BM25 ranker alongside the vector scan and fuse the two ranked lists with Reciprocal
+Rank Fusion. The lexical ranker matches those tokens exactly, so a document whose body carries
+the code is recovered even when the embedding ranks it nowhere near the top.
+
+```python
+db.add("the turbine tripped and reported fault code E1234 overnight", metadata={"unit": "t3"})
+
+db.search("E1234", k=5)                 # mode="vector" (default): may miss the exact code
+db.search("E1234", k=5, mode="hybrid")  # BM25 + RRF: surfaces it in the top-k
+db.search("E1234", k=5, mode="lexical") # BM25 ranking alone, no vector scan
+```
+
+### Prerequisites
+
+`mode="hybrid"` and `mode="lexical"` build a BM25 index over your text, so they need a text
+source enabled when you open the database. `mode="vector"` (the default) needs nothing.
+
+| Mode | Enable | Source of the BM25 index |
+| --- | --- | --- |
+| `"vector"` (default) | nothing | not used |
+| `"hybrid"`, `"lexical"` | `store_text=True` (on by default) | rebuilt in memory from the retained raw text |
+| `"hybrid"`, `"lexical"` | `index_text=True` | a durable on-disk postings store, no raw text required |
+
+Either source is enough and you can enable both. `store_text=True` is the default, so hybrid
+works out of the box. With neither source enabled, a hybrid or lexical query raises a clear,
+actionable error rather than silently degrading.
+
+### How it works
+
+A `filter` constrains both rankers, so `mode="hybrid"` with a filter returns the true top-k of
+the matching subset. The vector half of a hybrid query runs on the same scan as `mode="vector"`,
+including the GPU-resident batch scan that serves `search_many`; only the BM25 ranking and the
+fusion run on the CPU, and the vector kernel and on-disk format are untouched. The serving BM25
+index lives in memory and is maintained incrementally: a small mutation folds just the changed
+chunks into the existing index, so a single `add` never forces a full re-tokenization.
+
+### Durable lexical index (`index_text=True`)
+
+By default the BM25 index is rebuilt from the retained raw text, so it needs `store_text=True`
+and is re-tokenized on the first hybrid query after opening. Pass `index_text=True` to persist
+it instead: each document's per-chunk terms are captured at `add` time into a dedicated `.tvlex`
+sidecar (a base plus a `.lxd` delta journal, committed O(changed) per write), so hybrid and
+lexical search survive a reopen rebuilt straight from the persisted terms, with no
+re-tokenization and without retaining the raw text at all. The `.tvlex` sidecar holds
+payload-derived terms only and, like the raw-text sidecar, never reaches the redacted artifacts
+or telemetry. The tokenizer lowercases and splits on punctuation but keeps code-like tokens
+whole, so `ABC-123` and `2024-01-15` stay findable as single tokens. Reopen with the same
+`index_text` value you wrote with.
+
+```python
+db = LodeDB(path="./data", index_text=True, store_text=False)  # durable lexical index, no raw text
+db.add("the turbine tripped and reported fault code E1234 overnight")
+db.close()
+
+reopened = LodeDB(path="./data", index_text=True, store_text=False)
+reopened.search("E1234", k=5, mode="hybrid")  # works after reopen, rebuilt from persisted terms
 ```
 
 ## GPU-resident index
@@ -221,6 +286,10 @@ lodedb benchmark   # local, metrics-only benchmark
   faster on the measured M1, so the MPS scan stays off by default until newer Apple GPUs are
   re-measured.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
+- **Hybrid search needs a lexical source and serves from memory.** `mode="hybrid"`/`"lexical"`
+  need either `store_text=True` (the index built from raw text) or `index_text=True` (a durable
+  `.tvlex` postings store that survives reopens without raw text). The serving index is held in
+  memory and maintained incrementally across mutations.
 - **Single writer per path.** One writer at a time (many concurrent readers), with no live
   cross-process refresh, on local filesystems only. See
   [Concurrency & durability](#concurrency--durability).

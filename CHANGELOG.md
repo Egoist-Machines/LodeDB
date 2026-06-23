@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Hybrid lexical + vector search (BM25 + RRF).** `search`/`search_many` take a `mode`
+  parameter: `"vector"` (default, unchanged), `"hybrid"`, and `"lexical"`. Hybrid runs an
+  Okapi BM25 ranker alongside the vector scan and fuses the two ranked lists with Reciprocal
+  Rank Fusion, so exact tokens the embedding misses (error codes like `E1234`, serials like
+  `ABC-123`, dates like `2024-01-15`) are recovered when they appear in the document body. The
+  tokenizer keeps code-like tokens whole. A `filter` constrains both rankers, so filtered
+  hybrid returns the true top-k of the matching subset. The BM25 ranking and the fusion are a
+  pure-Python CPU post-step and the vector kernel is untouched; the vector half of a hybrid
+  query still rides the batched GPU/MPS scan that serves `search_many`. The serving BM25 index
+  lives in memory, is maintained incrementally across mutations (a small change folds in only
+  the changed chunks), and is never sent to telemetry. By default it is rebuilt
+  from the retained raw text, so `mode="hybrid"`/`"lexical"` work whenever `store_text=True`
+  (the default). The new `LodeDB(..., index_text=True)` flag instead persists the index: the
+  per-chunk terms are captured at `add` time into a dedicated `.tvlex` base plus a `.lxd` delta
+  journal (checksum-guarded, committed O(changed) per write, pinned by the same root commit
+  manifest as the index), so hybrid and lexical search survive a reopen without rebuilding from
+  raw text and without requiring `store_text=True`. The `.tvlex` sidecar holds payload-derived
+  terms only and, like the raw-text sidecar, never reaches the redacted `.json`/`.jsd`/`.tvim`/
+  `.tvd` artifacts or telemetry; `index_text` defaults to off, leaving the standard layout
+  unchanged. A lexical query with neither flag set raises a clear error. The same `mode` is
+  exposed on the knowledge-graph search API (`semantic_nodes` / `semantic_edges` /
+  `search_subgraph`), so exact tokens in node labels and edge facts are recoverable there too.
 
 ## [0.1.2] - 2026-06-22
 

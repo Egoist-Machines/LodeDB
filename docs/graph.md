@@ -115,6 +115,9 @@ for node_id, score in sub.seeds:                 # semantic entry points + score
     ...
 for edge in sub.edges:                            # their 1-hop neighbourhood
     ...
+
+# lexical recall: exact tokens (codes, serials, dates) in labels or edge facts
+sub = kg.search_subgraph("E1234", k=3, hops=1, mode="hybrid")
 ```
 
 Nodes are embedded by their `label`, or by a caller-supplied vector via
@@ -122,6 +125,15 @@ Nodes are embedded by their `label`, or by a caller-supplied vector via
 also index edge "facts" for `semantic_edges`. `reindex()` rebuilds the LodeDB
 index from the SQLite source of truth, using enumeration to drop orphans, which
 makes the index a derived, throwaway artifact.
+
+`semantic_nodes`, `semantic_edges`, and `search_subgraph` take a `mode` argument
+forwarded to LodeDB search: `"vector"` (default), or `"hybrid"`/`"lexical"` to also
+match exact tokens in a node `label` or edge `fact` (error codes, serials, dates)
+the embedding misses. Lexical modes rank the query string, so they cannot be
+combined with a precomputed `embedding`, and they need the graph opened with
+`store_text=True` (the default) or `index_text=True`. This lexical fusion is
+distinct from the structural "hybrid retrieval" above (semantic seeds plus k-hop
+expansion); the two compose.
 
 > `reindex()` rebuilds a labelled node from its `label`. For vector-in nodes, open
 > the graph with `retain_vectors=True`: the topology store then keeps each node's

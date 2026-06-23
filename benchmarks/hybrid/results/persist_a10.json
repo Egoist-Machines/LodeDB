@@ -1,0 +1,194 @@
+{
+  "baseline_store_text": {
+    "bytes_lexical_sidecar": 0,
+    "bytes_total": 49725796,
+    "cold_build_ms": 4329.749488,
+    "document_count": 20215,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 18.044348174999996,
+      "p50_ms": 9.883706000000103,
+      "p95_ms": 44.80877399999983
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 492.83399320000063,
+      "p50_ms": 506.19549600000016,
+      "p95_ms": 566.5230160000015
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 4.107615599999311,
+      "p50_ms": 4.132911000001016,
+      "p95_ms": 4.645202999999043
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "gpu_cupy_exact_direct",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 45.89438569999995,
+        "p50_ms": 17.32456299999896,
+        "p95_ms": 586.7209989999989
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.115534650000257,
+        "p50_ms": 9.090146999998439,
+        "p95_ms": 9.352502000000484
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 44.548907649999855,
+        "p50_ms": 12.25505100000035,
+        "p95_ms": 655.535833
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1165.9826389999992
+  },
+  "commit_overhead": {
+    "absolute_ms": 6.01332971499988,
+    "baseline_mean_ms": 18.044348174999996,
+    "note": "store_text held True; the delta is the additive cost of index_text",
+    "relative_pct": 33.325280895051684,
+    "with_index_text_mean_ms": 24.057677889999876
+  },
+  "config": {
+    "dim": 384,
+    "incremental": 200,
+    "ingest_batch": 2000,
+    "plant_every": 50,
+    "planted_token_count": 134,
+    "query_batch": 64,
+    "query_count": 20,
+    "scale": 20000,
+    "top_k": 10
+  },
+  "index_text_no_store_text": {
+    "bytes_lexical_sidecar": 25548358,
+    "bytes_total": 57060990,
+    "cold_build_ms": 4773.352043000003,
+    "document_count": 20215,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 22.638496879999792,
+      "p50_ms": 11.496606000001464,
+      "p95_ms": 14.374810999996157
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 428.68572040000055,
+      "p50_ms": 441.9272800000016,
+      "p95_ms": 484.40578499999987
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 4.1043819333324905,
+      "p50_ms": 4.120993999997324,
+      "p95_ms": 4.510877999997831
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "gpu_cupy_exact_direct",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 36.67619029999969,
+        "p50_ms": 20.145630000001802,
+        "p95_ms": 356.408885999997
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.201747650000769,
+        "p50_ms": 9.186030999998707,
+        "p95_ms": 9.402403000002835
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 16.29357849999984,
+        "p50_ms": 12.544288999997377,
+        "p95_ms": 84.09931699999618
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1375.2552609999996
+  },
+  "machine": {
+    "cuda_available": true,
+    "gpu_name": "NVIDIA A10",
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35",
+    "python": "3.11.9"
+  },
+  "with_index_text": {
+    "bytes_lexical_sidecar": 25548358,
+    "bytes_total": 75311041,
+    "cold_build_ms": 4937.330882000001,
+    "document_count": 20215,
+    "incremental_commit": {
+      "count": 200,
+      "mean_ms": 24.057677889999876,
+      "p50_ms": 11.432990000002974,
+      "p95_ms": 14.183326000001273
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 419.98189146666596,
+      "p50_ms": 431.58164100000107,
+      "p95_ms": 477.89165300000036
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 4.342816933332945,
+      "p50_ms": 4.186158999999634,
+      "p95_ms": 6.48432599999893
+    },
+    "post_reopen_hybrid_recall_at_k": 0.96875,
+    "query_backend": {
+      "hybrid": "gpu_cupy_exact_direct",
+      "lexical": "avx512bw",
+      "vector": "gpu_cupy_exact_direct"
+    },
+    "query_latency_ms": {
+      "hybrid": {
+        "count": 20,
+        "mean_ms": 36.57515255000057,
+        "p50_ms": 20.440476000004537,
+        "p95_ms": 347.8076339999987
+      },
+      "lexical": {
+        "count": 20,
+        "mean_ms": 9.348454250000415,
+        "p50_ms": 9.228721999996026,
+        "p95_ms": 10.134286000003101
+      },
+      "vector": {
+        "count": 20,
+        "mean_ms": 16.046478250000007,
+        "p50_ms": 12.423585000000514,
+        "p95_ms": 83.85402200000414
+      }
+    },
+    "recall_at_k": {
+      "hybrid": 0.96875,
+      "lexical": 1.0,
+      "vector": 0.0
+    },
+    "reopen_load_ms": 1397.836865000002
+  }
+}
