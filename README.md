@@ -51,6 +51,13 @@ pip install "lodedb[gpu]"                       # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[mcp,langchain,llama-index]" # MCP server + LangChain/LlamaIndex adapters
 ```
 
+Using LodeDB as memory for a coding assistant? After installing the `mcp` extra, register its
+server in one step (details under [Use as an MCP server](#use-as-an-mcp-server)):
+
+```bash
+lodedb mcp install --client claude-code        # or: claude-desktop | cursor | lm-studio | codex | all
+```
+
 <details>
 <summary><b>Windows: NVIDIA GPU embeddings</b></summary>
 
