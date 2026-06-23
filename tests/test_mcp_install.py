@@ -481,7 +481,12 @@ def test_cli_install_passes_through_options(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     args = json.loads(cfg.read_text())["mcpServers"]["lodedb"]["args"]
-    assert args == ["mcp", "--path", "/d", "--model", "bge", "--device", "cuda", "--exclude-text"]
+    # The CLI resolves --path to an absolute path (drive-anchored on Windows, so `/d` becomes
+    # e.g. `D:\d`); assert the structure and the pass-through flags rather than pinning the
+    # platform-specific path string.
+    assert args[:2] == ["mcp", "--path"]
+    assert Path(args[2]).is_absolute()
+    assert args[3:] == ["--model", "bge", "--device", "cuda", "--exclude-text"]
 
 
 def test_cli_install_resolves_relative_path_to_absolute(tmp_path, monkeypatch):
