@@ -69,6 +69,19 @@ def test_vector_in_documents_have_no_text(tmp_path):
     assert db.get_document("a")["chunk_count"] == 1
 
 
+def test_vector_in_optional_text_roundtrip(tmp_path):
+    db = _db(tmp_path)
+    db.add_vectors(_onehot(0), id="a", text='{"data":"payload alpha"}')
+    assert db.get_text("a") == '{"data":"payload alpha"}'
+    db.close()
+
+    reopened = _db(tmp_path)
+    assert reopened.get_text("a") == '{"data":"payload alpha"}'
+    reopened.add_vectors(_onehot(0), id="a")
+    assert reopened.get_text("a") is None
+    reopened.close()
+
+
 def test_normalize_dedup_is_noop(tmp_path):
     db = _db(tmp_path)
     db.add_vectors(_onehot(0, scale=1.0), id="a")

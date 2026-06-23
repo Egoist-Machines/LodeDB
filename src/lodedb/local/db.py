@@ -387,13 +387,14 @@ class LodeDB:
         *,
         id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
         normalize: bool = True,
     ) -> str:
         """Adds (or replaces) one document from a precomputed embedding vector.
 
         The *vector-in* counterpart to :meth:`add`: the caller supplies the
         embedding directly (e.g. from their own model), and LodeDB stores it
-        verbatim without embedding or chunking any text — so this is how an
+        verbatim without embedding or chunking text — so this is how an
         external system (or a graph layer that embeds once) reuses its own
         vectors. The vector must have the index's embedding dimension
         (``minilm`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
@@ -401,9 +402,13 @@ class LodeDB:
         path and with self-embedded documents in the same index; pass
         ``normalize=False`` if your vectors are already unit-norm.
 
-        No raw text is retained for a vector-in document, so :meth:`get` returns
-        ``None`` for it. Reusing an ``id`` upserts; an identical vector is a
-        no-op re-encode. The mutation commits atomically before returning.
+        ``text`` is optional retained payload text for integrations that own
+        embeddings but still need durable payload reconstruction. It is stored
+        only in the dedicated raw-text sidecar when ``store_text=True``; it is
+        never embedded, chunked, or written into redacted metadata. Without
+        ``text``, :meth:`get` returns ``None`` for the vector-in document. Reusing
+        an ``id`` upserts; an identical vector is a no-op re-encode. The mutation
+        commits atomically before returning.
 
         Note: vectors added here are compared by similarity against everything
         else in the index, so only mix vectors produced by the *same* embedding
@@ -419,6 +424,7 @@ class LodeDB:
                     document_id=document_id,
                     vector=prepared,
                     metadata=_coerce_metadata(metadata),
+                    text=_coerce_optional_text(text),
                 ),
             )
         )
@@ -451,6 +457,7 @@ class LodeDB:
                     document_id=document_id,
                     vector=_prepare_vector(vector, self._vector_dim, normalize=normalize),
                     metadata=_coerce_metadata(item.get("metadata")),
+                    text=_coerce_optional_text(item.get("text")),
                 )
             )
         if payload:
@@ -662,6 +669,26 @@ class LodeDB:
         # chunks actually removed, so a positive value means the doc existed.
         response = self._index.delete_batch((id,))
         return int(response.get("deleted_chunks", 0) or 0) > 0
+
+    def _update_document_payload(
+        self,
+        id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+    ) -> None:
+        """Internal adapter hook for metadata/raw-text updates without re-embedding."""
+
+        self._require_writable()
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("id must be a non-empty string")
+        self._index.update_document_payload(
+            id,
+            metadata=_coerce_metadata(metadata) if metadata is not None else None,
+            text=text,
+            clear_text=clear_text,
+        )
 
     def get(self, id: str) -> str | None:
         """Returns the stored raw text for a document id, or ``None`` if absent.
@@ -996,6 +1023,16 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
                 f"metadata value for {key!r} must be a string, number, or bool"
             )
     return coerced
+
+
+def _coerce_optional_text(value: Any) -> str | None:
+    """Validates optional retained text on vector-in document mappings."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("vector document 'text' must be a string when provided")
+    return value
 
 
 def _prepare_vector(

@@ -29,7 +29,7 @@ if "lodedb.engine.gpu_turbovec" in sys.modules:
 """
 
 # LodeDB declares a lean runtime set (turbovec, numpy, typer, sentence-transformers,
-# pyyaml; extras [mcp]/[langchain]/[gpu]). None of the heavy deps below may load when
+# pyyaml; extras [mcp]/[langchain]/[mem0]/[gpu]). None of the heavy deps below may load when
 # the package is imported. Top-level roots are checked (e.g. `sklearn`, not
 # `sklearn.x`) because importing any submodule pulls the heavy root. `scikit-learn`
 # may be *installed* (transitive via sentence-transformers); this asserts it is not
@@ -39,6 +39,16 @@ import importlib, sys
 for _m in ("lodedb", "lodedb.local.db", "lodedb.local.backends", "lodedb.local.cli"):
     importlib.import_module(_m)
 _FORBIDDEN = ("faiss", "modal", "mteb", "datasets", "matplotlib", "sklearn")
+_loaded = {_name.split(".", 1)[0] for _name in sys.modules}
+for _root in _FORBIDDEN:
+    if _root in _loaded:
+        print("LOADED " + _root)
+"""
+
+_OPTIONAL_INTEGRATION_PROBE = """
+import importlib, sys
+importlib.import_module("lodedb")
+_FORBIDDEN = ("langchain", "langchain_core", "llama_index", "mem0")
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:
     if _root in _loaded:
@@ -72,3 +82,9 @@ def test_import_loads_no_heavy_dependency():
     assert leaked == [], (
         f"heavy dependencies loaded on import (must stay out of the lean package): {leaked}"
     )
+
+
+def test_import_does_not_load_optional_integrations():
+    """Importing LodeDB must not import optional framework integrations."""
+
+    assert _probe_lines(_OPTIONAL_INTEGRATION_PROBE, "LOADED") == []

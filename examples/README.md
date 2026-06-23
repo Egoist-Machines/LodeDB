@@ -10,6 +10,7 @@ The first run downloads the embedding model from Hugging Face and caches it loca
 | [`langchain_store.py`](langchain_store.py) | LodeDB as a LangChain `VectorStore` (needs `--extra langchain`) | `uv run python examples/langchain_store.py` |
 | [`llama_index_store.py`](llama_index_store.py) | LodeDB as a LlamaIndex `VectorStore` (needs `--extra llama-index`) | `uv run python examples/llama_index_store.py` |
 | [`llama_index_graph_store.py`](llama_index_graph_store.py) | LodeDB as a LlamaIndex `PropertyGraphStore` (needs `--extra llama-index`) | `uv run python examples/llama_index_graph_store.py` |
+| [`mem0_store.py`](mem0_store.py) | LodeDB as a mem0 `VectorStoreBase` backend (needs `--extra mem0`) | `uv run python examples/mem0_store.py` |
 | [`mcp_config.json`](mcp_config.json) | Register LodeDB as an MCP-capable agent's local memory (needs `--extra mcp`) | drop into your agent's MCP config |
 
 Each script writes its index under a local `./data*` folder, which is git-ignored.
