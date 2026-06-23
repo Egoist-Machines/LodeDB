@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-command MCP install for coding assistants.** `lodedb mcp install --client <client>`
+  registers the LodeDB MCP server with a coding assistant in one step, instead of hand-editing
+  each host's config. It supports `claude-code`, `claude-desktop`, `cursor`, `lm-studio`, `codex`,
+  and `all`, resolving the right launch command for the current environment so `command`/`args`
+  are correct even when `lodedb` is not on `PATH` (it falls back to the `uv run --project ...`
+  form, then an absolute path to the entry point), and resolving `--path` to an absolute path so
+  the entry works wherever the client launches the server. The edit is idempotent (an existing
+  `lodedb` entry is updated, never duplicated) and leaves other servers untouched; Claude Code is
+  registered via `claude mcp add` and the others edit the JSON/TOML config directly. It passes
+  through the `lodedb mcp` options (`--path`, `--model`, `--device`, `--exclude-text`,
+  `--no-store-text`), prints the entry and the file it wrote, and supports `--dry-run`, a
+  `--config <path>` override, and Cursor's project-level `--project <dir>`. `lodedb mcp uninstall
+  --client <client>` removes the entry again.
+
 - **MCP search returns document text and defaults to hybrid.** The `lodedb mcp` server's
   `lodedb_search` tool now returns each hit's stored text alongside the score, id, and
   metadata, so an agent can rank and answer in a single call instead of chaining a follow-up
