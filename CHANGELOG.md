@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.2.1] - 2026-06-23
+
 ### Added
 
 - **One-command MCP install for coding assistants.** `lodedb mcp install --client <client>`
