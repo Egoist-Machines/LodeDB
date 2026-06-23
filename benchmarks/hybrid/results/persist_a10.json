@@ -1,39 +1,51 @@
 {
   "baseline_store_text": {
     "bytes_lexical_sidecar": 0,
-    "bytes_total": 49663390,
-    "cold_build_ms": 4482.609755,
-    "document_count": 20200,
+    "bytes_total": 49725796,
+    "cold_build_ms": 4437.3811510000005,
+    "document_count": 20215,
     "incremental_commit": {
       "count": 200,
-      "mean_ms": 17.388290589999983,
-      "p50_ms": 11.471359000001513,
-      "p95_ms": 15.1950369999998
+      "mean_ms": 17.398173459999967,
+      "p50_ms": 10.562127000000032,
+      "p95_ms": 22.35314600000038
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 478.86045113333347,
+      "p50_ms": 449.82778299999995,
+      "p95_ms": 551.009312999998
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 32.704642333332735,
+      "p50_ms": 32.95019199999771,
+      "p95_ms": 33.59791799999812
     },
     "post_reopen_hybrid_recall_at_k": 0.96875,
     "query_backend": {
-      "hybrid": "avx512bw",
+      "hybrid": "gpu_cupy_exact_direct",
       "lexical": "avx512bw",
       "vector": "gpu_cupy_exact_direct"
     },
     "query_latency_ms": {
       "hybrid": {
         "count": 20,
-        "mean_ms": 82.13450179999988,
-        "p50_ms": 53.48277599999918,
-        "p95_ms": 629.3251949999999
+        "mean_ms": 43.736357899999945,
+        "p50_ms": 20.11901199999855,
+        "p95_ms": 490.331638999999
       },
       "lexical": {
         "count": 20,
-        "mean_ms": 9.35870285,
-        "p50_ms": 9.386684999999062,
-        "p95_ms": 10.127672999999504
+        "mean_ms": 9.033916199999936,
+        "p50_ms": 9.015393000000316,
+        "p95_ms": 9.58791100000056
       },
       "vector": {
         "count": 20,
-        "mean_ms": 49.138157849999594,
-        "p50_ms": 12.409545000000577,
-        "p95_ms": 744.7242029999987
+        "mean_ms": 46.11466170000007,
+        "p50_ms": 13.216629000000424,
+        "p95_ms": 669.1367209999992
       }
     },
     "recall_at_k": {
@@ -41,14 +53,14 @@
       "lexical": 1.0,
       "vector": 0.0
     },
-    "reopen_load_ms": 1069.6894550000006
+    "reopen_load_ms": 1188.4714340000003
   },
   "commit_overhead": {
-    "absolute_ms": 9.122090280000158,
-    "baseline_mean_ms": 17.388290589999983,
+    "absolute_ms": 6.222440260000031,
+    "baseline_mean_ms": 17.398173459999967,
     "note": "store_text held True; the delta is the additive cost of index_text",
-    "relative_pct": 52.461110152174925,
-    "with_index_text_mean_ms": 26.51038087000014
+    "relative_pct": 35.76490528908684,
+    "with_index_text_mean_ms": 23.620613719999998
   },
   "config": {
     "dim": 384,
@@ -62,40 +74,52 @@
     "top_k": 10
   },
   "index_text_no_store_text": {
-    "bytes_lexical_sidecar": 25539863,
-    "bytes_total": 56996919,
-    "cold_build_ms": 4906.076339000002,
-    "document_count": 20200,
+    "bytes_lexical_sidecar": 25548358,
+    "bytes_total": 57060990,
+    "cold_build_ms": 4928.060038000005,
+    "document_count": 20215,
     "incremental_commit": {
       "count": 200,
-      "mean_ms": 22.57466867500021,
-      "p50_ms": 11.074061999998719,
-      "p95_ms": 14.89035800000238
+      "mean_ms": 20.032045434999972,
+      "p50_ms": 9.947331999995868,
+      "p95_ms": 12.107849999999587
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 374.057293733334,
+      "p50_ms": 404.81093900000076,
+      "p95_ms": 437.4104389999971
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 96.87779739999958,
+      "p50_ms": 69.08823799999908,
+      "p95_ms": 187.23107999999655
     },
     "post_reopen_hybrid_recall_at_k": 0.96875,
     "query_backend": {
-      "hybrid": "avx512bw",
+      "hybrid": "gpu_cupy_exact_direct",
       "lexical": "avx512bw",
       "vector": "gpu_cupy_exact_direct"
     },
     "query_latency_ms": {
       "hybrid": {
         "count": 20,
-        "mean_ms": 81.64173830000045,
-        "p50_ms": 57.24876400000056,
-        "p95_ms": 496.86584100000175
+        "mean_ms": 33.92792465000056,
+        "p50_ms": 17.531429000001708,
+        "p95_ms": 339.9365980000013
       },
       "lexical": {
         "count": 20,
-        "mean_ms": 9.858297400000282,
-        "p50_ms": 9.8473150000018,
-        "p95_ms": 10.363978000000884
+        "mean_ms": 9.037586150000365,
+        "p50_ms": 9.024943999996538,
+        "p95_ms": 9.30656599999935
       },
       "vector": {
         "count": 20,
-        "mean_ms": 19.011195399999536,
-        "p50_ms": 14.393308999999022,
-        "p95_ms": 95.70612999999639
+        "mean_ms": 16.0124427500012,
+        "p50_ms": 12.272373000001835,
+        "p95_ms": 85.69872600000394
       }
     },
     "recall_at_k": {
@@ -103,7 +127,7 @@
       "lexical": 1.0,
       "vector": 0.0
     },
-    "reopen_load_ms": 1407.3424460000012
+    "reopen_load_ms": 1333.1910480000033
   },
   "machine": {
     "cuda_available": true,
@@ -112,40 +136,52 @@
     "python": "3.11.9"
   },
   "with_index_text": {
-    "bytes_lexical_sidecar": 25539863,
-    "bytes_total": 75234178,
-    "cold_build_ms": 5120.140413999998,
-    "document_count": 20200,
+    "bytes_lexical_sidecar": 25548358,
+    "bytes_total": 75311041,
+    "cold_build_ms": 5012.19004,
+    "document_count": 20215,
     "incremental_commit": {
       "count": 200,
-      "mean_ms": 26.51038087000014,
-      "p50_ms": 12.44794800000193,
-      "p95_ms": 15.616204000000522
+      "mean_ms": 23.620613719999998,
+      "p50_ms": 11.283598999998645,
+      "p95_ms": 14.500919999999695
+    },
+    "post_mutation_first_query_full_rebuild_ms": {
+      "count": 15,
+      "mean_ms": 388.7498441333321,
+      "p50_ms": 426.22765499999815,
+      "p95_ms": 439.834359999999
+    },
+    "post_mutation_first_query_incremental_ms": {
+      "count": 15,
+      "mean_ms": 76.3886800666654,
+      "p50_ms": 69.14315799999571,
+      "p95_ms": 181.73372500000085
     },
     "post_reopen_hybrid_recall_at_k": 0.96875,
     "query_backend": {
-      "hybrid": "avx512bw",
+      "hybrid": "gpu_cupy_exact_direct",
       "lexical": "avx512bw",
       "vector": "gpu_cupy_exact_direct"
     },
     "query_latency_ms": {
       "hybrid": {
         "count": 20,
-        "mean_ms": 76.32925034999953,
-        "p50_ms": 54.782184999996986,
-        "p95_ms": 485.81541699999775
+        "mean_ms": 40.0638275500004,
+        "p50_ms": 17.608551999998667,
+        "p95_ms": 463.1146380000004
       },
       "lexical": {
         "count": 20,
-        "mean_ms": 9.699483199999648,
-        "p50_ms": 9.672324999996817,
-        "p95_ms": 10.418502000000274
+        "mean_ms": 9.04986415000053,
+        "p50_ms": 9.032894000000624,
+        "p95_ms": 9.303817000002823
       },
       "vector": {
         "count": 20,
-        "mean_ms": 18.41321279999999,
-        "p50_ms": 13.461670999998177,
-        "p95_ms": 97.36167999999878
+        "mean_ms": 16.477637200000217,
+        "p50_ms": 12.414226000004192,
+        "p95_ms": 90.19691599999646
       }
     },
     "recall_at_k": {
@@ -153,6 +189,6 @@
       "lexical": 1.0,
       "vector": 0.0
     },
-    "reopen_load_ms": 1381.128871999998
+    "reopen_load_ms": 1554.7537089999964
   }
 }

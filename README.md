@@ -124,18 +124,42 @@ db.search("E1234", k=5, mode="hybrid")  # BM25 + RRF: surfaces it in the top-k
 db.search("E1234", k=5, mode="lexical") # BM25 ranking alone, no vector scan
 ```
 
-Hybrid is a pure-CPU post-step over the same vector scan, so it changes no kernel format. A
-`filter` constrains both rankers, so `mode="hybrid"` with a filter returns the true top-k of
-the matching subset. The serving BM25 index lives in memory and is rebuilt lazily after a
-mutation. By default it is rebuilt from the retained raw text, so `mode="hybrid"`/`"lexical"`
-work whenever `store_text=True` (the default). Pass `index_text=True` to instead persist the
-index durably: the per-chunk terms are captured at `add` time into a dedicated `.tvlex` sidecar
-(a base plus a `.lxd` delta journal, committed O(changed) per write), so hybrid and lexical
-search survive a reopen without rebuilding from raw text and without requiring `store_text=True`.
-With neither `index_text=True` nor `store_text=True`, a lexical query raises a clear error. The
-`.tvlex` sidecar holds payload-derived terms only and, like the raw-text sidecar, never reaches
-the redacted artifacts or telemetry. The tokenizer lowercases and splits on punctuation but
-keeps code-like tokens whole, so `ABC-123` and `2024-01-15` stay findable as single tokens.
+### Prerequisites
+
+`mode="hybrid"` and `mode="lexical"` build a BM25 index over your text, so they need a text
+source enabled when you open the database. `mode="vector"` (the default) needs nothing.
+
+| Mode | Enable | Source of the BM25 index |
+| --- | --- | --- |
+| `"vector"` (default) | nothing | not used |
+| `"hybrid"`, `"lexical"` | `store_text=True` (on by default) | rebuilt in memory from the retained raw text |
+| `"hybrid"`, `"lexical"` | `index_text=True` | a durable on-disk postings store, no raw text required |
+
+Either source is enough and you can enable both. `store_text=True` is the default, so hybrid
+works out of the box. With neither source enabled, a hybrid or lexical query raises a clear,
+actionable error rather than silently degrading.
+
+### How it works
+
+A `filter` constrains both rankers, so `mode="hybrid"` with a filter returns the true top-k of
+the matching subset. The vector half of a hybrid query runs on the same scan as `mode="vector"`,
+including the GPU-resident batch scan that serves `search_many`; only the BM25 ranking and the
+fusion run on the CPU, and the vector kernel and on-disk format are untouched. The serving BM25
+index lives in memory and is maintained incrementally: a small mutation folds just the changed
+chunks into the existing index, so a single `add` never forces a full re-tokenization.
+
+### Durable lexical index (`index_text=True`)
+
+By default the BM25 index is rebuilt from the retained raw text, so it needs `store_text=True`
+and is re-tokenized on the first hybrid query after opening. Pass `index_text=True` to persist
+it instead: each document's per-chunk terms are captured at `add` time into a dedicated `.tvlex`
+sidecar (a base plus a `.lxd` delta journal, committed O(changed) per write), so hybrid and
+lexical search survive a reopen rebuilt straight from the persisted terms, with no
+re-tokenization and without retaining the raw text at all. The `.tvlex` sidecar holds
+payload-derived terms only and, like the raw-text sidecar, never reaches the redacted artifacts
+or telemetry. The tokenizer lowercases and splits on punctuation but keeps code-like tokens
+whole, so `ABC-123` and `2024-01-15` stay findable as single tokens. Reopen with the same
+`index_text` value you wrote with.
 
 ```python
 db = LodeDB(path="./data", index_text=True, store_text=False)  # durable lexical index, no raw text
@@ -263,9 +287,9 @@ lodedb benchmark   # local, metrics-only benchmark
   re-measured.
 - **Single queries run on the CPU**; the GPU serves batched `search_many`.
 - **Hybrid search needs a lexical source and serves from memory.** `mode="hybrid"`/`"lexical"`
-  need either `store_text=True` (the index rebuilt from raw text) or `index_text=True` (a
-  durable `.tvlex` postings store that survives reopens without raw text). Either way the
-  serving index is rebuilt lazily in memory after a mutation.
+  need either `store_text=True` (the index built from raw text) or `index_text=True` (a durable
+  `.tvlex` postings store that survives reopens without raw text). The serving index is held in
+  memory and maintained incrementally across mutations.
 - **Single writer per path.** One writer at a time (many concurrent readers), with no live
   cross-process refresh, on local filesystems only. See
   [Concurrency & durability](#concurrency--durability).

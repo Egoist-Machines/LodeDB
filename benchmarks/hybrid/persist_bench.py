@@ -105,6 +105,7 @@ def _measure_config(
     query_count: int,
     top_k: int,
     lexical_capable: bool,
+    post_mutation_rounds: int = 15,
 ) -> dict[str, Any]:
     """Builds one corpus, then measures commit, query, storage, and reopen costs."""
 
@@ -146,6 +147,26 @@ def _measure_config(
         )
         recall[mode] = hits / len(probes)
 
+    # Follow-up B signal: the cost of the first hybrid query right after a single
+    # mutation. The incremental path folds the one added chunk into the cached
+    # BM25 index in place; the forced path clears the cache so the same query
+    # pays a full O(corpus) rebuild. The gap is the incremental-maintenance win.
+    incremental_samples: list[float] = []
+    rebuild_samples: list[float] = []
+    probe_slice = probes[: min(8, len(probes))]
+    engine = getattr(getattr(db, "_index", None), "engine", None)
+    can_force = engine is not None and hasattr(engine, "_lexical_indexes")
+    for i in range(post_mutation_rounds):
+        db.add(f"{_PROSE} post-mutation probe {i}", id=f"pm-{i}", metadata={"shard": "9"})
+        started = time.perf_counter()
+        db.search_many(probe_slice, k=top_k, mode="hybrid")
+        incremental_samples.append((time.perf_counter() - started) * 1000.0)
+        if can_force:
+            engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild to compare
+            started = time.perf_counter()
+            db.search_many(probe_slice, k=top_k, mode="hybrid")
+            rebuild_samples.append((time.perf_counter() - started) * 1000.0)
+
     persist_dir = Path(db.path)
     total_bytes = _dir_bytes(persist_dir)
     lexical_bytes = _dir_bytes(persist_dir, suffix=".tvlex")
@@ -169,12 +190,14 @@ def _measure_config(
     reopened.close()
 
     return {
-        "document_count": len(documents) + incremental,
+        "document_count": len(documents) + incremental + post_mutation_rounds,
         "cold_build_ms": build_ms,
         "incremental_commit": _summary(commit_samples),
         "query_latency_ms": query_latency,
         "query_backend": backends,
         "recall_at_k": recall,
+        "post_mutation_first_query_incremental_ms": _summary(incremental_samples),
+        "post_mutation_first_query_full_rebuild_ms": _summary(rebuild_samples),
         "reopen_load_ms": reopen_ms,
         "post_reopen_hybrid_recall_at_k": post_recall,
         "bytes_total": total_bytes,

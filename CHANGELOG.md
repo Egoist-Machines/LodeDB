@@ -15,9 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rank Fusion, so exact tokens the embedding misses (error codes like `E1234`, serials like
   `ABC-123`, dates like `2024-01-15`) are recovered when they appear in the document body. The
   tokenizer keeps code-like tokens whole. A `filter` constrains both rankers, so filtered
-  hybrid returns the true top-k of the matching subset. Lexical ranking and fusion are a
-  pure-Python CPU post-step (the vector kernel, GPU, and MPS paths are untouched), and the
-  serving BM25 index lives in memory and is never sent to telemetry. By default it is rebuilt
+  hybrid returns the true top-k of the matching subset. The BM25 ranking and the fusion are a
+  pure-Python CPU post-step and the vector kernel is untouched; the vector half of a hybrid
+  query still rides the batched GPU/MPS scan that serves `search_many`. The serving BM25 index
+  lives in memory, is maintained incrementally across mutations (a small change folds in only
+  the changed chunks), and is never sent to telemetry. By default it is rebuilt
   from the retained raw text, so `mode="hybrid"`/`"lexical"` work whenever `store_text=True`
   (the default). The new `LodeDB(..., index_text=True)` flag instead persists the index: the
   per-chunk terms are captured at `add` time into a dedicated `.tvlex` base plus a `.lxd` delta

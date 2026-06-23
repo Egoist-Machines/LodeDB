@@ -340,8 +340,9 @@ class LodeDB:
         ``index_text=True`` (a durable postings store that survives reopens
         without raw text) or ``store_text=True`` (the index rebuilt from the
         retained raw text, the default); requesting them with neither raises
-        :class:`ValueError`. The serving index lives in memory, is rebuilt lazily
-        after a mutation, and never changes the on-disk format.
+        :class:`ValueError`. The serving index lives in memory, is maintained
+        incrementally across mutations (a small change folds in only the changed
+        chunks), and never changes the on-disk format.
 
         ``filter`` narrows results by metadata and is pushed into the TurboVec
         allowlist by the engine, so ``k`` still returns the true top-``k`` of the
@@ -401,8 +402,9 @@ class LodeDB:
         ``search_many(mode="hybrid")`` returns the same result as the
         corresponding repeated single :meth:`search` call. ``"hybrid"`` and
         ``"lexical"`` require a lexical source (``index_text=True`` or
-        ``store_text=True``). Vector queries in a batch keep the batched scan;
-        hybrid and lexical queries run as individual CPU post-steps.
+        ``store_text=True``). A batch of hybrid queries batches its vector half on
+        the shared scan (the GPU serves it where available) and fuses each query's
+        BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
         """
 
         if not isinstance(queries, list) or not queries:
