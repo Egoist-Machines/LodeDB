@@ -50,7 +50,8 @@ pip install "lodedb[gpu]"            # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[mcp,langchain]"  # MCP server + LangChain adapter
 ```
 
-### Windows: NVIDIA GPU embeddings
+<details>
+<summary><b>Windows: NVIDIA GPU embeddings</b></summary>
 
 On Windows, PyPI serves the CPU-only PyTorch build by default, so `pip install lodedb` (and
 `uv`) leave embeddings on the CPU even on a CUDA machine, and no package metadata can override
@@ -72,6 +73,8 @@ uv pip install torch --reinstall --index-url https://download.pytorch.org/whl/cu
 
 This is Windows-only: the default Linux PyPI wheel already bundles CUDA, and macOS uses CPU
 or MPS.
+
+</details>
 
 <details>
 <summary><b>Build from source</b> (contributors, or a platform without a wheel)</summary>
@@ -302,31 +305,38 @@ the server with `--exclude-text` to return metrics only (this also withdraws `lo
 `--no-store-text` to keep no text on disk at all. `lodedb_stats` is always metrics-only and raw
 query text never leaves the process.
 
-### Claude Code, Claude Desktop, Cursor
+<details>
+<summary><b>Register with a coding agent</b> (Claude Code, Claude Desktop, Cursor, LM Studio, Codex)</summary>
 
-Add an entry to the host's MCP config (`claude_desktop_config.json`, `.cursor/mcp.json`, or
-`claude mcp add`):
+The `lodedb` command must be on the host's `PATH`; if you installed into a virtual environment
+(including a `uv` project) where it isn't, use the `uv run` form at the bottom.
+
+**Claude Code, Claude Desktop, Cursor, LM Studio**: add the stdio entry to the host's MCP
+config (`claude_desktop_config.json`, `.cursor/mcp.json`, or LM Studio's `mcp.json`), or run
+`claude mcp add lodedb -- lodedb mcp --path ./data`:
 
 ```json
 { "mcpServers": { "lodedb": { "command": "lodedb", "args": ["mcp", "--path", "./data"] } } }
 ```
 
-### LM Studio
+**Codex**: add to `~/.codex/config.toml`:
 
-LM Studio drives the same stdio server. Add it to `mcp.json` (Program > Edit `mcp.json`) with
-the identical entry. The `lodedb` command must be on the host's `PATH`; if you installed into
-a virtual environment (including a `uv` project), run it through your environment manager
-instead:
+```toml
+[mcp_servers.lodedb]
+command = "lodedb"
+args = ["mcp", "--path", "./data"]
+```
+
+**From a virtual environment (uv)**, when `lodedb` is not on `PATH`:
 
 ```json
 { "mcpServers": { "lodedb": { "command": "uv",
   "args": ["run", "--project", "/path/to/LodeDB", "lodedb", "mcp", "--path", "/path/to/data"] } } }
 ```
 
-See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste starting point. On
-Windows with an NVIDIA GPU, install the CUDA PyTorch build (see
-[Windows: NVIDIA GPU embeddings](#windows-nvidia-gpu-embeddings)) so the server embeds on the
-GPU.
+See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste starting point.
+
+</details>
 
 ## Concurrency & durability
 
