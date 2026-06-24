@@ -17,10 +17,13 @@ Each script writes its index under a local `./data*` folder, which is git-ignore
 
 ## MCP config note
 
-`mcp_config.json` runs the `lodedb` CLI through `uv` against your cloned repo, since LodeDB
-isn't on PyPI yet. Edit the two absolute paths. Once a packaged release exists, the entry
-simplifies to:
+`pip install lodedb` puts the `lodedb` CLI on your `PATH`, so the normal MCP entry is just:
 
 ```json
 { "mcpServers": { "lodedb": { "command": "lodedb", "args": ["mcp", "--path", "./data"] } } }
 ```
+
+If you installed into a virtual environment (including a `uv` project) where `lodedb` isn't on
+`PATH`, use the `uv run --project` form in [`mcp_config.json`](mcp_config.json) instead and edit
+the two absolute paths. The [main README](../README.md#use-as-an-mcp-server) also covers `lodedb
+mcp install`, which writes the entry for you.
