@@ -39,8 +39,8 @@ backend, or where its current local default makes LodeDB's strengths easy to sho
 |---|---|---:|---|---|
 | [LangChain](https://github.com/langchain-ai/langchain) | Framework | 139k | `VectorStore` adapter (`lodedb[langchain]`) | ✅ Shipped |
 | [LlamaIndex](https://github.com/run-llama/llama_index) | Framework | 50k | `VectorStore` + `PropertyGraphStore` adapters (`lodedb[llama-index]`) | ✅ Shipped ([#7](https://github.com/Egoist-Machines/LodeDB/pull/7)) |
-| [mem0](https://github.com/mem0ai/mem0) | Agent memory | 59k | Vector-store provider (`base.py` + config registry) | 🔜 Next |
-| [PrivateGPT](https://github.com/zylon-ai/private-gpt) | Local RAG app | 57k | LlamaIndex provider + `settings.yaml` key | 🔜 Planned (unblocked by #7) |
+| [mem0](https://github.com/mem0ai/mem0) | Agent memory | 59k | `VectorStoreBase` provider (`lodedb[mem0]`) | ✅ Shipped ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16)) |
+| [PrivateGPT](https://github.com/zylon-ai/private-gpt) | Local RAG app | 57k | LlamaIndex provider shim + `settings.yaml` key | ✅ Shipped |
 | [Haystack](https://github.com/deepset-ai/haystack) | Framework | 25k | `DocumentStore` protocol | 📋 Backlog |
 | [txtai](https://github.com/neuml/txtai) | Framework | n/a | `custom` backend (resolvable class string) | 📋 Backlog |
 | [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) | Local RAG app (JS) | 62k | Provider layer + local bridge | 📋 Backlog |
@@ -55,40 +55,82 @@ Legend: ✅ shipped · 🚧 in review · 🔜 planned · 📋 backlog · 🔬 ev
 
 ## Sequencing
 
-**Now.** Ship the **mem0** provider: the highest-star clean config slot and the best
-delta-persistence showcase. The LangChain and LlamaIndex adapters have landed (the LlamaIndex
-work in [#7](https://github.com/Egoist-Machines/LodeDB/pull/7)), so the framework foundation is
-in place and every app built on those abstractions is reachable without a new adapter.
+**Done.** LangChain, LlamaIndex (vector + property-graph), and mem0
+([#16](https://github.com/Egoist-Machines/LodeDB/pull/16)) have landed, so the framework
+foundation is in place and every app built on those abstractions is reachable without a new
+adapter. **PrivateGPT** ships on top of it as a provider shim plus one config key: its store
+layer *is* LlamaIndex's `BasePydanticVectorStore`, so no new adapter was needed.
 
-**Next.** **PrivateGPT**: a registry entry plus one config key now that the LlamaIndex adapter
-exists, not a new adapter.
+**Now.** Framework breadth: **Haystack** and **txtai**, both low-effort drop-in adapters.
 
-**Later.** Framework breadth (Haystack, txtai) and high-visibility local apps. Lead with
-permissively licensed Python apps (kotaemon, LocalGPT, Open WebUI); the JS/TS apps
-(AnythingLLM, Flowise, Dify) need the local-bridge step first.
+**Later.** High-visibility local apps. Lead with permissively licensed Python apps (kotaemon,
+LocalGPT, Open WebUI); the JS/TS apps (AnythingLLM, Flowise, Dify) need the local-bridge step
+first.
 
-## Planned developments
+## Recently shipped
 
-### mem0 (next direct target)
-- **Repo:** mem0ai/mem0 (~59k★, Apache-2.0). **Pattern:** implement the vector-store provider
-  interface (`base.py`) and register it; users then select it with
-  `Memory.from_config({"vector_store": {"provider": "lodedb", "config": {...}}})`.
+### mem0 ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16))
+- **Repo:** mem0ai/mem0 (~59k★, Apache-2.0). **Install:** `lodedb[mem0]` (`mem0ai>=2.0.0`).
+- **Pattern:** `LodeDBVectorStore` implements mem0's `VectorStoreBase`; call
+  `register_mem0_provider()` to register the `"lodedb"` provider, then select it with
+  `Memory.from_config({"vector_store": {"provider": "lodedb", "config": {...}}})`. See
+  [`examples/mem0_store.py`](../examples/mem0_store.py).
 - **Why it fits:** mem0 is an agent-memory layer where memories accrue via incremental adds,
   which is exactly the workload LodeDB's O(changed) delta persistence is built for. It already
   ships FAISS / Chroma / embedded-Qdrant, so a local zero-server store is a category match, not
   a stretch.
-- **Nuance:** mem0's newer extraction can be "ADD-only" at the LLM layer, but adds still hit
-  the storage layer per commit, so delta persistence stays relevant.
-- **Effort:** low to medium (a new provider, no fork).
+- **Embeddings:** mem0 owns embedding, so the adapter uses LodeDB's vector-in path rather than
+  the text path. Full payloads (raw memory text and list-valued fields) go to LodeDB's raw-text
+  sidecar, while scalar fields such as `user_id` / `agent_id` / `run_id` stay in metadata so
+  mem0's filtered reads stay exact.
+- **Scope:** vector-store only. mem0's v2 line dropped the optional OSS graph-memory layer, so
+  there is no graph adapter; for a LodeDB-backed graph use `lodedb.graph.KnowledgeGraph` or the
+  LlamaIndex `LodeDBPropertyGraphStore`.
 
-### PrivateGPT (unblocked by the LlamaIndex adapter)
+### PrivateGPT (provider shim on the LlamaIndex adapter)
 - **Repo:** zylon-ai/private-gpt (~57k★, Apache-2.0). Marquee "100% private" RAG.
-- **Pattern:** its store layer is built on LlamaIndex's `BasePydanticVectorStore` behind a
-  provider/factory registry, selected by `vectorstore.database` in `settings.yaml`. Now that
-  the LlamaIndex adapter has landed (#7), PrivateGPT is a registry entry plus one config key,
-  not a new adapter.
-- **Important:** it uses *LlamaIndex's* interface, so the LangChain adapter does not apply
-  here; the LlamaIndex adapter is the prerequisite, and it is now in place.
+- **Pattern:** PrivateGPT's store layer *is* LlamaIndex's `BasePydanticVectorStore`, selected by
+  `vectorstore.database` in `settings.yaml`. Concretely, `VectorStoreComponent` builds
+  `{"qdrant": QdrantVectorStoreFactory, **_PROVIDERS}` and resolves `vectorstore.database` against
+  it; providers register into `_PROVIDERS` via
+  `private_gpt.components.vector_store.factory.register_vector_store(database, provider)`, where a
+  provider is a `VectorStoreFactory` (ABC) with `vector_store(collection) -> BasePydanticVectorStore`.
+  The `database` field is a free-form `str` (no `Literal` allow-list), so `database: lodedb` is
+  accepted once the provider is registered.
+- **What LodeDB ships:** `lodedb.local.integrations.privategpt`, a `VectorStoreFactory` subclass
+  that reads PrivateGPT settings and builds the existing text-path `LodeDBVectorStore` (one local
+  LodeDB index per collection), plus `register_lodedb_provider()` that registers it under
+  `"lodedb"`. It reuses the LlamaIndex adapter from [#7](https://github.com/Egoist-Machines/LodeDB/pull/7);
+  it is **not** a new adapter. Needs `lodedb[llama-index]` installed into PrivateGPT's environment.
+- **What must live in PrivateGPT's process:** `_PROVIDERS` is process-local with no entry-point
+  auto-discovery, so registration has to be *triggered* there, with one line
+  (`from lodedb.local.integrations.privategpt import register_lodedb_provider; register_lodedb_provider()`)
+  in a tiny launcher or near the top of `private_gpt/__main__.py`, before the
+  `VectorStoreComponent` is built. Then set in `settings.yaml`:
+
+  ```yaml
+  vectorstore:
+    database: lodedb        # or PGPT_VECTORSTORE=lodedb
+  lodedb:                   # optional; defaults shown
+    path: local_data/lodedb
+    model: minilm           # "minilm" (fast) or "bge" (quality)
+    device: auto            # auto | cpu | mps | cuda
+    store_text: true        # keep on for hybrid/lexical retrieval
+    index_text: false
+  ```
+
+  This needs no PrivateGPT fork (`register_vector_store` is the documented extension seam), but
+  the trigger and the YAML keys are PrivateGPT-side and cannot be set from LodeDB. See
+  [`examples/privategpt_provider.py`](../examples/privategpt_provider.py).
+- **Text-path:** like the LlamaIndex adapter, LodeDB embeds text itself, so PrivateGPT's own
+  embedding model is bypassed for storage/query and `vectorstore.embed_dim` is informational here;
+  point PrivateGPT at a cheap/mock embedding to avoid a redundant embedding call.
+- **Caveat:** this targets PrivateGPT's current factory-registry store layer. On a much older
+  PrivateGPT whose `VectorStoreComponent` is a hardcoded `if/elif` over `database` with no
+  `register_vector_store`, there is no clean seam without a fork; wire `LodeDBVectorStore` in by
+  hand there instead.
+
+## Planned developments
 
 ### Haystack and txtai (low-effort framework breadth)
 - **Haystack** (~25k★, Apache-2.0): duck-typed `DocumentStore` protocol (≈6 methods), no base
@@ -128,7 +170,8 @@ LodeDB now ships a knowledge-graph layer (`lodedb.graph.KnowledgeGraph`) and a L
   exists: `add_vectors` / `add_vectors_many` / `search_by_vector` / `search_many_by_vector`,
   plus a vector-only index (`LodeDB(vector_dim=...)` / `open_vector_store`) with no internal
   embedder. The LlamaIndex `PropertyGraphStore` adapter uses this mode to honor any host
-  `embed_model`, so an adapter that needs the host's own embeddings is no longer blocked.
+  `embed_model`, and the mem0 adapter uses it because mem0 owns embedding, so an adapter that
+  needs the host's own embeddings is no longer blocked.
 - **Metadata filters support comparison operators and boolean composition.** `filter=` accepts
   `$eq` / `$ne` / `$gt` / `$gte` / `$lt` / `$lte` / `$in` / `$nin` / `$exists` with `$and` /
   `$or` / `$not` composition; a bare scalar stays exact-match. The engine also exposes metadata

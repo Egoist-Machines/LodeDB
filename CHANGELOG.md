@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PrivateGPT vector-store provider.** `lodedb.local.integrations.privategpt` lets
+  [PrivateGPT](https://github.com/zylon-ai/private-gpt) use LodeDB as its local vector store.
+  PrivateGPT's store layer is LlamaIndex's `BasePydanticVectorStore` selected by
+  `vectorstore.database` in `settings.yaml`, which LodeDB already implements via the
+  `lodedb[llama-index]` adapter, so this is a small provider shim rather than a new adapter: a
+  `VectorStoreFactory` subclass that reads PrivateGPT settings and builds the text-path
+  `LodeDBVectorStore` (one local LodeDB index per collection, with `path` / `model` / `device` /
+  `store_text` / `index_text` configurable from an optional `lodedb:` settings block), plus
+  `register_lodedb_provider()` which registers it under `"lodedb"` with PrivateGPT's
+  `register_vector_store` factory registry. Selecting it inside PrivateGPT is one line to trigger
+  registration (the registry is process-local, with no entry-point auto-discovery) plus
+  `vectorstore.database: lodedb` (or `PGPT_VECTORSTORE=lodedb`); see
+  `examples/privategpt_provider.py` and `docs/integrations.md`. No PrivateGPT fork is required.
+
 ## [0.3.0] - 2026-06-24
 
 ### Changed
