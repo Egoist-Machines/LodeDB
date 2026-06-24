@@ -8,8 +8,8 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-**A drop-in, durable memory backend for LangChain, LlamaIndex, and mem0.** Point any of them
-at LodeDB instead of its default store. Over 17.5k documents (measured on a Modal A10), per
+LodeDB is a great **drop-in, durable memory backend for LangChain, LlamaIndex, and mem0.** Point any of them
+at LodeDB instead of its default store. Over 17.5k documents, per
 framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
@@ -20,22 +20,13 @@ framework default:
 | Durable add of one memory | **~570× faster** (20 ms vs 11.5 s) | **~2,200× faster** (11 ms vs 23.4 s) | 13 vs 0.7 ms (Qdrant faster) |
 | Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
 
-Every backend (LodeDB included) is fed the same precomputed vectors, so none is charged for
-embedding. The in-memory defaults rewrite the whole store to persist one new memory (about 12
-to 23 seconds at this corpus size) and scan in pure Python with no batch path; LodeDB appends
-an O(changed) delta (~11 to 20 ms), keeps single queries sub-millisecond on the CPU, and
-serves batched retrieval from its GPU-resident scan, at 0.95 recall@10 (4-bit quantized)
-versus the defaults' exact 1.00. It is also the smallest footprint and fastest single query
-among embedded local DBs (LanceDB, sqlite-vec, pgvector). Latencies are a single sample on
-shared-CPU cloud hosts; the multipliers are the stable read. [Full benchmark, all backends
+[Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the
 GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
 incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
-
-Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 
 - **GPU-resident batch search**: an fp16 copy of the index lives on the GPU, scored with a
   tiled GEMM plus a streaming top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
