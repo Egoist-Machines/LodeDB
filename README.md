@@ -14,17 +14,20 @@ framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
-| On-disk footprint | **7.0× smaller** | **5.3× smaller** | **4.6× smaller** |
-| Single-query latency, p50 (CPU) | **~500× faster** | **~600× faster** | **~40× faster** |
-| Batched retrieval, 64 (GPU) | **~1,000× more qps** | **~2,000× more qps** | **~130× more qps** |
-| Durable add of one memory | **~480× faster** | **~1,400× faster** | both ms-scale |
+| On-disk footprint | **7.0× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
+| Single-query p50 (CPU) | **~440× faster** (0.9 vs 386 ms) | **~500× faster** (0.9 vs 427 ms) | **~32× faster** (0.9 vs 30 ms) |
+| Batched retrieval, 64 (GPU) | **~1,000×+** (5,061 vs ~2 qps) | **~1,000×+** (5,047 vs ~2 qps) | **~110×** (3,450 vs 32 qps) |
+| Durable add of one memory | **~590× faster** (30 ms vs 17.8 s) | **~990× faster** (29 ms vs 28.5 s) | 19 vs 1.6 ms (Qdrant faster) |
+| Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
 
-The in-memory defaults rewrite the whole store to persist one new memory (about 9 to 19
+The in-memory defaults rewrite the whole store to persist one new memory (about 18 to 29
 seconds at this corpus size) and scan in pure Python with no batch path; LodeDB appends an
-O(changed) delta (~15 ms), keeps single queries sub-millisecond on the CPU, and serves
-batched retrieval from its GPU-resident scan, at 0.95 recall@10 (4-bit quantized) versus the
-defaults' exact 1.00. [Full benchmark, all backends (FAISS, Chroma, Qdrant), and
-method.](benchmarks/memory_integrations)
+O(changed) delta (~19 ms, embed-free), keeps single queries sub-millisecond on the CPU, and
+serves batched retrieval from its GPU-resident scan, at 0.95 recall@10 (4-bit quantized)
+versus the defaults' exact 1.00. It is also the smallest footprint and fastest single query
+among embedded local DBs (LanceDB, sqlite-vec, pgvector). Latencies are a single sample on
+shared-CPU cloud hosts; the multipliers are the stable read. [Full benchmark, all backends
+(FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the
 GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,

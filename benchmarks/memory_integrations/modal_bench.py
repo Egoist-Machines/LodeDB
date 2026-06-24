@@ -46,6 +46,12 @@ _FRAMEWORK_DEPENDENCIES = (
     "qdrant-client==1.18.0",
     "chromadb==1.5.9",
     "faiss-cpu==1.14.3",
+    # additional embedded / local vector stores (LangChain suite)
+    "lancedb==0.33.0",
+    "sqlite-vec==0.1.9",
+    "langchain-postgres==0.0.17",
+    "psycopg==3.3.4",
+    "pgserver==0.1.4",  # embedded Postgres + pgvector, no separate service
 )
 _REMOTE_BENCH_DIR = "/root/memory_integrations"
 

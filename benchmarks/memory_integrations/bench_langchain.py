@@ -200,6 +200,114 @@ class _QdrantDriver(_LCDriver):
         self._close_client()
 
 
+class _LanceDBDriver(_LCDriver):
+    # Embedded columnar store; appends fragments, no full rewrite to persist. The
+    # adapter defaults to mode="overwrite" (each add replaces the table), so pin
+    # mode="append" or incremental adds would wipe the corpus.
+    def _open(self):
+        from langchain_community.vectorstores import LanceDB  # noqa: PLC0415
+
+        return LanceDB(uri=str(self.dir), table_name="rag", embedding=self.emb, mode="append")
+
+    def ingest(self, ids, texts, vectors, metadatas) -> None:
+        self.store = self._open()
+        self.store.add_texts(texts, metadatas=self._metas(ids, metadatas), ids=ids)
+
+    def reopen(self) -> int:
+        self.store = self._open()
+        try:
+            return int(self.store.get_table().count_rows())
+        except Exception:
+            return -1
+
+
+class _SQLiteVecDriver(_LCDriver):
+    # Single-file sqlite database with the sqlite-vec extension.
+    def ingest(self, ids, texts, vectors, metadatas) -> None:
+        from langchain_community.vectorstores import SQLiteVec  # noqa: PLC0415
+
+        self._dbfile = str(self.dir / "vec.db")
+        conn = SQLiteVec.create_connection(db_file=self._dbfile)
+        self.store = SQLiteVec(table="rag", connection=conn, embedding=self.emb)
+        self.store.add_texts(texts, metadatas=self._metas(ids, metadatas), ids=ids)
+
+    def reopen(self) -> int:
+        from langchain_community.vectorstores import SQLiteVec  # noqa: PLC0415
+
+        conn = SQLiteVec.create_connection(db_file=self._dbfile)
+        self.store = SQLiteVec(table="rag", connection=conn, embedding=self.emb)
+        try:
+            return int(self.store._connection.execute("SELECT count(*) FROM rag").fetchone()[0])
+        except Exception:
+            return -1
+
+
+class _PgVectorDriver(_LCDriver):
+    # Postgres + pgvector via an embedded server (pgserver bundles the binary +
+    # the vector extension). No ANN index, so it is an exact seq scan, like LodeDB.
+    def __init__(self, name, base_dir, emb) -> None:
+        super().__init__(name, base_dir, emb)
+        self._srv = None
+        self._uri = None
+
+    def warmup(self) -> None:
+        import pgserver  # noqa: PLC0415
+
+        self._srv = pgserver.get_server(str(self.dir / "pg"))
+        self._srv.psql("CREATE EXTENSION IF NOT EXISTS vector;")
+        self._uri = self._srv.get_uri()
+
+    def _open(self):
+        from langchain_postgres import PGVector  # noqa: PLC0415
+
+        return PGVector(
+            embeddings=self.emb,
+            collection_name="rag",
+            connection=self._uri.replace("postgresql://", "postgresql+psycopg://"),
+            use_jsonb=True,
+        )
+
+    def ingest(self, ids, texts, vectors, metadatas) -> None:
+        self.store = self._open()
+        metas = self._metas(ids, metadatas)
+        # libpq caps a single statement at 65,535 bound params and PGVector inserts
+        # one multi-row INSERT (~5 params/row), so chunk to stay under the limit.
+        for i in range(0, len(ids), CHROMA_BATCH):
+            sl = slice(i, i + CHROMA_BATCH)
+            self.store.add_texts(texts[sl], metadatas=metas[sl], ids=ids[sl])
+
+    def footprint_bytes(self) -> int:
+        # The embedding table + indexes + toast (excludes server WAL/catalogs),
+        # the fairest "this data's footprint" measure for a server-backed store.
+        try:
+            import psycopg  # noqa: PLC0415
+
+            with psycopg.connect(self._uri) as c:
+                return int(
+                    c.execute("SELECT pg_total_relation_size('langchain_pg_embedding')").fetchone()[
+                        0
+                    ]
+                )
+        except Exception:
+            return dir_bytes(self.dir)
+
+    def reopen(self) -> int:
+        self.store = self._open()
+        try:
+            import psycopg  # noqa: PLC0415
+
+            with psycopg.connect(self._uri) as c:
+                return int(c.execute("SELECT count(*) FROM langchain_pg_embedding").fetchone()[0])
+        except Exception:
+            return -1
+
+    def close(self) -> None:
+        try:
+            self._srv.cleanup()
+        except Exception:
+            pass
+
+
 class _LodeDBDriver(_LCDriver):
     role = "lodedb"
     embeds_on_ingest = True  # text-path: LodeDB embeds internally on add_texts
@@ -283,6 +391,9 @@ def run_langchain_suite(
         ("faiss", lambda d: _FaissDriver("faiss", d, emb)),
         ("chroma", lambda d: _ChromaDriver("chroma", d, emb)),
         ("qdrant", lambda d: _QdrantDriver("qdrant", d, emb)),
+        ("lancedb", lambda d: _LanceDBDriver("lancedb", d, emb)),
+        ("sqlite-vec", lambda d: _SQLiteVecDriver("sqlite-vec", d, emb)),
+        ("pgvector", lambda d: _PgVectorDriver("pgvector", d, emb)),
     ]
 
     backends: list[dict[str, Any]] = []
