@@ -18,6 +18,17 @@ LodeDB instead of its default store. Over 17.5k documents, per framework default
 | Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
 | Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.9 vs 0.5 ms (both sub-ms) |
 
+LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more compact footprint:
+
+| **embedded stores** | **add p50** | **memory footprint** |
+| --- | ---: | ---: |
+| sqlite-vec | 0.4 ms | 101 MB | 
+| qdrant | 0.5 ms | 85 MB | 
+| **LodeDB** | 0.6 ms | **29 MB** | 
+| pgvector | 2.3 ms | 50 MB | 
+| lancedb | 3.2 ms | 37 MB | 
+| chroma | 6.5 ms | 151 MB | 
+
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
