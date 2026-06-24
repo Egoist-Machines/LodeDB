@@ -62,9 +62,11 @@ from lodedb.engine.route_registry import (
     RouteRegistry,
 )
 from lodedb.engine.runtime_policy import (
+    CommitMode,
     GpuDirectTurboVecPolicy,
     MpsDirectTurboVecPolicy,
     TvimDeltaPersistencePolicy,
+    commit_mode_from_env,
     gpu_direct_turbovec_max_batch_from_env,
     gpu_direct_turbovec_policy_from_env,
     gpu_direct_turbovec_should_use,
@@ -87,6 +89,12 @@ from lodedb.engine.turbovec_index import (
     require_turbovec_available,
     stable_uint64_ids_for_chunk_ids,
     turbovec_capability,
+)
+from lodedb.engine.wal_store import (
+    DEFAULT_CHECKPOINT_BYTES,
+    DEFAULT_CHECKPOINT_OPS,
+    WalStore,
+    wal_path,
 )
 
 # The optional CUDA path (`gpu_turbovec`) is imported lazily inside the methods
@@ -311,6 +319,24 @@ class _PlannedDocumentMutation:
     new_chunk_ids: tuple[str, ...]
     planned_chunks: tuple[tuple[str, str, IndexedChunk | None, int | None], ...]
     unchanged: bool = False
+
+
+@dataclass(frozen=True)
+class _TurboVecChangeset:
+    """Exact set of chunk-level changes a mutation verb applied to ``state.chunks``.
+
+    Threaded from the upsert/delete verbs into ``_sync_direct_turbovec_index`` so
+    the sync can reconcile the serving index in O(changed) instead of re-deriving
+    the full diff against the whole corpus on every mutation. ``added_chunks`` are
+    the :class:`IndexedChunk` objects the verb just wrote; ``removed_chunk_ids``
+    are the chunk ids it removed. The changeset is only a hint — the sync still
+    truth-checks every id against the post-mutation ``state.chunks`` and the live
+    id map, so an over-reporting changeset (e.g. a chunk added then orphaned in
+    one batch) stays correct without scanning the corpus.
+    """
+
+    added_chunks: tuple[IndexedChunk, ...] = ()
+    removed_chunk_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -592,6 +618,7 @@ class LodeEngine:
         persistence_dir: str | Path | None = None,
         read_only: bool = False,
         fsync_on_commit: bool = False,
+        commit_mode: CommitMode | None = None,
         embedding_backend: EngineEmbeddingBackend | None = None,
         route_policy: EngineRoutePolicy | None = None,
         gpu_memory_budget_bytes: int | None = None,
@@ -621,6 +648,27 @@ class LodeEngine:
         # fsync each published file + its directory on commit (power-loss
         # durability) vs. the default atomic-but-fast rename.
         self._fsync_on_commit = bool(fsync_on_commit)
+        # Per-mutation commit strategy. ``generation`` (default) publishes a
+        # crash-atomic MVCC generation on every mutation; ``wal`` appends one
+        # framed record to ``<key>.wal`` per mutation and checkpoints into a
+        # generation periodically (opt-in, single-writer; see wal_store).
+        self._commit_mode = (
+            commit_mode if commit_mode is not None else commit_mode_from_env()
+        )
+        # Open WAL stores per index key (writer handles only). Populated lazily on
+        # the first WAL append/load; never created for a read-only handle or in
+        # generation mode.
+        self._wal_stores: dict[str, WalStore] = {}
+        # Ops/bytes thresholds that trigger a WAL -> generation checkpoint.
+        self._wal_checkpoint_ops = DEFAULT_CHECKPOINT_OPS
+        self._wal_checkpoint_bytes = DEFAULT_CHECKPOINT_BYTES
+        # Set while replaying WAL records on open so the replayed mutations
+        # re-drive the engine verbs without re-appending to the WAL.
+        self._wal_replaying = False
+        # The logical mutation a verb stages for the next WAL append, keyed by
+        # index key: ``(op, payload)``. Consumed by ``_append_wal_record`` so the
+        # single ``_persist_state`` funnel records the right verb in WAL mode.
+        self._pending_wal_records: dict[str, tuple[str, dict[str, Any]]] = {}
         # Single-writer lock timeout (seconds), read once at construction.
         self._persist_lock_timeout = lodedb_lock_timeout_from_env()
         self.embedding_backend = embedding_backend
@@ -732,6 +780,21 @@ class LodeEngine:
                     self._release_writer_lock()
                     raise
 
+    @_synchronized
+    def checkpoint(self) -> None:
+        """Folds any outstanding WAL into a committed generation (no-op otherwise).
+
+        The explicit durability checkpoint behind the SDK ``persist()`` in WAL
+        commit mode: it commits a fresh generation for every index that has
+        WAL-logged-but-not-yet-checkpointed mutations and truncates the WAL. In
+        the default ``generation`` mode there is nothing buffered, so it does
+        nothing. A read-only handle never checkpoints.
+        """
+
+        if self._read_only:
+            return
+        self._checkpoint_all_wals()
+
     def _acquire_writer_lock(self) -> None:
         """Takes the exclusive single-writer lock for this engine's directory."""
 
@@ -758,9 +821,21 @@ class LodeEngine:
         lock.release()
 
     def close(self) -> None:
-        """Releases the single-writer lock; the engine must not persist afterwards."""
+        """Checkpoints any open WAL, then releases the single-writer lock.
 
-        self._release_writer_lock()
+        In ``wal`` commit mode a clean close folds the outstanding WAL into a
+        fresh committed generation and truncates it, so the next open finds an
+        up-to-date base and an empty WAL (replay only ever has to recover an
+        *unclean* shutdown). A best-effort guard keeps a checkpoint failure from
+        leaking the writer lock — the WAL is still durable and will replay on the
+        next open. After this the engine must not persist again.
+        """
+
+        try:
+            if not self._read_only:
+                self._checkpoint_all_wals()
+        finally:
+            self._release_writer_lock()
 
     def _require_writable(self) -> None:
         """Raises if this engine was opened read-only (mutations are forbidden).
@@ -1046,6 +1121,9 @@ class LodeEngine:
             return result
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
+        self._stage_wal_record(
+            context, state, "upsert_documents", _documents_wal_payload(documents)
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1074,22 +1152,27 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_documents")
         if isinstance(state, EngineResponse):
             return state
-        result = self._ingest_documents(
+        ingest = self._ingest_documents(
             context=context,
             state=state,
             documents=documents,
             operation="upsert_documents",
             embed_batch_size=embed_batch_size,
         )
-        if isinstance(result, EngineResponse):
-            return result
+        if isinstance(ingest, EngineResponse):
+            return ingest
+        result, changeset = ingest
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
+        self._stage_wal_record(
+            context, state, "upsert_documents", _documents_wal_payload(documents)
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
             result=result,
             event_name="documents_upserted",
+            changeset=changeset,
         )
         return EngineResponse(
             200,
@@ -1121,20 +1204,23 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_vectors")
         if isinstance(state, EngineResponse):
             return state
-        result = self._ingest_vectors(
+        ingest = self._ingest_vectors(
             context=context,
             state=state,
             vectors=vectors,
             operation="upsert_vectors",
         )
-        if isinstance(result, EngineResponse):
-            return result
+        if isinstance(ingest, EngineResponse):
+            return ingest
+        result, changeset = ingest
         self._capture_vector_document_text(state, vectors)
+        self._stage_wal_record(context, state, "upsert_vectors", _vectors_wal_payload(vectors))
         self._finalize_document_ingest(
             context=context,
             state=state,
             result=result,
             event_name="vectors_upserted",
+            changeset=changeset,
         )
         return EngineResponse(
             200,
@@ -1218,6 +1304,21 @@ class LodeEngine:
             # delta that _delta_append_ok requires), so _persist_state appends an
             # O(changed) journal delta instead of rewriting the full O(corpus) base.
             self._sync_direct_turbovec_index(state)
+            self._stage_wal_record(
+                context,
+                state,
+                "update_document_payload",
+                {
+                    "document_id": document_id,
+                    "metadata": (
+                        None
+                        if metadata is None
+                        else {str(k): str(v) for k, v in dict(metadata).items()}
+                    ),
+                    "text": (None if text is None else str(text)),
+                    "clear_text": bool(clear_text),
+                },
+            )
             self._persist_state(state)
 
         return EngineResponse(
@@ -1403,8 +1504,13 @@ class LodeEngine:
         documents: tuple[EngineDocument, ...],
         operation: str,
         embed_batch_size: int | None = None,
-    ) -> dict[str, float | int] | EngineResponse:
-        """Validates, chunks, embeds, and applies document changes without persisting."""
+    ) -> tuple[dict[str, float | int], _TurboVecChangeset] | EngineResponse:
+        """Validates, chunks, embeds, and applies document changes without persisting.
+
+        On success returns ``(result, changeset)`` where ``changeset`` is the exact
+        chunk-level delta for the O(changed) direct TurboVec sync; validation
+        failures still return an :class:`EngineResponse` so callers can short-circuit.
+        """
 
         if not documents:
             return self._error(
@@ -1501,6 +1607,13 @@ class LodeEngine:
             batch_size=embedding_batch_size,
         )
         result["embedding_time_ms"] += (perf_counter() - embedding_started) * 1000.0
+        # Collect the exact chunk-level delta this batch applies so the direct
+        # TurboVec sync can reconcile in O(changed). Only genuinely new chunks
+        # (reusable_chunk is None) are "added": reused chunks keep their
+        # content-hash id, are already in the index, and would be filtered out by
+        # the sync's truth check anyway.
+        added_chunks: list[IndexedChunk] = []
+        removed_chunk_ids: list[str] = []
         for document_index, plan in enumerate(plans, start=1):
             document = plan.document
             if plan.unchanged:
@@ -1520,17 +1633,22 @@ class LodeEngine:
                     # discarded their transient embeddings.
                     embedding = reusable_chunk.embedding
                     result["reused_chunks"] += 1
-                state.chunks[chunk_id] = IndexedChunk(
+                new_chunk = IndexedChunk(
                     chunk_id=chunk_id,
                     document_id=document.document_id,
                     content_hash=chunk_hash,
                     embedding=embedding,
                 )
-            result["deleted_chunks"] += _delete_orphaned_document_chunks(
+                state.chunks[chunk_id] = new_chunk
+                if reusable_chunk is None:
+                    added_chunks.append(new_chunk)
+            orphan_ids = _delete_orphaned_document_chunks(
                 state,
                 document.document_id,
                 list(plan.new_chunk_ids),
             )
+            result["deleted_chunks"] += len(orphan_ids)
+            removed_chunk_ids.extend(orphan_ids)
             state.document_hashes[document.document_id] = plan.content_hash
             state.document_chunk_ids[document.document_id] = tuple(plan.new_chunk_ids)
             state.document_metadata[document.document_id] = dict(document.metadata)
@@ -1548,7 +1666,11 @@ class LodeEngine:
             state,
             upserted_document_ids=tuple(plan.document.document_id for plan in plans),
         )
-        return result
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        return result, changeset
 
     def _ingest_vectors(
         self,
@@ -1557,7 +1679,7 @@ class LodeEngine:
         state: ClientIndexState,
         vectors: tuple[EngineVectorDocument, ...],
         operation: str,
-    ) -> dict[str, float | int] | EngineResponse:
+    ) -> tuple[dict[str, float | int], _TurboVecChangeset] | EngineResponse:
         """Validates and applies pre-embedded documents without embedding/chunking.
 
         Mirrors the apply half of :meth:`_ingest_documents` but treats each
@@ -1566,7 +1688,8 @@ class LodeEngine:
         applied), writes one :class:`IndexedChunk` per document carrying the
         caller's vector as its transient embedding, and journals the mutation.
         The shared :meth:`_finalize_document_ingest` then runs the same direct
-        TurboVec sync + atomic commit the text path uses.
+        TurboVec sync + atomic commit the text path uses. On success returns
+        ``(result, changeset)`` for the O(changed) sync.
         """
 
         if not vectors:
@@ -1612,6 +1735,8 @@ class LodeEngine:
             "embedding_batch_size": 0,
         }
         upserted_ids: list[str] = []
+        added_chunks: list[IndexedChunk] = []
+        removed_chunk_ids: list[str] = []
         for document_id, content_hash, embedding, metadata in planned:
             upserted_ids.append(document_id)
             if state.document_hashes.get(document_id) == content_hash:
@@ -1622,16 +1747,18 @@ class LodeEngine:
                 state.updated_at = _utc_now_iso(context.now)
                 continue
             chunk_id = _chunk_id_for_hash(document_id, chunk_hash=content_hash, occurrence=0)
-            state.chunks[chunk_id] = IndexedChunk(
+            new_chunk = IndexedChunk(
                 chunk_id=chunk_id,
                 document_id=document_id,
                 content_hash=content_hash,
                 embedding=embedding,
             )
+            state.chunks[chunk_id] = new_chunk
+            added_chunks.append(new_chunk)
             result["embedded_chunks"] += 1
-            result["deleted_chunks"] += _delete_orphaned_document_chunks(
-                state, document_id, [chunk_id]
-            )
+            orphan_ids = _delete_orphaned_document_chunks(state, document_id, [chunk_id])
+            result["deleted_chunks"] += len(orphan_ids)
+            removed_chunk_ids.extend(orphan_ids)
             state.document_hashes[document_id] = content_hash
             state.document_chunk_ids[document_id] = (chunk_id,)
             state.document_metadata[document_id] = dict(metadata)
@@ -1639,7 +1766,11 @@ class LodeEngine:
         self._record_pending_state_journal_documents(
             state, upserted_document_ids=tuple(upserted_ids)
         )
-        return result
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        return result, changeset
 
     def _finalize_document_ingest(
         self,
@@ -1648,8 +1779,14 @@ class LodeEngine:
         state: ClientIndexState,
         result: dict[str, float | int],
         event_name: str,
+        changeset: _TurboVecChangeset | None = None,
     ) -> None:
-        """Updates counters, syncs the direct index, and persists once."""
+        """Updates counters, syncs the direct index, and persists once.
+
+        ``changeset`` carries the exact chunk-level delta from the upsert verbs so
+        the TurboVec sync runs in O(changed); when it is ``None`` (e.g. the cold
+        build path) the sync falls back to the full corpus diff.
+        """
 
         embedded = int(result["embedded_chunks"])
         reused = int(result["reused_chunks"])
@@ -1666,7 +1803,7 @@ class LodeEngine:
                 chunk_count=len(state.chunks),
             )
             sync_started = perf_counter()
-            synced_chunk_ids = self._sync_direct_turbovec_index(state)
+            synced_chunk_ids = self._sync_direct_turbovec_index(state, changeset=changeset)
             _log_document_ingest_finalize_progress(
                 event_name,
                 phase="turbovec_sync",
@@ -1729,6 +1866,7 @@ class LodeEngine:
                 context.client_id,
             )
         deleted_chunks = 0
+        removed_chunk_ids: list[str] = []
         unique_document_ids = tuple(dict.fromkeys(document_ids))
         for document_id in document_ids:
             if _is_blank(document_id):
@@ -1739,7 +1877,9 @@ class LodeEngine:
                     context.client_id,
                 )
         for document_id in unique_document_ids:
-            deleted_chunks += self._delete_document_chunks(state, document_id)
+            removed = self._delete_document_chunks(state, document_id)
+            deleted_chunks += len(removed)
+            removed_chunk_ids.extend(removed)
             state.document_hashes.pop(document_id, None)
             state.document_chunk_ids.pop(document_id, None)
             state.document_metadata.pop(document_id, None)
@@ -1752,7 +1892,10 @@ class LodeEngine:
         state.delete_count += len(unique_document_ids)
         state.deleted_chunk_count += deleted_chunks
         state.updated_at = _utc_now_iso(context.now)
-        self._sync_direct_turbovec_index(state)
+        self._sync_direct_turbovec_index(
+            state,
+            changeset=_TurboVecChangeset(removed_chunk_ids=tuple(removed_chunk_ids)),
+        )
         self._emit(
             "documents_deleted",
             context.client_id,
@@ -1760,6 +1903,9 @@ class LodeEngine:
                 "document_count": len(unique_document_ids),
                 "deleted_chunks": deleted_chunks,
             },
+        )
+        self._stage_wal_record(
+            context, state, "delete_documents", {"document_ids": list(unique_document_ids)}
         )
         self._persist_state(state)
         return EngineResponse(
@@ -2419,13 +2565,19 @@ class LodeEngine:
             self.route_policy.native_dim,
         )
 
-    def _delete_document_chunks(self, state: ClientIndexState, document_id: str) -> int:
-        """Removes all chunks for one document from a client-local index."""
+    def _delete_document_chunks(
+        self, state: ClientIndexState, document_id: str
+    ) -> tuple[str, ...]:
+        """Removes all chunks for one document from a client-local index.
+
+        Returns the removed chunk ids so ``delete_documents`` can build the
+        direct TurboVec changeset; the deleted-chunk count is ``len(...)``.
+        """
 
         chunk_ids = state.document_chunk_ids.get(document_id, ())
         for chunk_id in chunk_ids:
             state.chunks.pop(chunk_id, None)
-        return len(chunk_ids)
+        return tuple(chunk_ids)
 
     def _embedding_backend_for_state(self, state: ClientIndexState) -> EngineEmbeddingBackend:
         """Returns the configured local backend or a deterministic fixture backend."""
@@ -3571,12 +3723,25 @@ class LodeEngine:
             if matches(chunk.document_id, document_metadata.get(chunk.document_id, {}))
         )
 
-    def _sync_direct_turbovec_index(self, state: ClientIndexState) -> tuple[str, ...]:
+    def _sync_direct_turbovec_index(
+        self, state: ClientIndexState, changeset: _TurboVecChangeset | None = None
+    ) -> tuple[str, ...]:
         """Applies transient full-embedding mutations to a direct TurboVec index.
 
         Returns the chunk ids whose transient full embeddings are now encoded in
         the index and can therefore be discarded by the caller (the rows added
         this sync), so the discard is O(changed) rather than O(corpus).
+
+        When ``changeset`` is supplied and an index already exists, the diff is
+        taken straight from the verb's exact ``(added_chunks, removed_chunk_ids)``
+        in O(changed) instead of re-deriving it against the whole corpus. The
+        changeset is only a hint: every removed id is confirmed present in the
+        live id map and gone from ``state.chunks``, and every added chunk is
+        confirmed still in ``state.chunks`` and not already indexed, so an
+        over-reporting changeset can never corrupt the index — it degrades at
+        worst to the same set the full scan would have produced. When
+        ``changeset`` is ``None`` (or no prior index exists) the original
+        full-corpus diff runs verbatim as a fallback.
         """
 
         if not _state_uses_direct_turbovec(state):
@@ -3586,7 +3751,13 @@ class LodeEngine:
         gpu_session = self._gpu_direct_turbovec_sessions.get(state.index_key)
         mps_session = self._mps_direct_turbovec_sessions.get(state.index_key)
         previous = self._turbovec_indexes.get(state.index_key)
-        current_chunk_ids = set(state.chunks)
+        # Incremental reconciliation needs a prior index to mutate; the cold-build
+        # branch below ignores the changeset and re-encodes the whole corpus.
+        incremental = previous is not None and changeset is not None
+        # The full-diff fallback needs the corpus-wide id set; the incremental
+        # path uses O(1) ``state.chunks`` membership instead, so only pay for the
+        # set when falling back.
+        current_chunk_ids = set(state.chunks) if not incremental else frozenset()
         generation = self._index_generations.get(state.index_key, 0) + 1
         progress_label = _direct_turbovec_progress_label(
             self,
@@ -3611,11 +3782,37 @@ class LodeEngine:
             # A cold rebuild re-encodes every chunk, so every chunk's transient
             # embedding is now in the index and can be discarded.
             return tuple(state.chunks)
-        removed_stable_ids = tuple(
-            int(stable_id)
-            for stable_id, chunk_id in previous.chunk_ids_by_stable_id.items()
-            if chunk_id not in current_chunk_ids
-        )
+        if incremental:
+            assert changeset is not None  # narrowed by ``incremental``
+            # O(changed) removals: map each reported removed chunk id to its
+            # derived stable id and keep only those the index actually still holds
+            # and that are truly gone from state.chunks. The chunk-id match guards
+            # against a (vanishingly unlikely) stable-id collision aliasing a
+            # different live chunk, and the ``seen`` set dedupes a chunk reported
+            # twice in one batch so remove_many's count check stays exact.
+            removed_seen: set[int] = set()
+            removed_stable_list: list[int] = []
+            removed_chunk_ids_applied: list[str] = []
+            for chunk_id in changeset.removed_chunk_ids:
+                if chunk_id in state.chunks:
+                    continue  # re-added within the same batch: not a net removal
+                stable_id = int(
+                    stable_uint64_ids_for_chunk_ids((str(chunk_id),))[0]
+                )
+                if stable_id in removed_seen:
+                    continue
+                if previous.chunk_ids_by_stable_id.get(stable_id) != str(chunk_id):
+                    continue  # not indexed under this id (already gone or collision)
+                removed_seen.add(stable_id)
+                removed_stable_list.append(stable_id)
+                removed_chunk_ids_applied.append(str(chunk_id))
+            removed_stable_ids = tuple(removed_stable_list)
+        else:
+            removed_stable_ids = tuple(
+                int(stable_id)
+                for stable_id, chunk_id in previous.chunk_ids_by_stable_id.items()
+                if chunk_id not in current_chunk_ids
+            )
         if removed_stable_ids:
             _log_direct_turbovec_update_progress(
                 progress_label,
@@ -3655,10 +3852,37 @@ class LodeEngine:
                 generation=generation,
                 elapsed_ms=(perf_counter() - started) * 1000.0,
             )
-        indexed_chunk_ids = set(previous.chunk_ids_by_stable_id.values())
-        new_chunks = tuple(
-            chunk for chunk in state.chunks.values() if chunk.chunk_id not in indexed_chunk_ids
-        )
+        if incremental:
+            assert changeset is not None  # narrowed by ``incremental``
+            # O(changed) additions: keep each reported added chunk that survived
+            # to state.chunks and is not already indexed (after the removals
+            # above). The stable-id and chunk-id truth checks make a chunk that
+            # was added then orphaned in the same batch, or one already present,
+            # drop out — yielding exactly the set the full scan would, in the same
+            # relative order, so the batched stable-id assignment below matches.
+            added_seen: set[str] = set()
+            incremental_new: list[Any] = []
+            for chunk in changeset.added_chunks:
+                chunk_id = str(chunk.chunk_id)
+                if chunk_id in added_seen:
+                    continue
+                if chunk_id not in state.chunks:
+                    continue  # added then removed within the batch
+                candidate_stable_id = int(
+                    stable_uint64_ids_for_chunk_ids((chunk_id,))[0]
+                )
+                if candidate_stable_id in previous.chunk_ids_by_stable_id:
+                    continue  # already indexed (e.g. unchanged reused chunk)
+                added_seen.add(chunk_id)
+                incremental_new.append(chunk)
+            new_chunks = tuple(incremental_new)
+        else:
+            indexed_chunk_ids = set(previous.chunk_ids_by_stable_id.values())
+            new_chunks = tuple(
+                chunk
+                for chunk in state.chunks.values()
+                if chunk.chunk_id not in indexed_chunk_ids
+            )
         if new_chunks:
             if not _chunks_have_full_embeddings(new_chunks, native_dim=state.native_dim):
                 raise RuntimeError("direct TurboVec new chunks require transient full embeddings")
@@ -3724,17 +3948,37 @@ class LodeEngine:
             except Exception:
                 # Fail closed: drop the resident copy so the next batch rebuilds.
                 self._mps_direct_turbovec_sessions.pop(state.index_key, None)
-        self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
-            index=previous.index,
-            chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
-            document_ids_by_stable_id=dict(previous.document_ids_by_stable_id),
-            dim=previous.dim,
-            bit_width=previous.bit_width,
-            generation=generation,
-            native_backend=previous.native_backend,
-            native_used=previous.native_used,
-            build_seconds=previous.build_seconds,
-        )
+        if incremental:
+            # Reuse the existing serving index in place rather than constructing a
+            # fresh one. The forward id maps were already mutated above (removals
+            # popped, adds inserted); patch the derived reverse chunk-id -> stable-id
+            # map for the same O(changed) ids and bump the generation. Building a new
+            # frozen TurboVecServingIndex would re-derive that reverse map from the
+            # whole forward map in TurboVecServingIndex.__post_init__ — an O(corpus)
+            # cost on every mutation, which is the floor this incremental path exists
+            # to remove. Safe because every engine access is serialized by
+            # @_synchronized, this engine is the sole in-process holder of the object,
+            # and concurrent readers are separate processes loading from disk.
+            reverse_map: dict[str, int] = previous._stable_id_by_chunk_id
+            for removed_chunk_id in removed_chunk_ids_applied:
+                reverse_map.pop(removed_chunk_id, None)
+            if new_chunks:
+                for stable_id, chunk in zip(stable_ids, new_chunks, strict=True):
+                    reverse_map[str(chunk.chunk_id)] = int(stable_id)
+            object.__setattr__(previous, "generation", generation)
+            self._turbovec_indexes[state.index_key] = previous
+        else:
+            self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
+                index=previous.index,
+                chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
+                document_ids_by_stable_id=dict(previous.document_ids_by_stable_id),
+                dim=previous.dim,
+                bit_width=previous.bit_width,
+                generation=generation,
+                native_backend=previous.native_backend,
+                native_used=previous.native_used,
+                build_seconds=previous.build_seconds,
+            )
         self._index_generations[state.index_key] = generation
         pending = self._pending_tvim_deltas.setdefault(
             state.index_key, {"upserted": (), "removed": ()}
@@ -3839,7 +4083,224 @@ class LodeEngine:
         self._gpu_direct_turbovec_sessions.pop(client_id_hash, None)
         self._mps_direct_turbovec_sessions.pop(client_id_hash, None)
 
+    # -- write-ahead log (opt-in commit_mode="wal") -------------------------
+
+    def _stage_wal_record(
+        self,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        op: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Stages the logical mutation a verb will append to the WAL on persist.
+
+        A no-op outside WAL mode (so the verbs stay branch-light) and while
+        replaying. The record envelope captures the live ``client_id``/``index_id``
+        so replay resolves the same index the live call did (the persisted state
+        snapshot drops the raw ``client_id``, so it cannot be recovered from the
+        loaded state alone). ``_persist_state`` then appends the staged record
+        instead of publishing a generation.
+        """
+
+        if self._commit_mode != CommitMode.WAL or self._wal_replaying:
+            return
+        envelope = {
+            "client_id": context.client_id,
+            "index_id": state.index_id,
+            **payload,
+        }
+        self._pending_wal_records[state.index_key] = (op, envelope)
+
+    def _wal_store_for(self, index_key: str) -> WalStore:
+        """Returns (opening lazily) the WAL store for one index key."""
+
+        store = self._wal_stores.get(index_key)
+        if store is None:
+            store = WalStore(
+                wal_path(self.persistence_dir, index_key), fsync=self._fsync_on_commit
+            )
+            self._wal_stores[index_key] = store
+        return store
+
+    def _append_wal_record(self, state: ClientIndexState) -> None:
+        """Appends the staged logical mutation to the WAL and maybe checkpoints.
+
+        The in-memory index was already synced before this runs, so the record
+        only has to make the mutation recoverable. After the append, if the WAL
+        backlog crosses the checkpoint threshold the WAL is folded into a fresh
+        committed generation and truncated, bounding replay time and file size.
+        """
+
+        record = self._pending_wal_records.pop(state.index_key, None)
+        if record is None:
+            # No logical mutation was staged (e.g. an internal persist with no
+            # verb). Fall back to a generation publish so nothing is lost.
+            self._persist_generation(state)
+            return
+        self.persistence_dir.mkdir(parents=True, exist_ok=True)
+        op, payload = record
+        store = self._wal_store_for(state.index_key)
+        store.append(op, payload)
+        if store.should_checkpoint(
+            checkpoint_ops=self._wal_checkpoint_ops,
+            checkpoint_bytes=self._wal_checkpoint_bytes,
+        ):
+            self._checkpoint_wal(state)
+
+    def _checkpoint_wal(self, state: ClientIndexState) -> None:
+        """Folds the WAL into a fresh committed generation, then truncates it.
+
+        The generation is committed via the atomic root-manifest swap *before*
+        the WAL is truncated, so a crash between the two simply replays a few
+        already-applied (idempotent) records on the next open rather than losing
+        them. Marks delta-append ineligible so the checkpoint always writes a
+        fresh base epoch (the live deltas may not reflect every WAL mutation).
+        """
+
+        store = self._wal_stores.get(state.index_key)
+        if store is None or store.op_count == 0:
+            return
+        # Drop any pending delta accumulators: a WAL run may have advanced the
+        # in-memory index past what the live base+deltas describe, so the
+        # checkpoint must write a self-contained fresh base, not append a delta.
+        self._pending_state_journal_documents.pop(state.index_key, None)
+        self._pending_tvim_deltas.pop(state.index_key, None)
+        self._base_epochs.pop(state.index_key, None)
+        self._persist_generation(state)
+        store.truncate()
+
+    def _checkpoint_all_wals(self) -> None:
+        """Checkpoints every open WAL into a generation (used by persist/close)."""
+
+        if self._commit_mode != CommitMode.WAL:
+            return
+        for index_key, store in list(self._wal_stores.items()):
+            if store.op_count == 0:
+                continue
+            state = self._indexes.get(index_key)
+            if state is not None:
+                self._checkpoint_wal(state)
+
+    def _replay_wal(self, state: ClientIndexState) -> dict[str, float]:
+        """Replays this index's intact WAL records onto the loaded generation.
+
+        Each record re-invokes the public engine verb that produced it, so the
+        recovered state is rebuilt by the identical ingest/sync path — never a
+        parallel decoder. A torn trailing record (writer crashed mid-append) was
+        already dropped by the store, so replay applies exactly the mutations
+        that were durably logged. Runs under ``_wal_replaying`` so the replayed
+        verbs do not re-append to (or checkpoint) the WAL.
+        """
+
+        store = self._wal_store_for(state.index_key)
+        records = store.read_records()
+        if not records:
+            return {"wal_records_replayed": 0.0}
+        started = perf_counter()
+        self._wal_replaying = True
+        try:
+            for record in records:
+                self._apply_wal_record(state, record.op, record.payload)
+        finally:
+            self._wal_replaying = False
+        return {
+            "wal_records_replayed": float(len(records)),
+            "wal_replay_ms": float((perf_counter() - started) * 1000.0),
+        }
+
+    def _apply_wal_record(
+        self,
+        state: ClientIndexState,
+        op: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Re-drives one logical WAL mutation through its public engine verb.
+
+        The record envelope carries the live ``client_id``/``index_id`` so the
+        re-invoked verb resolves the same index the original call did (replay is
+        otherwise indistinguishable from a fresh public call, which is what keeps
+        the recovered state byte-identical to what produced the log).
+        """
+
+        context = EngineRequestContext(
+            client_id=str(payload.get("client_id", state.client_id)),
+            now=datetime.now(tz=UTC),
+        )
+        index_id = str(payload.get("index_id", state.index_id))
+        if op == "upsert_documents":
+            documents = tuple(
+                EngineDocument(
+                    document_id=str(item["document_id"]),
+                    text=str(item["text"]),
+                    metadata={str(k): str(v) for k, v in dict(item.get("metadata", {})).items()},
+                )
+                for item in payload.get("documents", [])
+            )
+            response = self.upsert_documents(
+                context=context, documents=documents, index_id=index_id
+            )
+        elif op == "upsert_vectors":
+            vectors = tuple(
+                EngineVectorDocument(
+                    document_id=str(item["document_id"]),
+                    vector=tuple(float(value) for value in item["vector"]),
+                    metadata={str(k): str(v) for k, v in dict(item.get("metadata", {})).items()},
+                    text=(None if item.get("text") is None else str(item["text"])),
+                )
+                for item in payload.get("vectors", [])
+            )
+            response = self.upsert_vectors(context=context, vectors=vectors, index_id=index_id)
+        elif op == "delete_documents":
+            document_ids = tuple(str(value) for value in payload.get("document_ids", []))
+            response = self.delete_documents(
+                context=context, document_ids=document_ids, index_id=index_id
+            )
+        elif op == "update_document_payload":
+            response = self.update_document_payload(
+                context=context,
+                document_id=str(payload["document_id"]),
+                metadata=(
+                    None
+                    if payload.get("metadata") is None
+                    else {str(k): str(v) for k, v in dict(payload["metadata"]).items()}
+                ),
+                text=(None if payload.get("text") is None else str(payload["text"])),
+                clear_text=bool(payload.get("clear_text", False)),
+                index_id=index_id,
+            )
+        else:
+            raise RuntimeError(f"unknown WAL record op during replay: {op!r}")
+        if isinstance(response, EngineResponse) and int(response.status_code) >= 400:
+            raise RuntimeError(
+                f"WAL replay of {op!r} failed: {response.body.get('error', 'engine error')}"
+            )
+
     def _persist_state(self, state: ClientIndexState) -> None:
+        """Persists one mutation, dispatching on the configured commit mode.
+
+        In the default ``generation`` mode this publishes a new crash-atomic,
+        MVCC-readable generation (see :meth:`_persist_generation`). In ``wal``
+        mode it instead appends the in-flight logical mutation to the index WAL
+        (one framed ``write`` + an optional fsync) and checkpoints into a
+        generation only when the backlog crosses a threshold — so the common
+        single-add commit avoids the multi-file generation publish entirely. WAL
+        replay on open re-drives the verb, so ``_persist_state`` is a no-op while
+        replaying (the in-memory state is already being rebuilt).
+        """
+
+        if self.persistence_dir is None:
+            return
+        self._require_writable()
+        if self._commit_mode == CommitMode.WAL and not self._wal_replaying:
+            self._append_wal_record(state)
+            return
+        if self._wal_replaying:
+            # Replaying a WAL record only rebuilds in-memory state; the durable
+            # base is the committed generation already on disk plus the WAL itself.
+            return
+        self._persist_generation(state)
+
+    def _persist_generation(self, state: ClientIndexState) -> None:
         """Commits one index generation atomically via its root commit manifest.
 
         Each commit writes its durable artifacts under the per-index
@@ -4332,6 +4793,52 @@ class LodeEngine:
             if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
                 continue
             self._load_legacy_index(path)
+        # WAL recovery (writer handles only). The durable base on disk is always a
+        # committed generation; this replays any <key>.wal tail on top so a
+        # WAL-committed-but-not-yet-checkpointed mutation survives the reopen, then
+        # folds it into a fresh generation so the handle always lands on a clean,
+        # consistent generation (and WAL mode starts a fresh log from there). A
+        # torn trailing record (crash mid-append) was already dropped by the store.
+        # This runs regardless of the configured commit mode and of whether the
+        # prior writer used WAL or generation; with no WAL present (the common
+        # case) it is one cheap stat per index and a no-op. Read-only handles never
+        # replay (the WAL is the writer's private log).
+        if not self._read_only:
+            self._recover_wals()
+
+    def _recover_wals(self) -> None:
+        """Replays each index's WAL tail, then folds it into a fresh generation.
+
+        The durable base loaded above is always a committed generation; any
+        ``<key>.wal`` holds only mutations a prior writer logged but had not yet
+        checkpointed (a clean close folds and truncates the WAL, so one is present
+        only after an unclean shutdown). Replay re-drives the same engine verbs to
+        rebuild the in-memory state, then the recovered WAL is always folded into a
+        fresh generation and truncated, so every open lands on a clean, consistent
+        generation regardless of commit mode: WAL mode then starts a new log from
+        that generation, and generation mode is simply left with no stray log. A
+        torn trailing record was dropped by the store, so exactly the durably
+        logged mutations are recovered.
+        """
+
+        for index_key in list(self._indexes):
+            state = self._indexes.get(index_key)
+            if state is None:
+                continue
+            store = self._wal_store_for(index_key)
+            if not store.exists():
+                continue
+            stats = self._replay_wal(state)
+            if stats.get("wal_records_replayed"):
+                self._state_load_telemetry.setdefault(index_key, {}).update(stats)
+                # Normalize to a clean generation on open: fold the recovered WAL
+                # into a fresh generation and truncate it, in either commit mode.
+                self._checkpoint_wal(state)
+            else:
+                # A WAL with no intact records (only a torn partial frame): nothing
+                # to recover, but drop the stray bytes so a later append cannot turn
+                # them into interior corruption.
+                store.truncate()
 
     def _load_index_from_commit(self, key: str, body: dict[str, Any]) -> None:
         """Loads one index from the consistent generation named by its root manifest."""
@@ -5291,18 +5798,22 @@ def _delete_orphaned_document_chunks(
     state: ClientIndexState,
     document_id: str,
     new_chunk_ids: list[str],
-) -> int:
-    """Deletes old chunk rows for a document that are absent after a chunk-level upsert."""
+) -> tuple[str, ...]:
+    """Deletes old chunk rows for a document that are absent after a chunk-level upsert.
+
+    Returns the chunk ids it removed so the caller can thread them into the
+    direct TurboVec changeset (the count is just ``len(...)`` of this).
+    """
 
     new_ids = set(new_chunk_ids)
-    orphan_ids = [
+    orphan_ids = tuple(
         chunk_id
         for chunk_id in state.document_chunk_ids.get(document_id, ())
         if chunk_id not in new_ids
-    ]
+    )
     for chunk_id in orphan_ids:
         state.chunks.pop(chunk_id, None)
-    return len(orphan_ids)
+    return orphan_ids
 
 
 def _recompute_fraction(*, embedded: int, reused: int) -> float:
@@ -5331,6 +5842,48 @@ def _document_ingest_response_payload(
     if "embedding_batch_size" in result:
         payload["embedding_batch_size"] = int(result["embedding_batch_size"])
     return payload
+
+
+def _documents_wal_payload(documents: tuple[EngineDocument, ...]) -> dict[str, Any]:
+    """Frames an ``upsert``/``build`` document batch as a WAL record payload.
+
+    Captures exactly the public-call inputs (id, text, redacted metadata) so
+    replay re-embeds and re-indexes through the identical ingest path. Text is
+    included because the WAL is the writer's own durable log; it is never read by
+    a redacted/telemetry path and never leaves the process.
+    """
+
+    return {
+        "documents": [
+            {
+                "document_id": document.document_id,
+                "text": document.text,
+                "metadata": dict(document.metadata),
+            }
+            for document in documents
+        ]
+    }
+
+
+def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str, Any]:
+    """Frames a vector-in upsert batch as a WAL record payload.
+
+    Stores each vector verbatim (already L2-normalized at the SDK boundary) plus
+    redacted metadata and the optional retained text, so replay reproduces the
+    same encoded rows the live commit did.
+    """
+
+    return {
+        "vectors": [
+            {
+                "document_id": vector.document_id,
+                "vector": [float(value) for value in vector.vector],
+                "metadata": dict(vector.metadata),
+                "text": vector.text,
+            }
+            for vector in vectors
+        ]
+    }
 
 
 def _embedding_batch_size_for_backend(backend: EngineEmbeddingBackend) -> int:

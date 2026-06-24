@@ -86,7 +86,11 @@ def test_read_only_open_does_not_block_live_writer(tmp_path):
     must take no lock and succeed immediately.
     """
 
-    writer = _writer(tmp_path)
+    # Generation mode so the add is published to a committed generation a live
+    # read-only reader can see (the WAL default buffers uncheckpointed writes).
+    writer = LodeDB(
+        path=tmp_path, model="minilm", commit_mode="generation", _embedding_backend=_be()
+    )
     writer.add("doc", id="d")  # persisted on add
     try:
         reader = _reader(tmp_path)  # would block/raise if it took the writer lock

@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- **The default commit mode is now `commit_mode="wal"`.** A durable single `add`/`remove`
+  appends one length-prefixed, CRC32-framed record to a `<key>.wal` log (a single `write`, plus
+  one `fsync` under `durability="fsync"`) and a full generation is checkpointed only periodically,
+  instead of publishing a new generation on every mutation, removing the multi-file generation
+  publish from the hot write path. The WAL records logical
+  mutations and is replayed on open by re-driving the same engine verbs, so recovery is
+  crash-atomic: a half-written trailing record is discarded, an interior-corrupt record fails
+  closed, and every writable open folds any recovered WAL into a clean committed generation (so a
+  handle always opens onto a consistent generation, regardless of mode). WAL is single-writer; a
+  concurrent `open_readonly` reader loads a consistent committed generation, but the last
+  checkpointed one, not the writer's in-flight WAL. Pass `commit_mode="generation"` (or
+  `LODEDB_COMMIT_MODE=generation`) to keep the previous behavior: a crash-atomic, MVCC-readable
+  generation published on every write, for deployments where many out-of-process readers must see
+  each write the instant it commits.
+- **Direct TurboVec index sync is now O(changed) per mutation.** Each `add`/`upsert`/`delete`
+  previously re-derived the full corpus diff against the in-memory index on every call (scanning
+  the whole id map and all of `state.chunks`, plus copying both id maps and rebuilding the reverse
+  id map), making a single durable add O(corpus). The mutation verbs now hand the sync their exact
+  chunk-level delta, truth-checked against the post-mutation `state.chunks` (with a full-corpus-diff
+  fallback for any path that does not supply one), so per-add work is O(changed) and flat with
+  corpus size. Combined with the WAL default this puts durable single-add at ~0.6 ms on an L40S at
+  ~17.5k docs (down from ~6 ms), in the sqlite-vec/qdrant range; both commit modes benefit.
 
 ## [0.2.1] - 2026-06-23
 

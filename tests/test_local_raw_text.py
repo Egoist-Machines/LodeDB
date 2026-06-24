@@ -28,13 +28,14 @@ from lodedb.local.db import LodeDB
 _SECRET = "TOPSECRET document body that must only live in the text sidecar"
 
 
-def _open(tmp_path, *, store_text: bool, dim: int = 384) -> LodeDB:
+def _open(tmp_path, *, store_text: bool, dim: int = 384, commit_mode: str | None = None) -> LodeDB:
     """Opens a LodeDB with an injected deterministic hash backend."""
 
     return LodeDB(
         path=tmp_path,
         model="minilm",
         store_text=store_text,
+        commit_mode=commit_mode,
         _embedding_backend=HashEmbeddingBackend(native_dim=dim),
     )
 
@@ -81,7 +82,9 @@ def test_get_text_returns_stored_text(tmp_path):
 def test_text_commit_is_o_changed(tmp_path):
     """An incremental text commit appends a .txd delta, never rewriting the base."""
 
-    db = _open(tmp_path, store_text=True)
+    # O(changed) per-commit deltas are a generation-mode property (the WAL default
+    # buffers writes and folds them into a base at checkpoint, not per add).
+    db = _open(tmp_path, store_text=True, commit_mode="generation")
     db.add_many([{"text": f"base body {i}", "id": f"b{i}"} for i in range(12)])  # cold base
     base_files = glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True)
     assert base_files, "expected a raw-text base"
