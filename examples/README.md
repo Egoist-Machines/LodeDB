@@ -7,6 +7,7 @@ The first run downloads the embedding model from Hugging Face and caches it loca
 | File | What it shows | Run |
 |---|---|---|
 | [`quickstart.py`](quickstart.py) | Core SDK: add, `search`, batched `search_many`, `get`, `persist` | `uv run python examples/quickstart.py` |
+| [`multimodal_clip.py`](multimodal_clip.py) | Image + text search via the `clip` preset, and bring-your-own vectors (needs `--extra image` for the CLIP half) | `uv run python examples/multimodal_clip.py` |
 | [`langchain_store.py`](langchain_store.py) | LodeDB as a LangChain `VectorStore` (needs `--extra langchain`) | `uv run python examples/langchain_store.py` |
 | [`llama_index_store.py`](llama_index_store.py) | LodeDB as a LlamaIndex `VectorStore` (needs `--extra llama-index`) | `uv run python examples/llama_index_store.py` |
 | [`llama_index_graph_store.py`](llama_index_graph_store.py) | LodeDB as a LlamaIndex `PropertyGraphStore` (needs `--extra llama-index`) | `uv run python examples/llama_index_graph_store.py` |
