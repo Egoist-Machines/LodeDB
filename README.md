@@ -8,16 +8,16 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is a great **drop-in, durable memory backend for LangChain, LlamaIndex, and mem0.** Point any of them
-at LodeDB instead of its default store. Over 17.5k documents, per
-framework default:
+LodeDB is the best **drop-in, durable memory backend for LangChain, LlamaIndex, and mem0**: the most
+compact on disk, GPU-accelerated, and now sub-millisecond on durable writes. Point any of them at
+LodeDB instead of its default store. Over 17.5k documents, per framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
 | On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
 | Single-query p50 (CPU) | **~410× faster** (0.8 vs 345 ms) | **~500× faster** (0.9 vs 427 ms) | **~25× faster** (0.9 vs 23 ms) |
 | Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
-| Durable add of one memory | **~570× faster** (20 ms vs 11.5 s) | **~2,200× faster** (11 ms vs 23.4 s) | 13 vs 0.7 ms (Qdrant faster) |
+| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.9 vs 0.5 ms (both sub-ms) |
 | Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
 
 [Full benchmark, all backends
@@ -27,6 +27,22 @@ Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk ind
 GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
 incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
+
+**Durable single-add latency vs other embedded stores** (store-only, precomputed vectors;
+GovReport ~17.5k docs on a Modal A10 / L40S), the agent-memory write pattern. LodeDB's default
+WAL commit keeps per-add latency in the sqlite-vec/qdrant range at the most compact footprint:
+
+| store | add p50 (A10) | add p50 (L40S) | footprint | recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| sqlite-vec | 0.5 ms | 0.4 ms | 101 MB | 0.999 |
+| qdrant (local) | 0.6 ms | 0.5 ms | 85 MB | 0.999 |
+| **LodeDB** | **0.8 ms** | **0.6 ms** | **29 MB** | 0.95 |
+| pgvector | 1.9 ms | 2.3 ms | 50 MB | 0.998 |
+| lancedb | 2.7 ms | 3.2 ms | 37 MB | 0.999 |
+| chroma | 5.5 ms | 6.5 ms | 151 MB | 0.998 |
+
+LodeDB has the smallest footprint here (up to 5× smaller) and lands durable single-add in the
+sqlite-vec/qdrant range, trading ~5 points of recall (TurboVec's 2/4-bit codes) for it.
 
 - **GPU-resident batch search**: an fp16 copy of the index lives on the GPU, scored with a
   tiled GEMM plus a streaming top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
