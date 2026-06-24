@@ -34,6 +34,7 @@ from lodedb.engine.core import (
     EngineVectorDocument,
     LodeEngine,
 )
+from lodedb.engine.embedding_backends import EngineEmbeddingBackend
 from lodedb.engine.index import EngineError, LodeIndex
 from lodedb.engine.route_registry import default_route_registry, load_route_registry
 from lodedb.engine.runtime_policy import commit_mode_from_env, parse_commit_mode
@@ -41,7 +42,12 @@ from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
 )
-from lodedb.local.presets import LocalModelPreset, resolve_preset, vector_only_route_policy
+from lodedb.local.presets import (
+    LocalModelPreset,
+    custom_embedder_route_policy,
+    resolve_preset,
+    vector_only_route_policy,
+)
 
 # Fixed local identifier for the single-process client context. It never leaves
 # the process and has no security meaning — the local engine is auth-free.
@@ -146,6 +152,7 @@ class LodeDB:
         *,
         model: str = "minilm",
         vector_dim: int | None = None,
+        embedder: EngineEmbeddingBackend | None = None,
         bit_width: int = 4,
         device: str = "auto",
         embedding_runtime: str = "auto",
@@ -162,7 +169,14 @@ class LodeDB:
     ) -> None:
         """Opens (or creates) an on-disk local index, loading any persisted state.
 
-        ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality).
+        ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality). Pass
+        ``embedder=`` instead to drive the index with your own
+        :class:`~lodedb.engine.embedding_backends.EngineEmbeddingBackend` at any
+        embedding dimension; ``model`` is then ignored and the index shape is taken
+        from the backend's ``native_dim`` (and its ``required_model_name``, when it
+        declares one, is pinned into the snapshot header and re-enforced on reopen).
+        ``embedder`` is mutually exclusive with ``vector_dim`` (a vector-only,
+        no-embedder index opened via :meth:`open_vector_store`).
         ``device`` is ``"auto"``/``"cpu"``/``"mps"``/``"cuda"`` (embedding only).
         ``embedding_runtime`` selects the embedding runtime: ``"auto"`` (default;
         prefer ONNX Runtime, fall back to PyTorch sentence-transformers when ONNX
@@ -228,6 +242,10 @@ class LodeDB:
         # index that embeds text internally.
         self.vector_only = vector_dim is not None
         self.preset: LocalModelPreset | None
+        if embedder is not None and self.vector_only:
+            raise ValueError("embedder and vector_dim are mutually exclusive")
+        if embedder is not None and _embedding_backend is not None:
+            raise ValueError("embedder and _embedding_backend are mutually exclusive")
 
         if self.vector_only:
             if _embedding_backend is not None:
@@ -247,6 +265,29 @@ class LodeDB:
                 fallback_reason="vector-only index (no embedding model)",
             )
             route_policy = vector_only_route_policy(dim, bit_width=int(bit_width))
+            route_profile = route_policy.profile
+        elif embedder is not None:
+            # A caller-supplied embedding backend: the index is text-capable (the
+            # backend embeds in/out), but its shape comes from the backend, not a
+            # preset, so it can run at any dimension.
+            native_dim = int(getattr(embedder, "native_dim", 0))
+            if native_dim <= 0:
+                raise ValueError("embedder must expose a positive native_dim")
+            self.preset = None
+            self._vector_dim_value = native_dim
+            backend = embedder
+            self._embedding_backend = backend
+            model_identity = getattr(embedder, "required_model_name", None) or "custom"
+            self.embedding_resolution = LocalEmbeddingResolution(
+                requested_device=device,
+                backend_name=getattr(backend, "name", "custom"),
+                effective_device="injected",
+                fallback_used=False,
+                fallback_reason="",
+            )
+            route_policy = custom_embedder_route_policy(
+                native_dim, bit_width=int(bit_width), model_identity=model_identity
+            )
             route_profile = route_policy.profile
         else:
             self.preset = resolve_preset(model)
