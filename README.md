@@ -8,12 +8,25 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
+LodeDB is a great **drop-in, durable memory backend for LangChain, LlamaIndex, and mem0.** Point any of them
+at LodeDB instead of its default store. Over 17.5k documents, per
+framework default:
+
+| vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
+|---|---|---|---|
+| On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
+| Single-query p50 (CPU) | **~410× faster** (0.8 vs 345 ms) | **~500× faster** (0.9 vs 427 ms) | **~25× faster** (0.9 vs 23 ms) |
+| Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
+| Durable add of one memory | **~570× faster** (20 ms vs 11.5 s) | **~2,200× faster** (11 ms vs 23.4 s) | 13 vs 0.7 ms (Qdrant faster) |
+| Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
+
+[Full benchmark, all backends
+(FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
+
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the
 GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
 incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
-
-Fast on a laptop. Faster on a GPU. Exact every time. Never phones home.
 
 - **GPU-resident batch search**: an fp16 copy of the index lives on the GPU, scored with a
   tiled GEMM plus a streaming top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
