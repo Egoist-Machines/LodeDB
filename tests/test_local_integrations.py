@@ -589,6 +589,18 @@ def _install_private_gpt_factory_stub(monkeypatch):
         "_load_private_gpt_factory_base",
         lambda: (VectorStoreFactory, register_vector_store),
     )
+
+    # Build the provider's per-collection indexes with the deterministic hash embedding backend
+    # the other adapter tests use, so these tests never download or load a real
+    # SentenceTransformer model. That keeps them offline and fast and avoids loading a torch
+    # model onto a GPU/MPS device on CI runners. Device is dropped since the hash backend needs
+    # none.
+    def _hash_backed_lodedb(*args, **kwargs):
+        kwargs.pop("device", None)
+        kwargs.setdefault("_embedding_backend", HashEmbeddingBackend(native_dim=384))
+        return LodeDB(*args, **kwargs)
+
+    monkeypatch.setattr(pgpt_mod, "LodeDB", _hash_backed_lodedb)
     return VectorStoreFactory, providers
 
 
