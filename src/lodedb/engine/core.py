@@ -321,6 +321,24 @@ class _PlannedDocumentMutation:
     unchanged: bool = False
 
 
+@dataclass(frozen=True)
+class _TurboVecChangeset:
+    """Exact set of chunk-level changes a mutation verb applied to ``state.chunks``.
+
+    Threaded from the upsert/delete verbs into ``_sync_direct_turbovec_index`` so
+    the sync can reconcile the serving index in O(changed) instead of re-deriving
+    the full diff against the whole corpus on every mutation. ``added_chunks`` are
+    the :class:`IndexedChunk` objects the verb just wrote; ``removed_chunk_ids``
+    are the chunk ids it removed. The changeset is only a hint — the sync still
+    truth-checks every id against the post-mutation ``state.chunks`` and the live
+    id map, so an over-reporting changeset (e.g. a chunk added then orphaned in
+    one batch) stays correct without scanning the corpus.
+    """
+
+    added_chunks: tuple[IndexedChunk, ...] = ()
+    removed_chunk_ids: tuple[str, ...] = ()
+
+
 @dataclass
 class ClientIndexState:
     """Stores per-client index state without crossing client boundaries."""
@@ -1134,15 +1152,16 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_documents")
         if isinstance(state, EngineResponse):
             return state
-        result = self._ingest_documents(
+        ingest = self._ingest_documents(
             context=context,
             state=state,
             documents=documents,
             operation="upsert_documents",
             embed_batch_size=embed_batch_size,
         )
-        if isinstance(result, EngineResponse):
-            return result
+        if isinstance(ingest, EngineResponse):
+            return ingest
+        result, changeset = ingest
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
         self._stage_wal_record(
@@ -1153,6 +1172,7 @@ class LodeEngine:
             state=state,
             result=result,
             event_name="documents_upserted",
+            changeset=changeset,
         )
         return EngineResponse(
             200,
@@ -1184,14 +1204,15 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_vectors")
         if isinstance(state, EngineResponse):
             return state
-        result = self._ingest_vectors(
+        ingest = self._ingest_vectors(
             context=context,
             state=state,
             vectors=vectors,
             operation="upsert_vectors",
         )
-        if isinstance(result, EngineResponse):
-            return result
+        if isinstance(ingest, EngineResponse):
+            return ingest
+        result, changeset = ingest
         self._capture_vector_document_text(state, vectors)
         self._stage_wal_record(context, state, "upsert_vectors", _vectors_wal_payload(vectors))
         self._finalize_document_ingest(
@@ -1199,6 +1220,7 @@ class LodeEngine:
             state=state,
             result=result,
             event_name="vectors_upserted",
+            changeset=changeset,
         )
         return EngineResponse(
             200,
@@ -1482,8 +1504,13 @@ class LodeEngine:
         documents: tuple[EngineDocument, ...],
         operation: str,
         embed_batch_size: int | None = None,
-    ) -> dict[str, float | int] | EngineResponse:
-        """Validates, chunks, embeds, and applies document changes without persisting."""
+    ) -> tuple[dict[str, float | int], _TurboVecChangeset] | EngineResponse:
+        """Validates, chunks, embeds, and applies document changes without persisting.
+
+        On success returns ``(result, changeset)`` where ``changeset`` is the exact
+        chunk-level delta for the O(changed) direct TurboVec sync; validation
+        failures still return an :class:`EngineResponse` so callers can short-circuit.
+        """
 
         if not documents:
             return self._error(
@@ -1580,6 +1607,13 @@ class LodeEngine:
             batch_size=embedding_batch_size,
         )
         result["embedding_time_ms"] += (perf_counter() - embedding_started) * 1000.0
+        # Collect the exact chunk-level delta this batch applies so the direct
+        # TurboVec sync can reconcile in O(changed). Only genuinely new chunks
+        # (reusable_chunk is None) are "added": reused chunks keep their
+        # content-hash id, are already in the index, and would be filtered out by
+        # the sync's truth check anyway.
+        added_chunks: list[IndexedChunk] = []
+        removed_chunk_ids: list[str] = []
         for document_index, plan in enumerate(plans, start=1):
             document = plan.document
             if plan.unchanged:
@@ -1599,17 +1633,22 @@ class LodeEngine:
                     # discarded their transient embeddings.
                     embedding = reusable_chunk.embedding
                     result["reused_chunks"] += 1
-                state.chunks[chunk_id] = IndexedChunk(
+                new_chunk = IndexedChunk(
                     chunk_id=chunk_id,
                     document_id=document.document_id,
                     content_hash=chunk_hash,
                     embedding=embedding,
                 )
-            result["deleted_chunks"] += _delete_orphaned_document_chunks(
+                state.chunks[chunk_id] = new_chunk
+                if reusable_chunk is None:
+                    added_chunks.append(new_chunk)
+            orphan_ids = _delete_orphaned_document_chunks(
                 state,
                 document.document_id,
                 list(plan.new_chunk_ids),
             )
+            result["deleted_chunks"] += len(orphan_ids)
+            removed_chunk_ids.extend(orphan_ids)
             state.document_hashes[document.document_id] = plan.content_hash
             state.document_chunk_ids[document.document_id] = tuple(plan.new_chunk_ids)
             state.document_metadata[document.document_id] = dict(document.metadata)
@@ -1627,7 +1666,11 @@ class LodeEngine:
             state,
             upserted_document_ids=tuple(plan.document.document_id for plan in plans),
         )
-        return result
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        return result, changeset
 
     def _ingest_vectors(
         self,
@@ -1636,7 +1679,7 @@ class LodeEngine:
         state: ClientIndexState,
         vectors: tuple[EngineVectorDocument, ...],
         operation: str,
-    ) -> dict[str, float | int] | EngineResponse:
+    ) -> tuple[dict[str, float | int], _TurboVecChangeset] | EngineResponse:
         """Validates and applies pre-embedded documents without embedding/chunking.
 
         Mirrors the apply half of :meth:`_ingest_documents` but treats each
@@ -1645,7 +1688,8 @@ class LodeEngine:
         applied), writes one :class:`IndexedChunk` per document carrying the
         caller's vector as its transient embedding, and journals the mutation.
         The shared :meth:`_finalize_document_ingest` then runs the same direct
-        TurboVec sync + atomic commit the text path uses.
+        TurboVec sync + atomic commit the text path uses. On success returns
+        ``(result, changeset)`` for the O(changed) sync.
         """
 
         if not vectors:
@@ -1691,6 +1735,8 @@ class LodeEngine:
             "embedding_batch_size": 0,
         }
         upserted_ids: list[str] = []
+        added_chunks: list[IndexedChunk] = []
+        removed_chunk_ids: list[str] = []
         for document_id, content_hash, embedding, metadata in planned:
             upserted_ids.append(document_id)
             if state.document_hashes.get(document_id) == content_hash:
@@ -1701,16 +1747,18 @@ class LodeEngine:
                 state.updated_at = _utc_now_iso(context.now)
                 continue
             chunk_id = _chunk_id_for_hash(document_id, chunk_hash=content_hash, occurrence=0)
-            state.chunks[chunk_id] = IndexedChunk(
+            new_chunk = IndexedChunk(
                 chunk_id=chunk_id,
                 document_id=document_id,
                 content_hash=content_hash,
                 embedding=embedding,
             )
+            state.chunks[chunk_id] = new_chunk
+            added_chunks.append(new_chunk)
             result["embedded_chunks"] += 1
-            result["deleted_chunks"] += _delete_orphaned_document_chunks(
-                state, document_id, [chunk_id]
-            )
+            orphan_ids = _delete_orphaned_document_chunks(state, document_id, [chunk_id])
+            result["deleted_chunks"] += len(orphan_ids)
+            removed_chunk_ids.extend(orphan_ids)
             state.document_hashes[document_id] = content_hash
             state.document_chunk_ids[document_id] = (chunk_id,)
             state.document_metadata[document_id] = dict(metadata)
@@ -1718,7 +1766,11 @@ class LodeEngine:
         self._record_pending_state_journal_documents(
             state, upserted_document_ids=tuple(upserted_ids)
         )
-        return result
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        return result, changeset
 
     def _finalize_document_ingest(
         self,
@@ -1727,8 +1779,14 @@ class LodeEngine:
         state: ClientIndexState,
         result: dict[str, float | int],
         event_name: str,
+        changeset: _TurboVecChangeset | None = None,
     ) -> None:
-        """Updates counters, syncs the direct index, and persists once."""
+        """Updates counters, syncs the direct index, and persists once.
+
+        ``changeset`` carries the exact chunk-level delta from the upsert verbs so
+        the TurboVec sync runs in O(changed); when it is ``None`` (e.g. the cold
+        build path) the sync falls back to the full corpus diff.
+        """
 
         embedded = int(result["embedded_chunks"])
         reused = int(result["reused_chunks"])
@@ -1745,7 +1803,7 @@ class LodeEngine:
                 chunk_count=len(state.chunks),
             )
             sync_started = perf_counter()
-            synced_chunk_ids = self._sync_direct_turbovec_index(state)
+            synced_chunk_ids = self._sync_direct_turbovec_index(state, changeset=changeset)
             _log_document_ingest_finalize_progress(
                 event_name,
                 phase="turbovec_sync",
@@ -1808,6 +1866,7 @@ class LodeEngine:
                 context.client_id,
             )
         deleted_chunks = 0
+        removed_chunk_ids: list[str] = []
         unique_document_ids = tuple(dict.fromkeys(document_ids))
         for document_id in document_ids:
             if _is_blank(document_id):
@@ -1818,7 +1877,9 @@ class LodeEngine:
                     context.client_id,
                 )
         for document_id in unique_document_ids:
-            deleted_chunks += self._delete_document_chunks(state, document_id)
+            removed = self._delete_document_chunks(state, document_id)
+            deleted_chunks += len(removed)
+            removed_chunk_ids.extend(removed)
             state.document_hashes.pop(document_id, None)
             state.document_chunk_ids.pop(document_id, None)
             state.document_metadata.pop(document_id, None)
@@ -1831,7 +1892,10 @@ class LodeEngine:
         state.delete_count += len(unique_document_ids)
         state.deleted_chunk_count += deleted_chunks
         state.updated_at = _utc_now_iso(context.now)
-        self._sync_direct_turbovec_index(state)
+        self._sync_direct_turbovec_index(
+            state,
+            changeset=_TurboVecChangeset(removed_chunk_ids=tuple(removed_chunk_ids)),
+        )
         self._emit(
             "documents_deleted",
             context.client_id,
@@ -2501,13 +2565,19 @@ class LodeEngine:
             self.route_policy.native_dim,
         )
 
-    def _delete_document_chunks(self, state: ClientIndexState, document_id: str) -> int:
-        """Removes all chunks for one document from a client-local index."""
+    def _delete_document_chunks(
+        self, state: ClientIndexState, document_id: str
+    ) -> tuple[str, ...]:
+        """Removes all chunks for one document from a client-local index.
+
+        Returns the removed chunk ids so ``delete_documents`` can build the
+        direct TurboVec changeset; the deleted-chunk count is ``len(...)``.
+        """
 
         chunk_ids = state.document_chunk_ids.get(document_id, ())
         for chunk_id in chunk_ids:
             state.chunks.pop(chunk_id, None)
-        return len(chunk_ids)
+        return tuple(chunk_ids)
 
     def _embedding_backend_for_state(self, state: ClientIndexState) -> EngineEmbeddingBackend:
         """Returns the configured local backend or a deterministic fixture backend."""
@@ -3653,12 +3723,25 @@ class LodeEngine:
             if matches(chunk.document_id, document_metadata.get(chunk.document_id, {}))
         )
 
-    def _sync_direct_turbovec_index(self, state: ClientIndexState) -> tuple[str, ...]:
+    def _sync_direct_turbovec_index(
+        self, state: ClientIndexState, changeset: _TurboVecChangeset | None = None
+    ) -> tuple[str, ...]:
         """Applies transient full-embedding mutations to a direct TurboVec index.
 
         Returns the chunk ids whose transient full embeddings are now encoded in
         the index and can therefore be discarded by the caller (the rows added
         this sync), so the discard is O(changed) rather than O(corpus).
+
+        When ``changeset`` is supplied and an index already exists, the diff is
+        taken straight from the verb's exact ``(added_chunks, removed_chunk_ids)``
+        in O(changed) instead of re-deriving it against the whole corpus. The
+        changeset is only a hint: every removed id is confirmed present in the
+        live id map and gone from ``state.chunks``, and every added chunk is
+        confirmed still in ``state.chunks`` and not already indexed, so an
+        over-reporting changeset can never corrupt the index — it degrades at
+        worst to the same set the full scan would have produced. When
+        ``changeset`` is ``None`` (or no prior index exists) the original
+        full-corpus diff runs verbatim as a fallback.
         """
 
         if not _state_uses_direct_turbovec(state):
@@ -3668,7 +3751,13 @@ class LodeEngine:
         gpu_session = self._gpu_direct_turbovec_sessions.get(state.index_key)
         mps_session = self._mps_direct_turbovec_sessions.get(state.index_key)
         previous = self._turbovec_indexes.get(state.index_key)
-        current_chunk_ids = set(state.chunks)
+        # Incremental reconciliation needs a prior index to mutate; the cold-build
+        # branch below ignores the changeset and re-encodes the whole corpus.
+        incremental = previous is not None and changeset is not None
+        # The full-diff fallback needs the corpus-wide id set; the incremental
+        # path uses O(1) ``state.chunks`` membership instead, so only pay for the
+        # set when falling back.
+        current_chunk_ids = set(state.chunks) if not incremental else frozenset()
         generation = self._index_generations.get(state.index_key, 0) + 1
         progress_label = _direct_turbovec_progress_label(
             self,
@@ -3693,11 +3782,37 @@ class LodeEngine:
             # A cold rebuild re-encodes every chunk, so every chunk's transient
             # embedding is now in the index and can be discarded.
             return tuple(state.chunks)
-        removed_stable_ids = tuple(
-            int(stable_id)
-            for stable_id, chunk_id in previous.chunk_ids_by_stable_id.items()
-            if chunk_id not in current_chunk_ids
-        )
+        if incremental:
+            assert changeset is not None  # narrowed by ``incremental``
+            # O(changed) removals: map each reported removed chunk id to its
+            # derived stable id and keep only those the index actually still holds
+            # and that are truly gone from state.chunks. The chunk-id match guards
+            # against a (vanishingly unlikely) stable-id collision aliasing a
+            # different live chunk, and the ``seen`` set dedupes a chunk reported
+            # twice in one batch so remove_many's count check stays exact.
+            removed_seen: set[int] = set()
+            removed_stable_list: list[int] = []
+            removed_chunk_ids_applied: list[str] = []
+            for chunk_id in changeset.removed_chunk_ids:
+                if chunk_id in state.chunks:
+                    continue  # re-added within the same batch: not a net removal
+                stable_id = int(
+                    stable_uint64_ids_for_chunk_ids((str(chunk_id),))[0]
+                )
+                if stable_id in removed_seen:
+                    continue
+                if previous.chunk_ids_by_stable_id.get(stable_id) != str(chunk_id):
+                    continue  # not indexed under this id (already gone or collision)
+                removed_seen.add(stable_id)
+                removed_stable_list.append(stable_id)
+                removed_chunk_ids_applied.append(str(chunk_id))
+            removed_stable_ids = tuple(removed_stable_list)
+        else:
+            removed_stable_ids = tuple(
+                int(stable_id)
+                for stable_id, chunk_id in previous.chunk_ids_by_stable_id.items()
+                if chunk_id not in current_chunk_ids
+            )
         if removed_stable_ids:
             _log_direct_turbovec_update_progress(
                 progress_label,
@@ -3737,10 +3852,37 @@ class LodeEngine:
                 generation=generation,
                 elapsed_ms=(perf_counter() - started) * 1000.0,
             )
-        indexed_chunk_ids = set(previous.chunk_ids_by_stable_id.values())
-        new_chunks = tuple(
-            chunk for chunk in state.chunks.values() if chunk.chunk_id not in indexed_chunk_ids
-        )
+        if incremental:
+            assert changeset is not None  # narrowed by ``incremental``
+            # O(changed) additions: keep each reported added chunk that survived
+            # to state.chunks and is not already indexed (after the removals
+            # above). The stable-id and chunk-id truth checks make a chunk that
+            # was added then orphaned in the same batch, or one already present,
+            # drop out — yielding exactly the set the full scan would, in the same
+            # relative order, so the batched stable-id assignment below matches.
+            added_seen: set[str] = set()
+            incremental_new: list[Any] = []
+            for chunk in changeset.added_chunks:
+                chunk_id = str(chunk.chunk_id)
+                if chunk_id in added_seen:
+                    continue
+                if chunk_id not in state.chunks:
+                    continue  # added then removed within the batch
+                candidate_stable_id = int(
+                    stable_uint64_ids_for_chunk_ids((chunk_id,))[0]
+                )
+                if candidate_stable_id in previous.chunk_ids_by_stable_id:
+                    continue  # already indexed (e.g. unchanged reused chunk)
+                added_seen.add(chunk_id)
+                incremental_new.append(chunk)
+            new_chunks = tuple(incremental_new)
+        else:
+            indexed_chunk_ids = set(previous.chunk_ids_by_stable_id.values())
+            new_chunks = tuple(
+                chunk
+                for chunk in state.chunks.values()
+                if chunk.chunk_id not in indexed_chunk_ids
+            )
         if new_chunks:
             if not _chunks_have_full_embeddings(new_chunks, native_dim=state.native_dim):
                 raise RuntimeError("direct TurboVec new chunks require transient full embeddings")
@@ -3806,17 +3948,37 @@ class LodeEngine:
             except Exception:
                 # Fail closed: drop the resident copy so the next batch rebuilds.
                 self._mps_direct_turbovec_sessions.pop(state.index_key, None)
-        self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
-            index=previous.index,
-            chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
-            document_ids_by_stable_id=dict(previous.document_ids_by_stable_id),
-            dim=previous.dim,
-            bit_width=previous.bit_width,
-            generation=generation,
-            native_backend=previous.native_backend,
-            native_used=previous.native_used,
-            build_seconds=previous.build_seconds,
-        )
+        if incremental:
+            # Reuse the existing serving index in place rather than constructing a
+            # fresh one. The forward id maps were already mutated above (removals
+            # popped, adds inserted); patch the derived reverse chunk-id -> stable-id
+            # map for the same O(changed) ids and bump the generation. Building a new
+            # frozen TurboVecServingIndex would re-derive that reverse map from the
+            # whole forward map in TurboVecServingIndex.__post_init__ — an O(corpus)
+            # cost on every mutation, which is the floor this incremental path exists
+            # to remove. Safe because every engine access is serialized by
+            # @_synchronized, this engine is the sole in-process holder of the object,
+            # and concurrent readers are separate processes loading from disk.
+            reverse_map: dict[str, int] = previous._stable_id_by_chunk_id
+            for removed_chunk_id in removed_chunk_ids_applied:
+                reverse_map.pop(removed_chunk_id, None)
+            if new_chunks:
+                for stable_id, chunk in zip(stable_ids, new_chunks, strict=True):
+                    reverse_map[str(chunk.chunk_id)] = int(stable_id)
+            object.__setattr__(previous, "generation", generation)
+            self._turbovec_indexes[state.index_key] = previous
+        else:
+            self._turbovec_indexes[state.index_key] = TurboVecServingIndex(
+                index=previous.index,
+                chunk_ids_by_stable_id=dict(previous.chunk_ids_by_stable_id),
+                document_ids_by_stable_id=dict(previous.document_ids_by_stable_id),
+                dim=previous.dim,
+                bit_width=previous.bit_width,
+                generation=generation,
+                native_backend=previous.native_backend,
+                native_used=previous.native_used,
+                build_seconds=previous.build_seconds,
+            )
         self._index_generations[state.index_key] = generation
         pending = self._pending_tvim_deltas.setdefault(
             state.index_key, {"upserted": (), "removed": ()}
@@ -5636,18 +5798,22 @@ def _delete_orphaned_document_chunks(
     state: ClientIndexState,
     document_id: str,
     new_chunk_ids: list[str],
-) -> int:
-    """Deletes old chunk rows for a document that are absent after a chunk-level upsert."""
+) -> tuple[str, ...]:
+    """Deletes old chunk rows for a document that are absent after a chunk-level upsert.
+
+    Returns the chunk ids it removed so the caller can thread them into the
+    direct TurboVec changeset (the count is just ``len(...)`` of this).
+    """
 
     new_ids = set(new_chunk_ids)
-    orphan_ids = [
+    orphan_ids = tuple(
         chunk_id
         for chunk_id in state.document_chunk_ids.get(document_id, ())
         if chunk_id not in new_ids
-    ]
+    )
     for chunk_id in orphan_ids:
         state.chunks.pop(chunk_id, None)
-    return len(orphan_ids)
+    return orphan_ids
 
 
 def _recompute_fraction(*, embedded: int, reused: int) -> float:
