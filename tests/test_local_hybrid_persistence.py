@@ -32,6 +32,7 @@ def _open(
     index_text: bool = True,
     store_text: bool = False,
     dim: int = 384,
+    commit_mode: str | None = None,
 ) -> LodeDB:
     """Opens a LodeDB with an injected deterministic hash backend."""
 
@@ -39,6 +40,7 @@ def _open(
         path=tmp_path,
         index_text=index_text,
         store_text=store_text,
+        commit_mode=commit_mode,
         _embedding_backend=HashEmbeddingBackend(native_dim=dim),
     )
 
@@ -158,7 +160,9 @@ def test_default_layout_matches_no_lexical_store(tmp_path):
 def test_lexical_commit_is_o_changed(tmp_path):
     """An incremental commit appends one .lxd delta, never rewriting the base."""
 
-    db = _open(tmp_path, index_text=True, store_text=False)
+    # O(changed) per-commit deltas are a generation-mode property (the WAL default
+    # buffers writes and folds them into a base at checkpoint, not per add).
+    db = _open(tmp_path, index_text=True, store_text=False, commit_mode="generation")
     # Cold base: a batch large enough that the first commit writes a full base.
     db.add_many([{"text": f"base body {i} token{i}", "id": f"b{i}"} for i in range(12)])
     base_files = glob.glob(str(Path(tmp_path) / "**" / "g*.tvlex"), recursive=True)

@@ -4631,32 +4631,32 @@ class LodeEngine:
             if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
                 continue
             self._load_legacy_index(path)
-        # WAL recovery (writer handles only): each index loaded its last committed
-        # generation above; now replay any intact WAL records on top so a
-        # WAL-committed-but-not-yet-checkpointed mutation survives the reopen. A
-        # torn trailing record (writer crashed mid-append) was dropped by the
-        # store, so this applies exactly the durably-logged mutations. This runs
-        # regardless of the configured commit mode: a leftover <key>.wal means a
-        # prior WAL-mode writer crashed before checkpointing, so those durably
-        # logged mutations are recovered even when this handle opened in the
-        # default generation mode (otherwise they would be silently lost). With no
-        # WAL present (the common case) it is one cheap stat per index and a no-op.
-        # Read-only handles never replay (the WAL is the writer's private log).
+        # WAL recovery (writer handles only). The durable base on disk is always a
+        # committed generation; this replays any <key>.wal tail on top so a
+        # WAL-committed-but-not-yet-checkpointed mutation survives the reopen, then
+        # folds it into a fresh generation so the handle always lands on a clean,
+        # consistent generation (and WAL mode starts a fresh log from there). A
+        # torn trailing record (crash mid-append) was already dropped by the store.
+        # This runs regardless of the configured commit mode and of whether the
+        # prior writer used WAL or generation; with no WAL present (the common
+        # case) it is one cheap stat per index and a no-op. Read-only handles never
+        # replay (the WAL is the writer's private log).
         if not self._read_only:
             self._recover_wals()
 
     def _recover_wals(self) -> None:
-        """Replays each loaded index's leftover WAL onto its committed generation.
+        """Replays each index's WAL tail, then folds it into a fresh generation.
 
-        After replay the in-memory state reflects the committed generation plus
-        every durably-logged WAL mutation. In ``wal`` commit mode a WAL still
-        under the checkpoint threshold is left in place (the cheap append path)
-        and folded later at the next threshold/persist/close, while an oversized
-        one is folded now so the next open replays less. In the default
-        ``generation`` mode a leftover WAL only exists because a prior WAL-mode
-        writer crashed before checkpointing, so it is always folded into a fresh
-        generation and truncated here: the data is recovered without leaving a log
-        the generation path would never consult.
+        The durable base loaded above is always a committed generation; any
+        ``<key>.wal`` holds only mutations a prior writer logged but had not yet
+        checkpointed (a clean close folds and truncates the WAL, so one is present
+        only after an unclean shutdown). Replay re-drives the same engine verbs to
+        rebuild the in-memory state, then the recovered WAL is always folded into a
+        fresh generation and truncated, so every open lands on a clean, consistent
+        generation regardless of commit mode: WAL mode then starts a new log from
+        that generation, and generation mode is simply left with no stray log. A
+        torn trailing record was dropped by the store, so exactly the durably
+        logged mutations are recovered.
         """
 
         for index_key in list(self._indexes):
@@ -4667,17 +4667,16 @@ class LodeEngine:
             if not store.exists():
                 continue
             stats = self._replay_wal(state)
-            if not stats.get("wal_records_replayed"):
-                continue
-            self._state_load_telemetry.setdefault(index_key, {}).update(stats)
-            # In generation mode, absorb the recovered WAL into a generation so the
-            # default commit path is not left with a log it never reads. In WAL
-            # mode, only fold an oversized WAL; small ones stay on the append path.
-            if self._commit_mode != CommitMode.WAL or store.should_checkpoint(
-                checkpoint_ops=self._wal_checkpoint_ops,
-                checkpoint_bytes=self._wal_checkpoint_bytes,
-            ):
+            if stats.get("wal_records_replayed"):
+                self._state_load_telemetry.setdefault(index_key, {}).update(stats)
+                # Normalize to a clean generation on open: fold the recovered WAL
+                # into a fresh generation and truncate it, in either commit mode.
                 self._checkpoint_wal(state)
+            else:
+                # A WAL with no intact records (only a torn partial frame): nothing
+                # to recover, but drop the stray bytes so a later append cannot turn
+                # them into interior corruption.
+                store.truncate()
 
     def _load_index_from_commit(self, key: str, body: dict[str, Any]) -> None:
         """Loads one index from the consistent generation named by its root manifest."""

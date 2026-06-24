@@ -35,7 +35,10 @@ def _be() -> HashEmbeddingBackend:
 
 
 def _writer(path) -> LodeDB:
-    return LodeDB(path=path, model="minilm", _embedding_backend=_be())
+    # This suite exercises the generation commit subsystem (per-mutation atomic
+    # generation publish, O(changed) deltas, MVCC reader snapshots, torn-commit
+    # rollback), so it pins the opt-out generation mode rather than the WAL default.
+    return LodeDB(path=path, model="minilm", commit_mode="generation", _embedding_backend=_be())
 
 
 def _reader(path) -> LodeDB:

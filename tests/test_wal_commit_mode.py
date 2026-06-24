@@ -43,17 +43,19 @@ def _wal_files(path) -> list[str]:
 
 
 def test_parse_commit_mode_values():
-    assert parse_commit_mode(None) is CommitMode.GENERATION
-    assert parse_commit_mode("") is CommitMode.GENERATION
-    assert parse_commit_mode("generation") is CommitMode.GENERATION
+    assert parse_commit_mode(None) is CommitMode.WAL  # wal is the default
+    assert parse_commit_mode("") is CommitMode.WAL
     assert parse_commit_mode("wal") is CommitMode.WAL
-    assert parse_commit_mode("WAL") is CommitMode.WAL  # case-insensitive
+    assert parse_commit_mode("generation") is CommitMode.GENERATION
+    assert parse_commit_mode("GENERATION") is CommitMode.GENERATION  # case-insensitive
     with pytest.raises(ValueError):
         parse_commit_mode("bogus")
 
 
 def test_commit_mode_from_env(monkeypatch):
     monkeypatch.delenv("LODEDB_COMMIT_MODE", raising=False)
+    assert commit_mode_from_env() is CommitMode.WAL  # wal is the default
+    monkeypatch.setenv("LODEDB_COMMIT_MODE", "generation")
     assert commit_mode_from_env() is CommitMode.GENERATION
     monkeypatch.setenv("LODEDB_COMMIT_MODE", "wal")
     assert commit_mode_from_env() is CommitMode.WAL
@@ -65,35 +67,52 @@ def test_bad_commit_mode_rejected_at_open(tmp_path):
 
 
 def test_cli_exposes_commit_mode_flag():
-    """The ``index`` and ``serve`` commands surface a ``--commit-mode`` option."""
+    """The ``index`` and ``serve`` commands register a ``--commit-mode`` option.
 
-    from typer.testing import CliRunner
+    Introspects the Click command tree rather than the rendered ``--help`` text:
+    Typer renders help through Rich, which wraps/reflows option names at narrow or
+    non-TTY widths (e.g. CI), so asserting on the rendered string is flaky.
+    """
+
+    import typer.main
 
     from lodedb.local.cli import app
 
-    runner = CliRunner()
-    for command in ("index", "serve"):
-        result = runner.invoke(app, [command, "--help"])
-        assert result.exit_code == 0
-        assert "--commit-mode" in result.stdout
+    command = typer.main.get_command(app)
+    for name in ("index", "serve"):
+        opts = [opt for param in command.commands[name].params for opt in param.opts]
+        assert "--commit-mode" in opts, f"{name} is missing the --commit-mode option"
 
 
-def test_default_mode_writes_no_wal(tmp_path):
-    """The default (generation) mode never creates a WAL file."""
+def test_default_mode_is_wal(tmp_path):
+    """The default commit mode is now WAL: a live add lands in a <key>.wal log."""
 
-    db = _open(tmp_path)
+    db = _open(tmp_path)  # no explicit commit_mode -> default
     db.add("alpha", id="a")
     db.add("beta", id="b")
+    # Before a checkpoint, the mutations live in the WAL.
+    assert _wal_files(tmp_path)
+    db.close()
+    # A clean close folds the WAL into a generation and truncates it.
+    assert _wal_files(tmp_path) == []
+
+
+def test_generation_mode_writes_no_wal(tmp_path):
+    """The opt-out generation mode never creates a WAL file."""
+
+    db = _open(tmp_path, commit_mode="generation")
+    db.add("alpha", id="a")
+    db.add("beta", id="b")
+    assert _wal_files(tmp_path) == []  # no WAL even before close
     db.close()
     assert _wal_files(tmp_path) == []
 
 
-def test_env_default_can_select_wal(tmp_path, monkeypatch):
-    monkeypatch.setenv("LODEDB_COMMIT_MODE", "wal")
+def test_env_can_select_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("LODEDB_COMMIT_MODE", "generation")
     db = _open(tmp_path)  # no explicit commit_mode -> reads env
     db.add("alpha", id="a")
-    # Before a checkpoint, the mutation lives in the WAL.
-    assert _wal_files(tmp_path)
+    assert _wal_files(tmp_path) == []  # generation mode writes no WAL
     db.close()
 
 
@@ -228,14 +247,14 @@ def test_recovery_after_unclean_shutdown(tmp_path):
         recovered.close()
 
 
-def test_recovery_when_reopened_in_default_generation_mode(tmp_path):
-    """A leftover WAL is recovered even if the next open omits ``commit_mode="wal"``.
+def test_recovery_when_reopened_in_generation_mode(tmp_path):
+    """A leftover WAL is recovered even when the next open opts into generation mode.
 
-    A writer that crashes in WAL mode before checkpointing leaves a ``<key>.wal``
-    on disk. Reopening without re-specifying the mode (so it defaults to
-    ``generation``) must still replay those durably-logged mutations rather than
-    silently dropping them, and must fold the recovered WAL into a generation so
-    the default commit path is not left with a log it never consults.
+    A writer that crashes before checkpointing leaves a ``<key>.wal`` on disk.
+    Reopening with ``commit_mode="generation"`` must still replay those
+    durably-logged mutations rather than silently dropping them, and must fold the
+    recovered WAL into a generation so the generation path is not left with a log
+    it never consults.
     """
 
     db = _open(tmp_path, commit_mode="wal")
@@ -248,8 +267,8 @@ def test_recovery_when_reopened_in_default_generation_mode(tmp_path):
     del db
     assert _wal_files(tmp_path), "the crashed WAL-mode writer should leave a WAL"
 
-    # Reopen in the DEFAULT generation mode (no commit_mode passed).
-    recovered = _open(tmp_path)
+    # Reopen explicitly in generation mode (the opt-out path).
+    recovered = _open(tmp_path, commit_mode="generation")
     try:
         assert recovered.count() == 3
         assert recovered.get("a") == "the quick brown fox"
@@ -258,7 +277,36 @@ def test_recovery_when_reopened_in_default_generation_mode(tmp_path):
     finally:
         recovered.close()
     # The recovered WAL was folded into a generation and truncated, so the
-    # default path is left with no lingering log.
+    # generation path is left with no lingering log.
+    assert _wal_files(tmp_path) == []
+
+
+def test_open_normalizes_wal_into_generation(tmp_path):
+    """Every writable open folds a leftover WAL into a clean generation tail.
+
+    Reopening in WAL mode after an unclean shutdown still lands on a normalized
+    committed generation (the recovered WAL is folded, not left on disk), and a
+    subsequent add starts a fresh WAL on top of it.
+    """
+
+    db = _open(tmp_path, commit_mode="wal")
+    db.add("alpha one", id="a")
+    db.add("beta two", id="b")
+    db._engine._release_writer_lock()  # crash: WAL left on disk
+    del db
+    assert _wal_files(tmp_path)
+
+    reopened = _open(tmp_path, commit_mode="wal")
+    try:
+        # Open folded the recovered WAL into a generation: no stray log remains.
+        assert _wal_files(tmp_path) == []
+        assert reopened.count() == 2
+        # A fresh add starts a new WAL on top of the normalized generation.
+        reopened.add("gamma three", id="c")
+        assert _wal_files(tmp_path)
+        assert reopened.count() == 3
+    finally:
+        reopened.close()
     assert _wal_files(tmp_path) == []
 
 

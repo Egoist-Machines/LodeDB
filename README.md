@@ -398,16 +398,17 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
 - **Durability is `fast` by default.** Commits are *atomic* but not fsync'd. Pass
   `durability="fsync"` (or `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each
   file and its directory on commit for power-loss durability, at some commit-throughput cost.
-- **Optional WAL commit mode for write-heavy single-process workloads.** The default publishes
-  a new crash-atomic, reader-visible generation on *every* mutation. Pass `commit_mode="wal"`
-  (or `LODEDB_COMMIT_MODE=wal`) to instead append one framed record per mutation to a
-  `<key>.wal` log and checkpoint into a generation periodically, which drops durable single-add
-  latency by ~10x into the sqlite-vec/qdrant range. The WAL is replayed crash-atomically on
-  reopen (a half-written trailing record is discarded), and a clean `close()`/`persist()` folds
-  it into a generation. It is **single-writer** and drops the lock-free view of *uncheckpointed*
-  writes (a concurrent `open_readonly` reader still sees the last committed generation, just not
-  the writer's in-flight WAL), so it is for single-process deployments. The default
-  `generation` mode and its MVCC readers are unchanged.
+- **WAL commit by default for low-latency durable writes.** Each `add`/`remove` appends one
+  framed record to a `<key>.wal` log and a full generation is checkpointed periodically, so a
+  durable single add costs roughly an order of magnitude less than publishing a whole generation
+  per write, into the sqlite-vec/qdrant range (see the comparison up top). The WAL is replayed
+  crash-atomically on reopen (a half-written trailing record is discarded), every writable open
+  folds it into a clean committed generation, and `close()`/`persist()` checkpoint it. WAL is
+  single-writer: a concurrent `open_readonly` reader still loads a consistent committed
+  generation, but the last *checkpointed* one, not the writer's in-flight WAL. Pass
+  `commit_mode="generation"` (or `LODEDB_COMMIT_MODE=generation`) for the classic path that
+  publishes a crash-atomic, MVCC-readable generation on every write; pick it when many
+  out-of-process readers must see each write the instant it commits.
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Limitations

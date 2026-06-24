@@ -7,20 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- **Optional write-ahead-log commit mode (`commit_mode="wal"`).** A single-process,
-  single-writer alternative to the default per-mutation generation publish, for write-heavy
-  workloads. Each `add`/`remove` appends one length-prefixed, CRC32-framed record to a
-  `<key>.wal` log (a single `write`, plus one `fsync` under `durability="fsync"`) and a full
-  generation is checkpointed only periodically, dropping durable single-add latency by ~10x into
-  the sqlite-vec/qdrant range. The WAL records logical mutations and is replayed on open by
-  re-driving the same engine verbs, so recovery is crash-atomic: a half-written trailing record
-  is discarded, an interior-corrupt record fails closed, and a clean `close()`/`persist()` folds
-  the WAL into a generation. Opt in per handle (`LodeDB(path, commit_mode="wal")`) or via
-  `LODEDB_COMMIT_MODE=wal`. The default `generation` mode, its on-disk layout, and its lock-free
-  MVCC readers are unchanged; a concurrent `open_readonly` reader still sees the last committed
-  generation (just not the writer's in-flight WAL).
+- **The default commit mode is now `commit_mode="wal"`.** A durable single `add`/`remove`
+  appends one length-prefixed, CRC32-framed record to a `<key>.wal` log (a single `write`, plus
+  one `fsync` under `durability="fsync"`) and a full generation is checkpointed only periodically,
+  instead of publishing a new generation on every mutation. This drops durable single-add latency
+  by roughly an order of magnitude, into the sqlite-vec/qdrant range. The WAL records logical
+  mutations and is replayed on open by re-driving the same engine verbs, so recovery is
+  crash-atomic: a half-written trailing record is discarded, an interior-corrupt record fails
+  closed, and every writable open folds any recovered WAL into a clean committed generation (so a
+  handle always opens onto a consistent generation, regardless of mode). WAL is single-writer; a
+  concurrent `open_readonly` reader loads a consistent committed generation, but the last
+  checkpointed one, not the writer's in-flight WAL. Pass `commit_mode="generation"` (or
+  `LODEDB_COMMIT_MODE=generation`) to keep the previous behavior: a crash-atomic, MVCC-readable
+  generation published on every write, for deployments where many out-of-process readers must see
+  each write the instant it commits.
 
 ## [0.2.1] - 2026-06-23
 
