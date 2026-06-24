@@ -65,6 +65,35 @@ def _windows_gpu_embedding_hint() -> dict[str, Any] | None:
     }
 
 
+def _image_embedding_status() -> dict[str, Any]:
+    """Returns whether the optional image+text (CLIP) embedding path is installed.
+
+    The ``"clip"`` preset / ``add_image`` runs on the base sentence-transformers
+    stack and adds only Pillow (the ``[image]`` extra) for decoding image files.
+    """
+
+    import importlib.util
+
+    pillow_present = importlib.util.find_spec("PIL") is not None
+    st_present = importlib.util.find_spec("sentence_transformers") is not None
+    available = bool(pillow_present and st_present)
+    if available:
+        reason = "Pillow + sentence-transformers present (use model='clip')"
+    else:
+        missing = []
+        if not pillow_present:
+            missing.append("Pillow")
+        if not st_present:
+            missing.append("sentence-transformers")
+        reason = f"image embedding requires {' + '.join(missing)} (pip install 'lodedb[image]')"
+    return {
+        "image_embedding_available": available,
+        "pillow_present": pillow_present,
+        "model": "sentence-transformers/clip-ViT-B-32",
+        "reason": reason,
+    }
+
+
 def _gpu_vector_scan_status() -> dict[str, Any]:
     """Returns honest GPU-resident vector-scan availability (CUDA/CuPy only)."""
 
@@ -176,6 +205,7 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
             "cuda_available": cuda,
             "runtime": _embedding_runtime_status(),
         },
+        "image_embedding": _image_embedding_status(),
         "compact_backend": {
             **capability.to_dict(),
             "inferred_native_dispatch": turbovec_native_backend_from_flags(cpu_flags),
@@ -191,6 +221,7 @@ def format_capability_report(report: dict[str, Any]) -> str:
 
     plat = report["platform"]
     emb = report["embedding"]
+    img = report["image_embedding"]
     backend = report["compact_backend"]
     gpu = report["gpu_vector_scan"]
     mps_scan = report["mps_vector_scan"]
@@ -208,6 +239,11 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"    fallback             : {emb['runtime']['note']}",
         f"  onnxruntime available  : {emb['runtime']['onnxruntime_available']}",
         f"  onnx providers         : {', '.join(emb['runtime']['onnx_providers']) or 'none'}",
+        "",
+        "Image + text embedding (CLIP, optional [image] extra)",
+        f"  available              : {img['image_embedding_available']}",
+        f"  model                  : {img['model']}",
+        f"  reason                 : {img['reason']}",
         "",
         "Compact storage backend (TurboVec)",
         f"  available              : {backend['available']}",

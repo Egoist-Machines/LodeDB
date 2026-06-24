@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import math
+import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -124,6 +127,123 @@ class SentenceTransformerEmbeddingBackend:
                 model.max_seq_length = int(self.max_seq_length)
             self._model = model
         return self._model
+
+
+class ClipEmbeddingBackend:
+    """Embeds text and images into one shared CLIP space for cross-modal search.
+
+    Backs the local ``"clip"`` preset. It wraps a sentence-transformers CLIP model
+    (e.g. ``clip-ViT-B-32``), which maps both text and images into the *same*
+    vector space, so text->image and image->image retrieval run over the ordinary
+    single-vector TurboVec scan with no storage or scoring change. The model is
+    loaded lazily on first use, and Pillow (the optional ``lodedb[image]`` extra)
+    is imported only when an image is encoded, so a plain ``import lodedb`` pulls
+    neither sentence-transformers nor Pillow.
+
+    ``embed_images`` is an additional capability beyond the text-only
+    :class:`EngineEmbeddingBackend` protocol; the SDK's ``add_image`` /
+    ``search_by_image`` verbs detect it by duck typing.
+    """
+
+    name = "clip"
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        native_dim: int,
+        device: str = "cpu",
+        batch_size: int = 16,
+    ) -> None:
+        """Initializes a lazy CLIP backend for shared image/text embedding."""
+
+        if not model_name:
+            raise ValueError("model_name is required")
+        if native_dim <= 0:
+            raise ValueError("native_dim must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.model_name = model_name
+        self.required_model_name = model_name
+        self.native_dim = native_dim
+        self.device = device
+        self.batch_size = batch_size
+        self._model: object | None = None
+
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Embeds text chunks into the shared CLIP space."""
+
+        return self._encode(list(texts))
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        """Embeds one text query into the shared CLIP space."""
+
+        return self._encode([text])[0]
+
+    def embed_images(self, images: Sequence[Any]) -> tuple[tuple[float, ...], ...]:
+        """Embeds images into the shared CLIP space, aligned cross-modally with text.
+
+        Each item may be a filesystem path (``str`` / ``os.PathLike``), raw image
+        ``bytes``, or an already-opened PIL ``Image``. Images are loaded with
+        Pillow (the ``lodedb[image]`` extra) only here, never on import.
+        """
+
+        loaded = [self._load_image(item) for item in images]
+        return self._encode(loaded)
+
+    def _encode(self, items: list[Any]) -> tuple[tuple[float, ...], ...]:
+        """Encodes a batch of text or image items into normalized vectors."""
+
+        if not items:
+            return ()
+        model = self._load_model()
+        embeddings = model.encode(  # type: ignore[attr-defined]
+            items,
+            batch_size=self.batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        array = np.asarray(embeddings, dtype=np.float32)
+        if array.ndim != 2 or array.shape[1] != self.native_dim:
+            returned_dim = array.shape[1] if array.ndim == 2 else "unknown"
+            raise ValueError(
+                f"{self.model_name} returned dim {returned_dim}; expected {self.native_dim}"
+            )
+        return tuple(tuple(float(value) for value in row) for row in array)
+
+    def _load_model(self) -> object:
+        """Loads the sentence-transformers CLIP model lazily."""
+
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(self.model_name, device=self.device)
+        return self._model
+
+    @staticmethod
+    def _load_image(item: Any) -> Any:
+        """Loads one image item (path / bytes / PIL image) into an RGB PIL image."""
+
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - exercised via the [image] extra
+            raise ImportError(
+                "image embedding requires Pillow; install the optional extra: "
+                "pip install 'lodedb[image]'"
+            ) from exc
+
+        if isinstance(item, Image.Image):
+            image = item
+        elif isinstance(item, (bytes, bytearray)):
+            image = Image.open(io.BytesIO(bytes(item)))
+        elif isinstance(item, (str, os.PathLike)):
+            image = Image.open(os.fspath(item))
+        else:
+            raise TypeError(
+                f"image must be a path, bytes, or a PIL Image; got {type(item).__name__}"
+            )
+        return image.convert("RGB")
 
 
 class ONNXRuntimeEmbeddingBackend:

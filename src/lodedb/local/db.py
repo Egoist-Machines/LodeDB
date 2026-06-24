@@ -117,6 +117,17 @@ class VectorOnlyIndexError(RuntimeError):
     """
 
 
+class ImageEmbeddingUnsupportedError(RuntimeError):
+    """Raised when ``add_image``/``search_by_image`` is used on a non-multimodal index.
+
+    Image verbs need a backend that embeds images: open with ``model="clip"`` (the
+    shared image/text preset), or pass a custom ``embedder=`` that exposes an
+    ``embed_images`` method. A text-only preset (``"minilm"``/``"bge"``) or a
+    vector-only index cannot embed images; for the latter, embed the image with
+    your own model and use ``add_vectors`` / ``search_by_vector``.
+    """
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -727,6 +738,61 @@ class LodeDB:
             out.append(self._hits_from_result_rows(item.get("results", [])))
         return out
 
+    def add_image(
+        self,
+        image: Any,
+        *,
+        id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+    ) -> str:
+        """Embeds one image with the index's multimodal model and stores it; returns its id.
+
+        Requires a multimodal index (``model="clip"``, or a custom ``embedder=``
+        exposing ``embed_images``); otherwise raises
+        :class:`ImageEmbeddingUnsupportedError`. ``image`` may be a filesystem path
+        (``str`` / :class:`~pathlib.Path`), raw ``bytes``, or a PIL ``Image``. The
+        image is embedded into the model's shared image/text space and stored as a
+        single vector via the same atomic-commit + TurboVec path as
+        :meth:`add_vectors`.
+
+        The raw image bytes are **not** stored: keep the file on disk (or in object
+        storage) and put its path/URI in ``metadata`` so a hit can be resolved back
+        to the image; ``text`` is optional retained payload (e.g. a caption), kept
+        only in the raw-text sidecar when ``store_text=True``. Because the CLIP
+        space is shared, a stored image is retrievable cross-modally by
+        :meth:`search` (a text query) and by :meth:`search_by_image`.
+        """
+
+        self._require_writable()
+        backend = self._image_backend()
+        vector = backend.embed_images((image,))[0]
+        return self.add_vectors(vector, id=id, metadata=metadata, text=text)
+
+    def search_by_image(
+        self,
+        image: Any,
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[LodeSearchHit]:
+        """Returns the top-``k`` hits for an image query, cross-modal over the shared space.
+
+        Requires a multimodal index (``model="clip"``, or a custom ``embedder=``
+        exposing ``embed_images``); otherwise raises
+        :class:`ImageEmbeddingUnsupportedError`. The ``image`` (path / bytes / PIL
+        image) is embedded into the shared image/text space and searched with the
+        same vector-in path as :meth:`search_by_vector`, so it matches both stored
+        images and stored text. ``filter`` takes the same grammar as
+        :meth:`search`.
+        """
+
+        if k <= 0:
+            raise ValueError("k must be positive")
+        backend = self._image_backend()
+        vector = backend.embed_images((image,))[0]
+        return self.search_by_vector(vector, k=k, filter=filter)
+
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
@@ -972,6 +1038,23 @@ class LodeDB:
                 "this index is vector-only (no embedding model); use add_vectors / "
                 "add_vectors_many / search_by_vector / search_many_by_vector"
             )
+
+    def _image_backend(self) -> Any:
+        """Returns the embedding backend if it can embed images, else raises.
+
+        Image verbs are duck-typed on an ``embed_images`` method, which the
+        ``"clip"`` preset's backend (and any custom multimodal ``embedder=``)
+        provides and the text-only presets do not.
+        """
+
+        backend = self._embedding_backend
+        if backend is None or not callable(getattr(backend, "embed_images", None)):
+            raise ImageEmbeddingUnsupportedError(
+                "this index cannot embed images; open LodeDB with model='clip' "
+                "(install the extra: pip install 'lodedb[image]'), or pass a custom "
+                "embedder= that exposes embed_images"
+            )
+        return backend
 
     def _ensure_index(self) -> None:
         """Binds the single local index, creating it unless this handle is read-only."""

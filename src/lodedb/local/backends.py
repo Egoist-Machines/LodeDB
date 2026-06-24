@@ -33,6 +33,7 @@ import platform
 from dataclasses import dataclass
 
 from lodedb.engine.embedding_backends import (
+    ClipEmbeddingBackend,
     EngineEmbeddingBackend,
     ONNXRuntimeEmbeddingBackend,
     SentenceTransformerEmbeddingBackend,
@@ -250,6 +251,23 @@ def build_local_embedding_backend(
             f"unknown embedding_runtime {embedding_runtime!r}; choose auto, onnx, or torch"
         )
     resolved = resolve_local_device(device)
+
+    # A multimodal preset ("clip") embeds text and images into one shared space via
+    # sentence-transformers; it does not use the ONNX/torch text runtime selection.
+    if preset.multimodal:
+        backend = ClipEmbeddingBackend(
+            model_name=preset.model_name,
+            native_dim=preset.native_dim,
+            device=resolved,
+            batch_size=batch_size,
+        )
+        return backend, LocalEmbeddingResolution(
+            requested_device=device,
+            backend_name=backend.name,
+            effective_device=resolved,
+            fallback_used=False,
+            fallback_reason="",
+        )
 
     fallback_reason = ""
     if runtime in {"auto", "onnx"}:

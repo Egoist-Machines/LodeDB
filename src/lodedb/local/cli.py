@@ -26,7 +26,7 @@ app = typer.Typer(
 
 _PATH_OPTION = typer.Option(Path("./data"), "--path", "-p", help="On-disk LodeDB directory.")
 _MODEL_OPTION = typer.Option(
-    "minilm", "--model", "-m", help="Preset: minilm (fast) | bge (quality)."
+    "minilm", "--model", "-m", help="Preset: minilm (fast) | bge (quality) | clip (image+text)."
 )
 _DEVICE_OPTION = typer.Option(
     "auto", "--device", "-d", help="auto | cpu | mps | cuda (embedding only)."

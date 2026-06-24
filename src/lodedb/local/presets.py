@@ -15,6 +15,7 @@ from lodedb.engine.core import EngineRoutePolicy
 from lodedb.engine.route_profiles import (
     BGE_BASE_QUERY_PREFIX,
     BGE_TURBOVEC_ROUTE_PROFILE,
+    CLIP_TURBOVEC_ROUTE_PROFILE,
     MINILM_TURBOVEC_ROUTE_PROFILE,
     route_policy_for_profile,
 )
@@ -33,6 +34,9 @@ class LocalModelPreset:
     # reproduce the sentence-transformers vector. The torch path reads pooling
     # from the model's own config, so this only matters for the ONNX backend.
     pooling: str = "mean"
+    # When True, the preset's backend also embeds images into the same space
+    # (the ``"clip"`` preset), enabling ``add_image`` / ``search_by_image``.
+    multimodal: bool = False
 
     @property
     def route_policy(self) -> EngineRoutePolicy:
@@ -77,6 +81,17 @@ LOCAL_MODEL_PRESETS: dict[str, LocalModelPreset] = {
         document_prefix="",
         description="Quality: BAAI/bge-base-en-v1.5, 768-dim, 4-bit TurboVec.",
         pooling="cls",
+    ),
+    "clip": LocalModelPreset(
+        name="clip",
+        route_profile=CLIP_TURBOVEC_ROUTE_PROFILE,
+        query_prefix="",
+        document_prefix="",
+        description=(
+            "Image + text: sentence-transformers/clip-ViT-B-32, 512-dim, 4-bit "
+            "TurboVec. Needs the [image] extra for image input."
+        ),
+        multimodal=True,
     ),
 }
 
