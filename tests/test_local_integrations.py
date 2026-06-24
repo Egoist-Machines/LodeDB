@@ -544,3 +544,192 @@ def test_llama_index_property_graph_high_level_retriever(tmp_path):
     assert results  # the seed's relational context (alice -[WORKS_AT]-> acme)
 
     store.client.close()
+
+
+# -- PrivateGPT vector-store provider ---------------------------------------
+#
+# PrivateGPT is an application, not a pip-installable library, so it cannot be a dependency or an
+# importorskip target. Its vector-store contract is, however, tiny and stable: a VectorStoreFactory
+# ABC with vector_store(collection) -> BasePydanticVectorStore, plus a register_vector_store() that
+# fills a process-local _PROVIDERS dict. These tests stand up that exact contract as a local stub
+# and exercise the real LodeDB provider code (register_lodedb_provider / LodeDBVectorStoreFactory)
+# against it, with the LlamaIndex extra supplying BasePydanticVectorStore.
+
+
+def _install_private_gpt_factory_stub(monkeypatch):
+    """Builds a stand-in for PrivateGPT's factory module and binds the provider shim to it.
+
+    Returns ``(VectorStoreFactory, providers)`` where ``providers`` is the stub registry the
+    provider registers into. Mirrors ``private_gpt.components.vector_store.factory``.
+    """
+
+    from abc import ABC, abstractmethod
+
+    from llama_index.core.vector_stores.types import BasePydanticVectorStore
+
+    providers: dict[str, object] = {}
+
+    class VectorStoreFactory(ABC):
+        def __init__(self, settings, embed_dim=None):
+            self.settings = settings
+            self.embed_dim = embed_dim
+
+        @abstractmethod
+        def vector_store(self, collection: str) -> BasePydanticVectorStore: ...
+
+    def register_vector_store(database: str, provider) -> None:
+        providers[database] = provider
+
+    # The provider shim imports PrivateGPT lazily through this single helper, so patching it is
+    # enough to run the real registration/factory code without a PrivateGPT checkout.
+    from lodedb.local.integrations import privategpt as pgpt_mod
+
+    monkeypatch.setattr(
+        pgpt_mod,
+        "_load_private_gpt_factory_base",
+        lambda: (VectorStoreFactory, register_vector_store),
+    )
+
+    # Build the provider's per-collection indexes with the deterministic hash embedding backend
+    # the other adapter tests use, so these tests never download or load a real
+    # SentenceTransformer model. That keeps them offline and fast and avoids loading a torch
+    # model onto a GPU/MPS device on CI runners. Device is dropped since the hash backend needs
+    # none.
+    def _hash_backed_lodedb(*args, **kwargs):
+        kwargs.pop("device", None)
+        kwargs.setdefault("_embedding_backend", HashEmbeddingBackend(native_dim=384))
+        return LodeDB(*args, **kwargs)
+
+    monkeypatch.setattr(pgpt_mod, "LodeDB", _hash_backed_lodedb)
+    return VectorStoreFactory, providers
+
+
+class _StubVectorstoreSettings:
+    """Stand-in for PrivateGPT's ``settings.vectorstore`` (only the fields the shim reads)."""
+
+    def __init__(self, embed_dim=384):
+        self.embed_dim = embed_dim
+
+
+class _StubSettings:
+    """Stand-in for PrivateGPT's ``Settings`` carrying an optional ``lodedb`` block."""
+
+    def __init__(self, lodedb=None, embed_dim=384):
+        self.vectorstore = _StubVectorstoreSettings(embed_dim=embed_dim)
+        self.lodedb = lodedb
+
+
+def test_privategpt_provider_registers_and_builds_store(tmp_path, monkeypatch):
+    """register_lodedb_provider registers under 'lodedb'; the factory builds a working store."""
+
+    pytest.importorskip("llama_index.core")  # needs lodedb[llama-index]
+    from llama_index.core.schema import TextNode
+    from llama_index.core.vector_stores.types import (
+        BasePydanticVectorStore,
+        VectorStoreQuery,
+        VectorStoreQueryMode,
+    )
+
+    from lodedb.local.integrations.privategpt import register_lodedb_provider
+
+    _factory_base, providers = _install_private_gpt_factory_stub(monkeypatch)
+
+    factory_cls = register_lodedb_provider()
+    # The provider landed in PrivateGPT's registry under the default name.
+    assert providers["lodedb"] is factory_cls
+
+    settings = _StubSettings(lodedb={"path": str(tmp_path / "pgpt"), "model": "minilm"})
+    factory = factory_cls(settings, embed_dim=384)
+    store = factory.vector_store("docs")
+    assert isinstance(store, BasePydanticVectorStore)
+    assert store.is_embedding_query is False  # text-path, like the LlamaIndex adapter
+
+    store.add(
+        [
+            TextNode(id_="d1", text="LodeDB keeps data local", metadata={"src": "a"}),
+            TextNode(id_="d2", text="request failed with error E1234", metadata={"src": "log"}),
+        ]
+    )
+    res = store.query(VectorStoreQuery(query_str="local data", similarity_top_k=2))
+    assert set(res.ids) == {"d1", "d2"}
+    # Hybrid still works through the provider-built store (store_text on by default).
+    hybrid = store.query(
+        VectorStoreQuery(query_str="E1234", similarity_top_k=2, mode=VectorStoreQueryMode.HYBRID)
+    )
+    assert "d2" in hybrid.ids
+
+    factory.close()
+
+
+def test_privategpt_provider_collections_are_isolated(tmp_path, monkeypatch):
+    """Each PrivateGPT collection maps to its own LodeDB index; same name is cached."""
+
+    pytest.importorskip("llama_index.core")
+    from llama_index.core.schema import TextNode
+
+    from lodedb.local.integrations.privategpt import register_lodedb_provider
+
+    _factory_base, _providers = _install_private_gpt_factory_stub(monkeypatch)
+    factory_cls = register_lodedb_provider()
+
+    factory = factory_cls(_StubSettings(lodedb={"path": str(tmp_path / "pgpt")}), embed_dim=384)
+    alpha = factory.vector_store("alpha")
+    beta = factory.vector_store("beta")
+    # Requesting the same collection returns the cached store (one handle per collection).
+    assert factory.vector_store("alpha") is alpha
+
+    alpha.add([TextNode(id_="a1", text="only in alpha", metadata={})])
+    beta.add([TextNode(id_="b1", text="only in beta", metadata={})])
+
+    a_ids = {n.node_id for n in alpha.get_nodes()}
+    b_ids = {n.node_id for n in beta.get_nodes()}
+    assert a_ids == {"a1"} and b_ids == {"b1"}  # collections are separate indexes
+
+    # Each collection persisted to its own subdirectory under the configured path.
+    assert (tmp_path / "pgpt" / "alpha").exists()
+    assert (tmp_path / "pgpt" / "beta").exists()
+
+    factory.close()
+
+
+def test_privategpt_provider_settings_defaults_and_override(tmp_path, monkeypatch):
+    """An absent lodedb block falls back to defaults; a provided block overrides them."""
+
+    pytest.importorskip("llama_index.core")
+
+    from lodedb.local.integrations.privategpt import _lodedb_settings, register_lodedb_provider
+
+    # Defaults when no lodedb block is configured.
+    defaults = _lodedb_settings(_StubSettings(lodedb=None))
+    assert defaults["model"] == "minilm"
+    assert defaults["store_text"] is True
+    assert defaults["index_text"] is False
+    assert defaults["path"] == "local_data/lodedb"
+
+    # A partial block overrides only the keys it sets.
+    merged = _lodedb_settings(_StubSettings(lodedb={"model": "bge", "index_text": True}))
+    assert merged["model"] == "bge"
+    assert merged["index_text"] is True
+    assert merged["store_text"] is True  # untouched default preserved
+
+    # The override actually reaches the constructed LodeDB handle.
+    _factory_base, _providers = _install_private_gpt_factory_stub(monkeypatch)
+    factory_cls = register_lodedb_provider()
+    factory = factory_cls(
+        _StubSettings(lodedb={"path": str(tmp_path / "pgpt"), "index_text": True}), embed_dim=384
+    )
+    store = factory.vector_store("docs")
+    assert store.client.index_text is True
+    factory.close()
+
+
+def test_privategpt_provider_requires_private_gpt():
+    """Outside a PrivateGPT environment, registration raises a clear, actionable error."""
+
+    pytest.importorskip("llama_index.core")
+
+    from lodedb.local.integrations.privategpt import register_lodedb_provider
+
+    # No stub installed and PrivateGPT is genuinely not importable in this repo's env.
+    with pytest.raises(ImportError, match="PrivateGPT"):
+        register_lodedb_provider()

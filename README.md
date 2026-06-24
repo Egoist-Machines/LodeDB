@@ -51,8 +51,10 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
 - **Batteries included**: a `lodedb` CLI, a loopback dev server, an
-  [MCP server](#use-as-an-mcp-server), and LangChain, LlamaIndex, and mem0 adapters
-  (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`).
+  [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
+  (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
+  [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
+  LlamaIndex adapter.
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
