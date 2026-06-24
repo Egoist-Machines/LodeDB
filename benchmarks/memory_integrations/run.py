@@ -110,8 +110,8 @@ def run_memory_integrations_suite(
             "effective_device": embedded.effective_device,
             "doc_embed_ms_warm": round(embedded.doc_embed_ms, 2),
             "query_embed_ms_warm": round(embedded.query_embed_ms, 2),
-            "note": "one fixed model across all backends; baselines receive these vectors, "
-            "LodeDB text-path adapters re-embed and the runner subtracts this time for store-only",
+            "note": "one fixed model across all backends; every backend (including LodeDB via "
+            "its vector-in SDK) receives these precomputed vectors, so none pays for embedding",
         },
         "suites": suites,
     }

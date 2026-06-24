@@ -210,7 +210,10 @@ class _QdrantDriver(_LIDriver):
 
 class _LodeDBDriver(_LIDriver):
     role = "lodedb"
-    embeds_on_ingest = True
+    # Fed the same precomputed vectors as every baseline (LodeDB vector-in SDK), so
+    # no backend is charged for embedding. See the note in the LangChain driver.
+    embeds_on_ingest = False
+    incremental_is_delta = True
     batch_path = "search_many_by_vector (GPU-resident scan on CUDA)"
 
     def __init__(self, name, base_dir, dim, *, model: str, device: str) -> None:
@@ -227,15 +230,19 @@ class _LodeDBDriver(_LIDriver):
         self.store = LodeDBVectorStore(self._db)
 
     def warmup(self) -> None:
-        self._open()
-        try:
-            self._db._embedding_backend.embed_documents(("warmup",))
-        except Exception:
-            pass
+        self._open()  # vectors are precomputed, so no embedding model to warm
 
     def ingest(self, ids, texts, vectors, metadatas) -> None:
-        nodes = [_node(ids[i], texts[i], vectors[i], metadatas[i]) for i in range(len(ids))]
-        self.store.add(nodes)
+        self._db.add_vectors_many(
+            [
+                {"vector": vectors[i], "id": ids[i], "metadata": metadatas[i], "text": texts[i]}
+                for i in range(len(ids))
+            ],
+            normalize=False,
+        )
+
+    def incremental_add(self, doc_id, text, vector, metadata) -> None:
+        self._db.add_vectors(vector, id=doc_id, metadata=metadata, text=text, normalize=False)
 
     def query_one(self, qvec, k) -> list[str]:
         return [h.id for h in self._db.search_by_vector(qvec, k=k)]

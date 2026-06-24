@@ -14,15 +14,16 @@ framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
-| On-disk footprint | **7.0× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~440× faster** (0.9 vs 386 ms) | **~500× faster** (0.9 vs 427 ms) | **~32× faster** (0.9 vs 30 ms) |
-| Batched retrieval, 64 (GPU) | **~1,000×+** (5,061 vs ~2 qps) | **~1,000×+** (5,047 vs ~2 qps) | **~110×** (3,450 vs 32 qps) |
-| Durable add of one memory | **~590× faster** (30 ms vs 17.8 s) | **~990× faster** (29 ms vs 28.5 s) | 19 vs 1.6 ms (Qdrant faster) |
+| On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
+| Single-query p50 (CPU) | **~410× faster** (0.8 vs 345 ms) | **~500× faster** (0.9 vs 427 ms) | **~25× faster** (0.9 vs 23 ms) |
+| Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
+| Durable add of one memory | **~570× faster** (20 ms vs 11.5 s) | **~2,200× faster** (11 ms vs 23.4 s) | 13 vs 0.7 ms (Qdrant faster) |
 | Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
 
-The in-memory defaults rewrite the whole store to persist one new memory (about 18 to 29
-seconds at this corpus size) and scan in pure Python with no batch path; LodeDB appends an
-O(changed) delta (~19 ms, embed-free), keeps single queries sub-millisecond on the CPU, and
+Every backend (LodeDB included) is fed the same precomputed vectors, so none is charged for
+embedding. The in-memory defaults rewrite the whole store to persist one new memory (about 12
+to 23 seconds at this corpus size) and scan in pure Python with no batch path; LodeDB appends
+an O(changed) delta (~11 to 20 ms), keeps single queries sub-millisecond on the CPU, and
 serves batched retrieval from its GPU-resident scan, at 0.95 recall@10 (4-bit quantized)
 versus the defaults' exact 1.00. It is also the smallest footprint and fastest single query
 among embedded local DBs (LanceDB, sqlite-vec, pgvector). Latencies are a single sample on

@@ -310,7 +310,13 @@ class _PgVectorDriver(_LCDriver):
 
 class _LodeDBDriver(_LCDriver):
     role = "lodedb"
-    embeds_on_ingest = True  # text-path: LodeDB embeds internally on add_texts
+    # Fed the same precomputed vectors as every baseline (via LodeDB's vector-in
+    # SDK), so no backend is charged for embedding and this is a store-vs-store
+    # comparison. The LangChain adapter is text-path in production (it embeds
+    # internally), but the embedding is shared work every backend's app pays; the
+    # harness factors it out for all of them, LodeDB included.
+    embeds_on_ingest = False
+    incremental_is_delta = True
     batch_path = "search_many_by_vector (GPU-resident scan on CUDA)"
 
     def __init__(self, name, base_dir, emb, *, model: str, device: str) -> None:
@@ -327,21 +333,21 @@ class _LodeDBDriver(_LCDriver):
         self.store = LodeDBVectorStore(self._db)
 
     def warmup(self) -> None:
-        # Open the handle and warm the embedding model so ingest times the store
-        # work (warm embed + quantize + commit), not the one-time model load. That
-        # is the same figure the runner subtracts the shared warm embed time from.
-        self._open()
-        try:
-            self._db._embedding_backend.embed_documents(("warmup",))
-        except Exception:
-            pass
+        self._open()  # vectors are precomputed, so no embedding model to warm
 
     def ingest(self, ids, texts, vectors, metadatas) -> None:
-        self.store.add_texts(texts, metadatas=self._metas(ids, metadatas), ids=ids)
+        self._db.add_vectors_many(
+            [
+                {"vector": vectors[i], "id": ids[i], "metadata": metadatas[i], "text": texts[i]}
+                for i in range(len(ids))
+            ],
+            normalize=False,
+        )
+
+    def incremental_add(self, doc_id, text, vector, metadata) -> None:
+        self._db.add_vectors(vector, id=doc_id, metadata=metadata, text=text, normalize=False)
 
     def query_one(self, qvec, k) -> list[str]:
-        # By-vector query on the text index (parity with the baselines), so query
-        # embedding is not charged and the comparison is store search only.
         return [h.id for h in self._db.search_by_vector(qvec, k=k)]
 
     def query_batch(self, qvecs, k) -> list[list[str]]:

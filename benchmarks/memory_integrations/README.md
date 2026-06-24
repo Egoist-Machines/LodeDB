@@ -112,7 +112,7 @@ stays on the CPU kernel by design (see [`runtime_policy.py`](../../src/lodedb/en
 footprint tables are a CPU-vs-CPU store comparison: LodeDB's CPU TurboVec scan
 against FAISS (CPU), Chroma, Qdrant, LanceDB, sqlite-vec, pgvector (all local), and
 the in-memory defaults. The proof is that the A10 and L40S store metrics match; only
-embedding throughput differs (~730 docs/s on the A10 versus ~1,330 docs/s on the L40S).
+embedding throughput differs (~800 docs/s on the A10 versus ~1,370 docs/s on the L40S).
 
 The single-query tables below are the **A10** run. `docs/s` is store-only ingest,
 `query p50` is by-vector search, `add p50` is the durable single-add (sampled under a
@@ -128,17 +128,17 @@ multiplier.
 
 | Axis | LangChain (`InMemoryVectorStore`) | LlamaIndex (`SimpleVectorStore`) | mem0 (Qdrant) |
 |---|---|---|---|
-| **On-disk footprint** | 28 vs 199 MB = **7.0x smaller** | 28 vs 145 MB = **5.3x smaller** | 15 vs 70 MB = **4.6x smaller** |
-| **Single-query p50** (CPU) | 0.88 vs 386 ms = **~440x faster** | 0.86 vs 427 ms = **~500x faster** | 0.93 vs 30 ms = **~32x faster** |
-| **Batched retrieval, 64** (GPU) | 5,061 vs ~2 qps = **~1,000x+** | 5,047 vs ~2 qps = **~1,000x+** | 3,450 vs 32 qps = **~110x** |
-| **Durable single add** | 30 ms vs 17.8 s = **~590x faster**† | 29 ms vs 28.5 s = **~990x faster**† | 19 ms vs 1.6 ms (Qdrant faster)† |
+| **On-disk footprint** | 28 vs 199 MB = **7.2x smaller** | 28 vs 145 MB = **5.3x smaller** | 15 vs 70 MB = **4.6x smaller** |
+| **Single-query p50** (CPU) | 0.84 vs 345 ms = **~410x faster** | 0.85 vs 427 ms = **~500x faster** | 0.92 vs 23 ms = **~25x faster** |
+| **Batched retrieval, 64** (GPU) | 6,280 vs ~3 qps = **~2,000x** | 5,744 vs ~2 qps = **~2,800x** | 2,686 vs 43 qps = **~62x** |
+| **Durable single add** | 20 ms vs 11.5 s = **~570x faster** | 11 ms vs 23.4 s = **~2,200x faster** | 13 ms vs 0.7 ms (Qdrant faster) |
 | **Recall@10** | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 (filtered 0.95 vs 1.00) |
 
-The in-memory defaults rewrite the whole store to persist one memory and scan in pure
+Every backend, LodeDB included, is fed the same precomputed vectors (LodeDB via its
+vector-in SDK), so none is charged for embedding -- a store-vs-store comparison. The
+in-memory defaults rewrite the whole store to persist one memory and scan in pure
 Python with no batch path. mem0's default Qdrant is a real DB, so its single add is
-fast, but LodeDB reads far faster and stores far smaller. **†** the durable-add figure
-for the text-path frameworks includes embedding the new document; the embed-free
-persist cost is ~19 ms (the mem0 vector-in number) -- see "Durable add" under Reading.
+fast, but LodeDB reads far faster, stores far smaller, and batches far harder.
 
 ### LangChain (default `InMemoryVectorStore`), RAG over ~17.5k docs
 
@@ -148,33 +148,33 @@ pgvector**.
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | durable add p50 | delta? | footprint | vs LodeDB |
 |---|---|---|---|---|---|---|---|
-| **lodedb** | 4,869 | **0.88** | 0.95 | 30.1 ms† | yes | **28 MB** | 1.0x |
-| inmemory (default) | 30,209 | 385.9 | 1.00 | 17,775 ms | no | 199 MB | 7.0x |
-| faiss | 27,323 | 4.36 | 1.00 | 222 ms | no | 43 MB | 1.5x |
-| chroma | 231 | 11.7 | 1.00 | 29.1 ms | yes | 144 MB | 5.1x |
-| qdrant | 406 | 29.1 | 1.00 | 3.5 ms | yes | 81 MB | 2.9x |
-| lancedb | 1,496 | 27.1 | 1.00 | 9.7 ms | yes | 35 MB | 1.2x |
-| sqlite-vec | 10,957 | 41.6 | 1.00 | 1.3 ms | yes | 96 MB | 3.4x |
-| pgvector | 1,196 | 67.9 | 1.00 | 5.0 ms | yes | 47 MB | 1.7x |
+| **lodedb** | 4,885 | **0.84** | 0.95 | 20.3 ms | yes | **28 MB** | 1.0x |
+| inmemory (default) | 33,432 | 344.6 | 1.00 | 11,541 ms | no | 199 MB | 7.2x |
+| faiss | 34,987 | 3.30 | 1.00 | 129.5 ms | no | 43 MB | 1.6x |
+| chroma | 554 | 4.18 | 1.00 | 8.6 ms | yes | 144 MB | 5.2x |
+| qdrant | 804 | 16.6 | 1.00 | 1.1 ms | yes | 81 MB | 2.9x |
+| lancedb | 3,459 | 13.6 | 1.00 | 4.7 ms | yes | 35 MB | 1.3x |
+| sqlite-vec | 18,065 | 28.5 | 1.00 | 0.9 ms | yes | 96 MB | 3.5x |
+| pgvector | 1,407 | 67.5 | 1.00 | 2.4 ms | yes | 47 MB | 1.7x |
 
 Among the embedded local DBs, **LodeDB has the smallest footprint and the fastest
-single query** -- LanceDB (27 ms), sqlite-vec (42 ms), and pgvector (68 ms) are
-30x to 77x slower per query because they scan without LodeDB's quantized SIMD kernel,
-trading the 5 points of recall LodeDB gives up. LanceDB is the closest on footprint
-(35 MB vs 28 MB). pgvector runs via an embedded `pgserver` (Postgres + pgvector, no
-separate service) with no ANN index, so it is an exact seq scan like LodeDB, LanceDB,
-and sqlite-vec. **†** LodeDB's text-path add embeds the doc; embed-free persist is
-~19 ms (the mem0 row).
+single query** -- LanceDB (14 ms), sqlite-vec (28 ms), and pgvector (67 ms) are 16x to
+80x slower per query because they scan without LodeDB's quantized SIMD kernel, trading
+the 5 points of recall LodeDB gives up. LanceDB is the closest on footprint (35 MB vs
+28 MB). pgvector runs via an embedded `pgserver` (Postgres + pgvector, no separate
+service) with no ANN index, so it is an exact seq scan like LodeDB, LanceDB, and
+sqlite-vec. On durable single-add the lazy-append stores (qdrant 1.1 ms, sqlite-vec
+0.9 ms) beat LodeDB's ~20 ms crash-atomic commit -- see "Durable add" under Reading.
 
 ### LlamaIndex (default `SimpleVectorStore`), RAG over ~17.5k docs
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | durable add p50 | delta? | footprint | vs LodeDB |
 |---|---|---|---|---|---|---|---|
-| **lodedb** | 5,329 | **0.86** | 0.95 | 28.9 ms† | yes | **28 MB** | 1.0x |
-| simple (default) | 11,709 | 426.8 | 1.00 | 28,544 ms | no | 145 MB | 5.3x |
-| faiss | 13,092 | 1.54 | 1.00 | 12.7 ms | no | 26 MB | 0.9x |
-| chroma | 274 | 12.5 | 1.00 | 29.8 ms | yes | 165 MB | 6.0x |
-| qdrant | 524 | 34.8 | 1.00 | 3.1 ms | yes | 93 MB | 3.4x |
+| **lodedb** | 4,746 | **0.85** | 0.95 | 10.6 ms | yes | **28 MB** | 1.0x |
+| simple (default) | 16,789 | 426.5 | 1.00 | 23,382 ms | no | 145 MB | 5.3x |
+| faiss | 21,999 | 0.67 | 1.00 | 15.8 ms | no | 26 MB | 0.9x |
+| chroma | 536 | 4.69 | 1.00 | 8.4 ms | yes | 165 MB | 6.0x |
+| qdrant | 1,145 | 23.7 | 1.00 | 2.3 ms | yes | 93 MB | 3.4x |
 
 `SimpleVectorStore` reopens by reloading its 145 MB JSON in ~35 s; LodeDB reopens in
 ~1.4 s.
@@ -186,10 +186,10 @@ embed-free for every backend -- the fair persist-to-persist comparison.
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | filtered recall | durable add p50 | footprint | vs LodeDB |
 |---|---|---|---|---|---|---|---|
-| **lodedb** | 3,588 | **0.93** | 0.95 | 0.95 | 19.2 ms | **15 MB** | 1.0x |
-| qdrant (default) | 629 | 30.1 | 1.00 | 1.00 | 1.6 ms | 70 MB | 4.6x |
-| faiss | 34,319 | 0.92 | 1.00 | **0.04** | 225.8 ms | 30 MB | 1.9x |
-| chroma | 828 | 7.43 | 1.00 | 1.00 | 18.2 ms | 47 MB | 3.1x |
+| **lodedb** | 4,155 | **0.92** | 0.95 | 0.95 | 13.3 ms | **15 MB** | 1.0x |
+| qdrant (default) | 1,119 | 23.2 | 1.00 | 1.00 | 0.7 ms | 70 MB | 4.6x |
+| faiss | 39,389 | 0.80 | 1.00 | **0.04** | 176.7 ms | 30 MB | 1.9x |
+| chroma | 1,663 | 4.13 | 1.00 | 1.00 | 8.2 ms | 47 MB | 3.1x |
 
 ### Batched retrieval (batch = 64): the GPU path
 
@@ -202,16 +202,17 @@ index upload); batched recall matches single-query recall (0.95 for LodeDB).
 
 | Framework (batch = 64, A10) | LodeDB qps | default-store qps | LodeDB vs default | best alternative |
 |---|---|---|---|---|
-| LangChain | **5,061** | `InMemoryVectorStore` ~2 | **~1,000x+** | FAISS-CPU 256* |
-| LlamaIndex | **5,047** | `SimpleVectorStore` ~2 | **~1,000x+** | FAISS-CPU 617* |
-| mem0 | **3,450** | Qdrant 32 | **~110x** | FAISS 1,015* |
+| LangChain | **6,280** | `InMemoryVectorStore` ~3 | **~2,000x** | FAISS-CPU 273* |
+| LlamaIndex | **5,744** | `SimpleVectorStore` ~2 | **~2,800x** | FAISS-CPU 911* |
+| mem0 | **2,686** | Qdrant 43 | **~62x** | FAISS 632* |
 
 Reading it:
 
 - **vs the defaults.** The in-memory defaults have no batch path, so a batch is a
   loop of ~300 ms pure-Python scans (~2 to 4 qps). LodeDB's batched GPU scan is
-  ~3,500 to 5,000 qps on the A10 (7,282 qps on the L40S for LangChain), roughly
-  **1,000x+**. Against local Qdrant (~32 qps) it is ~110x; against Chroma (~140) ~25x.
+  ~2,700 to 6,300 qps on the A10 (7,922 qps on the L40S for LangChain), roughly
+  **1,000x to 2,800x**. Against local Qdrant (~43 qps) it is ~60x; against Chroma
+  (~220) ~12x.
 - **Self-speedup.** LodeDB's batched GPU throughput is **~3x its own single-query CPU
   rate**, inside the 2.8x to 4.8x range the project reports for the GPU-resident scan.
 - **FAISS is the one close baseline, and it is noisy.** `*` FAISS-CPU is the only
@@ -231,21 +232,21 @@ Reading it:
   `SimpleVectorStore`, 4.6x than mem0's Qdrant, and smaller than every embedded local
   DB (LanceDB 35 MB, pgvector 47 MB, sqlite-vec 96 MB vs LodeDB 28 MB). This is what
   it costs to keep a growing agent memory persisted.
-- **Durable single add.** Two things drive LodeDB's per-add number. (1) The text-path
-  suites (LangChain/LlamaIndex) charge LodeDB for embedding the new doc (~7 to 10 ms,
-  a minilm forward pass) while the baselines get a precomputed vector; the embed-free
-  persist is the mem0 vector-in figure, ~19 ms. (2) That persist is a full
-  crash-atomic commit -- encode the row, append the O(changed) delta, write a new
-  generation-addressed manifest, publish it atomically -- a stronger per-write
-  guarantee than stores that append/fsync lazily (qdrant 1.6 ms, sqlite-vec 1.3 ms).
-  It is not fsync (the default `durability="fast"` skips it; `"fsync"` adds ~0.4 ms),
-  and it amortizes away under batching (`add_many` is one commit, hence the
-  thousands-per-second ingest). Either way it is 500x to 1,000x faster than the
-  in-memory defaults' multi-second full rewrite.
-- **Query latency.** The in-memory defaults scan in pure Python (~290 to 430 ms);
-  LodeDB is under 1 ms. Among the embedded local DBs LodeDB is also 30x to 77x faster
+- **Durable single add.** Every backend is fed precomputed vectors, so this column is
+  persist-only for all of them (no embedding). LodeDB's ~11 to 20 ms here (A10;
+  ~6 ms on the L40S host) is slower than the lazy-append stores -- qdrant 1.1 ms,
+  sqlite-vec 0.9 ms, pgvector 2.4 ms, lancedb 4.7 ms -- because it does more per write:
+  it publishes a new immutable generation (encode the row, append the O(changed)
+  delta, write a generation-addressed manifest, swap the root atomically). That buys a
+  **crash-atomic, never-torn store and lock-free reader snapshots** (one writer, many
+  readers per path); the faster stores defer or WAL their writes. It is not fsync
+  (default `durability="fast"`; `"fsync"` adds ~0.4 ms), and it amortizes under
+  batching (`add_many` is one commit, hence the thousands/sec ingest above). Even so it
+  is ~570x to ~2,200x faster than the in-memory defaults' multi-second full rewrite.
+- **Query latency.** The in-memory defaults scan in pure Python (~345 to 430 ms);
+  LodeDB is under 1 ms. Among the embedded local DBs LodeDB is also 16x to 80x faster
   per query than LanceDB/sqlite-vec/pgvector (all exact scans without the SIMD kernel)
-  and ~30x faster than local-mode Qdrant. FAISS-flat is the only one in LodeDB's
+  and ~25x faster than local-mode Qdrant. FAISS-flat is the only one near LodeDB's
   single-query range, and it is not durable (full rewrite, no payload round-trip).
 - **Recall.** LodeDB returns 0.95 recall@10 (4-bit quantization) versus 1.00 for the
   exact/flat stores -- the deliberate trade for footprint and query speed. The scan
