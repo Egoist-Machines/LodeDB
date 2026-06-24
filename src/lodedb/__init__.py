@@ -11,6 +11,7 @@ from __future__ import annotations
 from lodedb.local import (
     LOCAL_MODEL_PRESETS,
     ConcurrentWriterError,
+    LodeCollection,
     LodeDB,
     LodeSearchHit,
     ReadOnlyError,
@@ -24,6 +25,7 @@ __version__ = "0.3.0"
 __all__ = [
     "LOCAL_MODEL_PRESETS",
     "ConcurrentWriterError",
+    "LodeCollection",
     "LodeDB",
     "LodeSearchHit",
     "ReadOnlyError",

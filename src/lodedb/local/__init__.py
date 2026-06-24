@@ -15,6 +15,7 @@ from lodedb.local.backends import (
     build_local_embedding_backend,
     resolve_local_device,
 )
+from lodedb.local.collection import LodeCollection
 from lodedb.local.db import LodeDB, LodeSearchHit, ReadOnlyError
 from lodedb.local.doctor import local_capability_report
 from lodedb.local.presets import LOCAL_MODEL_PRESETS, LocalModelPreset, resolve_preset
@@ -22,6 +23,7 @@ from lodedb.local.presets import LOCAL_MODEL_PRESETS, LocalModelPreset, resolve_
 __all__ = [
     "LOCAL_MODEL_PRESETS",
     "ConcurrentWriterError",
+    "LodeCollection",
     "LodeDB",
     "LodeSearchHit",
     "LocalEmbeddingResolution",
