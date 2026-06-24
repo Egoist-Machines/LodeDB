@@ -1,15 +1,14 @@
-# LodeDB
+<h1 align="center">LodeDB</h1>
+<p align="center">🔥 the <b>fastest</b> and <i>most compact</i> embedded vector database in the world 🌍</p>
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
 
-**A fast, exact embedded vector database for local RAG: in-process, on-disk, no server.**
-
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is the best **drop-in, durable memory backend for LangChain, LlamaIndex, and mem0**: the most
-compact on disk, GPU-accelerated, and now sub-millisecond on durable writes. Point any of them at
+LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0** across all metrics that matter: the most
+compact on disk, GPU-accelerated, and sub-millisecond on durable writes. Point any of them at
 LodeDB instead of its default store. Over 17.5k documents, per framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
@@ -18,31 +17,14 @@ LodeDB instead of its default store. Over 17.5k documents, per framework default
 | Single-query p50 (CPU) | **~410× faster** (0.8 vs 345 ms) | **~500× faster** (0.9 vs 427 ms) | **~25× faster** (0.9 vs 23 ms) |
 | Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
 | Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.9 vs 0.5 ms (both sub-ms) |
-| Recall@10 | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 |
 
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
-Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the
-GPU when you have one: batched search hits **24k queries/sec on an A10 and 50k qps on an L40S**,
+Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index **on the
+GPU** when you have one: batched search hits *24k queries/sec on an A10 and 50k qps on an L40S*,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
 incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
-
-**Durable single-add latency vs other embedded stores** (store-only, precomputed vectors;
-GovReport ~17.5k docs on a Modal A10 / L40S), the agent-memory write pattern. LodeDB's default
-WAL commit keeps per-add latency in the sqlite-vec/qdrant range at the most compact footprint:
-
-| store | add p50 (A10) | add p50 (L40S) | footprint | recall@10 |
-| --- | ---: | ---: | ---: | ---: |
-| sqlite-vec | 0.5 ms | 0.4 ms | 101 MB | 0.999 |
-| qdrant (local) | 0.6 ms | 0.5 ms | 85 MB | 0.999 |
-| **LodeDB** | **0.8 ms** | **0.6 ms** | **29 MB** | 0.95 |
-| pgvector | 1.9 ms | 2.3 ms | 50 MB | 0.998 |
-| lancedb | 2.7 ms | 3.2 ms | 37 MB | 0.999 |
-| chroma | 5.5 ms | 6.5 ms | 151 MB | 0.998 |
-
-LodeDB has the smallest footprint here (up to 5× smaller) and lands durable single-add in the
-sqlite-vec/qdrant range, trading ~5 points of recall (TurboVec's 2/4-bit codes) for it.
 
 - **GPU-resident batch search**: an fp16 copy of the index lives on the GPU, scored with a
   tiled GEMM plus a streaming top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
@@ -187,7 +169,8 @@ db.search("E1234", k=5, mode="hybrid")  # BM25 + RRF: surfaces it in the top-k
 db.search("E1234", k=5, mode="lexical") # BM25 ranking alone, no vector scan
 ```
 
-### Prerequisites
+<details>
+<summary><b>Prerequisites</b></summary>
 
 `mode="hybrid"` and `mode="lexical"` build a BM25 index over your text, so they need a text
 source enabled when you open the database. `mode="vector"` (the default) needs nothing.
@@ -201,8 +184,10 @@ source enabled when you open the database. `mode="vector"` (the default) needs n
 Either source is enough and you can enable both. `store_text=True` is the default, so hybrid
 works out of the box. With neither source enabled, a hybrid or lexical query raises a clear,
 actionable error rather than silently degrading.
+</details>
 
-### How it works
+<details>
+<summary><b>How it works</b></summary>
 
 A `filter` constrains both rankers, so `mode="hybrid"` with a filter returns the true top-k of
 the matching subset. The vector half of a hybrid query runs on the same scan as `mode="vector"`,
@@ -210,8 +195,10 @@ including the GPU-resident batch scan that serves `search_many`; only the BM25 r
 fusion run on the CPU, and the vector kernel and on-disk format are untouched. The serving BM25
 index lives in memory and is maintained incrementally: a small mutation folds just the changed
 chunks into the existing index, so a single `add` never forces a full re-tokenization.
+</details>
 
-### Durable lexical index (`index_text=True`)
+<details>
+<summary><b>Durable lexical index (`index_text=True`)</b></summary>
 
 By default the BM25 index is rebuilt from the retained raw text, so it needs `store_text=True`
 and is re-tokenized on the first hybrid query after opening. Pass `index_text=True` to persist
@@ -232,6 +219,7 @@ db.close()
 reopened = LodeDB(path="./data", index_text=True, store_text=False)
 reopened.search("E1234", k=5, mode="hybrid")  # works after reopen, rebuilt from persisted terms
 ```
+</details>
 
 ## GPU-resident index
 
@@ -330,6 +318,9 @@ your host at `lodedb mcp`:
 
 ```bash
 pip install "lodedb[mcp]"
+
+# for coding assistant:
+lodedb mcp install --client claude-code  # or: claude-desktop | cursor | lm-studio | codex | all
 ```
 
 It exposes `lodedb_add`, `lodedb_search`, `lodedb_remove`, and `lodedb_stats`, plus
@@ -342,7 +333,7 @@ the server with `--exclude-text` to return metrics only (this also withdraws `lo
 `--no-store-text` to keep no text on disk at all. `lodedb_stats` is always metrics-only and raw
 query text never leaves the process.
 
-### One command
+### One command install
 
 `lodedb mcp install` writes the correct entry to a client's config for you, so you do not have to
 find the file or hand-write the JSON/TOML:
