@@ -4,11 +4,11 @@
   "device": "cuda",
   "document_count": 17517,
   "embedding": {
-    "doc_embed_ms_warm": 12810.73,
+    "doc_embed_ms_warm": 12173.14,
     "effective_device": "cuda",
     "native_dim": 384,
     "note": "one fixed model across all backends; every backend (including LodeDB via its vector-in SDK) receives these precomputed vectors, so none pays for embedding",
-    "query_embed_ms_warm": 788.86
+    "query_embed_ms_warm": 804.13
   },
   "incremental_count": 30,
   "model": "minilm",
@@ -23,45 +23,45 @@
           "footprint_bytes": 28890916,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 29040935,
+            "footprint_bytes_after": 29165773,
             "is_delta_persistence": true,
-            "mean_ms": 11.6663,
-            "p50_ms": 6.0869,
-            "p95_ms": 9.3785,
+            "mean_ms": 6.1689,
+            "p50_ms": 0.6485,
+            "p95_ms": 1.3731,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 6894.5,
-            "store_only_ms": 2540.72,
-            "total_ms": 2540.72
+            "store_only_docs_per_s": 2691.9,
+            "store_only_ms": 6507.22,
+            "total_ms": 6507.22
           },
           "persist": {
-            "full_dump_ms": 57.18
+            "full_dump_ms": 50.69
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.5587,
-            "p50_ms": 0.5574,
-            "p95_ms": 0.5921,
+            "mean_ms": 0.4908,
+            "p50_ms": 0.4864,
+            "p95_ms": 0.502,
             "recall_at_k": 0.9484
           },
           "query_batch": {
-            "batch_p50_ms": 7.785,
+            "batch_p50_ms": 6.646,
             "batch_size": 64,
-            "mean_per_query_ms": 0.1262,
+            "mean_per_query_ms": 0.1108,
             "path": "search_many_by_vector (GPU-resident scan on CUDA)",
             "queries": 256,
             "recall_at_k": 0.9543,
-            "throughput_qps": 7921.6
+            "throughput_qps": 9023.9
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 752.47,
+            "reopen_ms": 1298.98,
             "surviving_documents": 17547
           },
           "role": "lodedb"
@@ -73,43 +73,43 @@
             "count": 10,
             "footprint_bytes_after": 208554579,
             "is_delta_persistence": false,
-            "mean_ms": 6140.6508,
-            "p50_ms": 6076.7484,
-            "p95_ms": 6469.8217,
+            "mean_ms": 6314.2777,
+            "p50_ms": 6244.5367,
+            "p95_ms": 6634.0929,
             "requested": 30,
             "stopped_early": true
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 48460.6,
-            "store_only_ms": 361.47,
-            "total_ms": 361.47
+            "store_only_docs_per_s": 43795.0,
+            "store_only_ms": 399.98,
+            "total_ms": 399.98
           },
           "persist": {
-            "full_dump_ms": 5866.81
+            "full_dump_ms": 6179.08
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 223.8749,
-            "p50_ms": 221.2515,
-            "p95_ms": 240.8798,
+            "mean_ms": 221.8456,
+            "p50_ms": 219.8439,
+            "p95_ms": 243.3088,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 14089.939,
+            "batch_p50_ms": 13998.474,
             "batch_size": 64,
-            "mean_per_query_ms": 220.1553,
+            "mean_per_query_ms": 218.7262,
             "path": "single-query loop",
             "queries": 128,
             "recall_at_k": 0.9984,
-            "throughput_qps": 4.5
+            "throughput_qps": 4.6
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17527,
-            "reopen_ms": 2477.27,
+            "reopen_ms": 2404.09,
             "surviving_documents": 17527
           },
           "role": "baseline"
@@ -121,66 +121,66 @@
             "count": 30,
             "footprint_bytes_after": 44905699,
             "is_delta_persistence": false,
-            "mean_ms": 86.4255,
-            "p50_ms": 56.3152,
-            "p95_ms": 355.5087,
+            "mean_ms": 103.3367,
+            "p50_ms": 76.9046,
+            "p95_ms": 451.2285,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 62206.7,
-            "store_only_ms": 281.59,
-            "total_ms": 281.59
+            "store_only_docs_per_s": 53020.3,
+            "store_only_ms": 330.38,
+            "total_ms": 330.38
           },
           "persist": {
-            "full_dump_ms": 66.7
+            "full_dump_ms": 81.51
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.5243,
-            "p50_ms": 0.3856,
-            "p95_ms": 0.5269,
+            "mean_ms": 0.5436,
+            "p50_ms": 0.4561,
+            "p95_ms": 0.6408,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 35.583,
+            "batch_p50_ms": 33.074,
             "batch_size": 64,
-            "mean_per_query_ms": 0.5635,
+            "mean_per_query_ms": 0.5163,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 1774.6
+            "throughput_qps": 1936.8
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 61.36,
+            "reopen_ms": 442.35,
             "surviving_documents": 17547
           },
           "role": "baseline"
         },
         {
           "backend": "chroma",
-          "footprint_bytes": 150666884,
+          "footprint_bytes": 150810244,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 150666884,
+            "footprint_bytes_after": 150810244,
             "is_delta_persistence": true,
-            "mean_ms": 5.3492,
-            "p50_ms": 5.1313,
-            "p95_ms": 6.6213,
+            "mean_ms": 6.7252,
+            "p50_ms": 6.499,
+            "p95_ms": 8.6004,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 991.1,
-            "store_only_ms": 17673.96,
-            "total_ms": 17673.96
+            "store_only_docs_per_s": 883.7,
+            "store_only_ms": 19822.04,
+            "total_ms": 19822.04
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -188,24 +188,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 2.8737,
-            "p50_ms": 2.742,
-            "p95_ms": 3.8139,
+            "mean_ms": 3.1905,
+            "p50_ms": 3.0109,
+            "p95_ms": 4.438,
             "recall_at_k": 0.9977
           },
           "query_batch": {
-            "batch_p50_ms": 176.164,
+            "batch_p50_ms": 200.983,
             "batch_size": 64,
-            "mean_per_query_ms": 2.7477,
+            "mean_per_query_ms": 3.1382,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9977,
-            "throughput_qps": 363.9
+            "throughput_qps": 318.7
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 8.75,
+            "reopen_ms": 10.62,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -217,18 +217,18 @@
             "count": 30,
             "footprint_bytes_after": 85426696,
             "is_delta_persistence": true,
-            "mean_ms": 0.4301,
-            "p50_ms": 0.3885,
-            "p95_ms": 0.6644,
+            "mean_ms": 0.5852,
+            "p50_ms": 0.5426,
+            "p95_ms": 0.8706,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 2130.1,
-            "store_only_ms": 8223.39,
-            "total_ms": 8223.39
+            "store_only_docs_per_s": 1469.3,
+            "store_only_ms": 11921.79,
+            "total_ms": 11921.79
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -236,47 +236,47 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 11.9625,
-            "p50_ms": 11.9164,
-            "p95_ms": 12.171,
+            "mean_ms": 27.8272,
+            "p50_ms": 27.2896,
+            "p95_ms": 36.4286,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 761.678,
+            "batch_p50_ms": 1727.81,
             "batch_size": 64,
-            "mean_per_query_ms": 11.896,
+            "mean_per_query_ms": 27.0225,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 84.1
+            "throughput_qps": 37.0
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 762.41,
+            "reopen_ms": 944.27,
             "surviving_documents": 17547
           },
           "role": "baseline"
         },
         {
           "backend": "lancedb",
-          "footprint_bytes": 36694655,
+          "footprint_bytes": 36637183,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 36881190,
+            "footprint_bytes_after": 36823730,
             "is_delta_persistence": true,
-            "mean_ms": 2.7412,
-            "p50_ms": 2.702,
-            "p95_ms": 2.8944,
+            "mean_ms": 3.1921,
+            "p50_ms": 3.1614,
+            "p95_ms": 3.6743,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 6993.6,
-            "store_only_ms": 2504.71,
-            "total_ms": 2504.71
+            "store_only_docs_per_s": 5984.0,
+            "store_only_ms": 2927.29,
+            "total_ms": 2927.29
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -284,24 +284,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 8.8108,
-            "p50_ms": 7.8782,
-            "p95_ms": 14.1887,
+            "mean_ms": 11.146,
+            "p50_ms": 10.2655,
+            "p95_ms": 16.9807,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 508.137,
+            "batch_p50_ms": 641.791,
             "batch_size": 64,
-            "mean_per_query_ms": 7.9846,
+            "mean_per_query_ms": 10.0343,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 125.2
+            "throughput_qps": 99.7
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 2.57,
+            "reopen_ms": 4.4,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -313,18 +313,18 @@
             "count": 30,
             "footprint_bytes_after": 100810752,
             "is_delta_persistence": true,
-            "mean_ms": 0.4016,
-            "p50_ms": 0.337,
-            "p95_ms": 0.6095,
+            "mean_ms": 0.5538,
+            "p50_ms": 0.4404,
+            "p95_ms": 0.9367,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 35908.9,
-            "store_only_ms": 487.82,
-            "total_ms": 487.82
+            "store_only_docs_per_s": 29548.8,
+            "store_only_ms": 592.82,
+            "total_ms": 592.82
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -332,24 +332,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 18.674,
-            "p50_ms": 17.6429,
-            "p95_ms": 27.3138,
+            "mean_ms": 25.9412,
+            "p50_ms": 25.2971,
+            "p95_ms": 33.056,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 1138.605,
+            "batch_p50_ms": 1549.551,
             "batch_size": 64,
-            "mean_per_query_ms": 17.7996,
+            "mean_per_query_ms": 25.0717,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 56.2
+            "throughput_qps": 39.9
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 43.01,
+            "reopen_ms": 101.29,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -361,18 +361,18 @@
             "count": 30,
             "footprint_bytes_after": 49913856,
             "is_delta_persistence": true,
-            "mean_ms": 1.945,
-            "p50_ms": 1.9298,
-            "p95_ms": 2.5569,
+            "mean_ms": 2.3596,
+            "p50_ms": 2.277,
+            "p95_ms": 3.3624,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 2457.4,
-            "store_only_ms": 7128.17,
-            "total_ms": 7128.17
+            "store_only_docs_per_s": 2032.9,
+            "store_only_ms": 8616.81,
+            "total_ms": 8616.81
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -380,24 +380,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 30.6717,
-            "p50_ms": 30.7627,
-            "p95_ms": 32.1917,
+            "mean_ms": 30.4278,
+            "p50_ms": 30.3501,
+            "p95_ms": 30.9454,
             "recall_at_k": 0.9984
           },
           "query_batch": {
-            "batch_p50_ms": 1964.498,
+            "batch_p50_ms": 1945.036,
             "batch_size": 64,
-            "mean_per_query_ms": 30.8638,
+            "mean_per_query_ms": 30.5831,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9984,
-            "throughput_qps": 32.4
+            "throughput_qps": 32.7
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 50.58,
+            "reopen_ms": 64.28,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -417,45 +417,45 @@
           "footprint_bytes": 28890916,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 29040935,
+            "footprint_bytes_after": 29165773,
             "is_delta_persistence": true,
-            "mean_ms": 5.8746,
-            "p50_ms": 5.6294,
-            "p95_ms": 7.1204,
+            "mean_ms": 0.7011,
+            "p50_ms": 0.6465,
+            "p95_ms": 0.8699,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 8048.4,
-            "store_only_ms": 2176.46,
-            "total_ms": 2176.46
+            "store_only_docs_per_s": 2920.3,
+            "store_only_ms": 5998.32,
+            "total_ms": 5998.32
           },
           "persist": {
-            "full_dump_ms": 55.67
+            "full_dump_ms": 52.31
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.4516,
-            "p50_ms": 0.4412,
-            "p95_ms": 0.4822,
+            "mean_ms": 0.4807,
+            "p50_ms": 0.4766,
+            "p95_ms": 0.4879,
             "recall_at_k": 0.9484
           },
           "query_batch": {
-            "batch_p50_ms": 7.292,
+            "batch_p50_ms": 7.259,
             "batch_size": 64,
-            "mean_per_query_ms": 0.1158,
+            "mean_per_query_ms": 0.119,
             "path": "search_many_by_vector (GPU-resident scan on CUDA)",
             "queries": 256,
             "recall_at_k": 0.9543,
-            "throughput_qps": 8634.5
+            "throughput_qps": 8403.0
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 677.22,
+            "reopen_ms": 1379.83,
             "surviving_documents": 17547
           },
           "role": "lodedb"
@@ -467,43 +467,43 @@
             "count": 5,
             "footprint_bytes_after": 152160039,
             "is_delta_persistence": false,
-            "mean_ms": 14472.8358,
-            "p50_ms": 14417.6651,
-            "p95_ms": 15388.3535,
+            "mean_ms": 14210.7372,
+            "p50_ms": 14256.5869,
+            "p95_ms": 14985.8752,
             "requested": 30,
             "stopped_early": true
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 18899.1,
-            "store_only_ms": 926.87,
-            "total_ms": 926.87
+            "store_only_docs_per_s": 16181.3,
+            "store_only_ms": 1082.55,
+            "total_ms": 1082.55
           },
           "persist": {
-            "full_dump_ms": 14579.14
+            "full_dump_ms": 14712.26
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 255.5568,
-            "p50_ms": 245.7406,
-            "p95_ms": 293.7093,
+            "mean_ms": 249.0369,
+            "p50_ms": 245.1239,
+            "p95_ms": 262.6293,
             "recall_at_k": 0.9992
           },
           "query_batch": {
-            "batch_p50_ms": 17318.61,
+            "batch_p50_ms": 16275.736,
             "batch_size": 64,
-            "mean_per_query_ms": 270.6033,
+            "mean_per_query_ms": 254.3084,
             "path": "single-query loop",
             "queries": 128,
             "recall_at_k": 0.9992,
-            "throughput_qps": 3.7
+            "throughput_qps": 3.9
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17522,
-            "reopen_ms": 34127.28,
+            "reopen_ms": 28083.39,
             "surviving_documents": 17522
           },
           "role": "baseline"
@@ -515,66 +515,66 @@
             "count": 30,
             "footprint_bytes_after": 26952237,
             "is_delta_persistence": false,
-            "mean_ms": 14.0127,
-            "p50_ms": 14.0163,
-            "p95_ms": 15.4986,
+            "mean_ms": 16.5298,
+            "p50_ms": 16.4085,
+            "p95_ms": 18.8499,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 30476.3,
-            "store_only_ms": 574.78,
-            "total_ms": 574.78
+            "store_only_docs_per_s": 28785.5,
+            "store_only_ms": 608.54,
+            "total_ms": 608.54
           },
           "persist": {
-            "full_dump_ms": 9.45
+            "full_dump_ms": 9.92
           },
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.2981,
-            "p50_ms": 0.2527,
-            "p95_ms": 0.385,
+            "mean_ms": 0.3508,
+            "p50_ms": 0.3074,
+            "p95_ms": 0.5163,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 20.49,
+            "batch_p50_ms": 20.127,
             "batch_size": 64,
-            "mean_per_query_ms": 0.4008,
+            "mean_per_query_ms": 0.3183,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 2494.8
+            "throughput_qps": 3141.4
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 8.12,
+            "reopen_ms": 8.32,
             "surviving_documents": 17547
           },
           "role": "baseline"
         },
         {
           "backend": "chroma",
-          "footprint_bytes": 172904068,
+          "footprint_bytes": 172879492,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 172904068,
+            "footprint_bytes_after": 172879492,
             "is_delta_persistence": true,
-            "mean_ms": 6.3122,
-            "p50_ms": 6.0059,
-            "p95_ms": 8.6289,
+            "mean_ms": 10.7267,
+            "p50_ms": 9.7291,
+            "p95_ms": 17.4924,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 824.7,
-            "store_only_ms": 21239.51,
-            "total_ms": 21239.51
+            "store_only_docs_per_s": 799.2,
+            "store_only_ms": 21917.76,
+            "total_ms": 21917.76
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -582,24 +582,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 4.0147,
-            "p50_ms": 3.834,
-            "p95_ms": 5.1527,
+            "mean_ms": 4.8094,
+            "p50_ms": 4.4147,
+            "p95_ms": 7.6616,
             "recall_at_k": 0.9969
           },
           "query_batch": {
-            "batch_p50_ms": 231.552,
+            "batch_p50_ms": 343.973,
             "batch_size": 64,
-            "mean_per_query_ms": 3.6438,
+            "mean_per_query_ms": 5.0973,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9969,
-            "throughput_qps": 274.4
+            "throughput_qps": 196.2
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 8.85,
+            "reopen_ms": 12.03,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -611,18 +611,18 @@
             "count": 30,
             "footprint_bytes_after": 97419780,
             "is_delta_persistence": true,
-            "mean_ms": 0.6227,
-            "p50_ms": 0.5819,
-            "p95_ms": 0.8856,
+            "mean_ms": 0.5969,
+            "p50_ms": 0.5314,
+            "p95_ms": 0.9644,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 2563.5,
-            "store_only_ms": 6833.13,
-            "total_ms": 6833.13
+            "store_only_docs_per_s": 1588.4,
+            "store_only_ms": 11028.38,
+            "total_ms": 11028.38
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -630,24 +630,24 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 26.1472,
-            "p50_ms": 25.6842,
-            "p95_ms": 29.5978,
+            "mean_ms": 38.7823,
+            "p50_ms": 30.6148,
+            "p95_ms": 45.9866,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 1677.206,
+            "batch_p50_ms": 1784.265,
             "batch_size": 64,
-            "mean_per_query_ms": 26.2644,
+            "mean_per_query_ms": 27.6709,
             "path": "single-query loop",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 38.1
+            "throughput_qps": 36.1
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 1044.71,
+            "reopen_ms": 1031.92,
             "surviving_documents": 17547
           },
           "role": "baseline"
@@ -667,28 +667,28 @@
           "filtered_query": {
             "count": 256,
             "filter": "user_id=u0",
-            "mean_ms": 0.9354,
-            "p50_ms": 0.8126,
-            "p95_ms": 0.8355,
+            "mean_ms": 0.8617,
+            "p50_ms": 0.7256,
+            "p95_ms": 0.7999,
             "recall_at_k": 0.9543
           },
           "footprint_bytes": 16013392,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 32370050,
+            "footprint_bytes_after": 16804534,
             "is_delta_persistence": true,
-            "mean_ms": 24.3818,
-            "p50_ms": 6.7459,
-            "p95_ms": 8.3177,
+            "mean_ms": 0.6803,
+            "p50_ms": 0.6496,
+            "p95_ms": 0.7302,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 5644.9,
-            "store_only_ms": 3103.15,
-            "total_ms": 3103.15
+            "store_only_docs_per_s": 2752.8,
+            "store_only_ms": 6363.37,
+            "total_ms": 6363.37
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -696,32 +696,32 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.6553,
-            "p50_ms": 0.6538,
-            "p95_ms": 0.6689,
+            "mean_ms": 0.5522,
+            "p50_ms": 0.5466,
+            "p95_ms": 0.5753,
             "recall_at_k": 0.9484
           },
           "query_batch": {
-            "batch_p50_ms": 11.661,
+            "batch_p50_ms": 10.147,
             "batch_size": 64,
-            "mean_per_query_ms": 0.1833,
+            "mean_per_query_ms": 0.168,
             "path": "search_batch -> search_many_by_vector (GPU-resident scan on CUDA)",
             "queries": 256,
             "recall_at_k": 0.9543,
-            "throughput_qps": 5456.4
+            "throughput_qps": 5952.6
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 809.17,
+            "reopen_ms": 1255.46,
             "surviving_documents": 17547
           },
           "role": "lodedb",
           "update": {
             "count": 64,
-            "mean_ms": 7.0305,
-            "p50_ms": 6.9228,
-            "p95_ms": 8.6303
+            "mean_ms": 0.3295,
+            "p50_ms": 0.3005,
+            "p95_ms": 0.5126
           }
         },
         {
@@ -729,9 +729,9 @@
           "filtered_query": {
             "count": 256,
             "filter": "user_id=u0",
-            "mean_ms": 140.4421,
-            "p50_ms": 139.0214,
-            "p95_ms": 144.2453,
+            "mean_ms": 140.3492,
+            "p50_ms": 140.6061,
+            "p95_ms": 149.7633,
             "recall_at_k": 1.0
           },
           "footprint_bytes": 73445933,
@@ -739,18 +739,18 @@
             "count": 30,
             "footprint_bytes_after": 73572909,
             "is_delta_persistence": true,
-            "mean_ms": 0.4331,
-            "p50_ms": 0.4116,
-            "p95_ms": 0.6182,
+            "mean_ms": 0.3883,
+            "p50_ms": 0.3697,
+            "p95_ms": 0.5171,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 2265.8,
-            "store_only_ms": 7731.18,
-            "total_ms": 7731.18
+            "store_only_docs_per_s": 1890.2,
+            "store_only_ms": 9267.22,
+            "total_ms": 9267.22
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -758,32 +758,32 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 24.8202,
-            "p50_ms": 24.4283,
-            "p95_ms": 28.8433,
+            "mean_ms": 27.9624,
+            "p50_ms": 26.795,
+            "p95_ms": 43.4,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 1547.489,
+            "batch_p50_ms": 1815.49,
             "batch_size": 64,
-            "mean_per_query_ms": 24.0641,
+            "mean_per_query_ms": 28.6273,
             "path": "search_batch",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 41.6
+            "throughput_qps": 34.9
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 1373.02,
+            "reopen_ms": 1503.1,
             "surviving_documents": 17547
           },
           "role": "baseline",
           "update": {
             "count": 64,
-            "mean_ms": 0.6085,
-            "p50_ms": 0.5329,
-            "p95_ms": 1.1164
+            "mean_ms": 0.5833,
+            "p50_ms": 0.53,
+            "p95_ms": 0.8712
           }
         },
         {
@@ -791,9 +791,9 @@
           "filtered_query": {
             "count": 256,
             "filter": "user_id=u0",
-            "mean_ms": 0.3517,
-            "p50_ms": 0.3367,
-            "p95_ms": 0.4664,
+            "mean_ms": 0.358,
+            "p50_ms": 0.357,
+            "p95_ms": 0.395,
             "recall_at_k": 0.0395
           },
           "footprint_bytes": 31256223,
@@ -801,18 +801,18 @@
             "count": 30,
             "footprint_bytes_after": 31309752,
             "is_delta_persistence": true,
-            "mean_ms": 97.5034,
-            "p50_ms": 97.5547,
-            "p95_ms": 102.2659,
+            "mean_ms": 97.7743,
+            "p50_ms": 97.1679,
+            "p95_ms": 100.723,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 56257.0,
-            "store_only_ms": 311.37,
-            "total_ms": 311.37
+            "store_only_docs_per_s": 63843.7,
+            "store_only_ms": 274.37,
+            "total_ms": 274.37
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -820,32 +820,32 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 0.3065,
-            "p50_ms": 0.2884,
-            "p95_ms": 0.4136,
+            "mean_ms": 0.3396,
+            "p50_ms": 0.3222,
+            "p95_ms": 0.432,
             "recall_at_k": 0.9988
           },
           "query_batch": {
-            "batch_p50_ms": 24.625,
+            "batch_p50_ms": 21.748,
             "batch_size": 64,
-            "mean_per_query_ms": 0.4079,
+            "mean_per_query_ms": 0.3399,
             "path": "search_batch",
             "queries": 256,
             "recall_at_k": 0.9988,
-            "throughput_qps": 2451.9
+            "throughput_qps": 2942.4
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 25.18,
+            "reopen_ms": 29.82,
             "surviving_documents": 17547
           },
           "role": "baseline",
           "update": {
             "count": 64,
-            "mean_ms": 235.7574,
-            "p50_ms": 234.7452,
-            "p95_ms": 246.704
+            "mean_ms": 239.1532,
+            "p50_ms": 239.0633,
+            "p95_ms": 243.8439
           }
         },
         {
@@ -853,28 +853,28 @@
           "filtered_query": {
             "count": 256,
             "filter": "user_id=u0",
-            "mean_ms": 11.5369,
-            "p50_ms": 11.3125,
-            "p95_ms": 12.9675,
+            "mean_ms": 13.3732,
+            "p50_ms": 13.4641,
+            "p95_ms": 14.9346,
             "recall_at_k": 1.0
           },
-          "footprint_bytes": 49024576,
+          "footprint_bytes": 49016384,
           "incremental_add": {
             "count": 30,
-            "footprint_bytes_after": 49024576,
+            "footprint_bytes_after": 49016384,
             "is_delta_persistence": true,
-            "mean_ms": 4.7595,
-            "p50_ms": 4.6652,
-            "p95_ms": 5.1166,
+            "mean_ms": 6.2275,
+            "p50_ms": 6.1826,
+            "p95_ms": 7.3447,
             "requested": 30,
             "stopped_early": false
           },
           "ingest": {
             "documents": 17517,
             "embeds_on_ingest": false,
-            "store_only_docs_per_s": 2634.9,
-            "store_only_ms": 6647.98,
-            "total_ms": 6647.98
+            "store_only_docs_per_s": 2209.4,
+            "store_only_ms": 7928.39,
+            "total_ms": 7928.39
           },
           "persist": {
             "full_dump_ms": 0.0
@@ -882,32 +882,32 @@
           "query": {
             "count": 256,
             "k": 10,
-            "mean_ms": 2.9676,
-            "p50_ms": 2.8253,
-            "p95_ms": 4.0973,
+            "mean_ms": 3.0969,
+            "p50_ms": 2.9754,
+            "p95_ms": 3.9078,
             "recall_at_k": 0.9965
           },
           "query_batch": {
-            "batch_p50_ms": 184.446,
+            "batch_p50_ms": 194.511,
             "batch_size": 64,
-            "mean_per_query_ms": 2.8701,
+            "mean_per_query_ms": 3.0355,
             "path": "search_batch",
             "queries": 256,
             "recall_at_k": 0.9965,
-            "throughput_qps": 348.4
+            "throughput_qps": 329.4
           },
           "reopen": {
             "durable": true,
             "expected_documents": 17547,
-            "reopen_ms": 9.11,
+            "reopen_ms": 13.0,
             "surviving_documents": 17547
           },
           "role": "baseline",
           "update": {
             "count": 64,
-            "mean_ms": 5.7055,
-            "p50_ms": 5.5881,
-            "p95_ms": 6.8914
+            "mean_ms": 6.4355,
+            "p50_ms": 6.4035,
+            "p95_ms": 7.8992
           }
         }
       ],
