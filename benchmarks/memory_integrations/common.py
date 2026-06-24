@@ -361,9 +361,13 @@ class StoreDriver:
     # O(corpus) rewrite (the in-memory dump-to-disk stores).
     incremental_is_delta: bool = True
 
+    # Label for how this backend answers a batch of queries (shown in results).
+    batch_path: str = "single-query loop"
+
     def warmup(self) -> None: ...  # one-time setup excluded from the ingest timer (model load)
     def ingest(self, ids, texts, vectors, metadatas) -> None: ...
     def query_one(self, qvec, k) -> list[str]: ...
+    def query_batch(self, qvecs, k) -> list[list[str]]: ...  # answer many queries at once
     def persist(self) -> None: ...  # force a durability checkpoint (full dump for in-RAM stores)
     def footprint_bytes(self) -> int: ...
     def reopen(self) -> int: ...  # returns surviving document count, or -1 if unsupported
@@ -383,6 +387,8 @@ def run_core_phases(
     incremental_count: int,
     incremental_ids: list[str] | None = None,
     incremental_time_budget_s: float = 60.0,
+    batch_size: int = 64,
+    batch_query_time_budget_s: float = 20.0,
     extra_phases: Any = None,
 ) -> dict[str, Any]:
     """Times ingest, query (+recall), footprint, reopen, and incremental adds.
@@ -426,6 +432,46 @@ def run_core_phases(
         **latency_summary(latencies),
         "k": k,
         "recall_at_k": recall_at_k(returned, truth, k),
+    }
+
+    # --- batched query throughput (the GPU story) ---
+    # Single-query search stays on the CPU kernel by design; the batched path is
+    # what engages LodeDB's GPU-resident scan on CUDA (search_many_by_vector at
+    # batch >= 2). LangChain/LlamaIndex retriever contracts are single-query, so
+    # those backends answer a batch as a loop; mem0 exposes search_batch, so its
+    # providers use it. Throughput is queries / wall-clock at the given batch size.
+    qvecs_all = [row.tolist() for row in embedded.query_vectors]
+    if qvecs_all:
+        # Warm up once so the timed window excludes one-time setup: the CUDA context
+        # init plus LodeDB's GPU-resident index upload (both fire on the first
+        # batch >= 2 and otherwise dominate it instead of steady-state throughput).
+        # A few queries trigger the full build (the whole index uploads regardless),
+        # so this stays cheap for the slow single-query-loop stores.
+        driver.query_batch(qvecs_all[: min(batch_size, 8)], k)
+    batch_returned: list[list[str]] = []
+    batch_latencies: list[float] = []
+    cumulative_s = 0.0
+    done = 0
+    for i in range(0, len(qvecs_all), batch_size):
+        chunk = qvecs_all[i : i + batch_size]
+        s = time.perf_counter()
+        res = driver.query_batch(chunk, k)
+        dt = time.perf_counter() - s
+        batch_latencies.append(dt * 1000.0)
+        batch_returned.extend(res)
+        done += len(chunk)
+        cumulative_s += dt
+        if cumulative_s > batch_query_time_budget_s and done >= batch_size:
+            break
+    result["query_batch"] = {
+        "batch_size": batch_size,
+        "queries": done,
+        "throughput_qps": round(done / cumulative_s, 1) if cumulative_s > 0 else 0.0,
+        "mean_per_query_ms": round(cumulative_s * 1000.0 / done, 4) if done else 0.0,
+        "batch_p50_ms": round(median(batch_latencies), 3) if batch_latencies else 0.0,
+        # Slice truth to the queries actually run (the budget can stop a slow store early).
+        "recall_at_k": recall_at_k(batch_returned, truth[: len(batch_returned)], k),
+        "path": driver.batch_path,
     }
 
     # --- persist (force durability) + footprint (durable, on disk) ---

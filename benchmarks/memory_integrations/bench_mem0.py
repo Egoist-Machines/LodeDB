@@ -46,6 +46,7 @@ class _Mem0Driver(StoreDriver):
     role = "baseline"
     embeds_on_ingest = False  # mem0 is vector-in: stores receive precomputed vectors
     incremental_is_delta = True
+    batch_path = "search_batch"
 
     def __init__(self, name: str, base_dir: Path, dim: int) -> None:
         self.name = name
@@ -67,6 +68,15 @@ class _Mem0Driver(StoreDriver):
     def filtered_query_one(self, qvec, k, filters) -> list[str]:
         hits = self.store.search(query="", vectors=qvec, top_k=k, filters=filters)
         return [str(h.id) for h in hits]
+
+    def query_batch(self, qvecs, k) -> list[list[str]]:
+        # mem0's VectorStoreBase exposes search_batch; LodeDB routes it to
+        # search_many_by_vector (GPU-resident scan on CUDA).
+        try:
+            batches = self.store.search_batch([""] * len(qvecs), qvecs, top_k=k)
+            return [[str(getattr(h, "id", "")) for h in res] for res in batches]
+        except Exception:
+            return [self.query_one(qv, k) for qv in qvecs]
 
     def persist(self) -> None:
         pass  # mem0 providers persist on every write (Qdrant/Chroma/FAISS path-backed)
@@ -109,6 +119,7 @@ class _Mem0Driver(StoreDriver):
 
 class _LodeDBDriver(_Mem0Driver):
     role = "lodedb"
+    batch_path = "search_batch -> search_many_by_vector (GPU-resident scan on CUDA)"
 
     def _construct(self) -> Any:
         from lodedb.local.integrations.mem0 import LodeDBVectorStore
@@ -232,6 +243,7 @@ def run_mem0_suite(
     n_users: int,
     k: int,
     incremental_count: int,
+    batch_size: int,
     workdir: Path,
 ) -> dict[str, Any]:
     """Runs the mem0 agent-memory workflow across all available providers."""
@@ -270,6 +282,7 @@ def run_mem0_suite(
                 k=k,
                 incremental_count=incremental_count,
                 incremental_ids=inc_ids,
+                batch_size=batch_size,
                 extra_phases=extra,
             )
             backends.append(metrics)

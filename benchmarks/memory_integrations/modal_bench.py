@@ -140,6 +140,7 @@ def _full_spec(output_dir: str) -> dict:
         "top_k": 10,
         "incremental_count": 30,
         "n_users": 50,
+        "batch_size": 64,
     }
 
 
@@ -156,6 +157,7 @@ def _smoke_spec(output_dir: str) -> dict:
         "top_k": 10,
         "incremental_count": 20,
         "n_users": 10,
+        "batch_size": 64,
     }
 
 

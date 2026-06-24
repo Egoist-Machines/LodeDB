@@ -40,6 +40,7 @@ def run_memory_integrations_suite(
     top_k: int = 10,
     incremental_count: int = 50,
     n_users: int = 20,
+    batch_size: int = 64,
     frameworks: tuple[str, ...] = _FRAMEWORKS,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
@@ -65,6 +66,7 @@ def run_memory_integrations_suite(
                     device=device,
                     k=top_k,
                     incremental_count=incremental_count,
+                    batch_size=batch_size,
                     workdir=workdir / "langchain",
                 )
             if "llamaindex" in frameworks:
@@ -77,6 +79,7 @@ def run_memory_integrations_suite(
                     device=device,
                     k=top_k,
                     incremental_count=incremental_count,
+                    batch_size=batch_size,
                     workdir=workdir / "llamaindex",
                 )
             if "mem0" in frameworks:
@@ -87,6 +90,7 @@ def run_memory_integrations_suite(
                     n_users=n_users,
                     k=top_k,
                     incremental_count=incremental_count,
+                    batch_size=batch_size,
                     workdir=workdir / "mem0",
                 )
 
@@ -100,6 +104,7 @@ def run_memory_integrations_suite(
         "query_count": len(queries),
         "top_k": top_k,
         "incremental_count": incremental_count,
+        "batch_size": batch_size,
         "embedding": {
             "native_dim": embedded.native_dim,
             "effective_device": embedded.effective_device,
@@ -131,6 +136,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--incremental-count", type=int, default=50)
     parser.add_argument("--n-users", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--frameworks",
         default=",".join(_FRAMEWORKS),
@@ -148,6 +154,7 @@ def main() -> None:
         top_k=args.top_k,
         incremental_count=args.incremental_count,
         n_users=args.n_users,
+        batch_size=args.batch_size,
         frameworks=tuple(f.strip() for f in args.frameworks.split(",") if f.strip()),
         output_dir=args.out,
     )

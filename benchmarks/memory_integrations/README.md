@@ -95,9 +95,23 @@ split is the same corpus the `graph_memory` benchmark uses). LodeDB uses 4-bit
 TurboVec quantization, so its recall is intentionally below the exact stores' 1.0;
 that trade buys footprint and durable-write cost.
 
-The tables below are the **A10** run. The L40S run is store-for-store equivalent
-(the scan is CPU-bound); the only material difference is embedding throughput, 792
-docs/s on the A10 versus 1,230 docs/s on the L40S. `docs/s` is store-only ingest,
+**What uses the GPU.** The runs are named for their GPU (A10 / L40S), but the GPU
+only does two things, and only for LodeDB:
+
+1. The shared **embedding** step (held constant across every backend, computed once,
+   subtracted to give store-only ingest).
+2. LodeDB's **batched** `search_many_by_vector` path in the "Batched retrieval"
+   section below, which engages the GPU-resident scan at batch >= 2.
+
+Everything else is **CPU on every backend**, including LodeDB. Single-query search
+stays on the CPU kernel by design (see [`runtime_policy.py`](../../src/lodedb/engine/runtime_policy.py)
+`gpu_direct_turbovec_should_use`), so the ingest / single-query / durable-add /
+footprint tables are a CPU-vs-CPU store comparison: LodeDB's CPU TurboVec scan
+against FAISS (CPU), Chroma, Qdrant (local), and the in-memory defaults. The proof
+is that the A10 and L40S store metrics match; only embedding throughput differs
+(792 docs/s on the A10 versus 1,230 docs/s on the L40S).
+
+The single-query tables below are the **A10** run. `docs/s` is store-only ingest,
 `query p50` is by-vector search, `add p50` is the durable single-add (sampled `n`
 times; a slow full-rewrite store is sampled fewer times under a wall-clock budget),
 and `footprint` is durable on-disk size.
@@ -109,36 +123,38 @@ LodeDB's; the multiplier is how much better LodeDB is on that axis.
 
 | Axis | LangChain default (`InMemoryVectorStore`) | LlamaIndex default (`SimpleVectorStore`) | mem0 default (Qdrant) |
 |---|---|---|---|
-| **Durable single add** | 10,482 ms to **16.9 ms** = **620x faster** | 22,132 ms to **16.5 ms** = **1,341x faster** | 0.7 ms to 9.7 ms (Qdrant faster) |
-| **Query p50** | 343 ms to **0.85 ms** = **404x faster** | 422 ms to **0.84 ms** = **502x faster** | 26.3 ms to **0.91 ms** = **29x faster** |
+| **Durable single add** | 8,590 ms to **18 ms** = **477x faster** | 19,351 ms to **13.5 ms** = **1,433x faster** | 0.5 ms to 8.2 ms (Qdrant faster) |
+| **Query p50** (single, CPU) | 288 ms to **0.57 ms** = **506x faster** | 334 ms to **0.56 ms** = **597x faster** | 26.9 ms to **0.62 ms** = **43x faster** |
+| **Batched retrieval (64), qps** (GPU) | 4 to **4,045** = **~1,000x** | 3 to **6,684** = **~2,200x** | 38 to **5,007** = **~130x** |
 | **On-disk footprint** | 199 MB to **28 MB** = **7.0x smaller** | 145 MB to **28 MB** = **5.3x smaller** | 70 MB to **15 MB** = **4.6x smaller** |
 | **Recall@10** | 1.00 to 0.95 | 1.00 to 0.95 | 1.00 to 0.95 (filtered 1.00 to 0.95) |
 
 LangChain's and LlamaIndex's defaults are in-memory: persisting one new memory
-rewrites the whole store (O(corpus)), and queries are a pure-Python scan. mem0's
-default Qdrant is already a real DB, so its single-add is fast, but LodeDB still
-reads far faster and stores far smaller. LodeDB trades 5 points of recall (4-bit
-quantization) for all of it.
+rewrites the whole store (O(corpus)), and queries are a pure-Python scan with no
+batch path. mem0's default Qdrant is already a real DB, so its single-add is fast,
+but LodeDB still reads far faster and stores far smaller. The batched row is where
+LodeDB's GPU-resident scan engages (see "Batched retrieval" below). LodeDB trades 5
+points of recall (4-bit quantization) for all of it.
 
 ### LangChain (default `InMemoryVectorStore`), RAG over ~17.5k docs
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | durable add p50 | n | delta? | footprint | footprint vs LodeDB |
 |---|---|---|---|---|---|---|---|---|
-| **lodedb** | 5,771 | **0.85** | 0.95 | **16.9 ms** | 30 | yes | **28 MB** | 1.0x (baseline) |
-| inmemory (default) | 43,254 | 343.5 | 1.00 | 10,482 ms | 6 | no | 199 MB | **7.0x bigger** |
-| faiss | 23,207 | 0.71 | 1.00 | 128.9 ms | 30 | no | 43 MB | 1.5x bigger |
-| chroma | 609 | 4.47 | 1.00 | 8.7 ms | 30 | yes | 144 MB | 5.1x bigger |
-| qdrant | 902 | 17.3 | 1.00 | 0.9 ms | 30 | yes | 81 MB | 2.9x bigger |
+| **lodedb** | 5,582 | **0.57** | 0.95 | **18 ms** | 30 | yes | **28 MB** | 1.0x (baseline) |
+| inmemory (default) | 174,630 | 288.4 | 1.00 | 8,590 ms | 6 | no | 199 MB | **7.0x bigger** |
+| faiss | 27,206 | 0.44 | 1.00 | 112.1 ms | 30 | no | 43 MB | 1.5x bigger |
+| chroma | 894 | 3.26 | 1.00 | 6.5 ms | 30 | yes | 144 MB | 5.1x bigger |
+| qdrant | 1,438 | 15.8 | 1.00 | 0.6 ms | 30 | yes | 81 MB | 2.9x bigger |
 
 ### LlamaIndex (default `SimpleVectorStore`), RAG over ~17.5k docs
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | durable add p50 | n | delta? | footprint | footprint vs LodeDB |
 |---|---|---|---|---|---|---|---|---|
-| **lodedb** | 5,542 | **0.84** | 0.95 | **16.5 ms** | 30 | yes | **28 MB** | 1.0x (baseline) |
-| simple (default) | 17,273 | 421.6 | 1.00 | 22,132 ms | 3 | no | 145 MB | **5.3x bigger** |
-| faiss | 16,938 | 0.47 | 1.00 | 14.6 ms | 30 | no | 26 MB | 0.9x (similar) |
-| chroma | 574 | 5.00 | 1.00 | 8.7 ms | 30 | yes | 165 MB | 6.0x bigger |
-| qdrant | 1,273 | 25.5 | 1.00 | 0.8 ms | 30 | yes | 93 MB | 3.4x bigger |
+| **lodedb** | 7,970 | **0.56** | 0.95 | **13.5 ms** | 30 | yes | **28 MB** | 1.0x (baseline) |
+| simple (default) | 20,623 | 334.1 | 1.00 | 19,351 ms | 3 | no | 145 MB | **5.3x bigger** |
+| faiss | 17,385 | 0.28 | 1.00 | 31.3 ms | 30 | no | 26 MB | 0.9x (similar) |
+| chroma | 815 | 3.50 | 1.00 | 5.8 ms | 30 | yes | 165 MB | 6.0x bigger |
+| qdrant | 1,851 | 27.4 | 1.00 | 0.6 ms | 30 | yes | 93 MB | 3.4x bigger |
 
 `SimpleVectorStore` reopens by reloading its 145 MB JSON in about 40 s; LodeDB
 reopens in about 1.4 s.
@@ -147,10 +163,45 @@ reopens in about 1.4 s.
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | filtered recall | durable add p50 | footprint | footprint vs LodeDB |
 |---|---|---|---|---|---|---|---|
-| **lodedb** | 4,348 | **0.91** | 0.95 | 0.95 | 9.7 ms | **15 MB** | 1.0x (baseline) |
-| qdrant (default) | 1,204 | 26.3 | 1.00 | 1.00 | 0.7 ms | 70 MB | **4.6x bigger** |
-| faiss | 25,155 | 0.50 | 1.00 | **0.04** | 153 ms | 30 MB | 1.9x bigger |
-| chroma | 1,582 | 4.06 | 1.00 | 1.00 | 7.7 ms | 47 MB | 3.1x bigger |
+| **lodedb** | 5,128 | **0.62** | 0.95 | 0.95 | 8.2 ms | **15 MB** | 1.0x (baseline) |
+| qdrant (default) | 1,535 | 26.9 | 1.00 | 1.00 | 0.5 ms | 70 MB | **4.6x bigger** |
+| faiss | 27,142 | 0.27 | 1.00 | **0.04** | 319.9 ms | 30 MB | 1.9x bigger |
+| chroma | 2,164 | 2.93 | 1.00 | 1.00 | 7.7 ms | 47 MB | 3.1x bigger |
+
+### Batched retrieval (batch = 64): the GPU path
+
+The single-query numbers above are all CPU. The batched path is where LodeDB
+engages its GPU-resident scan: `search_many_by_vector` at batch >= 2 runs the whole
+batch as one resident scan. LangChain's and LlamaIndex's retriever contracts are
+single-query, so their stores answer a batch as a loop; mem0 exposes `search_batch`,
+so its providers use it. Throughput is warm steady-state queries/sec (the one-time
+GPU index upload is excluded with a warmup batch); batched recall matches
+single-query recall (0.95 for LodeDB), so the GPU path is correctness-preserving.
+
+| Framework (batch = 64) | LodeDB qps (A10 / L40S) | default-store qps | LodeDB vs default | best alternative |
+|---|---|---|---|---|
+| LangChain | **4,045 / 6,294** | `InMemoryVectorStore` 4 | **~1,000x** | FAISS-CPU 881* |
+| LlamaIndex | **6,684 / 6,540** | `SimpleVectorStore` 3 | **~2,200x** | FAISS-CPU 3,418* |
+| mem0 | **5,007 / 4,790** | Qdrant 38 | **~130x** | FAISS 3,116* |
+
+Reading it:
+
+- **vs the defaults.** The in-memory defaults have no batch path, so a batch is a
+  loop of ~300 ms pure-Python scans: 3 to 4 qps. LodeDB's batched GPU scan is ~5,000
+  to 6,700 qps, roughly **1,000x to 2,200x**. Against local Qdrant (~40 qps) it is
+  ~120x; against Chroma (~290 qps) ~20x.
+- **Self-speedup.** LodeDB's batched GPU throughput is about **3x its own
+  single-query CPU rate** (for example 1,786 qps single to 6,684 batched on the A10),
+  inside the 2.8x to 4.8x range the project reports for the GPU-resident scan.
+- **FAISS is the one close baseline, and it is noisy.** `*` FAISS-CPU is the only
+  baseline that batches efficiently, but its CPU throughput is host-dependent on
+  Modal's shared instances (it ranged 361 to 3,418 qps across runs and suites here),
+  so treat it as "comparable to a few-x slower than LodeDB," not a fixed number.
+- **Scale.** At ~17.5k vectors the GPU is not compute-bound (A10 and L40S land
+  within noise of each other), so this is a conservative view of the GPU win. The
+  headline GPU throughput (24k qps A10, 50k qps L40S, 2.8x to 4.8x the CPU ceiling)
+  is a larger-corpus result, measured at 100k to 1M vectors in
+  [`govreport_scale`](../govreport_scale) and [`direct_gpu_sweep`](../direct_gpu_sweep).
 
 ## Reading the results
 
@@ -160,23 +211,28 @@ reopens in about 1.4 s.
   heaviest on disk. This is what it costs to keep a growing agent memory persisted.
 - **Durable single add.** The in-memory defaults are fast to *fill* but cannot
   durably add one memory without rewriting the entire store. At ~17.5k docs that is
-  about 10.5 s per single add for `InMemoryVectorStore` and about 22 s for
+  about 8.6 s per single add for `InMemoryVectorStore` and about 19 s for
   `SimpleVectorStore`, and it grows O(corpus). LodeDB appends an O(changed) delta in
-  about 16 ms, flat as the store grows. FAISS shares the full-rewrite model; Chroma
+  ~13 to 18 ms, flat as the store grows. FAISS shares the full-rewrite model; Chroma
   and Qdrant, like LodeDB, persist incrementally.
-- **Query latency.** The in-memory defaults scan in pure Python, so query p50 is
-  340 to 420 ms at this corpus size, versus under 1 ms for LodeDB. LodeDB is also
-  20 to 40x faster than the *local-mode* Qdrant client (which is unindexed; server
+- **Query latency.** The in-memory defaults scan in pure Python, so single-query p50
+  is ~290 to 334 ms at this corpus size, versus under 1 ms for LodeDB. LodeDB is also
+  ~30 to 45x faster than the *local-mode* Qdrant client (which is unindexed; server
   Qdrant would differ).
 - **Recall.** LodeDB returns 0.95 recall@10 (4-bit quantization) versus 1.00 for
   the exact and flat stores, the deliberate trade for footprint and write cost.
 - **mem0 filtered search.** mem0's FAISS provider has no server-side filtering: it
   over-fetches only `2*k` then post-filters, so within-user recall collapses to
-  0.04 at 2% selectivity (and its `update` rebuilds the index, ~150 ms). LodeDB,
+  0.04 at 2% selectivity (and its `update` rebuilds the index, ~320 ms). LodeDB,
   Qdrant, and Chroma push the `user_id` predicate into the index and stay accurate.
 
 ## Caveats
 
+- **Latencies are measured on Modal's shared-CPU instances and vary run to run**
+  (FAISS-CPU's single-query p50 ranged ~0.4 to 2.3 ms across runs, its batch
+  throughput 361 to 3,418 qps). The deterministic results -- footprint, recall, and
+  the order-of-magnitude gaps (seconds-vs-ms durable add, hundreds-of-ms-vs-sub-ms
+  query) -- do not move; treat the precise CPU-baseline figures as a single sample.
 - The in-memory defaults are not durable until dumped; the durable-add and
   footprint columns charge them for that dump, which is the real cost of persisting
   agent memory. Their in-RAM ingest and query speed is real but undurable.

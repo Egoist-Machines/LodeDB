@@ -15,13 +15,15 @@ framework default:
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
 | On-disk footprint | **7.0× smaller** | **5.3× smaller** | **4.6× smaller** |
-| Query latency (p50) | **404× faster** | **502× faster** | **29× faster** |
-| Durable add of one memory | **620× faster** | **1,341× faster** | both ms-scale |
+| Single-query latency, p50 (CPU) | **~500× faster** | **~600× faster** | **~40× faster** |
+| Batched retrieval, 64 (GPU) | **~1,000× more qps** | **~2,000× more qps** | **~130× more qps** |
+| Durable add of one memory | **~480× faster** | **~1,400× faster** | both ms-scale |
 
-The in-memory defaults rewrite the whole store to persist one new memory (about 10 to 22
-seconds at this corpus size) and scan in pure Python; LodeDB appends an O(changed) delta
-(about 16 ms) and keeps queries sub-millisecond, at 0.95 recall@10 (4-bit quantized) versus
-the defaults' exact 1.00. [Full benchmark, all backends (FAISS, Chroma, Qdrant), and
+The in-memory defaults rewrite the whole store to persist one new memory (about 9 to 19
+seconds at this corpus size) and scan in pure Python with no batch path; LodeDB appends an
+O(changed) delta (~15 ms), keeps single queries sub-millisecond on the CPU, and serves
+batched retrieval from its GPU-resident scan, at 0.95 recall@10 (4-bit quantized) versus the
+defaults' exact 1.00. [Full benchmark, all backends (FAISS, Chroma, Qdrant), and
 method.](benchmarks/memory_integrations)
 
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index on the

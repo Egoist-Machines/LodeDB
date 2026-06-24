@@ -76,6 +76,10 @@ class _LCDriver(StoreDriver):
         docs = self.store.similarity_search_by_vector(qvec, k=k)
         return [_doc_id(d) for d in docs]
 
+    def query_batch(self, qvecs, k) -> list[list[str]]:
+        # LangChain's VectorStore retriever contract is single-query.
+        return [self.query_one(qv, k) for qv in qvecs]
+
     def incremental_add(self, doc_id, text, vector, metadata) -> None:
         self.store.add_texts([text], metadatas=[{**metadata, "_id": doc_id}], ids=[doc_id])
         self._persist_incremental()
@@ -199,6 +203,7 @@ class _QdrantDriver(_LCDriver):
 class _LodeDBDriver(_LCDriver):
     role = "lodedb"
     embeds_on_ingest = True  # text-path: LodeDB embeds internally on add_texts
+    batch_path = "search_many_by_vector (GPU-resident scan on CUDA)"
 
     def __init__(self, name, base_dir, emb, *, model: str, device: str) -> None:
         super().__init__(name, base_dir, emb)
@@ -231,6 +236,10 @@ class _LodeDBDriver(_LCDriver):
         # embedding is not charged and the comparison is store search only.
         return [h.id for h in self._db.search_by_vector(qvec, k=k)]
 
+    def query_batch(self, qvecs, k) -> list[list[str]]:
+        # The batched path: on a CUDA host with cupy this runs the GPU-resident scan.
+        return [[h.id for h in hits] for hits in self._db.search_many_by_vector(qvecs, k=k)]
+
     def persist(self) -> None:
         self._db.persist()
 
@@ -254,6 +263,7 @@ def run_langchain_suite(
     device: str,
     k: int,
     incremental_count: int,
+    batch_size: int,
     workdir: Path,
 ) -> dict[str, Any]:
     """Runs the RAG workflow across all available LangChain vector stores."""
@@ -293,6 +303,7 @@ def run_langchain_suite(
                 k=k,
                 incremental_count=incremental_count,
                 incremental_ids=inc_ids,
+                batch_size=batch_size,
             )
             backends.append(metrics)
         except Exception as exc:

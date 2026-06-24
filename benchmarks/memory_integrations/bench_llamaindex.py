@@ -63,6 +63,10 @@ class _LIDriver(StoreDriver):
     def query_one(self, qvec, k) -> list[str]:
         return list(self.store.query(_vsquery(qvec, k)).ids or [])
 
+    def query_batch(self, qvecs, k) -> list[list[str]]:
+        # LlamaIndex's vector-store query contract is single-query.
+        return [self.query_one(qv, k) for qv in qvecs]
+
     def incremental_add(self, doc_id, text, vector, metadata) -> None:
         self.store.add([_node(doc_id, text, vector, metadata)])
         self._persist_incremental()
@@ -207,6 +211,7 @@ class _QdrantDriver(_LIDriver):
 class _LodeDBDriver(_LIDriver):
     role = "lodedb"
     embeds_on_ingest = True
+    batch_path = "search_many_by_vector (GPU-resident scan on CUDA)"
 
     def __init__(self, name, base_dir, dim, *, model: str, device: str) -> None:
         super().__init__(name, base_dir, dim)
@@ -235,6 +240,10 @@ class _LodeDBDriver(_LIDriver):
     def query_one(self, qvec, k) -> list[str]:
         return [h.id for h in self._db.search_by_vector(qvec, k=k)]
 
+    def query_batch(self, qvecs, k) -> list[list[str]]:
+        # The batched path: on a CUDA host with cupy this runs the GPU-resident scan.
+        return [[h.id for h in hits] for hits in self._db.search_many_by_vector(qvecs, k=k)]
+
     def persist(self) -> None:
         self._db.persist()
 
@@ -258,6 +267,7 @@ def run_llamaindex_suite(
     device: str,
     k: int,
     incremental_count: int,
+    batch_size: int,
     workdir: Path,
 ) -> dict[str, Any]:
     """Runs the RAG workflow across all available LlamaIndex vector stores."""
@@ -294,6 +304,7 @@ def run_llamaindex_suite(
                 k=k,
                 incremental_count=incremental_count,
                 incremental_ids=inc_ids,
+                batch_size=batch_size,
             )
             backends.append(metrics)
         except Exception as exc:
