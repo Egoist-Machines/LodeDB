@@ -398,6 +398,16 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
 - **Durability is `fast` by default.** Commits are *atomic* but not fsync'd. Pass
   `durability="fsync"` (or `--durability fsync` / `LODEDB_DURABILITY=fsync`) to fsync each
   file and its directory on commit for power-loss durability, at some commit-throughput cost.
+- **Optional WAL commit mode for write-heavy single-process workloads.** The default publishes
+  a new crash-atomic, reader-visible generation on *every* mutation. Pass `commit_mode="wal"`
+  (or `LODEDB_COMMIT_MODE=wal`) to instead append one framed record per mutation to a
+  `<key>.wal` log and checkpoint into a generation periodically, which drops durable single-add
+  latency by ~10x into the sqlite-vec/qdrant range. The WAL is replayed crash-atomically on
+  reopen (a half-written trailing record is discarded), and a clean `close()`/`persist()` folds
+  it into a generation. It is **single-writer** and drops the lock-free view of *uncheckpointed*
+  writes (a concurrent `open_readonly` reader still sees the last committed generation, just not
+  the writer's in-flight WAL), so it is for single-process deployments. The default
+  `generation` mode and its MVCC readers are unchanged.
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Limitations

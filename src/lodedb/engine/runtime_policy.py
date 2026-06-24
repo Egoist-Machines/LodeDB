@@ -14,6 +14,21 @@ class TvimDeltaPersistencePolicy(StrEnum):
     AUTO = "auto"
 
 
+class CommitMode(StrEnum):
+    """Names the engine's per-mutation commit strategy.
+
+    ``generation`` (the default) publishes a new crash-atomic, MVCC-readable
+    generation on every mutation via the root-manifest swap. ``wal`` is the
+    opt-in single-writer path that appends one framed record to ``<key>.wal`` per
+    mutation and checkpoints into a generation periodically; it trades the
+    lock-free reader snapshot (unnecessary for single-process writers) for a much
+    cheaper per-write commit, and replays the WAL crash-atomically on open.
+    """
+
+    GENERATION = "generation"
+    WAL = "wal"
+
+
 class GpuDirectTurboVecPolicy(StrEnum):
     """Names GPU-resident exact batch serving policies for direct TurboVec."""
 
@@ -63,6 +78,30 @@ def tvim_delta_persistence_policy_from_env(
     return _parse_tvim_delta_persistence_policy(
         source.get("LODEDB_TVIM_DELTA_PERSISTENCE", "auto")
     )
+
+
+def commit_mode_from_env(env: Mapping[str, str] | None = None) -> CommitMode:
+    """Returns the per-mutation commit mode from the environment.
+
+    Defaults to ``generation`` (every mutation publishes a crash-atomic,
+    MVCC-readable generation — the historical behavior). ``LODEDB_COMMIT_MODE=wal``
+    opts a single-writer handle into the write-ahead-log commit path (one framed
+    append per mutation, periodic checkpoint into a generation, crash-atomic WAL
+    replay on open). Used only when no explicit ``commit_mode=`` is passed.
+    """
+
+    source = os.environ if env is None else env
+    return parse_commit_mode(source.get("LODEDB_COMMIT_MODE", "generation"))
+
+
+def parse_commit_mode(value: str | None) -> CommitMode:
+    """Parses and validates a commit-mode string (shared by the env + SDK paths)."""
+
+    try:
+        return CommitMode(str(value or "generation").strip().lower())
+    except ValueError as exc:
+        allowed = ", ".join(mode.value for mode in CommitMode)
+        raise ValueError(f"commit_mode must be one of: {allowed}") from exc
 
 
 def gpu_direct_turbovec_policy_from_env(

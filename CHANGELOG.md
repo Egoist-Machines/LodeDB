@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Optional write-ahead-log commit mode (`commit_mode="wal"`).** A single-process,
+  single-writer alternative to the default per-mutation generation publish, for write-heavy
+  workloads. Each `add`/`remove` appends one length-prefixed, CRC32-framed record to a
+  `<key>.wal` log (a single `write`, plus one `fsync` under `durability="fsync"`) and a full
+  generation is checkpointed only periodically, dropping durable single-add latency by ~10x into
+  the sqlite-vec/qdrant range. The WAL records logical mutations and is replayed on open by
+  re-driving the same engine verbs, so recovery is crash-atomic: a half-written trailing record
+  is discarded, an interior-corrupt record fails closed, and a clean `close()`/`persist()` folds
+  the WAL into a generation. Opt in per handle (`LodeDB(path, commit_mode="wal")`) or via
+  `LODEDB_COMMIT_MODE=wal`. The default `generation` mode, its on-disk layout, and its lock-free
+  MVCC readers are unchanged; a concurrent `open_readonly` reader still sees the last committed
+  generation (just not the writer's in-flight WAL).
 
 ## [0.2.1] - 2026-06-23
 

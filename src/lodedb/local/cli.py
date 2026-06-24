@@ -56,6 +56,13 @@ _DURABILITY_OPTION = typer.Option(
     help="fast (default: atomic but not power-loss durable) | fsync (fsync each "
     "file + dir on commit, durable but slower). Unset reads LODEDB_DURABILITY.",
 )
+_COMMIT_MODE_OPTION = typer.Option(
+    None,
+    "--commit-mode",
+    help="generation (default: publish a crash-atomic MVCC generation per commit) | "
+    "wal (append per mutation, checkpoint periodically; ~10x faster single adds, "
+    "single-writer). Unset reads LODEDB_COMMIT_MODE.",
+)
 
 
 @app.command()
@@ -128,6 +135,7 @@ def index(
     file: Path | None = _FILE_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
     durability: str | None = _DURABILITY_OPTION,
+    commit_mode: str | None = _COMMIT_MODE_OPTION,
 ) -> None:
     """Adds documents to the local index (positional texts or --file lines).
 
@@ -146,7 +154,12 @@ def index(
     if not docs:
         raise typer.BadParameter("provide document texts or --file")
     db = LodeDB(
-        path=path, model=model, device=device, store_text=store_text, durability=durability
+        path=path,
+        model=model,
+        device=device,
+        store_text=store_text,
+        durability=durability,
+        commit_mode=commit_mode,
     )
     ids = db.add_many([{"text": text} for text in docs])
     db.persist()
@@ -265,6 +278,7 @@ def serve(
     port: int = typer.Option(8088, "--port", help="Local port."),
     store_text: bool = _STORE_TEXT_OPTION,
     durability: str | None = _DURABILITY_OPTION,
+    commit_mode: str | None = _COMMIT_MODE_OPTION,
 ) -> None:
     """Serves the local index over a minimal loopback HTTP API (no auth).
 
@@ -288,6 +302,7 @@ def serve(
         port=port,
         store_text=store_text,
         durability=durability,
+        commit_mode=commit_mode,
     )
 
 

@@ -35,6 +35,7 @@ from lodedb.engine.core import (
 )
 from lodedb.engine.index import EngineError, LodeIndex
 from lodedb.engine.route_registry import default_route_registry, load_route_registry
+from lodedb.engine.runtime_policy import commit_mode_from_env, parse_commit_mode
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
@@ -153,6 +154,7 @@ class LodeDB:
         index_text: bool = False,
         read_only: bool = False,
         durability: str | None = None,
+        commit_mode: str | None = None,
         route_registry_path: str | Path | None = None,
         _embedding_backend: Any | None = None,
     ) -> None:
@@ -168,6 +170,20 @@ class LodeDB:
         ``durability`` is ``"fast"`` (default: atomic but not power-loss durable)
         or ``"fsync"`` (fsync each file + its directory on commit, trading commit
         throughput for power-loss durability). Unset reads ``LODEDB_DURABILITY``.
+        ``commit_mode`` selects how each mutation is committed and defaults to
+        ``"generation"`` (every change publishes a new crash-atomic, lock-free
+        MVCC-readable generation — the historical behavior, unchanged). Pass
+        ``"wal"`` to opt a single-writer handle into the write-ahead-log path:
+        each ``add``/``remove`` appends one framed record to a ``<key>.wal`` file
+        (a single ``write`` plus, in ``durability="fsync"``, one ``fsync``) and a
+        full generation is checkpointed only periodically, which makes the common
+        single-add commit far cheaper. The WAL is replayed crash-atomically on the
+        next open (a half-written trailing record is discarded), and a clean
+        ``close``/``persist`` folds it into a generation. WAL mode drops the
+        lock-free concurrent-reader snapshot that ``open_readonly`` relies on for
+        *uncheckpointed* writes — it is meant for single-process deployments —
+        but the on-disk generation a reader sees is always a consistent committed
+        one. Unset reads ``LODEDB_COMMIT_MODE``.
         ``store_text`` controls durable raw-text retention and defaults to
         ``True``: the original text passed to ``add``/``add_many`` is kept in a
         dedicated on-disk sidecar so ``get``/``get_text``/``get_texts`` can return
@@ -195,6 +211,11 @@ class LodeDB:
         # explicit arg wins; otherwise LODEDB_DURABILITY, else fast.
         fsync_on_commit = (
             durability_from_env() if durability is None else normalize_durability(durability)
+        )
+        # "generation" (per-mutation MVCC publish, default) vs "wal" (append +
+        # periodic checkpoint). Explicit arg wins; otherwise LODEDB_COMMIT_MODE.
+        resolved_commit_mode = (
+            commit_mode_from_env() if commit_mode is None else parse_commit_mode(commit_mode)
         )
         seq_len = int(max_seq_length) if max_seq_length is not None else 256
         # vector_dim set => a vector-only index (no embedding model): only the
@@ -272,6 +293,7 @@ class LodeDB:
             persistence_dir=self.path,
             read_only=self.read_only,
             fsync_on_commit=fsync_on_commit,
+            commit_mode=resolved_commit_mode,
             embedding_backend=backend,
             route_policy=route_policy,
         )
@@ -799,12 +821,18 @@ class LodeDB:
         """Flushes durable on-disk state and returns redacted storage stats.
 
         The engine already persists on every mutation; this is an explicit
-        durability + stats checkpoint. State is reloaded automatically on the
-        next ``LodeDB(path=...)`` open.
+        durability + stats checkpoint. In ``commit_mode="wal"`` it folds the
+        outstanding write-ahead log into a fresh committed generation (so the
+        on-disk base is fully up to date and the WAL is empty); in the default
+        ``generation`` mode there is nothing buffered, so it only reports stats.
+        State is reloaded automatically on the next ``LodeDB(path=...)`` open.
         """
 
-        # A no-op upsert path is avoided; instead surface the engine's current
-        # redacted stats, which include persisted byte accounting.
+        if not self.read_only and self._engine is not None:
+            # Fold any WAL backlog into a generation; a no-op in generation mode.
+            self._engine.checkpoint()
+        # Surface the engine's current redacted stats, which include persisted
+        # byte accounting.
         return self._index.stats()
 
     def count(self, *, filter: Mapping[str, Any] | None = None) -> int:

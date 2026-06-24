@@ -62,9 +62,11 @@ from lodedb.engine.route_registry import (
     RouteRegistry,
 )
 from lodedb.engine.runtime_policy import (
+    CommitMode,
     GpuDirectTurboVecPolicy,
     MpsDirectTurboVecPolicy,
     TvimDeltaPersistencePolicy,
+    commit_mode_from_env,
     gpu_direct_turbovec_max_batch_from_env,
     gpu_direct_turbovec_policy_from_env,
     gpu_direct_turbovec_should_use,
@@ -87,6 +89,12 @@ from lodedb.engine.turbovec_index import (
     require_turbovec_available,
     stable_uint64_ids_for_chunk_ids,
     turbovec_capability,
+)
+from lodedb.engine.wal_store import (
+    DEFAULT_CHECKPOINT_BYTES,
+    DEFAULT_CHECKPOINT_OPS,
+    WalStore,
+    wal_path,
 )
 
 # The optional CUDA path (`gpu_turbovec`) is imported lazily inside the methods
@@ -592,6 +600,7 @@ class LodeEngine:
         persistence_dir: str | Path | None = None,
         read_only: bool = False,
         fsync_on_commit: bool = False,
+        commit_mode: CommitMode | None = None,
         embedding_backend: EngineEmbeddingBackend | None = None,
         route_policy: EngineRoutePolicy | None = None,
         gpu_memory_budget_bytes: int | None = None,
@@ -621,6 +630,27 @@ class LodeEngine:
         # fsync each published file + its directory on commit (power-loss
         # durability) vs. the default atomic-but-fast rename.
         self._fsync_on_commit = bool(fsync_on_commit)
+        # Per-mutation commit strategy. ``generation`` (default) publishes a
+        # crash-atomic MVCC generation on every mutation; ``wal`` appends one
+        # framed record to ``<key>.wal`` per mutation and checkpoints into a
+        # generation periodically (opt-in, single-writer; see wal_store).
+        self._commit_mode = (
+            commit_mode if commit_mode is not None else commit_mode_from_env()
+        )
+        # Open WAL stores per index key (writer handles only). Populated lazily on
+        # the first WAL append/load; never created for a read-only handle or in
+        # generation mode.
+        self._wal_stores: dict[str, WalStore] = {}
+        # Ops/bytes thresholds that trigger a WAL -> generation checkpoint.
+        self._wal_checkpoint_ops = DEFAULT_CHECKPOINT_OPS
+        self._wal_checkpoint_bytes = DEFAULT_CHECKPOINT_BYTES
+        # Set while replaying WAL records on open so the replayed mutations
+        # re-drive the engine verbs without re-appending to the WAL.
+        self._wal_replaying = False
+        # The logical mutation a verb stages for the next WAL append, keyed by
+        # index key: ``(op, payload)``. Consumed by ``_append_wal_record`` so the
+        # single ``_persist_state`` funnel records the right verb in WAL mode.
+        self._pending_wal_records: dict[str, tuple[str, dict[str, Any]]] = {}
         # Single-writer lock timeout (seconds), read once at construction.
         self._persist_lock_timeout = lodedb_lock_timeout_from_env()
         self.embedding_backend = embedding_backend
@@ -732,6 +762,21 @@ class LodeEngine:
                     self._release_writer_lock()
                     raise
 
+    @_synchronized
+    def checkpoint(self) -> None:
+        """Folds any outstanding WAL into a committed generation (no-op otherwise).
+
+        The explicit durability checkpoint behind the SDK ``persist()`` in WAL
+        commit mode: it commits a fresh generation for every index that has
+        WAL-logged-but-not-yet-checkpointed mutations and truncates the WAL. In
+        the default ``generation`` mode there is nothing buffered, so it does
+        nothing. A read-only handle never checkpoints.
+        """
+
+        if self._read_only:
+            return
+        self._checkpoint_all_wals()
+
     def _acquire_writer_lock(self) -> None:
         """Takes the exclusive single-writer lock for this engine's directory."""
 
@@ -758,9 +803,21 @@ class LodeEngine:
         lock.release()
 
     def close(self) -> None:
-        """Releases the single-writer lock; the engine must not persist afterwards."""
+        """Checkpoints any open WAL, then releases the single-writer lock.
 
-        self._release_writer_lock()
+        In ``wal`` commit mode a clean close folds the outstanding WAL into a
+        fresh committed generation and truncates it, so the next open finds an
+        up-to-date base and an empty WAL (replay only ever has to recover an
+        *unclean* shutdown). A best-effort guard keeps a checkpoint failure from
+        leaking the writer lock — the WAL is still durable and will replay on the
+        next open. After this the engine must not persist again.
+        """
+
+        try:
+            if not self._read_only:
+                self._checkpoint_all_wals()
+        finally:
+            self._release_writer_lock()
 
     def _require_writable(self) -> None:
         """Raises if this engine was opened read-only (mutations are forbidden).
@@ -1046,6 +1103,9 @@ class LodeEngine:
             return result
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
+        self._stage_wal_record(
+            context, state, "upsert_documents", _documents_wal_payload(documents)
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1085,6 +1145,9 @@ class LodeEngine:
             return result
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
+        self._stage_wal_record(
+            context, state, "upsert_documents", _documents_wal_payload(documents)
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1130,6 +1193,7 @@ class LodeEngine:
         if isinstance(result, EngineResponse):
             return result
         self._capture_vector_document_text(state, vectors)
+        self._stage_wal_record(context, state, "upsert_vectors", _vectors_wal_payload(vectors))
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1218,6 +1282,21 @@ class LodeEngine:
             # delta that _delta_append_ok requires), so _persist_state appends an
             # O(changed) journal delta instead of rewriting the full O(corpus) base.
             self._sync_direct_turbovec_index(state)
+            self._stage_wal_record(
+                context,
+                state,
+                "update_document_payload",
+                {
+                    "document_id": document_id,
+                    "metadata": (
+                        None
+                        if metadata is None
+                        else {str(k): str(v) for k, v in dict(metadata).items()}
+                    ),
+                    "text": (None if text is None else str(text)),
+                    "clear_text": bool(clear_text),
+                },
+            )
             self._persist_state(state)
 
         return EngineResponse(
@@ -1760,6 +1839,9 @@ class LodeEngine:
                 "document_count": len(unique_document_ids),
                 "deleted_chunks": deleted_chunks,
             },
+        )
+        self._stage_wal_record(
+            context, state, "delete_documents", {"document_ids": list(unique_document_ids)}
         )
         self._persist_state(state)
         return EngineResponse(
@@ -3839,7 +3921,224 @@ class LodeEngine:
         self._gpu_direct_turbovec_sessions.pop(client_id_hash, None)
         self._mps_direct_turbovec_sessions.pop(client_id_hash, None)
 
+    # -- write-ahead log (opt-in commit_mode="wal") -------------------------
+
+    def _stage_wal_record(
+        self,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        op: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Stages the logical mutation a verb will append to the WAL on persist.
+
+        A no-op outside WAL mode (so the verbs stay branch-light) and while
+        replaying. The record envelope captures the live ``client_id``/``index_id``
+        so replay resolves the same index the live call did (the persisted state
+        snapshot drops the raw ``client_id``, so it cannot be recovered from the
+        loaded state alone). ``_persist_state`` then appends the staged record
+        instead of publishing a generation.
+        """
+
+        if self._commit_mode != CommitMode.WAL or self._wal_replaying:
+            return
+        envelope = {
+            "client_id": context.client_id,
+            "index_id": state.index_id,
+            **payload,
+        }
+        self._pending_wal_records[state.index_key] = (op, envelope)
+
+    def _wal_store_for(self, index_key: str) -> WalStore:
+        """Returns (opening lazily) the WAL store for one index key."""
+
+        store = self._wal_stores.get(index_key)
+        if store is None:
+            store = WalStore(
+                wal_path(self.persistence_dir, index_key), fsync=self._fsync_on_commit
+            )
+            self._wal_stores[index_key] = store
+        return store
+
+    def _append_wal_record(self, state: ClientIndexState) -> None:
+        """Appends the staged logical mutation to the WAL and maybe checkpoints.
+
+        The in-memory index was already synced before this runs, so the record
+        only has to make the mutation recoverable. After the append, if the WAL
+        backlog crosses the checkpoint threshold the WAL is folded into a fresh
+        committed generation and truncated, bounding replay time and file size.
+        """
+
+        record = self._pending_wal_records.pop(state.index_key, None)
+        if record is None:
+            # No logical mutation was staged (e.g. an internal persist with no
+            # verb). Fall back to a generation publish so nothing is lost.
+            self._persist_generation(state)
+            return
+        self.persistence_dir.mkdir(parents=True, exist_ok=True)
+        op, payload = record
+        store = self._wal_store_for(state.index_key)
+        store.append(op, payload)
+        if store.should_checkpoint(
+            checkpoint_ops=self._wal_checkpoint_ops,
+            checkpoint_bytes=self._wal_checkpoint_bytes,
+        ):
+            self._checkpoint_wal(state)
+
+    def _checkpoint_wal(self, state: ClientIndexState) -> None:
+        """Folds the WAL into a fresh committed generation, then truncates it.
+
+        The generation is committed via the atomic root-manifest swap *before*
+        the WAL is truncated, so a crash between the two simply replays a few
+        already-applied (idempotent) records on the next open rather than losing
+        them. Marks delta-append ineligible so the checkpoint always writes a
+        fresh base epoch (the live deltas may not reflect every WAL mutation).
+        """
+
+        store = self._wal_stores.get(state.index_key)
+        if store is None or store.op_count == 0:
+            return
+        # Drop any pending delta accumulators: a WAL run may have advanced the
+        # in-memory index past what the live base+deltas describe, so the
+        # checkpoint must write a self-contained fresh base, not append a delta.
+        self._pending_state_journal_documents.pop(state.index_key, None)
+        self._pending_tvim_deltas.pop(state.index_key, None)
+        self._base_epochs.pop(state.index_key, None)
+        self._persist_generation(state)
+        store.truncate()
+
+    def _checkpoint_all_wals(self) -> None:
+        """Checkpoints every open WAL into a generation (used by persist/close)."""
+
+        if self._commit_mode != CommitMode.WAL:
+            return
+        for index_key, store in list(self._wal_stores.items()):
+            if store.op_count == 0:
+                continue
+            state = self._indexes.get(index_key)
+            if state is not None:
+                self._checkpoint_wal(state)
+
+    def _replay_wal(self, state: ClientIndexState) -> dict[str, float]:
+        """Replays this index's intact WAL records onto the loaded generation.
+
+        Each record re-invokes the public engine verb that produced it, so the
+        recovered state is rebuilt by the identical ingest/sync path — never a
+        parallel decoder. A torn trailing record (writer crashed mid-append) was
+        already dropped by the store, so replay applies exactly the mutations
+        that were durably logged. Runs under ``_wal_replaying`` so the replayed
+        verbs do not re-append to (or checkpoint) the WAL.
+        """
+
+        store = self._wal_store_for(state.index_key)
+        records = store.read_records()
+        if not records:
+            return {"wal_records_replayed": 0.0}
+        started = perf_counter()
+        self._wal_replaying = True
+        try:
+            for record in records:
+                self._apply_wal_record(state, record.op, record.payload)
+        finally:
+            self._wal_replaying = False
+        return {
+            "wal_records_replayed": float(len(records)),
+            "wal_replay_ms": float((perf_counter() - started) * 1000.0),
+        }
+
+    def _apply_wal_record(
+        self,
+        state: ClientIndexState,
+        op: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Re-drives one logical WAL mutation through its public engine verb.
+
+        The record envelope carries the live ``client_id``/``index_id`` so the
+        re-invoked verb resolves the same index the original call did (replay is
+        otherwise indistinguishable from a fresh public call, which is what keeps
+        the recovered state byte-identical to what produced the log).
+        """
+
+        context = EngineRequestContext(
+            client_id=str(payload.get("client_id", state.client_id)),
+            now=datetime.now(tz=UTC),
+        )
+        index_id = str(payload.get("index_id", state.index_id))
+        if op == "upsert_documents":
+            documents = tuple(
+                EngineDocument(
+                    document_id=str(item["document_id"]),
+                    text=str(item["text"]),
+                    metadata={str(k): str(v) for k, v in dict(item.get("metadata", {})).items()},
+                )
+                for item in payload.get("documents", [])
+            )
+            response = self.upsert_documents(
+                context=context, documents=documents, index_id=index_id
+            )
+        elif op == "upsert_vectors":
+            vectors = tuple(
+                EngineVectorDocument(
+                    document_id=str(item["document_id"]),
+                    vector=tuple(float(value) for value in item["vector"]),
+                    metadata={str(k): str(v) for k, v in dict(item.get("metadata", {})).items()},
+                    text=(None if item.get("text") is None else str(item["text"])),
+                )
+                for item in payload.get("vectors", [])
+            )
+            response = self.upsert_vectors(context=context, vectors=vectors, index_id=index_id)
+        elif op == "delete_documents":
+            document_ids = tuple(str(value) for value in payload.get("document_ids", []))
+            response = self.delete_documents(
+                context=context, document_ids=document_ids, index_id=index_id
+            )
+        elif op == "update_document_payload":
+            response = self.update_document_payload(
+                context=context,
+                document_id=str(payload["document_id"]),
+                metadata=(
+                    None
+                    if payload.get("metadata") is None
+                    else {str(k): str(v) for k, v in dict(payload["metadata"]).items()}
+                ),
+                text=(None if payload.get("text") is None else str(payload["text"])),
+                clear_text=bool(payload.get("clear_text", False)),
+                index_id=index_id,
+            )
+        else:
+            raise RuntimeError(f"unknown WAL record op during replay: {op!r}")
+        if isinstance(response, EngineResponse) and int(response.status_code) >= 400:
+            raise RuntimeError(
+                f"WAL replay of {op!r} failed: {response.body.get('error', 'engine error')}"
+            )
+
     def _persist_state(self, state: ClientIndexState) -> None:
+        """Persists one mutation, dispatching on the configured commit mode.
+
+        In the default ``generation`` mode this publishes a new crash-atomic,
+        MVCC-readable generation (see :meth:`_persist_generation`). In ``wal``
+        mode it instead appends the in-flight logical mutation to the index WAL
+        (one framed ``write`` + an optional fsync) and checkpoints into a
+        generation only when the backlog crosses a threshold — so the common
+        single-add commit avoids the multi-file generation publish entirely. WAL
+        replay on open re-drives the verb, so ``_persist_state`` is a no-op while
+        replaying (the in-memory state is already being rebuilt).
+        """
+
+        if self.persistence_dir is None:
+            return
+        self._require_writable()
+        if self._commit_mode == CommitMode.WAL and not self._wal_replaying:
+            self._append_wal_record(state)
+            return
+        if self._wal_replaying:
+            # Replaying a WAL record only rebuilds in-memory state; the durable
+            # base is the committed generation already on disk plus the WAL itself.
+            return
+        self._persist_generation(state)
+
+    def _persist_generation(self, state: ClientIndexState) -> None:
         """Commits one index generation atomically via its root commit manifest.
 
         Each commit writes its durable artifacts under the per-index
@@ -4332,6 +4631,53 @@ class LodeEngine:
             if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
                 continue
             self._load_legacy_index(path)
+        # WAL recovery (writer handles only): each index loaded its last committed
+        # generation above; now replay any intact WAL records on top so a
+        # WAL-committed-but-not-yet-checkpointed mutation survives the reopen. A
+        # torn trailing record (writer crashed mid-append) was dropped by the
+        # store, so this applies exactly the durably-logged mutations. This runs
+        # regardless of the configured commit mode: a leftover <key>.wal means a
+        # prior WAL-mode writer crashed before checkpointing, so those durably
+        # logged mutations are recovered even when this handle opened in the
+        # default generation mode (otherwise they would be silently lost). With no
+        # WAL present (the common case) it is one cheap stat per index and a no-op.
+        # Read-only handles never replay (the WAL is the writer's private log).
+        if not self._read_only:
+            self._recover_wals()
+
+    def _recover_wals(self) -> None:
+        """Replays each loaded index's leftover WAL onto its committed generation.
+
+        After replay the in-memory state reflects the committed generation plus
+        every durably-logged WAL mutation. In ``wal`` commit mode a WAL still
+        under the checkpoint threshold is left in place (the cheap append path)
+        and folded later at the next threshold/persist/close, while an oversized
+        one is folded now so the next open replays less. In the default
+        ``generation`` mode a leftover WAL only exists because a prior WAL-mode
+        writer crashed before checkpointing, so it is always folded into a fresh
+        generation and truncated here: the data is recovered without leaving a log
+        the generation path would never consult.
+        """
+
+        for index_key in list(self._indexes):
+            state = self._indexes.get(index_key)
+            if state is None:
+                continue
+            store = self._wal_store_for(index_key)
+            if not store.exists():
+                continue
+            stats = self._replay_wal(state)
+            if not stats.get("wal_records_replayed"):
+                continue
+            self._state_load_telemetry.setdefault(index_key, {}).update(stats)
+            # In generation mode, absorb the recovered WAL into a generation so the
+            # default commit path is not left with a log it never reads. In WAL
+            # mode, only fold an oversized WAL; small ones stay on the append path.
+            if self._commit_mode != CommitMode.WAL or store.should_checkpoint(
+                checkpoint_ops=self._wal_checkpoint_ops,
+                checkpoint_bytes=self._wal_checkpoint_bytes,
+            ):
+                self._checkpoint_wal(state)
 
     def _load_index_from_commit(self, key: str, body: dict[str, Any]) -> None:
         """Loads one index from the consistent generation named by its root manifest."""
@@ -5331,6 +5677,48 @@ def _document_ingest_response_payload(
     if "embedding_batch_size" in result:
         payload["embedding_batch_size"] = int(result["embedding_batch_size"])
     return payload
+
+
+def _documents_wal_payload(documents: tuple[EngineDocument, ...]) -> dict[str, Any]:
+    """Frames an ``upsert``/``build`` document batch as a WAL record payload.
+
+    Captures exactly the public-call inputs (id, text, redacted metadata) so
+    replay re-embeds and re-indexes through the identical ingest path. Text is
+    included because the WAL is the writer's own durable log; it is never read by
+    a redacted/telemetry path and never leaves the process.
+    """
+
+    return {
+        "documents": [
+            {
+                "document_id": document.document_id,
+                "text": document.text,
+                "metadata": dict(document.metadata),
+            }
+            for document in documents
+        ]
+    }
+
+
+def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str, Any]:
+    """Frames a vector-in upsert batch as a WAL record payload.
+
+    Stores each vector verbatim (already L2-normalized at the SDK boundary) plus
+    redacted metadata and the optional retained text, so replay reproduces the
+    same encoded rows the live commit did.
+    """
+
+    return {
+        "vectors": [
+            {
+                "document_id": vector.document_id,
+                "vector": [float(value) for value in vector.vector],
+                "metadata": dict(vector.metadata),
+                "text": vector.text,
+            }
+            for vector in vectors
+        ]
+    }
 
 
 def _embedding_batch_size_for_backend(backend: EngineEmbeddingBackend) -> int:

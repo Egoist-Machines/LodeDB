@@ -111,6 +111,7 @@ def serve_local(
     port: int = 8088,
     store_text: bool = True,
     durability: str | None = None,
+    commit_mode: str | None = None,
 ) -> None:
     """Opens an :class:`LodeDB` and serves it on a loopback HTTP loop (blocking).
 
@@ -118,13 +119,20 @@ def serve_local(
     original text by id; pass ``store_text=False`` to opt out. ``durability``
     (``"fast"``/``"fsync"``) controls power-loss durability of each commit; this
     is the writer that holds the path, so its requests are serialized by the
-    engine's in-process lock.
+    engine's in-process lock. ``commit_mode`` (``"generation"``/``"wal"``)
+    selects the per-mutation commit path; ``"wal"`` checkpoints the log into a
+    generation on shutdown via the ``db.close()`` below.
     """
 
     if not is_private_bind_host(host):
         raise ValueError("LodeDB local server host must be loopback or private network")
     db = LodeDB(
-        path=path, model=model, device=device, store_text=store_text, durability=durability
+        path=path,
+        model=model,
+        device=device,
+        store_text=store_text,
+        durability=durability,
+        commit_mode=commit_mode,
     )
     handler = build_local_handler(db)
     server = ThreadingHTTPServer((host, port), handler)
