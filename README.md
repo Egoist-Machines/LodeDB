@@ -1,5 +1,5 @@
 <h1 align="center">LodeDB</h1>
-<p align="center">🔥 the <b>fastest</b> and <i>most compact</i> embedded vector database in the world 🌍</p>
+<p align="center">🔥 the <b>fastest</b> and <i>most compact</i> multimodal embedded vector database in the world 🌍</p>
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
@@ -51,6 +51,9 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
   `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
+- **Multimodal**: index images and text in one shared CLIP space (`model="clip"`) for
+  cross-modal search, or bring your own vectors from any model.
+  [How it works](#multimodal--bring-your-own-vectors).
 - **Batteries included**: a `lodedb` CLI, a loopback/private-network dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
