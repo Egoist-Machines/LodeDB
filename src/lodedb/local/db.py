@@ -37,7 +37,7 @@ from lodedb.engine.core import (
 from lodedb.engine.embedding_backends import EngineEmbeddingBackend
 from lodedb.engine.index import EngineError, LodeIndex
 from lodedb.engine.route_registry import default_route_registry, load_route_registry
-from lodedb.engine.runtime_policy import CommitMode, commit_mode_from_env, parse_commit_mode
+from lodedb.engine.runtime_policy import commit_mode_from_env, parse_commit_mode
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
@@ -255,21 +255,6 @@ class LodeDB:
         # vector-in verbs work, at the caller's chosen dim. Otherwise a preset
         # index that embeds text internally.
         self.vector_only = vector_dim is not None
-        # WAL replay of a text document re-embeds it from the logged body, so a
-        # text-embedding index that retains no raw text (store_text=False) cannot use
-        # the WAL without writing raw text to disk. Generation mode persists the
-        # compact codes directly and needs no raw text, so fall back to it for that
-        # combination; reject an explicit commit_mode="wal" that cannot be honored.
-        # (A vector-only index has no text-in path, so it keeps the WAL: its optional
-        # vector-in text is dropped from the WAL payload when store_text is off.)
-        if not self.vector_only and not self.store_text and resolved_commit_mode == CommitMode.WAL:
-            if commit_mode is not None and parse_commit_mode(commit_mode) == CommitMode.WAL:
-                raise ValueError(
-                    "commit_mode='wal' cannot be combined with store_text=False on a "
-                    "text-embedding index: WAL replay would need the raw text. Use "
-                    "commit_mode='generation', or store_text=True."
-                )
-            resolved_commit_mode = CommitMode.GENERATION
         self.commit_mode = resolved_commit_mode
         self.preset: LocalModelPreset | None
         if embedder is not None and self.vector_only:

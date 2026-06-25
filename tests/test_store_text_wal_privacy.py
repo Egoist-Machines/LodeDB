@@ -8,8 +8,6 @@ store_text=False, across the vector-in, image, and text-in paths.
 
 from __future__ import annotations
 
-import pytest
-
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend, hash_embedding
 
@@ -49,11 +47,11 @@ def test_add_vectors_caption_no_leak_under_wal(tmp_path):
 
 
 def test_add_image_caption_no_leak(tmp_path):
-    # A text-capable (embedder) index with store_text=False resolves to generation,
-    # which persists compact codes with no raw text.
+    # An image add keeps the WAL; the caption is dropped from the vector WAL payload
+    # when store_text is off, so no raw text reaches disk.
     db = LodeDB(path=tmp_path, embedder=_FakeClip(), store_text=False)
     db.add_image("photo-1", id="a", text=SECRET.decode())
-    assert db.commit_mode == "generation"
+    assert db.commit_mode == "wal"
     assert _files_containing(tmp_path, SECRET) == []
     db.close()
 
@@ -65,21 +63,48 @@ def test_add_text_in_no_leak(tmp_path):
         store_text=False,
         _embedding_backend=HashEmbeddingBackend(native_dim=384),
     )
-    assert db.commit_mode == "generation"  # text-in + store_text=False -> generation
+    assert db.commit_mode == "wal"  # text-in + store_text=False keeps the WAL now
     db.add(SECRET.decode(), id="d")
-    assert _files_containing(tmp_path, SECRET) == []
+    assert _files_containing(tmp_path, SECRET) == []  # WAL logs embeddings, not text
     db.close()
 
 
-def test_explicit_wal_with_store_text_false_text_index_rejected(tmp_path):
-    with pytest.raises(ValueError, match="store_text=False"):
-        LodeDB(
-            path=tmp_path,
-            model="minilm",
-            store_text=False,
-            commit_mode="wal",
-            _embedding_backend=HashEmbeddingBackend(native_dim=384),
-        )
+def test_store_text_false_text_recovers_from_wal_without_raw_text(tmp_path):
+    # store_text=False + WAL text-in: the WAL logs the chunk embeddings, not the
+    # body. A crash leaves the WAL on disk; reopening replays it (no re-embedding)
+    # to the identical index, and no raw text ever reaches disk.
+    secret_doc = "alpha " + SECRET.decode() + " beta gamma delta " * 80  # multi-chunk
+    db = LodeDB(
+        path=tmp_path,
+        model="minilm",
+        store_text=False,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    assert db.commit_mode == "wal"
+    db.add(secret_doc, id="long")
+    db.add("a short note", id="short")
+    live = [(h.id, round(h.score, 6)) for h in db.search("alpha beta", k=2)]
+    assert db.get_document("long")["chunk_count"] >= 2  # exercises the multi-chunk delta
+    assert _files_containing(tmp_path, SECRET) == []
+
+    # Crash: leave the WAL on disk, release the lock so the test can reopen.
+    db._engine._release_writer_lock()
+    del db
+
+    recovered = LodeDB(
+        path=tmp_path,
+        model="minilm",
+        store_text=False,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    try:
+        assert recovered.count() == 2
+        assert recovered.get_document("long")["chunk_count"] >= 2
+        # Replay rebuilt the identical index from the logged embeddings.
+        assert [(h.id, round(h.score, 6)) for h in recovered.search("alpha beta", k=2)] == live
+        assert _files_containing(tmp_path, SECRET) == []  # still no raw text after replay
+    finally:
+        recovered.close()
 
 
 def test_store_text_true_retains_caption_under_wal(tmp_path):

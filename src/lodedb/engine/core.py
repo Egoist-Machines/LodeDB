@@ -1093,34 +1093,36 @@ class LodeEngine:
             },
         )
 
-    def _reject_text_in_wal_without_retention(
-        self, context: EngineRequestContext, operation: str
-    ) -> EngineResponse | None:
-        """Rejects text-in ingestion that WAL cannot replay without persisting raw text.
+    def _stage_document_ingest_wal_record(
+        self,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        documents: tuple[EngineDocument, ...],
+        *,
+        changeset: _TurboVecChangeset | None,
+    ) -> None:
+        """Stages the WAL record for a text-in ingest, raw-text-aware.
 
-        WAL replay re-embeds a text document from its logged body, so the only way
-        to keep the log replayable under ``store_text=False`` would be to write the
-        raw text into the WAL, which violates the no-raw-text-on-disk contract.
-        Generation mode persists the compact codes directly and needs no raw text,
-        so it is the supported durability mode for this combination (the local SDK
-        selects it automatically; this guards direct engine callers). Never fires
-        during replay, where the in-memory state is simply being rebuilt.
+        With raw-text storage on (``store_text=True``), it logs the documents' text
+        and lets replay re-embed them (the text is retained on disk anyway). With it
+        off, it logs the chunk-level embedding delta instead (``apply_embedded_documents``)
+        so the WAL carries no raw text and replay rebuilds the rows from the
+        embeddings without re-embedding. On the cold build path there is no prior
+        chunk to reuse, so the whole current chunk set is the delta.
         """
 
-        if (
-            self._commit_mode == CommitMode.WAL
-            and not self.raw_text_storage_enabled
-            and not self._wal_replaying
-        ):
-            return self._error(
-                400,
-                "commit_mode='wal' cannot ingest text documents when raw-text storage is "
-                "disabled (store_text=False): WAL replay would need the raw text. Use "
-                "commit_mode='generation', enable store_text, or use the vector-in API.",
-                operation,
-                context.client_id,
+        if self.raw_text_storage_enabled:
+            self._stage_wal_record(
+                context, state, "upsert_documents", _documents_wal_payload(documents)
             )
-        return None
+            return
+        effective = changeset or _TurboVecChangeset(added_chunks=tuple(state.chunks.values()))
+        self._stage_wal_record(
+            context,
+            state,
+            "apply_embedded_documents",
+            _embedded_documents_wal_payload(state, documents, effective),
+        )
 
     @_synchronized
     def build_documents(
@@ -1136,9 +1138,6 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="build_documents")
         if isinstance(state, EngineResponse):
             return state
-        guard = self._reject_text_in_wal_without_retention(context, "build_documents")
-        if guard is not None:
-            return guard
         if state.chunks or state.document_hashes:
             return self._error(
                 409,
@@ -1156,9 +1155,7 @@ class LodeEngine:
             return result
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
-        self._stage_wal_record(
-            context, state, "upsert_documents", _documents_wal_payload(documents)
-        )
+        self._stage_document_ingest_wal_record(context, state, documents, changeset=None)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1187,9 +1184,6 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_documents")
         if isinstance(state, EngineResponse):
             return state
-        guard = self._reject_text_in_wal_without_retention(context, "upsert_documents")
-        if guard is not None:
-            return guard
         ingest = self._ingest_documents(
             context=context,
             state=state,
@@ -1202,9 +1196,7 @@ class LodeEngine:
         result, changeset = ingest
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
-        self._stage_wal_record(
-            context, state, "upsert_documents", _documents_wal_payload(documents)
-        )
+        self._stage_document_ingest_wal_record(context, state, documents, changeset=changeset)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -4359,12 +4351,81 @@ class LodeEngine:
                 clear_text=bool(payload.get("clear_text", False)),
                 index_id=index_id,
             )
+        elif op == "apply_embedded_documents":
+            # Raw-text-free text-in replay: rebuild rows from logged embeddings.
+            self._apply_embedded_documents(context=context, state=state, payload=payload)
+            response = None
         else:
             raise RuntimeError(f"unknown WAL record op during replay: {op!r}")
         if isinstance(response, EngineResponse) and int(response.status_code) >= 400:
             raise RuntimeError(
                 f"WAL replay of {op!r} failed: {response.body.get('error', 'engine error')}"
             )
+
+    def _apply_embedded_documents(
+        self,
+        *,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        payload: dict[str, Any],
+    ) -> None:
+        """Replays a raw-text-free text-in upsert from logged chunk embeddings.
+
+        The counterpart to the ``apply_embedded_documents`` WAL record written when
+        raw-text storage is off: it rebuilds the affected documents' chunks from the
+        logged embeddings — no raw text, no re-embedding — on top of the committed
+        base, then runs the shared TurboVec sync via :meth:`_finalize_document_ingest`.
+        Mirrors the apply half of :meth:`_ingest_vectors` for the recorded
+        chunk-level delta; reused chunks already live in the base, so only the added
+        chunks carry embeddings.
+        """
+
+        added_chunks: list[IndexedChunk] = []
+        for item in payload.get("added_chunks", []):
+            chunk = IndexedChunk(
+                chunk_id=str(item["chunk_id"]),
+                document_id=str(item["document_id"]),
+                content_hash=str(item["content_hash"]),
+                embedding=tuple(float(value) for value in item["embedding"]),
+            )
+            state.chunks[chunk.chunk_id] = chunk
+            added_chunks.append(chunk)
+        removed_chunk_ids = [str(value) for value in payload.get("removed_chunk_ids", [])]
+        for chunk_id in removed_chunk_ids:
+            state.chunks.pop(chunk_id, None)
+        document_ids: list[str] = []
+        for item in payload.get("documents", []):
+            document_id = str(item["document_id"])
+            document_ids.append(document_id)
+            state.document_chunk_ids[document_id] = tuple(
+                str(value) for value in item.get("chunk_ids", [])
+            )
+            state.document_hashes[document_id] = str(item["content_hash"])
+            state.document_metadata[document_id] = {
+                str(key): str(value) for key, value in dict(item.get("metadata", {})).items()
+            }
+        self._record_pending_state_journal_documents(
+            state, upserted_document_ids=tuple(document_ids)
+        )
+        result: dict[str, float | int] = {
+            "document_count": len(document_ids),
+            "embedded_chunks": len(added_chunks),
+            "reused_chunks": 0,
+            "deleted_chunks": len(removed_chunk_ids),
+            "embedding_time_ms": 0.0,
+            "embedding_batch_size": 0,
+        }
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        self._finalize_document_ingest(
+            context=context,
+            state=state,
+            result=result,
+            event_name="documents_upserted",
+            changeset=changeset,
+        )
 
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
@@ -5965,6 +6026,45 @@ def _documents_wal_payload(documents: tuple[EngineDocument, ...]) -> dict[str, A
             }
             for document in documents
         ]
+    }
+
+
+def _embedded_documents_wal_payload(
+    state: ClientIndexState,
+    documents: tuple[EngineDocument, ...],
+    changeset: _TurboVecChangeset,
+) -> dict[str, Any]:
+    """Frames a text-in upsert as embeddings (not raw text) for WAL replay.
+
+    Used when raw-text storage is off (``store_text=False``): instead of the raw
+    body, it logs the chunk-level delta the ingest produced — the added chunks with
+    their embeddings and the removed chunk ids — plus each affected document's final
+    chunk list, content hash, and redacted metadata. Replay (:meth:`_apply_embedded_documents`)
+    rebuilds the rows from the embeddings on top of the committed base, so the WAL
+    carries no raw text and replay never re-embeds. Chunks reused from a prior
+    commit already live in the committed base, so the delta need not re-log them.
+    """
+
+    return {
+        "documents": [
+            {
+                "document_id": document.document_id,
+                "content_hash": state.document_hashes.get(document.document_id, ""),
+                "metadata": dict(state.document_metadata.get(document.document_id, {})),
+                "chunk_ids": list(state.document_chunk_ids.get(document.document_id, ())),
+            }
+            for document in documents
+        ],
+        "added_chunks": [
+            {
+                "chunk_id": chunk.chunk_id,
+                "document_id": chunk.document_id,
+                "content_hash": chunk.content_hash,
+                "embedding": [float(value) for value in chunk.embedding],
+            }
+            for chunk in changeset.added_chunks
+        ],
+        "removed_chunk_ids": list(changeset.removed_chunk_ids),
     }
 
 
