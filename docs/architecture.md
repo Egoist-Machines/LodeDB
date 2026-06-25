@@ -142,9 +142,13 @@ keeps a streaming top-k on device. `LodeDB.search_many(...)` is the public SDK p
 hit this route. Single queries, missing GPU dependencies, memory rejection, and explicit
 `off` policy use the compact CPU SIMD scan as source of truth/fallback.
 
-On Apple Silicon, the default ONNX embedding runs on the CPU (or the Core ML execution provider
-when the onnxruntime wheel includes it); the sentence-transformers fallback uses MPS. Vector search
-on Mac defaults to the CPU TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
+On Apple Silicon, the default ONNX embedding runs on the **CPU** execution provider; the
+sentence-transformers fallback uses MPS. An opt-in ONNX Core ML provider exists
+(`LODEDB_ONNX_COREML=1`) but stays off by default for the same reason the MPS vector scan does:
+on the dynamic-shape preset graphs it fragments into many Core ML/CPU partitions and measured
+slower than the CPU provider for single-query embedding (about 16 ms vs 3 ms on an M-series CPU),
+so it should be re-measured (ideally with a fixed-shape export) before any default change. Vector
+search on Mac defaults to the CPU TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
 batched `search_many` via `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`, but it stays off by default:
 on the measured M1 it was slower than NEON at every batch size, and newer Apple GPUs should be
 re-measured before any default change.
