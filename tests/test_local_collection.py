@@ -259,3 +259,44 @@ def test_collection_space_rejects_wrong_embedder_identity(tmp_path):
     with pytest.raises(RuntimeError, match="does not match"):
         reopened.space("notes", embedder=_IdentBackend("model-B"))
     reopened.close()
+
+
+def test_manifest_publish_failure_rolls_back_space(tmp_path, monkeypatch):
+    col = LodeCollection(tmp_path)
+
+    def _boom():
+        raise OSError("simulated manifest write failure")
+
+    monkeypatch.setattr(col, "_write_manifest", _boom)
+    with pytest.raises(RuntimeError, match="rolled back"):
+        col.space("alpha", vector_dim=8)
+
+    # The space was never registered or cached, and its writer lock was released.
+    assert col.spaces() == []
+    assert "alpha" not in col._open
+
+    # A fresh collection can open the same space (no leaked lock -> no
+    # ConcurrentWriterError) and the manifest now publishes cleanly.
+    reopened = LodeCollection(tmp_path)
+    space = reopened.space("alpha", vector_dim=8)
+    space.add_vectors([1, 0, 0, 0, 0, 0, 0, 0], id="v")
+    assert reopened.spaces() == ["alpha"]
+    reopened.close()
+    col.close()
+
+
+def test_manifest_write_honors_fsync_durability(tmp_path, monkeypatch):
+    import lodedb.local.collection as collection_mod
+
+    captured: dict[str, object] = {}
+    real_durable_replace = collection_mod.durable_replace
+
+    def _capture(tmp, dst, *, fsync):
+        captured["fsync"] = fsync
+        return real_durable_replace(tmp, dst, fsync=fsync)
+
+    monkeypatch.setattr(collection_mod, "durable_replace", _capture)
+    col = LodeCollection(tmp_path, durability="fsync")
+    col.space("vec", vector_dim=8)  # publishes the manifest
+    assert captured.get("fsync") is True
+    col.close()

@@ -17,13 +17,14 @@ the manifest is only a registry of siblings.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from lodedb.engine._atomic_io import durable_replace
+from lodedb.engine._atomic_io import durability_from_env, durable_replace, normalize_durability
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.local.db import LodeDB
 from lodedb.local.presets import resolve_preset
@@ -54,15 +55,31 @@ class LodeCollection:
     with a different ``model``/``vector_dim`` raises :class:`ValueError`.
     """
 
-    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        read_only: bool = False,
+        durability: str | None = None,
+    ) -> None:
         """Opens (or creates) a collection root and loads its space manifest.
 
         ``read_only=True`` opens every space read-only and never creates the root
         or a missing space (see :meth:`space`); the root must already exist.
+        ``durability`` (``"fast"`` default, or ``"fsync"``) governs the collection
+        manifest's commit and is the default for the spaces it opens, exactly like
+        :class:`LodeDB`; unset reads ``LODEDB_DURABILITY``. With ``"fsync"`` the
+        manifest is fsynced into place so a durable space is never left invisible
+        after a power loss.
         """
 
         self.path = Path(path)
         self.read_only = bool(read_only)
+        # Same resolution as LodeDB: explicit arg wins, else LODEDB_DURABILITY, else fast.
+        self._durability_arg = durability
+        self._fsync = (
+            durability_from_env() if durability is None else normalize_durability(durability)
+        )
         if self.read_only:
             if not self.path.is_dir():
                 raise FileNotFoundError(
@@ -132,11 +149,27 @@ class LodeCollection:
         if safe in self._open:
             return self._open[safe]
 
+        # Spaces inherit the collection's durability unless the caller overrides it.
+        kwargs.setdefault("durability", self._durability_arg)
         db = LodeDB(path=self.path / safe, read_only=self.read_only, **open_kwargs, **kwargs)
-        self._open[safe] = db
         if new_config is not None and not self.read_only:
+            # Publish to the manifest before caching the handle. If the publish
+            # fails, the space was never registered, so close it (releasing its
+            # writer lock) and restore the registry rather than leaving an
+            # unpublished, locked space behind.
+            previous = dict(self._spaces_config)
             self._spaces_config[safe] = new_config
-            self._write_manifest()
+            try:
+                self._write_manifest()
+            except Exception as exc:
+                self._spaces_config = previous
+                with contextlib.suppress(Exception):
+                    db.close()
+                raise RuntimeError(
+                    f"failed to publish collection manifest for space {name!r}; "
+                    "rolled back (the space was not registered and its lock was released)"
+                ) from exc
+        self._open[safe] = db
         return db
 
     def spaces(self) -> list[str]:
@@ -369,7 +402,9 @@ class LodeCollection:
             try:
                 with open(fd, "w", encoding="utf-8") as handle:
                     handle.write(body)
-                durable_replace(tmp_name, manifest_path, fsync=False)
+                # fsync the manifest into place under durability="fsync", so a durable
+                # space is never left invisible after a power loss.
+                durable_replace(tmp_name, manifest_path, fsync=self._fsync)
             finally:
                 Path(tmp_name).unlink(missing_ok=True)
         finally:
