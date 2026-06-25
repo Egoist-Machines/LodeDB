@@ -2632,30 +2632,41 @@ class LodeEngine:
     def _validate_loaded_state_identity(self, state: ClientIndexState) -> None:
         """Rejects a loaded index whose persisted identity contradicts this handle.
 
-        Index creation validates (model, provider, task, native_dim) against the
-        active route policy and embedding backend; loading must enforce the same,
-        or a store written with one model/dimension could be reopened with a
-        same-dimension, different-model backend and silently serve meaningless
-        similarity scores. Identity is only enforced when the opener declares one:
-        a backend with ``required_model_name is None`` (e.g. a custom embedder that
-        names no model) has no identity to compare, so only the dimension is
-        enforced for it.
+        Loading enforces the full persisted route identity against the active route
+        policy: model, provider, task, native_dim, storage profile, and TurboVec bit
+        width. Checking only model/dim is not enough, because a vector-only store and
+        a custom-embedder index can share model/provider/dim and differ only in task,
+        and reopening at a different bit width must fail rather than silently keep the
+        stored width. The backend's ``required_model_name`` is also checked when set
+        (an identity-free backend has nothing to compare, so only the dimension binds
+        it).
         """
 
         if self.route_policy is not None:
             policy = self.route_policy
-            if state.native_dim != policy.native_dim:
-                raise RuntimeError(
-                    f"persisted index dimension {state.native_dim} does not match the opened "
-                    f"route profile {policy.profile!r} (dim {policy.native_dim}); reopen with "
-                    "the same model / embedder / vector_dim it was written with"
-                )
-            if state.model != policy.model:
-                raise RuntimeError(
-                    f"persisted index model {state.model!r} does not match the opened route "
-                    f"profile {policy.profile!r} model {policy.model!r}; reopen with the same "
-                    "model / embedder it was written with"
-                )
+            expected_bit_width = (
+                int(policy.turbovec_bit_width) if policy.turbovec_bit_width is not None else 4
+            )
+            expected_storage = storage_profile_for_route_policy(policy)
+            # Enforce the full persisted identity, not just (model, dim): a vector-only
+            # store and a custom-embedder index can share model/provider/dim yet differ
+            # in task, and a reopen at a different bit_width must not silently keep the
+            # stored width. A mismatch in any field means the store would serve a route
+            # it was not written for.
+            for label, persisted, expected in (
+                ("dimension", state.native_dim, policy.native_dim),
+                ("model", state.model, policy.model),
+                ("provider", state.provider, policy.provider),
+                ("task", state.task, policy.task),
+                ("storage profile", state.storage_profile, expected_storage),
+                ("bit_width", int(state.turbovec_bit_width), expected_bit_width),
+            ):
+                if persisted != expected:
+                    raise RuntimeError(
+                        f"persisted index {label} {persisted!r} does not match the opened route "
+                        f"profile {policy.profile!r} ({label} {expected!r}); reopen with the same "
+                        "model / embedder / vector_dim / bit_width it was written with"
+                    )
         backend = self.embedding_backend
         if backend is not None:
             if backend.native_dim != state.native_dim:

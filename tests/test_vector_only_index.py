@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from lodedb import LodeDB
+from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import VectorOnlyIndexError
 
 # A dimension that matches no preset (presets are 384 and 768).
@@ -112,3 +113,37 @@ def test_reopen_at_wrong_dim_is_rejected(tmp_path):
     # mismatched ingest).
     with pytest.raises(RuntimeError, match="does not match"):
         LodeDB.open_vector_store(tmp_path, vector_dim=128)
+
+
+def test_vector_only_store_cannot_reopen_as_custom_embedder(tmp_path):
+    # A vector-only store pins model="external"; a custom embedder can collide on
+    # that identity, but the persisted task ("vector-only") differs from the custom
+    # route ("custom-embedder"), so reopening must reject the route collision rather
+    # than serve text queries against vectors from an unknown external space.
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
+    writer.add_vectors(_onehot(0), id="a")
+    writer.persist()
+    writer.close()
+
+    class _ExternalIdBackend(HashEmbeddingBackend):
+        def __init__(self) -> None:
+            super().__init__(native_dim=DIM)
+            self.required_model_name = "external"  # collides with the vector-only model id
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        LodeDB(tmp_path, embedder=_ExternalIdBackend())
+
+
+def test_reopen_at_wrong_bit_width_is_rejected(tmp_path):
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=DIM, bit_width=4)
+    writer.add_vectors(_onehot(0), id="a")
+    writer.persist()
+    writer.close()
+    # Reopening at a different (valid) width must not silently keep the stored width.
+    with pytest.raises(RuntimeError, match="bit_width"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=DIM, bit_width=2)
+
+
+def test_invalid_bit_width_rejected_at_construction(tmp_path):
+    with pytest.raises(ValueError, match="bit_width must be 2 or 4"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=DIM, bit_width=8)

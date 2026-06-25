@@ -240,6 +240,11 @@ class LodeDB:
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
         self.read_only = bool(read_only)
+        # TurboVec stores 2- or 4-bit codes; reject any other width up front (it only
+        # affects vector-only / custom-embedder indexes, but a bad value should fail
+        # at the boundary rather than be silently ignored or surface deep in the kernel).
+        if int(bit_width) not in {2, 4}:
+            raise ValueError(f"bit_width must be 2 or 4, got {bit_width!r}")
         # "fast" (atomic rename only) vs "fsync" (power-loss durable). An
         # explicit arg wins; otherwise LODEDB_DURABILITY, else fast.
         fsync_on_commit = (
@@ -792,13 +797,14 @@ class LodeDB:
         Batched counterpart to :meth:`add_image`: each item is a mapping with an
         ``"image"`` (path / ``bytes`` / PIL image) plus optional ``"id"``,
         ``"metadata"``, and ``"text"`` (caption). Images are decoded and encoded in
-        backend-sized batches (so peak memory is bounded by the batch, not the whole
-        gallery) and the resulting vectors are stored in one atomic commit via the
-        same path as :meth:`add_vectors_many` — far cheaper than repeated
-        :meth:`add_image`. Returns the ids in input order. Requires a multimodal
-        index (``model="clip"`` or a custom ``embedder=`` exposing ``embed_images``);
-        the per-image storage contract matches :meth:`add_image` (the raw image bytes
-        are never stored).
+        backend-sized batches, so peak *decoded-image* memory is bounded by the batch
+        rather than the whole gallery; the resulting vectors do accumulate (one
+        ``EngineVectorDocument`` per image) for a single atomic commit, so this is far
+        cheaper than repeated :meth:`add_image` but is not a streaming-ingest path for
+        an unbounded gallery (commit in chunks of this call for very large sets).
+        Returns the ids in input order. Requires a multimodal index (``model="clip"``
+        or a custom ``embedder=`` exposing ``embed_images``); the per-image storage
+        contract matches :meth:`add_image` (the raw image bytes are never stored).
         """
 
         self._require_writable()
