@@ -4,7 +4,7 @@ Thin wrapper over the local SDK (:class:`LodeDB`) and the existing engine — no
 retrieval/storage logic is duplicated here. ``doctor`` reuses
 :func:`local_capability_report`; ``index``/``query``/``benchmark`` drive
 ``LodeDB``; ``serve`` runs a minimal local HTTP loop over the same in-process
-engine the SDK uses (loopback, no auth).
+engine the SDK uses (loopback/private-network, no auth).
 """
 
 from __future__ import annotations
@@ -65,9 +65,9 @@ _DURABILITY_OPTION = typer.Option(
 _COMMIT_MODE_OPTION = typer.Option(
     None,
     "--commit-mode",
-    help="generation (default: publish a crash-atomic MVCC generation per commit) | "
-    "wal (append per mutation, checkpoint periodically; ~10x faster single adds, "
-    "single-writer). Unset reads LODEDB_COMMIT_MODE.",
+    help="wal (default: append per mutation, checkpoint periodically; low-latency "
+    "single-writer durable writes) | generation (publish a crash-atomic MVCC "
+    "generation per commit). Unset reads LODEDB_COMMIT_MODE.",
 )
 
 

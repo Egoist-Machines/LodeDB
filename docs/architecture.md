@@ -59,7 +59,7 @@ src/lodedb/
     backends.py            #   embedding runtime + device selection (ONNX / torch; MPS / CUDA / CPU)
     onnx_artifacts.py    #   fetch/export + cache the preset ONNX model on first use
     presets.py           #   minilm / bge route presets
-    cli.py, server.py    #   `lodedb` CLI + loopback dev server
+    cli.py, server.py    #   `lodedb` CLI + loopback/private-network dev server
     mcp_server.py        #   optional stdio MCP server (agent memory)
     doctor.py, benchmark.py     #   capability report + local benchmark
     integrations/langchain.py   #   optional LangChain VectorStore adapter

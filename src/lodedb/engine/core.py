@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import logging
 import re
 import shutil
 import threading
@@ -103,6 +104,8 @@ from lodedb.engine.wal_store import (
 if TYPE_CHECKING:
     from lodedb.engine.gpu_turbovec import GpuDirectTurboVecSession
     from lodedb.engine.mps_turbovec import MpsDirectTurboVecSession
+
+logger = logging.getLogger("lodedb.engine")
 
 DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
 # Cap on the per-index in-memory query-latency ring. Latency samples are
@@ -787,8 +790,8 @@ class LodeEngine:
         The explicit durability checkpoint behind the SDK ``persist()`` in WAL
         commit mode: it commits a fresh generation for every index that has
         WAL-logged-but-not-yet-checkpointed mutations and truncates the WAL. In
-        the default ``generation`` mode there is nothing buffered, so it does
-        nothing. A read-only handle never checkpoints.
+        ``generation`` mode there is nothing buffered, so it does nothing. A
+        read-only handle never checkpoints.
         """
 
         if self._read_only:
@@ -4278,14 +4281,14 @@ class LodeEngine:
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
 
-        In the default ``generation`` mode this publishes a new crash-atomic,
-        MVCC-readable generation (see :meth:`_persist_generation`). In ``wal``
-        mode it instead appends the in-flight logical mutation to the index WAL
+        In the default ``wal`` mode this appends the in-flight logical mutation to the index WAL
         (one framed ``write`` + an optional fsync) and checkpoints into a
         generation only when the backlog crosses a threshold — so the common
         single-add commit avoids the multi-file generation publish entirely. WAL
         replay on open re-drives the verb, so ``_persist_state`` is a no-op while
-        replaying (the in-memory state is already being rebuilt).
+        replaying (the in-memory state is already being rebuilt). In
+        ``generation`` mode, this publishes a new crash-atomic, MVCC-readable
+        generation on every mutation (see :meth:`_persist_generation`).
         """
 
         if self.persistence_dir is None:
@@ -5460,12 +5463,17 @@ def _log_direct_turbovec_update_progress(
 ) -> None:
     """Emits raw-payload-free progress for incremental direct TurboVec updates."""
 
-    elapsed = "" if elapsed_ms is None else f" elapsed_ms={elapsed_ms:.3f}"
-    print(
-        "turbovec_update: "
-        f"label={progress_label} phase={phase} event={event} chunks={chunk_count} "
-        f"native_dim={native_dim} bit_width={bit_width} generation={generation}{elapsed}",
-        flush=True,
+    logger.info(
+        "turbovec_update label=%s phase=%s event=%s chunks=%d native_dim=%d "
+        "bit_width=%d generation=%d elapsed_ms=%s",
+        progress_label,
+        phase,
+        event,
+        chunk_count,
+        native_dim,
+        bit_width,
+        generation,
+        None if elapsed_ms is None else round(elapsed_ms, 3),
     )
 
 
@@ -6123,10 +6131,13 @@ def _log_large_ingest_progress(
         return
     if processed_documents not in {1, total_documents} and processed_documents % 500 != 0:
         return
-    print(
-        f"{operation}: processed {processed_documents}/{total_documents} documents "
-        f"({embedded_chunks} embedded chunks, {reused_chunks} reused chunks)",
-        flush=True,
+    logger.info(
+        "%s processed_documents=%d total_documents=%d embedded_chunks=%d reused_chunks=%d",
+        operation,
+        processed_documents,
+        total_documents,
+        embedded_chunks,
+        reused_chunks,
     )
 
 
@@ -6143,11 +6154,14 @@ def _log_document_ingest_finalize_progress(
 
     if document_count < 1_000 and chunk_count < 100_000:
         return
-    elapsed = "" if elapsed_ms is None else f" elapsed_ms={elapsed_ms:.3f}"
-    print(
-        f"{operation}: phase={phase} event={event} "
-        f"documents={document_count} chunks={chunk_count}{elapsed}",
-        flush=True,
+    logger.info(
+        "%s phase=%s event=%s documents=%d chunks=%d elapsed_ms=%s",
+        operation,
+        phase,
+        event,
+        document_count,
+        chunk_count,
+        None if elapsed_ms is None else round(elapsed_ms, 3),
     )
 
 

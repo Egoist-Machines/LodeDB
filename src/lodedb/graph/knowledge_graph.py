@@ -272,10 +272,6 @@ class KnowledgeGraph:
         precomputed embedding), versus one index commit per node with
         :meth:`add_node`. Each item is ``{"id"?, "type"?, "label"?, "properties"?,
         "embedding"?}``. Returns the ids in input order.
-
-        Note: unlike :meth:`add_node`, this does not clear a stale index entry for a
-        node that loses its label/embedding (bulk load is for new content); use
-        :meth:`add_node` or :meth:`reindex` to reconcile such removals.
         """
 
         self._require_writable()
@@ -283,7 +279,9 @@ class KnowledgeGraph:
         ids: list[str] = []
         text_docs: list[dict[str, Any]] = []
         vector_docs: list[dict[str, Any]] = []
+        stale_doc_ids: list[str] = []
         retained_vectors: list[tuple[str, Sequence[float]]] = []
+        stale_retained_vector_ids: list[str] = []
         for item in nodes:
             raw_id = item.get("id")
             node_id = str(raw_id) if raw_id is not None else f"node-{secrets.token_hex(8)}"
@@ -307,9 +305,19 @@ class KnowledgeGraph:
                 text_docs.append(
                     {"text": node.label, "id": _NODE_PREFIX + node.id, "metadata": metadata}
                 )
+                if self.retain_vectors:
+                    stale_retained_vector_ids.append(node.id)
+            else:
+                stale_doc_ids.append(_NODE_PREFIX + node.id)
+                if self.retain_vectors:
+                    stale_retained_vector_ids.append(node.id)
         self._store.upsert_nodes(node_objs)
+        for node_id in stale_retained_vector_ids:
+            self._store.remove_node_vector(node_id)
         if self.retain_vectors and retained_vectors:
             self._store.set_node_vectors(retained_vectors)
+        for doc_id in stale_doc_ids:
+            self._db.remove(doc_id)
         if text_docs:
             self._db.add_many(text_docs)
         if vector_docs:
@@ -329,6 +337,7 @@ class KnowledgeGraph:
         ids: list[str] = []
         text_docs: list[dict[str, Any]] = []
         vector_docs: list[dict[str, Any]] = []
+        stale_doc_ids: list[str] = []
         for item in edges:
             src = str(item["src"])
             relation = str(item["relation"])
@@ -363,7 +372,11 @@ class KnowledgeGraph:
                     text_docs.append(
                         {"text": fact, "id": _EDGE_PREFIX + edge_id, "metadata": metadata}
                     )
+                else:
+                    stale_doc_ids.append(_EDGE_PREFIX + edge_id)
         self._store.upsert_edges(edge_objs)
+        for doc_id in stale_doc_ids:
+            self._db.remove(doc_id)
         if text_docs:
             self._db.add_many(text_docs)
         if vector_docs:

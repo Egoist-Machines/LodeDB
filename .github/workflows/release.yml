@@ -4,7 +4,9 @@ name: release
 # publish them to PyPI via Trusted Publishing (OIDC, no stored token), and attach them to a
 # GitHub Release. The patched TurboVec Rust core is bundled into the lodedb wheel (see
 # pyproject [tool.maturin]), so `pip install lodedb` resolves the patched core with nothing
-# to compile and no extra dependency.
+# to compile and no extra dependency. Release wheels must also satisfy the base-runtime
+# contract: ONNX Runtime / transformers / sentence-transformers / PyYAML install from the
+# wheel metadata, while `import lodedb` keeps those embedding runtimes lazy.
 #
 # One-time setup before the first publish: configure a PyPI Trusted Publisher for project
 # `lodedb` (owner: this repo, workflow: release.yml, environment: pypi). Until that exists the
@@ -64,6 +66,55 @@ jobs:
             # CBLAS provider for the vendored TurboVec crate (Linux only; no-op elsewhere).
             dnf install -y epel-release || true
             dnf install -y openblas-devel || yum install -y openblas-devel
+      - name: Smoke install wheel and base runtime contract
+        if: ${{ runner.os != 'macOS' || matrix.target != 'x86_64' }}
+        shell: bash
+        run: |
+          python -m venv .wheel-smoke
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY=".wheel-smoke/Scripts/python.exe"
+          else
+            PY=".wheel-smoke/bin/python"
+          fi
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install dist/*.whl
+          "$PY" - <<'PY'
+          import importlib.util
+          import sys
+
+          import lodedb
+
+          loaded = {name.split(".", 1)[0] for name in sys.modules}
+          eager_forbidden = {
+              "onnxruntime",
+              "transformers",
+              "sentence_transformers",
+              "torch",
+              "sklearn",
+              "faiss",
+              "modal",
+              "mteb",
+              "datasets",
+              "matplotlib",
+          }
+          eager = sorted(loaded & eager_forbidden)
+          if eager:
+              raise SystemExit(f"wheel import eagerly loaded heavy runtime modules: {eager}")
+
+          required = {
+              "numpy": "numpy",
+              "typer": "typer",
+              "onnxruntime": "onnxruntime",
+              "transformers": "transformers",
+              "sentence-transformers": "sentence_transformers",
+              "pyyaml": "yaml",
+          }
+          missing = [name for name, module in required.items() if importlib.util.find_spec(module) is None]
+          if missing:
+              raise SystemExit(f"missing base runtime dependencies from wheel install: {missing}")
+
+          assert lodedb.__version__
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}

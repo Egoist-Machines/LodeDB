@@ -38,6 +38,7 @@ resident copy is invalidated by generation and the next batch re-uploads.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from importlib import import_module
@@ -45,6 +46,8 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+logger = logging.getLogger("lodedb.engine")
 
 GPU_DIRECT_TURBOVEC_BACKEND = "gpu_cupy_exact_direct"
 # Widened (post-filter) top-k requests fall back to the CPU kernel rather
@@ -572,5 +575,5 @@ def _log_top_k_backend(name: str) -> None:
 
     global _TOP_K_BACKEND_LOGGED
     if not _TOP_K_BACKEND_LOGGED:
-        print(f"gpu_direct_top_k_backend={name}", flush=True)
+        logger.info("gpu_direct_top_k_backend=%s", name)
         _TOP_K_BACKEND_LOGGED = True

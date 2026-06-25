@@ -25,9 +25,10 @@ version and watch releases until a stable line is published.
 
 ## Scope and operational notes
 
-- The bundled dev server (`lodedb serve`) and MCP server (`lodedb mcp`) are
-  **unauthenticated and intended for loopback / local use only**. Do not expose them to
-  untrusted networks.
+- The bundled dev server (`lodedb serve`) is **unauthenticated**. It binds to loopback by
+  default and may intentionally bind to a private/RFC1918 address for trusted-LAN use, but
+  must not be exposed to public or untrusted networks. The MCP server (`lodedb mcp`) runs over
+  stdio and inherits the local process boundary.
 - Original document text is retained **by default** in a local `.tvtext` sidecar. Treat
   that directory as sensitive, or open the database with `store_text=False` to keep no
   text on disk. See [`docs/architecture.md`](docs/architecture.md) for the

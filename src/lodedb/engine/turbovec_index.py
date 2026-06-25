@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import logging
 import platform
 import sys
 import time
@@ -13,6 +14,8 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+logger = logging.getLogger("lodedb.engine")
 
 # The compiled TurboVec extension is bundled into the lodedb wheel as
 # `lodedb._turbovec` (maturin builds it from third_party/turbovec). A standalone
@@ -437,13 +440,18 @@ def _log_turbovec_build_progress(
 
     if progress_label is None:
         return
-    elapsed = "" if elapsed_ms is None else f" elapsed_ms={elapsed_ms:.3f}"
-    print(
-        "turbovec_build: "
-        f"label={progress_label} phase={phase} event={event} "
-        f"chunks={chunk_count} native_dim={native_dim} bit_width={bit_width} "
-        f"generation={generation} backend={backend}{elapsed}",
-        flush=True,
+    logger.info(
+        "turbovec_build label=%s phase=%s event=%s chunks=%d native_dim=%d "
+        "bit_width=%d generation=%d backend=%s elapsed_ms=%s",
+        progress_label,
+        phase,
+        event,
+        chunk_count,
+        native_dim,
+        bit_width,
+        generation,
+        backend,
+        None if elapsed_ms is None else round(elapsed_ms, 3),
     )
 
 
