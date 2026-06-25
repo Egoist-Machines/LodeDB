@@ -1,5 +1,5 @@
 <h1 align="center">LodeDB</h1>
-<p align="center">🔥 the <b>fastest</b> and <i>most compact</i> multimodal embedded vector database in the world 🌍</p>
+<p align="center">🔥 the <b>fastest</b> and <i>most compact</i> embedded vector database in the world 🌍</p>
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
