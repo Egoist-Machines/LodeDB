@@ -47,11 +47,38 @@ def test_manifest_persists_across_reopen(tmp_path):
     assert reopened.spaces() == ["notes", "vectors"]
     # A vector-only space records model=None; a preset space records its model.
     assert reopened.space_config("vectors") == {
-        "model": None,
+        "kind": "vector",
         "vector_dim": 8,
         "bit_width": 4,
     }
-    assert reopened.space_config("notes")["model"] == "minilm"
+    assert reopened.space_config("notes") == {
+        "kind": "preset",
+        "model": "minilm",
+        "bit_width": 4,
+    }
+    reopened.close()
+
+
+def test_custom_embedder_space_records_identity_and_reopens(tmp_path):
+    col = LodeCollection(tmp_path)
+    space = col.space("notes", embedder=_IdentBackend("my-model"))
+    space.add("hello world", id="a")
+    space.persist()
+    # Recorded as a custom space with its identity, not a false preset.
+    assert col.space_config("notes") == {
+        "kind": "custom",
+        "model_identity": "my-model",
+        "bit_width": 4,
+    }
+    col.close()
+
+    reopened = LodeCollection(tmp_path)
+    # The backend can't be persisted, so reopening without one is a clear error.
+    with pytest.raises(ValueError, match="custom-embedder space"):
+        reopened.space("notes")
+    # Reopening with a matching embedder works.
+    space2 = reopened.space("notes", embedder=_IdentBackend("my-model"))
+    assert space2.count() == 1
     reopened.close()
 
 
