@@ -128,19 +128,26 @@ it the same way.
 
 To drive a text-capable index with your own model at any dimension, pass
 `embedder=` an object implementing the embedding protocol (`embed_documents`,
-`embed_query`, `native_dim`). This covers domain-specific text models, hosted
-embedding APIs, and multimodal encoders. If the backend also exposes an
-`embed_images` method, `add_image` and `search_by_image` work too.
+`embed_query`, `native_dim`, `required_model_name`). This covers domain-specific text
+models, hosted embedding APIs, and multimodal encoders. If the backend also exposes
+an `embed_images` method, `add_image` and `search_by_image` work too.
+
+`required_model_name` is **required** and must be a non-empty, non-secret public
+identifier (a model name). It is pinned in the index header and re-enforced on reopen,
+so reopening the store with a different-model backend of the same dimension is rejected
+instead of silently returning meaningless scores. It is written to the on-disk header,
+so it must not carry credentials or API keys.
 
 ```python
-db = LodeDB("./store", embedder=my_backend)      # model= is ignored; shape from the backend
-```
+class MyBackend:
+    name = "my-backend"
+    native_dim = 1024
+    required_model_name = "my-org/my-model-v1"   # required, non-secret, persisted
+    def embed_documents(self, texts): ...
+    def embed_query(self, text): ...
 
-If the backend sets `required_model_name`, that identity is pinned in the index
-header and re-enforced on reopen, so reopening the store with a different-model
-backend of the same dimension is rejected instead of silently returning
-meaningless scores. Use a non-secret public identifier there (a model name): it is
-written to the on-disk header and must not carry credentials or API keys.
+db = LodeDB("./store", embedder=MyBackend())      # model= is ignored; shape from the backend
+```
 
 ## Notes
 

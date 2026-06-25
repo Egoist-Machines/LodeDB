@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `required_model_name`), and `LodeCollection` groups named vector spaces (sibling indexes) under
   one root, reopened from a manifest that records each space's kind, identity, bit width, and
   privacy flags (`store_text`/`index_text`) and re-applies them on reopen, so a `store_text=False`
-  space never silently flips back to retaining raw text. A preset, custom-embedder, or vector-only
+  space never silently flips back to retaining raw text. The collection registry is crash-safe to
+  the engine's standard: the manifest honors `durability="fsync"`, and a failed publish rolls the
+  space back (closing it, releasing its lock) instead of leaving it open and unregistered. A
+  preset, custom-embedder, or vector-only
   index pins its model identity in the on-disk header and re-enforces it on reopen. The raw image
   is never stored (keep its path in metadata), and `store_text=False` now keeps raw text off disk
   in WAL commit mode too: WAL records log chunk embeddings (and lexical tokens when
