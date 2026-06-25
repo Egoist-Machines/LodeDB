@@ -66,6 +66,36 @@ def test_add_image_and_cross_modal_text_search(tmp_path):
     assert image_hits[0].id == "img-dog"
 
 
+def test_add_images_batch(tmp_path):
+    db = _multimodal_db(tmp_path)
+    ids = db.add_images(
+        [
+            {"image": "cat", "id": "c", "metadata": {"path": "cat.jpg"}},
+            {"image": "dog", "id": "d", "text": "a dog"},
+            {"image": "bird"},  # auto id
+        ]
+    )
+    assert ids[0] == "c" and ids[1] == "d"
+    assert ids[2].startswith("doc-")
+    assert db.count() == 3
+    # The batched encode lands in the same space as single add_image / text.
+    assert db.search("cat", k=1)[0].id == "c"
+    assert db.search_by_image("dog", k=1)[0].id == "d"
+    assert db.get("d") == "a dog"  # caption retained (store_text defaults True)
+
+
+def test_add_images_requires_image_key(tmp_path):
+    db = _multimodal_db(tmp_path)
+    with pytest.raises(ValueError, match="image"):
+        db.add_images([{"id": "x"}])
+
+
+def test_add_images_rejected_without_image_backend(tmp_path):
+    db = LodeDB(path=tmp_path, embedder=HashEmbeddingBackend(native_dim=DIM))
+    with pytest.raises(ImageEmbeddingUnsupportedError):
+        db.add_images([{"image": "cat"}])
+
+
 def test_add_image_stores_no_raw_bytes(tmp_path):
     db = _multimodal_db(tmp_path)
     db.add_image("cat", id="img-cat", metadata={"path": "cat.jpg"})

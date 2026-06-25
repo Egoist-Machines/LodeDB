@@ -788,6 +788,57 @@ class LodeDB:
         vector = backend.embed_images((image,))[0]
         return self.add_vectors(vector, id=id, metadata=metadata, text=text)
 
+    def add_images(
+        self,
+        documents: list[Mapping[str, Any]],
+        *,
+        normalize: bool = True,
+    ) -> list[str]:
+        """Embeds and stores a batch of images in one model call and one commit.
+
+        Batched counterpart to :meth:`add_image`: each item is a mapping with an
+        ``"image"`` (path / ``bytes`` / PIL image) plus optional ``"id"``,
+        ``"metadata"``, and ``"text"`` (caption). Every image is embedded in a
+        single ``embed_images`` call, which is far cheaper than repeated
+        :meth:`add_image` for a gallery, then the batch is stored through the same
+        atomic-commit vector path as :meth:`add_vectors_many`. Returns the ids in
+        input order. Requires a multimodal index (``model="clip"`` or a custom
+        ``embedder=`` exposing ``embed_images``); the per-image storage contract
+        matches :meth:`add_image` (the raw image bytes are never stored).
+        """
+
+        self._require_writable()
+        backend = self._image_backend()
+        if not isinstance(documents, list):
+            raise ValueError("documents must be a list")
+        images: list[Any] = []
+        ids: list[str] = []
+        metadatas: list[Mapping[str, Any] | None] = []
+        texts: list[Any] = []
+        for item in documents:
+            image = item.get("image")
+            if image is None:
+                raise ValueError("each document needs an 'image'")
+            images.append(image)
+            ids.append(str(item["id"]) if item.get("id") is not None else self._next_auto_id())
+            metadatas.append(item.get("metadata"))
+            texts.append(item.get("text"))
+        if not images:
+            return []
+        # One batched encode for the whole gallery, then one atomic commit.
+        vectors = backend.embed_images(images)
+        payload = [
+            EngineVectorDocument(
+                document_id=ids[index],
+                vector=_prepare_vector(vectors[index], self._vector_dim, normalize=normalize),
+                metadata=_coerce_metadata(metadatas[index]),
+                text=_coerce_optional_text(texts[index]),
+            )
+            for index in range(len(images))
+        ]
+        self._index.upsert_vectors_batch(tuple(payload))
+        return ids
+
     def search_by_image(
         self,
         image: Any,

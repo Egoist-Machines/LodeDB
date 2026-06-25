@@ -45,9 +45,14 @@ def clip_demo(workdir: Path) -> None:
 
     # The first run downloads sentence-transformers/clip-ViT-B-32 from Hugging Face.
     db = LodeDB(path=workdir / "clip_store", model="clip")
-    for name, path in paths.items():
-        # Store only the vector; keep the file path in metadata to resolve a hit.
-        db.add_image(str(path), id=name, metadata={"path": str(path), "color": name})
+    # add_images embeds the whole gallery in one model call (cheaper than add_image
+    # per file). Only the vector is stored; the file path lives in metadata.
+    db.add_images(
+        [
+            {"image": str(path), "id": name, "metadata": {"path": str(path), "color": name}}
+            for name, path in paths.items()
+        ]
+    )
     print(f"indexed {db.count()} images with model='clip'")
 
     # Cross-modal: a text query searches the same space the images live in.
