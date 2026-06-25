@@ -164,15 +164,19 @@ def test_add_images_validates_all_items_before_embedding(tmp_path):
     with pytest.raises(ValueError):
         db.add_images([{"image": "cat"}, {"image": "dog", "metadata": {"bad": ["x"]}}])
     assert db.count() == 0
-    assert db.stats()["image_embedding"]["images_embedded"] == 0
+    assert db.stats()["image_embedding"]["ingest"]["images_embedded"] == 0
 
 
 def test_image_embedding_metrics_in_stats(tmp_path):
     db = _multimodal_db(tmp_path)
     db.add_image("cat", id="c")
     db.add_images([{"image": "dog"}, {"image": "bird"}])
+    db.search_by_image("cat", k=1)
     metrics = db.stats()["image_embedding"]
-    assert metrics["images_embedded"] == 3
-    assert metrics["encode_calls"] >= 2
-    assert metrics["encode_failures"] == 0
-    assert metrics["encode_seconds"] >= 0.0
+    # ingest counts the three stored images; query counts the one search.
+    assert metrics["ingest"]["images_embedded"] == 3
+    assert metrics["ingest"]["encode_calls"] >= 2
+    assert metrics["ingest"]["encode_failures"] == 0
+    assert metrics["ingest"]["encode_seconds"] >= 0.0
+    assert metrics["query"]["images_embedded"] == 1
+    assert metrics["query"]["encode_calls"] == 1

@@ -393,11 +393,15 @@ class LodeDB:
         self._auto_id_counter = 0
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
-        self._image_metrics: dict[str, Any] = {
-            "images_embedded": 0,
-            "encode_calls": 0,
-            "encode_seconds": 0.0,
-            "encode_failures": 0,
+        # Split by phase: "ingest" (add_image/add_images) vs "query" (search_by_image).
+        self._image_metrics: dict[str, dict[str, Any]] = {
+            phase: {
+                "images_embedded": 0,
+                "encode_calls": 0,
+                "encode_seconds": 0.0,
+                "encode_failures": 0,
+            }
+            for phase in ("ingest", "query")
         }
 
     # -- public API ---------------------------------------------------------
@@ -801,7 +805,7 @@ class LodeDB:
 
         self._require_writable()
         backend = self._image_backend()
-        vector = self._embed_images_tracked(backend, (image,))[0]
+        vector = self._embed_images_tracked(backend, (image,), phase="ingest")[0]
         return self.add_vectors(vector, id=id, metadata=metadata, text=text)
 
     def add_images(
@@ -850,7 +854,11 @@ class LodeDB:
         batch_size = max(1, int(getattr(backend, "batch_size", 16) or 16))
         vectors: list[Any] = []
         for start in range(0, len(images), batch_size):
-            vectors.extend(self._embed_images_tracked(backend, images[start : start + batch_size]))
+            vectors.extend(
+                self._embed_images_tracked(
+                    backend, images[start : start + batch_size], phase="ingest"
+                )
+            )
         payload = [
             EngineVectorDocument(
                 document_id=ids[index],
@@ -884,7 +892,7 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         backend = self._image_backend()
-        vector = backend.embed_images((image,))[0]
+        vector = self._embed_images_tracked(backend, (image,), phase="query")[0]
         return self.search_by_vector(vector, k=k, filter=filter)
 
     def remove(self, id: str) -> bool:
@@ -1058,14 +1066,18 @@ class LodeDB:
         """Returns redacted engine stats (counts, storage bytes, telemetry).
 
         Includes an ``"image_embedding"`` block with this handle's redacted CLIP
-        encode counters (images embedded, encode calls, cumulative encode seconds,
-        failures) so image-embedding cost is visible separately from storage commit
-        cost. The counters are per-handle and carry no paths, captions, or pixels.
+        encode counters split by phase (``"ingest"`` for add_image(s), ``"query"`` for
+        search_by_image): images embedded, encode calls, cumulative encode seconds, and
+        failures. So image-embedding cost is visible separately from storage commit
+        cost, and ingest separately from query. The counters are per-handle and carry
+        no paths, captions, or pixels.
         """
 
         stats = self._index.stats()
         if isinstance(stats, dict):
-            stats["image_embedding"] = dict(self._image_metrics)
+            stats["image_embedding"] = {
+                phase: dict(counters) for phase, counters in self._image_metrics.items()
+            }
         return stats
 
     def close(self) -> None:
@@ -1159,24 +1171,28 @@ class LodeDB:
             )
         return backend
 
-    def _embed_images_tracked(self, backend: Any, images: Sequence[Any]) -> tuple[Any, ...]:
+    def _embed_images_tracked(
+        self, backend: Any, images: Sequence[Any], *, phase: str
+    ) -> tuple[Any, ...]:
         """Embeds images via the backend, recording redacted encode metrics.
 
         Counts images, cumulative encode time, and failures into
-        ``self._image_metrics`` (surfaced via :meth:`stats`), so operators can see
-        CLIP encode cost separately from storage-commit cost. No paths or pixels are
-        recorded.
+        ``self._image_metrics[phase]`` (``"ingest"`` for add_image(s), ``"query"`` for
+        search_by_image; surfaced via :meth:`stats`), so operators can see CLIP encode
+        cost separately from storage-commit cost, and ingest separately from query. No
+        paths or pixels are recorded.
         """
 
+        metrics = self._image_metrics[phase]
         started = time.perf_counter()
         try:
             vectors = tuple(backend.embed_images(images))
         except Exception:
-            self._image_metrics["encode_failures"] += 1
+            metrics["encode_failures"] += 1
             raise
-        self._image_metrics["encode_calls"] += 1
-        self._image_metrics["images_embedded"] += len(images)
-        self._image_metrics["encode_seconds"] += time.perf_counter() - started
+        metrics["encode_calls"] += 1
+        metrics["images_embedded"] += len(images)
+        metrics["encode_seconds"] += time.perf_counter() - started
         return vectors
 
     def _ensure_index(self) -> None:
