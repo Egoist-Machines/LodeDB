@@ -63,11 +63,15 @@ def test_manifest_persists_across_reopen(tmp_path):
         "kind": "vector",
         "vector_dim": 8,
         "bit_width": 4,
+        "store_text": True,
+        "index_text": False,
     }
     assert reopened.space_config("notes") == {
         "kind": "preset",
         "model": "minilm",
         "bit_width": 4,
+        "store_text": True,
+        "index_text": False,
     }
     reopened.close()
 
@@ -82,6 +86,8 @@ def test_custom_embedder_space_records_identity_and_reopens(tmp_path):
         "kind": "custom",
         "model_identity": "my-model",
         "bit_width": 4,
+        "store_text": True,
+        "index_text": False,
     }
     col.close()
 
@@ -103,8 +109,43 @@ def test_preset_space_records_effective_bit_width(tmp_path):
     # A preset space records the preset's real width (4), never a caller value that
     # would not take effect.
     col.space("notes", model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384))
-    assert col.space_config("notes") == {"kind": "preset", "model": "minilm", "bit_width": 4}
+    assert col.space_config("notes") == {
+        "kind": "preset",
+        "model": "minilm",
+        "bit_width": 4,
+        "store_text": True,
+        "index_text": False,
+    }
     col.close()
+
+
+def test_collection_owns_privacy_flags_across_reopen(tmp_path):
+    col = LodeCollection(tmp_path)
+    col.space("vec", vector_dim=8, store_text=False, index_text=True)
+    col.close()
+
+    # Reopening with no flags restores the recorded store_text/index_text, so a
+    # privacy-off space never silently flips back to retaining raw text.
+    reopened = LodeCollection(tmp_path)
+    space = reopened.space("vec")
+    assert space.store_text is False
+    assert space.index_text is True
+    cfg = reopened.space_config("vec")
+    assert cfg["store_text"] is False and cfg["index_text"] is True
+    # store_text=False refuses raw-text retrieval on the reopened handle too.
+    with pytest.raises(ValueError, match="store_text"):
+        space.get_text("anything")
+    reopened.close()
+
+
+def test_collection_rejects_conflicting_store_text(tmp_path):
+    col = LodeCollection(tmp_path)
+    col.space("vec", vector_dim=8, store_text=False)
+    col.close()
+    reopened = LodeCollection(tmp_path)
+    with pytest.raises(ValueError, match="store_text"):
+        reopened.space("vec", store_text=True)
+    reopened.close()
 
 
 def test_same_handle_mismatched_config_is_rejected(tmp_path):
