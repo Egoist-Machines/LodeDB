@@ -40,8 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0 extras)
-        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0
+      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0/image extras)
+        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image
 
       - name: Lint
         run: uv run ruff check .
@@ -104,6 +104,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
+
+      - name: Assert the lockfile is current with pyproject.toml
+        run: uv lock --check
 
       - name: Sync (builds the vendored TurboVec core)
         run: uv sync
