@@ -32,8 +32,9 @@ _MANIFEST_VERSION = 1
 # Space names are used as directory names, so keep them to a safe, portable set
 # and forbid anything that could escape the collection root.
 _SPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-# The space-defining fields the manifest pins and re-enforces on reopen.
-_PINNED_FIELDS = ("model", "vector_dim", "bit_width")
+# Sentinel for space() arguments the caller did not pass: a recorded space then
+# reopens from its manifest config instead of being compared against fresh defaults.
+_UNSET: Any = object()
 
 
 class LodeCollection:
@@ -77,56 +78,64 @@ class LodeCollection:
         self,
         name: str,
         *,
-        model: str = "minilm",
-        vector_dim: int | None = None,
-        bit_width: int = 4,
+        model: str = _UNSET,
+        vector_dim: int | None = _UNSET,
+        bit_width: int = _UNSET,
         **kwargs: Any,
     ) -> LodeDB:
         """Opens (or creates) the named space and returns its :class:`LodeDB` handle.
 
-        The space lives at ``<root>/<name>/``. The first open records its
-        ``(model, vector_dim, bit_width)`` in the manifest; later opens must match
-        what was recorded, or this raises :class:`ValueError`. Pass ``model=`` for a
-        preset space (``"minilm"``/``"bge"``/``"clip"``) or ``vector_dim=`` for a
-        bring-your-own-vectors space. Extra keyword arguments (``store_text``,
-        ``index_text``, ``device``, ``commit_mode``, ...) pass through to
-        :class:`LodeDB`. The same handle is returned for repeated calls in one
-        process.
+        The space lives at ``<root>/<name>/``. A new space records its
+        ``(model, vector_dim, bit_width)`` in the manifest (``model="minilm"`` and
+        ``bit_width=4`` by default; pass ``vector_dim=`` for a bring-your-own-vectors
+        space). **Reopening uses the recorded config**: ``col.space("name")`` with no
+        config args reopens any recorded space (including vector-only / ``clip`` /
+        non-default ones) without restating it; passing a config value that conflicts
+        with what was recorded raises :class:`ValueError`. Extra keyword arguments
+        (``store_text``, ``index_text``, ``device``, ``commit_mode``, ...) pass
+        through to :class:`LodeDB`. The same handle is returned for repeated calls in
+        one process.
         """
 
         safe = self._validate_name(name)
-        # A vector-only space ignores the preset model, so record it as null to
-        # keep the manifest honest (and reopen-comparison stable).
-        requested = {
-            "model": None if vector_dim is not None else model,
-            "vector_dim": vector_dim,
-            "bit_width": int(bit_width),
-        }
         recorded = self._spaces_config.get(safe)
         if recorded is not None:
-            # Enforce the requested config before anything else, including before
-            # returning an already-open handle, so a mismatched reopen fails here
-            # rather than much later on a vector insert into the wrong-shape index.
-            self._enforce_config(safe, recorded, requested)
+            # Reopen from the recorded config; enforce only explicit, conflicting
+            # overrides (checked before returning an already-open handle, so a
+            # mismatch fails here rather than later on a vector insert).
+            self._enforce_explicit_overrides(safe, recorded, model, vector_dim, bit_width)
+            open_model = recorded["model"]
+            open_vector_dim = recorded["vector_dim"]
+            open_bit_width = int(recorded["bit_width"])
         elif self.read_only:
             raise FileNotFoundError(
                 f"space {name!r} does not exist in this collection (read-only): {self.path}"
             )
+        else:
+            open_model = "minilm" if model is _UNSET else model
+            open_vector_dim = None if vector_dim is _UNSET else vector_dim
+            open_bit_width = 4 if bit_width is _UNSET else int(bit_width)
 
         if safe in self._open:
             return self._open[safe]
 
         db = LodeDB(
             path=self.path / safe,
-            model=model,
-            vector_dim=vector_dim,
-            bit_width=int(bit_width),
+            # A vector-only space ignores model; "minilm" is a harmless placeholder.
+            model=open_model or "minilm",
+            vector_dim=open_vector_dim,
+            bit_width=open_bit_width,
             read_only=self.read_only,
             **kwargs,
         )
         self._open[safe] = db
         if recorded is None and not self.read_only:
-            self._spaces_config[safe] = requested
+            self._spaces_config[safe] = {
+                # A vector-only space ignores the preset model, so record it as null.
+                "model": None if open_vector_dim is not None else open_model,
+                "vector_dim": open_vector_dim,
+                "bit_width": open_bit_width,
+            }
             self._write_manifest()
         return db
 
@@ -172,19 +181,35 @@ class LodeCollection:
         return name
 
     @staticmethod
-    def _enforce_config(
+    def _enforce_explicit_overrides(
         name: str,
         recorded: dict[str, Any],
-        requested: dict[str, Any],
+        model: Any,
+        vector_dim: Any,
+        bit_width: Any,
     ) -> None:
-        """Raises if a reopen's space-defining fields differ from the recorded ones."""
+        """Raises if an explicitly-passed config value conflicts with the recorded space.
 
-        for field in _PINNED_FIELDS:
-            if recorded.get(field) != requested[field]:
-                raise ValueError(
-                    f"space {name!r} was created with {field}={recorded.get(field)!r}; "
-                    f"reopen requested {field}={requested[field]!r}"
-                )
+        Arguments left as ``_UNSET`` are taken from the manifest, so a recorded space
+        reopens cleanly; only a value the caller actually passed is checked, so a
+        genuine mismatch (different dim / model / bit_width) still fails fast.
+        """
+
+        if model is not _UNSET and model != recorded["model"]:
+            raise ValueError(
+                f"space {name!r} was created with model={recorded['model']!r}; "
+                f"reopen requested model={model!r}"
+            )
+        if vector_dim is not _UNSET and vector_dim != recorded["vector_dim"]:
+            raise ValueError(
+                f"space {name!r} was created with vector_dim={recorded['vector_dim']!r}; "
+                f"reopen requested vector_dim={vector_dim!r}"
+            )
+        if bit_width is not _UNSET and int(bit_width) != recorded["bit_width"]:
+            raise ValueError(
+                f"space {name!r} was created with bit_width={recorded['bit_width']!r}; "
+                f"reopen requested bit_width={int(bit_width)!r}"
+            )
 
     def _manifest_path(self) -> Path:
         """Returns the path to the collection manifest file."""

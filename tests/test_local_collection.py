@@ -76,6 +76,28 @@ def test_reopen_enforces_space_config(tmp_path):
     reopened.close()
 
 
+def test_reopen_recorded_space_without_restating_config(tmp_path):
+    # A recorded space reopens from its manifest with no config args, including
+    # vector-only and clip spaces whose config differs from the plain defaults.
+    col = LodeCollection(tmp_path)
+    col.space("vec", vector_dim=16)
+    col.space("img", model="clip")  # ClipEmbeddingBackend is lazy: no download on open
+    col.close()
+
+    reopened = LodeCollection(tmp_path)
+    vec = reopened.space("vec")  # no vector_dim -> taken from the manifest
+    assert vec.vector_only and vec._vector_dim == 16
+    img = reopened.space("img")  # no model -> taken from the manifest
+    assert img.preset is not None and img.preset.multimodal
+    reopened.close()
+
+    # Read-only reopen of a recorded vector-only space, no config args.
+    reader = LodeCollection(tmp_path, read_only=True)
+    ro = reader.space("vec")
+    assert ro.read_only and ro._vector_dim == 16
+    reader.close()
+
+
 @pytest.mark.parametrize("bad", ["../evil", "a/b", "", ".", "..", "x y"])
 def test_invalid_space_name_rejected(tmp_path, bad):
     col = LodeCollection(tmp_path)
