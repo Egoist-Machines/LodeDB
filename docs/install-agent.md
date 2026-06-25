@@ -11,7 +11,7 @@ location, embedding dimension, or package manager is ambiguous.
 
 This page is the provider-first entry point. It is a router: if the project uses LangChain,
 LlamaIndex, or mem0, it hands off to the framework migration toolkit on the
-[migrate-agent page](migrate-agent.md) instead of attempting a direct provider export. Direct
+[migrate-agent page](https://egoistmachines.com/lodedb/migrate-agent) instead of attempting a direct provider export. Direct
 migration here is for projects that use a store such as pgvector directly from application code.
 
 ## 1. Identify the project and package manager
@@ -32,7 +32,7 @@ Search source and config for framework ownership first:
 
 The routing rule is: **framework detection wins over direct-provider detection.** If LangChain,
 LlamaIndex, or mem0 owns the vector store, switch to the framework migration toolkit on the
-[migrate-agent page](migrate-agent.md). Do not continue with a direct pgvector/Qdrant/Chroma
+[migrate-agent page](https://egoistmachines.com/lodedb/migrate-agent). Do not continue with a direct pgvector/Qdrant/Chroma
 export unless the plan explicitly shows the framework is not the owner. If a project uses
 pgvector *through* LangChain, this is a LangChain migration, not a direct pgvector migration.
 
@@ -88,7 +88,7 @@ the connection at run time with `--source`.
 ## 5. Migrate safely
 
 If the plan routes to a framework, follow the framework migration commands on the
-[migrate-agent page](migrate-agent.md). If it stays on the direct-provider path, run a dry run
+[migrate-agent page](https://egoistmachines.com/lodedb/migrate-agent). If it stays on the direct-provider path, run a dry run
 first, then write a new LodeDB target path:
 
 ```bash
@@ -170,4 +170,4 @@ schemas:
   follow-up provider modules. Until then, those projects that wire the store through a framework
   still migrate today through the framework path.
 - The framework path (LangChain, LlamaIndex, mem0) is documented on the
-  [migrate-agent page](migrate-agent.md).
+  [migrate-agent page](https://egoistmachines.com/lodedb/migrate-agent).

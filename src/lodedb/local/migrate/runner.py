@@ -23,6 +23,7 @@ replay).
 
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from collections.abc import Iterator
@@ -41,7 +42,6 @@ from lodedb.local.migrate.plan import (
 from lodedb.local.migrate.report import (
     fingerprint_text,
     hash_id,
-    sample_indices,
 )
 from lodedb.local.migrate.sources.base import (
     MODE_TEXT_REPLAY,
@@ -52,6 +52,10 @@ from lodedb.local.migrate.sources.base import (
 
 # LodeDB vector indexes require a dimension that is a positive multiple of 8.
 _VECTOR_DIM_MULTIPLE = 8
+# Rows are replayed into the target in bounded batches so a large migration uses
+# the batch SDK APIs (one commit + one embedding pass per batch) instead of one
+# commit and one embedding call per row.
+_WRITE_BATCH = 500
 
 
 class MigrationError(RuntimeError):
@@ -403,28 +407,42 @@ def run_migration(
         if write_dir.exists():
             shutil.rmtree(write_dir)
         try:
-            written, skipped = _write_target(
+            written, skipped, sample = _write_target(
                 export, plan, write_dir, embedding_backend=embedding_backend
             )
             result.written_count = written
             result.skipped = skipped
             result.validation = _validate_target(
-                export,
                 plan,
                 write_dir,
                 written=written,
                 skipped_count=len(skipped),
+                source_count=export.count,
+                sample=sample,
+                embedding_dim=result.embedding_dim,
                 embedding_backend=embedding_backend,
             )
-            _write_manifest(write_dir, result)
-            _atomic_move(write_dir, target_path, resume=resume, overwrite=overwrite_target)
         except Exception:
             # Leave the source untouched; clean up the partial temp on failure.
             if write_dir.exists():
                 shutil.rmtree(write_dir, ignore_errors=True)
             raise
         result.finished_at = time.time()
-        # Rewrite the manifest at the final path so its timings/validation are complete.
+        # Record the manifest in the temp dir first (a failed run is left there,
+        # unpublished, for inspection).
+        _write_manifest(write_dir, result)
+        if not result.validation.get("passed", False):
+            result.status = "failed"
+            raise MigrationError(
+                "migration validation failed (count_parity="
+                f"{result.validation.get('count_parity')}, audit_passed="
+                f"{result.validation.get('audit_passed')}, sample_ok="
+                f"{result.validation.get('sample', {}).get('ok')}); the target "
+                f"{target_path} was not published and any existing store there is left "
+                f"unchanged. The unpublished run is in {write_dir} for inspection."
+            )
+        # Validation passed: publish, then rewrite the manifest at the final path.
+        _atomic_move(write_dir, target_path, resume=resume, overwrite=overwrite_target)
         _write_manifest(target_path, result)
         return result
     finally:
@@ -493,27 +511,54 @@ def _write_target(
     write_dir: Path,
     *,
     embedding_backend: Any | None,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Replays the source into a fresh LodeDB target; returns ``(written, skipped)``."""
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Replays the source into a fresh LodeDB target in bounded batches.
 
+    Returns ``(written, skipped, sample)``. Each row's skip reason is decided per row
+    (so skip accounting is unchanged), but valid rows are buffered and flushed through
+    the batch SDK APIs so a large migration pays one commit and one embedding pass per
+    batch rather than per row. ``sample`` is a bounded prefix of valid source rows
+    (id, scalar metadata, text presence) that validation compares against the target.
+    """
+
+    dim: int | None = None
     if export.mode == MODE_VECTOR_PRESERVE:
-        writer = _open_vector_target(plan, write_dir, int(export.vector_dim or plan.embedding_dim))
+        dim = int(export.vector_dim or plan.embedding_dim or 0)
+        writer = _open_vector_target(plan, write_dir, dim)
     else:
         writer = _open_text_target(plan, write_dir, embedding_backend)
 
+    sample_limit = int(plan.thresholds.get("sample_size", 25))
     written = 0
     skipped: list[dict[str, Any]] = []
+    sample: list[dict[str, Any]] = []
+    batch: list[ExportedRow] = []
     try:
         for row in export.iter_rows():
-            reason = writer.write(row)
-            if reason is None:
-                written += 1
-            else:
+            reason = _would_skip(row, export.mode, dim)
+            if reason is not None:
                 skipped.append({"id_hash": hash_id(row.id), "reason": reason})
+                continue
+            if len(sample) < sample_limit:
+                sample.append(
+                    {
+                        "id": row.id,
+                        "metadata": _stringify_metadata(row.metadata),
+                        "has_text": bool(row.text and row.text.strip()),
+                    }
+                )
+            batch.append(row)
+            if len(batch) >= _WRITE_BATCH:
+                writer.write_batch(batch)
+                written += len(batch)
+                batch = []
+        if batch:
+            writer.write_batch(batch)
+            written += len(batch)
         writer.persist()
     finally:
         writer.close()
-    return written, skipped
+    return written, skipped, sample
 
 
 # -- target writers ---------------------------------------------------------
@@ -525,12 +570,13 @@ class _PlainTextTargetWriter:
     def __init__(self, db: LodeDB) -> None:
         self._db = db
 
-    def write(self, row: ExportedRow) -> str | None:
-        if not row.text or not row.text.strip():
-            return "missing-text"
-        metadata = _stringify_metadata(row.metadata)
-        self._db.add(row.text, id=row.id, metadata=metadata)
-        return None
+    def write_batch(self, rows: list[ExportedRow]) -> None:
+        self._db.add_many(
+            [
+                {"text": row.text, "id": row.id, "metadata": _stringify_metadata(row.metadata)}
+                for row in rows
+            ]
+        )
 
     def persist(self) -> None:
         self._db.persist()
@@ -546,13 +592,12 @@ class _LangChainTargetWriter:
         self._store = store
         self._db = db
 
-    def write(self, row: ExportedRow) -> str | None:
-        if not row.text or not row.text.strip():
-            return "missing-text"
+    def write_batch(self, rows: list[ExportedRow]) -> None:
         self._store.add_texts(
-            [row.text], metadatas=[_stringify_metadata(row.metadata)], ids=[row.id]
+            [row.text for row in rows],
+            metadatas=[_stringify_metadata(row.metadata) for row in rows],
+            ids=[row.id for row in rows],
         )
-        return None
 
     def persist(self) -> None:
         self._db.persist()
@@ -568,18 +613,18 @@ class _LlamaIndexTargetWriter:
         self._store = store
         self._db = db
 
-    def write(self, row: ExportedRow) -> str | None:
-        if not row.text or not row.text.strip():
-            return "missing-text"
+    def write_batch(self, rows: list[ExportedRow]) -> None:
         from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 
-        node = TextNode(
-            id_=row.id, text=row.text, metadata=_stringify_metadata(row.metadata)
-        )
-        if row.ref_doc_id is not None:
-            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=row.ref_doc_id)
-        self._store.add([node])
-        return None
+        nodes = []
+        for row in rows:
+            node = TextNode(id_=row.id, text=row.text, metadata=_stringify_metadata(row.metadata))
+            if row.ref_doc_id is not None:
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=row.ref_doc_id
+                )
+            nodes.append(node)
+        self._store.add(nodes)
 
     def persist(self) -> None:
         self._db.persist()
@@ -594,20 +639,23 @@ class _VectorTargetWriter:
     def __init__(self, db: LodeDB) -> None:
         self._db = db
 
-    def write(self, row: ExportedRow) -> str | None:
-        if row.vector is None:
-            return "missing-vector"
-        if len(row.vector) != self._db._vector_dim:
-            return "dimension-mismatch"
-        text = row.text
-        if text is None and row.raw_payload:
-            import json
-
-            text = json.dumps(row.raw_payload, sort_keys=True, separators=(",", ":"), default=str)
-        self._db.add_vectors(
-            row.vector, id=row.id, metadata=_stringify_metadata(row.metadata), text=text
-        )
-        return None
+    def write_batch(self, rows: list[ExportedRow]) -> None:
+        documents = []
+        for row in rows:
+            text = row.text
+            if text is None and row.raw_payload:
+                text = json.dumps(
+                    row.raw_payload, sort_keys=True, separators=(",", ":"), default=str
+                )
+            documents.append(
+                {
+                    "id": row.id,
+                    "vector": row.vector,
+                    "metadata": _stringify_metadata(row.metadata),
+                    "text": text,
+                }
+            )
+        self._db.add_vectors_many(documents)
 
     def persist(self) -> None:
         self._db.persist()
@@ -623,14 +671,12 @@ class _Mem0TargetWriter:
         self._store = store
         self._dim = int(store.embedding_model_dims)
 
-    def write(self, row: ExportedRow) -> str | None:
-        if row.vector is None:
-            return "missing-vector"
-        if len(row.vector) != self._dim:
-            return "dimension-mismatch"
-        payload = dict(row.raw_payload or {})
-        self._store.insert(vectors=[row.vector], ids=[row.id], payloads=[payload])
-        return None
+    def write_batch(self, rows: list[ExportedRow]) -> None:
+        self._store.insert(
+            vectors=[row.vector for row in rows],
+            ids=[row.id for row in rows],
+            payloads=[dict(row.raw_payload or {}) for row in rows],
+        )
 
     def persist(self) -> None:
         self._store.client.persist()
@@ -643,26 +689,30 @@ class _Mem0TargetWriter:
 
 
 def _validate_target(
-    export: SourceExport,
     plan: MigrationPlan,
     write_dir: Path,
     *,
     written: int,
     skipped_count: int,
+    source_count: int | None,
+    sample: list[dict[str, Any]],
+    embedding_dim: int | None,
     embedding_backend: Any | None,
 ) -> dict[str, Any]:
     """Validates the freshly written target by reopening it read-only.
 
-    Checks count parity (or documented skips), id/metadata survival for a sample,
-    stored-text fetch after reopen when text is retained, and the persisted-index
-    audit. ``written``/``skipped_count`` are the run's own counts; count parity
-    holds when every source row was either written or recorded as skipped.
+    Checks count parity (or documented skips), survival of a sampled set of source
+    rows (id presence, scalar-metadata match, and stored-text fetch after reopen when
+    text is retained), and the persisted-index audit. ``written``/``skipped_count``
+    are the run's own counts; count parity holds when the reopened store holds what we
+    wrote and every source row was either written or recorded as skipped. ``embedding_dim``
+    is the effective dimension the target was written with (the source-discovered
+    dimension when the plan did not pin one), used to reopen vector-preserve stores.
     """
 
     checks: dict[str, Any] = {}
     store_dir = _store_dir(plan, write_dir)
-    read_back = _read_back_counts(plan, store_dir, embedding_backend)
-    source_count = export.count
+    read_back = _read_back_counts(plan, store_dir, sample, embedding_dim, embedding_backend)
     checks["count"] = {
         "source": source_count,
         "target": read_back["count"],
@@ -692,19 +742,33 @@ def _validate_target(
         checks["audit_passed"] = False
 
     checks["sample"] = read_back["sample"]
-    checks["passed"] = bool(checks["count_parity"]) and bool(checks.get("audit_passed"))
+    checks["passed"] = (
+        bool(checks["count_parity"])
+        and bool(checks.get("audit_passed"))
+        and bool(checks["sample"].get("ok"))
+    )
     return checks
 
 
 def _read_back_counts(
-    plan: MigrationPlan, write_dir: Path, embedding_backend: Any | None
+    plan: MigrationPlan,
+    write_dir: Path,
+    sample: list[dict[str, Any]],
+    embedding_dim: int | None,
+    embedding_backend: Any | None,
 ) -> dict[str, Any]:
-    """Reopens the written store read-only and gathers count/sample parity facts."""
+    """Reopens the written store read-only and compares a source sample to the target.
+
+    The count comes from ``count()`` (no full materialization). For each sampled source
+    row it confirms the id is present, the scalar metadata round-tripped (only where the
+    source carried scalar metadata, so it does not flag adapter-derived metadata), and,
+    when text is retained, that the stored text comes back after reopen.
+    """
 
     if plan.mode == MODE_VECTOR_PRESERVE:
         db = LodeDB.open_vector_store(
             write_dir,
-            vector_dim=int(plan.embedding_dim or 8),
+            vector_dim=int(embedding_dim or plan.embedding_dim or 8),
             read_only=True,
             store_text=plan.store_text,
         )
@@ -717,25 +781,47 @@ def _read_back_counts(
             _embedding_backend=embedding_backend,
         )
     try:
-        records = db.list_documents()
-        ids = [record["id"] for record in records]
-        sample_idx = sample_indices(len(ids), limit=int(plan.thresholds.get("sample_size", 25)))
-        sample_ids = [ids[i] for i in sample_idx]
+        count = db.count()
+        ids_present = 0
+        metadata_checked = 0
+        metadata_matched = 0
+        for row in sample:
+            record = db.get_document(row["id"])
+            if record is None:
+                continue
+            ids_present += 1
+            expected_meta = row.get("metadata") or {}
+            if expected_meta:
+                metadata_checked += 1
+                # Subset, not equality: an adapter may add reserved keys (e.g. the
+                # LlamaIndex ref-doc key), but every source scalar must survive.
+                target_meta = dict(record.get("metadata", {}))
+                if all(target_meta.get(key) == value for key, value in expected_meta.items()):
+                    metadata_matched += 1
+        text_ids = [row["id"] for row in sample if row.get("has_text")]
         text_recovered = 0
-        if plan.store_text and sample_ids:
+        if plan.store_text and text_ids:
             try:
-                texts = db.get_texts(sample_ids)
+                texts = db.get_texts(text_ids)
                 text_recovered = sum(1 for value in texts.values() if value)
             except ValueError:
                 text_recovered = 0
+        sample_ok = (
+            ids_present == len(sample)
+            and (metadata_checked == 0 or metadata_matched == metadata_checked)
+            and (not plan.store_text or text_recovered == len(text_ids))
+        )
         return {
-            "count": len(ids),
-            "skipped": 0,
+            "count": count,
             "sample": {
-                "size": len(sample_ids),
-                "ids_present": len(sample_ids),
+                "size": len(sample),
+                "ids_present": ids_present,
+                "metadata_checked": metadata_checked,
+                "metadata_matched": metadata_matched,
+                "text_expected": len(text_ids),
                 "text_recovered": text_recovered,
-                "id_hashes": [hash_id(i) for i in sample_ids[:5]],
+                "ok": sample_ok,
+                "id_hashes": [hash_id(row["id"]) for row in sample[:5]],
             },
         }
     finally:
@@ -827,18 +913,23 @@ def _atomic_move(write_dir: Path, target: Path, *, resume: bool, overwrite: bool
 
 
 def _write_manifest(directory: Path, result: MigrationResult) -> None:
-    """Writes the payload-free ``migration.json`` manifest into ``directory``."""
+    """Writes the payload-free ``migration.json`` manifest into ``directory``.
 
-    import json
+    The manifest is written to a sibling temp file and ``durable_replace``-d into
+    place so a crash mid-write cannot leave a half-written ``migration.json``.
+    """
 
+    from lodedb.engine._atomic_io import durable_replace
     from lodedb.local.migrate.report import assert_payload_free
 
     directory.mkdir(parents=True, exist_ok=True)
     manifest = result.to_manifest()
     assert_payload_free(manifest, where="migration.json")
-    (directory / "migration.json").write_text(
+    tmp = directory / "migration.json.tmp"
+    tmp.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    durable_replace(tmp, directory / "migration.json", fsync=False)
 
 
 def _validate_vector_dim(dim: int | None) -> None:

@@ -555,3 +555,137 @@ def test_missing_text_in_text_replay_is_skipped_with_reason(tmp_path):
     result = run_migration(plan, dry_run=False, source=export, embedding_backend=_backend())
     assert result.written_count == 1
     assert any(s["reason"] == "missing-text" for s in result.skipped)
+
+
+# --------------------------------------------------------------------------------------
+# Publish safety, dimension discovery, and batched writes.
+# --------------------------------------------------------------------------------------
+
+
+def test_failed_validation_does_not_publish_target(tmp_path):
+    """A run whose validation fails must raise and leave no target on disk.
+
+    Two source rows share an id, so the target holds one document while the run wrote
+    two: count parity fails. The run must not publish a failed migration.
+    """
+
+    export = _FixtureExport(
+        [ExportedRow(id="dup", text="first"), ExportedRow(id="dup", text="second")],
+        framework="langchain",
+        provider="in-memory",
+        mode=MODE_TEXT_REPLAY,
+        location="dump.json",
+    )
+    det = Detection(route="framework", framework="langchain")
+    plan = build_plan(det, target=tmp_path / "lc", model="minilm")
+    with pytest.raises(MigrationError):
+        run_migration(plan, dry_run=False, source=export, embedding_backend=_backend())
+    assert not (tmp_path / "lc").exists()
+
+
+def test_failed_overwrite_leaves_existing_target_intact(tmp_path):
+    """A failed `--overwrite-target` run must not replace a previously valid target."""
+
+    det = Detection(route="framework", framework="langchain")
+    plan = build_plan(det, target=tmp_path / "lc", model="minilm")
+
+    good = _FixtureExport(
+        [ExportedRow(id="a", text="alpha")],
+        framework="langchain",
+        provider="in-memory",
+        mode=MODE_TEXT_REPLAY,
+        location="dump.json",
+    )
+    run_migration(plan, dry_run=False, source=good, embedding_backend=_backend())
+    assert target_has_store(tmp_path / "lc")
+
+    bad = _FixtureExport(
+        [ExportedRow(id="x", text="one"), ExportedRow(id="x", text="two")],
+        framework="langchain",
+        provider="in-memory",
+        mode=MODE_TEXT_REPLAY,
+        location="dump.json",
+    )
+    with pytest.raises(MigrationError):
+        run_migration(
+            plan, dry_run=False, overwrite_target=True, source=bad, embedding_backend=_backend()
+        )
+
+    db = LodeDB(path=tmp_path / "lc", model="minilm", read_only=True, _embedding_backend=_backend())
+    try:
+        assert db.count() == 1
+        assert db.get("a") == "alpha"
+    finally:
+        db.close()
+
+
+def test_vector_preserve_validates_with_discovered_dimension(tmp_path):
+    """A provider plan with no --embedding-dim validates against the discovered dimension.
+
+    The source discovers a 16-dim vector; the target is written 16-dim and validation
+    must reopen it 16-dim (not the 8 fallback), so the run succeeds and the manifest
+    records the discovered dimension.
+    """
+
+    rows = [
+        ExportedRow(
+            id=str(i),
+            vector=[1.0 if j == i % 16 else 0.0 for j in range(16)],
+            metadata={"t": "a"},
+        )
+        for i in range(3)
+    ]
+    export = _FixtureExport(
+        rows,
+        framework=None,
+        provider="pgvector",
+        mode=MODE_VECTOR_PRESERVE,
+        location="postgresql://localhost/app",
+        vector_dim=16,
+    )
+    det = Detection(route="provider", provider="pgvector")
+    plan = build_plan(det, target=tmp_path / "pg", embedding_dim=None, table="docs")
+    assert plan.embedding_dim is None
+
+    result = run_migration(plan, dry_run=False, source=export)
+    assert result.status == "migrated"
+    assert result.embedding_dim == 16
+    assert result.validation["passed"] is True
+
+    manifest = json.loads((tmp_path / "pg" / "migration.json").read_text(encoding="utf-8"))
+    assert manifest["target"]["embedding_dim"] == 16
+
+
+def test_write_path_batches_rows_not_one_call_per_row(tmp_path, monkeypatch):
+    """The writer flushes rows through the batch API a bounded number of times.
+
+    1,000 rows must produce ceil(1000 / _WRITE_BATCH) batch calls, not 1,000, so large
+    migrations keep batched commits and batched embedding.
+    """
+
+    from lodedb.local.migrate import runner as runner_mod
+
+    n = 1000
+    rows = [ExportedRow(id=str(i), text=f"doc {i}", metadata={"k": "v"}) for i in range(n)]
+    export = _FixtureExport(
+        rows, framework=None, provider="pgvector", mode=MODE_TEXT_REPLAY, location="src"
+    )
+    det = Detection(route="provider", provider="pgvector")
+    plan = build_plan(det, target=tmp_path / "t", model="minilm", mode=MODE_TEXT_REPLAY)
+
+    calls = {"batches": 0, "rows": 0}
+    original = runner_mod._PlainTextTargetWriter.write_batch
+
+    def counting(self, batch):
+        calls["batches"] += 1
+        calls["rows"] += len(batch)
+        return original(self, batch)
+
+    monkeypatch.setattr(runner_mod._PlainTextTargetWriter, "write_batch", counting)
+    result = run_migration(plan, dry_run=False, source=export, embedding_backend=_backend())
+
+    assert result.written_count == n
+    assert calls["rows"] == n
+    expected_batches = (n + runner_mod._WRITE_BATCH - 1) // runner_mod._WRITE_BATCH
+    assert calls["batches"] == expected_batches
+    assert calls["batches"] < n

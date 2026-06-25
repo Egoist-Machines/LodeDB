@@ -131,4 +131,4 @@ Two replay modes, matching the shipped adapters:
   beneath a framework) are tracked as follow-up source modules. The plan and routing already
   recognize them; the read-only exporters land next.
 - The direct (non-framework) provider path, starting with pgvector, is documented on the
-  companion [install-agent page](install-agent.md).
+  companion [install-agent page](https://egoistmachines.com/lodedb/install-agent).
