@@ -59,6 +59,10 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
   LlamaIndex adapter.
+- **Migrate onto LodeDB**: `lodedb migrate` moves an existing LangChain, LlamaIndex, or mem0
+  store, or a direct provider such as pgvector, onto a local LodeDB path along a
+  plan-first, non-destructive inspect/plan/dry-run/run/validate path.
+  [Migration guide](docs/integrations.md#migrating-onto-lodedb).
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC

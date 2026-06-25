@@ -17,6 +17,7 @@ import typer
 from lodedb.local.backends import resolve_local_device
 from lodedb.local.db import LodeDB
 from lodedb.local.doctor import format_capability_report, local_capability_report
+from lodedb.local.migrate.cli import migrate_app
 
 app = typer.Typer(
     help="LodeDB — local-first embedded vector DB with optional CUDA batch search. "
@@ -335,6 +336,7 @@ mcp_app = typer.Typer(
     help="Serve LodeDB over MCP (stdio), or `install`/`uninstall` it for a coding assistant.",
 )
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(migrate_app, name="migrate")
 
 
 @mcp_app.callback(invoke_without_command=True)
