@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cold-indexing throughput is hardware-dependent and can still favor torch on CPU, so pass
   `embedding_runtime="torch"` for batch-indexing-heavy workloads. `onnxruntime` and `transformers`
   join the base install; `sentence-transformers` (which pulls torch) remains for the fallback.
-  `lodedb doctor` now reports the resolved runtime and the active ONNX execution providers.
+  `lodedb doctor` now reports the preferred runtime (with its torch fallback) and the active ONNX
+  execution providers.
 
 ## [0.3.0] - 2026-06-24
 

@@ -130,8 +130,8 @@ the preset models ship a prebuilt ONNX graph on the Hub that is fetched and cach
 sentence-transformers path keep the vectors comparable, so an index stays portable between
 runtimes. When `onnxruntime` is absent or the ONNX graph cannot be obtained, embedding falls back
 to `sentence-transformers` (PyTorch) on CUDA, MPS, or CPU. `embedding_runtime="auto"|"onnx"|"torch"`
-selects the runtime and `lodedb doctor` reports the resolved one plus the active ONNX execution
-providers. ONNX lowers single-query and incremental-add latency; large-batch cold-indexing
+selects the runtime and `lodedb doctor` reports the preferred one (with its torch fallback) plus the
+active ONNX execution providers. ONNX lowers single-query and incremental-add latency; large-batch cold-indexing
 throughput is hardware-dependent and can favor torch on CPU, so batch-indexing-heavy workloads can
 pin `embedding_runtime="torch"`.
 
