@@ -1250,11 +1250,16 @@ class LodeEngine:
             return ingest
         result, changeset = ingest
         self._capture_vector_document_text(state, vectors)
+        self._capture_vector_lexical_tokens(state, vectors)
         self._stage_wal_record(
             context,
             state,
             "upsert_vectors",
-            _vectors_wal_payload(vectors, include_text=self.raw_text_storage_enabled),
+            _vectors_wal_payload(
+                vectors,
+                include_text=self.raw_text_storage_enabled,
+                include_tokens=self.lexical_index_enabled,
+            ),
         )
         self._finalize_document_ingest(
             context=context,
@@ -4350,6 +4355,16 @@ class LodeEngine:
                 for item in payload.get("vectors", [])
             )
             response = self.upsert_vectors(context=context, vectors=vectors, index_id=index_id)
+            # Under store_text=False the caption is absent from the payload, so the
+            # upsert above could only clear the postings; restore the logged
+            # caption tokens (payload-derived) so lexical/hybrid recover them.
+            if self.lexical_index_enabled:
+                for item in payload.get("vectors", []):
+                    tokens = item.get("tokens")
+                    if tokens is not None:
+                        state.document_tokens[str(item["document_id"])] = [
+                            [str(token) for token in chunk_tokens] for chunk_tokens in tokens
+                        ]
         elif op == "delete_documents":
             document_ids = tuple(str(value) for value in payload.get("document_ids", []))
             response = self.delete_documents(
@@ -5313,6 +5328,28 @@ class LodeEngine:
                 for chunk in chunk_text(document.text, self.chunk_character_limit)
             ]
 
+    def _capture_vector_lexical_tokens(
+        self,
+        state: ClientIndexState,
+        documents: tuple[EngineVectorDocument, ...],
+    ) -> None:
+        """Refreshes persisted lexical tokens when vector-in / image documents are upserted.
+
+        A vector document is a single chunk with no embedded body, but its optional
+        ``text`` caption should be lexically searchable when ``index_text=True``. So set
+        the document's token lists to the caption's tokens, or to an **empty** list when
+        there is no caption. The empty list (rather than dropping the key) both clears
+        any stale postings from a text document this id replaced and journals that clear
+        into the ``.tvlex`` delta, so ``mode="lexical"``/``"hybrid"`` stop matching the
+        old body in this handle and after reopen.
+        """
+
+        if not self.lexical_index_enabled:
+            return
+        for document in documents:
+            caption = document.text
+            state.document_tokens[document.document_id] = [tokenize(caption)] if caption else []
+
     def _journal_text(
         self,
         state: ClientIndexState,
@@ -6107,6 +6144,7 @@ def _vectors_wal_payload(
     vectors: tuple[EngineVectorDocument, ...],
     *,
     include_text: bool,
+    include_tokens: bool,
 ) -> dict[str, Any]:
     """Frames a vector-in upsert batch as a WAL record payload.
 
@@ -6115,7 +6153,11 @@ def _vectors_wal_payload(
     did. The optional retained ``text`` is included only when raw-text storage is
     enabled (``store_text=True``); with ``store_text=False`` it is dropped so no
     raw text is ever written to the WAL, and replay rebuilds the row from the
-    vector alone.
+    vector alone. When a durable lexical index is on (``index_text=True``), the
+    caption's tokens are logged too (payload-derived terms the index already
+    persists, not raw text), so a caption stays lexically searchable after a
+    crash-replay even with ``store_text=False``; otherwise replay leaves the
+    recovered row with empty postings.
     """
 
     return {
@@ -6125,6 +6167,9 @@ def _vectors_wal_payload(
                 "vector": [float(value) for value in vector.vector],
                 "metadata": dict(vector.metadata),
                 "text": vector.text if include_text else None,
+                "tokens": (
+                    ([tokenize(vector.text)] if vector.text else []) if include_tokens else None
+                ),
             }
             for vector in vectors
         ]
