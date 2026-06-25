@@ -180,3 +180,13 @@ def test_image_embedding_metrics_in_stats(tmp_path):
     assert metrics["ingest"]["encode_seconds"] >= 0.0
     assert metrics["query"]["images_embedded"] == 1
     assert metrics["query"]["encode_calls"] == 1
+
+
+def test_add_image_validates_before_embedding(tmp_path):
+    db = _multimodal_db(tmp_path)
+    # Invalid metadata must fail before the expensive encode, wasting no CLIP call
+    # and skewing no ingest metrics (mirrors add_images).
+    with pytest.raises(ValueError):
+        db.add_image("cat", metadata={"bad": ["not", "a", "scalar"]})
+    assert db.count() == 0
+    assert db.stats()["image_embedding"]["ingest"]["encode_calls"] == 0

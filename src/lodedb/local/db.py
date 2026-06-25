@@ -805,6 +805,10 @@ class LodeDB:
 
         self._require_writable()
         backend = self._image_backend()
+        # Validate the cheap payload before the expensive encode, so a bad request
+        # wastes no CLIP encode and does not skew ingest metrics (mirrors add_images).
+        _coerce_metadata(metadata)
+        _coerce_optional_text(text)
         vector = self._embed_images_tracked(backend, (image,), phase="ingest")[0]
         return self.add_vectors(vector, id=id, metadata=metadata, text=text)
 
