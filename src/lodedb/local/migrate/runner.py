@@ -428,11 +428,15 @@ def run_migration(
                 shutil.rmtree(write_dir, ignore_errors=True)
             raise
         result.finished_at = time.time()
-        # Record the manifest in the temp dir first (a failed run is left there,
-        # unpublished, for inspection).
-        _write_manifest(write_dir, result)
-        if not result.validation.get("passed", False):
+        # Set the status before writing the manifest so an unpublished failed run's
+        # ``target.tmp/migration.json`` reflects "failed", not "migrated".
+        passed = bool(result.validation.get("passed", False))
+        if not passed:
             result.status = "failed"
+        # Record the manifest in the temp dir (a failed run is left there, unpublished,
+        # for inspection).
+        _write_manifest(write_dir, result)
+        if not passed:
             raise MigrationError(
                 "migration validation failed (count_parity="
                 f"{result.validation.get('count_parity')}, audit_passed="

@@ -106,8 +106,9 @@ Two replay modes, matching the shipped adapters:
 - Text replay (LangChain, LlamaIndex). Export canonical text, ids, and metadata; LodeDB embeds
   with the selected preset and retains text in its raw-text sidecar by default, so reopen-safe
   retrieval and hybrid search work. Ranking parity with the source embeddings is not promised;
-  validation checks count, metadata and filter behavior, stored-text recovery after reopen, and
-  a representative query-overlap sample.
+  validation checks count parity, a sampled set of source ids and scalar metadata, stored-text
+  recovery after reopen, and the persisted-index audit. Representative query-overlap is a
+  reserved check and is not yet enforced.
 - Vector preserve (mem0). mem0 owns embeddings, so ids, vectors, and full payloads are copied
   verbatim. The full mem0 payload JSON is kept in LodeDB's raw-text sidecar, and scalar filter
   keys such as `user_id`, `agent_id`, and `run_id` stay in metadata so filtered reads stay

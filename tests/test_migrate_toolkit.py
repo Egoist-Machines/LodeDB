@@ -581,6 +581,10 @@ def test_failed_validation_does_not_publish_target(tmp_path):
     with pytest.raises(MigrationError):
         run_migration(plan, dry_run=False, source=export, embedding_backend=_backend())
     assert not (tmp_path / "lc").exists()
+    # The unpublished run is left in the temp dir, and its manifest reflects the failure.
+    tmp_manifest = tmp_path / "lc.tmp" / "migration.json"
+    assert tmp_manifest.exists()
+    assert json.loads(tmp_manifest.read_text(encoding="utf-8"))["status"] == "failed"
 
 
 def test_failed_overwrite_leaves_existing_target_intact(tmp_path):

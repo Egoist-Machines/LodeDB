@@ -23,14 +23,12 @@ from lodedb.local.migrate.sources.base import MODE_TEXT_REPLAY, MODE_VECTOR_PRES
 
 PLAN_VERSION = 1
 
-# Default validation thresholds. ``query_overlap`` is the fraction of a query's
-# top-k that must survive the migration for representative queries (text-replay
-# re-embeds, so exact rank parity is explicitly not promised — see the issue
-# non-goals). ``sample_size`` bounds the id/metadata/text parity check.
+# Default validation thresholds for the checks the runner actually enforces:
+# count parity and the id/metadata/text sample (``sample_size`` bounds the sample).
+# Representative-query overlap is a planned check and is intentionally not advertised
+# here until the runner enforces it, so a plan never implies a check that does not run.
 DEFAULT_THRESHOLDS = {
     "count_parity": True,
-    "query_overlap": 0.6,
-    "query_sample": 5,
     "sample_size": 25,
 }
 
@@ -120,8 +118,7 @@ class MigrationPlan:
             "## Validation thresholds",
             "",
             f"- Count parity required: {self.thresholds.get('count_parity')}",
-            f"- Query overlap threshold: {self.thresholds.get('query_overlap')}",
-            f"- Sample size: {self.thresholds.get('sample_size')}",
+            f"- Sample size (id/metadata/text checks): {self.thresholds.get('sample_size')}",
             "",
             "## Switch the application",
             "",
