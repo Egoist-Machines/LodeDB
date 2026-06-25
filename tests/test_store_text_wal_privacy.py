@@ -16,13 +16,26 @@ DIM = 8
 
 
 def _files_containing(root, needle: bytes) -> list[str]:
-    """Returns the on-disk files under root whose bytes contain needle."""
+    """Returns the on-disk files under root whose bytes contain needle.
 
-    return [
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.is_file() and needle in path.read_bytes()
-    ]
+    Skips the single-writer lock sentinel (``.lodedb.lock``): it carries no payload,
+    and on Windows the live writer holds it open with a byte-range lock, so reading
+    it raises PermissionError (a portability quirk, not a leak). The WAL and every
+    data sidecar are opened-and-closed per write, so they stay in scope; a
+    PermissionError on anything else is tolerated defensively for the same reason.
+    """
+
+    hits: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.name == ".lodedb.lock":
+            continue
+        try:
+            data = path.read_bytes()
+        except PermissionError:
+            continue
+        if needle in data:
+            hits.append(str(path.relative_to(root)))
+    return hits
 
 
 class _FakeClip(HashEmbeddingBackend):
