@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durable_replace
+from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.local.db import LodeDB
 
 _MANIFEST_NAME = "collection.json"
@@ -94,9 +95,6 @@ class LodeCollection:
         """
 
         safe = self._validate_name(name)
-        if safe in self._open:
-            return self._open[safe]
-
         # A vector-only space ignores the preset model, so record it as null to
         # keep the manifest honest (and reopen-comparison stable).
         requested = {
@@ -106,11 +104,17 @@ class LodeCollection:
         }
         recorded = self._spaces_config.get(safe)
         if recorded is not None:
+            # Enforce the requested config before anything else, including before
+            # returning an already-open handle, so a mismatched reopen fails here
+            # rather than much later on a vector insert into the wrong-shape index.
             self._enforce_config(safe, recorded, requested)
         elif self.read_only:
             raise FileNotFoundError(
                 f"space {name!r} does not exist in this collection (read-only): {self.path}"
             )
+
+        if safe in self._open:
+            return self._open[safe]
 
         db = LodeDB(
             path=self.path / safe,
@@ -203,18 +207,33 @@ class LodeCollection:
         return {str(name): dict(config) for name, config in spaces.items()}
 
     def _write_manifest(self) -> None:
-        """Atomically publishes the current space registry to the manifest file."""
+        """Atomically publishes the space registry, merging any concurrent spaces.
 
-        manifest_path = self._manifest_path()
-        body = json.dumps(
-            {"version": _MANIFEST_VERSION, "spaces": self._spaces_config},
-            indent=2,
-            sort_keys=True,
-        )
-        fd, tmp_name = tempfile.mkstemp(dir=self.path, prefix=".collection-", suffix=".tmp")
+        Manifest mutations are serialized on a collection-root advisory lock, and
+        the on-disk manifest is re-read under it (read-merge-write), so a space that
+        another handle created since this one loaded is preserved rather than lost
+        to last-writer-wins. (Within one process, spaces still follow LodeDB's
+        single-writer-per-path model; this only guards the shared manifest file.)
+        """
+
+        lock = WriterLock(self.path)
+        lock.acquire(timeout=lodedb_lock_timeout_from_env())
         try:
-            with open(fd, "w", encoding="utf-8") as handle:
-                handle.write(body)
-            durable_replace(tmp_name, manifest_path, fsync=False)
+            merged = self._load_manifest()
+            merged.update(self._spaces_config)
+            self._spaces_config = merged
+            manifest_path = self._manifest_path()
+            body = json.dumps(
+                {"version": _MANIFEST_VERSION, "spaces": self._spaces_config},
+                indent=2,
+                sort_keys=True,
+            )
+            fd, tmp_name = tempfile.mkstemp(dir=self.path, prefix=".collection-", suffix=".tmp")
+            try:
+                with open(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+                durable_replace(tmp_name, manifest_path, fsync=False)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
         finally:
-            Path(tmp_name).unlink(missing_ok=True)
+            lock.release()
