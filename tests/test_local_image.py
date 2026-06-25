@@ -27,7 +27,7 @@ class _FakeClipBackend:
     """
 
     name = "clip"
-    required_model_name = None
+    required_model_name = "fake-clip"
     native_dim = DIM
 
     def embed_documents(self, texts):
@@ -48,6 +48,14 @@ class _FakeClipBackend:
 
 def _multimodal_db(path, **kwargs) -> LodeDB:
     return LodeDB(path=path, embedder=_FakeClipBackend(), **kwargs)
+
+
+def _text_only_embedder() -> HashEmbeddingBackend:
+    # A text-only embedder (no embed_images) with an identity, so construction
+    # succeeds and the image verbs fail for the right reason.
+    backend = HashEmbeddingBackend(native_dim=DIM)
+    backend.required_model_name = "text-only"
+    return backend
 
 
 def test_add_image_and_cross_modal_text_search(tmp_path):
@@ -91,7 +99,7 @@ def test_add_images_requires_image_key(tmp_path):
 
 
 def test_add_images_rejected_without_image_backend(tmp_path):
-    db = LodeDB(path=tmp_path, embedder=HashEmbeddingBackend(native_dim=DIM))
+    db = LodeDB(path=tmp_path, embedder=_text_only_embedder())
     with pytest.raises(ImageEmbeddingUnsupportedError):
         db.add_images([{"image": "cat"}])
 
@@ -112,7 +120,7 @@ def test_add_image_optional_caption_text(tmp_path):
 
 def test_image_verbs_rejected_without_image_backend(tmp_path):
     # A text-only embedder (no embed_images) cannot serve image verbs.
-    db = LodeDB(path=tmp_path, embedder=HashEmbeddingBackend(native_dim=DIM))
+    db = LodeDB(path=tmp_path, embedder=_text_only_embedder())
     with pytest.raises(ImageEmbeddingUnsupportedError):
         db.add_image("cat")
     with pytest.raises(ImageEmbeddingUnsupportedError):

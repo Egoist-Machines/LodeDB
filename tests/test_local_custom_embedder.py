@@ -19,7 +19,16 @@ DIM = 512
 
 
 def _embedder() -> HashEmbeddingBackend:
-    return HashEmbeddingBackend(native_dim=DIM)
+    # The public embedder= path requires a non-empty required_model_name (a public
+    # identity pinned into the index header), so give the fixture one.
+    backend = HashEmbeddingBackend(native_dim=DIM)
+    backend.required_model_name = "test-embedder"
+    return backend
+
+
+def test_embedder_without_identity_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="required_model_name"):
+        LodeDB(path=tmp_path, embedder=HashEmbeddingBackend(native_dim=DIM))
 
 
 def test_custom_embedder_text_roundtrip(tmp_path):

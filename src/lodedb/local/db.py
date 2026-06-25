@@ -288,11 +288,19 @@ class LodeDB:
             native_dim = int(getattr(embedder, "native_dim", 0))
             if native_dim <= 0:
                 raise ValueError("embedder must expose a positive native_dim")
+            model_identity = getattr(embedder, "required_model_name", None)
+            if not model_identity:
+                raise ValueError(
+                    "embedder must set a non-empty required_model_name: a public, "
+                    "non-secret identifier for the model that produced the vectors. It is "
+                    "pinned into the index header and re-enforced on reopen, so a "
+                    "same-dimension different-model backend is rejected rather than scored. "
+                    "Identity-free fixtures belong on the internal _embedding_backend hook."
+                )
             self.preset = None
             self._vector_dim_value = native_dim
             backend = embedder
             self._embedding_backend = backend
-            model_identity = getattr(embedder, "required_model_name", None) or "custom"
             self.embedding_resolution = LocalEmbeddingResolution(
                 requested_device=device,
                 backend_name=getattr(backend, "name", "custom"),
@@ -779,17 +787,18 @@ class LodeDB:
         *,
         normalize: bool = True,
     ) -> list[str]:
-        """Embeds and stores a batch of images in one model call and one commit.
+        """Embeds and stores a batch of images, then commits once.
 
         Batched counterpart to :meth:`add_image`: each item is a mapping with an
         ``"image"`` (path / ``bytes`` / PIL image) plus optional ``"id"``,
-        ``"metadata"``, and ``"text"`` (caption). Every image is embedded in a
-        single ``embed_images`` call, which is far cheaper than repeated
-        :meth:`add_image` for a gallery, then the batch is stored through the same
-        atomic-commit vector path as :meth:`add_vectors_many`. Returns the ids in
-        input order. Requires a multimodal index (``model="clip"`` or a custom
-        ``embedder=`` exposing ``embed_images``); the per-image storage contract
-        matches :meth:`add_image` (the raw image bytes are never stored).
+        ``"metadata"``, and ``"text"`` (caption). Images are decoded and encoded in
+        backend-sized batches (so peak memory is bounded by the batch, not the whole
+        gallery) and the resulting vectors are stored in one atomic commit via the
+        same path as :meth:`add_vectors_many` — far cheaper than repeated
+        :meth:`add_image`. Returns the ids in input order. Requires a multimodal
+        index (``model="clip"`` or a custom ``embedder=`` exposing ``embed_images``);
+        the per-image storage contract matches :meth:`add_image` (the raw image bytes
+        are never stored).
         """
 
         self._require_writable()
@@ -810,8 +819,12 @@ class LodeDB:
             texts.append(item.get("text"))
         if not images:
             return []
-        # One batched encode for the whole gallery, then one atomic commit.
-        vectors = backend.embed_images(images)
+        # Decode + encode in backend-sized batches so memory is bounded by the batch
+        # (not the whole gallery's decoded pixels), then commit all vectors at once.
+        batch_size = max(1, int(getattr(backend, "batch_size", 16) or 16))
+        vectors: list[Any] = []
+        for start in range(0, len(images), batch_size):
+            vectors.extend(backend.embed_images(images[start : start + batch_size]))
         payload = [
             EngineVectorDocument(
                 document_id=ids[index],
