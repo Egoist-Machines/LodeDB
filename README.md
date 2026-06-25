@@ -76,6 +76,7 @@ the install with `lodedb doctor`. Optional extras:
 
 ```bash
 pip install "lodedb[gpu]"                            # GPU-resident scan (Linux/CUDA)
+pip install "lodedb[image]"                          # image + text (CLIP) embedding (model="clip")
 pip install "lodedb[mcp,langchain,llama-index,mem0]" # MCP server + LangChain/LlamaIndex/mem0 adapters
 pip install "lodedb[onnx-export]"                    # export ONNX for a custom model (Optimum); presets need no export
 ```

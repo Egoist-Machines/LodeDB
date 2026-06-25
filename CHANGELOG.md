@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multimodal (CLIP) and bring-your-own-vector search.** A `clip` preset embeds images and text
+  into one shared space (`db.add_image()` / `db.add_images()` and cross-modal `search` /
+  `search_by_image`) via a sentence-transformers CLIP model behind the optional `lodedb[image]`
+  extra (Pillow only, lazy-imported). A public `embedder=` argument drives a text-capable index
+  with any embedding backend at its own dimension (it must declare a non-secret
+  `required_model_name`), and `LodeCollection` groups named vector spaces (sibling indexes) under
+  one root, reopened from a manifest. A preset, custom-embedder, or vector-only index pins its
+  model identity in the on-disk header and re-enforces it on reopen. The raw image is never stored
+  (keep its path in metadata), and `store_text=False` now keeps raw text off disk in WAL commit
+  mode too: WAL records log chunk embeddings (and lexical tokens when `index_text=True`), never the
+  raw document body or a vector caption.
 - **PrivateGPT vector-store provider.** `lodedb.local.integrations.privategpt` lets
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) use LodeDB as its local vector store.
   PrivateGPT's store layer is LlamaIndex's `BasePydanticVectorStore` selected by
