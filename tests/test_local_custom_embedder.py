@@ -62,6 +62,31 @@ def test_embedder_and_vector_dim_mutually_exclusive(tmp_path):
         LodeDB(path=tmp_path, vector_dim=DIM, embedder=_embedder())
 
 
+class _IdentBackend(HashEmbeddingBackend):
+    """A hash backend that declares a model identity, for reopen-identity tests."""
+
+    def __init__(self, model_name: str, dim: int = DIM) -> None:
+        super().__init__(native_dim=dim)
+        self.required_model_name = model_name
+        self.name = "ident"
+
+
+def test_reopen_with_wrong_embedder_identity_is_rejected(tmp_path):
+    db = LodeDB(path=tmp_path, embedder=_IdentBackend("model-A"))
+    db.add("hello world", id="a")
+    db.persist()
+    db.close()
+
+    # Same dimension, different declared model identity: rejected at open rather
+    # than silently serving meaningless scores.
+    with pytest.raises(RuntimeError, match="does not match"):
+        LodeDB(path=tmp_path, embedder=_IdentBackend("model-B"))
+
+    # The matching identity still reopens cleanly.
+    reopened = LodeDB(path=tmp_path, embedder=_IdentBackend("model-A"))
+    assert reopened.count() == 1
+
+
 class _NoDimBackend:
     """A backend that fails to declare a usable dimension."""
 

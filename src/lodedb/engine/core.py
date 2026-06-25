@@ -1093,6 +1093,35 @@ class LodeEngine:
             },
         )
 
+    def _reject_text_in_wal_without_retention(
+        self, context: EngineRequestContext, operation: str
+    ) -> EngineResponse | None:
+        """Rejects text-in ingestion that WAL cannot replay without persisting raw text.
+
+        WAL replay re-embeds a text document from its logged body, so the only way
+        to keep the log replayable under ``store_text=False`` would be to write the
+        raw text into the WAL, which violates the no-raw-text-on-disk contract.
+        Generation mode persists the compact codes directly and needs no raw text,
+        so it is the supported durability mode for this combination (the local SDK
+        selects it automatically; this guards direct engine callers). Never fires
+        during replay, where the in-memory state is simply being rebuilt.
+        """
+
+        if (
+            self._commit_mode == CommitMode.WAL
+            and not self.raw_text_storage_enabled
+            and not self._wal_replaying
+        ):
+            return self._error(
+                400,
+                "commit_mode='wal' cannot ingest text documents when raw-text storage is "
+                "disabled (store_text=False): WAL replay would need the raw text. Use "
+                "commit_mode='generation', enable store_text, or use the vector-in API.",
+                operation,
+                context.client_id,
+            )
+        return None
+
     @_synchronized
     def build_documents(
         self,
@@ -1107,6 +1136,9 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="build_documents")
         if isinstance(state, EngineResponse):
             return state
+        guard = self._reject_text_in_wal_without_retention(context, "build_documents")
+        if guard is not None:
+            return guard
         if state.chunks or state.document_hashes:
             return self._error(
                 409,
@@ -1155,6 +1187,9 @@ class LodeEngine:
         state = self._index_for_context(context, index_id=index_id, operation="upsert_documents")
         if isinstance(state, EngineResponse):
             return state
+        guard = self._reject_text_in_wal_without_retention(context, "upsert_documents")
+        if guard is not None:
+            return guard
         ingest = self._ingest_documents(
             context=context,
             state=state,
@@ -1217,7 +1252,12 @@ class LodeEngine:
             return ingest
         result, changeset = ingest
         self._capture_vector_document_text(state, vectors)
-        self._stage_wal_record(context, state, "upsert_vectors", _vectors_wal_payload(vectors))
+        self._stage_wal_record(
+            context,
+            state,
+            "upsert_vectors",
+            _vectors_wal_payload(vectors, include_text=self.raw_text_storage_enabled),
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -2588,8 +2628,56 @@ class LodeEngine:
         if self.embedding_backend is not None:
             if self.embedding_backend.native_dim != state.native_dim:
                 raise ValueError("configured embedding backend dimension does not match index")
+            required = self.embedding_backend.required_model_name
+            if required and required != state.model:
+                raise ValueError(
+                    "configured embedding backend model does not match index "
+                    f"(backend {required!r} vs index {state.model!r})"
+                )
             return self.embedding_backend
         return HashEmbeddingBackend(native_dim=state.native_dim)
+
+    def _validate_loaded_state_identity(self, state: ClientIndexState) -> None:
+        """Rejects a loaded index whose persisted identity contradicts this handle.
+
+        Index creation validates (model, provider, task, native_dim) against the
+        active route policy and embedding backend; loading must enforce the same,
+        or a store written with one model/dimension could be reopened with a
+        same-dimension, different-model backend and silently serve meaningless
+        similarity scores. Identity is only enforced when the opener declares one:
+        a backend with ``required_model_name is None`` (e.g. a custom embedder that
+        names no model) has no identity to compare, so only the dimension is
+        enforced for it.
+        """
+
+        if self.route_policy is not None:
+            policy = self.route_policy
+            if state.native_dim != policy.native_dim:
+                raise RuntimeError(
+                    f"persisted index dimension {state.native_dim} does not match the opened "
+                    f"route profile {policy.profile!r} (dim {policy.native_dim}); reopen with "
+                    "the same model / embedder / vector_dim it was written with"
+                )
+            if state.model != policy.model:
+                raise RuntimeError(
+                    f"persisted index model {state.model!r} does not match the opened route "
+                    f"profile {policy.profile!r} model {policy.model!r}; reopen with the same "
+                    "model / embedder it was written with"
+                )
+        backend = self.embedding_backend
+        if backend is not None:
+            if backend.native_dim != state.native_dim:
+                raise RuntimeError(
+                    f"configured embedding backend dimension {backend.native_dim} does not "
+                    f"match persisted index dimension {state.native_dim}"
+                )
+            required = backend.required_model_name
+            if required and required != state.model:
+                raise RuntimeError(
+                    f"configured embedding backend model {required!r} does not match the "
+                    f"persisted index model {state.model!r}; reopen with the embedder it was "
+                    "written with"
+                )
 
     def _query_serving_index(
         self,
@@ -4796,6 +4884,13 @@ class LodeEngine:
             if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
                 continue
             self._load_legacy_index(path)
+        # Reject any persisted index whose identity does not match this handle's
+        # route policy / embedding backend. Create enforces (model, native_dim);
+        # loading must enforce the same, or a store written with one model could be
+        # reopened with a same-dimension different-model backend and serve
+        # meaningless scores instead of failing.
+        for state in self._indexes.values():
+            self._validate_loaded_state_identity(state)
         # WAL recovery (writer handles only). The durable base on disk is always a
         # committed generation; this replays any <key>.wal tail on top so a
         # WAL-committed-but-not-yet-checkpointed mutation survives the reopen, then
@@ -5873,12 +5968,19 @@ def _documents_wal_payload(documents: tuple[EngineDocument, ...]) -> dict[str, A
     }
 
 
-def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str, Any]:
+def _vectors_wal_payload(
+    vectors: tuple[EngineVectorDocument, ...],
+    *,
+    include_text: bool,
+) -> dict[str, Any]:
     """Frames a vector-in upsert batch as a WAL record payload.
 
     Stores each vector verbatim (already L2-normalized at the SDK boundary) plus
-    redacted metadata and the optional retained text, so replay reproduces the
-    same encoded rows the live commit did.
+    redacted metadata, so replay reproduces the same encoded rows the live commit
+    did. The optional retained ``text`` is included only when raw-text storage is
+    enabled (``store_text=True``); with ``store_text=False`` it is dropped so no
+    raw text is ever written to the WAL, and replay rebuilds the row from the
+    vector alone.
     """
 
     return {
@@ -5887,7 +5989,7 @@ def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str,
                 "document_id": vector.document_id,
                 "vector": [float(value) for value in vector.vector],
                 "metadata": dict(vector.metadata),
-                "text": vector.text,
+                "text": vector.text if include_text else None,
             }
             for vector in vectors
         ]

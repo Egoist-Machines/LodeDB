@@ -107,8 +107,8 @@ def test_reopen_at_wrong_dim_is_rejected(tmp_path):
     writer.persist()
     writer.close()
 
-    # The persisted index is DIM-dimensional; reopening "as" a different dim and
-    # ingesting a vector of that dim is rejected by the engine's dim enforcement.
-    db = LodeDB.open_vector_store(tmp_path, vector_dim=128)
-    with pytest.raises(Exception):  # noqa: B017 - EngineError surfaces the 400
-        db.add_vectors(_onehot(0, 128), id="b")
+    # The persisted index is DIM-dimensional; reopening "as" a different dim is
+    # rejected at open by the engine's identity enforcement (fail fast, before any
+    # mismatched ingest).
+    with pytest.raises(RuntimeError, match="does not match"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=128)
