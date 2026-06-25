@@ -2,7 +2,8 @@
 
 ``LodeDB`` runs the engine in-process in a local profile that:
 
-- binds to loopback only (never a network address);
+- binds the embedded SDK to loopback, while `lodedb serve` may intentionally bind a
+  private-network address for trusted-LAN demos;
 - requires no authentication — the user never supplies or sees any credential;
 - keeps telemetry metrics-only (counts / bytes / latency, never payloads);
 - stores vectors in the compact TurboVec format and commits every change
@@ -176,10 +177,7 @@ class LodeDB:
         or ``"fsync"`` (fsync each file + its directory on commit, trading commit
         throughput for power-loss durability). Unset reads ``LODEDB_DURABILITY``.
         ``commit_mode`` selects how each mutation is committed and defaults to
-        ``"generation"`` (every change publishes a new crash-atomic, lock-free
-        MVCC-readable generation — the historical behavior, unchanged). Pass
-        ``"wal"`` to opt a single-writer handle into the write-ahead-log path:
-        each ``add``/``remove`` appends one framed record to a ``<key>.wal`` file
+        ``"wal"``: each ``add``/``remove`` appends one framed record to a ``<key>.wal`` file
         (a single ``write`` plus, in ``durability="fsync"``, one ``fsync``) and a
         full generation is checkpointed only periodically, which makes the common
         single-add commit far cheaper. The WAL is replayed crash-atomically on the
@@ -188,7 +186,9 @@ class LodeDB:
         lock-free concurrent-reader snapshot that ``open_readonly`` relies on for
         *uncheckpointed* writes — it is meant for single-process deployments —
         but the on-disk generation a reader sees is always a consistent committed
-        one. Unset reads ``LODEDB_COMMIT_MODE``.
+        one. Pass ``"generation"`` for the historical path where every change
+        publishes a new crash-atomic, lock-free MVCC-readable generation. Unset
+        reads ``LODEDB_COMMIT_MODE``.
         ``store_text`` controls durable raw-text retention and defaults to
         ``True``: the original text passed to ``add``/``add_many`` is kept in a
         dedicated on-disk sidecar so ``get``/``get_text``/``get_texts`` can return
@@ -217,8 +217,8 @@ class LodeDB:
         fsync_on_commit = (
             durability_from_env() if durability is None else normalize_durability(durability)
         )
-        # "generation" (per-mutation MVCC publish, default) vs "wal" (append +
-        # periodic checkpoint). Explicit arg wins; otherwise LODEDB_COMMIT_MODE.
+        # "wal" (append + periodic checkpoint, default) vs "generation"
+        # (per-mutation MVCC publish). Explicit arg wins; otherwise LODEDB_COMMIT_MODE.
         resolved_commit_mode = (
             commit_mode_from_env() if commit_mode is None else parse_commit_mode(commit_mode)
         )
@@ -827,10 +827,10 @@ class LodeDB:
         """Flushes durable on-disk state and returns redacted storage stats.
 
         The engine already persists on every mutation; this is an explicit
-        durability + stats checkpoint. In ``commit_mode="wal"`` it folds the
+        durability + stats checkpoint. In the default ``commit_mode="wal"`` it folds the
         outstanding write-ahead log into a fresh committed generation (so the
-        on-disk base is fully up to date and the WAL is empty); in the default
-        ``generation`` mode there is nothing buffered, so it only reports stats.
+        on-disk base is fully up to date and the WAL is empty); in
+        ``commit_mode="generation"`` there is nothing buffered, so it only reports stats.
         State is reloaded automatically on the next ``LodeDB(path=...)`` open.
         """
 

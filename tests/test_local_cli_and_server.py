@@ -24,14 +24,9 @@ runner = CliRunner()
 
 
 def _cli_json(output: str) -> dict:
-    """Extracts the command's JSON object from CLI output.
+    """Extracts the command's JSON object from clean CLI output."""
 
-    Indexing emits metrics-only engine log lines (counts/latency, never text) to
-    stdout alongside the command's JSON result; those lines carry no braces, so
-    decoding from the first ``{`` recovers the JSON regardless of interleaving.
-    """
-
-    return json.JSONDecoder().raw_decode(output[output.index("{") :])[0]
+    return json.loads(output)
 
 
 def test_cli_doctor_text_and_json():
@@ -77,12 +72,12 @@ def _http_json(url: str, payload: dict | None = None) -> dict:
 
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - loopback only
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - local test URL
         return json.loads(response.read().decode("utf-8"))
 
 
 def test_local_server_add_search_remove_round_trip(tmp_path):
-    """The loopback server adds, searches, reports stats, and removes documents."""
+    """The local server adds, searches, reports stats, and removes documents."""
 
     db = LodeDB(
         path=tmp_path, model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384)
@@ -203,6 +198,17 @@ def test_cli_index_default_get_and_no_store_text_round_trip(tmp_path, monkeypatc
     plain_id = _cli_json(plain.output)["ids"][0]
     missing = runner.invoke(app, ["get", plain_id, "-p", str(tmp_path / "plain")])
     assert missing.exit_code != 0  # BadParameter -> "document not found"
+
+
+def test_private_bind_hosts_are_intentional_but_unspecified_is_rejected():
+    """serve_local allows loopback/private addresses, not public or all-interface binds."""
+
+    from lodedb.engine.core import is_private_bind_host
+
+    for host in ("127.0.0.1", "::1", "localhost", "10.0.0.5", "172.16.0.5", "192.168.1.5"):
+        assert is_private_bind_host(host), host
+    for host in ("8.8.8.8", "1.1.1.1", "0.0.0.0", "::"):
+        assert not is_private_bind_host(host), host
 
 
 def test_local_server_rejects_non_private_host(tmp_path):

@@ -31,11 +31,51 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (lean runtime + dev/mcp/langchain/llama-index/mem0 extras)
+      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0 extras)
         run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0
 
       - name: Lint
         run: uv run ruff check .
+
+      - name: Base runtime contract
+        run: |
+          uv run python - <<'PY'
+          import importlib.util
+          import sys
+
+          import lodedb
+
+          loaded = {name.split(".", 1)[0] for name in sys.modules}
+          eager_forbidden = {
+              "onnxruntime",
+              "transformers",
+              "sentence_transformers",
+              "torch",
+              "sklearn",
+              "faiss",
+              "modal",
+              "mteb",
+              "datasets",
+              "matplotlib",
+          }
+          eager = sorted(loaded & eager_forbidden)
+          if eager:
+              raise SystemExit(f"import lodedb eagerly loaded heavy runtime modules: {eager}")
+
+          required = {
+              "numpy": "numpy",
+              "typer": "typer",
+              "onnxruntime": "onnxruntime",
+              "transformers": "transformers",
+              "sentence-transformers": "sentence_transformers",
+              "pyyaml": "yaml",
+          }
+          missing = [name for name, module in required.items() if importlib.util.find_spec(module) is None]
+          if missing:
+              raise SystemExit(f"missing base runtime dependencies: {missing}")
+
+          assert lodedb.__version__
+          PY
 
       - name: Test
         run: uv run pytest -q

@@ -16,9 +16,7 @@ not reimplement search.
 
 from __future__ import annotations
 
-import contextlib
 import platform
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -76,49 +74,45 @@ def run_local_benchmark(
 ) -> dict[str, Any]:
     """Runs the embedding + CPU-scan benchmark and returns a redacted summary."""
 
-    # The engine emits build/query/persist progress lines to stdout; redirect
-    # them to stderr so the benchmark's own stdout stays pure metrics-only JSON
-    # (so `lodedb benchmark | jq ...` works). Timing is unaffected.
-    with contextlib.redirect_stdout(sys.stderr):
-        effective_device = resolve_local_device(device)
-        db = LodeDB(
-            path=path,
-            model=model,
-            device=device,
-            embedding_runtime=embedding_runtime,
-            batch_size=embed_batch_size,
-        )
+    effective_device = resolve_local_device(device)
+    db = LodeDB(
+        path=path,
+        model=model,
+        device=device,
+        embedding_runtime=embedding_runtime,
+        batch_size=embed_batch_size,
+    )
 
-        documents = _synthetic_documents(doc_count)
+    documents = _synthetic_documents(doc_count)
 
-        # Warm up the embedding backend (load weights once) so the timed throughput
-        # below is warm steady state, not the one-time model load. Without this the
-        # figure is dominated by cold start and depends on call ordering.
-        db._embedding_backend.embed_documents((documents[0]["text"],))
+    # Warm up the embedding backend (load weights once) so the timed throughput
+    # below is warm steady state, not the one-time model load. Without this the
+    # figure is dominated by cold start and depends on call ordering.
+    db._embedding_backend.embed_documents((documents[0]["text"],))
 
-        embed_start = time.perf_counter()
-        db.add_many(documents)
-        embed_seconds = time.perf_counter() - embed_start
-        docs_per_second = doc_count / embed_seconds if embed_seconds > 0 else 0.0
+    embed_start = time.perf_counter()
+    db.add_many(documents)
+    embed_seconds = time.perf_counter() - embed_start
+    docs_per_second = doc_count / embed_seconds if embed_seconds > 0 else 0.0
 
-        db.persist()
+    db.persist()
 
-        # Query latency: each search embeds the query then scans on the CPU kernel.
-        # We report total query latency and isolate the search component using the
-        # engine's own per-query timing fields (query_search_latency_ms), which
-        # exclude embedding.
-        queries = [documents[i % doc_count]["text"] for i in range(query_count)]
-        total_latencies: list[float] = []
-        search_latencies: list[float] = []
-        for text in queries:
-            t0 = time.perf_counter()
-            response = db._index.query(text, top_k=top_k)  # engine path; timed fields below
-            total_latencies.append((time.perf_counter() - t0) * 1000.0)
-            search_latencies.append(float(response.get("query_search_latency_ms", 0.0)))
+    # Query latency: each search embeds the query then scans on the CPU kernel.
+    # We report total query latency and isolate the search component using the
+    # engine's own per-query timing fields (query_search_latency_ms), which
+    # exclude embedding.
+    queries = [documents[i % doc_count]["text"] for i in range(query_count)]
+    total_latencies: list[float] = []
+    search_latencies: list[float] = []
+    for text in queries:
+        t0 = time.perf_counter()
+        response = db._index.query(text, top_k=top_k)  # engine path; timed fields below
+        total_latencies.append((time.perf_counter() - t0) * 1000.0)
+        search_latencies.append(float(response.get("query_search_latency_ms", 0.0)))
 
-        stats = db.stats()
-        storage = stats.get("storage", {}) if isinstance(stats.get("storage"), dict) else {}
-        db.close()
+    stats = db.stats()
+    storage = stats.get("storage", {}) if isinstance(stats.get("storage"), dict) else {}
+    db.close()
 
     return {
         "machine": {

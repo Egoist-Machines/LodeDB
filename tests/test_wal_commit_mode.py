@@ -1,10 +1,10 @@
-"""Opt-in WAL commit mode for LodeDB (``commit_mode="wal"``).
+"""Default WAL commit mode for LodeDB (``commit_mode="wal"``).
 
 WAL mode appends one framed record per mutation to ``<key>.wal`` and checkpoints
 into a generation periodically, instead of publishing a new generation on every
 write. It is crash-atomic: the WAL is replayed on open (a torn trailing record
 is discarded) and folded into a generation on a clean close. These tests cover
-the knob plumbing, equivalence with the default generation mode, the checkpoint,
+the knob plumbing, equivalence with the classic generation mode, the checkpoint,
 and crash recovery — including a hard ``os._exit`` kill of a writer mid-run.
 """
 

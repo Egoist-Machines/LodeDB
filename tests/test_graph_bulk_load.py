@@ -52,6 +52,33 @@ def test_add_nodes_and_edges_batch(tmp_path):
     assert kg.semantic_nodes(embedding=_onehot(40), k=1)[0][1].id == "b"
 
 
+def test_bulk_node_replacement_clears_stale_semantic_doc(tmp_path):
+    """Replacing a node with no semantic content removes its derived index doc."""
+
+    kg = _kg(tmp_path)
+    kg.add_nodes([{"id": "a", "label": "alpha E1234"}])
+    assert [node.id for _score, node in kg.semantic_nodes("E1234", mode="lexical")] == ["a"]
+
+    kg.add_nodes([{"id": "a", "label": ""}])
+
+    assert kg.get_node("a") is not None
+    assert kg.semantic_nodes("E1234", mode="lexical") == []
+
+
+def test_bulk_edge_replacement_clears_stale_semantic_doc(tmp_path):
+    """Replacing an indexed edge without fact/embedding removes its derived index doc."""
+
+    kg = _kg(tmp_path, index_edges=True)
+    kg.add_nodes([{"id": "a", "label": "a"}, {"id": "b", "label": "b"}])
+    kg.add_edges([{"id": "e", "src": "a", "relation": "rel", "dst": "b", "fact": "edge E1234"}])
+    assert [edge.id for _score, edge in kg.semantic_edges("E1234", mode="lexical")] == ["e"]
+
+    kg.add_edges([{"id": "e", "src": "a", "relation": "rel", "dst": "b"}])
+
+    assert kg.get_edge("e") is not None
+    assert kg.semantic_edges("E1234", mode="lexical") == []
+
+
 def test_add_nodes_equivalent_to_per_node(tmp_path):
     one = _kg(tmp_path / "one")
     many = _kg(tmp_path / "many")

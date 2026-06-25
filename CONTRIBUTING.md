@@ -34,14 +34,18 @@ These are load-bearing — PRs that break them won't be merged:
   exception is the original document text, which is retained by default in a *separate*
   `.tvtext` sidecar so `db.get(id)` can return it; pass `store_text=False` to keep no text
   on disk. No telemetry/redacted path ever reads that sidecar.
-- **Lean dependencies.** The runtime PyPI set is `numpy`, `typer`,
-  `sentence-transformers`, `pyyaml`; the patched TurboVec core is vendored and bundled into
-  the wheel as `lodedb._turbovec`, not a PyPI dependency. Heavier things go behind an extra
-  and must load lazily:
+- **Lean dependencies.** The runtime PyPI set is `numpy`, `typer`, `onnxruntime`,
+  `transformers`, `sentence-transformers`, `pyyaml`; the patched TurboVec core is vendored
+  and bundled into the wheel as `lodedb._turbovec`, not a PyPI dependency. ONNX Runtime,
+  transformers, and sentence-transformers are base install dependencies but must still load
+  lazily; Optimum stays in the `[onnx-export]` extra. Heavier things go behind an extra and
+  must load lazily:
   importing `lodedb` must not pull `faiss`, `modal`, `matplotlib`, and friends
   (`tests/test_import_boundary.py` enforces this).
 - **Licensing.** LodeDB is Apache-2.0. The vendored TurboVec core under
   `third_party/turbovec/` is MIT — preserve its `LICENSE` and the top-level `NOTICE`. No
   GPL/AGPL/LGPL dependencies.
-- **Local stays local.** The local path is no-auth, loopback, CPU-scan. The CUDA scan is an
-  opt-in `[gpu]` extra and stays lazy.
+- **Local stays local.** The local path is no-auth, loopback/private-network, CPU-scan.
+  Private-network binds are for trusted LANs only; do not expose `serve` or `mcp` to public or
+  untrusted networks without an explicit auth layer. The CUDA scan is an opt-in `[gpu]` extra
+  and stays lazy.

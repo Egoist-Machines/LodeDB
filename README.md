@@ -51,7 +51,7 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
   `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
-- **Batteries included**: a `lodedb` CLI, a loopback dev server, an
+- **Batteries included**: a `lodedb` CLI, a loopback/private-network dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
@@ -319,7 +319,7 @@ and end-to-end single-query latency is 5.7 ms p50.
 lodedb doctor      # capability report: embedding / GPU / TurboVec backend
 lodedb index ...   # build / add to an on-disk index
 lodedb query ...   # search
-lodedb serve       # loopback dev server (127.0.0.1, no auth)
+lodedb serve       # dev server (127.0.0.1 by default; private LAN only, no auth)
 lodedb mcp         # stdio MCP server for agent memory
 lodedb benchmark   # local, metrics-only benchmark
 ```
