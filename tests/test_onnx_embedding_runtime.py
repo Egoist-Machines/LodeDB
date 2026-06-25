@@ -247,13 +247,17 @@ def test_unknown_runtime_is_rejected() -> None:
 
 
 def test_doctor_reports_embedding_runtime() -> None:
-    """The doctor report carries the embedding-runtime resolution and provider list."""
+    """The doctor report carries the preferred embedding runtime, fallback note, and providers."""
 
-    from lodedb.local.doctor import local_capability_report
+    from lodedb.local.doctor import format_capability_report, local_capability_report
 
-    runtime = local_capability_report(device="cpu")["embedding"]["runtime"]
-    assert runtime["auto_resolves_to"] in {"onnx", "torch"}
+    report = local_capability_report(device="cpu")
+    runtime = report["embedding"]["runtime"]
+    assert runtime["preferred"] in {"onnx", "torch"}
     assert isinstance(runtime["onnx_providers"], list)
+    # The report states a preference with an explicit fallback, not a guaranteed resolution.
+    assert runtime["note"]
+    assert "runtime (auto prefers)" in format_capability_report(report)
 
 
 # -- real model (opt-in) ----------------------------------------------------
