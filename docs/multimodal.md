@@ -134,6 +134,12 @@ embedding APIs, and multimodal encoders. If the backend also exposes an
 db = LodeDB("./store", embedder=my_backend)      # model= is ignored; shape from the backend
 ```
 
+If the backend sets `required_model_name`, that identity is pinned in the index
+header and re-enforced on reopen, so reopening the store with a different-model
+backend of the same dimension is rejected instead of silently returning
+meaningless scores. Use a non-secret public identifier there (a model name): it is
+written to the on-disk header and must not carry credentials or API keys.
+
 ## Notes
 
 - Cross-modal calibration: CLIP maps text and images into one space, but the two

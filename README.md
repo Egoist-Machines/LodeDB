@@ -132,7 +132,7 @@ Run with `uv run` (e.g. `uv run lodedb doctor`).
 ```python
 from lodedb import LodeDB
 
-db = LodeDB(path="./data", model="minilm")   # "minilm" (fast) | "bge" (quality)
+db = LodeDB(path="./data", model="minilm")   # "minilm" (fast) | "bge" (quality) | "clip" (image+text)
 
 fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})
 db.add("a lazy dog sleeps all day", metadata={"topic": "animals"})
