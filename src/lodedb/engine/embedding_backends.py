@@ -234,16 +234,19 @@ class ClipEmbeddingBackend:
             ) from exc
 
         if isinstance(item, Image.Image):
-            image = item
-        elif isinstance(item, (bytes, bytearray)):
-            image = Image.open(io.BytesIO(bytes(item)))
+            return item.convert("RGB")
+        if isinstance(item, (bytes, bytearray)):
+            source: Any = io.BytesIO(bytes(item))
         elif isinstance(item, (str, os.PathLike)):
-            image = Image.open(os.fspath(item))
+            source = os.fspath(item)
         else:
             raise TypeError(
                 f"image must be a path, bytes, or a PIL Image; got {type(item).__name__}"
             )
-        return image.convert("RGB")
+        # Close the file/stream handle promptly rather than relying on finalization;
+        # convert() returns a new image holding its own decoded data.
+        with Image.open(source) as image:
+            return image.convert("RGB")
 
 
 class ONNXRuntimeEmbeddingBackend:

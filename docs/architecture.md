@@ -42,8 +42,11 @@ The public surface (`import lodedb`, the `lodedb` CLI, the optional MCP server, 
 LangChain adapter) all sit on one SDK (`LodeDB`), which drives the engine (`LodeEngine` →
 `LodeIndex`). Embedding (ONNX Runtime by default, with a device-selected sentence-transformers
 fallback) is kept separate from vector serving: the scan runs on the compact CPU TurboVec kernel
-by default, with an optional GPU-resident fp16 scan for batched queries on CUDA. State persists to
-four on-disk sidecars.
+by default, with an optional GPU-resident fp16 scan for batched queries on CUDA. The index is
+modality-agnostic: the same path stores text, CLIP image+text vectors (`model="clip"`), or
+bring-your-own vectors, and `LodeCollection` groups several such indexes under one root. State
+persists to generation-addressed artifacts (the redacted JSON state and compact vector base, plus
+the opt-in `.tvtext` raw-text and `.tvlex` lexical-postings sidecars).
 
 ## Package layout
 
@@ -81,14 +84,15 @@ third_party/turbovec/    # vendored MIT compact core + Apache-2.0 lifecycle patc
 
 Runtime PyPI dependencies: `numpy`, `typer`, `onnxruntime`, `transformers`,
 `sentence-transformers`, `pyyaml`. Extras: `[onnx-export]` (Optimum, for exporting an ONNX graph
-for a model that does not ship one), `[mcp]`, `[langchain]`, `[gpu]`. The compact TurboVec core is
-not a PyPI dependency: maturin compiles the vendored Rust crate and bundles it into the wheel as
-the `lodedb._turbovec` extension (see `pyproject.toml` `[tool.maturin]`).
+for a model that does not ship one), `[image]` (Pillow, for `model="clip"` / `add_image`), `[mcp]`,
+`[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`. The compact TurboVec core is not a PyPI
+dependency: maturin compiles the vendored Rust crate and bundles it into the wheel as the
+`lodedb._turbovec` extension (see `pyproject.toml` `[tool.maturin]`).
 
 Importing LodeDB loads none of `faiss`, `modal`, `mteb`, `datasets`, `matplotlib`, or
-`sklearn`: the embedding runtimes (`onnxruntime`, `transformers`, `sentence-transformers`) and the
-optional CUDA scan load lazily, at first build/query, and Optimum only ever runs in an export
-subprocess. `tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is
+`sklearn`: the embedding runtimes (`onnxruntime`, `transformers`, `sentence-transformers`), the
+optional CUDA scan, and the optional image stack (Pillow, plus the CLIP model) load lazily, at
+first build/query, and Optimum only ever runs in an export subprocess. `tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is
 pulled in transitively by `sentence-transformers`, but importing LodeDB does not import it.)
 
 ## Storage
