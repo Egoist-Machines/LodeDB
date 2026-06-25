@@ -28,6 +28,7 @@ by the other.
 from __future__ import annotations
 
 import importlib.util
+import os
 import platform
 from dataclasses import dataclass
 
@@ -154,19 +155,38 @@ def onnxruntime_available() -> bool:
     return importlib.util.find_spec("onnxruntime") is not None
 
 
-def _resolve_onnx_providers(device: str) -> tuple[str, ...]:
-    """Maps a device to ONNX Runtime providers, filtered to those actually available.
+def _coreml_opt_in() -> bool:
+    """Returns whether the opt-in ONNX Core ML provider is enabled (``LODEDB_ONNX_COREML``)."""
 
-    ONNX Runtime treats the provider list as a preference order, so we pass the
-    accelerator the device implies (CUDA, or Core ML for MPS/Apple) ahead of the
-    CPU provider, but only keep providers the installed wheel actually offers so
-    a missing accelerator EP degrades to CPU instead of erroring.
+    return os.environ.get("LODEDB_ONNX_COREML", "").strip().lower() in {"1", "true", "yes", "auto"}
+
+
+def _preferred_onnx_providers(device: str) -> tuple[str, ...]:
+    """Returns the preferred ONNX provider order for a device, before availability filtering.
+
+    CUDA hosts prefer the CUDA provider. The Apple **Core ML** provider is **off by default**:
+    on the dynamic-shape preset graphs it fragments into many Core ML/CPU partitions and measured
+    *slower* than the plain CPU provider for single-query embedding (about 16 ms vs 3 ms on an
+    M-series CPU), so it is opt-in via ``LODEDB_ONNX_COREML=1`` — the same stance the repo takes on
+    the MPS vector scan, which is also off by default because NEON was faster. Everything else (CPU,
+    and MPS without the opt-in) uses the CPU provider, which is the fast path for these models.
     """
 
-    preferred = {
-        "cuda": ("CUDAExecutionProvider", "CPUExecutionProvider"),
-        "mps": ("CoreMLExecutionProvider", "CPUExecutionProvider"),
-    }.get(device, ("CPUExecutionProvider",))
+    if device == "cuda":
+        return ("CUDAExecutionProvider", "CPUExecutionProvider")
+    if device == "mps" and _coreml_opt_in():
+        return ("CoreMLExecutionProvider", "CPUExecutionProvider")
+    return ("CPUExecutionProvider",)
+
+
+def _resolve_onnx_providers(device: str) -> tuple[str, ...]:
+    """Filters the preferred provider order to those the installed onnxruntime actually offers.
+
+    ONNX Runtime treats the list as a preference order; keeping only available providers means a
+    missing accelerator EP degrades to CPU instead of erroring. CPU is always appended last.
+    """
+
+    preferred = _preferred_onnx_providers(device)
     try:
         import onnxruntime as ort
 

@@ -130,8 +130,8 @@ the preset models ship a prebuilt ONNX graph on the Hub that is fetched and cach
 sentence-transformers path keep the vectors comparable, so an index stays portable between
 runtimes. When `onnxruntime` is absent or the ONNX graph cannot be obtained, embedding falls back
 to `sentence-transformers` (PyTorch) on CUDA, MPS, or CPU. `embedding_runtime="auto"|"onnx"|"torch"`
-selects the runtime and `lodedb doctor` reports the resolved one plus the active ONNX execution
-providers. ONNX lowers single-query and incremental-add latency; large-batch cold-indexing
+selects the runtime and `lodedb doctor` reports the preferred one (with its torch fallback) plus the
+active ONNX execution providers. ONNX lowers single-query and incremental-add latency; large-batch cold-indexing
 throughput is hardware-dependent and can favor torch on CPU, so batch-indexing-heavy workloads can
 pin `embedding_runtime="torch"`.
 
@@ -142,9 +142,13 @@ keeps a streaming top-k on device. `LodeDB.search_many(...)` is the public SDK p
 hit this route. Single queries, missing GPU dependencies, memory rejection, and explicit
 `off` policy use the compact CPU SIMD scan as source of truth/fallback.
 
-On Apple Silicon, the default ONNX embedding runs on the CPU (or the Core ML execution provider
-when the onnxruntime wheel includes it); the sentence-transformers fallback uses MPS. Vector search
-on Mac defaults to the CPU TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
+On Apple Silicon, the default ONNX embedding runs on the **CPU** execution provider; the
+sentence-transformers fallback uses MPS. An opt-in ONNX Core ML provider exists
+(`LODEDB_ONNX_COREML=1`) but stays off by default for the same reason the MPS vector scan does:
+on the dynamic-shape preset graphs it fragments into many Core ML/CPU partitions and measured
+slower than the CPU provider for single-query embedding (about 16 ms vs 3 ms on an M-series CPU),
+so it should be re-measured (ideally with a fixed-shape export) before any default change. Vector
+search on Mac defaults to the CPU TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
 batched `search_many` via `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`, but it stays off by default:
 on the measured M1 it was slower than NEON at every batch size, and newer Apple GPUs should be
 re-measured before any default change.

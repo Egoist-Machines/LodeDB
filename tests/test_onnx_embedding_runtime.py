@@ -247,13 +247,38 @@ def test_unknown_runtime_is_rejected() -> None:
 
 
 def test_doctor_reports_embedding_runtime() -> None:
-    """The doctor report carries the embedding-runtime resolution and provider list."""
+    """The doctor report carries the preferred embedding runtime, fallback note, and providers."""
 
-    from lodedb.local.doctor import local_capability_report
+    from lodedb.local.doctor import format_capability_report, local_capability_report
 
-    runtime = local_capability_report(device="cpu")["embedding"]["runtime"]
-    assert runtime["auto_resolves_to"] in {"onnx", "torch"}
+    report = local_capability_report(device="cpu")
+    runtime = report["embedding"]["runtime"]
+    assert runtime["preferred"] in {"onnx", "torch"}
     assert isinstance(runtime["onnx_providers"], list)
+    # The report states a preference with an explicit fallback, not a guaranteed resolution.
+    assert runtime["note"]
+    assert "runtime (auto prefers)" in format_capability_report(report)
+
+
+def test_onnx_providers_default_to_cpu_without_coreml(monkeypatch) -> None:
+    """Core ML is off by default: cpu and mps both prefer the CPU provider; CUDA prefers CUDA."""
+
+    from lodedb.local.backends import _preferred_onnx_providers
+
+    monkeypatch.delenv("LODEDB_ONNX_COREML", raising=False)
+    assert _preferred_onnx_providers("cpu") == ("CPUExecutionProvider",)
+    assert _preferred_onnx_providers("mps") == ("CPUExecutionProvider",)
+    assert _preferred_onnx_providers("cuda") == ("CUDAExecutionProvider", "CPUExecutionProvider")
+
+
+def test_onnx_coreml_provider_is_opt_in(monkeypatch) -> None:
+    """LODEDB_ONNX_COREML=1 puts the Core ML provider first for an Apple (mps) device only."""
+
+    from lodedb.local.backends import _preferred_onnx_providers
+
+    monkeypatch.setenv("LODEDB_ONNX_COREML", "1")
+    assert _preferred_onnx_providers("mps") == ("CoreMLExecutionProvider", "CPUExecutionProvider")
+    assert _preferred_onnx_providers("cpu") == ("CPUExecutionProvider",)
 
 
 # -- real model (opt-in) ----------------------------------------------------

@@ -123,9 +123,13 @@ def _mps_vector_scan_status() -> dict[str, Any]:
 
 
 def _embedding_runtime_status() -> dict[str, Any]:
-    """Reports the embedding runtime: whether ONNX is usable, its execution providers,
-    and which runtime ``embedding_runtime="auto"`` resolves to (ONNX when available,
-    else the PyTorch sentence-transformers fallback).
+    """Reports the embedding runtime ``embedding_runtime="auto"`` prefers, plus ONNX details.
+
+    ``auto`` uses ONNX Runtime only when ``onnxruntime`` is installed *and* the model's
+    ONNX graph can be obtained (cached, a prebuilt Hub snapshot, or an Optimum export),
+    falling back to PyTorch sentence-transformers otherwise. This probe checks the former
+    (a usable onnxruntime) without forcing a per-model download, so it reports a
+    *preference*, not a guarantee; the ``note`` states the fallback condition.
     """
 
     onnx = onnxruntime_available()
@@ -137,10 +141,16 @@ def _embedding_runtime_status() -> dict[str, Any]:
             providers = list(ort.get_available_providers())
         except Exception:  # noqa: BLE001 - report none if probing fails
             providers = []
+    note = (
+        "auto prefers ONNX; falls back to PyTorch if a model's ONNX graph is unavailable"
+        if onnx
+        else "onnxruntime not installed; auto uses PyTorch"
+    )
     return {
-        "auto_resolves_to": "onnx" if onnx else "torch",
+        "preferred": "onnx" if onnx else "torch",
         "onnxruntime_available": onnx,
         "onnx_providers": providers,
+        "note": note,
     }
 
 
@@ -194,7 +204,8 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  auto resolves to       : {emb['auto_resolves_to']}",
         f"  MPS available          : {emb['mps_available']}",
         f"  CUDA available         : {emb['cuda_available']}",
-        f"  runtime (auto)         : {emb['runtime']['auto_resolves_to']}",
+        f"  runtime (auto prefers) : {emb['runtime']['preferred']}",
+        f"    fallback             : {emb['runtime']['note']}",
         f"  onnxruntime available  : {emb['runtime']['onnxruntime_available']}",
         f"  onnx providers         : {', '.join(emb['runtime']['onnx_providers']) or 'none'}",
         "",
