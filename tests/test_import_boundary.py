@@ -28,9 +28,11 @@ if "lodedb.engine.gpu_turbovec" in sys.modules:
     print("EAGER lodedb.engine.gpu_turbovec")
 """
 
-# LodeDB declares a lean runtime set (turbovec, numpy, typer, sentence-transformers,
-# pyyaml; extras [mcp]/[langchain]/[mem0]/[gpu]). None of the heavy deps below may load when
-# the package is imported. Top-level roots are checked (e.g. `sklearn`, not
+# LodeDB declares a lean runtime set (turbovec, numpy, typer, onnxruntime, transformers,
+# sentence-transformers, pyyaml; extras [onnx-export]/[mcp]/[langchain]/[mem0]/[gpu]). None of
+# the heavy deps below may load when the package is imported, and neither may the embedding
+# runtimes themselves (onnxruntime/transformers/sentence-transformers are imported lazily, only
+# when a backend is actually built). Top-level roots are checked (e.g. `sklearn`, not
 # `sklearn.x`) because importing any submodule pulls the heavy root. `scikit-learn`
 # may be *installed* (transitive via sentence-transformers); this asserts it is not
 # *imported* by simply importing LodeDB.

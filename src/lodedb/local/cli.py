@@ -31,6 +31,12 @@ _MODEL_OPTION = typer.Option(
 _DEVICE_OPTION = typer.Option(
     "auto", "--device", "-d", help="auto | cpu | mps | cuda (embedding only)."
 )
+_RUNTIME_OPTION = typer.Option(
+    "auto",
+    "--runtime",
+    "-r",
+    help="Embedding runtime: auto (prefer ONNX, fall back to torch) | onnx | torch.",
+)
 _TEXTS_ARGUMENT = typer.Argument(None, help="Document texts to add (or use --file).")
 _FILE_OPTION = typer.Option(None, "--file", "-f", help="A text file: one document per line.")
 _BENCH_PATH_OPTION = typer.Option(
@@ -132,6 +138,7 @@ def index(
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
     file: Path | None = _FILE_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
     durability: str | None = _DURABILITY_OPTION,
@@ -157,6 +164,7 @@ def index(
         path=path,
         model=model,
         device=device,
+        embedding_runtime=runtime,
         store_text=store_text,
         durability=durability,
         commit_mode=commit_mode,
@@ -183,6 +191,7 @@ def query(
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
     k: int = typer.Option(10, "--k", "-k", help="Number of results."),
 ) -> None:
     """Searches the local index and prints redacted (score, id, metadata) rows.
@@ -192,7 +201,9 @@ def query(
     """
 
     try:
-        db = LodeDB(path=path, model=model, device=device, read_only=True)
+        db = LodeDB(
+            path=path, model=model, device=device, embedding_runtime=runtime, read_only=True
+        )
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
@@ -218,6 +229,7 @@ def get(
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
 ) -> None:
     """Prints the stored raw text for one document id.
 
@@ -226,7 +238,14 @@ def get(
     """
 
     try:
-        db = LodeDB(path=path, model=model, device=device, store_text=True, read_only=True)
+        db = LodeDB(
+            path=path,
+            model=model,
+            device=device,
+            embedding_runtime=runtime,
+            store_text=True,
+            read_only=True,
+        )
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
@@ -243,6 +262,7 @@ def benchmark(
     path: Path = _BENCH_PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
     docs: int = typer.Option(2000, "--docs", help="Number of synthetic documents to index."),
     queries: int = typer.Option(200, "--queries", help="Number of queries to time."),
     k: int = typer.Option(10, "--k", "-k", help="top-k per query."),
@@ -262,6 +282,7 @@ def benchmark(
         path=workdir,
         model=model,
         device=device,
+        embedding_runtime=runtime,
         doc_count=docs,
         query_count=queries,
         top_k=k,
@@ -274,6 +295,7 @@ def serve(
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
     host: str = typer.Option("127.0.0.1", "--host", help="Loopback/private bind host only."),
     port: int = typer.Option(8088, "--port", help="Local port."),
     store_text: bool = _STORE_TEXT_OPTION,
@@ -298,6 +320,7 @@ def serve(
         path=path,
         model=model,
         device=device,
+        embedding_runtime=runtime,
         host=host,
         port=port,
         store_text=store_text,
@@ -320,6 +343,7 @@ def mcp(
     path: Path = _PATH_OPTION,
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
+    runtime: str = _RUNTIME_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
     exclude_text: bool = _EXCLUDE_TEXT_OPTION,
 ) -> None:
@@ -342,7 +366,12 @@ def mcp(
     from lodedb.local.mcp_server import build_mcp_server
 
     server, _db = build_mcp_server(
-        path, model=model, device=device, store_text=store_text, exclude_text=exclude_text
+        path,
+        model=model,
+        device=device,
+        embedding_runtime=runtime,
+        store_text=store_text,
+        exclude_text=exclude_text,
     )
     server.run(transport="stdio")
 

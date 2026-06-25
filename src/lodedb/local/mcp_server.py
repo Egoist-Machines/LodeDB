@@ -101,6 +101,7 @@ def build_mcp_server(
     *,
     model: str = "minilm",
     device: str = "auto",
+    embedding_runtime: str = "auto",
     name: str = "lodedb",
     store_text: bool = True,
     exclude_text: bool = False,
@@ -131,6 +132,7 @@ def build_mcp_server(
         path=path,
         model=model,
         device=device,
+        embedding_runtime=embedding_runtime,
         store_text=store_text,
         _embedding_backend=_embedding_backend,
     )
@@ -212,6 +214,7 @@ def main() -> None:
         os.environ.get("LODEDB_PATH", "./data"),
         model=os.environ.get("LODEDB_MODEL", "minilm"),
         device=os.environ.get("LODEDB_DEVICE", "auto"),
+        embedding_runtime=os.environ.get("LODEDB_EMBEDDING_RUNTIME", "auto"),
     )
     server.run(transport="stdio")
 

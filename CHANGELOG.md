@@ -23,6 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vectorstore.database: lodedb` (or `PGPT_VECTORSTORE=lodedb`); see
   `examples/privategpt_provider.py` and `docs/integrations.md`. No PrivateGPT fork is required.
 
+### Changed
+
+- **ONNX Runtime is now the default embedding runtime, with a PyTorch fallback.** A new
+  `embedding_runtime` option on `LodeDB` (and `--runtime` on the CLI; `LODEDB_EMBEDDING_RUNTIME`
+  for the MCP server) selects `"auto"` (default), `"onnx"`, or `"torch"`. Under `"auto"` LodeDB
+  embeds through ONNX Runtime when `onnxruntime` is installed and the model's ONNX graph can be
+  obtained, and otherwise falls back to PyTorch `sentence-transformers`. The `minilm` and `bge`
+  presets ship a prebuilt ONNX graph on the Hub, so it is fetched and cached on first use (under
+  `~/.cache/lodedb/onnx`, override with `LODEDB_ONNX_CACHE`) with no export step; exporting an ONNX
+  graph for a model that does not ship one is the opt-in `lodedb[onnx-export]` extra (Optimum, run
+  in a subprocess). ONNX produces vectors matching the sentence-transformers path for the same model
+  (cosine > 0.99 on MiniLM), so existing indexes stay compatible. It is markedly faster for
+  single-query and incremental-add latency (about 3x on a measured Apple Silicon CPU); large-batch
+  cold-indexing throughput is hardware-dependent and can still favor torch on CPU, so pass
+  `embedding_runtime="torch"` for batch-indexing-heavy workloads. `onnxruntime` and `transformers`
+  join the base install; `sentence-transformers` (which pulls torch) remains for the fallback.
+  `lodedb doctor` now reports the resolved runtime and the active ONNX execution providers.
+
 ## [0.3.0] - 2026-06-24
 
 ### Changed

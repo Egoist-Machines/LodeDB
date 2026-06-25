@@ -13,7 +13,7 @@ flowchart TB
   subgraph ENG["Engine — src/lodedb/engine"]
     CORE["LodeEngine (core.py)"]
     IDX["LodeIndex (index.py)"]
-    EMB["Embedding backends<br/>sentence-transformers on CUDA/MPS/CPU"]
+    EMB["Embedding backends<br/>ONNX Runtime (default) / sentence-transformers fallback<br/>CPU · CUDA · MPS"]
     SCAN{{"Vector scan router"}}
     CPU["CPU SIMD scan<br/>TurboVec (default)"]
     GPU["GPU-resident fp16 scan<br/>gpu_turbovec · (gpu extra) · CUDA"]
@@ -40,9 +40,10 @@ flowchart TB
 
 The public surface (`import lodedb`, the `lodedb` CLI, the optional MCP server, and the
 LangChain adapter) all sit on one SDK (`LodeDB`), which drives the engine (`LodeEngine` →
-`LodeIndex`). Embedding (device-selected sentence-transformers) is kept separate from vector
-serving: the scan runs on the compact CPU TurboVec kernel by default, with an optional
-GPU-resident fp16 scan for batched queries on CUDA. State persists to four on-disk sidecars.
+`LodeIndex`). Embedding (ONNX Runtime by default, with a device-selected sentence-transformers
+fallback) is kept separate from vector serving: the scan runs on the compact CPU TurboVec kernel
+by default, with an optional GPU-resident fp16 scan for batched queries on CUDA. State persists to
+four on-disk sidecars.
 
 ## Package layout
 
@@ -55,7 +56,8 @@ src/lodedb/
   config.py              # minimal YAML loader
   local/                 # local-first product surface
     db.py                #   LodeDB: add / search / search_many / remove / persist
-    backends.py            #   embedding device selection (MPS / CUDA / CPU)
+    backends.py            #   embedding runtime + device selection (ONNX / torch; MPS / CUDA / CPU)
+    onnx_artifacts.py    #   fetch/export + cache the preset ONNX model on first use
     presets.py           #   minilm / bge route presets
     cli.py, server.py    #   `lodedb` CLI + loopback dev server
     mcp_server.py        #   optional stdio MCP server (agent memory)
@@ -67,7 +69,7 @@ src/lodedb/
     turbovec_index.py    #   TurboVec scan binding
     turbovec_delta_store.py     #   encoded-row delta store (.tvd)
     state_journal_store.py      #   durable state journal (.jsd)
-    embedding_backends.py       #   Hash / SentenceTransformer backends
+    embedding_backends.py       #   Hash / SentenceTransformer / ONNXRuntime backends
     gpu_turbovec.py      #   optional CUDA batched exact scan (lazy; `[gpu]` extra)
     mps_turbovec.py      #   first-class opt-in Apple-GPU (MPS) exact scan (lazy, off by default)
     route_registry.py, route_profiles.py, runtime_policy.py   #   route policy
@@ -76,15 +78,17 @@ third_party/turbovec/    # vendored MIT compact core + Apache-2.0 lifecycle patc
 
 ## Dependency boundary
 
-Runtime PyPI dependencies: `numpy`, `typer`, `sentence-transformers`, `pyyaml`. Extras:
-`[mcp]`, `[langchain]`, `[gpu]`. The compact TurboVec core is not a PyPI dependency: maturin
-compiles the vendored Rust crate and bundles it into the wheel as the `lodedb._turbovec`
-extension (see `pyproject.toml` `[tool.maturin]`).
+Runtime PyPI dependencies: `numpy`, `typer`, `onnxruntime`, `transformers`,
+`sentence-transformers`, `pyyaml`. Extras: `[onnx-export]` (Optimum, for exporting an ONNX graph
+for a model that does not ship one), `[mcp]`, `[langchain]`, `[gpu]`. The compact TurboVec core is
+not a PyPI dependency: maturin compiles the vendored Rust crate and bundles it into the wheel as
+the `lodedb._turbovec` extension (see `pyproject.toml` `[tool.maturin]`).
 
 Importing LodeDB loads none of `faiss`, `modal`, `mteb`, `datasets`, `matplotlib`, or
-`sklearn`: the embedding stack and the optional CUDA scan load lazily, at first build/query.
-`tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is pulled
-in transitively by `sentence-transformers`, but importing LodeDB does not import it.)
+`sklearn`: the embedding runtimes (`onnxruntime`, `transformers`, `sentence-transformers`) and the
+optional CUDA scan load lazily, at first build/query, and Optimum only ever runs in an export
+subprocess. `tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is
+pulled in transitively by `sentence-transformers`, but importing LodeDB does not import it.)
 
 ## Storage
 
@@ -120,8 +124,16 @@ top-level `<key>.json`) load via a legacy fallback and migrate on their next wri
 
 ## Embedding & scan
 
-LodeDB separates embedding device selection from vector serving. Embedding uses
-`sentence-transformers` on CUDA, MPS, or CPU according to the local device policy.
+LodeDB separates the embedding runtime from vector serving. Embedding defaults to ONNX Runtime:
+the preset models ship a prebuilt ONNX graph on the Hub that is fetched and cached on first use
+(`local/onnx_artifacts.py`), and the same tokenizer, pooling, and L2 normalization as the
+sentence-transformers path keep the vectors comparable, so an index stays portable between
+runtimes. When `onnxruntime` is absent or the ONNX graph cannot be obtained, embedding falls back
+to `sentence-transformers` (PyTorch) on CUDA, MPS, or CPU. `embedding_runtime="auto"|"onnx"|"torch"`
+selects the runtime and `lodedb doctor` reports the resolved one plus the active ONNX execution
+providers. ONNX lowers single-query and incremental-add latency; large-batch cold-indexing
+throughput is hardware-dependent and can favor torch on CPU, so batch-indexing-heavy workloads can
+pin `embedding_runtime="torch"`.
 
 On CUDA hosts (Linux), the optional `[gpu]` extra adds a GPU-resident exact scan
 (`engine/gpu_turbovec.py`) for batched serving. The engine reconstructs compact TurboVec
@@ -130,8 +142,9 @@ keeps a streaming top-k on device. `LodeDB.search_many(...)` is the public SDK p
 hit this route. Single queries, missing GPU dependencies, memory rejection, and explicit
 `off` policy use the compact CPU SIMD scan as source of truth/fallback.
 
-On Apple Silicon, MPS accelerates embedding by default. Vector search on Mac defaults to the CPU
-TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
+On Apple Silicon, the default ONNX embedding runs on the CPU (or the Core ML execution provider
+when the onnxruntime wheel includes it); the sentence-transformers fallback uses MPS. Vector search
+on Mac defaults to the CPU TurboVec kernel (NEON on Apple Silicon). A first-class opt-in MPS exact scan is available for
 batched `search_many` via `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`, but it stays off by default:
 on the measured M1 it was slower than NEON at every batch size, and newer Apple GPUs should be
 re-measured before any default change.

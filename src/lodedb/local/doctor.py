@@ -25,6 +25,7 @@ from lodedb.engine.turbovec_index import (
 )
 from lodedb.local.backends import (
     is_apple_silicon,
+    onnxruntime_available,
     resolve_local_device,
     torch_cuda_available,
     torch_cuda_build_version,
@@ -121,6 +122,28 @@ def _mps_vector_scan_status() -> dict[str, Any]:
     }
 
 
+def _embedding_runtime_status() -> dict[str, Any]:
+    """Reports the embedding runtime: whether ONNX is usable, its execution providers,
+    and which runtime ``embedding_runtime="auto"`` resolves to (ONNX when available,
+    else the PyTorch sentence-transformers fallback).
+    """
+
+    onnx = onnxruntime_available()
+    providers: list[str] = []
+    if onnx:
+        try:
+            import onnxruntime as ort
+
+            providers = list(ort.get_available_providers())
+        except Exception:  # noqa: BLE001 - report none if probing fails
+            providers = []
+    return {
+        "auto_resolves_to": "onnx" if onnx else "torch",
+        "onnxruntime_available": onnx,
+        "onnx_providers": providers,
+    }
+
+
 def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
     """Builds the full local capability report (no payloads)."""
 
@@ -141,6 +164,7 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
             "auto_resolves_to": effective_device,
             "mps_available": mps,
             "cuda_available": cuda,
+            "runtime": _embedding_runtime_status(),
         },
         "compact_backend": {
             **capability.to_dict(),
@@ -170,6 +194,9 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  auto resolves to       : {emb['auto_resolves_to']}",
         f"  MPS available          : {emb['mps_available']}",
         f"  CUDA available         : {emb['cuda_available']}",
+        f"  runtime (auto)         : {emb['runtime']['auto_resolves_to']}",
+        f"  onnxruntime available  : {emb['runtime']['onnxruntime_available']}",
+        f"  onnx providers         : {', '.join(emb['runtime']['onnx_providers']) or 'none'}",
         "",
         "Compact storage backend (TurboVec)",
         f"  available              : {backend['available']}",
