@@ -68,6 +68,7 @@ def run_local_benchmark(
     path: str | Path,
     model: str = "minilm",
     device: str = "auto",
+    embedding_runtime: str = "auto",
     doc_count: int = 2000,
     query_count: int = 200,
     top_k: int = 10,
@@ -80,7 +81,13 @@ def run_local_benchmark(
     # (so `lodedb benchmark | jq ...` works). Timing is unaffected.
     with contextlib.redirect_stdout(sys.stderr):
         effective_device = resolve_local_device(device)
-        db = LodeDB(path=path, model=model, device=device, batch_size=embed_batch_size)
+        db = LodeDB(
+            path=path,
+            model=model,
+            device=device,
+            embedding_runtime=embedding_runtime,
+            batch_size=embed_batch_size,
+        )
 
         documents = _synthetic_documents(doc_count)
 

@@ -147,6 +147,7 @@ class LodeDB:
         vector_dim: int | None = None,
         bit_width: int = 4,
         device: str = "auto",
+        embedding_runtime: str = "auto",
         batch_size: int = 32,
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
@@ -162,6 +163,10 @@ class LodeDB:
 
         ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality).
         ``device`` is ``"auto"``/``"cpu"``/``"mps"``/``"cuda"`` (embedding only).
+        ``embedding_runtime`` selects the embedding runtime: ``"auto"`` (default;
+        prefer ONNX Runtime, fall back to PyTorch sentence-transformers when ONNX
+        cannot be set up), ``"onnx"`` (force ONNX Runtime), or ``"torch"`` (force
+        sentence-transformers). ``embedding_resolution`` reports which was used.
         ``read_only=True`` opens a non-mutating snapshot handle that takes **no**
         writer lock, so it can read a path while another process holds the
         single-writer lock (e.g. query while ``lodedb serve`` runs); mutating
@@ -261,6 +266,7 @@ class LodeDB:
                     device=device,
                     batch_size=batch_size,
                     max_seq_length=seq_len,
+                    embedding_runtime=embedding_runtime,
                 )
             self._embedding_backend = backend
             route_policy = self.preset.route_policy

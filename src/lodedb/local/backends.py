@@ -1,26 +1,42 @@
-"""Embedding device selection for the local layer.
+"""Embedding runtime + device selection for the local layer.
 
-This module selects the embedding *device*; the TurboVec vector scan is separate
-(the CPU SIMD kernel, or the optional CUDA path) and is not affected here.
+This module selects the embedding *runtime* (ONNX Runtime or PyTorch) and the
+*device* it runs on; the TurboVec vector scan is separate (the CPU SIMD kernel,
+or the optional CUDA path) and is not affected here.
+
+Runtime (``embedding_runtime``):
+
+- ``"auto"`` (default) prefers the ONNX Runtime path when ``onnxruntime`` is
+  installed and the model's ONNX artifact can be materialized, and otherwise
+  falls back to PyTorch sentence-transformers. ONNX is typically faster for
+  feature extraction and drops the heavy torch dependency from the hot path.
+- ``"onnx"`` forces ONNX Runtime (errors if it cannot be set up).
+- ``"torch"`` forces PyTorch sentence-transformers.
+
+Device:
 
 - ``device="mps"`` runs sentence-transformers on PyTorch's Metal Performance
-  Shaders backend (the Apple GPU).
-- ``device="cuda"`` runs it on an NVIDIA GPU; ``device="cpu"`` on the CPU.
+  Shaders backend (the Apple GPU); for ONNX it prefers the Core ML provider.
+- ``device="cuda"`` runs on an NVIDIA GPU; ``device="cpu"`` on the CPU.
 - ``device="auto"`` prefers MPS on Apple Silicon, CUDA on NVIDIA, else CPU.
 
-All paths go through the existing ``SentenceTransformerEmbeddingBackend`` and the
-``EngineEmbeddingBackend`` protocol.
+Both runtimes implement the ``EngineEmbeddingBackend`` protocol and produce
+comparable vectors for the same model, so an index built with one stays usable
+by the other.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import platform
 from dataclasses import dataclass
 
 from lodedb.engine.embedding_backends import (
     EngineEmbeddingBackend,
+    ONNXRuntimeEmbeddingBackend,
     SentenceTransformerEmbeddingBackend,
 )
+from lodedb.local.onnx_artifacts import OnnxMaterializationError, materialize_onnx_model
 from lodedb.local.presets import LocalModelPreset
 
 
@@ -132,20 +148,110 @@ def _sentence_transformer_backend(
     )
 
 
+def onnxruntime_available() -> bool:
+    """Returns whether ``onnxruntime`` is importable (without importing it)."""
+
+    return importlib.util.find_spec("onnxruntime") is not None
+
+
+def _resolve_onnx_providers(device: str) -> tuple[str, ...]:
+    """Maps a device to ONNX Runtime providers, filtered to those actually available.
+
+    ONNX Runtime treats the provider list as a preference order, so we pass the
+    accelerator the device implies (CUDA, or Core ML for MPS/Apple) ahead of the
+    CPU provider, but only keep providers the installed wheel actually offers so
+    a missing accelerator EP degrades to CPU instead of erroring.
+    """
+
+    preferred = {
+        "cuda": ("CUDAExecutionProvider", "CPUExecutionProvider"),
+        "mps": ("CoreMLExecutionProvider", "CPUExecutionProvider"),
+    }.get(device, ("CPUExecutionProvider",))
+    try:
+        import onnxruntime as ort
+
+        available = set(ort.get_available_providers())
+    except Exception:  # noqa: BLE001 - if we cannot probe, CPU is always present
+        return ("CPUExecutionProvider",)
+    chosen = tuple(provider for provider in preferred if provider in available)
+    if "CPUExecutionProvider" not in chosen:
+        chosen = (*chosen, "CPUExecutionProvider")
+    return chosen
+
+
+def _onnx_backend(
+    preset: LocalModelPreset,
+    *,
+    device: str,
+    batch_size: int,
+    max_seq_length: int,
+) -> ONNXRuntimeEmbeddingBackend:
+    """Materializes the preset's ONNX model and builds the ONNX Runtime backend.
+
+    Raises :class:`OnnxMaterializationError` if no ONNX artifact can be obtained.
+    """
+
+    artifact = materialize_onnx_model(preset.model_name)
+    return ONNXRuntimeEmbeddingBackend(
+        model_name=preset.model_name,
+        native_dim=preset.native_dim,
+        onnx_model_path=artifact.model_path,
+        tokenizer_name_or_path=str(artifact.tokenizer_dir),
+        providers=_resolve_onnx_providers(device),
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        query_prefix=preset.query_prefix,
+        document_prefix=preset.document_prefix,
+        pooling=preset.pooling,
+        normalize=True,
+    )
+
+
 def build_local_embedding_backend(
     preset: LocalModelPreset,
     *,
     device: str = "auto",
     batch_size: int = 32,
     max_seq_length: int = 256,
+    embedding_runtime: str = "auto",
 ) -> tuple[EngineEmbeddingBackend, LocalEmbeddingResolution]:
-    """Builds the sentence-transformers embedding backend for a preset/device.
+    """Builds the embedding backend for a preset, runtime, and device.
 
+    ``embedding_runtime`` is ``"auto"`` (prefer ONNX Runtime, fall back to torch),
+    ``"onnx"`` (force ONNX Runtime), or ``"torch"`` (force sentence-transformers).
     Returns the backend plus a :class:`LocalEmbeddingResolution` describing the
-    device actually selected, so the SDK and ``doctor`` can report it.
+    runtime/device actually selected (and any fallback), so the SDK and ``doctor``
+    can report it.
     """
 
+    runtime = (embedding_runtime or "auto").strip().lower()
+    if runtime not in {"auto", "onnx", "torch"}:
+        raise ValueError(
+            f"unknown embedding_runtime {embedding_runtime!r}; choose auto, onnx, or torch"
+        )
     resolved = resolve_local_device(device)
+
+    fallback_reason = ""
+    if runtime in {"auto", "onnx"}:
+        if runtime == "onnx" or onnxruntime_available():
+            try:
+                backend = _onnx_backend(
+                    preset, device=resolved, batch_size=batch_size, max_seq_length=max_seq_length
+                )
+                return backend, LocalEmbeddingResolution(
+                    requested_device=device,
+                    backend_name=backend.name,
+                    effective_device=resolved,
+                    fallback_used=False,
+                    fallback_reason="",
+                )
+            except (OnnxMaterializationError, RuntimeError, ImportError) as exc:
+                if runtime == "onnx":
+                    raise
+                fallback_reason = f"onnx runtime unavailable, using torch: {exc}"
+        else:
+            fallback_reason = "onnxruntime not installed; using torch"
+
     backend = _sentence_transformer_backend(
         preset, device=resolved, batch_size=batch_size, max_seq_length=max_seq_length
     )
@@ -153,6 +259,6 @@ def build_local_embedding_backend(
         requested_device=device,
         backend_name=backend.name,
         effective_device=resolved,
-        fallback_used=False,
-        fallback_reason="",
+        fallback_used=bool(fallback_reason),
+        fallback_reason=fallback_reason,
     )

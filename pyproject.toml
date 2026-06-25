@@ -33,13 +33,19 @@ classifiers = [
 # Lean runtime set (see docs/architecture.md). The compact TurboVec CPU core +
 # .tvim/.tvd persistence is the bundled `lodedb._turbovec` extension (compiled
 # into the wheel, see [tool.maturin]), not a PyPI dependency. numpy = embedding/
-# scan I/O; typer = CLI; sentence-transformers = default embedding backend (pulls
-# torch/transformers); pyyaml = loads the bundled route registry. Heavy research
-# deps (faiss/modal/mteb/datasets/matplotlib/sklearn) are deliberately NOT here
-# and are guarded out by tests/test_import_boundary.py.
+# scan I/O; typer = CLI; pyyaml = loads the bundled route registry.
+# Embedding runtime: onnxruntime is the default (faster feature extraction; the
+# preset models ship a prebuilt ONNX on the Hub, fetched on first use) with
+# transformers for tokenization; sentence-transformers (which pulls torch) is the
+# fallback when ONNX cannot be set up. Exporting ONNX for a model without a prebuilt
+# graph is the opt-in [onnx-export] extra (Optimum), not part of the base install.
+# Heavy research deps (faiss/modal/mteb/datasets/matplotlib/sklearn) are
+# deliberately NOT here and are guarded out by tests/test_import_boundary.py.
 dependencies = [
   "numpy>=2.0.0",
   "typer>=0.12.0",
+  "onnxruntime>=1.20.0",
+  "transformers>=4.40.0",
   "sentence-transformers>=3.0.0",
   "pyyaml>=6.0.0",
 ]
@@ -48,6 +54,10 @@ dependencies = [
 # Opt-in GPU-resident exact scan on CUDA hosts (gpu_turbovec); absent CUDA, LodeDB uses
 # the CPU scan. cupy wheels are Linux/CUDA-only, so this resolves to nothing elsewhere.
 gpu = ["cupy-cuda12x>=13.0.0; platform_system == 'Linux'"]
+# Export an ONNX graph for a model that does not ship a prebuilt one on the Hub
+# (the built-in minilm/bge presets do, so this is only needed for custom models).
+# Optimum runs the export in a subprocess, so it never imports into the lodedb process.
+onnx-export = ["optimum[exporters]>=1.23.0,<2.0.0"]
 # Optional stdio MCP server so coding agents can use LodeDB as local memory.
 mcp = ["mcp>=1.0.0"]
 # Optional LangChain VectorStore adapter.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -123,6 +124,254 @@ class SentenceTransformerEmbeddingBackend:
                 model.max_seq_length = int(self.max_seq_length)
             self._model = model
         return self._model
+
+
+class ONNXRuntimeEmbeddingBackend:
+    """Embeds text with an ONNX Runtime feature-extraction model.
+
+    A drop-in for :class:`SentenceTransformerEmbeddingBackend` that runs the same
+    model through ONNX Runtime instead of PyTorch. It produces vectors comparable
+    to the sentence-transformers path for the same model (matching tokenizer,
+    pooling, and L2 normalization), so an index built with one runtime stays
+    usable by the other. ``onnxruntime`` and ``transformers`` are imported lazily
+    so a plain ``import lodedb`` never pays for them.
+
+    Pooling must match the source model: BGE uses ``"cls"`` (the model's own
+    pooling), MiniLM uses ``"mean"`` over the attention mask.
+    """
+
+    name = "onnx_runtime"
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        native_dim: int,
+        onnx_model_path: str | Path,
+        tokenizer_name_or_path: str,
+        providers: tuple[str, ...] = ("CPUExecutionProvider",),
+        batch_size: int = 16,
+        max_seq_length: int = 512,
+        query_prefix: str = "",
+        document_prefix: str = "",
+        pooling: str = "cls",
+        normalize: bool = True,
+        output_name: str | None = None,
+    ) -> None:
+        """Stores ONNX Runtime configuration while keeping imports and model load lazy."""
+
+        if not model_name:
+            raise ValueError("model_name is required")
+        if native_dim <= 0:
+            raise ValueError("native_dim must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if max_seq_length <= 0:
+            raise ValueError("max_seq_length must be positive")
+        if pooling not in {"cls", "mean"}:
+            raise ValueError("pooling must be cls or mean")
+        if not providers:
+            raise ValueError("at least one ONNX Runtime execution provider is required")
+        self.model_name = model_name
+        self.required_model_name = model_name
+        self.native_dim = native_dim
+        self.onnx_model_path = Path(onnx_model_path)
+        self.tokenizer_name_or_path = tokenizer_name_or_path
+        self.providers = tuple(providers)
+        self.batch_size = batch_size
+        self.max_seq_length = max_seq_length
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
+        self.pooling = pooling
+        self.normalize = normalize
+        self.output_name = output_name
+        self._session: object | None = None
+        self._tokenizer: object | None = None
+
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Embeds document chunks with the configured document prefix."""
+
+        return self._encode(tuple(f"{self.document_prefix}{text}" for text in texts))
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        """Embeds one retrieval query with the configured query prefix."""
+
+        return self._encode((f"{self.query_prefix}{text}",))[0]
+
+    def _encode(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Tokenizes, runs ONNX inference, pools, normalizes, and validates embeddings."""
+
+        if not texts:
+            return ()
+        rows: list[np.ndarray] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            tokenized = self._tokenize(batch)
+            outputs = self._session_run(tokenized)
+            pooled = _pool_onnx_output(
+                outputs,
+                attention_mask=np.asarray(tokenized.get("attention_mask")),
+                pooling=self.pooling,
+                output_name=self.output_name,
+            )
+            rows.append(pooled)
+        array = np.vstack(rows).astype(np.float32, copy=False)
+        if self.normalize:
+            array = _l2_normalize_rows(array)
+        _validate_embedding_array(array, native_dim=self.native_dim, model_name=self.model_name)
+        return tuple(tuple(float(value) for value in row) for row in array)
+
+    def active_providers(self) -> tuple[str, ...]:
+        """Returns the execution providers active in the loaded ONNX Runtime session."""
+
+        session = self._load_session()
+        return tuple(str(provider) for provider in session.get_providers())
+
+    def _tokenize(self, texts: tuple[str, ...]) -> dict[str, np.ndarray]:
+        """Returns NumPy tokenizer inputs compatible with ONNX Runtime."""
+
+        tokenizer = self._load_tokenizer()
+        tokenized = tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+            return_tensors="np",
+        )
+        return {key: np.asarray(value) for key, value in dict(tokenized).items()}
+
+    def _session_run(self, tokenized: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Runs the ONNX session with only the inputs the graph declares."""
+
+        session = self._load_session()
+        input_names = {item.name for item in session.get_inputs()}
+        run_inputs = {key: value for key, value in tokenized.items() if key in input_names}
+        if not run_inputs:
+            raise ValueError(f"{self.model_name} ONNX graph accepted no tokenizer inputs")
+        output_names = [item.name for item in session.get_outputs()]
+        output_values = session.run(output_names, run_inputs)
+        return {
+            name: np.asarray(value, dtype=np.float32)
+            for name, value in zip(output_names, output_values, strict=True)
+        }
+
+    def _load_session(self) -> object:
+        """Loads the ONNX Runtime session lazily so a plain import never needs it."""
+
+        if self._session is None:
+            try:
+                import onnxruntime as ort
+            except ImportError as exc:  # pragma: no cover - optional runtime
+                raise RuntimeError(
+                    "onnxruntime is required for the ONNX embedding runtime "
+                    "(install it, or use a runtime that falls back to torch)."
+                ) from exc
+            _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
+            self._session = ort.InferenceSession(
+                str(self.onnx_model_path),
+                providers=list(self.providers),
+            )
+        return self._session
+
+    def _load_tokenizer(self) -> object:
+        """Loads the Hugging Face tokenizer lazily to avoid import cost on a plain import."""
+
+        if self._tokenizer is None:
+            try:
+                from transformers import AutoTokenizer
+            except ImportError as exc:  # pragma: no cover - optional runtime
+                raise RuntimeError(
+                    "transformers is required to tokenize for the ONNX embedding runtime."
+                ) from exc
+            self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
+        return self._tokenizer
+
+
+def _preload_cuda_execution_provider_dependencies(
+    ort: object, *, providers: tuple[str, ...]
+) -> None:
+    """Preloads CUDA provider libraries before ONNX Runtime creates a session."""
+
+    if "CUDAExecutionProvider" not in providers:
+        return
+    preload_dlls = getattr(ort, "preload_dlls", None)
+    if callable(preload_dlls):
+        try:
+            preload_dlls(cuda=True, cudnn=True, msvc=False)
+        except TypeError:
+            preload_dlls()
+        except Exception:  # noqa: BLE001 - best-effort warmup; absence is fine
+            pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.current_device()
+    except Exception:  # noqa: BLE001 - best-effort warmup; absence is fine
+        pass
+
+
+def _pool_onnx_output(
+    outputs: dict[str, np.ndarray],
+    *,
+    attention_mask: np.ndarray,
+    pooling: str,
+    output_name: str | None,
+) -> np.ndarray:
+    """Pools ONNX token embeddings into one sentence embedding per input row."""
+
+    selected = _select_onnx_embedding_output(outputs, output_name=output_name)
+    if selected.ndim == 2:
+        return selected.astype(np.float32, copy=False)
+    if selected.ndim != 3:
+        raise ValueError("ONNX output must be a 2D sentence tensor or 3D token tensor")
+    if pooling == "cls":
+        return selected[:, 0, :].astype(np.float32, copy=False)
+    if attention_mask.ndim != 2:
+        raise ValueError("mean pooling requires a 2D attention_mask")
+    mask = attention_mask.astype(np.float32)
+    masked = selected * mask[:, :, None]
+    denominator = np.maximum(mask.sum(axis=1, keepdims=True), 1.0)
+    return (masked.sum(axis=1) / denominator).astype(np.float32, copy=False)
+
+
+def _select_onnx_embedding_output(
+    outputs: dict[str, np.ndarray],
+    *,
+    output_name: str | None,
+) -> np.ndarray:
+    """Selects the configured ONNX output or the first tensor shaped like embeddings."""
+
+    if output_name is not None:
+        if output_name not in outputs:
+            raise ValueError(f"ONNX output {output_name!r} was not returned")
+        return outputs[output_name]
+    for value in outputs.values():
+        if value.ndim in {2, 3}:
+            return value
+    raise ValueError("ONNX session returned no embedding-shaped output")
+
+
+def _l2_normalize_rows(array: np.ndarray) -> np.ndarray:
+    """Returns row-wise L2-normalized float32 embeddings with zero rows preserved."""
+
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    safe_norms = np.where(norms == 0.0, 1.0, norms)
+    return (array / safe_norms).astype(np.float32, copy=False)
+
+
+def _validate_embedding_array(
+    array: np.ndarray,
+    *,
+    native_dim: int,
+    model_name: str,
+) -> None:
+    """Raises a deterministic error when an embedding runtime returns the wrong shape."""
+
+    if array.ndim != 2:
+        raise ValueError(f"{model_name} returned rank {array.ndim}; expected a 2D tensor")
+    if array.shape[1] != native_dim:
+        raise ValueError(f"{model_name} returned dim {array.shape[1]}; expected {native_dim}")
 
 
 def hash_embedding(text: str, dim: int) -> tuple[float, ...]:

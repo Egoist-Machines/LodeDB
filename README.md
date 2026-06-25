@@ -49,7 +49,8 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   [How it works](#concurrency--durability).
 - **Private by default**: text, ids, and vectors stay local; telemetry is metrics-only
   (counts, bytes, latency), never raw payloads.
-- **Local embeddings**: `sentence-transformers` on CUDA, MPS, or CPU.
+- **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
+  `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
 - **Batteries included**: a `lodedb` CLI, a loopback dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
@@ -73,6 +74,7 @@ the install with `lodedb doctor`. Optional extras:
 ```bash
 pip install "lodedb[gpu]"                            # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[mcp,langchain,llama-index,mem0]" # MCP server + LangChain/LlamaIndex/mem0 adapters
+pip install "lodedb[onnx-export]"                    # export ONNX for a custom model (Optimum); presets need no export
 ```
 
 Using LodeDB as memory for a coding assistant? After installing the `mcp` extra, register its

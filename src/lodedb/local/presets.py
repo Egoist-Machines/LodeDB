@@ -29,6 +29,10 @@ class LocalModelPreset:
     query_prefix: str
     document_prefix: str
     description: str
+    # Sentence pooling the model was trained with, used by the ONNX runtime to
+    # reproduce the sentence-transformers vector. The torch path reads pooling
+    # from the model's own config, so this only matters for the ONNX backend.
+    pooling: str = "mean"
 
     @property
     def route_policy(self) -> EngineRoutePolicy:
@@ -62,6 +66,7 @@ LOCAL_MODEL_PRESETS: dict[str, LocalModelPreset] = {
         query_prefix="",
         document_prefix="",
         description="Fast default: all-MiniLM-L6-v2, 384-dim, 4-bit TurboVec.",
+        pooling="mean",
     ),
     "bge": LocalModelPreset(
         name="bge",
@@ -71,6 +76,7 @@ LOCAL_MODEL_PRESETS: dict[str, LocalModelPreset] = {
         query_prefix=BGE_BASE_QUERY_PREFIX,
         document_prefix="",
         description="Quality: BAAI/bge-base-en-v1.5, 768-dim, 4-bit TurboVec.",
+        pooling="cls",
     ),
 }
 
