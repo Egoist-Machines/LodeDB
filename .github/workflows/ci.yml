@@ -14,6 +14,15 @@ on:
 permissions:
   contents: read
 
+# Building the vendored TurboVec crate fetches its dependencies from crates.io.
+# On the Windows runner those fetches intermittently fail with
+# "[56] schannel: server closed abruptly (missing close_notify)", a known TLS flake
+# aggravated by HTTP/2 multiplexing. Disable multiplexing (the trigger) and retry
+# more on transient network errors. Harmless on Linux/macOS.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   test:
     strategy:
@@ -31,8 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0 extras)
-        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0
+      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0/image extras)
+        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image
 
       - name: Lint
         run: uv run ruff check .
@@ -95,6 +104,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
+
+      - name: Assert the lockfile is current with pyproject.toml
+        run: uv lock --check
 
       - name: Sync (builds the vendored TurboVec core)
         run: uv sync

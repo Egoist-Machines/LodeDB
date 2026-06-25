@@ -15,6 +15,7 @@ from lodedb.engine.core import EngineRoutePolicy
 from lodedb.engine.route_profiles import (
     BGE_BASE_QUERY_PREFIX,
     BGE_TURBOVEC_ROUTE_PROFILE,
+    CLIP_TURBOVEC_ROUTE_PROFILE,
     MINILM_TURBOVEC_ROUTE_PROFILE,
     route_policy_for_profile,
 )
@@ -33,6 +34,9 @@ class LocalModelPreset:
     # reproduce the sentence-transformers vector. The torch path reads pooling
     # from the model's own config, so this only matters for the ONNX backend.
     pooling: str = "mean"
+    # When True, the preset's backend also embeds images into the same space
+    # (the ``"clip"`` preset), enabling ``add_image`` / ``search_by_image``.
+    multimodal: bool = False
 
     @property
     def route_policy(self) -> EngineRoutePolicy:
@@ -78,6 +82,17 @@ LOCAL_MODEL_PRESETS: dict[str, LocalModelPreset] = {
         description="Quality: BAAI/bge-base-en-v1.5, 768-dim, 4-bit TurboVec.",
         pooling="cls",
     ),
+    "clip": LocalModelPreset(
+        name="clip",
+        route_profile=CLIP_TURBOVEC_ROUTE_PROFILE,
+        query_prefix="",
+        document_prefix="",
+        description=(
+            "Image + text: sentence-transformers/clip-ViT-B-32, 512-dim, 4-bit "
+            "TurboVec. Needs the [image] extra for image input."
+        ),
+        multimodal=True,
+    ),
 }
 
 
@@ -114,6 +129,46 @@ def vector_only_route_policy(native_dim: int, *, bit_width: int = 4) -> EngineRo
         model="external",
         provider="external",
         task="vector-only",
+        native_dim=int(native_dim),
+        method_template=f"direct_turbovec_full{int(native_dim)}_bw{int(bit_width)}",
+        experimental=False,
+        index_backend="turbovec_direct",
+        turbovec_bit_width=int(bit_width),
+    )
+
+
+CUSTOM_EMBEDDER_ROUTE_PROFILE = "custom-embedder"
+
+
+def custom_embedder_route_policy(
+    native_dim: int,
+    *,
+    bit_width: int = 4,
+    model_identity: str = "custom",
+) -> EngineRoutePolicy:
+    """Returns a route policy for an index driven by a caller-supplied embedder.
+
+    This backs the public ``LodeDB(embedder=...)`` argument. Like
+    :func:`vector_only_route_policy` it is built on demand at a caller-determined
+    dimension and is not registered in the client route manifest, but unlike the
+    vector-only profile it stays **text-capable**: the supplied
+    :class:`~lodedb.engine.embedding_backends.EngineEmbeddingBackend` embeds text
+    on the way in and on query, so ``add``/``search`` work as well as the vector-in
+    verbs. ``model_identity`` (the backend's ``required_model_name`` when it
+    declares one, else ``"custom"``) is pinned into the redacted snapshot header
+    and re-enforced on reopen, so a store written with one embedder dimension or
+    identity cannot be silently reopened with a mismatching one. The
+    ``turbovec_direct`` backend keeps the TurboVec-availability guard and the
+    O(changed) commit path identical to the preset routes.
+    """
+
+    return EngineRoutePolicy(
+        profile=CUSTOM_EMBEDDER_ROUTE_PROFILE,
+        label="Custom embedder (user-supplied)",
+        client_note="caller-supplied embedding backend; no built-in preset model",
+        model=model_identity,
+        provider="external",
+        task="custom-embedder",
         native_dim=int(native_dim),
         method_template=f"direct_turbovec_full{int(native_dim)}_bw{int(bit_width)}",
         experimental=False,

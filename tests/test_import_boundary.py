@@ -57,6 +57,23 @@ for _root in _FORBIDDEN:
         print("LOADED " + _root)
 """
 
+# The optional image extra is Pillow (the "clip" preset / add_image path). The CLIP
+# backend imports sentence-transformers and Pillow only inside the methods that
+# encode, so importing LodeDB — including the embedding-backends, presets, and
+# backends modules where the CLIP wiring lives — must not pull Pillow.
+_IMAGE_EXTRA_LAZINESS_PROBE = """
+import importlib, sys
+for _m in (
+    "lodedb",
+    "lodedb.engine.embedding_backends",
+    "lodedb.local.presets",
+    "lodedb.local.backends",
+):
+    importlib.import_module(_m)
+if "PIL" in {_name.split(".", 1)[0] for _name in sys.modules}:
+    print("EAGER PIL")
+"""
+
 
 def _probe_lines(probe: str, marker: str) -> list[str]:
     """Runs a probe in a fresh interpreter and returns the names it flagged."""
@@ -90,3 +107,9 @@ def test_import_does_not_load_optional_integrations():
     """Importing LodeDB must not import optional framework integrations."""
 
     assert _probe_lines(_OPTIONAL_INTEGRATION_PROBE, "LOADED") == []
+
+
+def test_image_extra_stays_lazy_on_import():
+    """Importing LodeDB must not eagerly load Pillow (the optional [image] extra)."""
+
+    assert _probe_lines(_IMAGE_EXTRA_LAZINESS_PROBE, "EAGER") == []

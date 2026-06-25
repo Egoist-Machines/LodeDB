@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multimodal (CLIP) and bring-your-own-vector search.** A `clip` preset embeds images and text
+  into one shared space (`db.add_image()` / `db.add_images()` and cross-modal `search` /
+  `search_by_image`) via a sentence-transformers CLIP model behind the optional `lodedb[image]`
+  extra (Pillow only, lazy-imported). A public `embedder=` argument drives a text-capable index
+  with any embedding backend at its own dimension (it must declare a non-secret
+  `required_model_name`), and `LodeCollection` groups named vector spaces (sibling indexes) under
+  one root, reopened from a manifest that records each space's kind, identity, bit width, and
+  privacy flags (`store_text`/`index_text`) and re-applies them on reopen, so a `store_text=False`
+  space never silently flips back to retaining raw text. The collection registry is crash-safe to
+  the engine's standard: the manifest honors `durability="fsync"`, and a failed publish rolls the
+  space back (closing it, releasing its lock) instead of leaving it open and unregistered. A
+  preset, custom-embedder, or vector-only
+  index pins its model identity in the on-disk header and re-enforces it on reopen. The raw image
+  is never stored (keep its path in metadata), and `store_text=False` now keeps raw text off disk
+  in WAL commit mode too: WAL records log chunk embeddings (and lexical tokens when
+  `index_text=True`), never the raw document body or a vector caption. A vector or image upsert
+  refreshes the document's lexical postings, so replacing a text document clears its stale terms
+  and an image caption is searchable when `index_text=True`. Reopen validates the full persisted
+  route identity (model, provider, task, dimension, storage profile, and bit width); image decoding
+  is bounded by `LODEDB_MAX_IMAGE_PIXELS` (a decompression-bomb guard, ~64 MP default); and
+  `stats()` reports per-handle image-embedding metrics split by phase (ingest vs query: count,
+  encode time, failures).
 - **PrivateGPT vector-store provider.** `lodedb.local.integrations.privategpt` lets
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) use LodeDB as its local vector store.
   PrivateGPT's store layer is LlamaIndex's `BasePydanticVectorStore` selected by

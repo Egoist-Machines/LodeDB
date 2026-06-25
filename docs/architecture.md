@@ -42,8 +42,11 @@ The public surface (`import lodedb`, the `lodedb` CLI, the optional MCP server, 
 LangChain adapter) all sit on one SDK (`LodeDB`), which drives the engine (`LodeEngine` →
 `LodeIndex`). Embedding (ONNX Runtime by default, with a device-selected sentence-transformers
 fallback) is kept separate from vector serving: the scan runs on the compact CPU TurboVec kernel
-by default, with an optional GPU-resident fp16 scan for batched queries on CUDA. State persists to
-four on-disk sidecars.
+by default, with an optional GPU-resident fp16 scan for batched queries on CUDA. The index is
+modality-agnostic: the same path stores text, CLIP image+text vectors (`model="clip"`), or
+bring-your-own vectors, and `LodeCollection` groups several such indexes under one root. State
+persists to generation-addressed artifacts (the redacted JSON state and compact vector base, plus
+the opt-in `.tvtext` raw-text and `.tvlex` lexical-postings sidecars).
 
 ## Package layout
 
@@ -55,10 +58,11 @@ src/lodedb/
   __init__.py            # public API: LodeDB, LodeSearchHit, the CLI
   config.py              # minimal YAML loader
   local/                 # local-first product surface
-    db.py                #   LodeDB: add / search / search_many / remove / persist
+    db.py                #   LodeDB: add / search / add_image / vector-in / remove / persist
     backends.py            #   embedding runtime + device selection (ONNX / torch; MPS / CUDA / CPU)
     onnx_artifacts.py    #   fetch/export + cache the preset ONNX model on first use
-    presets.py           #   minilm / bge route presets
+    presets.py           #   minilm / bge / clip route presets (+ custom embedder=)
+    collection.py        #   LodeCollection: named vector spaces under one root
     cli.py, server.py    #   `lodedb` CLI + loopback/private-network dev server
     mcp_server.py        #   optional stdio MCP server (agent memory)
     doctor.py, benchmark.py     #   capability report + local benchmark
@@ -80,14 +84,15 @@ third_party/turbovec/    # vendored MIT compact core + Apache-2.0 lifecycle patc
 
 Runtime PyPI dependencies: `numpy`, `typer`, `onnxruntime`, `transformers`,
 `sentence-transformers`, `pyyaml`. Extras: `[onnx-export]` (Optimum, for exporting an ONNX graph
-for a model that does not ship one), `[mcp]`, `[langchain]`, `[gpu]`. The compact TurboVec core is
-not a PyPI dependency: maturin compiles the vendored Rust crate and bundles it into the wheel as
-the `lodedb._turbovec` extension (see `pyproject.toml` `[tool.maturin]`).
+for a model that does not ship one), `[image]` (Pillow, for `model="clip"` / `add_image`), `[mcp]`,
+`[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`. The compact TurboVec core is not a PyPI
+dependency: maturin compiles the vendored Rust crate and bundles it into the wheel as the
+`lodedb._turbovec` extension (see `pyproject.toml` `[tool.maturin]`).
 
 Importing LodeDB loads none of `faiss`, `modal`, `mteb`, `datasets`, `matplotlib`, or
-`sklearn`: the embedding runtimes (`onnxruntime`, `transformers`, `sentence-transformers`) and the
-optional CUDA scan load lazily, at first build/query, and Optimum only ever runs in an export
-subprocess. `tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is
+`sklearn`: the embedding runtimes (`onnxruntime`, `transformers`, `sentence-transformers`), the
+optional CUDA scan, and the optional image stack (Pillow, plus the CLIP model) load lazily, at
+first build/query, and Optimum only ever runs in an export subprocess. `tests/test_import_boundary.py` checks this in a fresh subprocess. (`scikit-learn` is
 pulled in transitively by `sentence-transformers`, but importing LodeDB does not import it.)
 
 ## Storage
@@ -208,3 +213,25 @@ reopen rebuilt purely from the persisted terms, with no raw text and no re-token
 raw-text store it is deliberately separate from the redacted artifacts above and never reaches
 telemetry, so persisting the lexical index weakens no payload-free guarantee. A lexical query with
 neither `index_text=True` nor `store_text=True` raises a clear error.
+
+**The write-ahead log (`<key>.wal`) is payload-bearing between checkpoints.** In the default
+`commit_mode="wal"`, a mutation is appended to `<key>.wal` and a full generation is checkpointed
+only periodically, so the WAL holds in-flight payload and must be treated as sensitively as the
+data it indexes:
+
+- With `store_text=True`, a text `add` logs the document's raw text (replay re-embeds it).
+- With `store_text=False`, a text `add` logs the chunk embedding delta instead and, when
+  `index_text=True`, the per-chunk lexical tokens (payload-derived terms, never raw text) so a
+  crash recovers lexical/hybrid search without retaining text.
+- A vector-in or image upsert logs the vector and redacted metadata, plus the caption text only
+  when `store_text=True` and the caption tokens only when `index_text=True`.
+
+`db.persist()` and `db.close()` checkpoint the WAL into a committed generation and truncate it, so
+a cleanly closed store has an empty WAL and the durable artifacts above are fully current. A crash
+replays the WAL on the next writable open and then checkpoints, so recovery yields a normal
+committed generation. Read-only handles never read the WAL; they load the last checkpointed
+generation, not a writer's in-flight log. `commit_mode="generation"` publishes a full generation on
+every write and keeps no WAL, so it retains no between-write payload in a log at all (at a higher
+per-write cost). For backups, support bundles, and incident response, classify `<key>.wal` as
+carrying the same data class as the `.tvtext`/`.tvlex` sidecars under the active
+`store_text`/`index_text` settings.

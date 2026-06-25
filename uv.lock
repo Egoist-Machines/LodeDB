@@ -1353,6 +1353,9 @@ dev = [
 gpu = [
     { name = "cupy-cuda12x", marker = "sys_platform == 'linux'" },
 ]
+image = [
+    { name = "pillow" },
+]
 langchain = [
     { name = "langchain-core" },
 ]
@@ -1379,6 +1382,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "onnxruntime", specifier = ">=1.20.0" },
     { name = "optimum", extras = ["exporters"], marker = "extra == 'onnx-export'", specifier = ">=1.23.0,<2.0.0" },
+    { name = "pillow", marker = "extra == 'image'", specifier = ">=10.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.17" },
@@ -1386,7 +1390,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.40.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "dev"]
+provides-extras = ["gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "image", "dev"]
 
 [[package]]
 name = "markdown-it-py"

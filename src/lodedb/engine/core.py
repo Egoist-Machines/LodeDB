@@ -108,6 +108,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("lodedb.engine")
 
 DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
+# JSON files that may share a persistence directory but are NOT engine index
+# snapshots and must never be parsed as one. The SDK's LodeCollection writes a
+# ``collection.json`` manifest at the collection root; without this, pointing a
+# plain index open at a collection root would try to load it as a legacy snapshot
+# and fail with a confusing schema-version error.
+_NON_INDEX_JSON_FILES = frozenset({"collection.json"})
 # Cap on the per-index in-memory query-latency ring. Latency samples are
 # runtime telemetry (stats/audit percentiles), not durable state, so a long
 # query stream keeps only the most recent samples rather than growing without
@@ -1093,6 +1099,37 @@ class LodeEngine:
             },
         )
 
+    def _stage_document_ingest_wal_record(
+        self,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        documents: tuple[EngineDocument, ...],
+        *,
+        changeset: _TurboVecChangeset | None,
+    ) -> None:
+        """Stages the WAL record for a text-in ingest, raw-text-aware.
+
+        With raw-text storage on (``store_text=True``), it logs the documents' text
+        and lets replay re-embed them (the text is retained on disk anyway). With it
+        off, it logs the chunk-level embedding delta instead (``apply_embedded_documents``)
+        so the WAL carries no raw text and replay rebuilds the rows from the
+        embeddings without re-embedding. On the cold build path there is no prior
+        chunk to reuse, so the whole current chunk set is the delta.
+        """
+
+        if self.raw_text_storage_enabled:
+            self._stage_wal_record(
+                context, state, "upsert_documents", _documents_wal_payload(documents)
+            )
+            return
+        effective = changeset or _TurboVecChangeset(added_chunks=tuple(state.chunks.values()))
+        self._stage_wal_record(
+            context,
+            state,
+            "apply_embedded_documents",
+            _embedded_documents_wal_payload(state, documents, effective),
+        )
+
     @_synchronized
     def build_documents(
         self,
@@ -1124,9 +1161,7 @@ class LodeEngine:
             return result
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
-        self._stage_wal_record(
-            context, state, "upsert_documents", _documents_wal_payload(documents)
-        )
+        self._stage_document_ingest_wal_record(context, state, documents, changeset=None)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1167,9 +1202,7 @@ class LodeEngine:
         result, changeset = ingest
         self._capture_document_text(state, documents)
         self._capture_lexical_tokens(state, documents)
-        self._stage_wal_record(
-            context, state, "upsert_documents", _documents_wal_payload(documents)
-        )
+        self._stage_document_ingest_wal_record(context, state, documents, changeset=changeset)
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -1217,7 +1250,17 @@ class LodeEngine:
             return ingest
         result, changeset = ingest
         self._capture_vector_document_text(state, vectors)
-        self._stage_wal_record(context, state, "upsert_vectors", _vectors_wal_payload(vectors))
+        self._capture_vector_lexical_tokens(state, vectors)
+        self._stage_wal_record(
+            context,
+            state,
+            "upsert_vectors",
+            _vectors_wal_payload(
+                vectors,
+                include_text=self.raw_text_storage_enabled,
+                include_tokens=self.lexical_index_enabled,
+            ),
+        )
         self._finalize_document_ingest(
             context=context,
             state=state,
@@ -2588,8 +2631,67 @@ class LodeEngine:
         if self.embedding_backend is not None:
             if self.embedding_backend.native_dim != state.native_dim:
                 raise ValueError("configured embedding backend dimension does not match index")
+            required = self.embedding_backend.required_model_name
+            if required and required != state.model:
+                raise ValueError(
+                    "configured embedding backend model does not match index "
+                    f"(backend {required!r} vs index {state.model!r})"
+                )
             return self.embedding_backend
         return HashEmbeddingBackend(native_dim=state.native_dim)
+
+    def _validate_loaded_state_identity(self, state: ClientIndexState) -> None:
+        """Rejects a loaded index whose persisted identity contradicts this handle.
+
+        Loading enforces the full persisted route identity against the active route
+        policy: model, provider, task, native_dim, storage profile, and TurboVec bit
+        width. Checking only model/dim is not enough, because a vector-only store and
+        a custom-embedder index can share model/provider/dim and differ only in task,
+        and reopening at a different bit width must fail rather than silently keep the
+        stored width. The backend's ``required_model_name`` is also checked when set
+        (an identity-free backend has nothing to compare, so only the dimension binds
+        it).
+        """
+
+        if self.route_policy is not None:
+            policy = self.route_policy
+            expected_bit_width = (
+                int(policy.turbovec_bit_width) if policy.turbovec_bit_width is not None else 4
+            )
+            expected_storage = storage_profile_for_route_policy(policy)
+            # Enforce the full persisted identity, not just (model, dim): a vector-only
+            # store and a custom-embedder index can share model/provider/dim yet differ
+            # in task, and a reopen at a different bit_width must not silently keep the
+            # stored width. A mismatch in any field means the store would serve a route
+            # it was not written for.
+            for label, persisted, expected in (
+                ("dimension", state.native_dim, policy.native_dim),
+                ("model", state.model, policy.model),
+                ("provider", state.provider, policy.provider),
+                ("task", state.task, policy.task),
+                ("storage profile", state.storage_profile, expected_storage),
+                ("bit_width", int(state.turbovec_bit_width), expected_bit_width),
+            ):
+                if persisted != expected:
+                    raise RuntimeError(
+                        f"persisted index {label} {persisted!r} does not match the opened route "
+                        f"profile {policy.profile!r} ({label} {expected!r}); reopen with the same "
+                        "model / embedder / vector_dim / bit_width it was written with"
+                    )
+        backend = self.embedding_backend
+        if backend is not None:
+            if backend.native_dim != state.native_dim:
+                raise RuntimeError(
+                    f"configured embedding backend dimension {backend.native_dim} does not "
+                    f"match persisted index dimension {state.native_dim}"
+                )
+            required = backend.required_model_name
+            if required and required != state.model:
+                raise RuntimeError(
+                    f"configured embedding backend model {required!r} does not match the "
+                    f"persisted index model {state.model!r}; reopen with the embedder it was "
+                    "written with"
+                )
 
     def _query_serving_index(
         self,
@@ -4253,6 +4355,16 @@ class LodeEngine:
                 for item in payload.get("vectors", [])
             )
             response = self.upsert_vectors(context=context, vectors=vectors, index_id=index_id)
+            # Under store_text=False the caption is absent from the payload, so the
+            # upsert above could only clear the postings; restore the logged
+            # caption tokens (payload-derived) so lexical/hybrid recover them.
+            if self.lexical_index_enabled:
+                for item in payload.get("vectors", []):
+                    tokens = item.get("tokens")
+                    if tokens is not None:
+                        state.document_tokens[str(item["document_id"])] = [
+                            [str(token) for token in chunk_tokens] for chunk_tokens in tokens
+                        ]
         elif op == "delete_documents":
             document_ids = tuple(str(value) for value in payload.get("document_ids", []))
             response = self.delete_documents(
@@ -4271,12 +4383,88 @@ class LodeEngine:
                 clear_text=bool(payload.get("clear_text", False)),
                 index_id=index_id,
             )
+        elif op == "apply_embedded_documents":
+            # Raw-text-free text-in replay: rebuild rows from logged embeddings.
+            self._apply_embedded_documents(context=context, state=state, payload=payload)
+            response = None
         else:
             raise RuntimeError(f"unknown WAL record op during replay: {op!r}")
         if isinstance(response, EngineResponse) and int(response.status_code) >= 400:
             raise RuntimeError(
                 f"WAL replay of {op!r} failed: {response.body.get('error', 'engine error')}"
             )
+
+    def _apply_embedded_documents(
+        self,
+        *,
+        context: EngineRequestContext,
+        state: ClientIndexState,
+        payload: dict[str, Any],
+    ) -> None:
+        """Replays a raw-text-free text-in upsert from logged chunk embeddings.
+
+        The counterpart to the ``apply_embedded_documents`` WAL record written when
+        raw-text storage is off: it rebuilds the affected documents' chunks from the
+        logged embeddings — no raw text, no re-embedding — on top of the committed
+        base, then runs the shared TurboVec sync via :meth:`_finalize_document_ingest`.
+        Mirrors the apply half of :meth:`_ingest_vectors` for the recorded
+        chunk-level delta; reused chunks already live in the base, so only the added
+        chunks carry embeddings.
+        """
+
+        added_chunks: list[IndexedChunk] = []
+        for item in payload.get("added_chunks", []):
+            chunk = IndexedChunk(
+                chunk_id=str(item["chunk_id"]),
+                document_id=str(item["document_id"]),
+                content_hash=str(item["content_hash"]),
+                embedding=tuple(float(value) for value in item["embedding"]),
+            )
+            state.chunks[chunk.chunk_id] = chunk
+            added_chunks.append(chunk)
+        removed_chunk_ids = [str(value) for value in payload.get("removed_chunk_ids", [])]
+        for chunk_id in removed_chunk_ids:
+            state.chunks.pop(chunk_id, None)
+        document_ids: list[str] = []
+        for item in payload.get("documents", []):
+            document_id = str(item["document_id"])
+            document_ids.append(document_id)
+            state.document_chunk_ids[document_id] = tuple(
+                str(value) for value in item.get("chunk_ids", [])
+            )
+            state.document_hashes[document_id] = str(item["content_hash"])
+            state.document_metadata[document_id] = {
+                str(key): str(value) for key, value in dict(item.get("metadata", {})).items()
+            }
+            tokens = item.get("tokens")
+            if tokens is not None:
+                # Restore the durable lexical postings (index_text=True) so
+                # lexical/hybrid search recovers these docs, not just vector search.
+                state.document_tokens[document_id] = [
+                    [str(token) for token in chunk_tokens] for chunk_tokens in tokens
+                ]
+        self._record_pending_state_journal_documents(
+            state, upserted_document_ids=tuple(document_ids)
+        )
+        result: dict[str, float | int] = {
+            "document_count": len(document_ids),
+            "embedded_chunks": len(added_chunks),
+            "reused_chunks": 0,
+            "deleted_chunks": len(removed_chunk_ids),
+            "embedding_time_ms": 0.0,
+            "embedding_batch_size": 0,
+        }
+        changeset = _TurboVecChangeset(
+            added_chunks=tuple(added_chunks),
+            removed_chunk_ids=tuple(removed_chunk_ids),
+        )
+        self._finalize_document_ingest(
+            context=context,
+            state=state,
+            result=result,
+            event_name="documents_upserted",
+            changeset=changeset,
+        )
 
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
@@ -4793,9 +4981,20 @@ class LodeEngine:
             self._load_index_from_commit(key, body)
             loaded_keys.add(key)
         for path in sorted(self.persistence_dir.glob("*.json")):
-            if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
+            if (
+                is_commit_manifest_name(path.name)
+                or path.name in _NON_INDEX_JSON_FILES
+                or path.stem in loaded_keys
+            ):
                 continue
             self._load_legacy_index(path)
+        # Reject any persisted index whose identity does not match this handle's
+        # route policy / embedding backend. Create enforces (model, native_dim);
+        # loading must enforce the same, or a store written with one model could be
+        # reopened with a same-dimension different-model backend and serve
+        # meaningless scores instead of failing.
+        for state in self._indexes.values():
+            self._validate_loaded_state_identity(state)
         # WAL recovery (writer handles only). The durable base on disk is always a
         # committed generation; this replays any <key>.wal tail on top so a
         # WAL-committed-but-not-yet-checkpointed mutation survives the reopen, then
@@ -5128,6 +5327,28 @@ class LodeEngine:
                 tokenize(chunk)
                 for chunk in chunk_text(document.text, self.chunk_character_limit)
             ]
+
+    def _capture_vector_lexical_tokens(
+        self,
+        state: ClientIndexState,
+        documents: tuple[EngineVectorDocument, ...],
+    ) -> None:
+        """Refreshes persisted lexical tokens when vector-in / image documents are upserted.
+
+        A vector document is a single chunk with no embedded body, but its optional
+        ``text`` caption should be lexically searchable when ``index_text=True``. So set
+        the document's token lists to the caption's tokens, or to an **empty** list when
+        there is no caption. The empty list (rather than dropping the key) both clears
+        any stale postings from a text document this id replaced and journals that clear
+        into the ``.tvlex`` delta, so ``mode="lexical"``/``"hybrid"`` stop matching the
+        old body in this handle and after reopen.
+        """
+
+        if not self.lexical_index_enabled:
+            return
+        for document in documents:
+            caption = document.text
+            state.document_tokens[document.document_id] = [tokenize(caption)] if caption else []
 
     def _journal_text(
         self,
@@ -5873,12 +6094,70 @@ def _documents_wal_payload(documents: tuple[EngineDocument, ...]) -> dict[str, A
     }
 
 
-def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str, Any]:
+def _embedded_documents_wal_payload(
+    state: ClientIndexState,
+    documents: tuple[EngineDocument, ...],
+    changeset: _TurboVecChangeset,
+) -> dict[str, Any]:
+    """Frames a text-in upsert as embeddings (not raw text) for WAL replay.
+
+    Used when raw-text storage is off (``store_text=False``): instead of the raw
+    body, it logs the chunk-level delta the ingest produced — the added chunks with
+    their embeddings and the removed chunk ids — plus each affected document's final
+    chunk list, content hash, and redacted metadata. Replay (:meth:`_apply_embedded_documents`)
+    rebuilds the rows from the embeddings on top of the committed base, so the WAL
+    carries no raw text and replay never re-embeds. Chunks reused from a prior
+    commit already live in the committed base, so the delta need not re-log them.
+
+    When a durable lexical index is on (``index_text=True``), the per-document
+    per-chunk token lists are logged too (they are payload-derived terms the index
+    already persists, not raw text), so ``mode="lexical"``/``"hybrid"`` recover the
+    same documents after a crash; without them, replay would rebuild vectors but
+    leave the lexical postings empty for the recovered docs.
+    """
+
+    return {
+        "documents": [
+            {
+                "document_id": document.document_id,
+                "content_hash": state.document_hashes.get(document.document_id, ""),
+                "metadata": dict(state.document_metadata.get(document.document_id, {})),
+                "chunk_ids": list(state.document_chunk_ids.get(document.document_id, ())),
+                "tokens": state.document_tokens.get(document.document_id),
+            }
+            for document in documents
+        ],
+        "added_chunks": [
+            {
+                "chunk_id": chunk.chunk_id,
+                "document_id": chunk.document_id,
+                "content_hash": chunk.content_hash,
+                "embedding": [float(value) for value in chunk.embedding],
+            }
+            for chunk in changeset.added_chunks
+        ],
+        "removed_chunk_ids": list(changeset.removed_chunk_ids),
+    }
+
+
+def _vectors_wal_payload(
+    vectors: tuple[EngineVectorDocument, ...],
+    *,
+    include_text: bool,
+    include_tokens: bool,
+) -> dict[str, Any]:
     """Frames a vector-in upsert batch as a WAL record payload.
 
     Stores each vector verbatim (already L2-normalized at the SDK boundary) plus
-    redacted metadata and the optional retained text, so replay reproduces the
-    same encoded rows the live commit did.
+    redacted metadata, so replay reproduces the same encoded rows the live commit
+    did. The optional retained ``text`` is included only when raw-text storage is
+    enabled (``store_text=True``); with ``store_text=False`` it is dropped so no
+    raw text is ever written to the WAL, and replay rebuilds the row from the
+    vector alone. When a durable lexical index is on (``index_text=True``), the
+    caption's tokens are logged too (payload-derived terms the index already
+    persists, not raw text), so a caption stays lexically searchable after a
+    crash-replay even with ``store_text=False``; otherwise replay leaves the
+    recovered row with empty postings.
     """
 
     return {
@@ -5887,7 +6166,10 @@ def _vectors_wal_payload(vectors: tuple[EngineVectorDocument, ...]) -> dict[str,
                 "document_id": vector.document_id,
                 "vector": [float(value) for value in vector.vector],
                 "metadata": dict(vector.metadata),
-                "text": vector.text,
+                "text": vector.text if include_text else None,
+                "tokens": (
+                    ([tokenize(vector.text)] if vector.text else []) if include_tokens else None
+                ),
             }
             for vector in vectors
         ]

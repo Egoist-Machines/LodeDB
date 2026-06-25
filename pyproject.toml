@@ -66,6 +66,11 @@ langchain = ["langchain-core>=0.3.0"]
 llama-index = ["llama-index-core>=0.11.0"]
 # Optional mem0 vector-store adapter.
 mem0 = ["mem0ai>=2.0.0"]
+# Optional image + text (CLIP) embedding via the "clip" preset / add_image. The CLIP
+# model runs on the existing sentence-transformers + torch stack (already in the base
+# deps), so this adds only Pillow for decoding image files. Both are imported lazily,
+# so a plain `import lodedb` pulls neither (guarded by tests/test_import_boundary.py).
+image = ["pillow>=10.0.0"]
 # ruff is pinned (not floored) so `ruff format`/`ruff check` are reproducible across
 # contributors and CI — the formatter's output can change between ruff releases.
 dev = ["pytest>=8.3.0", "ruff==0.15.17"]

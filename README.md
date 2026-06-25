@@ -51,6 +51,9 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
   `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
+- **Multimodal**: index images and text in one shared CLIP space (`model="clip"`) for
+  cross-modal search, or bring your own vectors from any model.
+  [How it works](#multimodal--bring-your-own-vectors).
 - **Batteries included**: a `lodedb` CLI, a loopback/private-network dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
@@ -73,6 +76,7 @@ the install with `lodedb doctor`. Optional extras:
 
 ```bash
 pip install "lodedb[gpu]"                            # GPU-resident scan (Linux/CUDA)
+pip install "lodedb[image]"                          # image + text (CLIP) embedding (model="clip")
 pip install "lodedb[mcp,langchain,llama-index,mem0]" # MCP server + LangChain/LlamaIndex/mem0 adapters
 pip install "lodedb[onnx-export]"                    # export ONNX for a custom model (Optimum); presets need no export
 ```
@@ -132,7 +136,7 @@ Run with `uv run` (e.g. `uv run lodedb doctor`).
 ```python
 from lodedb import LodeDB
 
-db = LodeDB(path="./data", model="minilm")   # "minilm" (fast) | "bge" (quality)
+db = LodeDB(path="./data", model="minilm")   # "minilm" (fast) | "bge" (quality) | "clip" (image+text)
 
 fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})
 db.add("a lazy dog sleeps all day", metadata={"topic": "animals"})
@@ -156,8 +160,8 @@ db.persist()    # durable .tvim/.tvd/.jsd snapshot; replays on reopen
 
 Reopen with `LodeDB(path="./data")`; no migration step. Original text is kept in a
 `.tvtext` sidecar for `db.get`; pass `store_text=False` to keep none. Presets are `minilm`
-(384-dim) and `bge` (768-dim), with weights pulled from Hugging Face on first use. More in
-[`examples/`](examples/).
+(384-dim), `bge` (768-dim), and `clip` (512-dim, image+text), with weights pulled from Hugging
+Face on first use. More in [`examples/`](examples/).
 
 Need to read a store another process is writing to? Open it read-only. It takes no writer
 lock, so it never blocks on (or is blocked by) the writer:
@@ -235,6 +239,39 @@ reopened = LodeDB(path="./data", index_text=True, store_text=False)
 reopened.search("E1234", k=5, mode="hybrid")  # works after reopen, rebuilt from persisted terms
 ```
 </details>
+
+## Multimodal & bring-your-own vectors
+
+The storage and scan are modality-agnostic: TurboVec stores any normalized float32
+vector, so an image, audio, or video embedding is indexed and scanned exactly like a
+text one. There are two ways to use that.
+
+Bring your own vectors. Open a vector-only index at your dimension and pass the
+embeddings you already computed with any model (CLIP, SigLIP, ImageBind, an audio or
+video encoder, a hosted API). No embedding model is bundled on this path:
+
+```python
+db = LodeDB.open_vector_store("./media", vector_dim=512)
+db.add_vectors(image_vector, id="img-001", metadata={"path": "photos/img-001.jpg"})
+db.search_by_vector(query_vector, k=10)
+```
+
+Or use the built-in `clip` preset for image and text in one shared space, so a text
+query retrieves images and an image query retrieves images and text. It rides the base
+sentence-transformers stack and adds only Pillow (`pip install 'lodedb[image]'`):
+
+```python
+db = LodeDB("./gallery", model="clip")            # downloads clip-ViT-B-32 on first use
+db.add_image("photos/beach.jpg", metadata={"path": "photos/beach.jpg"})
+db.search("a beach at sunset", k=5)               # text -> image, cross-modal
+db.search_by_image("photos/beach.jpg", k=5)       # image -> image
+```
+
+The raw image is never stored; keep it on disk and put its path in `metadata`. Keep one
+embedding model per index (scores are only comparable within one space); the model
+identity is pinned and re-enforced on reopen. To hold several encoders side by side, use
+`LodeCollection` named spaces, and pass `embedder=` to drive an index with your own
+model. See [`docs/multimodal.md`](docs/multimodal.md).
 
 ## GPU-resident index
 
@@ -430,7 +467,11 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   generation, but the last *checkpointed* one, not the writer's in-flight WAL. Pass
   `commit_mode="generation"` (or `LODEDB_COMMIT_MODE=generation`) for the classic path that
   publishes a crash-atomic, MVCC-readable generation on every write; pick it when many
-  out-of-process readers must see each write the instant it commits.
+  out-of-process readers must see each write the instant it commits. Note `<key>.wal` is
+  **payload-bearing before a checkpoint** (raw text under `store_text=True`, otherwise embedding
+  deltas plus, with `index_text=True`, lexical tokens), so treat it as sensitively as the data it
+  indexes; `persist()`/`close()` checkpoint and truncate it, and `generation` mode keeps no WAL.
+  See the [payload boundary](docs/architecture.md#persistence--payload-boundary) docs.
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Limitations
