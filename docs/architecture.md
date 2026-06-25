@@ -213,3 +213,25 @@ reopen rebuilt purely from the persisted terms, with no raw text and no re-token
 raw-text store it is deliberately separate from the redacted artifacts above and never reaches
 telemetry, so persisting the lexical index weakens no payload-free guarantee. A lexical query with
 neither `index_text=True` nor `store_text=True` raises a clear error.
+
+**The write-ahead log (`<key>.wal`) is payload-bearing between checkpoints.** In the default
+`commit_mode="wal"`, a mutation is appended to `<key>.wal` and a full generation is checkpointed
+only periodically, so the WAL holds in-flight payload and must be treated as sensitively as the
+data it indexes:
+
+- With `store_text=True`, a text `add` logs the document's raw text (replay re-embeds it).
+- With `store_text=False`, a text `add` logs the chunk embedding delta instead and, when
+  `index_text=True`, the per-chunk lexical tokens (payload-derived terms, never raw text) so a
+  crash recovers lexical/hybrid search without retaining text.
+- A vector-in or image upsert logs the vector and redacted metadata, plus the caption text only
+  when `store_text=True` and the caption tokens only when `index_text=True`.
+
+`db.persist()` and `db.close()` checkpoint the WAL into a committed generation and truncate it, so
+a cleanly closed store has an empty WAL and the durable artifacts above are fully current. A crash
+replays the WAL on the next writable open and then checkpoints, so recovery yields a normal
+committed generation. Read-only handles never read the WAL; they load the last checkpointed
+generation, not a writer's in-flight log. `commit_mode="generation"` publishes a full generation on
+every write and keeps no WAL, so it retains no between-write payload in a log at all (at a higher
+per-write cost). For backups, support bundles, and incident response, classify `<key>.wal` as
+carrying the same data class as the `.tvtext`/`.tvlex` sidecars under the active
+`store_text`/`index_text` settings.

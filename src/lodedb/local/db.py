@@ -826,8 +826,18 @@ class LodeDB:
         backend-sized batches, so peak *decoded-image* memory is bounded by the batch
         rather than the whole gallery; the resulting vectors do accumulate (one
         ``EngineVectorDocument`` per image) for a single atomic commit, so this is far
-        cheaper than repeated :meth:`add_image` but is not a streaming-ingest path for
-        an unbounded gallery (commit in chunks of this call for very large sets).
+        cheaper than repeated :meth:`add_image`.
+
+        This is an **atomic batch, not a streaming bulk-ingest API**: the whole call
+        commits once, so memory grows with the call size and a late failure loses the
+        whole call. For a large gallery, drive it in chunks yourself, one atomic commit
+        per chunk, which also gives natural progress and resume points::
+
+            CHUNK = 512
+            for start in range(0, len(items), CHUNK):
+                db.add_images(items[start : start + CHUNK])   # one commit per chunk
+                # ...record progress (e.g. `start`) here to resume after a failure
+
         Returns the ids in input order. Requires a multimodal index (``model="clip"``
         or a custom ``embedder=`` exposing ``embed_images``); the per-image storage
         contract matches :meth:`add_image` (the raw image bytes are never stored).
@@ -1073,8 +1083,11 @@ class LodeDB:
         encode counters split by phase (``"ingest"`` for add_image(s), ``"query"`` for
         search_by_image): images embedded, encode calls, cumulative encode seconds, and
         failures. So image-embedding cost is visible separately from storage commit
-        cost, and ingest separately from query. The counters are per-handle and carry
-        no paths, captions, or pixels.
+        cost, and ingest separately from query. The counters carry no paths, captions,
+        or pixels, and are **scoped to this handle**: they start at zero on each open
+        (they are not persisted) and are not aggregated across a collection's spaces or
+        across processes. For fleet-wide image-encode visibility, read them per handle
+        and aggregate in your own metrics pipeline.
         """
 
         stats = self._index.stats()

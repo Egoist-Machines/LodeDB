@@ -160,8 +160,12 @@ db = LodeDB("./store", embedder=MyBackend())      # model= is ignored; shape fro
   mixing old and new vectors.
 - Large images: `add_image` / `add_images` reject an image whose pixel count exceeds
   `LODEDB_MAX_IMAGE_PIXELS` (default about 64 MP) before fully decoding it, as a
-  decompression-bomb guard. `db.stats()["image_embedding"]` reports this handle's
-  encode count, cumulative time, and failures (no paths or captions).
+  decompression-bomb guard. `db.stats()["image_embedding"]` reports encode count,
+  cumulative time, and failures split into `ingest` and `query` phases (no paths or
+  captions); the counters are per-handle and reset on reopen.
+- Large galleries: `add_images` is one atomic commit per call, so memory grows with the
+  call and a late failure loses the whole call. Ingest a big gallery in chunks (one
+  `add_images` call per chunk) for bounded memory and natural resume points.
 - `bit_width` is fixed by a preset (`minilm`/`bge`/`clip` are 4-bit); it is only
   configurable on a `vector_dim=` or `embedder=` index, where it must be 2 or 4.
 - Audio and video: there is no bundled audio or video encoder. Embed with your own

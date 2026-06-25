@@ -467,7 +467,11 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   generation, but the last *checkpointed* one, not the writer's in-flight WAL. Pass
   `commit_mode="generation"` (or `LODEDB_COMMIT_MODE=generation`) for the classic path that
   publishes a crash-atomic, MVCC-readable generation on every write; pick it when many
-  out-of-process readers must see each write the instant it commits.
+  out-of-process readers must see each write the instant it commits. Note `<key>.wal` is
+  **payload-bearing before a checkpoint** (raw text under `store_text=True`, otherwise embedding
+  deltas plus, with `index_text=True`, lexical tokens), so treat it as sensitively as the data it
+  indexes; `persist()`/`close()` checkpoint and truncate it, and `generation` mode keeps no WAL.
+  See the [payload boundary](docs/architecture.md#persistence--payload-boundary) docs.
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Limitations
