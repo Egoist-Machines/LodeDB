@@ -223,7 +223,12 @@ class ClipEmbeddingBackend:
 
     @staticmethod
     def _load_image(item: Any) -> Any:
-        """Loads one image item (path / bytes / PIL image) into an RGB PIL image."""
+        """Loads one image item (path / bytes / PIL image) into an RGB PIL image.
+
+        Guards against oversized / decompression-bomb images: the pixel count is
+        checked against ``LODEDB_MAX_IMAGE_PIXELS`` (default ~64 MP) from the header,
+        before the full decode, so a single hostile file cannot exhaust memory.
+        """
 
         try:
             from PIL import Image
@@ -233,7 +238,9 @@ class ClipEmbeddingBackend:
                 "pip install 'lodedb[image]'"
             ) from exc
 
+        limit = _max_image_pixels()
         if isinstance(item, Image.Image):
+            _reject_oversized_image(item, limit)
             return item.convert("RGB")
         if isinstance(item, (bytes, bytearray)):
             source: Any = io.BytesIO(bytes(item))
@@ -245,8 +252,47 @@ class ClipEmbeddingBackend:
             )
         # Close the file/stream handle promptly rather than relying on finalization;
         # convert() returns a new image holding its own decoded data.
-        with Image.open(source) as image:
-            return image.convert("RGB")
+        try:
+            with Image.open(source) as image:
+                _reject_oversized_image(image, limit)
+                return image.convert("RGB")
+        except Image.DecompressionBombError as exc:
+            raise ValueError(f"image rejected as a decompression bomb: {exc}") from exc
+
+
+# Default ceiling on the pixel count of an image fed to the CLIP backend (~64 MP),
+# a guard against oversized / decompression-bomb inputs. Override with the env var.
+_DEFAULT_MAX_IMAGE_PIXELS = 64_000_000
+
+
+def _max_image_pixels() -> int:
+    """Returns the image pixel-count ceiling, honoring ``LODEDB_MAX_IMAGE_PIXELS``."""
+
+    raw = os.environ.get("LODEDB_MAX_IMAGE_PIXELS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_IMAGE_PIXELS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LODEDB_MAX_IMAGE_PIXELS must be an integer") from exc
+    if value <= 0:
+        raise ValueError("LODEDB_MAX_IMAGE_PIXELS must be a positive integer")
+    return value
+
+
+def _reject_oversized_image(image: object, limit: int) -> None:
+    """Raises ``ValueError`` if an image's pixel count exceeds ``limit``.
+
+    Reads the dimensions from the decoded header (``size``), so an oversized image
+    is rejected before its pixels are fully materialized.
+    """
+
+    width, height = image.size  # type: ignore[attr-defined]
+    if width * height > limit:
+        raise ValueError(
+            f"image is {width}x{height} ({width * height} pixels), over the "
+            f"{limit}-pixel limit; raise LODEDB_MAX_IMAGE_PIXELS to allow it"
+        )
 
 
 class ONNXRuntimeEmbeddingBackend:

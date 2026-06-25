@@ -108,6 +108,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("lodedb.engine")
 
 DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
+# JSON files that may share a persistence directory but are NOT engine index
+# snapshots and must never be parsed as one. The SDK's LodeCollection writes a
+# ``collection.json`` manifest at the collection root; without this, pointing a
+# plain index open at a collection root would try to load it as a legacy snapshot
+# and fail with a confusing schema-version error.
+_NON_INDEX_JSON_FILES = frozenset({"collection.json"})
 # Cap on the per-index in-memory query-latency ring. Latency samples are
 # runtime telemetry (stats/audit percentiles), not durable state, so a long
 # query stream keeps only the most recent samples rather than growing without
@@ -4960,7 +4966,11 @@ class LodeEngine:
             self._load_index_from_commit(key, body)
             loaded_keys.add(key)
         for path in sorted(self.persistence_dir.glob("*.json")):
-            if is_commit_manifest_name(path.name) or path.stem in loaded_keys:
+            if (
+                is_commit_manifest_name(path.name)
+                or path.name in _NON_INDEX_JSON_FILES
+                or path.stem in loaded_keys
+            ):
                 continue
             self._load_legacy_index(path)
         # Reject any persisted index whose identity does not match this handle's

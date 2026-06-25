@@ -151,6 +151,12 @@ written to the on-disk header and must not carry credentials or API keys.
 - Encoder versions: a stored index is tied to its embedding model. Re-embed the
   corpus into a new index when you change models or model versions, rather than
   mixing old and new vectors.
+- Large images: `add_image` / `add_images` reject an image whose pixel count exceeds
+  `LODEDB_MAX_IMAGE_PIXELS` (default about 64 MP) before fully decoding it, as a
+  decompression-bomb guard. `db.stats()["image_embedding"]` reports this handle's
+  encode count, cumulative time, and failures (no paths or captions).
+- `bit_width` is fixed by a preset (`minilm`/`bge`/`clip` are 4-bit); it is only
+  configurable on a `vector_dim=` or `embedder=` index, where it must be 2 or 4.
 - Audio and video: there is no bundled audio or video encoder. Embed with your own
   model (for example an audio CLAP model or a video encoder) and use the
   bring-your-own-vectors path.

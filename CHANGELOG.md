@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model identity in the on-disk header and re-enforces it on reopen. The raw image is never stored
   (keep its path in metadata), and `store_text=False` now keeps raw text off disk in WAL commit
   mode too: WAL records log chunk embeddings (and lexical tokens when `index_text=True`), never the
-  raw document body or a vector caption.
+  raw document body or a vector caption. Reopen validates the full persisted route identity (model,
+  provider, task, dimension, storage profile, and bit width); image decoding is bounded by
+  `LODEDB_MAX_IMAGE_PIXELS` (a decompression-bomb guard, ~64 MP default); and `stats()` reports
+  per-handle image-embedding metrics (count, encode time, failures).
 - **PrivateGPT vector-store provider.** `lodedb.local.integrations.privategpt` lets
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) use LodeDB as its local vector store.
   PrivateGPT's store layer is LlamaIndex's `BasePydanticVectorStore` selected by

@@ -71,6 +71,13 @@ def test_embedder_and_vector_dim_mutually_exclusive(tmp_path):
         LodeDB(path=tmp_path, vector_dim=DIM, embedder=_embedder())
 
 
+def test_preset_rejects_conflicting_bit_width(tmp_path):
+    # A preset's width is fixed by its route; an explicit, conflicting bit_width
+    # must fail rather than be silently ignored. Raises before any model build.
+    with pytest.raises(ValueError, match="preset"):
+        LodeDB(path=tmp_path, model="minilm", bit_width=2)
+
+
 class _IdentBackend(HashEmbeddingBackend):
     """A hash backend that declares a model identity, for reopen-identity tests."""
 

@@ -9,9 +9,22 @@ from __future__ import annotations
 
 import pytest
 
-from lodedb import LodeCollection
+from lodedb import LodeCollection, LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import ReadOnlyError
+
+
+def test_plain_lodedb_open_on_collection_root_ignores_manifest(tmp_path):
+    # A collection writes collection.json at its root and puts each space in a
+    # subdirectory. Opening the root as a plain index must skip the manifest rather
+    # than try to parse it as a legacy snapshot (which raised a schema-version error).
+    col = LodeCollection(tmp_path)
+    col.space("vectors", vector_dim=8).add_vectors([1, 0, 0, 0, 0, 0, 0, 0], id="v")
+    col.close()
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)  # the root, not a space subdir
+    assert db.count() == 0  # spaces live in subdirs; the manifest is not an index
+    db.close()
 
 
 def test_spaces_are_independent(tmp_path):
@@ -80,6 +93,18 @@ def test_custom_embedder_space_records_identity_and_reopens(tmp_path):
     space2 = reopened.space("notes", embedder=_IdentBackend("my-model"))
     assert space2.count() == 1
     reopened.close()
+
+
+def test_preset_space_records_effective_bit_width(tmp_path):
+    col = LodeCollection(tmp_path)
+    # An explicit, conflicting bit_width for a preset space is rejected up front.
+    with pytest.raises(ValueError, match="preset"):
+        col.space("bad", model="minilm", bit_width=2)
+    # A preset space records the preset's real width (4), never a caller value that
+    # would not take effect.
+    col.space("notes", model="minilm", _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    assert col.space_config("notes") == {"kind": "preset", "model": "minilm", "bit_width": 4}
+    col.close()
 
 
 def test_same_handle_mismatched_config_is_rejected(tmp_path):

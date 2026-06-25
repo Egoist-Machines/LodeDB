@@ -143,3 +143,36 @@ def test_clip_preset_builds_multimodal_index(tmp_path):
     assert db._vector_dim == 512
     assert not db.vector_only
     assert callable(getattr(db._embedding_backend, "embed_images", None))
+
+
+def test_clip_backend_rejects_oversized_image(monkeypatch):
+    # The decode guard rejects an image whose pixel count exceeds the limit, before
+    # the full decode. Uses a tiny limit so a small image trips it (no model needed).
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from lodedb.engine.embedding_backends import ClipEmbeddingBackend
+
+    monkeypatch.setenv("LODEDB_MAX_IMAGE_PIXELS", "4")  # 2x2 ceiling
+    with pytest.raises(ValueError, match="pixel"):
+        ClipEmbeddingBackend._load_image(Image.new("RGB", (8, 8)))  # 64 px
+
+
+def test_add_images_validates_all_items_before_embedding(tmp_path):
+    db = _multimodal_db(tmp_path)
+    # A bad metadata value on a later item must fail before any image is embedded.
+    with pytest.raises(ValueError):
+        db.add_images([{"image": "cat"}, {"image": "dog", "metadata": {"bad": ["x"]}}])
+    assert db.count() == 0
+    assert db.stats()["image_embedding"]["images_embedded"] == 0
+
+
+def test_image_embedding_metrics_in_stats(tmp_path):
+    db = _multimodal_db(tmp_path)
+    db.add_image("cat", id="c")
+    db.add_images([{"image": "dog"}, {"image": "bird"}])
+    metrics = db.stats()["image_embedding"]
+    assert metrics["images_embedded"] == 3
+    assert metrics["encode_calls"] >= 2
+    assert metrics["encode_failures"] == 0
+    assert metrics["encode_seconds"] >= 0.0

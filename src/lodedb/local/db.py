@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import secrets
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -164,7 +165,7 @@ class LodeDB:
         model: str = "minilm",
         vector_dim: int | None = None,
         embedder: EngineEmbeddingBackend | None = None,
-        bit_width: int = 4,
+        bit_width: int | None = None,
         device: str = "auto",
         embedding_runtime: str = "auto",
         batch_size: int = 32,
@@ -240,11 +241,12 @@ class LodeDB:
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
         self.read_only = bool(read_only)
-        # TurboVec stores 2- or 4-bit codes; reject any other width up front (it only
-        # affects vector-only / custom-embedder indexes, but a bad value should fail
-        # at the boundary rather than be silently ignored or surface deep in the kernel).
-        if int(bit_width) not in {2, 4}:
+        # bit_width is only meaningful for vector-only / custom-embedder indexes (a
+        # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
+        # reject any other width at the boundary; ``None`` means "use the index default".
+        if bit_width is not None and int(bit_width) not in {2, 4}:
             raise ValueError(f"bit_width must be 2 or 4, got {bit_width!r}")
+        resolved_bit_width = 4 if bit_width is None else int(bit_width)
         # "fast" (atomic rename only) vs "fsync" (power-loss durable). An
         # explicit arg wins; otherwise LODEDB_DURABILITY, else fast.
         fsync_on_commit = (
@@ -284,7 +286,7 @@ class LodeDB:
                 fallback_used=False,
                 fallback_reason="vector-only index (no embedding model)",
             )
-            route_policy = vector_only_route_policy(dim, bit_width=int(bit_width))
+            route_policy = vector_only_route_policy(dim, bit_width=resolved_bit_width)
             route_profile = route_policy.profile
         elif embedder is not None:
             # A caller-supplied embedding backend: the index is text-capable (the
@@ -314,11 +316,19 @@ class LodeDB:
                 fallback_reason="",
             )
             route_policy = custom_embedder_route_policy(
-                native_dim, bit_width=int(bit_width), model_identity=model_identity
+                native_dim, bit_width=resolved_bit_width, model_identity=model_identity
             )
             route_profile = route_policy.profile
         else:
             self.preset = resolve_preset(model)
+            # A preset's bit width is fixed by its route; an explicit, conflicting
+            # bit_width would otherwise be silently ignored (the store stays the
+            # preset's width). Reject it so the requested width is never a lie.
+            if bit_width is not None and int(bit_width) != self.preset.turbovec_bit_width:
+                raise ValueError(
+                    f"model {model!r} is a {self.preset.turbovec_bit_width}-bit preset; "
+                    "bit_width is only configurable for a vector_dim= or embedder= index"
+                )
             self._vector_dim_value = None
             if _embedding_backend is not None:
                 backend = _embedding_backend
@@ -381,6 +391,14 @@ class LodeDB:
         # any persisted state for this client hash via the engine constructor.
         self._ensure_index()
         self._auto_id_counter = 0
+        # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
+        # under stats()["image_embedding"] so operators can see CLIP encode cost.
+        self._image_metrics: dict[str, Any] = {
+            "images_embedded": 0,
+            "encode_calls": 0,
+            "encode_seconds": 0.0,
+            "encode_failures": 0,
+        }
 
     # -- public API ---------------------------------------------------------
 
@@ -783,7 +801,7 @@ class LodeDB:
 
         self._require_writable()
         backend = self._image_backend()
-        vector = backend.embed_images((image,))[0]
+        vector = self._embed_images_tracked(backend, (image,))[0]
         return self.add_vectors(vector, id=id, metadata=metadata, text=text)
 
     def add_images(
@@ -811,32 +829,34 @@ class LodeDB:
         backend = self._image_backend()
         if not isinstance(documents, list):
             raise ValueError("documents must be a list")
+        # Validate and coerce every item up front (image present, metadata/text valid)
+        # so a bad item fails before any image is embedded, not after a wasted batch.
         images: list[Any] = []
         ids: list[str] = []
-        metadatas: list[Mapping[str, Any] | None] = []
-        texts: list[Any] = []
+        metadatas: list[dict[str, str]] = []
+        texts: list[str | None] = []
         for item in documents:
             image = item.get("image")
             if image is None:
                 raise ValueError("each document needs an 'image'")
             images.append(image)
             ids.append(str(item["id"]) if item.get("id") is not None else self._next_auto_id())
-            metadatas.append(item.get("metadata"))
-            texts.append(item.get("text"))
+            metadatas.append(_coerce_metadata(item.get("metadata")))
+            texts.append(_coerce_optional_text(item.get("text")))
         if not images:
             return []
-        # Decode + encode in backend-sized batches so memory is bounded by the batch
-        # (not the whole gallery's decoded pixels), then commit all vectors at once.
+        # Decode + encode in backend-sized batches so peak decoded-image memory is
+        # bounded by the batch, then commit all vectors at once.
         batch_size = max(1, int(getattr(backend, "batch_size", 16) or 16))
         vectors: list[Any] = []
         for start in range(0, len(images), batch_size):
-            vectors.extend(backend.embed_images(images[start : start + batch_size]))
+            vectors.extend(self._embed_images_tracked(backend, images[start : start + batch_size]))
         payload = [
             EngineVectorDocument(
                 document_id=ids[index],
                 vector=_prepare_vector(vectors[index], self._vector_dim, normalize=normalize),
-                metadata=_coerce_metadata(metadatas[index]),
-                text=_coerce_optional_text(texts[index]),
+                metadata=metadatas[index],
+                text=texts[index],
             )
             for index in range(len(images))
         ]
@@ -1035,9 +1055,18 @@ class LodeDB:
         return self._index.count_documents(filter=_normalize_filter(filter))
 
     def stats(self) -> dict[str, Any]:
-        """Returns redacted engine stats (counts, storage bytes, telemetry)."""
+        """Returns redacted engine stats (counts, storage bytes, telemetry).
 
-        return self._index.stats()
+        Includes an ``"image_embedding"`` block with this handle's redacted CLIP
+        encode counters (images embedded, encode calls, cumulative encode seconds,
+        failures) so image-embedding cost is visible separately from storage commit
+        cost. The counters are per-handle and carry no paths, captions, or pixels.
+        """
+
+        stats = self._index.stats()
+        if isinstance(stats, dict):
+            stats["image_embedding"] = dict(self._image_metrics)
+        return stats
 
     def close(self) -> None:
         """Releases the single-writer lock and engine references; state stays on disk."""
@@ -1129,6 +1158,26 @@ class LodeDB:
                 "embedder= that exposes embed_images"
             )
         return backend
+
+    def _embed_images_tracked(self, backend: Any, images: Sequence[Any]) -> tuple[Any, ...]:
+        """Embeds images via the backend, recording redacted encode metrics.
+
+        Counts images, cumulative encode time, and failures into
+        ``self._image_metrics`` (surfaced via :meth:`stats`), so operators can see
+        CLIP encode cost separately from storage-commit cost. No paths or pixels are
+        recorded.
+        """
+
+        started = time.perf_counter()
+        try:
+            vectors = tuple(backend.embed_images(images))
+        except Exception:
+            self._image_metrics["encode_failures"] += 1
+            raise
+        self._image_metrics["encode_calls"] += 1
+        self._image_metrics["images_embedded"] += len(images)
+        self._image_metrics["encode_seconds"] += time.perf_counter() - started
+        return vectors
 
     def _ensure_index(self) -> None:
         """Binds the single local index, creating it unless this handle is read-only."""

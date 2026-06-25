@@ -26,6 +26,7 @@ from typing import Any
 from lodedb.engine._atomic_io import durable_replace
 from lodedb.engine._filelock import WriterLock, lodedb_lock_timeout_from_env
 from lodedb.local.db import LodeDB
+from lodedb.local.presets import resolve_preset
 
 _MANIFEST_NAME = "collection.json"
 _MANIFEST_VERSION = 1
@@ -179,7 +180,9 @@ class LodeCollection:
         vector space, otherwise a preset space.
         """
 
-        resolved_bit_width = 4 if bit_width is _UNSET else int(bit_width)
+        explicit_bw = None if bit_width is _UNSET else int(bit_width)
+        if explicit_bw is not None and explicit_bw not in {2, 4}:
+            raise ValueError(f"bit_width must be 2 or 4, got {bit_width!r}")
         if embedder is not None:
             identity = getattr(embedder, "required_model_name", None)
             if not identity:
@@ -187,14 +190,25 @@ class LodeCollection:
                     "embedder used as a collection space must declare a non-empty "
                     "required_model_name (recorded as the space's identity)"
                 )
-            config = {"kind": "custom", "model_identity": identity, "bit_width": resolved_bit_width}
-            return {"embedder": embedder, "bit_width": resolved_bit_width}, config
+            bw = 4 if explicit_bw is None else explicit_bw
+            config = {"kind": "custom", "model_identity": identity, "bit_width": bw}
+            return {"embedder": embedder, "bit_width": bw}, config
         if vector_dim is not _UNSET and vector_dim is not None:
-            config = {"kind": "vector", "vector_dim": vector_dim, "bit_width": resolved_bit_width}
-            return {"vector_dim": vector_dim, "bit_width": resolved_bit_width}, config
+            bw = 4 if explicit_bw is None else explicit_bw
+            config = {"kind": "vector", "vector_dim": vector_dim, "bit_width": bw}
+            return {"vector_dim": vector_dim, "bit_width": bw}, config
+        # Preset space: its width is fixed by the preset, so record the *effective*
+        # width (never a caller value that would not take effect) and let LodeDB use
+        # it (no bit_width passed). An explicit, conflicting width is rejected.
         resolved_model = "minilm" if model is _UNSET else model
-        config = {"kind": "preset", "model": resolved_model, "bit_width": resolved_bit_width}
-        return {"model": resolved_model, "bit_width": resolved_bit_width}, config
+        effective_bw = resolve_preset(resolved_model).turbovec_bit_width
+        if explicit_bw is not None and explicit_bw != effective_bw:
+            raise ValueError(
+                f"model {resolved_model!r} is a {effective_bw}-bit preset; "
+                "bit_width is fixed by the preset"
+            )
+        config = {"kind": "preset", "model": resolved_model, "bit_width": effective_bw}
+        return {"model": resolved_model}, config
 
     def _reopen_space(
         self,
@@ -251,7 +265,8 @@ class LodeCollection:
             )
         if vector_dim is not _UNSET and vector_dim is not None:
             raise ValueError(f"space {name!r} is a preset space; do not pass vector_dim=")
-        return {"model": recorded["model"], "bit_width": recorded["bit_width"]}
+        # A preset's width is fixed by the preset, so don't pass bit_width to LodeDB.
+        return {"model": recorded["model"]}
 
     def _manifest_path(self) -> Path:
         """Returns the path to the collection manifest file."""
