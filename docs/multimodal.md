@@ -45,11 +45,13 @@ db.search("a beach at sunset", k=5)              # text query, cross-modal
 db.search_by_image("photos/beach.jpg", k=5)      # image query
 ```
 
-`add_image` accepts a path, raw `bytes`, or a PIL `Image`. It embeds the image and
-stores a single vector through the same atomic-commit path as `add_vectors`. The
-raw image bytes are never stored: keep the file on disk (or object storage) and put
-its path or URI in `metadata` so a hit can be resolved back to the image. A caption
-can go in the optional `text=` argument.
+`add_image` accepts a path, raw `bytes`, or a PIL `Image`. It hands the engine only
+the embedding vector (plus your metadata), through the same atomic-commit path as
+`add_vectors`; the raw image bytes never reach LodeDB. Keep the file on disk (or
+object storage) and put its path or URI in `metadata` so a hit can be resolved back
+to the image. The metadata is always stored; the only text an image row can retain
+is an optional `text=` caption, and only when `store_text=True` (the default). With
+no caption, an image row holds no text regardless of `store_text`.
 
 ## One embedding model per index
 
