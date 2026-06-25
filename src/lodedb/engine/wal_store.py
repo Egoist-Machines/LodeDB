@@ -1,13 +1,13 @@
-"""Opt-in single-writer write-ahead log for the LodeDB commit path.
+"""Default single-writer write-ahead log for the LodeDB commit path.
 
-The default commit path publishes a new immutable generation on every mutation
+The classic generation commit path publishes a new immutable generation on every mutation
 (an O(changed) ``.jsd``/``.tvd`` delta append plus the atomic ``<key>.commit.json``
 root-manifest swap — see :mod:`lodedb.engine._commit_manifest`). That gives
 lock-free MVCC readers a torn-free snapshot, but it costs several ``os.replace``
 publishes and as many sha256 passes per single ``add`` — overkill for the common
 single-process, single-writer deployment that just wants a durable append.
 
-This module is the alternative the writer can opt into (``commit_mode="wal"``).
+This module backs the default writer mode (``commit_mode="wal"``).
 A mutation appends **one** length-prefixed, CRC32-framed record to a single
 append-only ``<key>.wal`` file (one ``write`` + an optional ``fsync``) and skips
 the generation publish entirely. The in-memory index is already up to date when
@@ -37,8 +37,8 @@ truncated, so a crash between the two replays a few already-applied records
 (idempotent upserts/deletes) rather than losing them.
 
 This file format is independent of the generation artifacts and is only ever read
-or written by a writer that opted into WAL mode; the default generation/MVCC
-reader path never looks at it.
+or written by a writable handle using WAL mode; the generation/MVCC reader path
+never looks at it.
 """
 
 from __future__ import annotations

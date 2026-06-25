@@ -29,9 +29,10 @@ backend, or where its current local default makes LodeDB's strengths easy to sho
    interface and keep LodeDB fully in-process. This is the cleanest path and yields
    upstream-quality, reusable integrations. Used for LangChain and LlamaIndex.
 2. **App provider.** Plug LodeDB into an application's vector-DB provider/registry layer
-   directly (Python apps), or via a thin **local loopback bridge** for a first demo when the
-   app is JS/TS and LodeDB ships as a Python package. `lodedb serve` (loopback dev server) is
-   the starting point for such a bridge.
+   directly (Python apps), or via a thin **local bridge** for a first demo when the app is
+   JS/TS and LodeDB ships as a Python package. `lodedb serve` binds to loopback by default and
+   can bind to a trusted private-network address for LAN demos; it is unauthenticated and is
+   not a public-network service.
 
 ## Status
 
@@ -148,7 +149,7 @@ first.
   is unsafe under multiple workers or replicas, so LodeDB is both a performance and a *simpler
   local persistence* story. Note its license has branding requirements (see Licensing).
 - **AnythingLLM** (~62k★, JS) / **Flowise** (~53k★, TS): reach via the provider/node layer;
-  both need a local loopback bridge for a first demo (see language boundary below).
+  both need a local bridge for a first demo (see language boundary below).
 
 ### Watch list (agent-memory / knowledge layer)
 Same sweet spot as mem0; surfaced by research but not yet scoped:
@@ -180,8 +181,10 @@ LodeDB now ships a knowledge-graph layer (`lodedb.graph.KnowledgeGraph`) and a L
   outside this grammar (for example substring match) still raise clearly rather than silently
   degrade.
 - **Language boundary.** LodeDB is a Python package with an embedded Rust core. JS/TS targets
-  (AnythingLLM, Flowise, Dify) need a thin local loopback bridge for a first demo before any
-  native binding is worth it. Land clean in-process integrations in Python ecosystems first.
+  (AnythingLLM, Flowise, Dify) need a thin local bridge for a first demo before any
+  native binding is worth it. Use loopback by default; private-network binds are only for
+  trusted LAN demos because the bridge is intentionally unauthenticated. Land clean
+  in-process integrations in Python ecosystems first.
 - **GPU acceleration is opt-in.** The CUDA-resident exact scan ships in the `[gpu]` extra
   (cupy, Linux/CUDA), and the batch-throughput figures above are CUDA measurements. An opt-in
   Apple MPS resident scan also exists (`LODEDB_MPS_DIRECT_TURBOVEC`), but it's off by default

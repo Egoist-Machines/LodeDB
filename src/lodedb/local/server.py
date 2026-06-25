@@ -1,11 +1,13 @@
-"""Minimal loopback HTTP server for the local LodeDB (dev convenience, no auth).
+"""Minimal local HTTP server for LodeDB (dev convenience, no auth).
 
 A thin local HTTP loop over :class:`LodeDB` for quick experimentation from
 non-Python clients on your own machine. It binds to loopback by default and
-refuses non-private hosts, and carries no auth because the local embedded mode
-is no-auth. Raw documents and queries are never logged; by default it logs
-nothing. ``POST /get`` returns a stored document's raw text by id; it is available
-unless the server was started with ``serve --no-store-text``.
+refuses non-private hosts; private-network binds are an intentional trusted-LAN
+mode. It carries no auth because the local embedded mode is no-auth, so never
+expose it to public or untrusted networks. Raw documents and queries are never
+logged; by default it logs nothing. ``POST /get`` returns a stored document's raw
+text by id; it is available unless the server was started with
+``serve --no-store-text``.
 """
 
 from __future__ import annotations
@@ -114,7 +116,7 @@ def serve_local(
     durability: str | None = None,
     commit_mode: str | None = None,
 ) -> None:
-    """Opens an :class:`LodeDB` and serves it on a loopback HTTP loop (blocking).
+    """Opens an :class:`LodeDB` and serves it on a local/private HTTP loop (blocking).
 
     Raw-text storage is on by default so ``POST /get`` can return a document's
     original text by id; pass ``store_text=False`` to opt out. ``durability``

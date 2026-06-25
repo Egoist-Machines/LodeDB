@@ -15,7 +15,11 @@ Three layers:
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -25,6 +29,7 @@ from lodedb.engine.embedding_backends import (
     _pool_onnx_output,
 )
 from lodedb.local import backends as backends_mod
+from lodedb.local import onnx_artifacts as onnx_artifacts_mod
 from lodedb.local.backends import build_local_embedding_backend
 from lodedb.local.onnx_artifacts import OnnxArtifact, OnnxMaterializationError
 from lodedb.local.presets import resolve_preset
@@ -279,6 +284,105 @@ def test_onnx_coreml_provider_is_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("LODEDB_ONNX_COREML", "1")
     assert _preferred_onnx_providers("mps") == ("CoreMLExecutionProvider", "CPUExecutionProvider")
     assert _preferred_onnx_providers("cpu") == ("CPUExecutionProvider",)
+
+
+# -- artifact materialization ----------------------------------------------
+
+
+def _fake_snapshot(path, *, model_bytes: bytes = b"fake-onnx") -> None:
+    """Writes the minimum snapshot files materialize_onnx_model needs."""
+
+    (path / "onnx").mkdir(parents=True)
+    (path / "onnx" / "model.onnx").write_bytes(model_bytes)
+    (path / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+
+def test_onnx_materialization_publishes_manifest_and_reuses_cache(tmp_path, monkeypatch) -> None:
+    """A completed snapshot cache has a checksum manifest and avoids a second fetch."""
+
+    monkeypatch.setenv("LODEDB_ONNX_CACHE", str(tmp_path / "cache"))
+    snapshot_dir = tmp_path / "snapshot"
+    _fake_snapshot(snapshot_dir)
+    calls: list[str] = []
+
+    def snapshot_download(repo_id: str, allow_patterns: list[str]) -> str:
+        assert allow_patterns
+        calls.append(repo_id)
+        return str(snapshot_dir)
+
+    fake_hub = types.SimpleNamespace(snapshot_download=snapshot_download)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    artifact = onnx_artifacts_mod.materialize_onnx_model("repo/model")
+
+    assert artifact.source == "snapshot"
+    manifest = json.loads((artifact.tokenizer_dir / "artifact.json").read_text(encoding="utf-8"))
+    assert manifest["model_sha256"] == onnx_artifacts_mod._sha256_file(artifact.model_path)
+    assert manifest["model_size_bytes"] == artifact.model_path.stat().st_size
+    assert manifest["model_mtime_ns"] == artifact.model_path.stat().st_mtime_ns
+
+    def fail_fetch(repo_id: str, allow_patterns: list[str]) -> str:
+        raise AssertionError("cache hit should not fetch")
+
+    fake_hub.snapshot_download = fail_fetch
+    monkeypatch.setattr(
+        onnx_artifacts_mod,
+        "_sha256_file",
+        lambda path: (_ for _ in ()).throw(AssertionError("cache hit should not hash model")),
+    )
+    cached = onnx_artifacts_mod.materialize_onnx_model("repo/model")
+
+    assert cached.source == "cached"
+    assert calls == ["repo/model"]
+
+
+def test_onnx_materialization_ignores_partial_cache_without_manifest(
+    tmp_path, monkeypatch
+) -> None:
+    """A model/tokenizer pair without artifact.json is not treated as a complete cache."""
+
+    monkeypatch.setenv("LODEDB_ONNX_CACHE", str(tmp_path / "cache"))
+    cache_dir = onnx_artifacts_mod._model_cache_dir("repo/model")
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "model.onnx").write_bytes(b"partial")
+    (cache_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    snapshot_dir = tmp_path / "snapshot"
+    _fake_snapshot(snapshot_dir, model_bytes=b"complete")
+    calls: list[str] = []
+
+    def snapshot_download(repo_id: str, allow_patterns: list[str]) -> str:
+        calls.append(repo_id)
+        return str(snapshot_dir)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=snapshot_download),
+    )
+
+    artifact = onnx_artifacts_mod.materialize_onnx_model("repo/model")
+
+    assert artifact.source == "snapshot"
+    assert artifact.model_path.read_bytes() == b"complete"
+    assert calls == ["repo/model"]
+
+
+def test_onnx_export_subprocess_has_timeout(tmp_path, monkeypatch) -> None:
+    """The Optimum fallback cannot hang forever when export stalls."""
+
+    monkeypatch.setenv("LODEDB_ONNX_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("LODEDB_ONNX_EXPORT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    monkeypatch.setattr(onnx_artifacts_mod.shutil, "which", lambda name: None)
+
+    def timeout_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(onnx_artifacts_mod.subprocess, "run", timeout_run)
+
+    with pytest.raises(OnnxMaterializationError, match="timed out"):
+        onnx_artifacts_mod.materialize_onnx_model("repo/model")
 
 
 # -- real model (opt-in) ----------------------------------------------------

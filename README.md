@@ -14,20 +14,20 @@ LodeDB instead of its default store. Over 17.5k documents, per framework default
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
 | On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~410× faster** (0.8 vs 345 ms) | **~500× faster** (0.9 vs 427 ms) | **~25× faster** (0.9 vs 23 ms) |
-| Batched retrieval, 64 (GPU) | **~2,000×** (6,280 vs ~3 qps) | **~2,800×** (5,744 vs ~2 qps) | **~62×** (2,686 vs 43 qps) |
-| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.9 vs 0.5 ms (both sub-ms) |
+| Single-query p50 (CPU) | **~510× faster** (0.57 vs 294 ms) | **~610× faster** (0.57 vs 349 ms) | **~48× faster** (0.64 vs 31 ms) |
+| Batched retrieval, 64 (GPU) | **~1,900×** (6,602 vs ~4 qps) | **~2,200×** (6,414 vs ~3 qps) | **~160×** (4,649 vs 29 qps) |
+| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.6 vs 0.5 ms (both sub-ms) |
 
 LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more compact footprint:
 
-| **embedded stores** | **add p50** | **memory footprint** |
-| --- | ---: | ---: |
-| sqlite-vec | 0.4 ms | 101 MB | 
-| qdrant | 0.5 ms | 85 MB | 
-| **LodeDB** | 0.6 ms | **29 MB** | 
-| pgvector | 2.3 ms | 50 MB | 
-| lancedb | 3.2 ms | 37 MB | 
-| chroma | 6.5 ms | 151 MB | 
+| **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
+| --- | ---: | ---: | ---: | ---: |
+| sqlite-vec | **0.4 ms** | 25.3 ms | 25.1 ms | 101 MB |
+| qdrant | **0.5 ms** | 27.3 ms | 27.0 ms | 85 MB |
+| **LodeDB** | **0.6 ms** | **0.49 ms** | **0.11 ms** | **29 MB** |
+| pgvector | 2.3 ms | 30.4 ms | 30.6 ms | 50 MB |
+| lancedb | 3.2 ms | 10.3 ms | 10.0 ms | 37 MB |
+| chroma | 6.5 ms | 3.0 ms | 3.1 ms | 151 MB |
 
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
@@ -51,7 +51,7 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
   `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
-- **Batteries included**: a `lodedb` CLI, a loopback dev server, an
+- **Batteries included**: a `lodedb` CLI, a loopback/private-network dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
@@ -319,7 +319,7 @@ and end-to-end single-query latency is 5.7 ms p50.
 lodedb doctor      # capability report: embedding / GPU / TurboVec backend
 lodedb index ...   # build / add to an on-disk index
 lodedb query ...   # search
-lodedb serve       # loopback dev server (127.0.0.1, no auth)
+lodedb serve       # dev server (127.0.0.1 by default; private LAN only, no auth)
 lodedb mcp         # stdio MCP server for agent memory
 lodedb benchmark   # local, metrics-only benchmark
 ```

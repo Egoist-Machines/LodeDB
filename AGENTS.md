@@ -25,19 +25,23 @@ tests/                   local SDK suite + import-boundary guard
   exception is original document text, retained by default in a *separate* raw-text store
   (`g<epoch>.tvtext` base + `.txd` delta journal) for `db.get(id)`; pass `store_text=False` to
   keep no text on disk. No telemetry/redacted path reads that store.
-- **Lean dependencies:** runtime PyPI deps are `numpy`, `typer`,
-  `sentence-transformers`, `pyyaml` (+ extras `[mcp]`, `[langchain]`, `[gpu]`). The patched
-  TurboVec core is vendored under `third_party/turbovec/` and bundled into the wheel as
-  `lodedb._turbovec` — not a PyPI dependency.
+- **Lean dependencies:** runtime PyPI deps are `numpy`, `typer`, `onnxruntime`,
+  `transformers`, `sentence-transformers`, `pyyaml` (+ extras `[onnx-export]`, `[mcp]`,
+  `[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`). The patched TurboVec core is vendored
+  under `third_party/turbovec/` and bundled into the wheel as `lodedb._turbovec` — not a PyPI
+  dependency. ONNX Runtime / transformers / sentence-transformers are base runtime deps but
+  must still load lazily; a plain `import lodedb` must not import them.
   Importing LodeDB must **not** load `faiss` / `modal` / `mteb` / `datasets` / `matplotlib`
   / `sklearn` — `tests/test_import_boundary.py` fails closed (fresh subprocess) if it ever
   does. (`scikit-learn` may be *installed* transitively via `sentence-transformers`; the
   guard checks what *loads*, not what is installed.)
 - **Licensing:** our code is Apache-2.0; preserve the upstream **MIT** notice on
   `third_party/turbovec/` (see `NOTICE`). No GPL/AGPL/LGPL dependencies.
-- **Local path stays local:** the local SDK runs in a no-auth, loopback, CPU-scan profile.
-  Don't add auth, network, or server requirements to it. The CUDA scan (`[gpu]`) is an
-  opt-in extra and must stay lazy — importing LodeDB never requires CuPy.
+- **Local path stays local:** the local SDK runs in a no-auth, loopback/private-network,
+  CPU-scan profile. Binding `lodedb serve` to an RFC1918/private address is an intentional
+  trusted-LAN mode; never allow public/untrusted binds without adding an explicit auth story.
+  Don't add auth, external network, or server requirements to the embedded SDK. The CUDA scan
+  (`[gpu]`) is an opt-in extra and must stay lazy — importing LodeDB never requires CuPy.
 - **Concurrency invariants:** a writable handle holds the cross-process single-writer lock
   (`engine/_filelock.py`) for its lifetime; a `read_only=True` handle takes **no** lock and
   must never persist (`_persist_state` enforces this). Public `LodeEngine` operations run
@@ -59,9 +63,10 @@ tests/                   local SDK suite + import-boundary guard
   next warm query (`_sample_pending_drift`), never per commit. Drop only the rows just synced
   (`_discard_direct_turbovec_transient_embeddings(state, synced_ids)`), not every chunk. The
   exception is cold builds/compaction in `build_turbovec_serving_index`, which prepare once.
-  This includes the opt-in raw-text store: a delta commit appends a `.txd` text delta (upserted
-  texts + deleted ids) via `_journal_text`, never rewriting the full `document_id -> text` map —
-  only a base rewrite (cold build/compaction) writes the full `g<epoch>.tvtext` base.
+  This includes the raw-text store (enabled by default; opt out with `store_text=False`): a
+  delta commit appends a `.txd` text delta (upserted texts + deleted ids) via `_journal_text`,
+  never rewriting the full `document_id -> text` map — only a base rewrite (cold
+  build/compaction) writes the full `g<epoch>.tvtext` base.
 
 ## Develop
 

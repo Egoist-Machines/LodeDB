@@ -354,16 +354,28 @@ def test_stats_is_metrics_only_no_raw_text(tmp_path):
     db.close()
 
 
-def test_no_auth_required_and_loopback_only(tmp_path):
-    """Local mode requires no credentials and binds the engine to loopback."""
+def test_no_auth_required_and_private_bind_policy(tmp_path):
+    """Local mode requires no credentials and keeps a local/private bind policy."""
 
     db = _open(tmp_path)
     # The SDK never asks the caller for a credential — the engine carries no
-    # bearer/license/mTLS auth, only a loopback binding and metrics-only telemetry.
+    # bearer/license/mTLS auth, only a local/private bind policy and metrics-only telemetry.
     assert not hasattr(db._engine.security, "mtls_required")
     assert not hasattr(db._engine.security, "bearer_token_sha256")
     assert db._engine.security.bind_host in {"127.0.0.1", "localhost"}
     assert db._engine.security.telemetry_mode == "metrics_only"
+    db.close()
+
+
+def test_sdk_add_and_search_do_not_write_stdout(tmp_path, capsys):
+    """Engine diagnostics must not corrupt stdout protocols such as CLI JSON or MCP stdio."""
+
+    db = _open(tmp_path)
+    db.add("the quick brown fox", id="fox")
+    db.search("fox", k=1)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
     db.close()
 
 
