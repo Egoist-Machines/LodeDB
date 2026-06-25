@@ -53,6 +53,44 @@ to the image. The metadata is always stored; the only text an image row can reta
 is an optional `text=` caption, and only when `store_text=True` (the default). With
 no caption, an image row holds no text regardless of `store_text`.
 
+## Storing the images themselves
+
+LodeDB stores each image's embedding vector and its metadata, never the image. This
+is deliberate: a photo is thousands of times larger than its compact vector, so
+keeping media out of the index is what keeps the index small. Comparable vector
+stores work the same way (Chroma and Qdrant reference images by URI or path); holding
+the bytes is a data-lake concern, not an index one.
+
+Keep the media on disk or in object storage and put a path or URI in `metadata`:
+
+```python
+db.add_image("photos/beach.jpg", metadata={"path": "photos/beach.jpg"})
+hit = db.search("a beach at sunset", k=1)[0]
+image_path = hit.metadata["path"]        # resolve the hit back to the file
+```
+
+For a portable, self-contained bundle (ship the index and its images together), keep
+the images in a folder next to the index and store **relative** paths, then move or
+zip the parent folder as a unit:
+
+```python
+from pathlib import Path
+
+root = Path("gallery")                   # holds both the index and the images
+db = LodeDB(root / "index", model="clip")
+db.add_image(root / "images/beach.jpg", metadata={"path": "images/beach.jpg"})
+
+# later, on any machine, after copying the whole `gallery/` folder:
+hit = db.search("a beach at sunset", k=1)[0]
+image_file = root / hit.metadata["path"]
+```
+
+If you genuinely need the bytes inside the store (small ephemeral images with no
+durable home), you can base64-encode them into the `text=` payload with
+`store_text=True`, but it is not recommended: it inflates the raw-text sidecar, adds
+about a third in base64 overhead, and gives up the compact-on-disk property. Prefer
+an external blob store.
+
 ## One embedding model per index
 
 Similarity scores are only meaningful between vectors from the same model. Do not
