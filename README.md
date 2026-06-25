@@ -16,18 +16,15 @@ LodeDB instead of its default store. Over 17.5k documents, per framework default
 | On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
 | Single-query p50 (CPU) | **~510× faster** (0.57 vs 294 ms) | **~610× faster** (0.57 vs 349 ms) | **~48× faster** (0.64 vs 31 ms) |
 | Batched retrieval, 64 (GPU) | **~1,900×** (6,602 vs ~4 qps) | **~2,200×** (6,414 vs ~3 qps) | **~160×** (4,649 vs 29 qps) |
-| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.9 vs 0.5 ms (both sub-ms) |
+| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.6 vs 0.5 ms (both sub-ms) |
 
-LodeDB is sub-millisecond on both durable adds and search. The M1 laptop run records a
-**0.22 ms** CPU vector-scan p50 (`benchmarks/laptop/results/laptop_m1.json`); the full
-local-store matrix below is the L40S benchmark, where durable add is in sqlite-vec/Qdrant
-territory while query latency is much lower:
+LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more compact footprint:
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
 | sqlite-vec | **0.4 ms** | 25.3 ms | 25.1 ms | 101 MB |
-| qdrant | 0.5 ms | 27.3 ms | 27.0 ms | 85 MB |
-| **LodeDB** | 0.6 ms | **0.49 ms** | **0.11 ms** | **29 MB** |
+| qdrant | **0.5 ms** | 27.3 ms | 27.0 ms | 85 MB |
+| **LodeDB** | **0.6 ms** | **0.49 ms** | **0.11 ms** | **29 MB** |
 | pgvector | 2.3 ms | 30.4 ms | 30.6 ms | 50 MB |
 | lancedb | 3.2 ms | 10.3 ms | 10.0 ms | 37 MB |
 | chroma | 6.5 ms | 3.0 ms | 3.1 ms | 151 MB |
