@@ -31,6 +31,7 @@ class _FakeClip(HashEmbeddingBackend):
     def __init__(self, dim: int = DIM) -> None:
         super().__init__(native_dim=dim)
         self.name = "clip"
+        self.required_model_name = "fake-clip"  # public embedder= requires an identity
 
     def embed_images(self, images):
         return tuple(hash_embedding(str(image), self.native_dim) for image in images)
@@ -103,6 +104,38 @@ def test_store_text_false_text_recovers_from_wal_without_raw_text(tmp_path):
         # Replay rebuilt the identical index from the logged embeddings.
         assert [(h.id, round(h.score, 6)) for h in recovered.search("alpha beta", k=2)] == live
         assert _files_containing(tmp_path, SECRET) == []  # still no raw text after replay
+    finally:
+        recovered.close()
+
+
+def test_index_text_lexical_recovers_from_wal(tmp_path):
+    # index_text=True + store_text=False + WAL: the embedded WAL must carry the
+    # per-chunk lexical tokens, or a crash recovers vectors while leaving the
+    # lexical postings empty for the recovered docs (silent lexical misses).
+    def _open():
+        return LodeDB(
+            path=tmp_path,
+            model="minilm",
+            store_text=False,
+            index_text=True,
+            _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        )
+
+    db = _open()
+    assert db.commit_mode == "wal"
+    db.add("turbine fault code E1234 logged overnight", id="d")
+    db.add("a routine maintenance note", id="e")
+    assert [h.id for h in db.search("E1234", k=5, mode="lexical")] == ["d"]
+
+    # Crash: leave the uncheckpointed WAL on disk, release the lock to reopen.
+    db._engine._release_writer_lock()
+    del db
+
+    recovered = _open()
+    try:
+        assert recovered.count() == 2
+        # Pre-fix this returned [] (vectors recovered, lexical postings lost).
+        assert [h.id for h in recovered.search("E1234", k=5, mode="lexical")] == ["d"]
     finally:
         recovered.close()
 

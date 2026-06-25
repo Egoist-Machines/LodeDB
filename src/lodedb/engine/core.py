@@ -4404,6 +4404,13 @@ class LodeEngine:
             state.document_metadata[document_id] = {
                 str(key): str(value) for key, value in dict(item.get("metadata", {})).items()
             }
+            tokens = item.get("tokens")
+            if tokens is not None:
+                # Restore the durable lexical postings (index_text=True) so
+                # lexical/hybrid search recovers these docs, not just vector search.
+                state.document_tokens[document_id] = [
+                    [str(token) for token in chunk_tokens] for chunk_tokens in tokens
+                ]
         self._record_pending_state_journal_documents(
             state, upserted_document_ids=tuple(document_ids)
         )
@@ -6043,6 +6050,12 @@ def _embedded_documents_wal_payload(
     rebuilds the rows from the embeddings on top of the committed base, so the WAL
     carries no raw text and replay never re-embeds. Chunks reused from a prior
     commit already live in the committed base, so the delta need not re-log them.
+
+    When a durable lexical index is on (``index_text=True``), the per-document
+    per-chunk token lists are logged too (they are payload-derived terms the index
+    already persists, not raw text), so ``mode="lexical"``/``"hybrid"`` recover the
+    same documents after a crash; without them, replay would rebuild vectors but
+    leave the lexical postings empty for the recovered docs.
     """
 
     return {
@@ -6052,6 +6065,7 @@ def _embedded_documents_wal_payload(
                 "content_hash": state.document_hashes.get(document.document_id, ""),
                 "metadata": dict(state.document_metadata.get(document.document_id, {})),
                 "chunk_ids": list(state.document_chunk_ids.get(document.document_id, ())),
+                "tokens": state.document_tokens.get(document.document_id),
             }
             for document in documents
         ],
