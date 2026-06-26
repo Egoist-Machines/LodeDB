@@ -72,3 +72,23 @@ Added for LodeDB's GPU-resident exact batch path:
   reconstructed score is the MORE faithful estimate of the quantized
   representation; identity-calibration, 2-bit, and slot-churn
   (remove/upsert) cases are covered.
+
+## Late-interaction MaxSim kernel (multi-vector retrieval)
+
+Added for LodeDB's late-interaction retrieval (multi-vector / MaxSim, issue #25):
+
+- `turbovec/src/maxsim.rs`: `maxsim_scores(query, n_query, dim, docs,
+  doc_patch_counts)` — exact MaxSim of one multi-vector query against a set of
+  candidate documents (the documents' patch vectors concatenated row-major,
+  partitioned by per-document patch counts). Each document is scored in parallel
+  (rayon) by a small `query @ doc^T` faer GEMM followed by a max-over-patches,
+  sum-over-query-tokens reduction. Vectors are assumed L2-normalized, so each dot
+  is a cosine similarity. Lib unit tests cover the reference value, empty
+  documents, and mixed empty/non-empty bands.
+- `turbovec/src/lib.rs`: `pub mod maxsim;` + `pub use maxsim::maxsim_scores;`.
+- `turbovec-python/src/lib.rs`: `maxsim_scores(query, docs, doc_patch_counts)`
+  module function (validates shapes, raises `ValueError` on mismatch, releases the
+  GIL for the kernel) registered on the `_turbovec` module.
+
+This is purely additive (a new module + one exported function + one binding); it
+does not touch the quantized index, its storage format, or any existing API.

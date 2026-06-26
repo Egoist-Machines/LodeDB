@@ -23,7 +23,12 @@ retrieval is the two-stage approach the issue prescribes:
 The rescore is **exact**: TurboVec's quantized codes are used only to surface
 candidates cheaply, while the patch vectors themselves are kept verbatim (float32,
 base64, in the per-row text sidecar) so MaxSim is computed at full precision over
-the candidate set rather than from the quantized candidate-generation scores.
+the candidate set rather than from the quantized candidate-generation scores. The
+rescore defaults to numpy (per-document BLAS GEMM); a native TurboVec
+``maxsim_scores`` Rust kernel is also available (``scoring="native"``) for builds
+without a fast BLAS. Both return identical scores, and scoring is only a small
+fraction of query time (candidate generation and patch loading dominate), so the
+backend choice is not a latency lever.
 
 The page/token encoder is **bring-your-own** (ColPali / ColQwen weights are
 multi-GB and out of scope to bundle): pass precomputed patch matrices to
@@ -32,22 +37,57 @@ multi-GB and out of scope to bundle): pass precomputed patch matrices to
 
 Footprint note: a document contributes one stored row per patch, so a page with
 ~1000 patches is ~1000 rows (plus the float32 patch sidecar the exact rescore
-reads back). That is the known cost of late interaction and the reason native
-multi-vector storage plus a MaxSim kernel in the TurboVec core is a separate,
-benchmark-gated track (issue #25, stage 3); this prototype is for validating
-retrieval quality and the API shape first.
+reads back). That is the known cost of late interaction; native quantized
+multi-vector *storage* in the TurboVec core (to shrink that footprint) remains the
+deferred half of the stage-3 track (issue #25), while the MaxSim scoring kernel is
+already native here.
 """
 
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping, Sequence
+import importlib
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from lodedb.local.db import LodeDB
+
+# The bundled TurboVec extension exposes a native MaxSim kernel (`maxsim_scores`)
+# that scores the candidate set in parallel Rust, replacing the per-candidate
+# Python loop. It is resolved once and cached; a build that predates the kernel
+# (or a stock standalone `turbovec`) simply falls back to the numpy path, so the
+# SDK never hard-depends on the kernel being present.
+_TURBOVEC_PACKAGE_NAMES = ("lodedb._turbovec", "turbovec")
+_UNRESOLVED = object()  # distinct from None, which means "looked up, not present"
+_native_maxsim: Callable[..., Any] | None | object = _UNRESOLVED
+
+
+def _resolve_native_maxsim() -> Callable[..., Any] | None:
+    """Returns the native ``maxsim_scores`` kernel, or ``None`` if unavailable.
+
+    The lookup is performed once and memoized. The bundled ``lodedb._turbovec``
+    is tried before a standalone ``turbovec`` so a stray stock package cannot
+    shadow the patched core, mirroring the engine's TurboVec loader.
+    """
+
+    global _native_maxsim
+    if _native_maxsim is not _UNRESOLVED:  # already resolved (callable or None)
+        return _native_maxsim  # type: ignore[return-value]
+    resolved: Callable[..., Any] | None = None
+    for name in _TURBOVEC_PACKAGE_NAMES:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        candidate = getattr(module, "maxsim_scores", None)
+        if callable(candidate):
+            resolved = candidate
+            break
+    _native_maxsim = resolved
+    return resolved
 
 # Separator between a document id and its per-patch suffix in a stored row id.
 # Mirrors the ``<doc_id>#patch_NNNN`` shape suggested in issue #25, kept compact.
@@ -152,6 +192,7 @@ class LodeLateInteractionIndex:
         encoder: Any | None = None,
         bit_width: int = 4,
         candidate_depth: int = 16,
+        scoring: str = "numpy",
         read_only: bool = False,
         **lodedb_kwargs: Any,
     ) -> None:
@@ -166,24 +207,32 @@ class LodeLateInteractionIndex:
         :meth:`add_texts` / :meth:`search_text` and is never required for the
         precomputed-matrix API. ``candidate_depth`` is the per-query-token
         any-patch search depth used to gather rescoring candidates (higher =
-        better recall, more rescoring work). ``read_only=True`` opens a
-        non-mutating reader and requires the path to exist. ``bit_width`` and any
-        extra ``lodedb_kwargs`` (e.g. ``durability=``, ``commit_mode=``) are
-        forwarded to the underlying vector-only :class:`LodeDB`. The patch text
-        sidecar that holds the vectors is always retained, so ``store_text`` may
-        not be set ``False``.
+        better recall, more rescoring work). ``scoring`` selects the exact-MaxSim
+        rescore backend: ``"numpy"`` (default, per-document BLAS GEMM -- fastest on
+        builds with an optimized BLAS, always available) or ``"native"`` (the
+        TurboVec ``maxsim_scores`` Rust kernel, for builds without a fast BLAS;
+        falls back to numpy if the compiled kernel is absent). Both return
+        identical scores, and scoring is a small fraction of query time, so this is
+        not a latency lever. ``read_only=True`` opens a non-mutating reader and
+        requires the path to exist. ``bit_width`` and any extra ``lodedb_kwargs``
+        (e.g. ``durability=``, ``commit_mode=``) are forwarded to the underlying
+        vector-only :class:`LodeDB`. The patch text sidecar that holds the vectors
+        is always retained, so ``store_text`` may not be set ``False``.
         """
 
         if int(dim) <= 0:
             raise ValueError("dim must be a positive integer")
         if int(candidate_depth) <= 0:
             raise ValueError("candidate_depth must be a positive integer")
+        if scoring not in ("numpy", "native"):
+            raise ValueError("scoring must be 'numpy' or 'native'")
         if lodedb_kwargs.get("store_text") is False:
             raise ValueError(
                 "LodeLateInteractionIndex stores patch vectors in the text sidecar; "
                 "store_text must remain True"
             )
         self.dim = int(dim)
+        self.scoring = scoring
         self.encoder = encoder
         self.candidate_depth = int(candidate_depth)
         self.read_only = bool(read_only)
@@ -367,20 +416,29 @@ class LodeLateInteractionIndex:
             return []
 
         # Stage 2: exact MaxSim rescoring over the candidates' stored patches.
-        scored: list[LodeLateInteractionHit] = []
+        # Load every candidate's patches, then score the whole set in one shot
+        # (native Rust kernel when available, numpy otherwise).
+        loaded: list[np.ndarray] = []
+        meta_rows: list[tuple[str, dict[str, Any], int]] = []
         for parent in candidates:
             doc_patches, user_meta, patch_count = self._load_document(parent)
             if doc_patches is None or doc_patches.shape[0] == 0:
                 continue
-            score = _maxsim(query_matrix, doc_patches)
-            scored.append(
-                LodeLateInteractionHit(
-                    score=score,
-                    id=parent,
-                    metadata=user_meta,
-                    patch_count=patch_count,
-                )
+            loaded.append(doc_patches)
+            meta_rows.append((parent, user_meta, patch_count))
+        if not loaded:
+            return []
+        scores = _maxsim_batch(
+            query_matrix, loaded, prefer_native=self.scoring == "native"
+        )
+        scored = [
+            LodeLateInteractionHit(
+                score=float(score), id=parent, metadata=user_meta, patch_count=patch_count
             )
+            for score, (parent, user_meta, patch_count) in zip(
+                scores, meta_rows, strict=True
+            )
+        ]
         # Deterministic order: score desc, then id asc to break ties stably.
         scored.sort(key=lambda hit: (-hit.score, hit.id))
         return scored[: int(k)]
@@ -546,6 +604,49 @@ def _maxsim(query: np.ndarray, document: np.ndarray) -> float:
     # (Nq, Nd) similarity matrix, then max over doc patches, then sum over tokens.
     sims = query @ document.T
     return float(sims.max(axis=1).sum())
+
+
+def _maxsim_batch(
+    query: np.ndarray,
+    documents: list[np.ndarray],
+    *,
+    prefer_native: bool = False,
+) -> np.ndarray:
+    """Returns the MaxSim score of ``query`` against each document matrix.
+
+    Two paths return identical scores (parity holds to f32 rounding):
+
+    - ``numpy`` (default): per-document ``query @ doc.T`` via numpy, which on a
+      build with an optimized BLAS (e.g. Apple Accelerate, OpenBLAS) is the
+      fastest scoring path and needs no compiled kernel.
+    - ``native`` (``prefer_native=True``): the TurboVec ``maxsim_scores`` Rust
+      kernel (per-document faer GEMM, parallel across documents, GIL released),
+      used when the compiled extension provides it.
+
+    numpy is the default because it is consistently fastest for this step on
+    common platforms and is always available; the native kernel is exposed for
+    builds without a fast BLAS and as the basis for a future native
+    multi-vector storage path. Either way, MaxSim scoring is a small fraction of
+    query time (candidate generation and patch loading dominate), so the choice
+    is not a latency lever today. ``prefer_native`` silently falls back to numpy
+    if the kernel is unavailable.
+    """
+
+    if not documents:
+        return np.empty(0, dtype=np.float32)
+    native = _resolve_native_maxsim() if prefer_native else None
+    if native is not None:
+        flat = np.ascontiguousarray(np.vstack(documents), dtype=np.float32)
+        counts = np.fromiter(
+            (doc.shape[0] for doc in documents), dtype=np.int64, count=len(documents)
+        )
+        query_c = np.ascontiguousarray(query, dtype=np.float32)
+        return np.asarray(native(query_c, flat, counts), dtype=np.float32)
+    return np.fromiter(
+        (_maxsim(query, doc) for doc in documents),
+        dtype=np.float32,
+        count=len(documents),
+    )
 
 
 def _as_matrix(matrix: Any, dim: int, *, normalize: bool) -> np.ndarray:

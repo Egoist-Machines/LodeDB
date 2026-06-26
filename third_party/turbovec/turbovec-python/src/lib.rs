@@ -591,9 +591,71 @@ impl IdMapIndex {
     }
 }
 
+/// Exact late-interaction MaxSim scoring of one multi-vector query against a set
+/// of candidate documents.
+///
+/// `query` is a `(n_query, dim)` float32 matrix. `docs` is the candidate
+/// documents' patch vectors concatenated row-major into one `(total_patches,
+/// dim)` float32 matrix, partitioned by `doc_patch_counts` (patches per document,
+/// in order; must sum to `total_patches`). Returns one float32 score per
+/// document, in document order: the sum over query tokens of the maximum dot
+/// product against that document's patches. Vectors are assumed L2-normalized, so
+/// each dot is a cosine similarity. Documents are scored in parallel.
+#[pyfunction]
+fn maxsim_scores<'py>(
+    py: Python<'py>,
+    query: PyReadonlyArray2<f32>,
+    docs: PyReadonlyArray2<f32>,
+    doc_patch_counts: PyReadonlyArray1<i64>,
+) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    let q_arr = query.as_array();
+    let n_query = q_arr.nrows();
+    let dim = q_arr.ncols();
+    let q_slice = q_arr.as_slice().ok_or_else(|| not_contiguous_err("query"))?;
+
+    let d_arr = docs.as_array();
+    let total_patches = d_arr.nrows();
+    if d_arr.ncols() != dim {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "query dim {} does not match docs dim {}",
+            dim,
+            d_arr.ncols(),
+        )));
+    }
+    let d_slice = d_arr.as_slice().ok_or_else(|| not_contiguous_err("docs"))?;
+
+    let counts_arr = doc_patch_counts.as_array();
+    let counts_slice = counts_arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("doc_patch_counts"))?;
+    let mut counts: Vec<usize> = Vec::with_capacity(counts_slice.len());
+    for &value in counts_slice {
+        if value < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "doc_patch_counts must be non-negative",
+            ));
+        }
+        counts.push(value as usize);
+    }
+    let sum: usize = counts.iter().sum();
+    if sum != total_patches {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "doc_patch_counts sum {sum} does not match docs row count {total_patches}",
+        )));
+    }
+
+    // Detach from the interpreter (release the GIL): the kernel touches only the
+    // borrowed slices, which the PyReadonlyArray guards keep alive for the
+    // borrow's lifetime.
+    let scores =
+        py.detach(|| turbovec_core::maxsim_scores(q_slice, n_query, dim, d_slice, &counts));
+    Ok(scores.into_pyarray(py))
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
+    m.add_function(wrap_pyfunction!(maxsim_scores, m)?)?;
     Ok(())
 }

@@ -45,19 +45,33 @@ rescore is exact, so deeper candidate scans converge to perfect recall:
 
 ## What this says about stage 3
 
-The quality case for late interaction is clear. The cost is the open problem, and
-it is exactly what native support would address:
+The quality case for late interaction is clear. The cost is the open problem. A
+per-stage profile of one query (300 pages, 128 patches/page, dim 128,
+candidate_depth 16) shows where the ~110 ms goes:
 
-- **Latency** is 100-200 ms because candidate generation and the MaxSim rescore
-  run per query in Python over many patch rows. A native multi-vector store with a
-  MaxSim kernel removes the per-candidate Python loop and the row-at-a-time scan.
+| stage | share |
+|---|---:|
+| candidate generation (per-query-token quantized scans) | ~61% |
+| candidate loading (reading float32 patches back) | ~38% |
+| MaxSim rescore (scoring) | ~1% |
+
+So the scoring step is not the bottleneck. The native `maxsim_scores` kernel added
+in the TurboVec core (the scoring half of stage 3) is correctness-equivalent to
+numpy and useful on builds without a fast BLAS, but it cannot move end-to-end
+latency on its own, because scoring is ~1% of the query.
+
+The latency and footprint levers are both addressed by the remaining half of
+stage 3, native multi-vector **storage**:
+
+- **Latency** is dominated by candidate generation and patch loading. Keeping
+  patches resident in the core removes the per-token Python scan and the float32
+  read-back that make up ~99% of the query.
 - **Footprint** is ~400x the single-vector index: one stored row per patch, plus
   the float32 patch sidecar the exact rescore reads back. Native quantized
   multi-vector storage (and patch pooling on the encoder side) is what keeps the
   index compact, which is otherwise the project's main advantage.
 
-So stage 3 (native multi-vector storage + a MaxSim scoring kernel in the TurboVec
-core) is warranted: it targets the latency and footprint this prototype trades
-away, while the prototype already validates the retrieval quality and the API.
+So the scoring kernel is done; native multi-vector storage is the higher-impact
+piece still ahead, and this benchmark is how to judge it.
 
 All output is metrics-only: counts, bytes, latency, recall; never vectors.

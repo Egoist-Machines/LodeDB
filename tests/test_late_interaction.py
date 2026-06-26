@@ -16,7 +16,11 @@ import numpy as np
 import pytest
 
 from lodedb import LodeLateInteractionHit, LodeLateInteractionIndex, ReadOnlyError
-from lodedb.local.late_interaction import _maxsim
+from lodedb.local.late_interaction import (
+    _maxsim,
+    _maxsim_batch,
+    _resolve_native_maxsim,
+)
 
 DIM = 16
 
@@ -206,6 +210,52 @@ def test_maxsim_kernel_matches_reference():
     d /= np.linalg.norm(d, axis=1, keepdims=True)
     expected = sum(max(float(qt @ dp) for dp in d) for qt in q)
     assert _maxsim(q, d) == pytest.approx(expected, abs=1e-5)
+
+
+def test_native_kernel_is_available_and_matches_numpy():
+    # Stage 3: the bundled extension exposes the native MaxSim kernel. (If a build
+    # predates it, the SDK falls back to numpy; this asserts the bundled build.)
+    native = _resolve_native_maxsim()
+    assert native is not None, "native maxsim_scores kernel not found in lodedb._turbovec"
+    rng = np.random.default_rng(3)
+    q = rng.standard_normal((6, DIM)).astype(np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    docs = []
+    for n in (5, 8, 3, 11):
+        d = rng.standard_normal((n, DIM)).astype(np.float32)
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        docs.append(d)
+    reference = np.array([_maxsim(q, d) for d in docs], dtype=np.float32)
+    native_scores = _maxsim_batch(q, docs, prefer_native=True)
+    numpy_scores = _maxsim_batch(q, docs, prefer_native=False)
+    assert np.allclose(native_scores, reference, atol=1e-4)
+    assert np.allclose(native_scores, numpy_scores, atol=1e-4)
+
+
+def test_maxsim_batch_empty_returns_empty():
+    assert _maxsim_batch(np.zeros((2, DIM), dtype=np.float32), []).shape == (0,)
+
+
+def test_native_scoring_matches_numpy_end_to_end(tmp_path):
+    # The same corpus scored through the native kernel and the numpy path returns
+    # the same ranking and scores.
+    docs = [("a", [0, 1, 2]), ("b", [5, 6]), ("c", [2, 7, 9])]
+    np_idx = LodeLateInteractionIndex(tmp_path / "np", dim=DIM, scoring="numpy")
+    nat_idx = LodeLateInteractionIndex(tmp_path / "nat", dim=DIM, scoring="native")
+    for idx in (np_idx, nat_idx):
+        for doc_id, dims in docs:
+            idx.add_document(doc_id, _onehot_matrix(dims))
+    query = _onehot_matrix([0, 2])
+    np_hits = np_idx.search(query, k=3)
+    nat_hits = nat_idx.search(query, k=3)
+    assert [h.id for h in np_hits] == [h.id for h in nat_hits]
+    for a, b in zip(np_hits, nat_hits, strict=True):
+        assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_invalid_scoring_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        LodeLateInteractionIndex(tmp_path, dim=DIM, scoring="bogus")
 
 
 class _FakeColPali:
