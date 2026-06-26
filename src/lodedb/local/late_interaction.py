@@ -1,4 +1,4 @@
-"""Late-interaction (multi-vector / MaxSim) retrieval -- the issue #25 stage-1 prototype.
+"""Late-interaction (multi-vector / MaxSim) retrieval for visual-document RAG (issue #25).
 
 ColBERT-style late interaction, and its visual-document descendants (ColPali /
 ColQwen), represent each document -- or each page rendered as an image -- as a
@@ -7,25 +7,30 @@ query against a document with **MaxSim**::
 
     score(query, doc) = sum over query tokens t of  max over doc patches p of  <q_t, d_p>
 
-This does not fit LodeDB's one-vector-per-id TurboVec core, so it is built here
-as a pure-SDK prototype on top of a bring-your-own-vectors index
-(:meth:`LodeDB.open_vector_store`), with **no engine change** -- exactly the
-staged plan in issue #25. Each document's patches are stored as ordinary vector
-rows keyed ``<doc_id>#<NNNNN>`` carrying a ``parent_id`` in metadata, and the
-full-precision patch vectors are kept verbatim (float32, base64, in the per-row
-text sidecar) so MaxSim is always computed at **exact** full precision, never from
-the quantized codes. There are two retrieval paths (:meth:`search` picks one;
-both return identical scores):
+This is built on top of a bring-your-own-vectors :class:`LodeDB`
+(:meth:`LodeDB.open_vector_store`), with no engine change. Each document is stored
+as **one row**: the row's id is the document id, its vector is the document's
+mean-pooled patch vector, and its full patch matrix is kept in the per-row text
+sidecar -- a compact multi-vector layout that holds a page's ~1000 patches in a
+single row instead of ~1000 rows, which keeps both ingest and on-disk footprint
+low. The patch matrix is stored at a configurable precision (``storage=``):
+``float16`` (default, ~exact and half the size of float32), ``float32`` (bit
+exact), or ``int8`` (a per-vector-scaled quantization, ~4x smaller).
 
-1. *Resident* (default for an unfiltered query within ``resident_max_bytes``) --
-   every patch is held in one in-memory matrix and the whole corpus is scored in a
-   single GEMM plus a segmented max. No candidate-generation scan and no
-   per-candidate read-back, so it returns the true top-``k`` (no recall loss) at a
-   few milliseconds on thousands of pages.
-2. *Indexed* (a filtered query, a corpus over the resident budget, or
-   ``resident=False``) -- the two-stage approach the issue prescribes: a batched
-   any-patch scan to depth ``candidate_depth`` gathers candidate documents (the
-   filter is pushed engine-side), then exact MaxSim rescores them.
+Retrieval is exact MaxSim over the documents, by one of three paths
+(:meth:`search` picks one automatically; all return the true top-``k``):
+
+1. *Resident* -- the default for an unfiltered query whose corpus fits
+   ``resident_max_bytes``: every patch is held in one in-memory matrix and scored
+   in a single GEMM plus a segmented max, at a few milliseconds on thousands of
+   pages.
+2. *Filtered* -- a query with a ``filter`` scores the matching subset
+   exhaustively (the filter is resolved engine-side, then those documents are
+   scored), so a metadata filter both narrows and stays exact.
+3. *Streaming* -- a corpus over the resident budget (or ``resident=False``) is
+   scored by reading the documents back from disk in bounded chunks. Slower
+   (disk-bound) but exact and constant-memory, so the exact path is never capped
+   by RAM.
 
 The exact MaxSim itself defaults to numpy (a ``query @ patches.T`` BLAS GEMM); a
 native TurboVec ``maxsim_scores`` Rust kernel is also available
@@ -36,20 +41,13 @@ The page/token encoder is **bring-your-own** (ColPali / ColQwen weights are
 multi-GB and out of scope to bundle): pass precomputed patch matrices to
 :meth:`add_document` / :meth:`search`, or an optional ``encoder`` exposing
 ``encode_documents`` / ``encode_queries``.
-
-Footprint note: a document contributes one stored row per patch, so a page with
-~1000 patches is ~1000 rows (plus the float32 patch sidecar the exact rescore
-reads back). That is the known cost of late interaction; native quantized
-multi-vector *storage* in the TurboVec core (to shrink that footprint) remains the
-deferred half of the stage-3 track (issue #25), while the MaxSim scoring kernel is
-already native here.
 """
 
 from __future__ import annotations
 
 import base64
 import importlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,13 +57,28 @@ from lodedb.engine.index import EngineError
 from lodedb.local.db import LodeDB
 
 # The bundled TurboVec extension exposes a native MaxSim kernel (`maxsim_scores`)
-# that scores the candidate set in parallel Rust, replacing the per-candidate
-# Python loop. It is resolved once and cached; a build that predates the kernel
-# (or a stock standalone `turbovec`) simply falls back to the numpy path, so the
-# SDK never hard-depends on the kernel being present.
+# that scores documents in parallel Rust. It is resolved once and cached; a build
+# that predates the kernel (or a stock standalone `turbovec`) falls back to the
+# numpy path, so the SDK never hard-depends on the kernel being present.
 _TURBOVEC_PACKAGE_NAMES = ("lodedb._turbovec", "turbovec")
 _UNRESOLVED = object()  # distinct from None, which means "looked up, not present"
 _native_maxsim: Callable[..., Any] | None | object = _UNRESOLVED
+
+# Metadata keys LodeLateInteractionIndex reserves on each document row; a
+# caller-supplied metadata mapping may not set them, and they are stripped from
+# the metadata returned to callers.
+_PATCH_COUNT_KEY = "patch_count"  # number of patch vectors in the document
+_DTYPE_KEY = "li_dtype"  # storage precision the patch matrix was written at
+_RESERVED_METADATA_KEYS = frozenset({_PATCH_COUNT_KEY, _DTYPE_KEY})
+
+# Supported patch-matrix storage precisions.
+_STORAGE_CHOICES = ("float16", "float32", "int8")
+
+# Cap the transient float32 work buffer when scoring a resident or streamed scan,
+# so peak memory stays bounded regardless of corpus size.
+_SCORE_CHUNK_BYTES = 64 * 1024 * 1024
+# Documents read per batch from disk on the streaming / filtered paths.
+_LOAD_BATCH_DOCS = 128
 
 
 def _resolve_native_maxsim() -> Callable[..., Any] | None:
@@ -92,29 +105,14 @@ def _resolve_native_maxsim() -> Callable[..., Any] | None:
     _native_maxsim = resolved
     return resolved
 
-# Separator between a document id and its per-patch suffix in a stored row id.
-# Mirrors the ``<doc_id>#patch_NNNN`` shape suggested in issue #25, kept compact.
-_PATCH_SEP = "#"
-# Zero-padding width for the patch index in a row id, so row ids sort naturally;
-# five figures comfortably covers a rendered page's ~1000 patches with headroom.
-_PATCH_ID_WIDTH = 5
-# Metadata key holding the owning document id on every patch row. Reserved: a
-# caller-supplied metadata mapping may not set it.
-_PARENT_KEY = "parent_id"
-# Metadata key holding the document's patch count, stamped on patch 0 so a
-# document can be counted without scanning all of its rows. Also reserved.
-_PATCH_COUNT_KEY = "patch_count"
-
-_RESERVED_METADATA_KEYS = frozenset({_PARENT_KEY, _PATCH_COUNT_KEY})
-
 
 class LodeLateInteractionHit:
     """One late-interaction result: ``(score, id, metadata)`` for a *document*.
 
     ``score`` is the MaxSim score (sum over query tokens of the max patch
-    similarity), ``id`` is the document (parent) id, and ``metadata`` is the user
-    metadata supplied to :meth:`LodeLateInteractionIndex.add_document` (the
-    internal ``parent_id`` / ``patch_count`` keys are stripped). Unpacks like a
+    similarity), ``id`` is the document id, and ``metadata`` is the user metadata
+    supplied to :meth:`LodeLateInteractionIndex.add_document` (the internal
+    bookkeeping keys are stripped). Unpacks like a
     :class:`~lodedb.local.db.LodeSearchHit`.
     """
 
@@ -179,12 +177,11 @@ class LodeLateInteractionIndex:
         for score, doc_id, meta in idx.search(query_tokens, k=5):
             ...
 
-    All storage and scan reuse the embedded :class:`~lodedb.local.db.LodeDB`
-    vector-only index unchanged: each patch is one row keyed ``<id>#NNNNN`` with a
-    ``parent_id`` in metadata, and the float32 patch vectors are retained (base64,
-    in the per-row text sidecar) so the exact MaxSim score can be recomputed at
-    query time over the candidate documents. Data stays on local disk; nothing is
-    sent anywhere.
+    Each document is one row in the embedded :class:`~lodedb.local.db.LodeDB`: its
+    id is the document id, its vector is the mean-pooled patch vector, and its full
+    patch matrix is kept (at ``storage`` precision, base64, in the per-row text
+    sidecar) so MaxSim is computed exactly at query time. Data stays on local disk;
+    nothing is sent anywhere.
     """
 
     def __init__(
@@ -194,6 +191,7 @@ class LodeLateInteractionIndex:
         dim: int,
         encoder: Any | None = None,
         bit_width: int = 4,
+        storage: str = "float16",
         candidate_depth: int = 16,
         scoring: str = "numpy",
         resident: bool | str = "auto",
@@ -205,51 +203,55 @@ class LodeLateInteractionIndex:
 
         ``dim`` is the per-patch vector dimension (e.g. 128 for ColPali) and must
         be a positive multiple of 8 (the TurboVec store's requirement). All
-        document patches and query tokens must share it. ``encoder`` is an
-        optional bring-your-own page/token encoder exposing
+        document patches and query tokens must share it. ``encoder`` is an optional
+        bring-your-own page/token encoder exposing
         ``encode_documents(list[...]) -> list[2-D matrix]`` and
         ``encode_queries(list[...]) -> list[2-D matrix]``; it is only used by
         :meth:`add_texts` / :meth:`search_text` and is never required for the
-        precomputed-matrix API. ``candidate_depth`` is the per-query-token
-        any-patch search depth used to gather candidates on the *indexed* path only
-        (higher = better recall there, more rescoring work; the resident path is
-        exhaustive and always exact). ``resident`` controls the default fast path:
-        ``"auto"`` (default) uses the in-memory exact scan for unfiltered queries
-        when the patch corpus fits ``resident_max_bytes`` (default 512 MB) and
-        falls back to the indexed path otherwise; ``True`` always uses it; ``False``
-        always uses the indexed path. ``scoring`` selects the exact-MaxSim backend:
-        ``"numpy"`` (default, BLAS GEMM -- fastest on builds with an optimized BLAS,
-        always available) or ``"native"`` (the TurboVec ``maxsim_scores`` Rust
-        kernel, for builds without a fast BLAS; falls back to numpy if absent). Both
-        return identical scores. ``read_only=True`` opens a non-mutating reader and
-        requires the path to exist. ``bit_width`` and any extra ``lodedb_kwargs``
-        (e.g. ``durability=``, ``commit_mode=``) are forwarded to the underlying
-        vector-only :class:`LodeDB`. The patch text sidecar that holds the vectors
-        is always retained, so ``store_text`` may not be set ``False``.
+        precomputed-matrix API.
+
+        ``storage`` is the patch-matrix precision: ``"float16"`` (default,
+        near-exact at half the size of float32), ``"float32"`` (bit exact), or
+        ``"int8"`` (per-vector-scaled, ~4x smaller, a small recall cost). Each
+        document records the precision it was written at, so reopening decodes
+        correctly regardless of this argument. ``resident`` controls the default
+        fast path: ``"auto"`` (default) holds the corpus in memory and scans it
+        exactly for unfiltered queries when it fits ``resident_max_bytes`` (default
+        512 MB), and streams from disk otherwise; ``True`` always builds the
+        resident matrix; ``False`` always streams. ``scoring`` selects the
+        exact-MaxSim backend: ``"numpy"`` (default BLAS GEMM) or ``"native"`` (the
+        TurboVec Rust kernel; falls back to numpy if absent). ``candidate_depth`` is
+        accepted for backward compatibility but unused -- all paths are exhaustive
+        and exact. ``read_only=True`` opens a non-mutating reader and requires the
+        path to exist. ``bit_width`` and any extra ``lodedb_kwargs`` (e.g.
+        ``durability=``, ``commit_mode=``) are forwarded to the underlying
+        vector-only :class:`LodeDB`. The patch text sidecar is always retained, so
+        ``store_text`` may not be set ``False``.
         """
 
         if int(dim) <= 0:
             raise ValueError("dim must be a positive integer")
-        if int(candidate_depth) <= 0:
-            raise ValueError("candidate_depth must be a positive integer")
+        if storage not in _STORAGE_CHOICES:
+            raise ValueError(f"storage must be one of {_STORAGE_CHOICES}")
         if scoring not in ("numpy", "native"):
             raise ValueError("scoring must be 'numpy' or 'native'")
         if resident not in (True, False, "auto"):
             raise ValueError("resident must be True, False, or 'auto'")
         if lodedb_kwargs.get("store_text") is False:
             raise ValueError(
-                "LodeLateInteractionIndex stores patch vectors in the text sidecar; "
+                "LodeLateInteractionIndex stores patch matrices in the text sidecar; "
                 "store_text must remain True"
             )
         self.dim = int(dim)
+        self.storage = storage
         self.scoring = scoring
         self.resident = resident
         self.resident_max_bytes = int(resident_max_bytes)
-        self.encoder = encoder
         self.candidate_depth = int(candidate_depth)
+        self.encoder = encoder
         self.read_only = bool(read_only)
-        # In-memory exact-MaxSim serving cache (all patches as one float32 matrix);
-        # built lazily on first eligible search and invalidated on every write.
+        # In-memory serving cache (all patches as one compact matrix); built lazily
+        # on the first eligible search and invalidated on every write.
         self._resident_cache: dict[str, Any] | None = None
         lodedb_kwargs.pop("store_text", None)
         self._db = LodeDB.open_vector_store(
@@ -271,46 +273,17 @@ class LodeLateInteractionIndex:
         metadata: Mapping[str, Any] | None = None,
         normalize: bool = True,
     ) -> str:
-        """Stores one document as its set of patch vectors; returns its id.
+        """Stores one document from its set of patch vectors; returns its id.
 
         ``patches`` is a 2-D ``(num_patches, dim)`` matrix (a numpy array or a
-        sequence of equal-length rows). Each patch becomes one row keyed
-        ``<id>#NNNNN`` carrying ``parent_id=<id>`` (plus your ``metadata``) and is
-        L2-normalized by default so MaxSim dot-products are cosine similarities.
-        Re-adding an existing id first removes its old patches, so a document can
-        be replaced even if its patch count changed. The whole document commits in
-        one atomic batch.
+        sequence of equal-length rows), L2-normalized by default so MaxSim
+        dot-products are cosine similarities. The document is one row keyed ``id``;
+        re-adding an existing id replaces it. Commits atomically.
         """
 
-        document_id = _require_doc_id(id)
-        matrix = _as_matrix(patches, self.dim, normalize=normalize)
-        user_meta = _coerce_user_metadata(metadata)
-        # Replace cleanly: drop any prior patches for this id so a shorter re-add
-        # cannot leave stale tail rows behind. (Raises ReadOnlyError on a reader.)
-        self._remove_patches(document_id)
-        patch_count = matrix.shape[0]
-        rows: list[dict[str, Any]] = []
-        for index in range(patch_count):
-            row_meta = dict(user_meta)
-            row_meta[_PARENT_KEY] = document_id
-            if index == 0:
-                # Stamp the count on patch 0 only, so count() can tally documents
-                # by counting parent-marker rows without enumerating every patch.
-                row_meta[_PATCH_COUNT_KEY] = str(patch_count)
-            rows.append(
-                {
-                    "vector": matrix[index].tolist(),
-                    "id": _patch_id(document_id, index),
-                    "metadata": row_meta,
-                    # Patch vectors are unit-norm above; persist verbatim so the
-                    # exact MaxSim recompute reads back what was scored against.
-                    "text": _encode_vector(matrix[index]),
-                }
-            )
-        # Vectors are pre-normalized above; do not normalize twice.
-        self._db.add_vectors_many(rows, normalize=False)
+        self._db.add_vectors_many([self._build_row(id, patches, metadata, normalize)])
         self._resident_cache = None  # serving cache is now stale
-        return document_id
+        return _require_doc_id(id)
 
     def add_documents(
         self,
@@ -318,12 +291,12 @@ class LodeLateInteractionIndex:
         *,
         normalize: bool = True,
     ) -> list[str]:
-        """Adds a batch of ``{"id", "patches", "metadata"?}`` documents.
+        """Adds a batch of ``{"id", "patches", "metadata"?}`` documents in one commit.
 
-        Each document is expanded to its patch rows and committed. Returns the ids
-        in input order.
+        Returns the ids in input order.
         """
 
+        rows: list[dict[str, Any]] = []
         ids: list[str] = []
         for document in documents:
             if not isinstance(document, Mapping):
@@ -331,14 +304,14 @@ class LodeLateInteractionIndex:
             patches = document.get("patches")
             if patches is None:
                 raise ValueError("each document needs a 'patches' matrix")
-            ids.append(
-                self.add_document(
-                    document.get("id"),
-                    patches,
-                    metadata=document.get("metadata"),
-                    normalize=normalize,
-                )
+            row = self._build_row(
+                document.get("id"), patches, document.get("metadata"), normalize
             )
+            rows.append(row)
+            ids.append(row["id"])
+        if rows:
+            self._db.add_vectors_many(rows, normalize=False)
+            self._resident_cache = None
         return ids
 
     def add_texts(
@@ -349,8 +322,7 @@ class LodeLateInteractionIndex:
     ) -> list[str]:
         """Encodes documents with the bring-your-own ``encoder`` and stores them.
 
-        Convenience over :meth:`add_documents` for when an ``encoder`` was
-        supplied: each item is ``{"id", "content", "metadata"?}`` and
+        Each item is ``{"id", "content", "metadata"?}`` and
         ``encoder.encode_documents([content, ...])`` must return one 2-D patch
         matrix per item. Raises :class:`RuntimeError` if no encoder is set.
         """
@@ -370,9 +342,12 @@ class LodeLateInteractionIndex:
         return self.add_documents(prepared, normalize=normalize)
 
     def remove(self, id: str) -> bool:
-        """Removes a document and all its patches; True if any patch existed."""
+        """Removes a document; returns True if it existed."""
 
-        return self._remove_patches(_require_doc_id(id)) > 0
+        removed = self._db.remove(_require_doc_id(id))
+        if removed:
+            self._resident_cache = None
+        return removed
 
     # -- read path ----------------------------------------------------------
 
@@ -385,141 +360,44 @@ class LodeLateInteractionIndex:
         filter: Mapping[str, Any] | None = None,
         normalize: bool = True,
     ) -> list[LodeLateInteractionHit]:
-        """Returns the top-``k`` documents by MaxSim for a multi-vector query.
+        """Returns the top-``k`` documents by exact MaxSim for a multi-vector query.
 
-        ``query`` is a 2-D ``(num_query_tokens, dim)`` matrix. There are two
-        retrieval paths, chosen automatically:
-
-        - **Resident** (default for an unfiltered query when the patch corpus fits
-          ``resident_max_bytes``): the full exact MaxSim is computed against every
-          document in one pass over an in-memory patch matrix. This skips both the
-          per-query-token quantized scan and the per-candidate read-back -- the two
-          costs that dominate query time -- and returns the true top-``k`` (no
-          candidate-recall loss).
-        - **Indexed** (used when a ``filter`` is given, or the corpus exceeds the
-          resident budget, or ``resident=False``): the two-stage path -- a batched
-          any-patch search to depth ``candidate_depth`` gathers candidate documents
-          (the ``filter`` is pushed engine-side), then exact MaxSim rescores the
-          candidates.
-
-        ``candidate_depth`` overrides the index default for the indexed path.
-        ``filter`` takes the same exact-match-or-predicate grammar as
-        :meth:`LodeDB.search`. Query tokens are L2-normalized by default to match
-        stored patches. Both paths return identical scores.
+        ``query`` is a 2-D ``(num_query_tokens, dim)`` matrix. One of three exact
+        paths is chosen automatically: a filtered query scores the matching subset
+        exhaustively; an unfiltered query uses the in-memory resident scan when the
+        corpus fits ``resident_max_bytes`` and otherwise streams from disk. All
+        return the true top-``k``. ``filter`` takes the same grammar as
+        :meth:`LodeDB.search`; query tokens are L2-normalized by default.
+        ``candidate_depth`` is accepted for compatibility but unused.
         """
 
         if int(k) <= 0:
             raise ValueError("k must be positive")
-        depth = self.candidate_depth if candidate_depth is None else int(candidate_depth)
-        if depth <= 0:
-            raise ValueError("candidate_depth must be positive")
         query_matrix = _as_matrix(query, self.dim, normalize=normalize)
+        prefer_native = self.scoring == "native"
 
-        # Prefer the resident exact scan for unfiltered queries (a filter is pushed
-        # engine-side on the indexed path instead). Falls through to indexed when
-        # the corpus is over the resident budget. An empty index yields an empty
-        # resident cache, so this also handles the no-documents case without the
-        # (surprisingly costly) stats-based count() on the hot path.
-        if filter is None and self.resident is not False:
+        if filter is not None:
+            try:
+                doc_ids = [
+                    record["id"] for record in self._db.list_documents(filter=dict(filter))
+                ]
+            except EngineError:
+                return []
+            return self._topk_from_chunks(
+                query_matrix, self._disk_chunks(doc_ids), int(k), prefer_native
+            )
+
+        if self.resident is not False:
             cache = self._resident_cache_get()
             if cache is not None:
-                return self._search_resident(query_matrix, cache, int(k))
+                return self._topk_from_chunks(
+                    query_matrix, self._resident_chunks(cache), int(k), prefer_native
+                )
 
-        return self._search_indexed(query_matrix, int(k), depth, filter)
-
-    def _search_resident(
-        self,
-        query_matrix: np.ndarray,
-        cache: dict[str, Any],
-        k: int,
-    ) -> list[LodeLateInteractionHit]:
-        """Exact MaxSim over the whole resident patch matrix; returns top-``k``."""
-
-        scores = _maxsim_scores_flat(
-            query_matrix,
-            cache["flat"],
-            cache["counts"],
-            prefer_native=self.scoring == "native",
+        # Over the resident budget (or resident=False): stream from disk, exact.
+        return self._topk_from_chunks(
+            query_matrix, self._disk_chunks(self._all_document_ids()), int(k), prefer_native
         )
-        ids = cache["ids"]
-        metas = cache["metas"]
-        patch_counts = cache["patch_counts"]
-        scored = [
-            LodeLateInteractionHit(
-                score=float(scores[i]),
-                id=ids[i],
-                metadata=metas[i],
-                patch_count=patch_counts[i],
-            )
-            for i in range(len(ids))
-        ]
-        # Deterministic order: score desc, then id asc to break ties stably.
-        scored.sort(key=lambda hit: (-hit.score, hit.id))
-        return scored[:k]
-
-    def _search_indexed(
-        self,
-        query_matrix: np.ndarray,
-        k: int,
-        depth: int,
-        filter: Mapping[str, Any] | None,
-    ) -> list[LodeLateInteractionHit]:
-        """Two-stage retrieval: candidate generation then exact MaxSim rescore."""
-
-        # Stage 1: candidate generation. One any-patch sub-query per query token;
-        # union the owning documents of the hits. Pass the user filter as-is -- in a
-        # dedicated late-interaction index every row is a patch row, so a synthetic
-        # "parent_id exists" filter would only add allowlist overhead for no effect.
-        token_queries = [query_matrix[i].tolist() for i in range(query_matrix.shape[0])]
-        try:
-            per_token_hits = self._db.search_many_by_vector(
-                token_queries,
-                k=depth,
-                filter=dict(filter) if filter else None,
-                normalize=False,
-            )
-        except EngineError:
-            # An index with no committed patches has no serving snapshot to scan;
-            # treat that as no results rather than an error.
-            return []
-        candidates: list[str] = []
-        seen: set[str] = set()
-        for hits in per_token_hits:
-            for hit in hits:
-                parent = hit.metadata.get(_PARENT_KEY)
-                if parent and parent not in seen:
-                    seen.add(parent)
-                    candidates.append(parent)
-        if not candidates:
-            return []
-
-        # Stage 2: exact MaxSim rescoring over the candidates' stored patches.
-        # One batched read of all candidates' patches, then score in one shot.
-        loaded_docs = self._load_documents(candidates)
-        loaded: list[np.ndarray] = []
-        meta_rows: list[tuple[str, dict[str, Any], int]] = []
-        for parent in candidates:
-            entry = loaded_docs.get(parent)
-            if entry is None or entry[0].shape[0] == 0:
-                continue
-            loaded.append(entry[0])
-            meta_rows.append((parent, entry[1], entry[2]))
-        if not loaded:
-            return []
-        scores = _maxsim_batch(
-            query_matrix, loaded, prefer_native=self.scoring == "native"
-        )
-        scored = [
-            LodeLateInteractionHit(
-                score=float(score), id=parent, metadata=user_meta, patch_count=patch_count
-            )
-            for score, (parent, user_meta, patch_count) in zip(
-                scores, meta_rows, strict=True
-            )
-        ]
-        # Deterministic order: score desc, then id asc to break ties stably.
-        scored.sort(key=lambda hit: (-hit.score, hit.id))
-        return scored[:k]
 
     def search_text(
         self,
@@ -532,8 +410,8 @@ class LodeLateInteractionIndex:
     ) -> list[LodeLateInteractionHit]:
         """Encodes ``query`` with the bring-your-own ``encoder`` then searches.
 
-        Convenience over :meth:`search`: ``encoder.encode_queries([query])`` must
-        return one 2-D token matrix. Raises :class:`RuntimeError` with no encoder.
+        ``encoder.encode_queries([query])`` must return one 2-D token matrix.
+        Raises :class:`RuntimeError` with no encoder.
         """
 
         encoder = self._require_encoder()
@@ -549,16 +427,17 @@ class LodeLateInteractionIndex:
         )
 
     def count(self) -> int:
-        """Returns the number of distinct documents (parents) stored."""
-
-        # Patch 0 of every document carries the patch_count marker, so counting
-        # those rows counts documents without enumerating every patch.
-        return self._db.count(filter={_PATCH_COUNT_KEY: {"$exists": True}})
-
-    def patch_count(self) -> int:
-        """Returns the total number of stored patch rows across all documents."""
+        """Returns the number of documents stored."""
 
         return self._db.count()
+
+    def patch_count(self) -> int:
+        """Returns the total number of patch vectors across all documents."""
+
+        return sum(
+            _patch_count_from_metadata(record.get("metadata", {}))
+            for record in self._db.list_documents()
+        )
 
     def list_documents(
         self,
@@ -571,21 +450,17 @@ class LodeLateInteractionIndex:
         against your document metadata.
         """
 
-        records = self._db.list_documents(filter=_patch_scan_filter(filter))
-        parents: dict[str, dict[str, Any]] = {}
-        for record in records:
-            metadata = record.get("metadata", {})
-            if not isinstance(metadata, Mapping):
-                continue
-            parent = metadata.get(_PARENT_KEY)
-            if not isinstance(parent, str) or not parent or parent in parents:
-                continue
-            parents[parent] = {
-                "id": parent,
-                "metadata": _strip_internal_metadata(metadata),
-                "patch_count": _patch_count_from_metadata(metadata),
+        records = self._db.list_documents(filter=dict(filter) if filter else None)
+        out = [
+            {
+                "id": record["id"],
+                "metadata": _strip_internal_metadata(record.get("metadata", {})),
+                "patch_count": _patch_count_from_metadata(record.get("metadata", {})),
             }
-        return [parents[parent] for parent in sorted(parents)]
+            for record in records
+        ]
+        out.sort(key=lambda item: item["id"])
+        return out
 
     def persist(self) -> dict[str, Any]:
         """Flushes durable state and returns the underlying redacted storage stats."""
@@ -609,6 +484,27 @@ class LodeLateInteractionIndex:
 
     # -- internals ----------------------------------------------------------
 
+    def _build_row(
+        self,
+        id: Any,
+        patches: Any,
+        metadata: Mapping[str, Any] | None,
+        normalize: bool,
+    ) -> dict[str, Any]:
+        """Builds the single engine row (pooled vector + encoded matrix) for a doc."""
+
+        document_id = _require_doc_id(id)
+        matrix = _as_matrix(patches, self.dim, normalize=normalize)
+        row_meta = _coerce_user_metadata(metadata)
+        row_meta[_PATCH_COUNT_KEY] = str(matrix.shape[0])
+        row_meta[_DTYPE_KEY] = self.storage
+        return {
+            "vector": _pool(matrix).tolist(),
+            "id": document_id,
+            "metadata": row_meta,
+            "text": _encode_matrix(matrix, self.storage),
+        }
+
     def _require_encoder(self) -> Any:
         """Returns the bring-your-own encoder or raises a clear error."""
 
@@ -623,96 +519,129 @@ class LodeLateInteractionIndex:
             )
         return encoder
 
-    def _remove_patches(self, document_id: str) -> int:
-        """Removes every patch row owned by ``document_id``; returns count removed.
+    def _resident_dtype(self) -> type[np.floating]:
+        """The in-memory dtype for the resident matrix (compact unless float32)."""
 
-        Uses the public per-id ``remove`` (the same pattern the graph layer uses
-        for multi-row deletes), so it goes through the engine's read-only guard and
-        atomic commit path rather than the private index.
-        """
+        return np.float32 if self.storage == "float32" else np.float16
 
-        records = self._db.list_documents(filter={_PARENT_KEY: document_id})
-        removed = 0
-        for record in records:
-            if self._db.remove(record["id"]):
-                removed += 1
-        if removed:
-            self._resident_cache = None  # serving cache is now stale
-        return removed
+    def _all_document_ids(self) -> list[str]:
+        """Returns every document id (sorted for determinism)."""
 
-    def _load_document(
-        self, document_id: str
-    ) -> tuple[np.ndarray | None, dict[str, Any], int]:
-        """Loads a document's ``(patch_matrix, user_metadata, patch_count)``.
-
-        Reads the patch rows back via metadata enumeration and decodes each stored
-        patch vector from its text-sidecar blob.
-        """
-
-        records = self._db.list_documents(filter={_PARENT_KEY: document_id})
-        if not records:
-            return None, {}, 0
-        records.sort(key=lambda record: record["id"])
-        texts = self._db.get_texts([record["id"] for record in records])
-        vectors: list[np.ndarray] = []
-        for record in records:
-            blob = texts.get(record["id"])
-            if blob is None:
-                continue
-            vectors.append(_decode_vector(blob, self.dim))
-        user_meta = _strip_internal_metadata(records[0].get("metadata", {}))
-        patch_count = max(
-            (_patch_count_from_metadata(record.get("metadata", {})) for record in records),
-            default=len(records),
-        )
-        if not vectors:
-            return None, user_meta, patch_count
-        return np.vstack(vectors), user_meta, patch_count
+        try:
+            records = self._db.list_documents()
+        except EngineError:
+            return []
+        return sorted(record["id"] for record in records)
 
     def _load_documents(
         self, document_ids: list[str]
     ) -> dict[str, tuple[np.ndarray, dict[str, Any], int]]:
-        """Batch-loads several documents' ``(patches, metadata, patch_count)``.
+        """Batch-loads ``{id: (patch_matrix_f32, user_metadata, patch_count)}``.
 
-        One enumeration and one text read cover every requested document, instead
-        of two engine round-trips per document.
+        One enumeration plus one text read cover the whole batch. Each document is
+        decoded using the precision it was written at.
         """
 
         if not document_ids:
             return {}
-        records = self._db.list_documents(filter={_PARENT_KEY: {"$in": list(document_ids)}})
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for record in records:
-            parent = record.get("metadata", {}).get(_PARENT_KEY)
-            if isinstance(parent, str) and parent:
-                grouped.setdefault(parent, []).append(record)
-        all_ids = [record["id"] for rows in grouped.values() for record in rows]
-        texts = self._db.get_texts(all_ids)
+        records = self._db.list_documents(filter={"document_ids": list(document_ids)})
+        meta_by_id = {record["id"]: record.get("metadata", {}) for record in records}
+        texts = self._db.get_texts(list(document_ids))
         out: dict[str, tuple[np.ndarray, dict[str, Any], int]] = {}
-        for parent, rows in grouped.items():
-            rows.sort(key=lambda record: record["id"])
-            vectors = [
-                _decode_vector(texts[record["id"]], self.dim)
-                for record in rows
-                if texts.get(record["id"]) is not None
-            ]
-            if not vectors:
+        for doc_id in document_ids:
+            blob = texts.get(doc_id)
+            if blob is None:
                 continue
-            user_meta = _strip_internal_metadata(rows[0].get("metadata", {}))
-            patch_count = max(
-                (_patch_count_from_metadata(r.get("metadata", {})) for r in rows),
-                default=len(rows),
-            )
-            out[parent] = (np.vstack(vectors), user_meta, patch_count)
+            meta = meta_by_id.get(doc_id, {})
+            row_dtype = str(meta.get(_DTYPE_KEY, "float32"))
+            matrix = _decode_matrix(blob, row_dtype, self.dim)
+            patch_count = _patch_count_from_metadata(meta) or matrix.shape[0]
+            out[doc_id] = (matrix, _strip_internal_metadata(meta), patch_count)
         return out
 
-    def _resident_cache_get(self) -> dict[str, Any] | None:
-        """Returns the resident exact-MaxSim cache, building it if needed.
+    def _disk_chunks(self, document_ids: list[str]) -> Iterator[tuple]:
+        """Yields scoring chunks read from disk in bounded batches of documents."""
 
-        Returns ``None`` when the corpus exceeds ``resident_max_bytes`` under the
-        ``resident="auto"`` policy (so the caller falls back to the indexed path),
-        or when the index is empty.
+        for start in range(0, len(document_ids), _LOAD_BATCH_DOCS):
+            batch = document_ids[start : start + _LOAD_BATCH_DOCS]
+            loaded = self._load_documents(batch)
+            mats: list[np.ndarray] = []
+            ids: list[str] = []
+            metas: list[dict[str, Any]] = []
+            patch_counts: list[int] = []
+            for doc_id in batch:
+                entry = loaded.get(doc_id)
+                if entry is None or entry[0].shape[0] == 0:
+                    continue
+                mats.append(entry[0])
+                ids.append(doc_id)
+                metas.append(entry[1])
+                patch_counts.append(entry[2])
+            if not mats:
+                continue
+            flat = np.ascontiguousarray(np.vstack(mats), dtype=np.float32)
+            counts = np.fromiter((m.shape[0] for m in mats), dtype=np.int64, count=len(mats))
+            yield flat, counts, ids, metas, patch_counts
+
+    def _resident_chunks(self, cache: dict[str, Any]) -> Iterator[tuple]:
+        """Yields scoring chunks by slicing the resident matrix to a patch budget.
+
+        Each chunk's patch rows are upcast to float32 just for the GEMM, so the
+        transient float32 buffer stays bounded even when the resident matrix is a
+        compact dtype and the corpus is large.
         """
+
+        flat = cache["flat"]
+        counts = cache["counts"]
+        ids = cache["ids"]
+        metas = cache["metas"]
+        patch_counts = cache["patch_counts"]
+        budget = max(1, _SCORE_CHUNK_BYTES // (self.dim * 4))
+        n_docs = len(ids)
+        doc = 0
+        row = 0
+        while doc < n_docs:
+            start_doc = doc
+            patches = 0
+            while doc < n_docs and (patches == 0 or patches + int(counts[doc]) <= budget):
+                patches += int(counts[doc])
+                doc += 1
+            sub = np.ascontiguousarray(flat[row : row + patches], dtype=np.float32)
+            yield (
+                sub,
+                counts[start_doc:doc],
+                ids[start_doc:doc],
+                metas[start_doc:doc],
+                patch_counts[start_doc:doc],
+            )
+            row += patches
+
+    def _topk_from_chunks(
+        self,
+        query_matrix: np.ndarray,
+        chunks: Iterator[tuple],
+        k: int,
+        prefer_native: bool,
+    ) -> list[LodeLateInteractionHit]:
+        """Scores every chunk and returns the global top-``k`` (score desc, id asc)."""
+
+        collected: list[tuple[float, str, dict[str, Any], int]] = []
+        for flat, counts, ids, metas, patch_counts in chunks:
+            if len(ids) == 0:
+                continue
+            scores = _maxsim_scores_flat(
+                query_matrix, flat, counts, prefer_native=prefer_native
+            )
+            for i in range(len(ids)):
+                collected.append((float(scores[i]), ids[i], metas[i], int(patch_counts[i])))
+        collected.sort(key=lambda item: (-item[0], item[1]))
+        return [
+            LodeLateInteractionHit(score=s, id=i, metadata=m, patch_count=p)
+            for s, i, m, p in collected[:k]
+        ]
+
+    def _resident_cache_get(self) -> dict[str, Any] | None:
+        """Returns the resident cache, building it if needed; ``None`` if over budget."""
 
         if self._resident_cache is not None:
             return self._resident_cache
@@ -721,60 +650,53 @@ class LodeLateInteractionIndex:
         return cache
 
     def _build_resident_cache(self) -> dict[str, Any] | None:
-        """Builds the in-memory exact-MaxSim cache from the stored patch sidecar.
+        """Builds the in-memory matrix from the stored documents.
 
-        Lays every document's patches out as one contiguous float32 matrix with a
-        per-document patch-count partition, so a query is one GEMM plus a segmented
-        reduction. Honors the ``resident_max_bytes`` budget under ``"auto"``.
+        Returns ``None`` when the corpus exceeds ``resident_max_bytes`` under
+        ``resident="auto"`` (so the caller streams instead), or an empty cache for
+        a no-document index.
         """
 
-        records = self._db.list_documents(filter={_PARENT_KEY: {"$exists": True}})
+        resident_dtype = self._resident_dtype()
+        try:
+            records = self._db.list_documents()
+        except EngineError:
+            return _empty_resident_cache(self.dim, resident_dtype)
         if not records:
-            return _empty_resident_cache(self.dim)
-        order: list[str] = []
-        groups: dict[str, dict[str, Any]] = {}
-        for record in records:
-            metadata = record.get("metadata", {})
-            parent = metadata.get(_PARENT_KEY)
-            if not isinstance(parent, str) or not parent:
-                continue
-            group = groups.get(parent)
-            if group is None:
-                group = {"ids": [], "meta": metadata}
-                groups[parent] = group
-                order.append(parent)
-            group["ids"].append(record["id"])
-        total_patches = sum(len(groups[parent]["ids"]) for parent in order)
+            return _empty_resident_cache(self.dim, resident_dtype)
+        records.sort(key=lambda record: record["id"])
+        total_patches = sum(
+            _patch_count_from_metadata(record.get("metadata", {})) for record in records
+        )
+        itemsize = np.dtype(resident_dtype).itemsize
         if (
             self.resident == "auto"
-            and total_patches * self.dim * 4 > self.resident_max_bytes
+            and total_patches * self.dim * itemsize > self.resident_max_bytes
         ):
-            return None  # over budget: caller uses the indexed path instead
+            return None
 
-        all_ids = [pid for parent in order for pid in groups[parent]["ids"]]
-        texts = self._db.get_texts(all_ids)
-        ids: list[str] = []
+        ids = [record["id"] for record in records]
+        texts = self._db.get_texts(ids)
+        kept_ids: list[str] = []
         mats: list[np.ndarray] = []
         metas: list[dict[str, Any]] = []
         patch_counts: list[int] = []
-        for parent in order:
-            group = groups[parent]
-            vectors = [
-                _decode_vector(texts[pid], self.dim)
-                for pid in sorted(group["ids"])
-                if texts.get(pid) is not None
-            ]
-            if not vectors:
+        for record in records:
+            blob = texts.get(record["id"])
+            if blob is None:
                 continue
-            ids.append(parent)
-            mats.append(np.vstack(vectors).astype(np.float32, copy=False))
-            metas.append(_strip_internal_metadata(group["meta"]))
-            patch_counts.append(max(_patch_count_from_metadata(group["meta"]), len(vectors)))
+            meta = record.get("metadata", {})
+            row_dtype = str(meta.get(_DTYPE_KEY, "float32"))
+            matrix = _decode_matrix(blob, row_dtype, self.dim)
+            kept_ids.append(record["id"])
+            mats.append(matrix.astype(resident_dtype, copy=False))
+            metas.append(_strip_internal_metadata(meta))
+            patch_counts.append(_patch_count_from_metadata(meta) or matrix.shape[0])
         if not mats:
-            return _empty_resident_cache(self.dim)
+            return _empty_resident_cache(self.dim, resident_dtype)
         return {
-            "ids": ids,
-            "flat": np.ascontiguousarray(np.vstack(mats), dtype=np.float32),
+            "ids": kept_ids,
+            "flat": np.ascontiguousarray(np.vstack(mats), dtype=resident_dtype),
             "counts": np.fromiter(
                 (m.shape[0] for m in mats), dtype=np.int64, count=len(mats)
             ),
@@ -786,12 +708,12 @@ class LodeLateInteractionIndex:
 # -- module helpers ---------------------------------------------------------
 
 
-def _empty_resident_cache(dim: int) -> dict[str, Any]:
+def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:
     """An empty resident cache (a no-document index), so search returns ``[]``."""
 
     return {
         "ids": [],
-        "flat": np.zeros((0, dim), dtype=np.float32),
+        "flat": np.zeros((0, dim), dtype=dtype),
         "counts": np.zeros(0, dtype=np.int64),
         "metas": [],
         "patch_counts": [],
@@ -806,7 +728,6 @@ def _maxsim(query: np.ndarray, document: np.ndarray) -> float:
     ``query=(Nq, dim)`` and ``document=(Nd, dim)``.
     """
 
-    # (Nq, Nd) similarity matrix, then max over doc patches, then sum over tokens.
     sims = query @ document.T
     return float(sims.max(axis=1).sum())
 
@@ -819,22 +740,8 @@ def _maxsim_batch(
 ) -> np.ndarray:
     """Returns the MaxSim score of ``query`` against each document matrix.
 
-    Two paths return identical scores (parity holds to f32 rounding):
-
-    - ``numpy`` (default): per-document ``query @ doc.T`` via numpy, which on a
-      build with an optimized BLAS (e.g. Apple Accelerate, OpenBLAS) is the
-      fastest scoring path and needs no compiled kernel.
-    - ``native`` (``prefer_native=True``): the TurboVec ``maxsim_scores`` Rust
-      kernel (per-document faer GEMM, parallel across documents, GIL released),
-      used when the compiled extension provides it.
-
-    numpy is the default because it is consistently fastest for this step on
-    common platforms and is always available; the native kernel is exposed for
-    builds without a fast BLAS and as the basis for a future native
-    multi-vector storage path. Either way, MaxSim scoring is a small fraction of
-    query time (candidate generation and patch loading dominate), so the choice
-    is not a latency lever today. ``prefer_native`` silently falls back to numpy
-    if the kernel is unavailable.
+    A convenience over :func:`_maxsim_scores_flat` that packs a list of
+    per-document matrices into the flat-plus-counts layout the scorer expects.
     """
 
     if not documents:
@@ -854,13 +761,13 @@ def _maxsim_scores_flat(
     prefer_native: bool = False,
 ) -> np.ndarray:
     """MaxSim of ``query`` against documents packed as one ``(total_patches, dim)``
-    matrix partitioned by ``counts`` (patches per document, in order).
+    float32 matrix partitioned by ``counts`` (patches per document, in order).
 
-    The native path hands the buffers straight to the Rust kernel. The numpy path
-    is a single ``query @ flat.T`` GEMM followed by a segmented max
-    (``np.maximum.reduceat``) summed over query tokens -- fully vectorized across
-    all documents, no per-document Python loop. Both return identical scores. All
-    documents are assumed non-empty (``counts >= 1``), which the callers guarantee.
+    The native path hands the buffers to the Rust kernel. The numpy path is a
+    single ``query @ flat.T`` GEMM followed by a segmented max
+    (``np.maximum.reduceat``) summed over query tokens -- vectorized across all
+    documents. Both return identical scores. Documents are assumed non-empty
+    (``counts >= 1``), which the callers guarantee.
     """
 
     n_docs = int(counts.shape[0])
@@ -869,9 +776,9 @@ def _maxsim_scores_flat(
     native = _resolve_native_maxsim() if prefer_native else None
     if native is not None:
         query_c = np.ascontiguousarray(query, dtype=np.float32)
-        return np.asarray(native(query_c, flat, counts), dtype=np.float32)
+        flat_c = np.ascontiguousarray(flat, dtype=np.float32)
+        return np.asarray(native(query_c, flat_c, counts), dtype=np.float32)
     sims = np.ascontiguousarray(query, dtype=np.float32) @ flat.T
-    # Segment boundaries (start column of each document) for reduceat.
     starts = np.empty(n_docs, dtype=np.intp)
     starts[0] = 0
     if n_docs > 1:
@@ -908,42 +815,65 @@ def _as_matrix(matrix: Any, dim: int, *, normalize: bool) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
-def _encode_vector(vector: np.ndarray) -> str:
-    """Serializes one float32 patch vector to a compact base64 text blob."""
+def _pool(matrix: np.ndarray) -> np.ndarray:
+    """Returns the document's mean-pooled unit vector (the stored row vector).
 
-    return base64.b64encode(np.asarray(vector, dtype="<f4").tobytes()).decode("ascii")
+    Used only as the row's index vector; retrieval scores the full patch matrix.
+    A zero mean (degenerate) falls back to the first patch so the vector is valid.
+    """
+
+    pooled = matrix.mean(axis=0)
+    norm = float(np.linalg.norm(pooled))
+    if norm == 0.0:
+        return np.ascontiguousarray(matrix[0], dtype=np.float32)
+    return np.ascontiguousarray(pooled / norm, dtype=np.float32)
 
 
-def _decode_vector(blob: str, dim: int) -> np.ndarray:
-    """Decodes a base64 text blob back to a float32 ``(dim,)`` vector."""
+def _encode_matrix(matrix: np.ndarray, storage: str) -> str:
+    """Serializes a ``(num_patches, dim)`` matrix to a base64 blob at ``storage``."""
+
+    if storage == "float32":
+        buffer = np.ascontiguousarray(matrix, dtype="<f4").tobytes()
+    elif storage == "float16":
+        buffer = np.ascontiguousarray(matrix, dtype="<f2").tobytes()
+    elif storage == "int8":
+        # Per-vector symmetric quantization: scale each patch by its max-abs so the
+        # int8 range is used fully, then store the f32 scales followed by the codes.
+        scales = np.abs(matrix).max(axis=1).astype("<f4")
+        safe = np.where(scales == 0.0, 1.0, scales).astype(np.float32)
+        codes = np.clip(np.round(matrix / safe[:, None] * 127.0), -127, 127).astype(np.int8)
+        buffer = scales.tobytes() + codes.tobytes()
+    else:  # pragma: no cover - guarded at construction
+        raise ValueError(f"unknown storage {storage!r}")
+    return base64.b64encode(buffer).decode("ascii")
+
+
+def _decode_matrix(blob: str, storage: str, dim: int) -> np.ndarray:
+    """Decodes a base64 blob back to a float32 ``(num_patches, dim)`` matrix."""
 
     raw = base64.b64decode(blob.encode("ascii"))
-    array = np.frombuffer(raw, dtype="<f4")
-    if array.shape[0] != dim:
-        raise ValueError(
-            f"stored patch vector has dimension {array.shape[0]}, expected {dim}"
-        )
-    return np.array(array, dtype=np.float32)
-
-
-def _patch_id(document_id: str, index: int) -> str:
-    """Builds the deterministic row id for a document's ``index``-th patch."""
-
-    return f"{document_id}{_PATCH_SEP}{index:0{_PATCH_ID_WIDTH}d}"
+    if storage == "float32":
+        return np.array(np.frombuffer(raw, dtype="<f4"), dtype=np.float32).reshape(-1, dim)
+    if storage == "float16":
+        return np.frombuffer(raw, dtype="<f2").astype(np.float32).reshape(-1, dim)
+    if storage == "int8":
+        n = len(raw) // (4 + dim)
+        scales = np.frombuffer(raw[: n * 4], dtype="<f4").astype(np.float32)
+        codes = np.frombuffer(raw[n * 4 :], dtype=np.int8).reshape(n, dim).astype(np.float32)
+        return codes * (scales[:, None] / 127.0)
+    raise ValueError(f"unknown storage {storage!r}")
 
 
 def _require_doc_id(value: Any) -> str:
-    """Validates and returns a non-empty document id without the patch separator."""
+    """Validates and returns a non-empty document id."""
 
     if not isinstance(value, str) or not value.strip():
         raise ValueError("document id must be a non-empty string")
-    if _PATCH_SEP in value:
-        raise ValueError(f"document id may not contain {_PATCH_SEP!r}")
     return value
 
 
 def _coerce_user_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Validates user metadata and reserves the internal patch keys."""
+    """Validates user metadata and reserves the internal bookkeeping keys."""
 
     if metadata is None:
         return {}
@@ -958,7 +888,7 @@ def _coerce_user_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def _strip_internal_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Drops the internal patch bookkeeping keys from row metadata."""
+    """Drops the internal bookkeeping keys from row metadata."""
 
     return {
         key: value
@@ -974,20 +904,3 @@ def _patch_count_from_metadata(metadata: Mapping[str, Any]) -> int:
         return int(metadata.get(_PATCH_COUNT_KEY, 0) or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _patch_scan_filter(metadata_filter: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Builds a candidate-scan filter restricted to patch rows.
-
-    Always constrains the scan to rows that carry a ``parent_id`` (every patch
-    row does), and AND-composes any caller metadata filter on top.
-    """
-
-    base: dict[str, Any] = {_PARENT_KEY: {"$exists": True}}
-    if metadata_filter is None:
-        return base
-    if not isinstance(metadata_filter, Mapping):
-        raise ValueError("filter must be a mapping")
-    if not metadata_filter:
-        return base
-    return {"$and": [base, dict(metadata_filter)]}

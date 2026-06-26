@@ -286,11 +286,11 @@ model. See [`docs/multimodal.md`](docs/multimodal.md).
 For visual-document RAG, ColPali / ColQwen style models encode a page as a *set* of
 patch vectors and rank with MaxSim (sum over query tokens of the best patch match),
 rather than pooling to one vector. `LodeLateInteractionIndex` runs this on the
-bring-your-own-vectors path with no engine change: patches are stored as ordinary
-rows grouped by a parent id, and an unfiltered query is answered by an exact
-resident scan (the whole corpus scored in one GEMM plus a segmented max) that
-returns the true top-k in ~1-2 ms on a few thousand pages; filtered or very large
-corpora fall back to a two-stage candidate-then-rescore path.
+bring-your-own-vectors path with no engine change: each document is one row holding
+its whole patch matrix, and an unfiltered query is answered by an exact resident
+scan (the corpus scored in one GEMM plus a segmented max) that returns the true
+top-k in a few milliseconds on thousands of pages; filtered queries score the
+matching subset exhaustively and over-budget corpora stream from disk (both exact).
 
 ```python
 from lodedb import LodeLateInteractionIndex
@@ -300,8 +300,9 @@ idx.add_document("report-p1", page_patches, metadata={"file": "report.pdf"})
 hits = idx.search(query_tokens, k=5)                       # [(score, doc_id, metadata), ...]
 ```
 
-The encoder stays bring-your-own (ColPali / ColQwen weights are multi-GB). Each patch
-is a stored row, so the index trades footprint for OCR-free page retrieval. See
+The encoder stays bring-your-own (ColPali / ColQwen weights are multi-GB). Patch
+matrices are stored at `storage="float16"` (default, near-exact), `"float32"`
+(bit-exact), or `"int8"` (~4x smaller). See
 [`docs/late-interaction.md`](docs/late-interaction.md).
 
 ## GPU-resident index

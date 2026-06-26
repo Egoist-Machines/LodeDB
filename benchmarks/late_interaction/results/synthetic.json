@@ -8,24 +8,25 @@
     "query_tokens": 8,
     "queries": 150,
     "k": 10,
-    "candidate_depth": 16,
+    "storage": "float16",
     "seed": 0
   },
   "late_interaction": {
-    "ingest_seconds": 25.933,
+    "storage": "float16",
+    "ingest_seconds": 0.475,
     "patch_rows": 51200,
-    "disk_bytes": 127367097,
-    "resident_build_seconds": 0.344,
-    "mean_query_ms": 1.48,
-    "p95_query_ms": 1.861,
+    "disk_bytes": 17843288,
+    "resident_build_seconds": 0.029,
+    "mean_query_ms": 3.611,
+    "p95_query_ms": 6.059,
     "recall_at_k": 1.0
   },
   "single_vector": {
-    "ingest_seconds": 0.227,
+    "ingest_seconds": 0.233,
     "rows": 800,
     "disk_bytes": 315490,
-    "mean_query_ms": 0.129,
-    "p95_query_ms": 0.181,
+    "mean_query_ms": 0.225,
+    "p95_query_ms": 0.638,
     "recall_at_k": 0.0487
   }
 }

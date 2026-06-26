@@ -19,47 +19,51 @@ uv run python benchmarks/late_interaction/run.py --docs 2000 --queries 200 --can
 
 ## Result
 
-The quality case holds decisively, and with the resident exact scan it comes at
-low query latency. On 800 synthetic pages (64 patches each, dim 128):
+The quality case holds decisively, at low query latency and a compact footprint.
+On 800 synthetic pages (64 patches each, dim 128), late interaction returns the
+exact MaxSim ranking that mean-pooling cannot:
 
-| metric | late interaction | single vector (pooled) |
+| metric | late interaction (float16) | single vector (pooled) |
 |---|---:|---:|
 | recall@10 vs exact MaxSim | **1.00** | 0.05 |
-| mean query latency | 1.5 ms | 0.13 ms |
-| resident build (one-time) | 0.34 s | -- |
-| ingest (800 docs) | 25.9 s | 0.23 s |
-| on-disk footprint | 127 MB | 0.3 MB |
+| mean query latency | 3.6 ms | 0.2 ms |
+| resident build (one-time) | 0.03 s | -- |
+| ingest (800 docs) | 0.48 s | 0.23 s |
+| on-disk footprint | 18 MB | 0.3 MB |
 
 Pooling a page to one vector destroys the per-patch signal MaxSim depends on, so
 its recall against the MaxSim ranking is near zero regardless of tuning. Late
-interaction returns the exact MaxSim ranking (recall 1.0): the default search
-path holds every patch in one in-memory matrix and scores the whole corpus with a
-single GEMM plus a segmented max, so there is no candidate-recall loss and no
+interaction holds every patch in one in-memory matrix and scores the whole corpus
+with a single GEMM plus a segmented max -- no candidate-recall loss, no
 per-candidate read-back.
 
-### How the query path got here
+### Storage precision (`--storage`)
 
-An earlier two-stage path (per-query-token quantized scan to gather candidates,
-then read each candidate's patches back and rescore) ran ~110 ms/query at
-recall 0.73. A per-stage profile showed scoring was ~1% of that; candidate
-generation (~61%) and patch loading (~38%) dominated. Two changes removed both:
+Each document's patch matrix is stored at a chosen precision. All three return the
+exact-MaxSim ranking on this set except int8, which is within ~2%:
 
-- **Resident exact scan** (default for unfiltered queries within a memory budget):
-  skips candidate generation and read-back entirely -- ~110 ms -> ~1.5 ms, and
-  exact (recall 0.73 -> 1.0). One-time build cost is reported as
-  `resident_build_seconds`.
-- The two-stage **indexed** path (used for filtered queries, or corpora over the
-  resident budget) was also sped up ~2x by dropping a redundant patch-row filter
-  and batching the candidate read.
+| storage | on-disk | ingest | query | recall@10 |
+|---|---:|---:|---:|---:|
+| float32 | 35 MB | 0.67 s | 1.9 ms | 1.000 |
+| **float16** (default) | **18 MB** | 0.48 s | 3.6 ms | 1.000 |
+| int8 | 9 MB | 0.37 s | 2.7 ms | 0.984 |
 
-## What's left for stage 3
+### How it got here
 
-Query latency is handled. The remaining lever is **footprint**: the index is
-~400x the single-vector store (one row per patch plus the full-precision sidecar
-the exact scan reads back), and the resident matrix is full-precision in memory.
-Native quantized multi-vector storage in the TurboVec core (plus patch pooling on
-the encoder side) is what would shrink both, and would extend the fast exact path
-to corpora past the resident budget. The native MaxSim kernel for scoring is
-already in the core (`scoring="native"`).
+The first prototype stored one engine row per patch and ran a two-stage
+quantized-candidate-then-rescore query: ~110 ms/query at recall 0.73, and ~127 MB
+on disk. A per-stage profile showed scoring was ~1% of the query; candidate
+generation (~61%) and patch read-back (~38%) dominated. Three changes removed all
+of it:
+
+- **Resident exact scan** (default, unfiltered, within `resident_max_bytes`):
+  scores the whole corpus from one in-memory matrix -- no candidate scan, no
+  read-back. ~110 ms -> a few ms, recall 0.73 -> 1.0.
+- **One row per document** (the whole patch matrix in a single row): 39-54x faster
+  ingest and far fewer rows; filtered queries score the matching subset
+  exhaustively, and corpora over the resident budget stream from disk (exact,
+  constant memory).
+- **Reduced-precision storage** (float16 default, int8 optional): 7-14x smaller on
+  disk and 2x more pages resident in RAM, at recall 1.0 (float16) / ~0.98 (int8).
 
 All output is metrics-only: counts, bytes, latency, recall; never vectors.

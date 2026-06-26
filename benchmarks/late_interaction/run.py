@@ -11,8 +11,9 @@ measures storage and scan behaviour, not an encoder. Ground truth is the exact
 brute-force MaxSim top-k over every document's full-precision patches -- the
 metric ColPali / ColQwen optimise -- and both indexes are scored against it:
 
-- late interaction: ``LodeLateInteractionIndex`` (quantized any-patch candidate
-  scan + exact MaxSim rescore over the candidate set);
+- late interaction: ``LodeLateInteractionIndex`` (one row per document, exact
+  MaxSim over the resident patch matrix; ``--storage`` selects float16 / float32 /
+  int8 precision);
 - single vector: each page mean-pooled to one unit vector in a plain vector-only
   ``LodeDB``, the cheap baseline late interaction is meant to beat.
 
@@ -184,12 +185,15 @@ def run(args: argparse.Namespace) -> dict:
     sv_path = workdir / "single_vector"
     try:
         # -- late-interaction index ----------------------------------------
-        li = LodeLateInteractionIndex(
-            li_path, dim=dim, candidate_depth=args.candidate_depth
-        )
+        li = LodeLateInteractionIndex(li_path, dim=dim, storage=args.storage)
         t0 = time.perf_counter()
-        for doc_id, matrix in zip(doc_ids, matrices, strict=True):
-            li.add_document(doc_id, matrix, normalize=False)
+        li.add_documents(
+            [
+                {"id": doc_id, "patches": matrix}
+                for doc_id, matrix in zip(doc_ids, matrices, strict=True)
+            ],
+            normalize=False,
+        )
         li.persist()
         li_ingest = time.perf_counter() - t0
         li_bytes = _dir_bytes(li_path)
@@ -243,10 +247,11 @@ def run(args: argparse.Namespace) -> dict:
                 "query_tokens": args.query_tokens,
                 "queries": args.queries,
                 "k": args.k,
-                "candidate_depth": args.candidate_depth,
+                "storage": args.storage,
                 "seed": args.seed,
             },
             "late_interaction": {
+                "storage": args.storage,
                 "ingest_seconds": round(li_ingest, 3),
                 "patch_rows": li.patch_count(),
                 "disk_bytes": li_bytes,
@@ -280,7 +285,12 @@ def main() -> None:
     parser.add_argument("--query-tokens", type=int, default=8)
     parser.add_argument("--queries", type=int, default=200)
     parser.add_argument("--k", type=int, default=10)
-    parser.add_argument("--candidate-depth", type=int, default=16)
+    parser.add_argument(
+        "--storage",
+        choices=("float16", "float32", "int8"),
+        default="float16",
+        help="patch-matrix storage precision",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--out",

@@ -1,11 +1,11 @@
-"""Tests for late-interaction (multi-vector / MaxSim) retrieval -- issue #25, stage 1.
+"""Tests for late-interaction (multi-vector / MaxSim) retrieval -- issue #25.
 
 These run fully offline: documents and queries are supplied as precomputed patch
 matrices (a deterministic fake encoder stands in for ColPali on the
-encoder-convenience path), so no model is downloaded. They exercise the storage
-layout (one row per patch with a parent_id), the two-stage exact-MaxSim
-retrieval, durability across reopen, metadata filtering, and the read-only /
-validation contracts.
+encoder-convenience path), so no model is downloaded. They exercise the
+one-row-per-document storage layout, the float16/float32/int8 precisions, the
+exact-MaxSim retrieval paths (resident, filtered, streaming), durability across
+reopen, metadata filtering, and the read-only / validation contracts.
 
 The patch dimension is a multiple of 8 because the TurboVec store requires it.
 """
@@ -34,11 +34,12 @@ def _onehot_matrix(indices: list[int], *, dim: int = DIM) -> list[list[float]]:
     return rows
 
 
-def test_add_document_stores_one_row_per_patch(tmp_path):
+def test_count_and_patch_count(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     idx.add_document("doc-a", _onehot_matrix([0, 1, 2]), metadata={"file": "a.pdf"})
-    assert idx.count() == 1
-    assert idx.patch_count() == 3
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))
+    assert idx.count() == 2  # two documents (one row each)
+    assert idx.patch_count() == 5  # total patches across documents
 
 
 def test_maxsim_ranks_best_overlap_first(tmp_path):
@@ -107,9 +108,9 @@ def test_remove_drops_all_patches(tmp_path):
     assert idx.remove("doc-a") is False  # already gone
 
 
-def test_resident_and_indexed_paths_agree(tmp_path):
-    # The resident exact scan (default) and the indexed two-stage path must return
-    # the same ranking and scores.
+def test_resident_and_streaming_paths_agree(tmp_path):
+    # The resident exact scan (default) and the disk-streaming path must return the
+    # same ranking and scores (both exhaustive, same stored precision).
     rng = np.random.default_rng(7)
     docs = []
     for i in range(40):
@@ -117,23 +118,21 @@ def test_resident_and_indexed_paths_agree(tmp_path):
         m /= np.linalg.norm(m, axis=1, keepdims=True)
         docs.append((f"d{i:03d}", m))
     res_idx = LodeLateInteractionIndex(tmp_path / "res", dim=DIM, resident=True)
-    idx_idx = LodeLateInteractionIndex(
-        tmp_path / "idx", dim=DIM, resident=False, candidate_depth=64
-    )
-    for store in (res_idx, idx_idx):
+    stream_idx = LodeLateInteractionIndex(tmp_path / "stream", dim=DIM, resident=False)
+    for store in (res_idx, stream_idx):
         for doc_id, m in docs:
             store.add_document(doc_id, m, normalize=False)
     q = rng.standard_normal((5, DIM)).astype(np.float32)
     q /= np.linalg.norm(q, axis=1, keepdims=True)
     res_hits = res_idx.search(q, k=10, normalize=False)
-    idx_hits = idx_idx.search(q, k=10, normalize=False)
-    assert [h.id for h in res_hits] == [h.id for h in idx_hits]
-    for a, b in zip(res_hits, idx_hits, strict=True):
+    stream_hits = stream_idx.search(q, k=10, normalize=False)
+    assert [h.id for h in res_hits] == [h.id for h in stream_hits]
+    for a, b in zip(res_hits, stream_hits, strict=True):
         assert a.score == pytest.approx(b.score, abs=1e-4)
 
 
-def test_resident_budget_falls_back_to_indexed(tmp_path):
-    # A tiny resident budget under "auto" forces the indexed path, still correct.
+def test_resident_budget_falls_back_to_streaming(tmp_path):
+    # A tiny resident budget under "auto" forces the streaming path, still correct.
     idx = LodeLateInteractionIndex(
         tmp_path, dim=DIM, resident="auto", resident_max_bytes=1
     )
@@ -204,13 +203,13 @@ def test_dimension_mismatch_is_rejected(tmp_path):
 def test_reserved_metadata_key_rejected(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     with pytest.raises(ValueError, match="reserved"):
-        idx.add_document("doc-a", _onehot_matrix([0]), metadata={"parent_id": "x"})
+        idx.add_document("doc-a", _onehot_matrix([0]), metadata={"patch_count": "x"})
 
 
-def test_doc_id_with_separator_rejected(tmp_path):
+def test_empty_doc_id_rejected(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     with pytest.raises(ValueError):
-        idx.add_document("doc#a", _onehot_matrix([0]))
+        idx.add_document("  ", _onehot_matrix([0]))
 
 
 def test_read_only_rejects_writes(tmp_path):
@@ -305,6 +304,69 @@ def test_native_scoring_matches_numpy_end_to_end(tmp_path):
 def test_invalid_scoring_rejected(tmp_path):
     with pytest.raises(ValueError):
         LodeLateInteractionIndex(tmp_path, dim=DIM, scoring="bogus")
+
+
+def test_invalid_storage_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        LodeLateInteractionIndex(tmp_path, dim=DIM, storage="bogus")
+
+
+@pytest.mark.parametrize("storage", ["float32", "float16", "int8"])
+def test_storage_roundtrip_and_reopen(tmp_path, storage):
+    # Each precision stores, retrieves, and reopens correctly. One-hot vectors are
+    # represented exactly by every precision, so ranking is unambiguous.
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, storage=storage)
+    idx.add_document("doc-a", _onehot_matrix([0, 1, 2]), metadata={"file": "a.pdf"})
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))
+    assert idx.count() == 2
+    assert idx.patch_count() == 5
+    hits = idx.search(_onehot_matrix([0, 1]), k=2)
+    assert hits[0].id == "doc-a"
+    assert hits[0].score == pytest.approx(2.0, abs=1e-2)
+    idx.persist()
+    idx.close()
+
+    # Reopen without specifying storage: each document records its own precision.
+    reopened = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert reopened.count() == 2
+    assert reopened.search(_onehot_matrix([5]), k=1)[0].id == "doc-b"
+    assert reopened.list_documents()[0] == {
+        "id": "doc-a",
+        "metadata": {"file": "a.pdf"},
+        "patch_count": 3,
+    }
+
+
+def test_storage_precision_recall_on_random_vectors(tmp_path):
+    # float16 should match the float32 ranking; int8 should be close.
+    rng = np.random.default_rng(11)
+    docs = []
+    for i in range(60):
+        m = rng.standard_normal((8, DIM)).astype(np.float32)
+        m /= np.linalg.norm(m, axis=1, keepdims=True)
+        docs.append((f"d{i:03d}", m))
+    queries = []
+    for _ in range(30):
+        q = rng.standard_normal((5, DIM)).astype(np.float32)
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        queries.append(q)
+
+    def ranking(storage):
+        idx = LodeLateInteractionIndex(tmp_path / storage, dim=DIM, storage=storage)
+        for doc_id, m in docs:
+            idx.add_document(doc_id, m, normalize=False)
+        return [[h.id for h in idx.search(q, k=5, normalize=False)] for q in queries]
+
+    truth = ranking("float32")
+
+    def recall_at_5(pred):
+        hits = sum(
+            len(set(p) & set(t)) / len(t) for p, t in zip(pred, truth, strict=True)
+        )
+        return hits / len(truth)
+
+    assert recall_at_5(ranking("float16")) == pytest.approx(1.0, abs=1e-6)
+    assert recall_at_5(ranking("int8")) >= 0.9
 
 
 class _FakeColPali:
