@@ -1,0 +1,822 @@
+{
+  "chunk_token_case": {
+    "documents": [
+      {
+        "chunk_ids": [
+          "a#0",
+          "a#1"
+        ],
+        "document_id": "doc-a",
+        "token_lists": [
+          [
+            "alpha",
+            "beta"
+          ],
+          [
+            "gamma"
+          ],
+          [
+            "extra"
+          ]
+        ]
+      },
+      {
+        "chunk_ids": [
+          "b#0"
+        ],
+        "document_id": "doc-b",
+        "token_lists": [
+          [
+            "delta"
+          ]
+        ]
+      },
+      {
+        "chunk_ids": [],
+        "document_id": "doc-empty",
+        "token_lists": []
+      }
+    ],
+    "expected": {
+      "chunk_ids": [
+        "a#0",
+        "a#1",
+        "b#0"
+      ],
+      "group_ids": [
+        "doc-a",
+        "doc-a",
+        "doc-b"
+      ],
+      "token_lists": [
+        [
+          "alpha",
+          "beta"
+        ],
+        [
+          "gamma"
+        ],
+        [
+          "delta"
+        ]
+      ]
+    }
+  },
+  "corpora": [
+    {
+      "name": "fixed",
+      "units": [
+        {
+          "group": "doc-a",
+          "id": "u1",
+          "text": "the turbine reported fault code e1234 overnight"
+        },
+        {
+          "group": "doc-b",
+          "id": "u2",
+          "text": "quick brown foxes and lazy dogs at noon"
+        },
+        {
+          "group": "doc-c",
+          "id": "u3",
+          "text": "quarterly revenue and operating costs with e1234"
+        },
+        {
+          "group": "doc-d",
+          "id": "u4",
+          "text": "common token common token rare token"
+        },
+        {
+          "group": "doc-e",
+          "id": "u5",
+          "text": "another e1234 mention for good measure here"
+        }
+      ]
+    },
+    {
+      "name": "random",
+      "units": [
+        {
+          "group": "g0",
+          "id": "r00",
+          "text": "epsilon epsilon delta beta beta epsilon common e1234 epsilon e1234"
+        },
+        {
+          "group": "g1",
+          "id": "r01",
+          "text": "gamma delta delta rare beta token beta token abc-123"
+        },
+        {
+          "group": "g2",
+          "id": "r02",
+          "text": "alpha rare e1234 alpha rare epsilon gamma token e1234"
+        },
+        {
+          "group": "g3",
+          "id": "r03",
+          "text": "common gamma beta abc-123 epsilon alpha"
+        },
+        {
+          "group": "g0",
+          "id": "r04",
+          "text": "gamma rare gamma epsilon"
+        },
+        {
+          "group": "g1",
+          "id": "r05",
+          "text": "gamma alpha rare"
+        },
+        {
+          "group": "g2",
+          "id": "r06",
+          "text": "e1234 token token abc-123 beta"
+        },
+        {
+          "group": "g3",
+          "id": "r07",
+          "text": "rare rare e1234 alpha e1234 gamma epsilon"
+        },
+        {
+          "group": "g0",
+          "id": "r08",
+          "text": "rare e1234 common alpha common"
+        },
+        {
+          "group": "g1",
+          "id": "r09",
+          "text": "gamma delta rare common beta e1234"
+        },
+        {
+          "group": "g2",
+          "id": "r10",
+          "text": "alpha abc-123 e1234 beta epsilon epsilon common beta"
+        },
+        {
+          "group": "g3",
+          "id": "r11",
+          "text": "rare rare epsilon common beta token alpha"
+        },
+        {
+          "group": "g0",
+          "id": "r12",
+          "text": "delta rare common common beta alpha token"
+        },
+        {
+          "group": "g1",
+          "id": "r13",
+          "text": "e1234 delta epsilon"
+        },
+        {
+          "group": "g2",
+          "id": "r14",
+          "text": "alpha common abc-123 abc-123"
+        },
+        {
+          "group": "g3",
+          "id": "r15",
+          "text": "alpha gamma e1234 alpha token delta delta abc-123 delta e1234"
+        }
+      ]
+    }
+  ],
+  "incremental_case": {
+    "base": [
+      {
+        "group": "docA",
+        "id": "a#0",
+        "text": "alpha beta gamma"
+      },
+      {
+        "group": "docA",
+        "id": "a#1",
+        "text": "alpha alpha delta"
+      },
+      {
+        "group": "docB",
+        "id": "b#0",
+        "text": "gamma e1234 note"
+      },
+      {
+        "group": "docB",
+        "id": "b#1",
+        "text": "delta delta beta"
+      },
+      {
+        "group": "docC",
+        "id": "c#0",
+        "text": "epsilon only here"
+      },
+      {
+        "group": "docC",
+        "id": "c#1",
+        "text": "abc-123 serial line"
+      }
+    ],
+    "ranks": {
+      "abc-123": [
+        [
+          "c#1",
+          1.304211142369
+        ]
+      ],
+      "alpha": [
+        [
+          "a#7",
+          1.530811533901
+        ]
+      ],
+      "beta": [
+        [
+          "a#8",
+          1.304211142369
+        ]
+      ],
+      "delta": [
+        [
+          "a#9",
+          1.530811533901
+        ]
+      ],
+      "e1234": [
+        [
+          "a#8",
+          1.304211142369
+        ]
+      ],
+      "epsilon": [
+        [
+          "a#9",
+          0.966733818082
+        ],
+        [
+          "c#0",
+          0.823631772642
+        ]
+      ],
+      "gamma": [
+        [
+          "a#8",
+          1.304211142369
+        ]
+      ]
+    },
+    "remove_group": "docB",
+    "replacement_group": "docA",
+    "replacement_units": [
+      [
+        "a#7",
+        [
+          "alpha",
+          "rewritten"
+        ]
+      ],
+      [
+        "a#8",
+        [
+          "beta",
+          "gamma",
+          "e1234"
+        ]
+      ],
+      [
+        "a#9",
+        [
+          "delta",
+          "epsilon"
+        ]
+      ]
+    ],
+    "unit_ids": [
+      "a#7",
+      "a#8",
+      "a#9",
+      "c#0",
+      "c#1"
+    ]
+  },
+  "rank_cases": [
+    {
+      "name": "e1234",
+      "query": "e1234",
+      "rank": [
+        [
+          "u1",
+          0.538996500733
+        ],
+        [
+          "u3",
+          0.538996500733
+        ],
+        [
+          "u5",
+          0.538996500733
+        ]
+      ]
+    },
+    {
+      "name": "e1234 revenue",
+      "query": "e1234 revenue",
+      "rank": [
+        [
+          "u3",
+          1.925290861853
+        ],
+        [
+          "u1",
+          0.538996500733
+        ],
+        [
+          "u5",
+          0.538996500733
+        ]
+      ]
+    },
+    {
+      "name": "common rare",
+      "query": "common rare",
+      "rank": [
+        [
+          "u4",
+          3.458287488831
+        ]
+      ]
+    },
+    {
+      "name": "foxes",
+      "query": "foxes",
+      "rank": [
+        [
+          "u2",
+          1.30975050069
+        ]
+      ]
+    },
+    {
+      "name": "turbine",
+      "query": "turbine",
+      "rank": [
+        [
+          "u1",
+          1.38629436112
+        ]
+      ]
+    },
+    {
+      "name": "zzz",
+      "query": "zzz",
+      "rank": []
+    },
+    {
+      "allowed_unit_ids": [
+        "u3",
+        "u5"
+      ],
+      "name": "allowed_e1234",
+      "query": "e1234",
+      "rank": [
+        [
+          "u3",
+          0.538996500733
+        ],
+        [
+          "u5",
+          0.538996500733
+        ]
+      ]
+    },
+    {
+      "limit": 2,
+      "name": "limit_2",
+      "query": "e1234",
+      "rank": [
+        [
+          "u1",
+          0.538996500733
+        ],
+        [
+          "u3",
+          0.538996500733
+        ]
+      ]
+    },
+    {
+      "corpus": "random",
+      "name": "random_alpha e1234",
+      "query": "alpha e1234",
+      "rank": [
+        [
+          "r02",
+          1.315404816856
+        ],
+        [
+          "r15",
+          1.265675677022
+        ],
+        [
+          "r07",
+          1.24615890891
+        ],
+        [
+          "r08",
+          1.17070389844
+        ],
+        [
+          "r10",
+          0.967675362059
+        ],
+        [
+          "r13",
+          0.744570424613
+        ],
+        [
+          "r00",
+          0.692378168542
+        ],
+        [
+          "r06",
+          0.640424585716
+        ],
+        [
+          "r05",
+          0.616513328571
+        ],
+        [
+          "r09",
+          0.598562969582
+        ],
+        [
+          "r14",
+          0.570154101775
+        ],
+        [
+          "r03",
+          0.495617387607
+        ],
+        [
+          "r11",
+          0.465208821857
+        ],
+        [
+          "r12",
+          0.465208821857
+        ]
+      ]
+    },
+    {
+      "corpus": "random",
+      "name": "random_rare token",
+      "query": "rare token",
+      "rank": [
+        [
+          "r11",
+          1.70918089437
+        ],
+        [
+          "r01",
+          1.689275031284
+        ],
+        [
+          "r02",
+          1.546359230515
+        ],
+        [
+          "r12",
+          1.490068993081
+        ],
+        [
+          "r06",
+          1.410526192795
+        ],
+        [
+          "r15",
+          0.783935841948
+        ],
+        [
+          "r07",
+          0.780950087053
+        ],
+        [
+          "r05",
+          0.744570424613
+        ],
+        [
+          "r04",
+          0.688581839159
+        ],
+        [
+          "r08",
+          0.640424585716
+        ],
+        [
+          "r09",
+          0.598562969582
+        ]
+      ]
+    },
+    {
+      "corpus": "random",
+      "name": "random_abc-123 gamma",
+      "query": "abc-123 gamma",
+      "rank": [
+        [
+          "r03",
+          1.701874360382
+        ],
+        [
+          "r14",
+          1.479495894582
+        ],
+        [
+          "r01",
+          1.422857387446
+        ],
+        [
+          "r15",
+          1.349128901015
+        ],
+        [
+          "r04",
+          1.066669956638
+        ],
+        [
+          "r06",
+          1.058065908097
+        ],
+        [
+          "r05",
+          0.886883970157
+        ],
+        [
+          "r10",
+          0.874571539451
+        ],
+        [
+          "r09",
+          0.712969365024
+        ],
+        [
+          "r07",
+          0.669225185832
+        ],
+        [
+          "r02",
+          0.596080269886
+        ]
+      ]
+    },
+    {
+      "corpus": "random",
+      "name": "random_epsilon missing",
+      "query": "epsilon missing",
+      "rank": [
+        [
+          "r00",
+          1.070486632236
+        ],
+        [
+          "r10",
+          0.89217353658
+        ],
+        [
+          "r13",
+          0.886883970157
+        ],
+        [
+          "r04",
+          0.8201940006
+        ],
+        [
+          "r03",
+          0.712969365024
+        ],
+        [
+          "r07",
+          0.669225185832
+        ],
+        [
+          "r11",
+          0.669225185832
+        ],
+        [
+          "r02",
+          0.596080269886
+        ]
+      ]
+    }
+  ],
+  "rrf_cases": [
+    {
+      "c": 60,
+      "fused": [
+        [
+          "B",
+          0.032522474881
+        ],
+        [
+          "C",
+          0.032002048131
+        ],
+        [
+          "A",
+          0.016393442623
+        ],
+        [
+          "D",
+          0.015873015873
+        ]
+      ],
+      "name": "worked",
+      "rankings": [
+        [
+          "A",
+          "B",
+          "C"
+        ],
+        [
+          "B",
+          "C",
+          "D"
+        ]
+      ]
+    },
+    {
+      "c": 60,
+      "fused": [
+        [
+          "A",
+          0.016393442623
+        ],
+        [
+          "B",
+          0.015873015873
+        ]
+      ],
+      "name": "dedupe",
+      "rankings": [
+        [
+          "A",
+          "A",
+          "B"
+        ]
+      ]
+    },
+    {
+      "c": 60,
+      "fused": [
+        [
+          "a",
+          0.016393442623
+        ],
+        [
+          "b",
+          0.016393442623
+        ]
+      ],
+      "name": "tie",
+      "rankings": [
+        [
+          "b"
+        ],
+        [
+          "a"
+        ]
+      ]
+    },
+    {
+      "c": 60,
+      "fused": [
+        [
+          "B",
+          0.081967213115
+        ],
+        [
+          "A",
+          0.016393442623
+        ]
+      ],
+      "name": "weighted",
+      "rankings": [
+        [
+          "A"
+        ],
+        [
+          "B"
+        ]
+      ],
+      "weights": [
+        1.0,
+        5.0
+      ]
+    }
+  ],
+  "token_cases": [
+    {
+      "text": "The Quick Brown Fox",
+      "tokens": [
+        "the",
+        "quick",
+        "brown",
+        "fox"
+      ]
+    },
+    {
+      "text": "fault code E1234 reported",
+      "tokens": [
+        "fault",
+        "code",
+        "e1234",
+        "reported"
+      ]
+    },
+    {
+      "text": "the failure was E1234.",
+      "tokens": [
+        "the",
+        "failure",
+        "was",
+        "e1234"
+      ]
+    },
+    {
+      "text": "(E1234)",
+      "tokens": [
+        "e1234"
+      ]
+    },
+    {
+      "text": "serial ABC-123 shipped",
+      "tokens": [
+        "serial",
+        "abc-123",
+        "shipped"
+      ]
+    },
+    {
+      "text": "part ABC-123-X",
+      "tokens": [
+        "part",
+        "abc-123-x"
+      ]
+    },
+    {
+      "text": "logged on 2024-01-15 today",
+      "tokens": [
+        "logged",
+        "on",
+        "2024-01-15",
+        "today"
+      ]
+    },
+    {
+      "text": "upgrade to v1.2.3",
+      "tokens": [
+        "upgrade",
+        "to",
+        "v1.2.3"
+      ]
+    },
+    {
+      "text": "ratio a/b here",
+      "tokens": [
+        "ratio",
+        "a/b",
+        "here"
+      ]
+    },
+    {
+      "text": "a--b",
+      "tokens": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "text": "-E1234-",
+      "tokens": [
+        "e1234"
+      ]
+    },
+    {
+      "text": "x... y",
+      "tokens": [
+        "x",
+        "y"
+      ]
+    },
+    {
+      "text": "/var/log/app.log moved",
+      "tokens": [
+        "var/log/app.log",
+        "moved"
+      ]
+    },
+    {
+      "text": "",
+      "tokens": []
+    },
+    {
+      "text": "!!! ??? ...",
+      "tokens": []
+    }
+  ]
+}

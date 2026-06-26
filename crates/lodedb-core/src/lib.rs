@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod filter;
+pub mod lexical;
 pub mod text;
 pub mod types;
 pub mod vector;
