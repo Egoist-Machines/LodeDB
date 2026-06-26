@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import base64
 import importlib
+import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,14 @@ _RESERVED_METADATA_KEYS = frozenset({_PATCH_COUNT_KEY, _DTYPE_KEY})
 
 # Supported patch-matrix storage precisions.
 _STORAGE_CHOICES = ("float16", "float32", "int8")
+# Default precision for a brand-new index when the caller does not choose one.
+_DEFAULT_STORAGE = "float16"
+# Index-level config sidecar (precision the index was created with), so the
+# choice persists and is reused on reopen without re-passing ``storage=``. The
+# extension deliberately avoids ``.json`` so the engine's ``*.json`` index scan
+# never mistakes it for persisted engine state; the contents are still JSON.
+_CONFIG_FILENAME = "lodedb_late_interaction.meta"
+_CONFIG_VERSION = 1
 
 # Cap the transient float32 work buffer when scoring a resident or streamed scan,
 # so peak memory stays bounded regardless of corpus size.
@@ -191,7 +200,7 @@ class LodeLateInteractionIndex:
         dim: int,
         encoder: Any | None = None,
         bit_width: int = 4,
-        storage: str = "float16",
+        storage: str | None = None,
         candidate_depth: int = 16,
         scoring: str = "numpy",
         resident: bool | str = "auto",
@@ -210,11 +219,14 @@ class LodeLateInteractionIndex:
         :meth:`add_texts` / :meth:`search_text` and is never required for the
         precomputed-matrix API.
 
-        ``storage`` is the patch-matrix precision: ``"float16"`` (default,
-        near-exact at half the size of float32), ``"float32"`` (bit exact), or
-        ``"int8"`` (per-vector-scaled, ~4x smaller, a small recall cost). Each
-        document records the precision it was written at, so reopening decodes
-        correctly regardless of this argument. ``resident`` controls the default
+        ``storage`` is the patch-matrix precision and is **persisted with the
+        index**: ``"float16"`` (default for a new index, near-exact at half the
+        size of float32), ``"float32"`` (bit exact), or ``"int8"``
+        (per-vector-scaled, ~4x smaller, a small recall cost). Leave it ``None`` to
+        adopt the precision the index was created with (or float16 for a new
+        index); passing a value that disagrees with the stored one raises
+        :class:`ValueError`, so an index keeps a single precision. ``resident``
+        controls the default
         fast path: ``"auto"`` (default) holds the corpus in memory and scans it
         exactly for unfiltered queries when it fits ``resident_max_bytes`` (default
         512 MB), and streams from disk otherwise; ``True`` always builds the
@@ -231,7 +243,7 @@ class LodeLateInteractionIndex:
 
         if int(dim) <= 0:
             raise ValueError("dim must be a positive integer")
-        if storage not in _STORAGE_CHOICES:
+        if storage is not None and storage not in _STORAGE_CHOICES:
             raise ValueError(f"storage must be one of {_STORAGE_CHOICES}")
         if scoring not in ("numpy", "native"):
             raise ValueError("scoring must be 'numpy' or 'native'")
@@ -243,7 +255,6 @@ class LodeLateInteractionIndex:
                 "store_text must remain True"
             )
         self.dim = int(dim)
-        self.storage = storage
         self.scoring = scoring
         self.resident = resident
         self.resident_max_bytes = int(resident_max_bytes)
@@ -262,6 +273,30 @@ class LodeLateInteractionIndex:
             read_only=self.read_only,
             **lodedb_kwargs,
         )
+        # Resolve the storage precision against any value persisted with the index,
+        # so the choice survives reopen and stays consistent across writes.
+        self.storage = self._resolve_storage(storage)
+
+    def _resolve_storage(self, requested: str | None) -> str:
+        """Reconciles a requested precision with the one persisted in the index.
+
+        Reads the index's config sidecar; a requested value that disagrees with a
+        stored one is rejected so the index keeps a single precision. The resolved
+        precision is written back (on a writable handle) so an index created
+        empty, or with an explicit choice, remembers it on reopen.
+        """
+
+        config_path = Path(self._db.path) / _CONFIG_FILENAME
+        stored = _read_li_config(config_path)
+        if requested is not None and stored is not None and requested != stored:
+            raise ValueError(
+                f"this index was created with storage={stored!r}; reopen with "
+                f"storage={stored!r} or omit it (got storage={requested!r})"
+            )
+        resolved = requested or stored or _DEFAULT_STORAGE
+        if not self.read_only and stored != resolved:
+            _write_li_config(config_path, resolved)
+        return resolved
 
     # -- write path ---------------------------------------------------------
 
@@ -706,6 +741,34 @@ class LodeLateInteractionIndex:
 
 
 # -- module helpers ---------------------------------------------------------
+
+
+def _read_li_config(config_path: Path) -> str | None:
+    """Returns the index's persisted storage precision, or ``None`` if unset.
+
+    Tolerates a missing or unreadable sidecar (treated as "no stored precision")
+    so a path created without one still opens.
+    """
+
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    storage = data.get("storage") if isinstance(data, Mapping) else None
+    return storage if storage in _STORAGE_CHOICES else None
+
+
+def _write_li_config(config_path: Path, storage: str) -> None:
+    """Persists the index's storage precision to its config sidecar."""
+
+    config_path.write_text(
+        json.dumps({"version": _CONFIG_VERSION, "storage": storage}),
+        encoding="utf-8",
+    )
 
 
 def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:

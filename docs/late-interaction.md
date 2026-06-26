@@ -80,14 +80,27 @@ read-back ~38%, scoring ~1%). The resident scan removes both dominant costs.
 
 ## Storage precision
 
-Each document's patch matrix is stored at a precision chosen with `storage=`;
-every document records its own precision, so reopening decodes correctly.
+Each document's patch matrix is stored at a precision chosen with `storage=`.
 
 | storage | size vs float32 | recall | notes |
 |---|---|---|---|
 | `"float32"` | 1x | exact | bit-exact; fastest query |
 | `"float16"` (default) | 0.5x | ~exact (1.0 in the benchmark) | half the disk and RAM |
 | `"int8"` | 0.25x | ~0.98 | per-vector-scaled; smallest |
+
+The precision is **persisted with the index** (in a small `lodedb_late_interaction.meta`
+sidecar), so you set it once at creation and reopen without re-passing it:
+
+```python
+LodeLateInteractionIndex("./pages", dim=128, storage="int8")  # create as int8
+...
+LodeLateInteractionIndex("./pages", dim=128)                  # reopens as int8
+```
+
+Leave `storage=None` (the default) to adopt the index's stored precision, or
+float16 for a brand-new index. Passing a value that disagrees with the stored one
+raises `ValueError`, so an index keeps a single precision; every document also
+records its own precision, so decoding is always correct.
 
 Combined with the one-row-per-document layout, float16 is ~7x smaller on disk than
 the original one-row-per-patch float32 prototype and keeps 2x more pages resident

@@ -337,6 +337,43 @@ def test_storage_roundtrip_and_reopen(tmp_path, storage):
     }
 
 
+def test_storage_persists_across_reopen(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, storage="int8")
+    assert idx.storage == "int8"
+    idx.add_document("doc-a", _onehot_matrix([0, 1]))
+    idx.persist()
+    idx.close()
+
+    # Reopen without specifying storage: it adopts the persisted precision.
+    reopened = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert reopened.storage == "int8"
+
+
+def test_new_index_defaults_to_float16(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert idx.storage == "float16"
+    idx.close()
+    assert LodeLateInteractionIndex(tmp_path, dim=DIM).storage == "float16"
+
+
+def test_conflicting_storage_on_reopen_rejected(tmp_path):
+    LodeLateInteractionIndex(tmp_path, dim=DIM, storage="float32").close()
+    with pytest.raises(ValueError, match="created with storage"):
+        LodeLateInteractionIndex(tmp_path, dim=DIM, storage="int8")
+    # Matching the stored precision is fine.
+    assert LodeLateInteractionIndex(tmp_path, dim=DIM, storage="float32").storage == "float32"
+
+
+def test_read_only_reopen_adopts_persisted_storage(tmp_path):
+    writer = LodeLateInteractionIndex(tmp_path, dim=DIM, storage="int8")
+    writer.add_document("doc-a", _onehot_matrix([0, 1]))
+    writer.persist()
+    writer.close()
+    reader = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    assert reader.storage == "int8"
+    assert reader.search(_onehot_matrix([0]), k=1)[0].id == "doc-a"
+
+
 def test_storage_precision_recall_on_random_vectors(tmp_path):
     # float16 should match the float32 ranking; int8 should be close.
     rng = np.random.default_rng(11)
