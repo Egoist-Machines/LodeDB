@@ -193,6 +193,67 @@ def test_native_core_extension_opens_readonly_persisted_vector_fixture(tmp_path)
     assert hits["hits"][0]["document_id"] == "vec-alpha"
 
 
+def test_native_core_extension_written_vector_store_opens_in_python(tmp_path) -> None:
+    from lodedb import LodeDB
+
+    index_key = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205"
+    options = {
+        "path": str(tmp_path),
+        "read_only": False,
+        "durability": "relaxed",
+        "commit_mode": "generation",
+        "store_text": True,
+        "index_text": False,
+    }
+    engine = native_core.CoreEngine.open(json.dumps(options))
+    engine.create_index_with_options(
+        json.dumps(
+            {
+                "index_id": "default",
+                "index_key": index_key,
+                "client_id_hash": index_key,
+                "name": "lodedb-local",
+                "model": "external",
+                "provider": "external",
+                "task": "vector-only",
+                "route_profile": "vector-only",
+                "storage_profile": "turbovec_direct",
+                "vector_dim": 8,
+                "bit_width": 4,
+            }
+        )
+    )
+    mutation = _loads(
+        engine.upsert_vectors(
+            "default",
+            json.dumps(
+                [
+                    {
+                        "document_id": "native-a",
+                        "vector": _onehot(0),
+                        "metadata": {"kind": "native"},
+                        "text": "Native retained text.",
+                    },
+                    {
+                        "document_id": "native-b",
+                        "vector": _onehot(1),
+                        "metadata": {"kind": "native"},
+                        "text": None,
+                    },
+                ]
+            ),
+        )
+    )
+    assert mutation["documents_upserted"] == 2
+    engine.persist()
+    engine.close()
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    hit = db.search_by_vector(_onehot(1), k=1)[0]
+    assert hit.id == "native-b"
+    assert db.get("native-a") == "Native retained text."
+
+
 def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) -> None:
     module = importlib.import_module("lodedb._native_core")
     monkeypatch.setattr("importlib.import_module", lambda name: module)
