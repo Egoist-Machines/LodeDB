@@ -1,6 +1,8 @@
-//! In-memory native core engine.
+//! Native core engine.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,8 +13,8 @@ use crate::lexical::tokenize;
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
-    CoreDocument, CoreMetadata, CoreMutationResult, CoreSearchHit, CoreSearchResults,
-    CoreVectorDocument,
+    CoreDocument, CoreMetadata, CoreMutationResult, CoreOpenOptions, CoreSearchHit,
+    CoreSearchResults, CoreVectorDocument,
 };
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 
@@ -21,12 +23,57 @@ use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 pub struct CoreEngine {
     indexes: BTreeMap<String, VectorOnlyIndex>,
     next_plan_id: u64,
+    persistence: Option<PersistenceState>,
 }
 
 impl CoreEngine {
     /// Creates an empty in-memory engine. No files are read or written.
     pub fn new_in_memory() -> Self {
         Self::default()
+    }
+
+    /// Opens a writable persistent engine and replays WAL tails when requested.
+    pub fn open(options: CoreOpenOptions) -> Result<Self, CoreError> {
+        let path = PathBuf::from(&options.path);
+        fs::create_dir_all(&path).map_err(core_io_error)?;
+        let lock = PersistentLock::acquire(&path)?;
+        let mut engine = Self {
+            indexes: BTreeMap::new(),
+            next_plan_id: 0,
+            persistence: Some(PersistenceState {
+                path,
+                read_only: false,
+                fsync: options.durability == "fsync",
+                store_text: options.store_text,
+                index_text: options.index_text,
+                _lock: Some(lock),
+            }),
+        };
+        engine.load_persisted_indexes(options.commit_mode == "wal")?;
+        Ok(engine)
+    }
+
+    /// Opens a lock-free read-only generation snapshot. WAL tails are ignored.
+    pub fn open_readonly(
+        path: impl AsRef<Path>,
+        mut options: CoreOpenOptions,
+    ) -> Result<Self, CoreError> {
+        options.path = path.as_ref().to_string_lossy().to_string();
+        options.read_only = true;
+        let mut engine = Self {
+            indexes: BTreeMap::new(),
+            next_plan_id: 0,
+            persistence: Some(PersistenceState {
+                path: path.as_ref().to_path_buf(),
+                read_only: true,
+                fsync: options.durability == "fsync",
+                store_text: options.store_text,
+                index_text: options.index_text,
+                _lock: None,
+            }),
+        };
+        engine.load_persisted_indexes(false)?;
+        Ok(engine)
     }
 
     /// Creates a vector-only index.
@@ -36,6 +83,7 @@ impl CoreEngine {
         vector_dim: usize,
         bit_width: usize,
     ) -> Result<(), CoreError> {
+        self.require_writable()?;
         validate_index_shape(vector_dim, bit_width)?;
         let index_id = index_id.into();
         if self.indexes.contains_key(&index_id) {
@@ -54,6 +102,7 @@ impl CoreEngine {
         index_id: &str,
         documents: &[CoreVectorDocument],
     ) -> Result<CoreMutationResult, CoreError> {
+        self.require_writable()?;
         let index = self.index_mut(index_id)?;
         let mut changed = 0usize;
         for document in documents {
@@ -95,6 +144,7 @@ impl CoreEngine {
         index_id: &str,
         document_ids: &[String],
     ) -> Result<CoreMutationResult, CoreError> {
+        self.require_writable()?;
         let index = self.index_mut(index_id)?;
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
@@ -133,6 +183,7 @@ impl CoreEngine {
         metadata: Option<CoreMetadata>,
         text: Option<Option<String>>,
     ) -> Result<CoreMutationResult, CoreError> {
+        self.require_writable()?;
         let index = self.index_mut(index_id)?;
         let Some(record) = index.documents.get_mut(document_id) else {
             return invalid("document not found");
@@ -162,6 +213,7 @@ impl CoreEngine {
         index_text: bool,
         chunk_character_limit: usize,
     ) -> Result<IngestPlan, CoreError> {
+        self.require_writable()?;
         let base_generation = self.index(index_id)?.generation;
         let existing_chunks = self.index(index_id)?.chunk_vectors_by_id();
         let mut prepared_documents = Vec::with_capacity(documents.len());
@@ -234,6 +286,7 @@ impl CoreEngine {
         embeddings: &[Vec<f32>],
         embedding_time_ms: f64,
     ) -> Result<TextApplyResult, CoreError> {
+        self.require_writable()?;
         let index = self.index_mut(&plan.index_id)?;
         if index.generation != plan.base_generation {
             return Err(CoreError::new(
@@ -437,6 +490,72 @@ impl CoreEngine {
             .collect())
     }
 
+    /// Persists every open index through generation-mode storage.
+    pub fn persist(&mut self) -> Result<(), CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        if persistence.read_only {
+            return invalid("read-only engine cannot persist");
+        }
+        for index in self.indexes.values() {
+            let state = state_payload_for_index(index);
+            let raw_text = if persistence.store_text {
+                index
+                    .documents
+                    .iter()
+                    .filter_map(|(document_id, record)| {
+                        record
+                            .text
+                            .as_ref()
+                            .map(|text| (document_id.clone(), text.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
+            let lexical_tokens = if persistence.index_text {
+                index
+                    .documents
+                    .iter()
+                    .filter(|(_, record)| !record.token_lists.is_empty())
+                    .map(|(document_id, record)| (document_id.clone(), record.token_lists.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
+            crate::storage::write_generation_commit(
+                &persistence.path,
+                crate::storage::GenerationCommitInput {
+                    index_key: &index.index_id,
+                    generation: index.generation.max(1),
+                    base_epoch: index.generation.max(1),
+                    state: &state,
+                    tvim: None,
+                    raw_text: Some(&raw_text),
+                    lexical_tokens: Some(&lexical_tokens),
+                },
+                crate::storage::GenerationWriteOptions {
+                    fsync: persistence.fsync,
+                    retained_epochs: 4,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Persists a writable engine and releases its writer lock.
+    pub fn close(&mut self) -> Result<(), CoreError> {
+        if matches!(
+            self.persistence.as_ref(),
+            Some(persistence) if !persistence.read_only
+        ) {
+            self.persist()?;
+        }
+        self.persistence = None;
+        Ok(())
+    }
+
     fn index(&self, index_id: &str) -> Result<&VectorOnlyIndex, CoreError> {
         self.indexes
             .get(index_id)
@@ -448,6 +567,278 @@ impl CoreEngine {
             .get_mut(index_id)
             .ok_or_else(|| invalid_err("index not found"))
     }
+
+    fn require_writable(&self) -> Result<(), CoreError> {
+        if matches!(
+            self.persistence.as_ref(),
+            Some(persistence) if persistence.read_only
+        ) {
+            return invalid("engine is open read-only");
+        }
+        Ok(())
+    }
+
+    fn load_persisted_indexes(&mut self, replay_wal: bool) -> Result<(), CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        if !persistence.path.is_dir() {
+            return Ok(());
+        }
+        let mut index_keys = Vec::new();
+        for entry in fs::read_dir(&persistence.path).map_err(core_io_error)? {
+            let entry = entry.map_err(core_io_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(index_key) = name.strip_suffix(".commit.json") {
+                index_keys.push(index_key.to_string());
+            }
+        }
+        for index_key in index_keys {
+            let mut loaded = crate::storage::load_store(
+                &persistence.path,
+                &index_key,
+                crate::storage::LoadOptions {
+                    read_only: persistence.read_only,
+                    read_wal: replay_wal && !persistence.read_only,
+                },
+            )?;
+            if replay_wal && !persistence.read_only {
+                let records = crate::storage::wal::read_records(&crate::storage::wal::wal_path(
+                    &persistence.path,
+                    &index_key,
+                ))?;
+                if !records.is_empty() {
+                    crate::storage::wal::replay_records_onto_store(&mut loaded, &records, 8192)?;
+                    crate::storage::wal::checkpoint_store(
+                        &persistence.path,
+                        &loaded,
+                        loaded.generation + 1,
+                        persistence.fsync,
+                    )?;
+                    loaded.generation += 1;
+                }
+            }
+            let index = index_from_loaded_store(&loaded)?;
+            self.indexes.insert(index.index_id.clone(), index);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PersistenceState {
+    path: PathBuf,
+    read_only: bool,
+    fsync: bool,
+    store_text: bool,
+    index_text: bool,
+    _lock: Option<PersistentLock>,
+}
+
+#[derive(Debug)]
+struct PersistentLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl PersistentLock {
+    fn acquire(path: &Path) -> Result<Self, CoreError> {
+        let lock_path = path.join(".lodedb.native.lock");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                CoreError::new(
+                    CoreErrorCode::InvalidArgument,
+                    format!("could not acquire native writer lock: {error}"),
+                )
+            })?;
+        Ok(Self {
+            path: lock_path,
+            _file: file,
+        })
+    }
+}
+
+impl Drop for PersistentLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn index_from_loaded_store(
+    loaded: &crate::storage::LoadedStore,
+) -> Result<VectorOnlyIndex, CoreError> {
+    let state = loaded
+        .state
+        .as_object()
+        .ok_or_else(|| invalid_err("loaded state must be a JSON object"))?;
+    let index_id = state
+        .get("index_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&loaded.index_key)
+        .to_string();
+    let vector_dim = state.get("native_dim").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let bit_width = state
+        .get("turbovec_bit_width")
+        .and_then(Value::as_u64)
+        .unwrap_or(4) as usize;
+    validate_index_shape(vector_dim, bit_width)?;
+    let metadata_by_id = state
+        .get("document_metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let chunk_ids_by_doc = state
+        .get("document_chunk_ids")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut documents = BTreeMap::new();
+    for document_id in state
+        .get("document_hashes")
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let metadata = metadata_by_id
+            .get(&document_id)
+            .and_then(Value::as_object)
+            .map(|object| {
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let chunks = chunk_ids_by_doc
+            .get(&document_id)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|chunk_id| ChunkRecord {
+                chunk_id: chunk_id.to_string(),
+                vector: vec![0.0; vector_dim],
+            })
+            .collect();
+        documents.insert(
+            document_id.clone(),
+            DocumentRecord {
+                metadata,
+                text: loaded.raw_text.get(&document_id).cloned(),
+                token_lists: loaded
+                    .lexical_tokens
+                    .get(&document_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                chunks,
+            },
+        );
+    }
+    Ok(VectorOnlyIndex {
+        index_id,
+        vector_dim,
+        bit_width,
+        documents,
+        generation: loaded.generation,
+        delete_count: state
+            .get("delete_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        deleted_chunk_count: state
+            .get("deleted_chunk_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+    })
+}
+
+fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
+    let mut chunks = Vec::new();
+    let mut document_hashes = serde_json::Map::new();
+    let mut document_chunk_ids = serde_json::Map::new();
+    let mut document_metadata = serde_json::Map::new();
+    for (document_id, record) in &index.documents {
+        let content_hash = record
+            .text
+            .as_ref()
+            .map(|text| crate::text::hash::sha256_text(text))
+            .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
+        document_hashes.insert(document_id.clone(), Value::String(content_hash));
+        document_chunk_ids.insert(
+            document_id.clone(),
+            Value::Array(
+                record
+                    .chunks
+                    .iter()
+                    .map(|chunk| Value::String(chunk.chunk_id.clone()))
+                    .collect(),
+            ),
+        );
+        document_metadata.insert(
+            document_id.clone(),
+            Value::Object(
+                record
+                    .metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect(),
+            ),
+        );
+        for chunk in &record.chunks {
+            chunks.push(serde_json::json!({
+                "chunk_id": chunk.chunk_id,
+                "content_hash": crate::text::hash::sha256_text(&chunk.chunk_id),
+                "document_id": document_id,
+            }));
+        }
+    }
+    chunks.sort_by(|left, right| {
+        left.get("chunk_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("chunk_id").and_then(Value::as_str))
+    });
+    serde_json::json!({
+        "cache_reuse_count": 0,
+        "chunks": chunks,
+        "client_id_hash": index.index_id,
+        "columnar_generation": index.generation.max(1),
+        "created_at": "1970-01-01T00:00:00+00:00",
+        "delete_count": index.delete_count,
+        "deleted_chunk_count": index.deleted_chunk_count,
+        "document_chunk_ids": document_chunk_ids,
+        "document_hashes": document_hashes,
+        "document_metadata": document_metadata,
+        "embedded_chunk_count": index.chunk_count(),
+        "fallback_count": 0,
+        "fallback_reasons": {},
+        "index_id": index.index_id,
+        "index_key": index.index_id,
+        "metadata": {},
+        "model": "native-core",
+        "name": "lodedb-local",
+        "native_dim": index.vector_dim,
+        "provider": "native",
+        "query_count": 0,
+        "route_profile": "native-core",
+        "schema_version": 1,
+        "status": "ready",
+        "storage_profile": "native-core",
+        "task": "native-core",
+        "turbovec_bit_width": index.bit_width,
+        "updated_at": "1970-01-01T00:00:00+00:00"
+    })
+}
+
+fn core_io_error(error: std::io::Error) -> CoreError {
+    CoreError::new(
+        CoreErrorCode::Internal,
+        format!("persistent engine I/O failed: {error}"),
+    )
 }
 
 #[derive(Debug, Clone)]

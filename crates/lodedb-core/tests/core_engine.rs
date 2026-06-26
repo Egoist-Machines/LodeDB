@@ -1,8 +1,15 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::CoreEngine;
-use lodedb_core::types::{CoreDocument, CoreVectorDocument};
+use lodedb_core::types::{CoreDocument, CoreOpenOptions, CoreVectorDocument};
 use serde_json::json;
+
+const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -27,6 +34,17 @@ fn text_doc(id: &str, text: &str, metadata: BTreeMap<String, String>) -> CoreDoc
         document_id: id.to_string(),
         text: text.to_string(),
         metadata,
+    }
+}
+
+fn open_options(path: &Path, read_only: bool, commit_mode: &str) -> CoreOpenOptions {
+    CoreOpenOptions {
+        path: path.to_string_lossy().to_string(),
+        read_only,
+        durability: "relaxed".to_string(),
+        commit_mode: commit_mode.to_string(),
+        store_text: true,
+        index_text: true,
     }
 }
 
@@ -249,4 +267,104 @@ fn stale_text_plan_is_rejected() {
         .apply_text_upsert(&plan, &[vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], 1.0)
         .unwrap_err();
     assert_eq!(error.code().as_str(), "PLAN_STALE");
+}
+
+#[test]
+fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
+    let path = unique_temp_dir("core_persistent");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("persist-a", 0, metadata(&[("kind", "alpha")])),
+                doc("persist-b", 1, metadata(&[("kind", "beta")])),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .query_vector(
+                "default",
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1,
+                None,
+            )
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "persist-a"
+    );
+    engine.persist().unwrap();
+    engine.close().unwrap();
+
+    let mut readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    assert_eq!(readonly.stats("default").unwrap().document_count, 2);
+    assert!(readonly.persist().is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
+    let path = unique_temp_dir("core_lock");
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert!(CoreEngine::open(open_options(&path, false, "generation")).is_err());
+    let readonly = CoreEngine::open_readonly(&path, open_options(&path, true, "generation"));
+    assert!(readonly.is_ok());
+    writer.close().unwrap();
+    let reopened = CoreEngine::open(open_options(&path, false, "generation"));
+    assert!(reopened.is_ok());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn writable_open_replays_and_checkpoints_wal_but_readonly_ignores_it() {
+    let path = copy_persisted_fixture("rust_wal");
+    let readonly = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(readonly.stats("default").unwrap().document_count, 0);
+    assert!(path.join(format!("{INDEX_KEY}.wal")).exists());
+
+    let mut writable = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert_eq!(writable.stats("default").unwrap().document_count, 1);
+    writable.close().unwrap();
+    assert!(!path.join(format!("{INDEX_KEY}.wal")).exists());
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "lodedb-core-{label}-{}-{nanos}-{counter}",
+        std::process::id()
+    ))
+}
+
+fn copy_persisted_fixture(name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/persisted")
+        .join(name);
+    let target = unique_temp_dir(name);
+    copy_dir_all(&source, &target);
+    target
+}
+
+fn copy_dir_all(source: &Path, target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let destination = target.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &destination);
+        } else {
+            fs::copy(&path, &destination).unwrap();
+        }
+    }
 }
