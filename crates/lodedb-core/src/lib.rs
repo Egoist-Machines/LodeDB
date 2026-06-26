@@ -8,6 +8,7 @@ pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod lexical;
+pub mod storage;
 pub mod text;
 pub mod types;
 pub mod vector;
