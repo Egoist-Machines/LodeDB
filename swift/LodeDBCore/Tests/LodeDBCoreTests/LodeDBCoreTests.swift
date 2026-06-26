@@ -27,3 +27,50 @@ import Testing
     let db = try LodeDB.openReadOnly(path: fixture)
     #expect(db.count == 3)
 }
+
+@Test func textPrepareApplyUsesEmbedderAndMatchesChunkIDFixture() throws {
+    let db = try LodeDB(vectorDimension: 3)
+    let embedder = HashTestEmbedder(dimension: 3)
+    let text = "Alpha launch notes mention error code E-1001 and a blue widget."
+    let plan = try db.prepareTextUpsert(text, id: "doc-alpha", metadata: ["topic": "ops"])
+    #expect(plan.chunks.first?.chunkID == "doc-alpha:6ed29ed824c2:0000")
+    let embeddings = try embedder.embed(texts: plan.chunks.map(\.text))
+    try db.applyTextUpsert(plan, embeddings: embeddings)
+
+    let vectorHits = try db.search(text: "blue widget", k: 1, mode: .vector, embedder: embedder)
+    #expect(vectorHits.first?.id == "doc-alpha")
+}
+
+@Test func swiftTextLexicalAndHybridSearchUsePayloadTokens() throws {
+    let db = try LodeDB(vectorDimension: 3)
+    let embedder = HashTestEmbedder(dimension: 3)
+    try db.addText(
+        "Beta incident report for serial AX-42 on 2024-06-13.",
+        id: "doc-beta",
+        embedder: embedder
+    )
+    try db.addText(
+        "Gamma handbook explains offline vector search and local recovery.",
+        id: "doc-gamma",
+        embedder: embedder
+    )
+
+    let lexical = try db.search(text: "serial AX-42", k: 1, mode: .lexical)
+    #expect(lexical.map(\.id) == ["doc-beta"])
+
+    let hybrid = try db.search(text: "local recovery", k: 2, mode: .hybrid, embedder: embedder)
+    #expect(hybrid.contains { $0.id == "doc-gamma" })
+}
+
+private struct HashTestEmbedder: LodeEmbedder {
+    let dimension: Int
+
+    func embed(texts: [String]) throws -> [[Float]] {
+        texts.map { text in
+            var vector = Array(repeating: Float(0), count: dimension)
+            let bucket = abs(text.hashValue) % dimension
+            vector[bucket] = 1
+            return vector
+        }
+    }
+}
