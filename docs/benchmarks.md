@@ -9,6 +9,34 @@ labels, never raw documents, queries, chunks, embeddings, or credentials.
 Provenance is tagged inline: `measured` = timed on the stated machine; `recorded` = read
 from the environment. No estimates.
 
+## Native-core migration baselines
+
+The native-core migration benchmark harness lives in
+[`benchmarks/native_migration/`](../benchmarks/native_migration). It records import/open,
+storage/WAL, lexical/hybrid, filter-planner, and TurboVec-adapter smoke measurements using
+deterministic fixture corpora. The committed smoke artifact is
+[`benchmarks/native_migration/results/baseline_smoke.json`](../benchmarks/native_migration/results/baseline_smoke.json).
+
+Run the baseline bundle from the repo root:
+
+```bash
+PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 \
+  uv run python -m benchmarks.native_migration.run
+```
+
+Current default-native verification is narrower than final runtime removal: fresh vector-only
+handles can execute through native core by default when the bundled extension is available, while
+Python remains the durable oracle and existing stores fall back to Python. Focused verification:
+
+```bash
+PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 uv run pytest -q \
+  tests/test_native_core_flags.py \
+  tests/test_native_core_shadow_vector_store.py \
+  tests/test_vector_only_index.py \
+  tests/test_local_vector_in.py \
+  tests/test_import_boundary.py
+```
+
 ## Launch benchmark: direct CUDA batch sweep
 
 The LodeDB-owned launch proof lives in
