@@ -25,6 +25,10 @@ class FakeCoreEngine:
     def create_index(self, index_id: str, vector_dim: int, bit_width: int) -> None:
         self.index = (index_id, vector_dim, bit_width)
 
+    def create_index_with_options(self, options_json: str) -> None:
+        options = json.loads(options_json)
+        self.index = (options["index_id"], options["vector_dim"], options["bit_width"])
+
     def upsert_vectors(self, index_id: str, documents_json: str) -> str:
         self.documents = json.loads(documents_json)
         return json.dumps(
@@ -248,7 +252,21 @@ def test_adapter_maps_native_errors_to_engine_response() -> None:
 
 def test_adapter_wraps_native_engine_vector_flow() -> None:
     engine = NativeCoreAdapter(FakeNativeModule()).new_engine()
-    engine.create_index("default", vector_dim=2, bit_width=4)
+    engine.create_index_with_options(
+        NativeCoreAdapter.index_create_options_payload(
+            index_id="default",
+            index_key="storage-key",
+            client_id_hash="client-hash",
+            name="lodedb-local",
+            model="external",
+            provider="external",
+            task="vector-only",
+            route_profile="vector-only",
+            storage_profile="turbovec_direct",
+            vector_dim=2,
+            bit_width=4,
+        )
+    )
     mutation = engine.upsert_vectors(
         "default",
         (

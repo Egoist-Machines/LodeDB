@@ -1,8 +1,8 @@
 use lodedb_core::{
     engine::{CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
-    CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreMutationResult, CoreOpenOptions,
-    CoreQuery, CoreRoutePolicy, CoreSearchResults, CoreSecurityOptions, CoreStats,
-    CoreVectorDocument,
+    CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreIndexCreateOptions,
+    CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchResults,
+    CoreSecurityOptions, CoreStats, CoreVectorDocument,
 };
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -703,6 +703,13 @@ impl PyCoreEngine {
     ) -> PyResult<()> {
         self.inner
             .create_index(index_id, vector_dim, bit_width)
+            .map_err(native_core_error_to_py)
+    }
+
+    fn create_index_with_options(&mut self, options_json: &str) -> PyResult<()> {
+        let options = native_from_json::<CoreIndexCreateOptions>(options_json)?;
+        self.inner
+            .create_index_with_options(options)
             .map_err(native_core_error_to_py)
     }
 

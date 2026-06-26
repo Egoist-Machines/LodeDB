@@ -100,6 +100,30 @@ def test_native_core_extension_executes_vector_store_flow() -> None:
     assert stats["raw_payload_text_present"] is False
 
 
+def test_native_core_extension_accepts_index_create_options() -> None:
+    engine = native_core.CoreEngine()
+    index_key = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205"
+    engine.create_index_with_options(
+        json.dumps(
+            {
+                "index_id": "default",
+                "index_key": index_key,
+                "client_id_hash": index_key,
+                "name": "lodedb-local",
+                "model": "external",
+                "provider": "external",
+                "task": "vector-only",
+                "route_profile": "vector-only",
+                "storage_profile": "turbovec_direct",
+                "vector_dim": 8,
+                "bit_width": 4,
+            }
+        )
+    )
+    stats = _loads(engine.stats("default"))
+    assert stats["document_count"] == 0
+
+
 def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     engine = native_core.CoreEngine()
     engine.create_index("text", 8, 4)

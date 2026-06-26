@@ -32,6 +32,9 @@ class FakeNativeVectorEngine:
     def create_index(self, index_id: str, *, vector_dim: int, bit_width: int = 4) -> None:
         self.created = (index_id, vector_dim, bit_width)
 
+    def create_index_with_options(self, options: dict) -> None:
+        self.created = (options["index_id"], options["vector_dim"], options["bit_width"])
+
     def upsert_vectors(self, index_id: str, documents) -> dict:
         for document in documents:
             self.documents[document.document_id] = {

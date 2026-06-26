@@ -35,6 +35,8 @@ from lodedb.engine.core import (
     EngineSecurityConfig,
     EngineVectorDocument,
     LodeEngine,
+    index_state_key_for_client_hash,
+    sha256_text,
 )
 from lodedb.engine.embedding_backends import EngineEmbeddingBackend
 from lodedb.engine.index import EngineError, LodeIndex
@@ -61,6 +63,7 @@ from lodedb.local.presets import (
 # Fixed local identifier for the single-process client context. It never leaves
 # the process and has no security meaning — the local engine is auth-free.
 _LOCAL_CLIENT_ID = "lodedb-local"
+_LOCAL_CLIENT_ID_HASH = sha256_text(_LOCAL_CLIENT_ID)
 # The local DB is a single, stable index. Pinning it to the engine's
 # DEFAULT_INDEX_ID makes the persisted snapshot key the bare client hash (the
 # legacy default snapshot name), so reopening the same path binds to the same
@@ -412,6 +415,11 @@ class LodeDB:
             resolved_bit_width,
             durability=native_durability,
             commit_mode=resolved_commit_mode.value,
+            route_profile=route_profile,
+            storage_profile=route_policy.index_backend,
+            model=route_policy.model,
+            provider=route_policy.provider,
+            task=route_policy.task,
         )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
@@ -1188,6 +1196,11 @@ class LodeDB:
         *,
         durability: str,
         commit_mode: str,
+        route_profile: str,
+        storage_profile: str,
+        model: str,
+        provider: str,
+        task: str,
     ) -> None:
         """Initializes the native vector engine when the rollout policy allows it."""
 
@@ -1219,10 +1232,22 @@ class LodeDB:
             return
         try:
             native_engine = adapter.new_engine()
-            native_engine.create_index(
-                _LOCAL_INDEX_ID,
-                vector_dim=self._vector_dim,
-                bit_width=bit_width,
+            native_engine.create_index_with_options(
+                _native_vector_index_options(
+                    index_id=_LOCAL_INDEX_ID,
+                    index_key=index_state_key_for_client_hash(
+                        _LOCAL_CLIENT_ID_HASH, _LOCAL_INDEX_ID
+                    ),
+                    client_id_hash=_LOCAL_CLIENT_ID_HASH,
+                    name="lodedb-local",
+                    model=model,
+                    provider=provider,
+                    task=task,
+                    route_profile=route_profile,
+                    storage_profile=storage_profile,
+                    vector_dim=self._vector_dim,
+                    bit_width=bit_width,
+                )
             )
         except Exception as exc:
             self._native_core_fallback_reason = "native_core_init_failed"
@@ -1606,6 +1631,37 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
                 f"metadata value for {key!r} must be a string, number, or bool"
             )
     return coerced
+
+
+def _native_vector_index_options(
+    *,
+    index_id: str,
+    index_key: str,
+    client_id_hash: str,
+    name: str,
+    model: str,
+    provider: str,
+    task: str,
+    route_profile: str,
+    storage_profile: str,
+    vector_dim: int,
+    bit_width: int,
+) -> dict[str, Any]:
+    """Builds the native-core index creation payload for the local vector store."""
+
+    return {
+        "index_id": str(index_id),
+        "index_key": str(index_key),
+        "client_id_hash": str(client_id_hash),
+        "name": str(name),
+        "model": str(model),
+        "provider": str(provider),
+        "task": str(task),
+        "route_profile": str(route_profile),
+        "storage_profile": str(storage_profile),
+        "vector_dim": int(vector_dim),
+        "bit_width": int(bit_width),
+    }
 
 
 def _coerce_optional_text(value: Any) -> str | None:

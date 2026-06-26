@@ -163,6 +163,35 @@ class NativeCoreAdapter:
         }
 
     @staticmethod
+    def index_create_options_payload(
+        *,
+        index_id: str,
+        index_key: str,
+        client_id_hash: str,
+        name: str,
+        model: str,
+        provider: str,
+        task: str,
+        route_profile: str,
+        storage_profile: str,
+        vector_dim: int,
+        bit_width: int,
+    ) -> dict[str, Any]:
+        return {
+            "index_id": str(index_id),
+            "index_key": str(index_key),
+            "client_id_hash": str(client_id_hash),
+            "name": str(name),
+            "model": str(model),
+            "provider": str(provider),
+            "task": str(task),
+            "route_profile": str(route_profile),
+            "storage_profile": str(storage_profile),
+            "vector_dim": int(vector_dim),
+            "bit_width": int(bit_width),
+        }
+
+    @staticmethod
     def response_from_native(status_code: int, payload: dict[str, Any]) -> EngineResponse:
         return EngineResponse(int(status_code), dict(payload))
 
@@ -204,6 +233,9 @@ class NativeCoreEngineHandle:
 
     def create_index(self, index_id: str, *, vector_dim: int, bit_width: int = 4) -> None:
         self._engine.create_index(str(index_id), int(vector_dim), int(bit_width))
+
+    def create_index_with_options(self, options: Mapping[str, Any]) -> None:
+        self._engine.create_index_with_options(self._dumps(dict(options)))
 
     def upsert_vectors(
         self,

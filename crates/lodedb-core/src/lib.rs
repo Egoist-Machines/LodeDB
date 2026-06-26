@@ -16,9 +16,9 @@ pub mod version;
 
 pub use error::{CoreError, CoreErrorCode};
 pub use types::{
-    CoreApiVersion, CoreDocument, CoreIndexConfig, CoreMetadata, CoreMutationResult,
-    CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit, CoreSearchResults,
-    CoreSecurityOptions, CoreStats, CoreVectorDocument,
+    CoreApiVersion, CoreDocument, CoreIndexConfig, CoreIndexCreateOptions, CoreMetadata,
+    CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit,
+    CoreSearchResults, CoreSecurityOptions, CoreStats, CoreVectorDocument,
 };
 pub use vector::stable_id::{stable_uint64_for_text, stable_uint64_ids_for_chunk_ids};
 pub use version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
