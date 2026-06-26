@@ -10,9 +10,9 @@ from lodedb.engine.runtime_policy import (
 )
 
 
-def test_native_core_flags_default_off() -> None:
+def test_native_core_flags_default_on() -> None:
     env: dict[str, str] = {}
-    assert native_core_mode_from_env(env) == NativeCoreMode.OFF
+    assert native_core_mode_from_env(env) == NativeCoreMode.ON
     assert native_core_write_mode_from_env(env) == NativeCoreMode.OFF
     assert native_core_strict_parity_from_env(env) is False
 

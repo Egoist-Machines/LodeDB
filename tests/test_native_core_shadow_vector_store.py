@@ -159,6 +159,22 @@ def test_native_on_requires_available_extension(tmp_path, monkeypatch) -> None:
         raise AssertionError("native-on open unexpectedly succeeded")
 
 
+def test_default_native_on_falls_back_when_extension_unavailable(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine()
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: FakeNativeAdapter(native, available=False),
+    )
+    monkeypatch.delenv("LODEDB_NATIVE_CORE", raising=False)
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="a")
+
+    assert [hit.id for hit in db.search_by_vector(_onehot(0), k=1)] == ["a"]
+    assert db.stats()["native_core"]["mode"] == "on"
+    assert db.stats()["native_core"]["enabled"] is False
+    assert db.stats()["native_core"]["fallback_reason"] == "native_core_extension_unavailable"
+
+
 def test_native_on_existing_store_falls_back_to_python_until_seeded(tmp_path, monkeypatch) -> None:
     writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
     writer.add_vectors(_onehot(0), id="a")

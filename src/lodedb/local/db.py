@@ -21,6 +21,7 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 from __future__ import annotations
 
 import math
+import os
 import secrets
 import time
 from collections.abc import Mapping, Sequence
@@ -250,6 +251,9 @@ class LodeDB:
         self.read_only = bool(read_only)
         self._native_core_mode = native_core_mode_from_env()
         self._native_core_strict_parity = native_core_strict_parity_from_env()
+        self._native_core_fail_closed = (
+            self._native_core_mode == NativeCoreMode.ON and "LODEDB_NATIVE_CORE" in os.environ
+        )
         self._native_vector_engine: NativeCoreEngineHandle | None = None
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
@@ -770,6 +774,8 @@ class LodeDB:
         if native_hits is None:
             return python_hits
         self._check_native_vector_parity(python_hits, native_hits)
+        if not self._native_vector_covered:
+            return python_hits
         if self._native_core_mode == NativeCoreMode.ON:
             return native_hits
         return python_hits
@@ -819,6 +825,8 @@ class LodeDB:
             return out
         for python_hits, native_hits in zip(out, native_batches, strict=True):
             self._check_native_vector_parity(python_hits, native_hits)
+        if not self._native_vector_covered:
+            return out
         if self._native_core_mode == NativeCoreMode.ON:
             return native_batches
         return out
@@ -1180,7 +1188,7 @@ class LodeDB:
         adapter = NativeCoreAdapter()
         if not adapter.available:
             self._native_core_fallback_reason = "native_core_extension_unavailable"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("LODEDB_NATIVE_CORE=on requires lodedb._native_core")
             return
         try:
@@ -1192,7 +1200,7 @@ class LodeDB:
             )
         except Exception as exc:
             self._native_core_fallback_reason = "native_core_init_failed"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("failed to initialize native core") from exc
             return
         document_count = int(self._index.stats().get("document_count", 0) or 0)
@@ -1211,7 +1219,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_core_fallback_reason = "native_core_upsert_failed"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("native core vector upsert failed") from exc
             if self._native_core_strict_parity:
                 raise
@@ -1230,7 +1238,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_core_fallback_reason = "native_core_delete_failed"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("native core vector delete failed") from exc
             if self._native_core_strict_parity:
                 raise
@@ -1256,7 +1264,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_core_fallback_reason = "native_core_query_failed"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("native core vector query failed") from exc
             if self._native_core_strict_parity:
                 raise
@@ -1284,7 +1292,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_core_fallback_reason = "native_core_batch_query_failed"
-            if self._native_core_mode == NativeCoreMode.ON:
+            if self._native_core_fail_closed:
                 raise RuntimeError("native core vector batch query failed") from exc
             if self._native_core_strict_parity:
                 raise
@@ -1328,7 +1336,7 @@ class LodeDB:
             return
         self._native_vector_covered = False
         self._native_core_fallback_reason = "native_core_vector_parity_mismatch"
-        if self._native_core_mode == NativeCoreMode.ON or self._native_core_strict_parity:
+        if self._native_core_fail_closed or self._native_core_strict_parity:
             raise RuntimeError(
                 f"native core vector parity mismatch: python={python_ids!r} native={native_ids!r}"
             )

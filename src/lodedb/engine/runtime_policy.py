@@ -117,12 +117,13 @@ def commit_mode_from_env(env: Mapping[str, str] | None = None) -> CommitMode:
 def native_core_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCoreMode:
     """Returns the native-core execution mode.
 
-    Defaults to ``off`` so current Python behavior is unchanged. ``shadow`` and
-    ``on`` are reserved for later migration milestones.
+    Defaults to ``on``: native-capable Python paths use the Rust core when the
+    extension and state coverage are available, with safe Python fallback for
+    unsupported paths during the final migration cycle.
     """
 
     source = os.environ if env is None else env
-    return parse_native_core_mode(source.get("LODEDB_NATIVE_CORE", "off"), "LODEDB_NATIVE_CORE")
+    return parse_native_core_mode(source.get("LODEDB_NATIVE_CORE", "on"), "LODEDB_NATIVE_CORE")
 
 
 def native_core_write_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCoreMode:
