@@ -892,6 +892,11 @@ fn native_core_version() -> &'static str {
 }
 
 #[pyfunction]
+fn native_core_abi_version() -> u32 {
+    lodedb_core::NATIVE_CORE_ABI_VERSION
+}
+
+#[pyfunction]
 fn storage_schema_version() -> u32 {
     lodedb_core::STORAGE_SCHEMA_VERSION
 }
@@ -981,6 +986,7 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(maxsim_scores, m)?)?;
     m.add_class::<PyCoreEngine>()?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
+    m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
     m.add_function(wrap_pyfunction!(core_document_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(round_trip_core_json, m)?)?;

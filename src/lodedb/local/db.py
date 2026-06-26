@@ -264,6 +264,7 @@ class LodeDB:
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
         self._native_core_version = ""
+        self._native_core_abi_version = 0
         self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
         self._native_shadow_persist_count = 0
         self._native_shadow_persist_verified = False
@@ -1231,6 +1232,7 @@ class LodeDB:
                 raise RuntimeError("LODEDB_NATIVE_CORE=on requires lodedb._native_core")
             return
         self._native_core_version = adapter.version
+        self._native_core_abi_version = adapter.abi_version
         if self.read_only:
             try:
                 native_engine = adapter.open_readonly_engine(
@@ -1408,6 +1410,7 @@ class LodeDB:
             "mode": self._native_core_mode.value,
             "write_mode": self._native_core_write_mode.value,
             "version": self._native_core_version,
+            "abi_version": self._native_core_abi_version,
             "enabled": self._native_vector_engine is not None,
             "covered": self._native_vector_covered,
             "fallback_reason": self._native_core_fallback_reason,

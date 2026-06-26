@@ -10,6 +10,7 @@ from __future__ import annotations
 from lodedb._turbovec import (  # type: ignore[attr-defined]
     CoreEngine,
     core_document_to_json,
+    native_core_abi_version,
     native_core_version,
     round_trip_core_json,
     storage_schema_version,
@@ -21,6 +22,7 @@ __all__ = [
     "CoreEngine",
     "__version__",
     "core_document_to_json",
+    "native_core_abi_version",
     "native_core_version",
     "round_trip_core_json",
     "storage_schema_version",

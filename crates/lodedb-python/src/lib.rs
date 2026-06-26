@@ -241,6 +241,12 @@ fn native_core_version() -> &'static str {
     lodedb_core::CORE_VERSION
 }
 
+/// Returns the stable native-core ABI version.
+#[pyfunction]
+fn native_core_abi_version() -> u32 {
+    lodedb_core::NATIVE_CORE_ABI_VERSION
+}
+
 /// Returns the persisted-store schema version understood by the native core.
 #[pyfunction]
 fn storage_schema_version() -> u32 {
@@ -333,6 +339,7 @@ fn _native_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", lodedb_core::CORE_VERSION)?;
     module.add_class::<PyCoreEngine>()?;
     module.add_function(wrap_pyfunction!(native_core_version, module)?)?;
+    module.add_function(wrap_pyfunction!(native_core_abi_version, module)?)?;
     module.add_function(wrap_pyfunction!(storage_schema_version, module)?)?;
     module.add_function(wrap_pyfunction!(core_document_to_json, module)?)?;
     module.add_function(wrap_pyfunction!(round_trip_core_json, module)?)?;

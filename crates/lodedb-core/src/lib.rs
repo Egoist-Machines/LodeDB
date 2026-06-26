@@ -21,4 +21,4 @@ pub use types::{
     CoreSearchResults, CoreSecurityOptions, CoreStats, CoreVectorDocument,
 };
 pub use vector::stable_id::{stable_uint64_for_text, stable_uint64_ids_for_chunk_ids};
-pub use version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
+pub use version::{CORE_VERSION, NATIVE_CORE_ABI_VERSION, STORAGE_SCHEMA_VERSION};

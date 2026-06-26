@@ -59,6 +59,7 @@ def _loads(payload: str) -> dict:
 
 
 def test_native_core_extension_executes_vector_store_flow() -> None:
+    assert native_core.native_core_abi_version() == 1
     engine = native_core.CoreEngine()
     engine.create_index("default", 8, 4)
     mutation = _loads(
@@ -268,6 +269,7 @@ def test_native_core_write_shadow_verifies_counts(tmp_path, monkeypatch) -> None
 
     assert stats["write_mode"] == "shadow"
     assert stats["version"]
+    assert stats["abi_version"] == 1
     assert stats["shadow_persist_count"] == 1
     assert stats["shadow_persist_verified"] is True
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "shadow-b"

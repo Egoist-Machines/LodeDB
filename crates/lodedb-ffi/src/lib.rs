@@ -10,7 +10,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = lodedb_core::NATIVE_CORE_ABI_VERSION;
 
 #[repr(C)]
 pub struct LodeError {
