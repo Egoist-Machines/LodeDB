@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::CoreEngine;
+use lodedb_core::error::CoreErrorCode;
 use lodedb_core::types::{CoreDocument, CoreOpenOptions, CoreVectorDocument};
 use serde_json::json;
 
@@ -302,6 +303,15 @@ fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
     let mut readonly =
         CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
     assert_eq!(readonly.stats("default").unwrap().document_count, 2);
+    let error = readonly
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), CoreErrorCode::Unsupported);
     assert!(readonly.persist().is_err());
     fs::remove_dir_all(path).unwrap();
 }

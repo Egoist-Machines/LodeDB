@@ -104,6 +104,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
+        index.require_vectors_seeded()?;
         let mut changed = 0usize;
         for document in documents {
             if document.document_id.trim().is_empty() {
@@ -146,6 +147,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
+        index.require_vectors_seeded()?;
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
@@ -185,6 +187,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
+        index.require_vectors_seeded()?;
         let Some(record) = index.documents.get_mut(document_id) else {
             return invalid("document not found");
         };
@@ -214,8 +217,10 @@ impl CoreEngine {
         chunk_character_limit: usize,
     ) -> Result<IngestPlan, CoreError> {
         self.require_writable()?;
-        let base_generation = self.index(index_id)?.generation;
-        let existing_chunks = self.index(index_id)?.chunk_vectors_by_id();
+        let index = self.index(index_id)?;
+        index.require_vectors_seeded()?;
+        let base_generation = index.generation;
+        let existing_chunks = index.chunk_vectors_by_id();
         let mut prepared_documents = Vec::with_capacity(documents.len());
         let mut chunks_to_embed = Vec::new();
 
@@ -288,6 +293,7 @@ impl CoreEngine {
     ) -> Result<TextApplyResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(&plan.index_id)?;
+        index.require_vectors_seeded()?;
         if index.generation != plan.base_generation {
             return Err(CoreError::new(
                 CoreErrorCode::PlanStale,
@@ -409,6 +415,7 @@ impl CoreEngine {
         if query_vector.len() != index.vector_dim {
             return invalid("query dimension does not match index");
         }
+        index.require_vectors_seeded()?;
         let candidates = index.resolve_filter(filter)?;
         let total_considered = candidates.len();
         let mut hits = candidates
@@ -699,6 +706,7 @@ fn index_from_loaded_store(
         .cloned()
         .unwrap_or_default();
     let mut documents = BTreeMap::new();
+    let mut has_placeholder_vectors = false;
     for document_id in state
         .get("document_hashes")
         .and_then(Value::as_object)
@@ -715,7 +723,7 @@ fn index_from_loaded_store(
                     .collect()
             })
             .unwrap_or_default();
-        let chunks = chunk_ids_by_doc
+        let chunks: Vec<ChunkRecord> = chunk_ids_by_doc
             .get(&document_id)
             .and_then(Value::as_array)
             .into_iter()
@@ -726,6 +734,9 @@ fn index_from_loaded_store(
                 vector: vec![0.0; vector_dim],
             })
             .collect();
+        if !chunks.is_empty() {
+            has_placeholder_vectors = true;
+        }
         documents.insert(
             document_id.clone(),
             DocumentRecord {
@@ -746,6 +757,7 @@ fn index_from_loaded_store(
         bit_width,
         documents,
         generation: loaded.generation,
+        vectors_seeded: !has_placeholder_vectors,
         delete_count: state
             .get("delete_count")
             .and_then(Value::as_u64)
@@ -848,6 +860,7 @@ struct VectorOnlyIndex {
     bit_width: usize,
     documents: BTreeMap<String, DocumentRecord>,
     generation: u64,
+    vectors_seeded: bool,
     delete_count: usize,
     deleted_chunk_count: usize,
 }
@@ -860,9 +873,20 @@ impl VectorOnlyIndex {
             bit_width,
             documents: BTreeMap::new(),
             generation: 0,
+            vectors_seeded: true,
             delete_count: 0,
             deleted_chunk_count: 0,
         }
+    }
+
+    fn require_vectors_seeded(&self) -> Result<(), CoreError> {
+        if !self.vectors_seeded {
+            return Err(CoreError::new(
+                CoreErrorCode::Unsupported,
+                "persisted vector sidecars are not yet loaded by native core",
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_filter(&self, filter: Option<&Value>) -> Result<BTreeSet<String>, CoreError> {
