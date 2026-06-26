@@ -7,12 +7,17 @@ class FakeNativeAdapter:
     def __init__(self, handle: FakeNativeVectorEngine, *, available: bool = True) -> None:
         self._handle = handle
         self._available = available
+        self.opened_readonly = False
 
     @property
     def available(self) -> bool:
         return self._available
 
     def new_engine(self) -> FakeNativeVectorEngine:
+        return self._handle
+
+    def open_readonly_engine(self, *args, **kwargs) -> FakeNativeVectorEngine:
+        self.opened_readonly = True
         return self._handle
 
 
@@ -173,6 +178,29 @@ def test_default_native_on_falls_back_when_extension_unavailable(tmp_path, monke
     assert db.stats()["native_core"]["mode"] == "on"
     assert db.stats()["native_core"]["enabled"] is False
     assert db.stats()["native_core"]["fallback_reason"] == "native_core_extension_unavailable"
+
+
+def test_native_on_readonly_existing_store_uses_persistent_seed(tmp_path, monkeypatch) -> None:
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    writer.add_vectors(_onehot(0), id="a", metadata={"topic": "ops"})
+    writer.close()
+
+    native = FakeNativeVectorEngine(score_offset=100)
+    native.documents["a"] = {"vector": _onehot(0), "metadata": {"topic": "ops"}}
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8, read_only=True)
+
+    hits = db.search_by_vector(_onehot(0), k=1)
+    assert [hit.id for hit in hits] == ["a"]
+    assert hits[0].score > 100.0
+    assert adapter.opened_readonly is True
+    assert db.stats()["native_core"]["covered"] is True
+    assert db.stats()["native_core"]["fallback_reason"] == ""
 
 
 def test_native_on_existing_store_falls_back_to_python_until_seeded(tmp_path, monkeypatch) -> None:

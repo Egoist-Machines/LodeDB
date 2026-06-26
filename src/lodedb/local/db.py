@@ -407,7 +407,12 @@ class LodeDB:
         # any persisted state for this client hash via the engine constructor.
         self._ensure_index()
         self._auto_id_counter = 0
-        self._maybe_init_native_vector_engine(resolved_bit_width)
+        native_durability = "fsync" if fsync_on_commit else "relaxed"
+        self._maybe_init_native_vector_engine(
+            resolved_bit_width,
+            durability=native_durability,
+            commit_mode=resolved_commit_mode.value,
+        )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
         # Split by phase: "ingest" (add_image/add_images) vs "query" (search_by_image).
@@ -1177,19 +1182,40 @@ class LodeDB:
 
     # -- internals ----------------------------------------------------------
 
-    def _maybe_init_native_vector_engine(self, bit_width: int) -> None:
+    def _maybe_init_native_vector_engine(
+        self,
+        bit_width: int,
+        *,
+        durability: str,
+        commit_mode: str,
+    ) -> None:
         """Initializes the native vector engine when the rollout policy allows it."""
 
         if self._native_core_mode == NativeCoreMode.OFF or not self.vector_only:
-            return
-        if self.read_only:
-            self._native_core_fallback_reason = "read_only_native_vector_seed_unavailable"
             return
         adapter = NativeCoreAdapter()
         if not adapter.available:
             self._native_core_fallback_reason = "native_core_extension_unavailable"
             if self._native_core_fail_closed:
                 raise RuntimeError("LODEDB_NATIVE_CORE=on requires lodedb._native_core")
+            return
+        if self.read_only:
+            try:
+                native_engine = adapter.open_readonly_engine(
+                    self.path,
+                    durability=durability,
+                    commit_mode=commit_mode,
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                )
+                native_engine.stats(_LOCAL_INDEX_ID)
+            except Exception as exc:
+                self._native_core_fallback_reason = "read_only_native_vector_seed_unavailable"
+                if self._native_core_fail_closed:
+                    raise RuntimeError("failed to initialize read-only native core") from exc
+                return
+            self._native_vector_engine = native_engine
+            self._native_vector_covered = True
             return
         try:
             native_engine = adapter.new_engine()

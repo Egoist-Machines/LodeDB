@@ -13,6 +13,7 @@ import importlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from os import PathLike
 from typing import Any, Protocol
 
 from lodedb.engine.core import EngineDocument, EngineQuery, EngineResponse, EngineVectorDocument
@@ -65,6 +66,53 @@ class NativeCoreAdapter:
         module = self._require_module()
         return NativeCoreEngineHandle(module.CoreEngine())
 
+    def open_engine(
+        self,
+        *,
+        path: str | PathLike[str],
+        read_only: bool,
+        durability: str,
+        commit_mode: str,
+        store_text: bool,
+        index_text: bool,
+    ) -> NativeCoreEngineHandle:
+        """Opens a persistent native engine handle through the hidden extension."""
+
+        module = self._require_module()
+        options = self.open_options_payload(
+            path=path,
+            read_only=read_only,
+            durability=durability,
+            commit_mode=commit_mode,
+            store_text=store_text,
+            index_text=index_text,
+        )
+        return NativeCoreEngineHandle(module.CoreEngine.open(self._dumps(options)))
+
+    def open_readonly_engine(
+        self,
+        path: str | PathLike[str],
+        *,
+        durability: str,
+        commit_mode: str,
+        store_text: bool,
+        index_text: bool,
+    ) -> NativeCoreEngineHandle:
+        """Opens a lock-free read-only native engine snapshot."""
+
+        module = self._require_module()
+        options = self.open_options_payload(
+            path=path,
+            read_only=True,
+            durability=durability,
+            commit_mode=commit_mode,
+            store_text=store_text,
+            index_text=index_text,
+        )
+        return NativeCoreEngineHandle(
+            module.CoreEngine.open_readonly(str(path), self._dumps(options))
+        )
+
     @staticmethod
     def document_payload(document: EngineDocument) -> dict[str, Any]:
         return {
@@ -93,6 +141,25 @@ class NativeCoreAdapter:
             "embedding": (
                 None if query.embedding is None else [float(value) for value in query.embedding]
             ),
+        }
+
+    @staticmethod
+    def open_options_payload(
+        *,
+        path: str | PathLike[str],
+        read_only: bool,
+        durability: str,
+        commit_mode: str,
+        store_text: bool,
+        index_text: bool,
+    ) -> dict[str, Any]:
+        return {
+            "path": str(path),
+            "read_only": bool(read_only),
+            "durability": str(durability),
+            "commit_mode": str(commit_mode),
+            "store_text": bool(store_text),
+            "index_text": bool(index_text),
         }
 
     @staticmethod
