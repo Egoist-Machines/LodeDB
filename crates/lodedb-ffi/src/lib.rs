@@ -235,6 +235,12 @@ pub unsafe extern "C" fn lodedb_engine_query_vector(
         }
         let engine = engine_ref(engine)?;
         let request = unsafe { *request };
+        validate_abi_header(
+            request.size,
+            request.version,
+            std::mem::size_of::<LodeSearchRequest>(),
+            "search request",
+        )?;
         let index_id = read_string(request.index_id)?;
         let query = read_f32_slice(request.query, request.query_len)?;
         let results = engine.query_vector(&index_id, query, request.top_k, None)?;
@@ -330,6 +336,12 @@ fn engine_ref<'a>(engine: *const LodeEngine) -> Result<&'a CoreEngine, CoreError
 }
 
 fn read_string(view: LodeStringView) -> Result<String, CoreError> {
+    validate_abi_header(
+        view.size,
+        view.version,
+        std::mem::size_of::<LodeStringView>(),
+        "string view",
+    )?;
     if view.data.is_null() {
         if view.len == 0 {
             return Ok(String::new());
@@ -360,6 +372,12 @@ fn read_vector_documents(
     documents
         .iter()
         .map(|document| {
+            validate_abi_header(
+                document.size,
+                document.version,
+                std::mem::size_of::<LodeVectorDocument>(),
+                "vector document",
+            )?;
             let vector = read_f32_slice(document.vector, document.vector_len)?.to_vec();
             Ok(CoreVectorDocument {
                 document_id: read_string(document.document_id)?,
@@ -385,7 +403,15 @@ fn read_metadata(
     let pairs = unsafe { slice::from_raw_parts(metadata, metadata_len) };
     pairs
         .iter()
-        .map(|pair| Ok((read_string(pair.key)?, read_string(pair.value)?)))
+        .map(|pair| {
+            validate_abi_header(
+                pair.size,
+                pair.version,
+                std::mem::size_of::<LodeMetadataPair>(),
+                "metadata pair",
+            )?;
+            Ok((read_string(pair.key)?, read_string(pair.value)?))
+        })
         .collect()
 }
 
@@ -398,9 +424,24 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
     Err(CoreError::new(CoreErrorCode::InvalidArgument, message))
 }
 
+fn validate_abi_header(
+    size: u32,
+    version: u32,
+    expected_size: usize,
+    context: &str,
+) -> Result<(), CoreError> {
+    if usize::try_from(size).ok() != Some(expected_size) {
+        return invalid(format!("{context} ABI size mismatch"));
+    }
+    if version != ABI_VERSION {
+        return invalid(format!("{context} ABI version mismatch"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LodeError, LodeSearchHit, LodeSearchRequest, LodeSearchResults};
+    use super::*;
 
     #[test]
     fn abi_struct_versions_start_each_public_struct() {
@@ -410,5 +451,94 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LodeSearchRequest, version), 4);
         assert_eq!(std::mem::offset_of!(LodeSearchHit, size), 0);
         assert_eq!(std::mem::offset_of!(LodeSearchResults, size), 0);
+    }
+
+    #[test]
+    fn invalid_search_request_version_returns_ffi_error() {
+        let mut error: *mut LodeError = ptr::null_mut();
+        let mut engine: *mut LodeEngine = ptr::null_mut();
+        let index_id = string_view("default");
+
+        unsafe {
+            assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
+            assert_eq!(
+                lodedb_engine_create_index(engine, index_id, 2, 4, &mut error),
+                0
+            );
+        }
+
+        let query = [1.0_f32, 0.0_f32];
+        let request = LodeSearchRequest {
+            size: std::mem::size_of::<LodeSearchRequest>() as u32,
+            version: ABI_VERSION + 1,
+            index_id,
+            query: query.as_ptr(),
+            query_len: query.len(),
+            top_k: 1,
+        };
+        let mut results: *mut LodeSearchResults = ptr::null_mut();
+        let status =
+            unsafe { lodedb_engine_query_vector(engine, &request, &mut results, &mut error) };
+
+        assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
+        assert!(results.is_null());
+        assert!(!error.is_null());
+        let message = unsafe { std::ffi::CStr::from_ptr((*error).message) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(message.contains("ABI version mismatch"));
+        unsafe {
+            lodedb_error_free(error);
+            lodedb_engine_free(engine);
+        }
+    }
+
+    #[test]
+    fn invalid_vector_document_size_returns_ffi_error() {
+        let mut error: *mut LodeError = ptr::null_mut();
+        let mut engine: *mut LodeEngine = ptr::null_mut();
+        let index_id = string_view("default");
+        unsafe {
+            assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
+            assert_eq!(
+                lodedb_engine_create_index(engine, index_id, 2, 4, &mut error),
+                0
+            );
+        }
+        let vector = [1.0_f32, 0.0_f32];
+        let document = LodeVectorDocument {
+            size: 0,
+            version: ABI_VERSION,
+            document_id: string_view("doc-a"),
+            vector: vector.as_ptr(),
+            vector_len: vector.len(),
+            metadata: ptr::null(),
+            metadata_len: 0,
+            text: string_view(""),
+            has_text: 0,
+        };
+
+        let status =
+            unsafe { lodedb_engine_upsert_vectors(engine, index_id, &document, 1, &mut error) };
+
+        assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
+        assert!(!error.is_null());
+        let message = unsafe { std::ffi::CStr::from_ptr((*error).message) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(message.contains("ABI size mismatch"));
+        unsafe {
+            lodedb_error_free(error);
+            lodedb_engine_free(engine);
+        }
+    }
+
+    fn string_view(text: &'static str) -> LodeStringView {
+        LodeStringView {
+            size: std::mem::size_of::<LodeStringView>() as u32,
+            version: ABI_VERSION,
+            data: text.as_ptr().cast::<c_char>(),
+            len: text.len(),
+        }
     }
 }
