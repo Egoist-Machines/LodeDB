@@ -1,0 +1,30 @@
+{
+  "config": {
+    "docs": 800,
+    "patches_per_doc": 64,
+    "dim": 128,
+    "concepts": 256,
+    "concepts_per_doc": 6,
+    "query_tokens": 8,
+    "queries": 150,
+    "k": 10,
+    "candidate_depth": 16,
+    "seed": 0
+  },
+  "late_interaction": {
+    "ingest_seconds": 30.112,
+    "patch_rows": 51200,
+    "disk_bytes": 127367097,
+    "mean_query_ms": 114.399,
+    "p95_query_ms": 174.381,
+    "recall_at_k": 0.728
+  },
+  "single_vector": {
+    "ingest_seconds": 0.287,
+    "rows": 800,
+    "disk_bytes": 315490,
+    "mean_query_ms": 0.148,
+    "p95_query_ms": 0.213,
+    "recall_at_k": 0.0487
+  }
+}
