@@ -4,6 +4,7 @@
 //! starts as a dependency-light home for deterministic core semantics that will
 //! move from Python into Rust milestone by milestone.
 
+pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod lexical;
