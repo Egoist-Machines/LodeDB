@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -138,6 +139,34 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
         )
     )
     assert hits["hits"][0]["document_id"] == "doc-alpha"
+
+
+def test_native_core_extension_opens_readonly_persisted_vector_fixture(tmp_path) -> None:
+    source = Path(__file__).resolve().parent / "fixtures" / "persisted" / "v0_4_store_text"
+    store = tmp_path / "store"
+    shutil.copytree(source, store)
+    options = {
+        "path": str(store),
+        "read_only": True,
+        "durability": "relaxed",
+        "commit_mode": "generation",
+        "store_text": True,
+        "index_text": False,
+    }
+
+    engine = native_core.CoreEngine.open_readonly(str(store), json.dumps(options))
+    stats = _loads(engine.stats("default"))
+    assert stats["document_count"] == 3
+
+    hits = _loads(
+        engine.query_vector(
+            "default",
+            json.dumps(_onehot(0)),
+            3,
+            None,
+        )
+    )
+    assert hits["hits"][0]["document_id"] == "vec-alpha"
 
 
 def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) -> None:
