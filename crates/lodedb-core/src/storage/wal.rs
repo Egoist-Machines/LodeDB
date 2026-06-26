@@ -559,10 +559,175 @@ fn crc32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::*;
+    use crate::storage::{LoadOptions, StoreLayout};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lodedb-core-wal-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn empty_state(index_key: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "client_id_hash": index_key,
+            "index_id": "default",
+            "index_key": index_key,
+            "name": "lodedb-local",
+            "model": "sentence-transformers/all-MiniLM-L6-v2",
+            "provider": "local_open",
+            "task": "direct-turbovec",
+            "route_profile": "minilm-turbovec",
+            "storage_profile": "turbovec_direct",
+            "native_dim": 384,
+            "turbovec_bit_width": 4,
+            "status": "ready",
+            "metadata": {},
+            "chunks": [],
+            "document_hashes": {},
+            "document_chunk_ids": {},
+            "document_metadata": {},
+            "embedded_chunk_count": 0,
+            "delete_count": 0,
+            "deleted_chunk_count": 0,
+            "cache_reuse_count": 0,
+            "fallback_count": 0,
+            "fallback_reasons": {},
+            "query_count": 0,
+            "columnar_generation": 1,
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "updated_at": "2026-06-26T00:00:00+00:00"
+        })
+    }
 
     #[test]
     fn crc32_matches_known_vector() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn appends_and_reads_framed_records() {
+        let dir = temp_dir("append-read");
+        let path = dir.join("default.wal");
+        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+            .expect("append first");
+        let append = append_record(
+            &path,
+            "delete_documents",
+            &json!({"document_ids": ["alpha"]}),
+            false,
+        )
+        .expect("append second");
+
+        let records = read_records(&path).expect("read records");
+        assert_eq!(append.op_count, 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].op, "upsert_documents");
+        assert_eq!(records[1].payload["document_ids"], json!(["alpha"]));
+        let stats = scan_stats(&path).expect("scan stats");
+        assert_eq!(stats.op_count, 2);
+        assert!(stats.byte_count >= append.record_bytes);
+    }
+
+    #[test]
+    fn drops_torn_trailing_frame() {
+        let dir = temp_dir("torn-tail");
+        let path = dir.join("default.wal");
+        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+            .expect("append first");
+        append_record(
+            &path,
+            "delete_documents",
+            &json!({"document_ids": ["alpha"]}),
+            false,
+        )
+        .expect("append second");
+        let mut handle = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open wal");
+        handle.write_all(&[0, 0, 1]).expect("write torn tail");
+
+        let records = read_records(&path).expect("read records");
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn corrupt_interior_frame_fails_closed() {
+        let dir = temp_dir("interior-corrupt");
+        let path = dir.join("default.wal");
+        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+            .expect("append first");
+        append_record(
+            &path,
+            "delete_documents",
+            &json!({"document_ids": ["alpha"]}),
+            false,
+        )
+        .expect("append second");
+        let mut raw = std::fs::read(&path).expect("read wal bytes");
+        raw[16] ^= 0xFF;
+        std::fs::write(&path, raw).expect("write corrupt wal");
+
+        let error = read_records(&path).expect_err("interior corruption should fail");
+        assert!(error.to_string().contains("interior corruption"));
+    }
+
+    #[test]
+    fn checkpoint_writes_generation_and_truncates_wal() {
+        let dir = temp_dir("checkpoint");
+        let index_key = "checkpoint-key";
+        let wal = wal_path(&dir, index_key);
+        append_record(
+            &wal,
+            "upsert_documents",
+            &json!({
+                "documents": [{
+                    "document_id": "alpha",
+                    "text": "Alpha text.",
+                    "metadata": {}
+                }]
+            }),
+            false,
+        )
+        .expect("append wal");
+        let mut state = empty_state(index_key);
+        state["document_hashes"]["alpha"] = json!(sha256_text("Alpha text."));
+        let mut raw_text = BTreeMap::new();
+        raw_text.insert("alpha".to_string(), "Alpha text.".to_string());
+        let store = LoadedStore {
+            layout: StoreLayout::Generation,
+            index_key: index_key.to_string(),
+            generation: 1,
+            base_epoch: 1,
+            state,
+            tvim_path: None,
+            raw_text,
+            lexical_tokens: BTreeMap::new(),
+            wal_records: Vec::new(),
+        };
+
+        checkpoint_store(&dir, &store, 2, false).expect("checkpoint");
+
+        assert!(!wal.exists());
+        let loaded = crate::storage::load_store(&dir, index_key, LoadOptions::default())
+            .expect("load checkpoint");
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.document_count(), 1);
+        assert_eq!(
+            loaded.raw_text.get("alpha").map(String::as_str),
+            Some("Alpha text.")
+        );
     }
 }
