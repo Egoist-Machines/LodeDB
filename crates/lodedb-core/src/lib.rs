@@ -5,6 +5,7 @@
 //! move from Python into Rust milestone by milestone.
 
 pub mod error;
+pub mod filter;
 pub mod text;
 pub mod types;
 pub mod vector;
