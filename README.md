@@ -32,6 +32,10 @@ LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more com
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
+> **Like what you see?** Point the coding assistant in your project at
+> [egoistmachines.com/lodedb/install-agent](https://egoistmachines.com/lodedb/install-agent)
+> and it will migrate your existing store onto the LodeDB backend.
+
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index **on the
 GPU** when you have one: batched search hits *24k queries/sec on an A10 and 50k qps on an L40S*,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
