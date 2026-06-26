@@ -1,0 +1,11 @@
+{
+  "base": {
+    "document_count": 3,
+    "file_bytes": 464,
+    "file_name": "g4.tvlex",
+    "sha256": "c05c1fedabcfb56064ff2f0dba98e7596c65125b2768628ebff5be749d24ed28"
+  },
+  "deltas": [],
+  "next_seq": 1,
+  "schema_version": 1
+}

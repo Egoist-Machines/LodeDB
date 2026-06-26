@@ -1,0 +1,21 @@
+{
+  "base": {
+    "calibration_fingerprint": 8657639890313018670,
+    "file_bytes": 3294,
+    "file_name": "g2.tvim",
+    "rows": 1,
+    "sha256": "5f655a76842d0c2c1f478299626ab0c7d3c2437774c562a95566526d95256d86"
+  },
+  "deltas": [
+    {
+      "file_bytes": 987,
+      "file_name": "delta-00000001.tvd",
+      "removed_rows": 0,
+      "seq": 1,
+      "sha256": "5e16cc845ed0763043fc3ecff0501a1a75cafb7cc9954bd6f817e01bb6f94e7d",
+      "upsert_rows": 1
+    }
+  ],
+  "next_seq": 2,
+  "schema_version": 1
+}

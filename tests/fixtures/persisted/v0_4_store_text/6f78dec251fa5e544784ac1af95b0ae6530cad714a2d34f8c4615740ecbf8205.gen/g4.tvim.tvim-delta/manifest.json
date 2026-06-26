@@ -1,0 +1,12 @@
+{
+  "base": {
+    "calibration_fingerprint": 9715441782240390313,
+    "file_bytes": 130,
+    "file_name": "g4.tvim",
+    "rows": 3,
+    "sha256": "fbaa961ee4fb3a9c5a5bb745163235d5b59dd5f46b49afbb995dc22f2b83c5f3"
+  },
+  "deltas": [],
+  "next_seq": 1,
+  "schema_version": 1
+}

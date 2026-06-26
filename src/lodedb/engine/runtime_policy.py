@@ -34,6 +34,19 @@ class CommitMode(StrEnum):
     WAL = "wal"
 
 
+class NativeCoreMode(StrEnum):
+    """Rollout modes for the future native Rust engine.
+
+    The flags are intentionally parsed in this module before any native runtime
+    is wired in. Commit 0 needs the safety rails available to tests and CI, but
+    the Python engine remains authoritative until later GOAL.md milestones.
+    """
+
+    OFF = "off"
+    SHADOW = "shadow"
+    ON = "on"
+
+
 class GpuDirectTurboVecPolicy(StrEnum):
     """Names GPU-resident exact batch serving policies for direct TurboVec."""
 
@@ -101,6 +114,42 @@ def commit_mode_from_env(env: Mapping[str, str] | None = None) -> CommitMode:
     return parse_commit_mode(source.get("LODEDB_COMMIT_MODE", "wal"))
 
 
+def native_core_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCoreMode:
+    """Returns the native-core execution mode.
+
+    Defaults to ``off`` so current Python behavior is unchanged. ``shadow`` and
+    ``on`` are reserved for later migration milestones.
+    """
+
+    source = os.environ if env is None else env
+    return parse_native_core_mode(source.get("LODEDB_NATIVE_CORE", "off"), "LODEDB_NATIVE_CORE")
+
+
+def native_core_write_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCoreMode:
+    """Returns the native-core durable-write mode.
+
+    This flag is independent from query/mutation execution because storage
+    cutover must be staged behind shadow writes and cross-read checks.
+    """
+
+    source = os.environ if env is None else env
+    return parse_native_core_mode(
+        source.get("LODEDB_NATIVE_CORE_WRITE", "off"), "LODEDB_NATIVE_CORE_WRITE"
+    )
+
+
+def native_core_strict_parity_from_env(env: Mapping[str, str] | None = None) -> bool:
+    """Returns whether native-core shadow mismatches should fail loudly."""
+
+    source = os.environ if env is None else env
+    value = str(source.get("LODEDB_NATIVE_CORE_STRICT_PARITY", "0")).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError("LODEDB_NATIVE_CORE_STRICT_PARITY must be a boolean flag")
+
+
 def parse_commit_mode(value: str | None) -> CommitMode:
     """Parses and validates a commit-mode string (shared by the env + SDK paths)."""
 
@@ -109,6 +158,19 @@ def parse_commit_mode(value: str | None) -> CommitMode:
     except ValueError as exc:
         allowed = ", ".join(mode.value for mode in CommitMode)
         raise ValueError(f"commit_mode must be one of: {allowed}") from exc
+
+
+def parse_native_core_mode(
+    value: str | None,
+    env_name: str = "LODEDB_NATIVE_CORE",
+) -> NativeCoreMode:
+    """Parses a native-core rollout mode string."""
+
+    try:
+        return NativeCoreMode(str(value or "off").strip().lower())
+    except ValueError as exc:
+        allowed = ", ".join(mode.value for mode in NativeCoreMode)
+        raise ValueError(f"{env_name} must be one of: {allowed}") from exc
 
 
 def gpu_direct_turbovec_policy_from_env(
@@ -326,5 +388,3 @@ def _parse_mps_direct_turbovec_policy(value: str | None) -> MpsDirectTurboVecPol
         raise ValueError(
             f"LODEDB_MPS_DIRECT_TURBOVEC must be one of: {allowed}"
         ) from exc
-
-

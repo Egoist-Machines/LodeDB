@@ -1,0 +1,12 @@
+{
+  "base": {
+    "chunk_count": 3,
+    "document_count": 3,
+    "file_bytes": 1861,
+    "file_name": "g4.json",
+    "sha256": "71db14f588b223780564f08c8def537d36e89115e2efb8a846a7bf70c6251db6"
+  },
+  "deltas": [],
+  "next_seq": 1,
+  "schema_version": 1
+}

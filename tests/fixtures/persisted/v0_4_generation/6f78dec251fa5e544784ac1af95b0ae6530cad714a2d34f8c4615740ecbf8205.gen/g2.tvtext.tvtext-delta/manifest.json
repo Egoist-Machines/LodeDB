@@ -1,0 +1,20 @@
+{
+  "base": {
+    "document_count": 1,
+    "file_bytes": 230,
+    "file_name": "g2.tvtext",
+    "sha256": "e40e504a15b3046f6b9f2cca36a9152a90decc56dd7e50a193e2c379ab9b9855"
+  },
+  "deltas": [
+    {
+      "deleted": 0,
+      "file_bytes": 269,
+      "file_name": "text-00000001.txd",
+      "seq": 1,
+      "sha256": "7c94a8447069b3d2ff99a1313c81abf1aab23faa32db887b0dc4ece20eafce73",
+      "upserted": 1
+    }
+  ],
+  "next_seq": 2,
+  "schema_version": 2
+}

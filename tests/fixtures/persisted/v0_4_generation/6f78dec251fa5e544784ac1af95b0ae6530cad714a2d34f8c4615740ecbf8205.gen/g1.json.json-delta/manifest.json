@@ -1,0 +1,12 @@
+{
+  "base": {
+    "chunk_count": 0,
+    "document_count": 0,
+    "file_bytes": 865,
+    "file_name": "g1.json",
+    "sha256": "fd511cbaaeb6245756c187fe903c2e6924629431520463104e54bd9e172333f2"
+  },
+  "deltas": [],
+  "next_seq": 1,
+  "schema_version": 1
+}
