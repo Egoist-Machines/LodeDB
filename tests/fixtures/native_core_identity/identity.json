@@ -1,0 +1,335 @@
+{
+  "chunk_cases": [
+    {
+      "chunks": [
+        "abc",
+        "def",
+        "g"
+      ],
+      "limit": 3,
+      "text": "  abcdefg  "
+    },
+    {
+      "chunks": [],
+      "limit": 5,
+      "text": ""
+    },
+    {
+      "chunks": [
+        "😀😃",
+        "😄😁"
+      ],
+      "limit": 2,
+      "text": "😀😃😄😁"
+    },
+    {
+      "chunks": [
+        "line one\n",
+        "line two"
+      ],
+      "limit": 9,
+      "text": "line one\nline two"
+    }
+  ],
+  "chunk_id_cases": [
+    {
+      "chunk_hash": "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+      "chunk_id": "doc-repeat:25e2b6b10652:0000",
+      "document_id": "doc-repeat",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+      "chunk_id": "doc-repeat:25e2b6b10652:0001",
+      "document_id": "doc-repeat",
+      "occurrence": 1
+    },
+    {
+      "chunk_hash": "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+      "chunk_id": "doc-repeat:25e2b6b10652:0002",
+      "document_id": "doc-repeat",
+      "occurrence": 2
+    },
+    {
+      "chunk_hash": "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+      "chunk_id": "doc-repeat:25e2b6b10652:0003",
+      "document_id": "doc-repeat",
+      "occurrence": 3
+    },
+    {
+      "chunk_hash": "81ef060bcd98adc7824eb5c1ada83c32491b16018e11e79f00ab9d09e04b015a",
+      "chunk_id": "doc-unicode:81ef060bcd98:0000",
+      "document_id": "doc-unicode",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e",
+      "chunk_id": "doc-unicode:850f7dc43910:0000",
+      "document_id": "doc-unicode",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+      "chunk_id": "doc-unicode:2e7d2c03a950:0000",
+      "document_id": "doc-unicode",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "9f66bf5df5bedea99b0883d61093d483b36d239dc4bf128652a60abcb08e2334",
+      "chunk_id": "doc-unicode:9f66bf5df5be:0000",
+      "document_id": "doc-unicode",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "ba2cf9cc51891a256b90fd0aab1c05be460abf5b18ba9d329ce2eac1062aa5ba",
+      "chunk_id": "doc-random-00:ba2cf9cc5189:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "d800b8c6db2922400660fe513f56b36142a2888057c87d577b517343a9be6a6a",
+      "chunk_id": "doc-random-00:d800b8c6db29:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "88cb88a1d86451d6938d0f30694bc3929630d90d6b7e311607bdd2a0f5d73100",
+      "chunk_id": "doc-random-00:88cb88a1d864:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "174e49f133d6deac07138256af4e6ae083a349aa84e87a7b0933213ddd9176b8",
+      "chunk_id": "doc-random-00:174e49f133d6:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "d39a9b234fa65dea10b9320c4b94dae985391ad501f0f8d27031a463f6658c78",
+      "chunk_id": "doc-random-00:d39a9b234fa6:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "20a6995aa5417d5231b9899dcf509e46930325294e8b4d2d679bde8bef76e528",
+      "chunk_id": "doc-random-00:20a6995aa541:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "2c5c8591634458460b2de6845fb8a46e3a091009463d09e8b710b8f6ca60bafb",
+      "chunk_id": "doc-random-00:2c5c85916344:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "990114a1a4647ebbab9422db465b3f06dcd0feb1fab089dc5db9c0506318a470",
+      "chunk_id": "doc-random-00:990114a1a464:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    },
+    {
+      "chunk_hash": "fd1f50f1b0b746a60624b5179e80f1f72ec8e75b6707c2e44f0f252ddfc88965",
+      "chunk_id": "doc-random-00:fd1f50f1b0b7:0000",
+      "document_id": "doc-random-00",
+      "occurrence": 0
+    }
+  ],
+  "document_cases": [
+    {
+      "chunk_hashes": [
+        "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+        "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+        "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1",
+        "25e2b6b106523880e27763084ffa6a0756335be0d7106022535365b9ad39b4b1"
+      ],
+      "chunk_ids": [
+        "doc-repeat:25e2b6b10652:0000",
+        "doc-repeat:25e2b6b10652:0001",
+        "doc-repeat:25e2b6b10652:0002",
+        "doc-repeat:25e2b6b10652:0003"
+      ],
+      "chunks": [
+        "repeat ",
+        "repeat ",
+        "repeat ",
+        "repeat"
+      ],
+      "document_id": "doc-repeat",
+      "limit": 7,
+      "text": "repeat repeat repeat repeat"
+    },
+    {
+      "chunk_hashes": [
+        "81ef060bcd98adc7824eb5c1ada83c32491b16018e11e79f00ab9d09e04b015a",
+        "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e",
+        "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6",
+        "9f66bf5df5bedea99b0883d61093d483b36d239dc4bf128652a60abcb08e2334"
+      ],
+      "chunk_ids": [
+        "doc-unicode:81ef060bcd98:0000",
+        "doc-unicode:850f7dc43910:0000",
+        "doc-unicode:2e7d2c03a950:0000",
+        "doc-unicode:9f66bf5df5be:0000"
+      ],
+      "chunks": [
+        "café",
+        " café",
+        "\n\t  c",
+        "afe"
+      ],
+      "document_id": "doc-unicode",
+      "limit": 5,
+      "text": "café café\n\t  cafe"
+    },
+    {
+      "chunk_hashes": [
+        "ba2cf9cc51891a256b90fd0aab1c05be460abf5b18ba9d329ce2eac1062aa5ba",
+        "d800b8c6db2922400660fe513f56b36142a2888057c87d577b517343a9be6a6a",
+        "88cb88a1d86451d6938d0f30694bc3929630d90d6b7e311607bdd2a0f5d73100",
+        "174e49f133d6deac07138256af4e6ae083a349aa84e87a7b0933213ddd9176b8",
+        "d39a9b234fa65dea10b9320c4b94dae985391ad501f0f8d27031a463f6658c78",
+        "20a6995aa5417d5231b9899dcf509e46930325294e8b4d2d679bde8bef76e528",
+        "2c5c8591634458460b2de6845fb8a46e3a091009463d09e8b710b8f6ca60bafb",
+        "990114a1a4647ebbab9422db465b3f06dcd0feb1fab089dc5db9c0506318a470",
+        "fd1f50f1b0b746a60624b5179e80f1f72ec8e75b6707c2e44f0f252ddfc88965"
+      ],
+      "chunk_ids": [
+        "doc-random-00:ba2cf9cc5189:0000",
+        "doc-random-00:d800b8c6db29:0000",
+        "doc-random-00:88cb88a1d864:0000",
+        "doc-random-00:174e49f133d6:0000",
+        "doc-random-00:d39a9b234fa6:0000",
+        "doc-random-00:20a6995aa541:0000",
+        "doc-random-00:2c5c85916344:0000",
+        "doc-random-00:990114a1a464:0000",
+        "doc-random-00:fd1f50f1b0b7:0000"
+      ],
+      "chunks": [
+        "JKzji",
+        "GéQGV",
+        "ZxFE ",
+        "jk21g",
+        "4Sb9G",
+        "rRD/s",
+        "mYMe/",
+        "kv6tH",
+        "ég"
+      ],
+      "document_id": "doc-random-00",
+      "limit": 5,
+      "text": "JKzjiGéQGVZxFE jk21g4Sb9GrRD/smYMe/kv6tHég"
+    },
+    {
+      "chunk_hashes": [
+        "8ca813ade2862c4eeafa9ad9f9266cfbdfbe7940fa5d2b970f8730694804040a",
+        "2d25137b9e208da867034f0653847f92caf1c37c9ea43d457790fedb5c9330c3"
+      ],
+      "chunk_ids": [
+        "doc-random-01:8ca813ade286:0000",
+        "doc-random-01:2d25137b9e20:0000"
+      ],
+      "chunks": [
+        "5tS1iN4",
+        "7TbUu"
+      ],
+      "document_id": "doc-random-01",
+      "limit": 7,
+      "text": "5tS1iN47TbUu"
+    },
+    {
+      "chunk_hashes": [
+        "cc3504a278b1cd7095c3f872785b7235e80d57631a035da7a111c9692b147693",
+        "6f10dd8217ead7413fc7be17f692c2bae57c868c97127b419dd58cfe98327328",
+        "86be9a55762d316a3026c2836d044f5fc76e34da10e1b45feee5f18be7edb177"
+      ],
+      "chunk_ids": [
+        "doc-random-02:cc3504a278b1:0000",
+        "doc-random-02:6f10dd8217ea:0000",
+        "doc-random-02:86be9a55762d:0000"
+      ],
+      "chunks": [
+        "9T_h_FvA lQ",
+        "RhYRoMGkM67",
+        "K"
+      ],
+      "document_id": "doc-random-02",
+      "limit": 11,
+      "text": "9T_h_FvA lQRhYRoMGkM67K"
+    }
+  ],
+  "hash_cases": [
+    {
+      "normalized_chunk_hash": "49ec476cea2b49f4ea1308c54b61fc858efc50379892cc10ce328fb2720b17a7",
+      "sha256": "49ec476cea2b49f4ea1308c54b61fc858efc50379892cc10ce328fb2720b17a7",
+      "text": "alpha document"
+    },
+    {
+      "normalized_chunk_hash": "64989ccbf3efa9c84e2afe7cee9bc5828bf0fcb91e44f8c1e591638a2c2e90e3",
+      "sha256": "5a4ec54364bbf05a22c84949ab1b938e42a818660012c5f81309a32ed4ca58e6",
+      "text": "alpha\n\t beta   gamma"
+    },
+    {
+      "normalized_chunk_hash": "a4f3ac0dd1f776e1bcf77465fee19e1e7f64f992a82da3614b292820784c5db2",
+      "sha256": "a4f3ac0dd1f776e1bcf77465fee19e1e7f64f992a82da3614b292820784c5db2",
+      "text": "café and café"
+    },
+    {
+      "normalized_chunk_hash": "2f5342d289b88dceed4f7407da698a273299607167eb5cab5d0fdecbcceb988f",
+      "sha256": "2ef763ca2f4f2881ff1efa49428784736bd11b60901cc192c12eb9df1c5885a9",
+      "text": "  leading and trailing  "
+    }
+  ],
+  "stable_id_cases": [
+    {
+      "chunk_ids": [
+        "doc-repeat:25e2b6b10652:0000",
+        "doc-repeat:25e2b6b10652:0001",
+        "doc-repeat:25e2b6b10652:0002",
+        "doc-repeat:25e2b6b10652:0003"
+      ],
+      "stable_ids": [
+        10252449756785751517,
+        16354713230100022617,
+        17656691364275568443,
+        10175536028099978759
+      ]
+    },
+    {
+      "chunk_ids": [
+        "doc-unicode:81ef060bcd98:0000",
+        "doc-unicode:850f7dc43910:0000",
+        "doc-unicode:2e7d2c03a950:0000",
+        "doc-unicode:9f66bf5df5be:0000"
+      ],
+      "stable_ids": [
+        9018313669912725634,
+        15278929694013891805,
+        6364485342380339792,
+        6102423981070640648
+      ]
+    },
+    {
+      "chunk_ids": [
+        "doc-random-02:cc3504a278b1:0000",
+        "doc-random-02:6f10dd8217ea:0000",
+        "doc-random-02:86be9a55762d:0000"
+      ],
+      "stable_ids": [
+        10961524861487411408,
+        369401614496718009,
+        12334038480246753236
+      ]
+    },
+    {
+      "chunk_ids": [
+        "doc-alpha:88d4741101bd:0000",
+        "doc-beta:fbccf9cc33a3:0000"
+      ],
+      "stable_ids": [
+        9230259498505691355,
+        4357769671793707343
+      ]
+    }
+  ]
+}

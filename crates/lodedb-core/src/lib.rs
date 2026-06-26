@@ -5,7 +5,9 @@
 //! move from Python into Rust milestone by milestone.
 
 pub mod error;
+pub mod text;
 pub mod types;
+pub mod vector;
 pub mod version;
 
 pub use error::{CoreError, CoreErrorCode};
@@ -14,4 +16,5 @@ pub use types::{
     CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit, CoreSearchResults,
     CoreSecurityOptions, CoreStats, CoreVectorDocument,
 };
+pub use vector::stable_id::{stable_uint64_for_text, stable_uint64_ids_for_chunk_ids};
 pub use version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
