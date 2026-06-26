@@ -10,7 +10,8 @@ surface is `import lodedb` plus the `lodedb` CLI; everything lives under `src/lo
 ```
 src/lodedb/__init__.py   public API: LodeDB, LodeSearchHit, the CLI
 src/lodedb/local/        local-first SDK: db, CLI, MPS/CPU embedding selector, dev
-                         server, MCP server, LangChain adapter
+                         server, MCP server, LangChain/LlamaIndex/mem0 adapters,
+                         and the `lodedb migrate` toolkit (local/migrate/)
 src/lodedb/engine/       engine core: index / storage / embedding / route profiles
                          (LodeEngine in core.py, LodeIndex in index.py)
 third_party/turbovec/    vendored MIT compact vector core (preserve LICENSE)
@@ -34,7 +35,11 @@ tests/                   local SDK suite + import-boundary guard
   Importing LodeDB must **not** load `faiss` / `modal` / `mteb` / `datasets` / `matplotlib`
   / `sklearn` — `tests/test_import_boundary.py` fails closed (fresh subprocess) if it ever
   does. (`scikit-learn` may be *installed* transitively via `sentence-transformers`; the
-  guard checks what *loads*, not what is installed.)
+  guard checks what *loads*, not what is installed.) The same discipline covers the optional
+  framework adapters (`langchain` / `llama_index` / `mem0`) and the `lodedb migrate` source
+  providers (`psycopg` / `qdrant_client` / `chromadb` / `lancedb`): `import lodedb` reaches the
+  `migrate` CLI sub-app, so every source exporter (`local/migrate/sources/`) keeps its provider
+  import function-local, and the same test guards them.
 - **Licensing:** our code is Apache-2.0; preserve the upstream **MIT** notice on
   `third_party/turbovec/` (see `NOTICE`). No GPL/AGPL/LGPL dependencies.
 - **Local path stays local:** the local SDK runs in a no-auth, loopback/private-network,
@@ -71,7 +76,7 @@ tests/                   local SDK suite + import-boundary guard
 ## Develop
 
 ```bash
-uv sync --extra dev --extra mcp --extra langchain   # build venv (compiles TurboVec)
+uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0  # build venv (compiles TurboVec)
 uv run pytest -q                                                # run the suite
 uv run ruff check .                                             # lint (line-length 100)
 ```

@@ -47,10 +47,19 @@ for _root in _FORBIDDEN:
         print("LOADED " + _root)
 """
 
+# The optional framework adapters (langchain/llama-index/mem0) and the `lodedb migrate`
+# source providers (psycopg/qdrant-client/chromadb/lancedb) are imported only inside the
+# adapter or exporter that uses them. `import lodedb` reaches the `lodedb migrate` CLI
+# sub-app (registered in lodedb.local.cli), so its source exporters must keep their provider
+# imports function-local; none of these may load on a plain import.
 _OPTIONAL_INTEGRATION_PROBE = """
 import importlib, sys
-importlib.import_module("lodedb")
-_FORBIDDEN = ("langchain", "langchain_core", "llama_index", "mem0")
+for _m in ("lodedb", "lodedb.local.cli"):
+    importlib.import_module(_m)
+_FORBIDDEN = (
+    "langchain", "langchain_core", "llama_index", "mem0",
+    "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
+)
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:
     if _root in _loaded:
@@ -104,9 +113,12 @@ def test_import_loads_no_heavy_dependency():
 
 
 def test_import_does_not_load_optional_integrations():
-    """Importing LodeDB must not import optional framework integrations."""
+    """Importing LodeDB must not import optional framework adapters or migrate providers."""
 
-    assert _probe_lines(_OPTIONAL_INTEGRATION_PROBE, "LOADED") == []
+    leaked = _probe_lines(_OPTIONAL_INTEGRATION_PROBE, "LOADED")
+    assert leaked == [], (
+        f"optional integration/migration-source deps loaded on import (must stay lazy): {leaked}"
+    )
 
 
 def test_image_extra_stays_lazy_on_import():
