@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from lodedb import LodeDB
 
 
@@ -218,6 +220,22 @@ def test_native_on_readonly_existing_store_uses_persistent_seed(tmp_path, monkey
     assert adapter.opened_readonly is True
     assert db.stats()["native_core"]["covered"] is True
     assert db.stats()["native_core"]["fallback_reason"] == ""
+
+
+def test_native_write_on_fails_closed_until_cutover(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    with pytest.raises(RuntimeError, match="LODEDB_NATIVE_CORE_WRITE=on"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+
+    assert adapter.opened_writable is False
 
 
 def test_native_write_shadow_persists_to_temp_native_handle(tmp_path, monkeypatch) -> None:

@@ -1247,6 +1247,9 @@ class LodeDB:
             self._native_vector_engine = native_engine
             self._native_vector_covered = True
             return
+        if self._native_core_write_mode == NativeCoreMode.ON:
+            self._native_core_fallback_reason = "native_core_write_on_unimplemented"
+            raise RuntimeError("LODEDB_NATIVE_CORE_WRITE=on is not available yet")
         try:
             if self._native_core_write_mode == NativeCoreMode.SHADOW:
                 shadow_dir = tempfile.TemporaryDirectory(prefix="lodedb-native-shadow-")
