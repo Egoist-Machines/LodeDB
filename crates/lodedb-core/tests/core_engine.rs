@@ -317,6 +317,48 @@ fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
 }
 
 #[test]
+fn persisted_v0_4_tvim_vectors_seed_readonly_queries() {
+    let path = copy_persisted_fixture("v0_4_store_text");
+    let readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+
+    let hits = readonly
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            None,
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "vec-alpha");
+    assert_eq!(hits.total_considered, 3);
+
+    let filtered = readonly
+        .query_vector(
+            "default",
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&json!({"metadata": {"tenant": "zen"}})),
+        )
+        .unwrap();
+    assert_eq!(filtered.hits[0].document_id, "vec-beta");
+    assert_eq!(filtered.total_considered, 1);
+    drop(readonly);
+
+    let mut writable = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let error = writable
+        .upsert_vectors(
+            "default",
+            &[doc("vec-delta", 3, metadata(&[("tenant", "new")]))],
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), CoreErrorCode::Unsupported);
+    drop(writable);
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
     let path = unique_temp_dir("core_lock");
     let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();

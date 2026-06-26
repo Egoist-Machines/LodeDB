@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use turbovec::IdMapIndex;
 
 use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter};
@@ -16,6 +17,7 @@ use crate::types::{
     CoreDocument, CoreMetadata, CoreMutationResult, CoreOpenOptions, CoreSearchHit,
     CoreSearchResults, CoreVectorDocument,
 };
+use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 
 /// In-memory vector-only native core engine.
@@ -104,7 +106,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
-        index.require_vectors_seeded()?;
+        index.require_vectors_mutable()?;
         let mut changed = 0usize;
         for document in documents {
             if document.document_id.trim().is_empty() {
@@ -147,7 +149,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
-        index.require_vectors_seeded()?;
+        index.require_vectors_mutable()?;
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
@@ -187,7 +189,7 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
-        index.require_vectors_seeded()?;
+        index.require_vectors_mutable()?;
         let Some(record) = index.documents.get_mut(document_id) else {
             return invalid("document not found");
         };
@@ -218,7 +220,7 @@ impl CoreEngine {
     ) -> Result<IngestPlan, CoreError> {
         self.require_writable()?;
         let index = self.index(index_id)?;
-        index.require_vectors_seeded()?;
+        index.require_vectors_mutable()?;
         let base_generation = index.generation;
         let existing_chunks = index.chunk_vectors_by_id();
         let mut prepared_documents = Vec::with_capacity(documents.len());
@@ -293,7 +295,7 @@ impl CoreEngine {
     ) -> Result<TextApplyResult, CoreError> {
         self.require_writable()?;
         let index = self.index_mut(&plan.index_id)?;
-        index.require_vectors_seeded()?;
+        index.require_vectors_mutable()?;
         if index.generation != plan.base_generation {
             return Err(CoreError::new(
                 CoreErrorCode::PlanStale,
@@ -416,6 +418,13 @@ impl CoreEngine {
             return invalid("query dimension does not match index");
         }
         index.require_vectors_seeded()?;
+        let rotated_query;
+        let query = if let Some(rotation) = &index.query_rotation {
+            rotated_query = rotate_query(query_vector, rotation, index.vector_dim)?;
+            rotated_query.as_slice()
+        } else {
+            query_vector
+        };
         let candidates = index.resolve_filter(filter)?;
         let total_considered = candidates.len();
         let mut hits = candidates
@@ -430,7 +439,7 @@ impl CoreEngine {
                     .map(|chunk| CoreSearchHit {
                         document_id: document_id.clone(),
                         chunk_id: chunk.chunk_id.clone(),
-                        score: dot(query_vector, &chunk.vector),
+                        score: dot(query, &chunk.vector),
                         metadata: record.metadata.clone(),
                     })
                     .collect::<Vec<_>>()
@@ -706,7 +715,11 @@ fn index_from_loaded_store(
         .cloned()
         .unwrap_or_default();
     let mut documents = BTreeMap::new();
-    let mut has_placeholder_vectors = false;
+    let chunk_vectors = reconstruct_tvim_vectors(loaded, vector_dim)?;
+    let vectors_seeded = loaded.chunk_count() == 0 || chunk_vectors.is_some();
+    let (chunk_vectors, query_rotation) = chunk_vectors
+        .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
+        .unwrap_or_default();
     for document_id in state
         .get("document_hashes")
         .and_then(Value::as_object)
@@ -731,12 +744,12 @@ fn index_from_loaded_store(
             .filter_map(Value::as_str)
             .map(|chunk_id| ChunkRecord {
                 chunk_id: chunk_id.to_string(),
-                vector: vec![0.0; vector_dim],
+                vector: chunk_vectors
+                    .get(chunk_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0.0; vector_dim]),
             })
             .collect();
-        if !chunks.is_empty() {
-            has_placeholder_vectors = true;
-        }
         documents.insert(
             document_id.clone(),
             DocumentRecord {
@@ -757,7 +770,8 @@ fn index_from_loaded_store(
         bit_width,
         documents,
         generation: loaded.generation,
-        vectors_seeded: !has_placeholder_vectors,
+        vectors_seeded,
+        query_rotation,
         delete_count: state
             .get("delete_count")
             .and_then(Value::as_u64)
@@ -767,6 +781,60 @@ fn index_from_loaded_store(
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReconstructedTvimVectors {
+    vectors: BTreeMap<String, Vec<f32>>,
+    query_rotation: Option<Vec<f32>>,
+}
+
+fn reconstruct_tvim_vectors(
+    loaded: &crate::storage::LoadedStore,
+    vector_dim: usize,
+) -> Result<Option<ReconstructedTvimVectors>, CoreError> {
+    let Some(tvim_path) = &loaded.tvim_path else {
+        return Ok(None);
+    };
+    if loaded.chunk_count() == 0 {
+        return Ok(Some(ReconstructedTvimVectors::default()));
+    }
+
+    let chunk_ids = loaded
+        .state
+        .get("chunks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("chunk_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if chunk_ids.is_empty() {
+        return Ok(Some(ReconstructedTvimVectors::default()));
+    }
+    let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
+    let index = IdMapIndex::load(tvim_path).map_err(core_io_error)?;
+    if index.dim() != vector_dim {
+        return invalid("persisted TurboVec dimension does not match JSON state");
+    }
+    let rows = index
+        .reconstruct_rows(&stable_ids)
+        .map_err(|error| CoreError::new(CoreErrorCode::CorruptStore, error.to_string()))?;
+    if rows.len() != chunk_ids.len() * vector_dim {
+        return Err(CoreError::new(
+            CoreErrorCode::CorruptStore,
+            "persisted TurboVec reconstruction returned malformed rows",
+        ));
+    }
+    let vectors = chunk_ids
+        .into_iter()
+        .zip(rows.chunks_exact(vector_dim))
+        .map(|(chunk_id, row)| (chunk_id, row.to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    Ok(Some(ReconstructedTvimVectors {
+        vectors,
+        query_rotation: index.rotation_matrix(),
+    }))
 }
 
 fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
@@ -861,6 +929,7 @@ struct VectorOnlyIndex {
     documents: BTreeMap<String, DocumentRecord>,
     generation: u64,
     vectors_seeded: bool,
+    query_rotation: Option<Vec<f32>>,
     delete_count: usize,
     deleted_chunk_count: usize,
 }
@@ -874,6 +943,7 @@ impl VectorOnlyIndex {
             documents: BTreeMap::new(),
             generation: 0,
             vectors_seeded: true,
+            query_rotation: None,
             delete_count: 0,
             deleted_chunk_count: 0,
         }
@@ -884,6 +954,17 @@ impl VectorOnlyIndex {
             return Err(CoreError::new(
                 CoreErrorCode::Unsupported,
                 "persisted vector sidecars are not yet loaded by native core",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_vectors_mutable(&self) -> Result<(), CoreError> {
+        self.require_vectors_seeded()?;
+        if self.query_rotation.is_some() {
+            return Err(CoreError::new(
+                CoreErrorCode::Unsupported,
+                "persisted TurboVec-backed native indexes are read-only until native vector sidecar writes are implemented",
             ));
         }
         Ok(())
@@ -1050,6 +1131,24 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
         .zip(right)
         .map(|(left, right)| left * right)
         .sum()
+}
+
+fn rotate_query(query: &[f32], rotation: &[f32], dim: usize) -> Result<Vec<f32>, CoreError> {
+    if rotation.len() != dim * dim {
+        return Err(CoreError::new(
+            CoreErrorCode::CorruptStore,
+            "persisted TurboVec rotation matrix has invalid dimensions",
+        ));
+    }
+    let mut rotated = vec![0.0; dim];
+    for out_d in 0..dim {
+        let mut acc = 0.0;
+        for in_d in 0..dim {
+            acc += query[in_d] * rotation[out_d * dim + in_d];
+        }
+        rotated[out_d] = acc;
+    }
+    Ok(rotated)
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
