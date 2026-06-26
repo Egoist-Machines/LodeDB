@@ -1,7 +1,8 @@
 //! C ABI for the native LodeDB core.
 
 use lodedb_core::engine::CoreEngine;
-use lodedb_core::types::CoreVectorDocument;
+use lodedb_core::engine::IngestPlan;
+use lodedb_core::types::{CoreDocument, CoreVectorDocument};
 use lodedb_core::{CoreError, CoreErrorCode};
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
@@ -31,6 +32,14 @@ pub struct LodeStringView {
     size: u32,
     version: u32,
     data: *const c_char,
+    len: usize,
+}
+
+#[repr(C)]
+pub struct LodeOwnedString {
+    size: u32,
+    version: u32,
+    data: *mut c_char,
     len: usize,
 }
 
@@ -105,6 +114,24 @@ pub unsafe extern "C" fn lodedb_error_free(error: *mut LodeError) {
     let error = Box::from_raw(error);
     if !error.message.is_null() {
         let _ = CString::from_raw(error.message);
+    }
+}
+
+/// Frees an owned string allocated by this library.
+///
+/// # Safety
+///
+/// `text` must be null or a pointer returned by an FFI function that documents
+/// `LodeOwnedString` ownership. It must not be used after this call or freed
+/// more than once.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_owned_string_free(text: *mut LodeOwnedString) {
+    if text.is_null() {
+        return;
+    }
+    let text = Box::from_raw(text);
+    if !text.data.is_null() {
+        let _ = CString::from_raw(text.data);
     }
 }
 
@@ -273,6 +300,78 @@ pub unsafe extern "C" fn lodedb_engine_query_vector(
     })
 }
 
+/// Plans a text upsert from a JSON array of `CoreDocument` objects.
+///
+/// Embeddings stay in the caller. The returned JSON is an `IngestPlan` and must
+/// be released with `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `documents_json`, and `out` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_prepare_text_upsert_json(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    documents_json: LodeStringView,
+    store_text: u8,
+    index_text: u8,
+    chunk_character_limit: usize,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let documents = read_json_view::<Vec<CoreDocument>>(documents_json)?;
+        let plan = engine.prepare_text_upsert(
+            &index_id,
+            &documents,
+            store_text != 0,
+            index_text != 0,
+            chunk_character_limit,
+        )?;
+        let result = owned_json(&plan)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Applies a JSON `IngestPlan` with caller-provided embeddings JSON.
+///
+/// The returned JSON is a `TextApplyResult` and must be released with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `plan_json`, `embeddings_json`, and `out` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_apply_text_upsert_json(
+    engine: *mut LodeEngine,
+    plan_json: LodeStringView,
+    embeddings_json: LodeStringView,
+    embedding_time_ms: f64,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_mut(engine)?;
+        let plan = read_json_view::<IngestPlan>(plan_json)?;
+        let embeddings = read_json_view::<Vec<Vec<f32>>>(embeddings_json)?;
+        let result = engine.apply_text_upsert(&plan, &embeddings, embedding_time_ms)?;
+        let result = owned_json(&result)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -352,6 +451,36 @@ fn read_string(view: LodeStringView) -> Result<String, CoreError> {
     std::str::from_utf8(bytes)
         .map(str::to_string)
         .map_err(|_| CoreError::new(CoreErrorCode::InvalidArgument, "string is not valid UTF-8"))
+}
+
+fn read_json_view<T: serde::de::DeserializeOwned>(view: LodeStringView) -> Result<T, CoreError> {
+    let text = read_string(view)?;
+    serde_json::from_str(&text).map_err(|error| {
+        CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            format!("invalid JSON payload: {error}"),
+        )
+    })
+}
+
+fn owned_json<T: serde::Serialize>(value: &T) -> Result<Box<LodeOwnedString>, CoreError> {
+    let text = serde_json::to_string(value).map_err(|error| {
+        CoreError::new(
+            CoreErrorCode::Internal,
+            format!("failed to serialize core value: {error}"),
+        )
+    })?;
+    owned_string(text)
+}
+
+fn owned_string(text: String) -> Result<Box<LodeOwnedString>, CoreError> {
+    let len = text.len();
+    Ok(Box::new(LodeOwnedString {
+        size: std::mem::size_of::<LodeOwnedString>() as u32,
+        version: ABI_VERSION,
+        data: c_string(text)?.into_raw(),
+        len,
+    }))
 }
 
 fn read_f32_slice<'a>(data: *const c_float, len: usize) -> Result<&'a [f32], CoreError> {
@@ -447,6 +576,8 @@ mod tests {
     fn abi_struct_versions_start_each_public_struct() {
         assert_eq!(std::mem::offset_of!(LodeError, size), 0);
         assert_eq!(std::mem::offset_of!(LodeError, version), 4);
+        assert_eq!(std::mem::offset_of!(LodeOwnedString, size), 0);
+        assert_eq!(std::mem::offset_of!(LodeOwnedString, version), 4);
         assert_eq!(std::mem::offset_of!(LodeSearchRequest, size), 0);
         assert_eq!(std::mem::offset_of!(LodeSearchRequest, version), 4);
         assert_eq!(std::mem::offset_of!(LodeSearchHit, size), 0);

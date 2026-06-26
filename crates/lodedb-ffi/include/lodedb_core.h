@@ -36,6 +36,13 @@ typedef struct LodeStringView {
   uintptr_t len;
 } LodeStringView;
 
+typedef struct LodeOwnedString {
+  uint32_t size;
+  uint32_t version;
+  char *data;
+  uintptr_t len;
+} LodeOwnedString;
+
 typedef struct LodeMetadataPair {
   uint32_t size;
   uint32_t version;
@@ -82,6 +89,7 @@ typedef struct LodeSearchResults {
 
 uint32_t lodedb_abi_version(void);
 void lodedb_error_free(LodeError *error);
+void lodedb_owned_string_free(LodeOwnedString *text);
 void lodedb_search_results_free(LodeSearchResults *results);
 
 uint32_t lodedb_engine_new_in_memory(LodeEngine **out, LodeError **error);
@@ -102,6 +110,22 @@ uint32_t lodedb_engine_query_vector(
     const LodeEngine *engine,
     const LodeSearchRequest *request,
     LodeSearchResults **out,
+    LodeError **error);
+uint32_t lodedb_engine_prepare_text_upsert_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView documents_json,
+    uint8_t store_text,
+    uint8_t index_text,
+    uintptr_t chunk_character_limit,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_apply_text_upsert_json(
+    LodeEngine *engine,
+    LodeStringView plan_json,
+    LodeStringView embeddings_json,
+    double embedding_time_ms,
+    LodeOwnedString **out,
     LodeError **error);
 
 #ifdef __cplusplus
