@@ -1,12 +1,50 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
+import importlib.util
 import json
+import os
+import sys
+from pathlib import Path
 
 import pytest
 
 
-native_core = pytest.importorskip("lodedb._native_core")
+def _load_turbovec_extension_override() -> None:
+    path = os.environ.get("LODEDB_NATIVE_CORE_EXTENSION_PATH")
+    if not path:
+        return
+    import lodedb  # noqa: F401 - ensure the package parent exists
+
+    extension_path = Path(path)
+    spec = importlib.util.spec_from_file_location("lodedb._turbovec", extension_path)
+    if spec is None or spec.loader is None:
+        loader = importlib.machinery.ExtensionFileLoader(
+            "lodedb._turbovec",
+            str(extension_path),
+        )
+        spec = importlib.util.spec_from_file_location(
+            "lodedb._turbovec",
+            extension_path,
+            loader=loader,
+        )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load extension from {extension_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["lodedb._turbovec"] = module
+    spec.loader.exec_module(module)
+
+
+_load_turbovec_extension_override()
+
+try:
+    native_core = importlib.import_module("lodedb._native_core")
+except ImportError as exc:
+    pytest.skip(
+        f"lodedb._native_core extension bridge is not available: {exc}",
+        allow_module_level=True,
+    )
 
 
 def _onehot(axis: int, dim: int = 8) -> list[float]:

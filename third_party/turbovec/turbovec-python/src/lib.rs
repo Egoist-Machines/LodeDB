@@ -1,6 +1,14 @@
+use lodedb_core::{
+    engine::{CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
+    CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreMutationResult, CoreOpenOptions,
+    CoreQuery, CoreRoutePolicy, CoreSearchResults, CoreSecurityOptions, CoreStats,
+    CoreVectorDocument,
+};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 fn not_contiguous_err(kind: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!(
@@ -59,7 +67,9 @@ impl TurboQuantIndex {
     fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> PyResult<()> {
         let arr = vectors.as_array();
         let dim = arr.ncols();
-        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("vectors"))?;
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         self.inner
@@ -82,7 +92,9 @@ impl TurboQuantIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         // Reject wrong-dim queries cleanly. Previously the inner
         // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
         // panic and surface to Python as a PanicException, not the
@@ -128,16 +140,15 @@ impl TurboQuantIndex {
     }
 
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::TurboQuantIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::TurboQuantIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -417,10 +428,7 @@ impl IdMapIndex {
     /// GEMM exactly.
     ///
     /// Local appliance extension on top of upstream v0.9.0.
-    fn rotation_matrix<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyArray2<f32>>>> {
+    fn rotation_matrix<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f32>>>> {
         match self.inner.rotation_matrix() {
             None => Ok(None),
             Some(rotation) => {
@@ -457,7 +465,9 @@ impl IdMapIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         if let Some(idx_dim) = self.inner.dim_opt() {
             if arr.ncols() != idx_dim {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -477,7 +487,9 @@ impl IdMapIndex {
                         "allowlist is empty",
                     ));
                 }
-                let slice = a_arr.as_slice().ok_or_else(|| not_contiguous_err("allowlist"))?;
+                let slice = a_arr
+                    .as_slice()
+                    .ok_or_else(|| not_contiguous_err("allowlist"))?;
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in slice {
                     if !self.inner.contains(id) {
@@ -542,18 +554,17 @@ impl IdMapIndex {
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::IdMapIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::IdMapIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -653,10 +664,318 @@ fn maxsim_scores<'py>(
     Ok(scores.into_pyarray(py))
 }
 
+/// Private Python-owned LodeDB native engine handle.
+#[pyclass(name = "CoreEngine", unsendable)]
+struct PyCoreEngine {
+    inner: RustCoreEngine,
+}
+
+#[pymethods]
+impl PyCoreEngine {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: RustCoreEngine::new_in_memory(),
+        }
+    }
+
+    #[staticmethod]
+    fn open(options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreEngine::open(options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    #[staticmethod]
+    fn open_readonly(path: String, options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreEngine::open_readonly(path, options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    fn create_index(
+        &mut self,
+        index_id: String,
+        vector_dim: usize,
+        bit_width: usize,
+    ) -> PyResult<()> {
+        self.inner
+            .create_index(index_id, vector_dim, bit_width)
+            .map_err(native_core_error_to_py)
+    }
+
+    fn upsert_vectors(&mut self, index_id: &str, documents_json: &str) -> PyResult<String> {
+        let documents = native_from_json::<Vec<CoreVectorDocument>>(documents_json)?;
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn delete_documents(&mut self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
+        let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
+        native_to_json(
+            &self
+                .inner
+                .delete_documents(index_id, &document_ids)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn update_document_payload(
+        &mut self,
+        index_id: &str,
+        document_id: &str,
+        metadata_json: Option<&str>,
+        text_json: Option<&str>,
+    ) -> PyResult<String> {
+        let metadata: Option<std::collections::BTreeMap<String, String>> =
+            metadata_json.map(native_from_json).transpose()?;
+        let text: Option<Option<String>> = text_json.map(native_from_json).transpose()?;
+        native_to_json(
+            &self
+                .inner
+                .update_document_payload(index_id, document_id, metadata, text)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn query_vector(
+        &self,
+        index_id: &str,
+        query_vector_json: &str,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_vector = native_from_json::<Vec<f32>>(query_vector_json)?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vector(index_id, &query_vector, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn query_vectors_batch(
+        &self,
+        index_id: &str,
+        query_vectors_json: &str,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_vectors = native_from_json::<Vec<Vec<f32>>>(query_vectors_json)?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vectors_batch(index_id, &query_vectors, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn prepare_text_upsert(
+        &mut self,
+        index_id: &str,
+        documents_json: &str,
+        store_text: bool,
+        index_text: bool,
+        chunk_character_limit: usize,
+    ) -> PyResult<String> {
+        let documents = native_from_json::<Vec<CoreDocument>>(documents_json)?;
+        native_to_json(
+            &self
+                .inner
+                .prepare_text_upsert(
+                    index_id,
+                    &documents,
+                    store_text,
+                    index_text,
+                    chunk_character_limit,
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn apply_text_upsert(
+        &mut self,
+        plan_json: &str,
+        embeddings_json: &str,
+        embedding_time_ms: f64,
+    ) -> PyResult<String> {
+        let plan = native_from_json::<IngestPlan>(plan_json)?;
+        let embeddings = native_from_json::<Vec<Vec<f32>>>(embeddings_json)?;
+        native_to_json(
+            &self
+                .inner
+                .apply_text_upsert(&plan, &embeddings, embedding_time_ms)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn prepare_query_text(&self, query: &str, mode: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .prepare_query_text(query, mode)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn search_embedded_text(
+        &self,
+        index_id: &str,
+        query_plan_json: &str,
+        query_embedding_json: Option<&str>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plan = native_from_json::<QueryPlan>(query_plan_json)?;
+        let query_embedding: Option<Vec<f32>> =
+            query_embedding_json.map(native_from_json).transpose()?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .search_embedded_text(
+                    index_id,
+                    &query_plan,
+                    query_embedding.as_deref(),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn stats(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .stats(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn document_token_lists(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .document_token_lists(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn persist(&mut self) -> PyResult<()> {
+        self.inner.persist().map_err(native_core_error_to_py)
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        self.inner.close().map_err(native_core_error_to_py)
+    }
+}
+
+#[pyfunction]
+fn native_core_version() -> &'static str {
+    lodedb_core::CORE_VERSION
+}
+
+#[pyfunction]
+fn storage_schema_version() -> u32 {
+    lodedb_core::STORAGE_SCHEMA_VERSION
+}
+
+#[pyfunction]
+fn core_document_to_json(
+    document_id: String,
+    text: String,
+    metadata: std::collections::BTreeMap<String, String>,
+) -> PyResult<String> {
+    native_to_json(&CoreDocument {
+        document_id,
+        text,
+        metadata,
+    })
+}
+
+#[pyfunction]
+fn round_trip_core_json(type_name: &str, json: &str) -> PyResult<String> {
+    match type_name {
+        "CoreDocument" => native_round_trip::<CoreDocument>(json),
+        "CoreIndexConfig" => native_round_trip::<CoreIndexConfig>(json),
+        "CoreMutationResult" => native_round_trip::<CoreMutationResult>(json),
+        "CoreOpenOptions" => native_round_trip::<CoreOpenOptions>(json),
+        "CoreQuery" => native_round_trip::<CoreQuery>(json),
+        "CoreRoutePolicy" => native_round_trip::<CoreRoutePolicy>(json),
+        "CoreSearchResults" => native_round_trip::<CoreSearchResults>(json),
+        "CoreSecurityOptions" => native_round_trip::<CoreSecurityOptions>(json),
+        "CoreStats" => native_round_trip::<CoreStats>(json),
+        "CoreVectorDocument" => native_round_trip::<CoreVectorDocument>(json),
+        _ => Err(native_core_error_to_py(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            "unknown core type",
+        ))),
+    }
+}
+
+fn native_round_trip<T>(json: &str) -> PyResult<String>
+where
+    T: serde::Serialize + DeserializeOwned,
+{
+    let value: T = native_from_json(json)?;
+    native_to_json(&value)
+}
+
+fn native_from_json<T>(json: &str) -> PyResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(json).map_err(|error| {
+        native_core_error_to_py(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            format!("invalid JSON payload: {error}"),
+        ))
+    })
+}
+
+fn native_to_json<T: serde::Serialize>(value: &T) -> PyResult<String> {
+    serde_json::to_string(value).map_err(|error| {
+        native_core_error_to_py(CoreError::new(
+            CoreErrorCode::Internal,
+            format!("failed to serialize core type: {error}"),
+        ))
+    })
+}
+
+fn native_optional_value(json: Option<&str>) -> PyResult<Option<Value>> {
+    json.map(native_from_json).transpose()
+}
+
+fn native_core_error_to_py(error: CoreError) -> PyErr {
+    match error.code() {
+        CoreErrorCode::InvalidArgument | CoreErrorCode::PlanStale => {
+            pyo3::exceptions::PyValueError::new_err(error.to_string())
+        }
+        CoreErrorCode::NotFound => pyo3::exceptions::PyKeyError::new_err(error.to_string()),
+        CoreErrorCode::CorruptStore | CoreErrorCode::Unsupported | CoreErrorCode::Internal => {
+            pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+        }
+    }
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
     m.add_function(wrap_pyfunction!(maxsim_scores, m)?)?;
+    m.add_class::<PyCoreEngine>()?;
+    m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
+    m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
+    m.add_function(wrap_pyfunction!(core_document_to_json, m)?)?;
+    m.add_function(wrap_pyfunction!(round_trip_core_json, m)?)?;
     Ok(())
 }

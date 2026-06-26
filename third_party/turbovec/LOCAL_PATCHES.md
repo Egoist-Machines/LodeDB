@@ -93,3 +93,13 @@ Added for LodeDB's late-interaction retrieval (multi-vector / MaxSim, issue #25)
 
 This is purely additive (a new module + one exported function + one binding); it
 does not touch the quantized index, its storage format, or any existing API.
+
+## Native-core packaging bridge
+
+Added while LodeDB migrates toward a shared Rust engine:
+
+- `turbovec-python/Cargo.toml`: local path dependency on `crates/lodedb-core`.
+- `turbovec-python/src/lib.rs`: registers the private native-core JSON helpers
+  and `CoreEngine` handle on the bundled `_turbovec` extension.
+- `src/lodedb/_native_core.py`: re-exports those symbols at the stable private
+  import path `lodedb._native_core` without importing them during `import lodedb`.
