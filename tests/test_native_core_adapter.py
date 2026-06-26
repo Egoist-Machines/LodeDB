@@ -9,9 +9,177 @@ from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreError
 
 
 class FakeNativeModule:
+    def CoreEngine(self) -> FakeCoreEngine:
+        return FakeCoreEngine()
+
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str:
         assert type_name in {"CoreDocument", "CoreVectorDocument", "CoreQuery"}
         return json_payload
+
+
+class FakeCoreEngine:
+    def __init__(self) -> None:
+        self.index: tuple[str, int, int] | None = None
+        self.documents: list[dict] = []
+
+    def create_index(self, index_id: str, vector_dim: int, bit_width: int) -> None:
+        self.index = (index_id, vector_dim, bit_width)
+
+    def upsert_vectors(self, index_id: str, documents_json: str) -> str:
+        self.documents = json.loads(documents_json)
+        return json.dumps(
+            {
+                "documents_upserted": len(self.documents),
+                "documents_deleted": 0,
+                "chunks_upserted": len(self.documents),
+                "chunks_deleted": 0,
+                "generation": 1,
+            }
+        )
+
+    def delete_documents(self, index_id: str, document_ids_json: str) -> str:
+        ids = set(json.loads(document_ids_json))
+        self.documents = [
+            document for document in self.documents if document["document_id"] not in ids
+        ]
+        return json.dumps(
+            {
+                "documents_upserted": 0,
+                "documents_deleted": len(ids),
+                "chunks_upserted": 0,
+                "chunks_deleted": len(ids),
+                "generation": 2,
+            }
+        )
+
+    def query_vector(
+        self,
+        index_id: str,
+        query_vector_json: str,
+        top_k: int,
+        filter_json: str | None,
+    ) -> str:
+        query = json.loads(query_vector_json)
+        metadata_filter = json.loads(filter_json or "{}").get("metadata", {})
+        rows = [
+            document
+            for document in self.documents
+            if all(document["metadata"].get(key) == value for key, value in metadata_filter.items())
+        ]
+        hits = [
+            {
+                "document_id": document["document_id"],
+                "chunk_id": document["document_id"],
+                "score": sum(
+                    left * right for left, right in zip(query, document["vector"], strict=True)
+                ),
+                "metadata": document["metadata"],
+            }
+            for document in rows
+        ]
+        hits.sort(key=lambda hit: (-hit["score"], hit["document_id"]))
+        return json.dumps({"hits": hits[:top_k], "total_considered": len(rows)})
+
+    def prepare_text_upsert(
+        self,
+        index_id: str,
+        documents_json: str,
+        store_text: bool,
+        index_text: bool,
+        chunk_character_limit: int,
+    ) -> str:
+        documents = json.loads(documents_json)
+        document = documents[0]
+        return json.dumps(
+            {
+                "plan_id": 0,
+                "index_id": index_id,
+                "base_generation": 0,
+                "documents": [
+                    {
+                        "document_id": document["document_id"],
+                        "metadata": document["metadata"],
+                        "text": document["text"] if store_text else None,
+                        "chunks": [
+                            {
+                                "chunk_id": f"{document['document_id']}:chunk:0000",
+                                "text": document["text"],
+                                "tokens": ["alpha"],
+                                "needs_embedding": True,
+                            }
+                        ],
+                    }
+                ],
+                "chunks_to_embed": [
+                    {
+                        "document_id": document["document_id"],
+                        "chunk_id": f"{document['document_id']}:chunk:0000",
+                        "text": document["text"],
+                    }
+                ],
+                "store_text": store_text,
+                "index_text": index_text,
+            }
+        )
+
+    def apply_text_upsert(
+        self,
+        plan_json: str,
+        embeddings_json: str,
+        embedding_time_ms: float,
+    ) -> str:
+        plan = json.loads(plan_json)
+        embeddings = json.loads(embeddings_json)
+        return json.dumps(
+            {
+                "mutation": {
+                    "documents_upserted": len(plan["documents"]),
+                    "documents_deleted": 0,
+                    "chunks_upserted": len(embeddings),
+                    "chunks_deleted": 0,
+                    "generation": 1,
+                },
+                "embedded_chunks": len(embeddings),
+                "reused_chunks": 0,
+                "embedding_time_ms": embedding_time_ms,
+            }
+        )
+
+    def prepare_query_text(self, query: str, mode: str) -> str:
+        return json.dumps(
+            {
+                "query": query,
+                "mode": mode,
+                "query_tokens": [query.lower()],
+                "requires_embedding": mode in {"vector", "hybrid"},
+            }
+        )
+
+    def search_embedded_text(
+        self,
+        index_id: str,
+        query_plan_json: str,
+        query_embedding_json: str | None,
+        top_k: int,
+        filter_json: str | None,
+    ) -> str:
+        plan = json.loads(query_plan_json)
+        return json.dumps(
+            {
+                "hits": [
+                    {
+                        "document_id": "doc-alpha",
+                        "chunk_id": "doc-alpha:chunk:0000",
+                        "score": 1.0,
+                        "metadata": {"query": plan["query"]},
+                    }
+                ],
+                "total_considered": 1,
+            }
+        )
+
+    def stats(self, index_id: str) -> str:
+        return json.dumps({"document_count": len(self.documents), "native_core_enabled": True})
 
 
 def test_adapter_maps_engine_document_to_native_payload() -> None:
@@ -76,6 +244,48 @@ def test_adapter_maps_native_errors_to_engine_response() -> None:
         "error": "manifest failed checksum",
         "native_core_error": "CORRUPT_STORE",
     }
+
+
+def test_adapter_wraps_native_engine_vector_flow() -> None:
+    engine = NativeCoreAdapter(FakeNativeModule()).new_engine()
+    engine.create_index("default", vector_dim=2, bit_width=4)
+    mutation = engine.upsert_vectors(
+        "default",
+        (
+            EngineVectorDocument("a", (1, 0), metadata={"topic": "ops"}, text=None),
+            EngineVectorDocument("b", (0, 1), metadata={"topic": "ml"}, text=None),
+        ),
+    )
+    assert mutation["documents_upserted"] == 2
+
+    hits = engine.query_vector(
+        "default",
+        (0, 1),
+        top_k=1,
+        filter={"metadata": {"topic": "ml"}},
+    )
+    assert hits["hits"][0]["document_id"] == "b"
+    assert engine.stats("default")["document_count"] == 2
+
+
+def test_adapter_wraps_native_engine_text_prepare_apply_flow() -> None:
+    engine = NativeCoreAdapter(FakeNativeModule()).new_engine()
+    plan = engine.prepare_text_upsert(
+        "text",
+        (EngineDocument("doc-alpha", "Alpha body", metadata={"topic": "ops"}),),
+        store_text=True,
+        index_text=True,
+        chunk_character_limit=900,
+    )
+    assert plan["chunks_to_embed"][0]["text"] == "Alpha body"
+
+    applied = engine.apply_text_upsert(plan, ([1.0, 0.0],), embedding_time_ms=2.5)
+    assert applied["embedded_chunks"] == 1
+    assert applied["embedding_time_ms"] == 2.5
+
+    query_plan = engine.prepare_query_text("Alpha", "vector")
+    hits = engine.search_embedded_text("text", query_plan, (1.0, 0.0), top_k=1)
+    assert hits["hits"][0]["document_id"] == "doc-alpha"
 
 
 def test_adapter_lazily_reports_missing_native_module(monkeypatch) -> None:

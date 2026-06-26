@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -20,6 +21,7 @@ from lodedb.engine.core import EngineDocument, EngineQuery, EngineResponse, Engi
 class NativeCoreModule(Protocol):
     """Subset of the hidden native module used by the adapter."""
 
+    def CoreEngine(self) -> Any: ...
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str: ...
 
 
@@ -56,6 +58,12 @@ class NativeCoreAdapter:
         module = self._require_module()
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return json.loads(module.round_trip_core_json(type_name, encoded))
+
+    def new_engine(self) -> NativeCoreEngineHandle:
+        """Creates an in-memory native engine handle through the hidden extension."""
+
+        module = self._require_module()
+        return NativeCoreEngineHandle(module.CoreEngine())
 
     @staticmethod
     def document_payload(document: EngineDocument) -> dict[str, Any]:
@@ -119,3 +127,125 @@ class NativeCoreAdapter:
         except ImportError:
             return None
         return self._native_module
+
+
+class NativeCoreEngineHandle:
+    """Small JSON-backed wrapper over ``lodedb._native_core.CoreEngine``."""
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    def create_index(self, index_id: str, *, vector_dim: int, bit_width: int = 4) -> None:
+        self._engine.create_index(str(index_id), int(vector_dim), int(bit_width))
+
+    def upsert_vectors(
+        self,
+        index_id: str,
+        documents: Iterable[EngineVectorDocument],
+    ) -> dict[str, Any]:
+        payload = [NativeCoreAdapter.vector_document_payload(document) for document in documents]
+        return self._loads(
+            self._engine.upsert_vectors(
+                str(index_id),
+                self._dumps(payload),
+            )
+        )
+
+    def delete_documents(self, index_id: str, document_ids: Iterable[str]) -> dict[str, Any]:
+        return self._loads(
+            self._engine.delete_documents(
+                str(index_id),
+                self._dumps([str(document_id) for document_id in document_ids]),
+            )
+        )
+
+    def query_vector(
+        self,
+        index_id: str,
+        vector: Iterable[float],
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._loads(
+            self._engine.query_vector(
+                str(index_id),
+                self._dumps([float(value) for value in vector]),
+                int(top_k),
+                None if filter is None else self._dumps(dict(filter)),
+            )
+        )
+
+    def prepare_text_upsert(
+        self,
+        index_id: str,
+        documents: Iterable[EngineDocument],
+        *,
+        store_text: bool,
+        index_text: bool,
+        chunk_character_limit: int,
+    ) -> dict[str, Any]:
+        payload = [NativeCoreAdapter.document_payload(document) for document in documents]
+        return self._loads(
+            self._engine.prepare_text_upsert(
+                str(index_id),
+                self._dumps(payload),
+                bool(store_text),
+                bool(index_text),
+                int(chunk_character_limit),
+            )
+        )
+
+    def apply_text_upsert(
+        self,
+        plan: Mapping[str, Any],
+        embeddings: Iterable[Iterable[float]],
+        *,
+        embedding_time_ms: float,
+    ) -> dict[str, Any]:
+        embedding_payload = [[float(value) for value in row] for row in embeddings]
+        return self._loads(
+            self._engine.apply_text_upsert(
+                self._dumps(dict(plan)),
+                self._dumps(embedding_payload),
+                float(embedding_time_ms),
+            )
+        )
+
+    def prepare_query_text(self, query: str, mode: str) -> dict[str, Any]:
+        return self._loads(self._engine.prepare_query_text(str(query), str(mode)))
+
+    def search_embedded_text(
+        self,
+        index_id: str,
+        query_plan: Mapping[str, Any],
+        query_embedding: Iterable[float] | None,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._loads(
+            self._engine.search_embedded_text(
+                str(index_id),
+                self._dumps(dict(query_plan)),
+                None
+                if query_embedding is None
+                else self._dumps([float(value) for value in query_embedding]),
+                int(top_k),
+                None if filter is None else self._dumps(dict(filter)),
+            )
+        )
+
+    def stats(self, index_id: str) -> dict[str, Any]:
+        return self._loads(self._engine.stats(str(index_id)))
+
+    @staticmethod
+    def _dumps(payload: Any) -> str:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _loads(payload: str) -> dict[str, Any]:
+        value = json.loads(payload)
+        if not isinstance(value, dict):
+            raise RuntimeError("native core returned a non-object JSON payload")
+        return value
