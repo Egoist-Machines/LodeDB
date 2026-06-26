@@ -98,6 +98,46 @@ impl CoreIndexConfig {
     }
 }
 
+/// Native index creation options including persisted storage identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreIndexCreateOptions {
+    pub index_id: String,
+    pub index_key: String,
+    pub client_id_hash: String,
+    pub name: String,
+    pub model: String,
+    pub provider: String,
+    pub task: String,
+    pub route_profile: String,
+    pub storage_profile: String,
+    pub vector_dim: usize,
+    pub bit_width: usize,
+}
+
+impl CoreIndexCreateOptions {
+    /// Returns the native-core default metadata used by the simple create path.
+    pub fn native_default(
+        index_id: impl Into<String>,
+        vector_dim: usize,
+        bit_width: usize,
+    ) -> Self {
+        let index_id = index_id.into();
+        Self {
+            index_key: index_id.clone(),
+            client_id_hash: index_id.clone(),
+            index_id,
+            name: "lodedb-local".to_string(),
+            model: "native-core".to_string(),
+            provider: "native".to_string(),
+            task: "native-core".to_string(),
+            route_profile: "native-core".to_string(),
+            storage_profile: "native-core".to_string(),
+            vector_dim,
+            bit_width,
+        }
+    }
+}
+
 /// Text document supplied by a binding layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreDocument {
@@ -190,9 +230,9 @@ impl Default for CoreStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreApiVersion, CoreDocument, CoreIndexConfig, CoreMetadata, CoreMutationResult,
-        CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit, CoreSearchResults,
-        CoreSecurityOptions, CoreStats, CoreVectorDocument,
+        CoreApiVersion, CoreDocument, CoreIndexConfig, CoreIndexCreateOptions, CoreMetadata,
+        CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit,
+        CoreSearchResults, CoreSecurityOptions, CoreStats, CoreVectorDocument,
     };
     use crate::error::CoreErrorCode;
 
@@ -257,6 +297,7 @@ mod tests {
         });
         assert_round_trip(&route_policy());
         assert_round_trip(&index_config());
+        assert_round_trip(&CoreIndexCreateOptions::native_default("default", 8, 4));
         assert_round_trip(&CoreDocument {
             document_id: "doc-alpha".to_string(),
             text: "alpha document".to_string(),

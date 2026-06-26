@@ -15,8 +15,8 @@ use crate::lexical::tokenize;
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
-    CoreDocument, CoreMetadata, CoreMutationResult, CoreOpenOptions, CoreSearchHit,
-    CoreSearchResults, CoreVectorDocument,
+    CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult, CoreOpenOptions,
+    CoreSearchHit, CoreSearchResults, CoreVectorDocument,
 };
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
@@ -86,16 +86,29 @@ impl CoreEngine {
         vector_dim: usize,
         bit_width: usize,
     ) -> Result<(), CoreError> {
+        self.create_index_with_options(CoreIndexCreateOptions::native_default(
+            index_id, vector_dim, bit_width,
+        ))
+    }
+
+    /// Creates a vector-only index with explicit persisted metadata.
+    pub fn create_index_with_options(
+        &mut self,
+        options: CoreIndexCreateOptions,
+    ) -> Result<(), CoreError> {
         self.require_writable()?;
-        validate_index_shape(vector_dim, bit_width)?;
-        let index_id = index_id.into();
-        if self.indexes.contains_key(&index_id) {
+        validate_index_shape(options.vector_dim, options.bit_width)?;
+        validate_index_options(&options)?;
+        if self.indexes.contains_key(&options.index_id)
+            || self
+                .indexes
+                .values()
+                .any(|index| index.index_key == options.index_key)
+        {
             return invalid("index already exists");
         }
-        self.indexes.insert(
-            index_id.clone(),
-            VectorOnlyIndex::new(index_id, vector_dim, bit_width),
-        );
+        self.indexes
+            .insert(options.index_id.clone(), VectorOnlyIndex::new(options));
         Ok(())
     }
 
@@ -545,7 +558,7 @@ impl CoreEngine {
             crate::storage::write_generation_commit(
                 &persistence.path,
                 crate::storage::GenerationCommitInput {
-                    index_key: &index.index_id,
+                    index_key: &index.index_key,
                     generation: index.generation.max(1),
                     base_epoch: index.generation.max(1),
                     state: &state,
@@ -706,6 +719,16 @@ fn index_from_loaded_store(
         .and_then(Value::as_str)
         .unwrap_or(&loaded.index_key)
         .to_string();
+    let index_key = state
+        .get("index_key")
+        .and_then(Value::as_str)
+        .unwrap_or(&loaded.index_key)
+        .to_string();
+    let client_id_hash = state
+        .get("client_id_hash")
+        .and_then(Value::as_str)
+        .unwrap_or(&index_key)
+        .to_string();
     let vector_dim = state.get("native_dim").and_then(Value::as_u64).unwrap_or(1) as usize;
     let bit_width = state
         .get("turbovec_bit_width")
@@ -774,6 +797,38 @@ fn index_from_loaded_store(
     }
     Ok(VectorOnlyIndex {
         index_id,
+        index_key,
+        client_id_hash,
+        name: state
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("lodedb-local")
+            .to_string(),
+        model: state
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("native-core")
+            .to_string(),
+        provider: state
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("native")
+            .to_string(),
+        task: state
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("native-core")
+            .to_string(),
+        route_profile: state
+            .get("route_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("native-core")
+            .to_string(),
+        storage_profile: state
+            .get("storage_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("native-core")
+            .to_string(),
         vector_dim,
         bit_width,
         documents,
@@ -953,7 +1008,7 @@ fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
     serde_json::json!({
         "cache_reuse_count": 0,
         "chunks": chunks,
-        "client_id_hash": index.index_id,
+        "client_id_hash": index.client_id_hash,
         "columnar_generation": index.generation.max(1),
         "created_at": "1970-01-01T00:00:00+00:00",
         "delete_count": index.delete_count,
@@ -965,18 +1020,18 @@ fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
         "fallback_count": 0,
         "fallback_reasons": {},
         "index_id": index.index_id,
-        "index_key": index.index_id,
+        "index_key": index.index_key,
         "metadata": {},
-        "model": "native-core",
-        "name": "lodedb-local",
+        "model": index.model,
+        "name": index.name,
         "native_dim": index.vector_dim,
-        "provider": "native",
+        "provider": index.provider,
         "query_count": 0,
-        "route_profile": "native-core",
+        "route_profile": index.route_profile,
         "schema_version": 1,
         "status": "ready",
-        "storage_profile": "native-core",
-        "task": "native-core",
+        "storage_profile": index.storage_profile,
+        "task": index.task,
         "turbovec_bit_width": index.bit_width,
         "updated_at": "1970-01-01T00:00:00+00:00"
     })
@@ -992,6 +1047,14 @@ fn core_io_error(error: std::io::Error) -> CoreError {
 #[derive(Debug, Clone)]
 struct VectorOnlyIndex {
     index_id: String,
+    index_key: String,
+    client_id_hash: String,
+    name: String,
+    model: String,
+    provider: String,
+    task: String,
+    route_profile: String,
+    storage_profile: String,
     vector_dim: usize,
     bit_width: usize,
     documents: BTreeMap<String, DocumentRecord>,
@@ -1003,11 +1066,19 @@ struct VectorOnlyIndex {
 }
 
 impl VectorOnlyIndex {
-    fn new(index_id: String, vector_dim: usize, bit_width: usize) -> Self {
+    fn new(options: CoreIndexCreateOptions) -> Self {
         Self {
-            index_id,
-            vector_dim,
-            bit_width,
+            index_id: options.index_id,
+            index_key: options.index_key,
+            client_id_hash: options.client_id_hash,
+            name: options.name,
+            model: options.model,
+            provider: options.provider,
+            task: options.task,
+            route_profile: options.route_profile,
+            storage_profile: options.storage_profile,
+            vector_dim: options.vector_dim,
+            bit_width: options.bit_width,
             documents: BTreeMap::new(),
             generation: 0,
             vectors_seeded: true,
@@ -1202,6 +1273,25 @@ fn validate_index_shape(vector_dim: usize, bit_width: usize) -> Result<(), CoreE
     }
     if !matches!(bit_width, 2 | 4) {
         return invalid("bit_width must be 2 or 4");
+    }
+    Ok(())
+}
+
+fn validate_index_options(options: &CoreIndexCreateOptions) -> Result<(), CoreError> {
+    for (field, value) in [
+        ("index_id", options.index_id.as_str()),
+        ("index_key", options.index_key.as_str()),
+        ("client_id_hash", options.client_id_hash.as_str()),
+        ("name", options.name.as_str()),
+        ("model", options.model.as_str()),
+        ("provider", options.provider.as_str()),
+        ("task", options.task.as_str()),
+        ("route_profile", options.route_profile.as_str()),
+        ("storage_profile", options.storage_profile.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return invalid(format!("{field} is required"));
+        }
     }
     Ok(())
 }

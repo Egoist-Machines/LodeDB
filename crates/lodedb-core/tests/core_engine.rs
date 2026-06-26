@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::CoreEngine;
 use lodedb_core::error::CoreErrorCode;
-use lodedb_core::types::{CoreDocument, CoreOpenOptions, CoreVectorDocument};
+use lodedb_core::types::{
+    CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreVectorDocument,
+};
 use serde_json::json;
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
@@ -317,6 +319,69 @@ fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
         "persist-a"
     );
     assert!(readonly.persist().is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn persistent_engine_writes_python_compatible_vector_metadata() {
+    let path = unique_temp_dir("core_python_compatible");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+        })
+        .unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("persist-a", 0, metadata(&[("kind", "alpha")])),
+                doc("persist-b", 1, metadata(&[("kind", "beta")])),
+            ],
+        )
+        .unwrap();
+    engine.persist().unwrap();
+    assert!(path.join(format!("{INDEX_KEY}.commit.json")).is_file());
+    assert!(!path.join("default.commit.json").exists());
+
+    let payload_path = path.join(format!("{INDEX_KEY}.gen/g1.json"));
+    let payload: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(payload_path).unwrap()).unwrap();
+    assert_eq!(payload["index_id"], "default");
+    assert_eq!(payload["index_key"], INDEX_KEY);
+    assert_eq!(payload["client_id_hash"], INDEX_KEY);
+    assert_eq!(payload["model"], "external");
+    assert_eq!(payload["provider"], "external");
+    assert_eq!(payload["task"], "vector-only");
+    assert_eq!(payload["route_profile"], "vector-only");
+    assert_eq!(payload["storage_profile"], "turbovec_direct");
+
+    engine.close().unwrap();
+    let readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    assert_eq!(
+        readonly
+            .query_vector(
+                "default",
+                &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1,
+                None,
+            )
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "persist-b"
+    );
     fs::remove_dir_all(path).unwrap();
 }
 
