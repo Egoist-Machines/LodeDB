@@ -287,8 +287,8 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument(
         "--storage",
-        choices=("float16", "float32", "int8"),
-        default="float16",
+        choices=("float32", "float16", "int8"),
+        default="float32",
         help="patch-matrix storage precision",
     )
     parser.add_argument("--seed", type=int, default=0)

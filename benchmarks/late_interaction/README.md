@@ -19,17 +19,17 @@ uv run python benchmarks/late_interaction/run.py --docs 2000 --queries 200 --can
 
 ## Result
 
-The quality case holds decisively, at low query latency and a compact footprint.
-On 800 synthetic pages (64 patches each, dim 128), late interaction returns the
-exact MaxSim ranking that mean-pooling cannot:
+The quality case holds decisively, at low query latency. On 800 synthetic pages
+(64 patches each, dim 128), late interaction returns the exact MaxSim ranking that
+mean-pooling cannot:
 
-| metric | late interaction (float16) | single vector (pooled) |
+| metric | late interaction (float32) | single vector (pooled) |
 |---|---:|---:|
 | recall@10 vs exact MaxSim | **1.00** | 0.05 |
-| mean query latency | 3.6 ms | 0.2 ms |
-| resident build (one-time) | 0.03 s | -- |
-| ingest (800 docs) | 0.48 s | 0.23 s |
-| on-disk footprint | 18 MB | 0.3 MB |
+| mean query latency | 1.5 ms | 0.2 ms |
+| resident build (one-time) | 0.05 s | -- |
+| ingest (800 docs) | 0.57 s | 0.23 s |
+| on-disk footprint | 35 MB | 0.3 MB |
 
 Pooling a page to one vector destroys the per-patch signal MaxSim depends on, so
 its recall against the MaxSim ranking is near zero regardless of tuning. Late
@@ -40,12 +40,13 @@ per-candidate read-back.
 ### Storage precision (`--storage`)
 
 Each document's patch matrix is stored at a chosen precision. All three return the
-exact-MaxSim ranking on this set except int8, which is within ~2%:
+exact-MaxSim ranking on this set except int8, which is within ~2%; float32 is the
+default for its query speed, with float16 / int8 trading a little for footprint:
 
 | storage | on-disk | ingest | query | recall@10 |
 |---|---:|---:|---:|---:|
-| float32 | 35 MB | 0.67 s | 1.9 ms | 1.000 |
-| **float16** (default) | **18 MB** | 0.48 s | 3.6 ms | 1.000 |
+| **float32** (default) | 35 MB | 0.67 s | 1.5 ms | 1.000 |
+| float16 | 18 MB | 0.48 s | 3.6 ms | 1.000 |
 | int8 | 9 MB | 0.37 s | 2.7 ms | 0.984 |
 
 ### How it got here
@@ -63,7 +64,8 @@ of it:
   ingest and far fewer rows; filtered queries score the matching subset
   exhaustively, and corpora over the resident budget stream from disk (exact,
   constant memory).
-- **Reduced-precision storage** (float16 default, int8 optional): 7-14x smaller on
-  disk and 2x more pages resident in RAM, at recall 1.0 (float16) / ~0.98 (int8).
+- **Reduced-precision storage** (optional, `storage="float16"`/`"int8"`): 7-14x
+  smaller on disk and up to 2x more pages resident in RAM, at recall 1.0 (float16)
+  / ~0.98 (int8). The default `float32` keeps the fastest query and bit-exactness.
 
 All output is metrics-only: counts, bytes, latency, recall; never vectors.

@@ -84,12 +84,14 @@ Each document's patch matrix is stored at a precision chosen with `storage=`.
 
 | storage | size vs float32 | recall | notes |
 |---|---|---|---|
-| `"float32"` | 1x | exact | bit-exact; fastest query |
-| `"float16"` (default) | 0.5x | ~exact (1.0 in the benchmark) | half the disk and RAM |
+| `"float32"` (default) | 1x | exact | bit-exact; fastest query |
+| `"float16"` | 0.5x | ~exact (1.0 in the benchmark) | half the disk and RAM |
 | `"int8"` | 0.25x | ~0.98 | per-vector-scaled; smallest |
 
-The precision is **persisted with the index** (in a small `lodedb_late_interaction.meta`
-sidecar), so you set it once at creation and reopen without re-passing it:
+The default is `float32` for its query speed and bit-exactness; choose `float16`
+or `int8` when footprint matters more. The precision is **persisted with the
+index** (in a small `lodedb_late_interaction.meta` sidecar), so you set it once at
+creation and reopen without re-passing it:
 
 ```python
 LodeLateInteractionIndex("./pages", dim=128, storage="int8")  # create as int8
@@ -98,7 +100,7 @@ LodeLateInteractionIndex("./pages", dim=128)                  # reopens as int8
 ```
 
 Leave `storage=None` (the default) to adopt the index's stored precision, or
-float16 for a brand-new index. Passing a value that disagrees with the stored one
+float32 for a brand-new index. Passing a value that disagrees with the stored one
 raises `ValueError`, so an index keeps a single precision; every document also
 records its own precision, so decoding is always correct.
 

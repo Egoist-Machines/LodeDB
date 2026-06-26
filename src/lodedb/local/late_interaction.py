@@ -14,8 +14,8 @@ mean-pooled patch vector, and its full patch matrix is kept in the per-row text
 sidecar -- a compact multi-vector layout that holds a page's ~1000 patches in a
 single row instead of ~1000 rows, which keeps both ingest and on-disk footprint
 low. The patch matrix is stored at a configurable precision (``storage=``):
-``float16`` (default, ~exact and half the size of float32), ``float32`` (bit
-exact), or ``int8`` (a per-vector-scaled quantization, ~4x smaller).
+``float32`` (default, fastest query and bit exact), ``float16`` (~exact at half
+the size), or ``int8`` (a per-vector-scaled quantization, ~4x smaller).
 
 Retrieval is exact MaxSim over the documents, by one of three paths
 (:meth:`search` picks one automatically; all return the true top-``k``):
@@ -75,7 +75,9 @@ _RESERVED_METADATA_KEYS = frozenset({_PATCH_COUNT_KEY, _DTYPE_KEY})
 # Supported patch-matrix storage precisions.
 _STORAGE_CHOICES = ("float16", "float32", "int8")
 # Default precision for a brand-new index when the caller does not choose one.
-_DEFAULT_STORAGE = "float16"
+# float32 favors query speed and bit-exactness; float16 / int8 trade a little for
+# a smaller footprint.
+_DEFAULT_STORAGE = "float32"
 # Index-level config sidecar (precision the index was created with), so the
 # choice persists and is reused on reopen without re-passing ``storage=``. The
 # extension deliberately avoids ``.json`` so the engine's ``*.json`` index scan
@@ -220,10 +222,10 @@ class LodeLateInteractionIndex:
         precomputed-matrix API.
 
         ``storage`` is the patch-matrix precision and is **persisted with the
-        index**: ``"float16"`` (default for a new index, near-exact at half the
-        size of float32), ``"float32"`` (bit exact), or ``"int8"``
+        index**: ``"float32"`` (default for a new index, fastest query and bit
+        exact), ``"float16"`` (near-exact at half the size), or ``"int8"``
         (per-vector-scaled, ~4x smaller, a small recall cost). Leave it ``None`` to
-        adopt the precision the index was created with (or float16 for a new
+        adopt the precision the index was created with (or float32 for a new
         index); passing a value that disagrees with the stored one raises
         :class:`ValueError`, so an index keeps a single precision. ``resident``
         controls the default

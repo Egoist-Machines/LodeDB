@@ -301,9 +301,9 @@ hits = idx.search(query_tokens, k=5)                       # [(score, doc_id, me
 ```
 
 The encoder stays bring-your-own (ColPali / ColQwen weights are multi-GB). Patch
-matrices are stored at `storage="float16"` (default, near-exact), `"float32"`
-(bit-exact), or `"int8"` (~4x smaller). See
-[`docs/late-interaction.md`](docs/late-interaction.md).
+matrices are stored at `storage="float32"` (default, fastest query and bit-exact),
+`"float16"` (near-exact, half the size), or `"int8"` (~4x smaller); the choice
+persists with the index. See [`docs/late-interaction.md`](docs/late-interaction.md).
 
 ## GPU-resident index
 

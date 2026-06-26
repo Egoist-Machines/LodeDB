@@ -349,11 +349,11 @@ def test_storage_persists_across_reopen(tmp_path):
     assert reopened.storage == "int8"
 
 
-def test_new_index_defaults_to_float16(tmp_path):
+def test_new_index_defaults_to_float32(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    assert idx.storage == "float16"
+    assert idx.storage == "float32"
     idx.close()
-    assert LodeLateInteractionIndex(tmp_path, dim=DIM).storage == "float16"
+    assert LodeLateInteractionIndex(tmp_path, dim=DIM).storage == "float32"
 
 
 def test_conflicting_storage_on_reopen_rejected(tmp_path):
