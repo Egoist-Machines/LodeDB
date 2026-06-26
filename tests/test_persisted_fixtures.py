@@ -77,3 +77,16 @@ def test_v0_4_legacy_top_level_json_fixture_opens(tmp_path: Path) -> None:
         assert db.count() == 3
     finally:
         db.close()
+
+
+def test_rust_generation_fixture_opens_in_python(tmp_path: Path) -> None:
+    path = _copy_fixture("rust_generation_empty", tmp_path)
+    db = LodeDB(
+        path,
+        commit_mode="generation",
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    try:
+        assert db.count() == 0
+    finally:
+        db.close()

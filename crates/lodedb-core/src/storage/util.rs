@@ -1,7 +1,8 @@
 use crate::error::{CoreError, CoreErrorCode};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 
 pub(crate) type CoreResult<T> = Result<T, CoreError>;
@@ -79,6 +80,70 @@ pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
 
 pub(crate) fn body_sha256(body: &Value) -> CoreResult<String> {
     Ok(sha256_bytes_hex(py_canonical_json(body)?.as_bytes()))
+}
+
+pub(crate) fn write_py_json(path: &Path, value: &Value, fsync: bool) -> CoreResult<usize> {
+    let text = py_canonical_json(value)?;
+    write_text_atomic(path, &text, fsync)
+}
+
+pub(crate) fn write_text_atomic(path: &Path, text: &str, fsync: bool) -> CoreResult<usize> {
+    write_bytes_atomic(path, text.as_bytes(), fsync)
+}
+
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8], fsync: bool) -> CoreResult<usize> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            corrupt(format!(
+                "could not create directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let temporary = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    {
+        let mut handle = File::create(&temporary)
+            .map_err(|error| corrupt(format!("could not create temp file: {error}")))?;
+        handle
+            .write_all(bytes)
+            .map_err(|error| corrupt(format!("could not write temp file: {error}")))?;
+        if fsync {
+            handle
+                .sync_all()
+                .map_err(|error| corrupt(format!("could not fsync temp file: {error}")))?;
+        }
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| corrupt(format!("could not replace {}: {error}", path.display())))?;
+    if fsync {
+        fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    }
+    Ok(bytes.len())
+}
+
+pub(crate) fn write_pretty_json_atomic(
+    path: &Path,
+    value: &Value,
+    fsync: bool,
+) -> CoreResult<usize> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|error| corrupt(format!("could not encode manifest JSON: {error}")))?;
+    write_text_atomic(path, &text, fsync)
+}
+
+pub(crate) fn fsync_dir(path: &Path) -> CoreResult<()> {
+    let Ok(handle) = File::open(path) else {
+        return Ok(());
+    };
+    handle.sync_all().map_err(|error| {
+        corrupt(format!(
+            "could not fsync directory {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 pub(crate) fn get_i64(object: &Map<String, Value>, key: &str, default: i64) -> i64 {

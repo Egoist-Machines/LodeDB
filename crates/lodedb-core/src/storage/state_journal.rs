@@ -1,5 +1,6 @@
 use crate::storage::util::{
-    corrupt, get_i64, get_str, read_json, sha256_bytes_hex, value_object, verify_file_sha256,
+    corrupt, get_i64, get_str, py_canonical_json, read_json, sha256_bytes_hex, sha256_file_hex,
+    value_object, verify_file_sha256, write_bytes_atomic, write_pretty_json_atomic, write_py_json,
     CoreResult,
 };
 use serde_json::{Map, Value};
@@ -285,6 +286,121 @@ pub fn read_journal_segment(path: &Path) -> CoreResult<Map<String, Value>> {
     segment.insert("header".to_string(), header);
     segment.insert("body".to_string(), body);
     Ok(segment)
+}
+
+pub fn write_base_json(base_path: &Path, payload: &Value, fsync: bool) -> CoreResult<usize> {
+    write_py_json(base_path, payload, fsync)
+}
+
+pub fn record_base(
+    base_path: &Path,
+    document_count: usize,
+    chunk_count: usize,
+    fsync: bool,
+) -> CoreResult<Value> {
+    if !base_path.is_file() {
+        return Err(corrupt("state journal base snapshot is missing"));
+    }
+    let path = manifest_path(base_path);
+    let previous = read_manifest_optional(base_path)?;
+    let next_seq = previous
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("next_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            corrupt(format!(
+                "state journal directory could not be created: {error}"
+            ))
+        })?;
+    }
+    let manifest = serde_json::json!({
+        "schema_version": STATE_JOURNAL_SCHEMA_VERSION,
+        "base": {
+            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
+            "sha256": sha256_file_hex(base_path)?,
+            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("state base metadata failed: {error}")))?.len(),
+            "document_count": document_count,
+            "chunk_count": chunk_count,
+        },
+        "deltas": [],
+        "next_seq": next_seq,
+    });
+    write_pretty_json_atomic(&path, &manifest, fsync)?;
+    Ok(manifest)
+}
+
+#[derive(Debug, Clone)]
+pub struct StateJournalDeltaInput {
+    pub upserted_documents: Vec<Value>,
+    pub deleted_document_ids: Vec<String>,
+    pub state_header: Value,
+    pub document_count_after: usize,
+    pub chunk_count_after: usize,
+    pub generation: u64,
+    pub fsync: bool,
+}
+
+pub fn append_delta(base_path: &Path, input: StateJournalDeltaInput) -> CoreResult<Value> {
+    let mut manifest = read_manifest_optional(base_path)?
+        .ok_or_else(|| corrupt("state journal manifest is missing"))?;
+    let manifest_object = manifest
+        .as_object_mut()
+        .ok_or_else(|| corrupt("state journal manifest must be a JSON object"))?;
+    let sequence = manifest_object
+        .get("next_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "schema_version": STATE_JOURNAL_SCHEMA_VERSION,
+        "upserted_documents": input.upserted_documents,
+        "deleted_document_ids": input.deleted_document_ids,
+        "state_header": input.state_header,
+    });
+    let body_blob = py_canonical_json(&body)?.into_bytes();
+    let header = serde_json::json!({
+        "schema_version": STATE_JOURNAL_SCHEMA_VERSION,
+        "kind": "delta",
+        "seq": sequence,
+        "generation_after": input.generation,
+        "document_count_after": input.document_count_after,
+        "chunk_count_after": input.chunk_count_after,
+        "body_bytes": body_blob.len(),
+        "body_sha256": sha256_bytes_hex(&body_blob),
+    });
+    let header_blob = py_canonical_json(&header)?.into_bytes();
+    let segment_name = format!("delta-{sequence:08}.jsd");
+    let delta_dir = base_path.with_file_name(format!(
+        "{}{}",
+        base_path.file_name().unwrap().to_string_lossy(),
+        STATE_JOURNAL_DIR_SUFFIX
+    ));
+    let segment_path = delta_dir.join(&segment_name);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(STATE_JOURNAL_MAGIC);
+    bytes.extend_from_slice(&(header_blob.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&header_blob);
+    bytes.extend_from_slice(&body_blob);
+    write_bytes_atomic(&segment_path, &bytes, input.fsync)?;
+    let deltas = manifest_object
+        .entry("deltas")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| corrupt("state journal manifest deltas must be a list"))?;
+    deltas.push(serde_json::json!({
+        "file_name": segment_name,
+        "sha256": sha256_file_hex(&segment_path)?,
+        "file_bytes": segment_path.metadata().map_err(|error| corrupt(format!("state journal segment metadata failed: {error}")))?.len(),
+        "seq": sequence,
+        "upserted_documents": body["upserted_documents"].as_array().map_or(0, Vec::len),
+        "deleted_documents": body["deleted_document_ids"].as_array().map_or(0, Vec::len),
+    }));
+    manifest_object.insert("next_seq".to_string(), Value::from(sequence + 1));
+    write_pretty_json_atomic(&manifest_path(base_path), &manifest, input.fsync)?;
+    Ok(manifest)
 }
 
 fn object_string_values(value: Option<&Value>) -> CoreResult<BTreeMap<String, String>> {

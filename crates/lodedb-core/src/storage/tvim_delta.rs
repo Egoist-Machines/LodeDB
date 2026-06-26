@@ -1,8 +1,9 @@
 use crate::storage::util::{
     corrupt, get_i64, get_str, sha256_bytes_hex, sha256_file_hex, value_object, verify_file_sha256,
-    CoreResult,
+    write_bytes_atomic, write_pretty_json_atomic, CoreResult,
 };
 use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const TVIM_DELTA_DIR_SUFFIX: &str = ".tvim-delta";
@@ -150,4 +151,136 @@ pub fn read_delta_segment_header(path: &Path) -> CoreResult<Value> {
         offset = stop;
     }
     Ok(header)
+}
+
+pub fn persist_base_bytes(
+    base_path: &Path,
+    tvim_bytes: &[u8],
+    rows: usize,
+    calibration_fingerprint: u64,
+    fsync: bool,
+) -> CoreResult<Value> {
+    write_bytes_atomic(base_path, tvim_bytes, fsync)?;
+    let manifest_path = manifest_path(base_path);
+    let previous = if manifest_path.is_file() {
+        Some(crate::storage::util::read_json(
+            &manifest_path,
+            "TurboVec delta manifest",
+        )?)
+    } else {
+        None
+    };
+    let next_seq = previous
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("next_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            corrupt(format!(
+                "TurboVec delta directory could not be created: {error}"
+            ))
+        })?;
+    }
+    let manifest = serde_json::json!({
+        "schema_version": TVIM_DELTA_SCHEMA_VERSION,
+        "base": {
+            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
+            "sha256": sha256_file_hex(base_path)?,
+            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("TurboVec base metadata failed: {error}")))?.len(),
+            "rows": rows,
+            "calibration_fingerprint": calibration_fingerprint,
+        },
+        "deltas": [],
+        "next_seq": next_seq,
+    });
+    write_pretty_json_atomic(&manifest_path, &manifest, fsync)?;
+    Ok(manifest)
+}
+
+#[derive(Debug, Clone)]
+pub struct TvimDeltaArray<'a> {
+    pub name: &'a str,
+    pub dtype: &'a str,
+    pub shape: Vec<usize>,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+pub struct TvimDeltaAppendInput<'a> {
+    pub generation: u64,
+    pub calibration_fingerprint: u64,
+    pub rows_after: usize,
+    pub arrays: &'a [TvimDeltaArray<'a>],
+    pub upsert_rows: usize,
+    pub removed_rows: usize,
+    pub fsync: bool,
+}
+
+pub fn append_delta_arrays(base_path: &Path, input: TvimDeltaAppendInput<'_>) -> CoreResult<Value> {
+    let manifest_path = manifest_path(base_path);
+    let mut manifest = crate::storage::util::read_json(&manifest_path, "TurboVec delta manifest")?;
+    let manifest_object = manifest
+        .as_object_mut()
+        .ok_or_else(|| corrupt("TurboVec delta manifest must be a JSON object"))?;
+    let sequence = manifest_object
+        .get("next_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let specs = input
+        .arrays
+        .iter()
+        .map(|array| {
+            serde_json::json!({
+                "name": array.name,
+                "dtype": array.dtype,
+                "shape": array.shape,
+                "nbytes": array.bytes.len(),
+                "sha256": sha256_bytes_hex(array.bytes),
+            })
+        })
+        .collect::<Vec<_>>();
+    let header = serde_json::json!({
+        "schema_version": TVIM_DELTA_SCHEMA_VERSION,
+        "kind": "delta",
+        "seq": sequence,
+        "generation_after": input.generation,
+        "calibration_fingerprint": input.calibration_fingerprint,
+        "rows_after": input.rows_after,
+        "arrays": specs,
+    });
+    let header_blob = crate::storage::util::py_canonical_json(&header)?.into_bytes();
+    let mut segment = Vec::new();
+    segment.extend_from_slice(TVIM_DELTA_MAGIC);
+    segment.extend_from_slice(&(header_blob.len() as u64).to_le_bytes());
+    segment.extend_from_slice(&header_blob);
+    for array in input.arrays {
+        segment.extend_from_slice(array.bytes);
+    }
+    let segment_name = format!("delta-{sequence:08}.tvd");
+    let delta_dir = base_path.with_file_name(format!(
+        "{}{}",
+        base_path.file_name().unwrap().to_string_lossy(),
+        TVIM_DELTA_DIR_SUFFIX
+    ));
+    let segment_path = delta_dir.join(&segment_name);
+    write_bytes_atomic(&segment_path, &segment, input.fsync)?;
+    let deltas = manifest_object
+        .entry("deltas")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| corrupt("TurboVec delta manifest deltas must be a list"))?;
+    deltas.push(serde_json::json!({
+        "file_name": segment_name,
+        "sha256": sha256_file_hex(&segment_path)?,
+        "file_bytes": segment_path.metadata().map_err(|error| corrupt(format!("TurboVec delta segment metadata failed: {error}")))?.len(),
+        "seq": sequence,
+        "upsert_rows": input.upsert_rows,
+        "removed_rows": input.removed_rows,
+    }));
+    manifest_object.insert("next_seq".to_string(), Value::from(sequence + 1));
+    write_pretty_json_atomic(&manifest_path, &manifest, input.fsync)?;
+    Ok(manifest)
 }

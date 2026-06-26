@@ -1,4 +1,7 @@
-use crate::storage::util::{body_sha256, corrupt, get_i64, get_str, read_json_object, CoreResult};
+use crate::storage::util::{
+    body_sha256, corrupt, get_i64, get_str, py_canonical_json, read_json_object, write_text_atomic,
+    CoreResult,
+};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -87,6 +90,47 @@ pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
         return Err(corrupt("commit manifest failed body checksum"));
     }
     Ok(Some(CommitManifest { body: body.clone() }))
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitBodyInput<'a> {
+    pub index_key: &'a str,
+    pub generation: u64,
+    pub base_epoch: u64,
+    pub document_count: usize,
+    pub chunk_count: usize,
+    pub json_manifest: Option<Value>,
+    pub tvim_manifest: Option<Value>,
+    pub tvim_present: bool,
+    pub tvtext_manifest: Option<Value>,
+    pub tvlex_manifest: Option<Value>,
+}
+
+pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
+    serde_json::json!({
+        "index_key": input.index_key,
+        "generation": input.generation,
+        "base_epoch": input.base_epoch,
+        "document_count": input.document_count,
+        "chunk_count": input.chunk_count,
+        "json": input.json_manifest,
+        "tvim": input.tvim_manifest,
+        "tvim_present": input.tvim_present,
+        "tvtext": input.tvtext_manifest,
+        "tvlex": input.tvlex_manifest,
+    })
+}
+
+pub fn write_commit_manifest(path: &Path, body: &Value, fsync: bool) -> CoreResult<usize> {
+    if !body.is_object() {
+        return Err(corrupt("commit manifest body must be a JSON object"));
+    }
+    let body_json = py_canonical_json(body)?;
+    let body_sha = body_sha256(body)?;
+    let document_json = format!(
+        "{{\"body\":{body_json},\"body_sha256\":\"{body_sha}\",\"schema_version\":{COMMIT_MANIFEST_SCHEMA_VERSION}}}"
+    );
+    write_text_atomic(path, &document_json, fsync)
 }
 
 pub fn list_base_epochs(persistence_dir: &Path, index_key: &str) -> CoreResult<BTreeSet<u64>> {

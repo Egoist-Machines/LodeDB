@@ -8,10 +8,10 @@ use lodedb_core::storage::commit_manifest::{
     read_commit_manifest,
 };
 use lodedb_core::storage::{
-    fixture_root, lexical_store, load_store, state_journal, text_store, tvim_delta, wal,
-    LoadOptions, StoreLayout,
+    fixture_root, gc_after_base_rewrite, lexical_store, load_store, state_journal, text_store,
+    tvim_delta, wal, GenerationCommitInput, GenerationWriteOptions, LoadOptions, StoreLayout,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
 
@@ -249,4 +249,174 @@ fn copy_dir_all(source: &Path, target: &Path) {
             fs::copy(&path, &destination).unwrap();
         }
     }
+}
+
+#[test]
+fn rust_generation_writer_round_trips_state_and_sidecars() {
+    let temp = unique_temp_dir("rust_write_roundtrip");
+    let raw_text = std::collections::BTreeMap::from([
+        ("doc-rust-a".to_string(), "alpha from rust".to_string()),
+        ("doc-rust-b".to_string(), "beta from rust".to_string()),
+    ]);
+    let lexical_tokens = std::collections::BTreeMap::from([
+        (
+            "doc-rust-a".to_string(),
+            vec![vec!["alpha".to_string(), "rust".to_string()]],
+        ),
+        (
+            "doc-rust-b".to_string(),
+            vec![vec!["beta".to_string(), "rust".to_string()]],
+        ),
+    ]);
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 1,
+            base_epoch: 1,
+            state: &rust_state_payload(1, &["doc-rust-a", "doc-rust-b"]),
+            tvim: None,
+            raw_text: Some(&raw_text),
+            lexical_tokens: Some(&lexical_tokens),
+        },
+        GenerationWriteOptions::default(),
+    )
+    .unwrap();
+
+    let loaded = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(loaded.generation, 1);
+    assert_eq!(loaded.document_count(), 2);
+    assert_eq!(loaded.raw_text, raw_text);
+    assert_eq!(loaded.lexical_tokens, lexical_tokens);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn generation_commit_point_and_gc_are_root_manifest_swap() {
+    let temp = unique_temp_dir("rust_commit_point");
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 1,
+            base_epoch: 1,
+            state: &rust_state_payload(1, &["old"]),
+            tvim: None,
+            raw_text: None,
+            lexical_tokens: None,
+        },
+        GenerationWriteOptions {
+            fsync: false,
+            retained_epochs: 4,
+        },
+    )
+    .unwrap();
+
+    let sidecar_path = lodedb_core::storage::commit_manifest::base_json_path(&temp, INDEX_KEY, 2);
+    state_journal::write_base_json(&sidecar_path, &rust_state_payload(2, &["new"]), false).unwrap();
+    state_journal::record_base(&sidecar_path, 1, 0, false).unwrap();
+    let still_old = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(still_old.generation, 1);
+    assert!(still_old.state["document_hashes"]
+        .as_object()
+        .unwrap()
+        .contains_key("old"));
+
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 2,
+            base_epoch: 2,
+            state: &rust_state_payload(2, &["new"]),
+            tvim: None,
+            raw_text: None,
+            lexical_tokens: None,
+        },
+        GenerationWriteOptions {
+            fsync: false,
+            retained_epochs: 4,
+        },
+    )
+    .unwrap();
+    let swapped = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(swapped.generation, 2);
+    assert!(swapped.state["document_hashes"]
+        .as_object()
+        .unwrap()
+        .contains_key("new"));
+
+    for epoch in 3..=7 {
+        lodedb_core::storage::write_generation_commit(
+            &temp,
+            GenerationCommitInput {
+                index_key: INDEX_KEY,
+                generation: epoch,
+                base_epoch: epoch,
+                state: &rust_state_payload(epoch, &[&format!("doc-{epoch}")]),
+                tvim: None,
+                raw_text: None,
+                lexical_tokens: None,
+            },
+            GenerationWriteOptions {
+                fsync: false,
+                retained_epochs: 2,
+            },
+        )
+        .unwrap();
+    }
+    gc_after_base_rewrite(&temp, INDEX_KEY, 7, 2).unwrap();
+    assert!(!lodedb_core::storage::commit_manifest::base_json_path(&temp, INDEX_KEY, 1).exists());
+    assert!(lodedb_core::storage::commit_manifest::base_json_path(&temp, INDEX_KEY, 7).exists());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+fn rust_state_payload(generation: u64, document_ids: &[&str]) -> Value {
+    let document_hashes = document_ids
+        .iter()
+        .map(|document_id| {
+            (
+                (*document_id).to_string(),
+                Value::String(format!("hash-{document_id}")),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let document_metadata = document_ids
+        .iter()
+        .map(|document_id| ((*document_id).to_string(), json!({"source": "rust"})))
+        .collect::<serde_json::Map<_, _>>();
+    let document_chunk_ids = document_ids
+        .iter()
+        .map(|document_id| ((*document_id).to_string(), Value::Array(Vec::new())))
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "cache_reuse_count": 0,
+        "chunks": [],
+        "client_id_hash": INDEX_KEY,
+        "columnar_generation": generation,
+        "created_at": "2026-06-26T00:00:00+00:00",
+        "delete_count": 0,
+        "deleted_chunk_count": 0,
+        "document_chunk_ids": document_chunk_ids,
+        "document_hashes": document_hashes,
+        "document_metadata": document_metadata,
+        "embedded_chunk_count": 0,
+        "fallback_count": 0,
+        "fallback_reasons": {},
+        "index_id": "default",
+        "index_key": INDEX_KEY,
+        "metadata": {},
+        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "name": "lodedb-local",
+        "native_dim": 384,
+        "provider": "local_open",
+        "query_count": 0,
+        "route_profile": "minilm-turbovec",
+        "schema_version": 1,
+        "status": "ready",
+        "storage_profile": "turbovec_direct",
+        "task": "direct-turbovec",
+        "turbovec_bit_width": 4,
+        "updated_at": "2026-06-26T00:00:00+00:00"
+    })
 }

@@ -9,7 +9,8 @@ pub mod wal;
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{
-    base_json_path, base_tvim_path, base_tvlex_path, base_tvtext_path, commit_manifest_path,
+    base_json_path, base_tvim_path, base_tvlex_path, base_tvtext_path, build_commit_body,
+    commit_manifest_path, generation_dir, list_base_epochs, write_commit_manifest, CommitBodyInput,
     CommitManifest,
 };
 use crate::storage::lexical_store::TokenLists;
@@ -17,6 +18,7 @@ use crate::storage::util::{corrupt, get_str, invalid, value_object, CoreResult};
 use crate::storage::wal::WalRecord;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,4 +155,163 @@ pub fn fixture_root(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(relative)
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationWriteOptions {
+    pub fsync: bool,
+    pub retained_epochs: usize,
+}
+
+impl Default for GenerationWriteOptions {
+    fn default() -> Self {
+        Self {
+            fsync: false,
+            retained_epochs: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TvimBaseWrite<'a> {
+    pub bytes: &'a [u8],
+    pub rows: usize,
+    pub calibration_fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationCommitInput<'a> {
+    pub index_key: &'a str,
+    pub generation: u64,
+    pub base_epoch: u64,
+    pub state: &'a Value,
+    pub tvim: Option<TvimBaseWrite<'a>>,
+    pub raw_text: Option<&'a BTreeMap<String, String>>,
+    pub lexical_tokens: Option<&'a BTreeMap<String, TokenLists>>,
+}
+
+pub fn write_generation_commit(
+    persistence_dir: impl AsRef<Path>,
+    input: GenerationCommitInput<'_>,
+    options: GenerationWriteOptions,
+) -> CoreResult<Value> {
+    let persistence_dir = persistence_dir.as_ref();
+    fs::create_dir_all(generation_dir(persistence_dir, input.index_key)).map_err(|error| {
+        corrupt(format!(
+            "generation directory could not be created for {}: {error}",
+            input.index_key
+        ))
+    })?;
+
+    let state_path = base_json_path(persistence_dir, input.index_key, input.base_epoch);
+    state_journal::write_base_json(&state_path, input.state, options.fsync)?;
+    let document_count = input
+        .state
+        .get("document_hashes")
+        .and_then(Value::as_object)
+        .map_or(0, |documents| documents.len());
+    let chunk_count = input
+        .state
+        .get("chunks")
+        .and_then(Value::as_array)
+        .map_or(0, |chunks| chunks.len());
+    let json_manifest =
+        state_journal::record_base(&state_path, document_count, chunk_count, options.fsync)?;
+
+    let tvim_manifest = match input.tvim {
+        Some(tvim) => Some(tvim_delta::persist_base_bytes(
+            &base_tvim_path(persistence_dir, input.index_key, input.base_epoch),
+            tvim.bytes,
+            tvim.rows,
+            tvim.calibration_fingerprint,
+            options.fsync,
+        )?),
+        None => None,
+    };
+    let text_manifest = match input.raw_text {
+        Some(raw_text) if !raw_text.is_empty() => Some(text_store::record_base(
+            &base_tvtext_path(persistence_dir, input.index_key, input.base_epoch),
+            raw_text,
+            options.fsync,
+        )?),
+        _ => None,
+    };
+    let lexical_manifest = match input.lexical_tokens {
+        Some(tokens) if !tokens.is_empty() => Some(lexical_store::record_base(
+            &base_tvlex_path(persistence_dir, input.index_key, input.base_epoch),
+            tokens,
+            options.fsync,
+        )?),
+        _ => None,
+    };
+    let body = build_commit_body(CommitBodyInput {
+        index_key: input.index_key,
+        generation: input.generation,
+        base_epoch: input.base_epoch,
+        document_count,
+        chunk_count,
+        json_manifest: Some(json_manifest),
+        tvim_present: tvim_manifest.is_some(),
+        tvim_manifest,
+        tvtext_manifest: text_manifest,
+        tvlex_manifest: lexical_manifest,
+    });
+    write_commit_manifest(
+        &commit_manifest_path(persistence_dir, input.index_key),
+        &body,
+        options.fsync,
+    )?;
+    gc_after_base_rewrite(
+        persistence_dir,
+        input.index_key,
+        input.base_epoch,
+        options.retained_epochs,
+    )?;
+    Ok(body)
+}
+
+pub fn gc_after_base_rewrite(
+    persistence_dir: &Path,
+    index_key: &str,
+    live_epoch: u64,
+    retained_epochs: usize,
+) -> CoreResult<()> {
+    let mut epochs = list_base_epochs(persistence_dir, index_key)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    epochs.sort_by(|left, right| right.cmp(left));
+    let keep = epochs
+        .iter()
+        .take(retained_epochs)
+        .copied()
+        .chain(std::iter::once(live_epoch))
+        .collect::<std::collections::BTreeSet<_>>();
+    for epoch in epochs {
+        if keep.contains(&epoch) {
+            continue;
+        }
+        for path in [
+            base_json_path(persistence_dir, index_key, epoch),
+            base_tvim_path(persistence_dir, index_key, epoch),
+            base_tvtext_path(persistence_dir, index_key, epoch),
+            base_tvlex_path(persistence_dir, index_key, epoch),
+        ] {
+            let _ = fs::remove_file(&path);
+            for suffix in [
+                state_journal::STATE_JOURNAL_DIR_SUFFIX,
+                tvim_delta::TVIM_DELTA_DIR_SUFFIX,
+                text_store::DOCUMENT_TEXT_DELTA_DIR_SUFFIX,
+                lexical_store::LEXICAL_INDEX_DELTA_DIR_SUFFIX,
+            ] {
+                if let Some(name) = path.file_name() {
+                    let _ = fs::remove_dir_all(path.with_file_name(format!(
+                        "{}{}",
+                        name.to_string_lossy(),
+                        suffix
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
