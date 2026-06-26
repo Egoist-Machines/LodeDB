@@ -23,6 +23,7 @@ htmlcov/
 .coverage
 
 # Rust / maturin build artifacts for the vendored TurboVec crate
+target/
 third_party/turbovec/target/
 
 # Local LodeDB data dirs created by examples/benchmarks
