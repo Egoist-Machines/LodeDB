@@ -1,0 +1,253 @@
+"""Tests for late-interaction (multi-vector / MaxSim) retrieval -- issue #25, stage 1.
+
+These run fully offline: documents and queries are supplied as precomputed patch
+matrices (a deterministic fake encoder stands in for ColPali on the
+encoder-convenience path), so no model is downloaded. They exercise the storage
+layout (one row per patch with a parent_id), the two-stage exact-MaxSim
+retrieval, durability across reopen, metadata filtering, and the read-only /
+validation contracts.
+
+The patch dimension is a multiple of 8 because the TurboVec store requires it.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from lodedb import LodeLateInteractionHit, LodeLateInteractionIndex, ReadOnlyError
+from lodedb.local.late_interaction import _maxsim
+
+DIM = 16
+
+
+def _onehot_matrix(indices: list[int], *, dim: int = DIM) -> list[list[float]]:
+    rows = []
+    for i in indices:
+        row = [0.0] * dim
+        row[i] = 1.0
+        rows.append(row)
+    return rows
+
+
+def test_add_document_stores_one_row_per_patch(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1, 2]), metadata={"file": "a.pdf"})
+    assert idx.count() == 1
+    assert idx.patch_count() == 3
+
+
+def test_maxsim_ranks_best_overlap_first(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    # doc-a patches cover dims {0,1,2}; doc-b covers {5,6,7}.
+    idx.add_document("doc-a", _onehot_matrix([0, 1, 2]))
+    idx.add_document("doc-b", _onehot_matrix([5, 6, 7]))
+
+    # Query tokens land on dims 0 and 1 -> should match doc-a.
+    hits = idx.search(_onehot_matrix([0, 1]), k=2)
+    assert hits[0].id == "doc-a"
+    assert hits[0].score > hits[1].score
+    # Two query tokens each perfectly matching a doc-a patch -> exact MaxSim == 2.0
+    # (the exact rescore reads back the float32 patches, so quantization noise in
+    # the candidate scan does not leak into the final score).
+    assert hits[0].score == pytest.approx(2.0, abs=1e-5)
+
+
+def test_search_returns_hit_tuple_and_attributes(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1]), metadata={"k": "v"})
+    [hit] = idx.search(_onehot_matrix([0]), k=1)
+    assert isinstance(hit, LodeLateInteractionHit)
+    score, doc_id, meta = hit
+    assert doc_id == "doc-a"
+    assert meta == {"k": "v"}  # internal parent_id / patch_count stripped
+    assert hit.patch_count == 2
+    assert score == pytest.approx(1.0, abs=1e-5)
+
+
+def test_persist_and_reopen_roundtrip(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1, 2]), metadata={"file": "a.pdf"})
+    idx.persist()
+    idx.close()
+
+    reopened = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert reopened.count() == 1
+    hits = reopened.search(_onehot_matrix([2]), k=1)
+    assert hits[0].id == "doc-a"
+    assert hits[0].metadata == {"file": "a.pdf"}
+    assert reopened.list_documents() == [
+        {"id": "doc-a", "metadata": {"file": "a.pdf"}, "patch_count": 3}
+    ]
+
+
+def test_readd_replaces_patches_even_when_shorter(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1, 2, 3]))
+    assert idx.patch_count() == 4
+    idx.add_document("doc-a", _onehot_matrix([5]))  # shorter re-add
+    assert idx.count() == 1
+    assert idx.patch_count() == 1  # no stale tail rows
+    hits = idx.search(_onehot_matrix([5]), k=1)
+    assert hits[0].id == "doc-a"
+    assert hits[0].patch_count == 1
+
+
+def test_remove_drops_all_patches(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1]))
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))
+    assert idx.remove("doc-a") is True
+    assert idx.count() == 1
+    assert idx.patch_count() == 2
+    assert idx.remove("doc-a") is False  # already gone
+
+
+def test_add_documents_batch(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    ids = idx.add_documents(
+        [
+            {"id": "x", "patches": _onehot_matrix([0])},
+            {"id": "y", "patches": _onehot_matrix([5])},
+        ]
+    )
+    assert ids == ["x", "y"]
+    assert idx.count() == 2
+
+
+def test_filter_narrows_candidates_to_matching_documents(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("public", _onehot_matrix([0, 1]), metadata={"tenant": "a"})
+    idx.add_document("private", _onehot_matrix([0, 2]), metadata={"tenant": "b"})
+
+    hits = idx.search(_onehot_matrix([0]), k=5, filter={"tenant": "b"})
+    assert [hit.id for hit in hits] == ["private"]
+
+
+def test_list_documents_filter(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("p1", _onehot_matrix([0]), metadata={"book": "x"})
+    idx.add_document("p2", _onehot_matrix([1]), metadata={"book": "y"})
+    listed = idx.list_documents(filter={"book": "y"})
+    assert listed == [{"id": "p2", "metadata": {"book": "y"}, "patch_count": 1}]
+
+
+def test_numpy_array_input_is_accepted(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    patches = np.asarray(_onehot_matrix([0, 1]), dtype=np.float32)
+    idx.add_document("doc-a", patches)
+    hits = idx.search(np.asarray(_onehot_matrix([1]), dtype=np.float32), k=1)
+    assert hits[0].id == "doc-a"
+
+
+def test_dimension_mismatch_is_rejected(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    with pytest.raises(ValueError):
+        idx.add_document("doc-a", [[0.0] * (DIM + 1)])
+    with pytest.raises(ValueError):
+        idx.search([[0.0] * (DIM - 1)])
+
+
+def test_reserved_metadata_key_rejected(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    with pytest.raises(ValueError, match="reserved"):
+        idx.add_document("doc-a", _onehot_matrix([0]), metadata={"parent_id": "x"})
+
+
+def test_doc_id_with_separator_rejected(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    with pytest.raises(ValueError):
+        idx.add_document("doc#a", _onehot_matrix([0]))
+
+
+def test_read_only_rejects_writes(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0]))
+    idx.persist()
+    idx.close()
+
+    ro = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    with pytest.raises(ReadOnlyError):
+        ro.add_document("doc-b", _onehot_matrix([1]))
+    # reads still work
+    assert ro.count() == 1
+    assert ro.search(_onehot_matrix([0]), k=1)[0].id == "doc-a"
+
+
+def test_store_text_false_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        LodeLateInteractionIndex(tmp_path, dim=DIM, store_text=False)
+
+
+def test_empty_doc_rejected(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    with pytest.raises(ValueError):
+        idx.add_document("doc-a", np.zeros((0, DIM), dtype=np.float32))
+
+
+def test_search_empty_index_returns_nothing(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert idx.search(_onehot_matrix([0]), k=5) == []
+
+
+def test_hit_equality():
+    hit = LodeLateInteractionHit(score=1.5, id="x", metadata={"a": "b"}, patch_count=3)
+    assert hit == (1.5, "x", {"a": "b"})
+    assert hit == LodeLateInteractionHit(
+        score=1.5, id="x", metadata={"a": "b"}, patch_count=3
+    )
+
+
+def test_maxsim_kernel_matches_reference():
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal((4, DIM)).astype(np.float32)
+    d = rng.standard_normal((7, DIM)).astype(np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    expected = sum(max(float(qt @ dp) for dp in d) for qt in q)
+    assert _maxsim(q, d) == pytest.approx(expected, abs=1e-5)
+
+
+class _FakeColPali:
+    """Deterministic stand-in for a ColPali-style encoder (no download).
+
+    Each input string is hashed token-by-token into unit one-hot patch vectors,
+    so the encoder path can be exercised offline and deterministically.
+    """
+
+    def encode_documents(self, contents):
+        return [self._matrix(content) for content in contents]
+
+    def encode_queries(self, queries):
+        return [self._matrix(query) for query in queries]
+
+    @staticmethod
+    def _matrix(text):
+        rows = []
+        for token in str(text).split():
+            dim_index = (sum(ord(ch) for ch in token)) % DIM
+            row = [0.0] * DIM
+            row[dim_index] = 1.0
+            rows.append(row)
+        return rows or [[1.0] + [0.0] * (DIM - 1)]
+
+
+def test_encoder_convenience_path(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, encoder=_FakeColPali())
+    idx.add_texts(
+        [
+            {"id": "p1", "content": "alpha beta gamma", "metadata": {"f": "1.pdf"}},
+            {"id": "p2", "content": "delta epsilon"},
+        ]
+    )
+    assert idx.count() == 2
+    hits = idx.search_text("alpha beta", k=2)
+    assert hits[0].id == "p1"
+
+
+def test_encoder_required_for_text_path(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)  # no encoder
+    with pytest.raises(RuntimeError):
+        idx.search_text("anything")
+    with pytest.raises(RuntimeError):
+        idx.add_texts([{"content": "x"}])

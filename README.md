@@ -281,6 +281,27 @@ identity is pinned and re-enforced on reopen. To hold several encoders side by s
 `LodeCollection` named spaces, and pass `embedder=` to drive an index with your own
 model. See [`docs/multimodal.md`](docs/multimodal.md).
 
+## Late-interaction (multi-vector) retrieval
+
+For visual-document RAG, ColPali / ColQwen style models encode a page as a *set* of
+patch vectors and rank with MaxSim (sum over query tokens of the best patch match),
+rather than pooling to one vector. `LodeLateInteractionIndex` runs this on the
+bring-your-own-vectors path with no engine change: patches are stored as ordinary
+rows grouped by a parent id, candidates are gathered by any-patch similarity, and the
+exact MaxSim score is recomputed over the candidate set.
+
+```python
+from lodedb import LodeLateInteractionIndex
+
+idx = LodeLateInteractionIndex("./pages", dim=128)        # bring your own encoder
+idx.add_document("report-p1", page_patches, metadata={"file": "report.pdf"})
+hits = idx.search(query_tokens, k=5)                       # [(score, doc_id, metadata), ...]
+```
+
+The encoder stays bring-your-own (ColPali / ColQwen weights are multi-GB). Each patch
+is a stored row, so the index trades footprint for OCR-free page retrieval. See
+[`docs/late-interaction.md`](docs/late-interaction.md).
+
 ## GPU-resident index
 
 With the `[gpu]` extra on a CUDA host, LodeDB reconstructs the compact index into an fp16
