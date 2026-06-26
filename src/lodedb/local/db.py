@@ -37,8 +37,15 @@ from lodedb.engine.core import (
 )
 from lodedb.engine.embedding_backends import EngineEmbeddingBackend
 from lodedb.engine.index import EngineError, LodeIndex
+from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreEngineHandle
 from lodedb.engine.route_registry import default_route_registry, load_route_registry
-from lodedb.engine.runtime_policy import commit_mode_from_env, parse_commit_mode
+from lodedb.engine.runtime_policy import (
+    NativeCoreMode,
+    commit_mode_from_env,
+    native_core_mode_from_env,
+    native_core_strict_parity_from_env,
+    parse_commit_mode,
+)
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
@@ -241,6 +248,11 @@ class LodeDB:
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
         self.read_only = bool(read_only)
+        self._native_core_mode = native_core_mode_from_env()
+        self._native_core_strict_parity = native_core_strict_parity_from_env()
+        self._native_vector_engine: NativeCoreEngineHandle | None = None
+        self._native_vector_covered = False
+        self._native_core_fallback_reason = ""
         # bit_width is only meaningful for vector-only / custom-embedder indexes (a
         # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
         # reject any other width at the boundary; ``None`` means "use the index default".
@@ -391,6 +403,7 @@ class LodeDB:
         # any persisted state for this client hash via the engine constructor.
         self._ensure_index()
         self._auto_id_counter = 0
+        self._maybe_init_native_vector_engine(resolved_bit_width)
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
         # Split by phase: "ingest" (add_image/add_images) vs "query" (search_by_image).
@@ -547,6 +560,16 @@ class LodeDB:
                 ),
             )
         )
+        self._native_upsert_vectors(
+            (
+                EngineVectorDocument(
+                    document_id=document_id,
+                    vector=prepared,
+                    metadata=_coerce_metadata(metadata),
+                    text=_coerce_optional_text(text),
+                ),
+            )
+        )
         return document_id
 
     def add_vectors_many(
@@ -581,6 +604,7 @@ class LodeDB:
             )
         if payload:
             self._index.upsert_vectors_batch(tuple(payload))
+            self._native_upsert_vectors(tuple(payload))
         return ids
 
     def search(
@@ -737,7 +761,18 @@ class LodeDB:
             filter=_normalize_filter(filter),
             include=("metadata",),
         )
-        return self._hits_from_result_rows(response.get("results", []))
+        python_hits = self._hits_from_result_rows(response.get("results", []))
+        native_hits = self._native_search_by_vector(
+            prepared,
+            k=int(k),
+            filter=_normalize_filter(filter),
+        )
+        if native_hits is None:
+            return python_hits
+        self._check_native_vector_parity(python_hits, native_hits)
+        if self._native_core_mode == NativeCoreMode.ON:
+            return native_hits
+        return python_hits
 
     def search_many_by_vector(
         self,
@@ -775,6 +810,17 @@ class LodeDB:
             if not isinstance(item, Mapping):
                 raise RuntimeError("invalid engine response: query item must be an object")
             out.append(self._hits_from_result_rows(item.get("results", [])))
+        native_batches = self._native_search_many_by_vector(
+            [item["vector"] for item in items],
+            k=int(k),
+            filter=normalized_filter,
+        )
+        if native_batches is None:
+            return out
+        for python_hits, native_hits in zip(out, native_batches, strict=True):
+            self._check_native_vector_parity(python_hits, native_hits)
+        if self._native_core_mode == NativeCoreMode.ON:
+            return native_batches
         return out
 
     def add_image(
@@ -919,7 +965,9 @@ class LodeDB:
         # ids *requested* (not necessarily existing); `deleted_chunks` counts
         # chunks actually removed, so a positive value means the doc existed.
         response = self._index.delete_batch((id,))
-        return int(response.get("deleted_chunks", 0) or 0) > 0
+        deleted = int(response.get("deleted_chunks", 0) or 0) > 0
+        self._native_delete_documents((id,))
+        return deleted
 
     def _update_document_payload(
         self,
@@ -1073,6 +1121,9 @@ class LodeDB:
         """
 
         if filter is None:
+            stats = self._native_stats()
+            if stats is not None and self._native_core_mode == NativeCoreMode.ON:
+                return int(stats.get("document_count", 0) or 0)
             return int(self._index.stats().get("document_count", 0) or 0)
         return self._index.count_documents(filter=_normalize_filter(filter))
 
@@ -1095,6 +1146,7 @@ class LodeDB:
             stats["image_embedding"] = {
                 phase: dict(counters) for phase, counters in self._image_metrics.items()
             }
+            stats["native_core"] = self._native_core_stats()
         return stats
 
     def close(self) -> None:
@@ -1116,6 +1168,189 @@ class LodeDB:
         self.close()
 
     # -- internals ----------------------------------------------------------
+
+    def _maybe_init_native_vector_engine(self, bit_width: int) -> None:
+        """Initializes the native vector engine when the rollout policy allows it."""
+
+        if self._native_core_mode == NativeCoreMode.OFF or not self.vector_only:
+            return
+        if self.read_only:
+            self._native_core_fallback_reason = "read_only_native_vector_seed_unavailable"
+            return
+        adapter = NativeCoreAdapter()
+        if not adapter.available:
+            self._native_core_fallback_reason = "native_core_extension_unavailable"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("LODEDB_NATIVE_CORE=on requires lodedb._native_core")
+            return
+        try:
+            native_engine = adapter.new_engine()
+            native_engine.create_index(
+                _LOCAL_INDEX_ID,
+                vector_dim=self._vector_dim,
+                bit_width=bit_width,
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_init_failed"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("failed to initialize native core") from exc
+            return
+        document_count = int(self._index.stats().get("document_count", 0) or 0)
+        self._native_vector_engine = native_engine
+        self._native_vector_covered = document_count == 0
+        if not self._native_vector_covered:
+            self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
+
+    def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
+        """Mirrors vector mutations into native core while Python remains durable."""
+
+        if not documents or self._native_vector_engine is None or not self._native_vector_covered:
+            return
+        try:
+            self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_upsert_failed"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("native core vector upsert failed") from exc
+            if self._native_core_strict_parity:
+                raise
+
+    def _native_delete_documents(self, document_ids: tuple[str, ...]) -> None:
+        """Mirrors vector deletes into native core while Python remains durable."""
+
+        if (
+            not document_ids
+            or self._native_vector_engine is None
+            or not self._native_vector_covered
+        ):
+            return
+        try:
+            self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_delete_failed"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("native core vector delete failed") from exc
+            if self._native_core_strict_parity:
+                raise
+
+    def _native_search_by_vector(
+        self,
+        vector: Sequence[float],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+    ) -> list[LodeSearchHit] | None:
+        """Returns native vector hits when this handle is covered by native state."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return None
+        try:
+            payload = self._native_vector_engine.query_vector(
+                _LOCAL_INDEX_ID,
+                vector,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_query_failed"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("native core vector query failed") from exc
+            if self._native_core_strict_parity:
+                raise
+            return None
+        return self._hits_from_native_rows(payload.get("hits", []))
+
+    def _native_search_many_by_vector(
+        self,
+        vectors: list[Sequence[float]],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+    ) -> list[list[LodeSearchHit]] | None:
+        """Returns native vector batch hits when this handle is covered by native state."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return None
+        try:
+            batches = self._native_vector_engine.query_vectors_batch(
+                _LOCAL_INDEX_ID,
+                vectors,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_batch_query_failed"
+            if self._native_core_mode == NativeCoreMode.ON:
+                raise RuntimeError("native core vector batch query failed") from exc
+            if self._native_core_strict_parity:
+                raise
+            return None
+        return [self._hits_from_native_rows(batch.get("hits", [])) for batch in batches]
+
+    def _native_stats(self) -> dict[str, Any] | None:
+        """Returns native stats only when this handle is covered by native state."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return None
+        try:
+            return self._native_vector_engine.stats(_LOCAL_INDEX_ID)
+        except Exception:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_stats_failed"
+            return None
+
+    def _native_core_stats(self) -> dict[str, Any]:
+        """Returns redacted native-core rollout status for this handle."""
+
+        stats = self._native_stats() or {}
+        return {
+            "mode": self._native_core_mode.value,
+            "enabled": self._native_vector_engine is not None,
+            "covered": self._native_vector_covered,
+            "fallback_reason": self._native_core_fallback_reason,
+            "document_count": int(stats.get("document_count", 0) or 0),
+        }
+
+    def _check_native_vector_parity(
+        self,
+        python_hits: list[LodeSearchHit],
+        native_hits: list[LodeSearchHit],
+    ) -> None:
+        """Raises on native/Python hit mismatch when strict parity is active."""
+
+        python_ids = [hit.id for hit in python_hits]
+        native_ids = [hit.id for hit in native_hits]
+        if python_ids == native_ids:
+            return
+        self._native_vector_covered = False
+        self._native_core_fallback_reason = "native_core_vector_parity_mismatch"
+        if self._native_core_mode == NativeCoreMode.ON or self._native_core_strict_parity:
+            raise RuntimeError(
+                f"native core vector parity mismatch: python={python_ids!r} native={native_ids!r}"
+            )
+
+    @staticmethod
+    def _hits_from_native_rows(rows: Any) -> list[LodeSearchHit]:
+        """Hydrates native search rows into public payload-free hit objects."""
+
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid native response: hits must be a list")
+        hits: list[LodeSearchHit] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise RuntimeError("invalid native response: hit row must be an object")
+            hits.append(
+                LodeSearchHit(
+                    score=float(row["score"]),
+                    id=str(row["document_id"]),
+                    metadata=dict(row.get("metadata", {})),
+                )
+            )
+        return hits
 
     @property
     def _vector_dim(self) -> int:

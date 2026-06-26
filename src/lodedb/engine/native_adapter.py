@@ -176,6 +176,26 @@ class NativeCoreEngineHandle:
             )
         )
 
+    def query_vectors_batch(
+        self,
+        index_id: str,
+        vectors: Iterable[Iterable[float]],
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        value = json.loads(
+            self._engine.query_vectors_batch(
+                str(index_id),
+                self._dumps([[float(value) for value in vector] for vector in vectors]),
+                int(top_k),
+                None if filter is None else self._dumps(dict(filter)),
+            )
+        )
+        if not isinstance(value, list):
+            raise RuntimeError("native core returned a non-list JSON payload")
+        return [dict(item) for item in value]
+
     def prepare_text_upsert(
         self,
         index_id: str,
