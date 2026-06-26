@@ -267,6 +267,7 @@ def test_native_core_write_shadow_verifies_counts(tmp_path, monkeypatch) -> None
     stats = db.stats()["native_core"]
 
     assert stats["write_mode"] == "shadow"
+    assert stats["version"]
     assert stats["shadow_persist_count"] == 1
     assert stats["shadow_persist_verified"] is True
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "shadow-b"

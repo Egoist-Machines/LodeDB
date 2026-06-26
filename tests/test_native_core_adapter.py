@@ -17,6 +17,9 @@ class FakeNativeModule:
         assert type_name in {"CoreDocument", "CoreVectorDocument", "CoreQuery"}
         return json_payload
 
+    def native_core_version(self) -> str:
+        return "test-native-core"
+
 
 class FakeCoreEngine:
     def __init__(self) -> None:
@@ -203,6 +206,7 @@ class FakeCoreEngine:
 
 def test_adapter_maps_engine_document_to_native_payload() -> None:
     adapter = NativeCoreAdapter(FakeNativeModule())
+    assert adapter.version == "test-native-core"
     payload = adapter.round_trip(
         "CoreDocument",
         adapter.document_payload(

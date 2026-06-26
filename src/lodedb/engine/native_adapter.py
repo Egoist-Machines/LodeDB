@@ -23,6 +23,7 @@ class NativeCoreModule(Protocol):
     """Subset of the hidden native module used by the adapter."""
 
     def CoreEngine(self) -> Any: ...
+    def native_core_version(self) -> str: ...
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str: ...
 
 
@@ -43,6 +44,13 @@ class NativeCoreAdapter:
     @property
     def available(self) -> bool:
         return self._module_or_none() is not None
+
+    @property
+    def version(self) -> str:
+        module = self._module_or_none()
+        if module is None:
+            return ""
+        return str(module.native_core_version())
 
     def document_json(self, document: EngineDocument) -> str:
         return json.dumps(self.document_payload(document), sort_keys=True, separators=(",", ":"))

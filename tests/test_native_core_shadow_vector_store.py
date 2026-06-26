@@ -16,6 +16,10 @@ class FakeNativeAdapter:
     def available(self) -> bool:
         return self._available
 
+    @property
+    def version(self) -> str:
+        return "test-native-core"
+
     def new_engine(self) -> FakeNativeVectorEngine:
         return self._handle
 
@@ -165,6 +169,7 @@ def test_open_vector_store_native_on_uses_native_vector_results(tmp_path, monkey
     assert batches[0][0].score > 100.0
     assert db.count() == 2
     assert db.stats()["native_core"]["enabled"] is True
+    assert db.stats()["native_core"]["version"] == "test-native-core"
 
 
 def test_native_on_requires_available_extension(tmp_path, monkeypatch) -> None:
@@ -195,6 +200,7 @@ def test_default_native_on_falls_back_when_extension_unavailable(tmp_path, monke
 
     assert [hit.id for hit in db.search_by_vector(_onehot(0), k=1)] == ["a"]
     assert db.stats()["native_core"]["mode"] == "on"
+    assert db.stats()["native_core"]["version"] == ""
     assert db.stats()["native_core"]["enabled"] is False
     assert db.stats()["native_core"]["fallback_reason"] == "native_core_extension_unavailable"
 
