@@ -8,6 +8,7 @@ class FakeNativeAdapter:
         self._handle = handle
         self._available = available
         self.opened_readonly = False
+        self.opened_writable = False
 
     @property
     def available(self) -> bool:
@@ -20,6 +21,10 @@ class FakeNativeAdapter:
         self.opened_readonly = True
         return self._handle
 
+    def open_engine(self, *args, **kwargs) -> FakeNativeVectorEngine:
+        self.opened_writable = True
+        return self._handle
+
 
 class FakeNativeVectorEngine:
     def __init__(self, *, score_offset: float = 0.0) -> None:
@@ -28,6 +33,8 @@ class FakeNativeVectorEngine:
         self.documents: dict[str, dict] = {}
         self.query_calls = 0
         self.batch_query_calls = 0
+        self.persist_calls = 0
+        self.close_calls = 0
 
     def create_index(self, index_id: str, *, vector_dim: int, bit_width: int = 4) -> None:
         self.created = (index_id, vector_dim, bit_width)
@@ -98,6 +105,12 @@ class FakeNativeVectorEngine:
             "document_count": len(self.documents),
             "native_core_enabled": True,
         }
+
+    def persist(self) -> None:
+        self.persist_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _onehot(i: int, dim: int = 8) -> list[float]:
@@ -204,6 +217,28 @@ def test_native_on_readonly_existing_store_uses_persistent_seed(tmp_path, monkey
     assert adapter.opened_readonly is True
     assert db.stats()["native_core"]["covered"] is True
     assert db.stats()["native_core"]["fallback_reason"] == ""
+
+
+def test_native_write_shadow_persists_to_temp_native_handle(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine(score_offset=100)
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "shadow")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="a", metadata={"topic": "ops"})
+
+    db.persist()
+    stats = db.stats()["native_core"]
+
+    assert adapter.opened_writable is True
+    assert native.persist_calls == 1
+    assert stats["write_mode"] == "shadow"
+    assert stats["covered"] is True
+    assert [hit.id for hit in db.search_by_vector(_onehot(0), k=1)] == ["a"]
 
 
 def test_native_on_existing_store_falls_back_to_python_until_seeded(tmp_path, monkeypatch) -> None:

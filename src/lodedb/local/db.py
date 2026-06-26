@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import os
 import secrets
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -47,6 +48,7 @@ from lodedb.engine.runtime_policy import (
     commit_mode_from_env,
     native_core_mode_from_env,
     native_core_strict_parity_from_env,
+    native_core_write_mode_from_env,
     parse_commit_mode,
 )
 from lodedb.local.backends import (
@@ -253,6 +255,7 @@ class LodeDB:
         self.index_text = bool(index_text)
         self.read_only = bool(read_only)
         self._native_core_mode = native_core_mode_from_env()
+        self._native_core_write_mode = native_core_write_mode_from_env()
         self._native_core_strict_parity = native_core_strict_parity_from_env()
         self._native_core_fail_closed = (
             self._native_core_mode == NativeCoreMode.ON and "LODEDB_NATIVE_CORE" in os.environ
@@ -260,6 +263,7 @@ class LodeDB:
         self._native_vector_engine: NativeCoreEngineHandle | None = None
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
+        self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
         # bit_width is only meaningful for vector-only / custom-embedder indexes (a
         # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
         # reject any other width at the boundary; ``None`` means "use the index default".
@@ -1129,6 +1133,7 @@ class LodeDB:
         if not self.read_only and self._engine is not None:
             # Fold any WAL backlog into a generation; a no-op in generation mode.
             self._engine.checkpoint()
+            self._native_persist()
         # Surface the engine's current redacted stats, which include persisted
         # byte accounting.
         return self._index.stats()
@@ -1175,6 +1180,16 @@ class LodeDB:
 
         if self._engine is not None:
             self._engine.close()
+        if self._native_vector_engine is not None:
+            try:
+                self._native_vector_engine.close()
+            except Exception:
+                pass
+        if self._native_write_shadow_dir is not None:
+            self._native_write_shadow_dir.cleanup()
+            self._native_write_shadow_dir = None
+        self._native_vector_engine = None
+        self._native_vector_covered = False
         self._index = None  # type: ignore[assignment]
         self._engine = None  # type: ignore[assignment]
 
@@ -1231,7 +1246,23 @@ class LodeDB:
             self._native_vector_covered = True
             return
         try:
-            native_engine = adapter.new_engine()
+            if self._native_core_write_mode == NativeCoreMode.SHADOW:
+                shadow_dir = tempfile.TemporaryDirectory(prefix="lodedb-native-shadow-")
+                try:
+                    native_engine = adapter.open_engine(
+                        path=shadow_dir.name,
+                        read_only=False,
+                        durability=durability,
+                        commit_mode="generation",
+                        store_text=self.store_text,
+                        index_text=self.index_text,
+                    )
+                except Exception:
+                    shadow_dir.cleanup()
+                    raise
+                self._native_write_shadow_dir = shadow_dir
+            else:
+                native_engine = adapter.new_engine()
             native_engine.create_index_with_options(
                 _native_vector_index_options(
                     index_id=_LOCAL_INDEX_ID,
@@ -1368,11 +1399,31 @@ class LodeDB:
         stats = self._native_stats() or {}
         return {
             "mode": self._native_core_mode.value,
+            "write_mode": self._native_core_write_mode.value,
             "enabled": self._native_vector_engine is not None,
             "covered": self._native_vector_covered,
             "fallback_reason": self._native_core_fallback_reason,
             "document_count": int(stats.get("document_count", 0) or 0),
         }
+
+    def _native_persist(self) -> None:
+        """Persists the native shadow writer when write rollout requests it."""
+
+        if (
+            self._native_core_write_mode != NativeCoreMode.SHADOW
+            or self._native_vector_engine is None
+            or not self._native_vector_covered
+        ):
+            return
+        try:
+            self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_shadow_persist_failed"
+            if self._native_core_fail_closed:
+                raise RuntimeError("native core shadow persist failed") from exc
+            if self._native_core_strict_parity:
+                raise
 
     def _check_native_vector_parity(
         self,

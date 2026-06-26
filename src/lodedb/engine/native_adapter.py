@@ -358,6 +358,12 @@ class NativeCoreEngineHandle:
     def stats(self, index_id: str) -> dict[str, Any]:
         return self._loads(self._engine.stats(str(index_id)))
 
+    def persist(self) -> None:
+        self._engine.persist()
+
+    def close(self) -> None:
+        self._engine.close()
+
     @staticmethod
     def _dumps(payload: Any) -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
