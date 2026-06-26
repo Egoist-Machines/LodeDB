@@ -12,19 +12,20 @@
     "seed": 0
   },
   "late_interaction": {
-    "ingest_seconds": 30.112,
+    "ingest_seconds": 25.933,
     "patch_rows": 51200,
     "disk_bytes": 127367097,
-    "mean_query_ms": 114.399,
-    "p95_query_ms": 174.381,
-    "recall_at_k": 0.728
+    "resident_build_seconds": 0.344,
+    "mean_query_ms": 1.48,
+    "p95_query_ms": 1.861,
+    "recall_at_k": 1.0
   },
   "single_vector": {
-    "ingest_seconds": 0.287,
+    "ingest_seconds": 0.227,
     "rows": 800,
     "disk_bytes": 315490,
-    "mean_query_ms": 0.148,
-    "p95_query_ms": 0.213,
+    "mean_query_ms": 0.129,
+    "p95_query_ms": 0.181,
     "recall_at_k": 0.0487
   }
 }

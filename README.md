@@ -287,8 +287,10 @@ For visual-document RAG, ColPali / ColQwen style models encode a page as a *set*
 patch vectors and rank with MaxSim (sum over query tokens of the best patch match),
 rather than pooling to one vector. `LodeLateInteractionIndex` runs this on the
 bring-your-own-vectors path with no engine change: patches are stored as ordinary
-rows grouped by a parent id, candidates are gathered by any-patch similarity, and the
-exact MaxSim score is recomputed over the candidate set.
+rows grouped by a parent id, and an unfiltered query is answered by an exact
+resident scan (the whole corpus scored in one GEMM plus a segmented max) that
+returns the true top-k in ~1-2 ms on a few thousand pages; filtered or very large
+corpora fall back to a two-stage candidate-then-rescore path.
 
 ```python
 from lodedb import LodeLateInteractionIndex

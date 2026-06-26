@@ -211,6 +211,13 @@ def run(args: argparse.Namespace) -> dict:
         sv_ingest = time.perf_counter() - t0
         sv_bytes = _dir_bytes(sv_path)
 
+        # Warm up: the first late-interaction query builds the in-memory resident
+        # patch matrix (a one-time cost, amortized over the session). Time it
+        # separately so the per-query latency reflects steady state.
+        t0 = time.perf_counter()
+        li.search(queries[0], k=args.k, normalize=False)
+        li_build = time.perf_counter() - t0
+
         # -- query: latency + recall vs exact MaxSim ground truth ----------
         li_recall, sv_recall = [], []
         li_latency, sv_latency = [], []
@@ -243,6 +250,7 @@ def run(args: argparse.Namespace) -> dict:
                 "ingest_seconds": round(li_ingest, 3),
                 "patch_rows": li.patch_count(),
                 "disk_bytes": li_bytes,
+                "resident_build_seconds": round(li_build, 3),
                 "mean_query_ms": round(float(np.mean(li_latency)), 3),
                 "p95_query_ms": round(float(np.percentile(li_latency, 95)), 3),
                 "recall_at_k": round(float(np.mean(li_recall)), 4),

@@ -11,24 +11,26 @@ This does not fit LodeDB's one-vector-per-id TurboVec core, so it is built here
 as a pure-SDK prototype on top of a bring-your-own-vectors index
 (:meth:`LodeDB.open_vector_store`), with **no engine change** -- exactly the
 staged plan in issue #25. Each document's patches are stored as ordinary vector
-rows keyed ``<doc_id>#<NNNNN>`` carrying a ``parent_id`` in metadata, and
-retrieval is the two-stage approach the issue prescribes:
+rows keyed ``<doc_id>#<NNNNN>`` carrying a ``parent_id`` in metadata, and the
+full-precision patch vectors are kept verbatim (float32, base64, in the per-row
+text sidecar) so MaxSim is always computed at **exact** full precision, never from
+the quantized codes. There are two retrieval paths (:meth:`search` picks one;
+both return identical scores):
 
-1. *Candidate generation* -- a batched any-patch nearest-neighbour search (one
-   sub-query per query token) over the existing TurboVec scan, whose hit parents
-   form a small candidate set.
-2. *MaxSim rescoring* -- the full MaxSim score is recomputed in Python (numpy)
-   over the candidate documents' patches, and the top ``k`` parents are returned.
+1. *Resident* (default for an unfiltered query within ``resident_max_bytes``) --
+   every patch is held in one in-memory matrix and the whole corpus is scored in a
+   single GEMM plus a segmented max. No candidate-generation scan and no
+   per-candidate read-back, so it returns the true top-``k`` (no recall loss) at a
+   few milliseconds on thousands of pages.
+2. *Indexed* (a filtered query, a corpus over the resident budget, or
+   ``resident=False``) -- the two-stage approach the issue prescribes: a batched
+   any-patch scan to depth ``candidate_depth`` gathers candidate documents (the
+   filter is pushed engine-side), then exact MaxSim rescores them.
 
-The rescore is **exact**: TurboVec's quantized codes are used only to surface
-candidates cheaply, while the patch vectors themselves are kept verbatim (float32,
-base64, in the per-row text sidecar) so MaxSim is computed at full precision over
-the candidate set rather than from the quantized candidate-generation scores. The
-rescore defaults to numpy (per-document BLAS GEMM); a native TurboVec
-``maxsim_scores`` Rust kernel is also available (``scoring="native"``) for builds
-without a fast BLAS. Both return identical scores, and scoring is only a small
-fraction of query time (candidate generation and patch loading dominate), so the
-backend choice is not a latency lever.
+The exact MaxSim itself defaults to numpy (a ``query @ patches.T`` BLAS GEMM); a
+native TurboVec ``maxsim_scores`` Rust kernel is also available
+(``scoring="native"``) for builds without a fast BLAS. Both return identical
+scores.
 
 The page/token encoder is **bring-your-own** (ColPali / ColQwen weights are
 multi-GB and out of scope to bundle): pass precomputed patch matrices to
@@ -53,6 +55,7 @@ from typing import Any
 
 import numpy as np
 
+from lodedb.engine.index import EngineError
 from lodedb.local.db import LodeDB
 
 # The bundled TurboVec extension exposes a native MaxSim kernel (`maxsim_scores`)
@@ -193,6 +196,8 @@ class LodeLateInteractionIndex:
         bit_width: int = 4,
         candidate_depth: int = 16,
         scoring: str = "numpy",
+        resident: bool | str = "auto",
+        resident_max_bytes: int = 512 * 1024 * 1024,
         read_only: bool = False,
         **lodedb_kwargs: Any,
     ) -> None:
@@ -206,14 +211,17 @@ class LodeLateInteractionIndex:
         ``encode_queries(list[...]) -> list[2-D matrix]``; it is only used by
         :meth:`add_texts` / :meth:`search_text` and is never required for the
         precomputed-matrix API. ``candidate_depth`` is the per-query-token
-        any-patch search depth used to gather rescoring candidates (higher =
-        better recall, more rescoring work). ``scoring`` selects the exact-MaxSim
-        rescore backend: ``"numpy"`` (default, per-document BLAS GEMM -- fastest on
-        builds with an optimized BLAS, always available) or ``"native"`` (the
-        TurboVec ``maxsim_scores`` Rust kernel, for builds without a fast BLAS;
-        falls back to numpy if the compiled kernel is absent). Both return
-        identical scores, and scoring is a small fraction of query time, so this is
-        not a latency lever. ``read_only=True`` opens a non-mutating reader and
+        any-patch search depth used to gather candidates on the *indexed* path only
+        (higher = better recall there, more rescoring work; the resident path is
+        exhaustive and always exact). ``resident`` controls the default fast path:
+        ``"auto"`` (default) uses the in-memory exact scan for unfiltered queries
+        when the patch corpus fits ``resident_max_bytes`` (default 512 MB) and
+        falls back to the indexed path otherwise; ``True`` always uses it; ``False``
+        always uses the indexed path. ``scoring`` selects the exact-MaxSim backend:
+        ``"numpy"`` (default, BLAS GEMM -- fastest on builds with an optimized BLAS,
+        always available) or ``"native"`` (the TurboVec ``maxsim_scores`` Rust
+        kernel, for builds without a fast BLAS; falls back to numpy if absent). Both
+        return identical scores. ``read_only=True`` opens a non-mutating reader and
         requires the path to exist. ``bit_width`` and any extra ``lodedb_kwargs``
         (e.g. ``durability=``, ``commit_mode=``) are forwarded to the underlying
         vector-only :class:`LodeDB`. The patch text sidecar that holds the vectors
@@ -226,6 +234,8 @@ class LodeLateInteractionIndex:
             raise ValueError("candidate_depth must be a positive integer")
         if scoring not in ("numpy", "native"):
             raise ValueError("scoring must be 'numpy' or 'native'")
+        if resident not in (True, False, "auto"):
+            raise ValueError("resident must be True, False, or 'auto'")
         if lodedb_kwargs.get("store_text") is False:
             raise ValueError(
                 "LodeLateInteractionIndex stores patch vectors in the text sidecar; "
@@ -233,9 +243,14 @@ class LodeLateInteractionIndex:
             )
         self.dim = int(dim)
         self.scoring = scoring
+        self.resident = resident
+        self.resident_max_bytes = int(resident_max_bytes)
         self.encoder = encoder
         self.candidate_depth = int(candidate_depth)
         self.read_only = bool(read_only)
+        # In-memory exact-MaxSim serving cache (all patches as one float32 matrix);
+        # built lazily on first eligible search and invalidated on every write.
+        self._resident_cache: dict[str, Any] | None = None
         lodedb_kwargs.pop("store_text", None)
         self._db = LodeDB.open_vector_store(
             path,
@@ -294,6 +309,7 @@ class LodeLateInteractionIndex:
             )
         # Vectors are pre-normalized above; do not normalize twice.
         self._db.add_vectors_many(rows, normalize=False)
+        self._resident_cache = None  # serving cache is now stale
         return document_id
 
     def add_documents(
@@ -371,15 +387,25 @@ class LodeLateInteractionIndex:
     ) -> list[LodeLateInteractionHit]:
         """Returns the top-``k`` documents by MaxSim for a multi-vector query.
 
-        ``query`` is a 2-D ``(num_query_tokens, dim)`` matrix. Retrieval is two
-        stage: a batched any-patch search (one sub-query per query token, each to
-        depth ``candidate_depth``) gathers a candidate set of documents, then the
-        exact MaxSim score is computed over each candidate's stored patches and
-        the top ``k`` are returned. ``candidate_depth`` overrides the index
-        default for this call. ``filter`` (the same exact-match-or-predicate
-        grammar as :meth:`LodeDB.search`) narrows the candidate scan by your
-        document metadata. Query tokens are L2-normalized by default to match
-        stored patches.
+        ``query`` is a 2-D ``(num_query_tokens, dim)`` matrix. There are two
+        retrieval paths, chosen automatically:
+
+        - **Resident** (default for an unfiltered query when the patch corpus fits
+          ``resident_max_bytes``): the full exact MaxSim is computed against every
+          document in one pass over an in-memory patch matrix. This skips both the
+          per-query-token quantized scan and the per-candidate read-back -- the two
+          costs that dominate query time -- and returns the true top-``k`` (no
+          candidate-recall loss).
+        - **Indexed** (used when a ``filter`` is given, or the corpus exceeds the
+          resident budget, or ``resident=False``): the two-stage path -- a batched
+          any-patch search to depth ``candidate_depth`` gathers candidate documents
+          (the ``filter`` is pushed engine-side), then exact MaxSim rescores the
+          candidates.
+
+        ``candidate_depth`` overrides the index default for the indexed path.
+        ``filter`` takes the same exact-match-or-predicate grammar as
+        :meth:`LodeDB.search`. Query tokens are L2-normalized by default to match
+        stored patches. Both paths return identical scores.
         """
 
         if int(k) <= 0:
@@ -389,21 +415,73 @@ class LodeLateInteractionIndex:
             raise ValueError("candidate_depth must be positive")
         query_matrix = _as_matrix(query, self.dim, normalize=normalize)
 
-        # An index with no patches has no serving snapshot to scan; short-circuit
-        # rather than letting the empty-store scan raise.
-        if self._db.count() == 0:
-            return []
+        # Prefer the resident exact scan for unfiltered queries (a filter is pushed
+        # engine-side on the indexed path instead). Falls through to indexed when
+        # the corpus is over the resident budget. An empty index yields an empty
+        # resident cache, so this also handles the no-documents case without the
+        # (surprisingly costly) stats-based count() on the hot path.
+        if filter is None and self.resident is not False:
+            cache = self._resident_cache_get()
+            if cache is not None:
+                return self._search_resident(query_matrix, cache, int(k))
+
+        return self._search_indexed(query_matrix, int(k), depth, filter)
+
+    def _search_resident(
+        self,
+        query_matrix: np.ndarray,
+        cache: dict[str, Any],
+        k: int,
+    ) -> list[LodeLateInteractionHit]:
+        """Exact MaxSim over the whole resident patch matrix; returns top-``k``."""
+
+        scores = _maxsim_scores_flat(
+            query_matrix,
+            cache["flat"],
+            cache["counts"],
+            prefer_native=self.scoring == "native",
+        )
+        ids = cache["ids"]
+        metas = cache["metas"]
+        patch_counts = cache["patch_counts"]
+        scored = [
+            LodeLateInteractionHit(
+                score=float(scores[i]),
+                id=ids[i],
+                metadata=metas[i],
+                patch_count=patch_counts[i],
+            )
+            for i in range(len(ids))
+        ]
+        # Deterministic order: score desc, then id asc to break ties stably.
+        scored.sort(key=lambda hit: (-hit.score, hit.id))
+        return scored[:k]
+
+    def _search_indexed(
+        self,
+        query_matrix: np.ndarray,
+        k: int,
+        depth: int,
+        filter: Mapping[str, Any] | None,
+    ) -> list[LodeLateInteractionHit]:
+        """Two-stage retrieval: candidate generation then exact MaxSim rescore."""
 
         # Stage 1: candidate generation. One any-patch sub-query per query token;
-        # union the owning documents of the hits. The quantized scan only needs to
-        # surface the right parents -- exact ranking happens in stage 2.
+        # union the owning documents of the hits. Pass the user filter as-is -- in a
+        # dedicated late-interaction index every row is a patch row, so a synthetic
+        # "parent_id exists" filter would only add allowlist overhead for no effect.
         token_queries = [query_matrix[i].tolist() for i in range(query_matrix.shape[0])]
-        per_token_hits = self._db.search_many_by_vector(
-            token_queries,
-            k=depth,
-            filter=_patch_scan_filter(filter),
-            normalize=False,
-        )
+        try:
+            per_token_hits = self._db.search_many_by_vector(
+                token_queries,
+                k=depth,
+                filter=dict(filter) if filter else None,
+                normalize=False,
+            )
+        except EngineError:
+            # An index with no committed patches has no serving snapshot to scan;
+            # treat that as no results rather than an error.
+            return []
         candidates: list[str] = []
         seen: set[str] = set()
         for hits in per_token_hits:
@@ -416,16 +494,16 @@ class LodeLateInteractionIndex:
             return []
 
         # Stage 2: exact MaxSim rescoring over the candidates' stored patches.
-        # Load every candidate's patches, then score the whole set in one shot
-        # (native Rust kernel when available, numpy otherwise).
+        # One batched read of all candidates' patches, then score in one shot.
+        loaded_docs = self._load_documents(candidates)
         loaded: list[np.ndarray] = []
         meta_rows: list[tuple[str, dict[str, Any], int]] = []
         for parent in candidates:
-            doc_patches, user_meta, patch_count = self._load_document(parent)
-            if doc_patches is None or doc_patches.shape[0] == 0:
+            entry = loaded_docs.get(parent)
+            if entry is None or entry[0].shape[0] == 0:
                 continue
-            loaded.append(doc_patches)
-            meta_rows.append((parent, user_meta, patch_count))
+            loaded.append(entry[0])
+            meta_rows.append((parent, entry[1], entry[2]))
         if not loaded:
             return []
         scores = _maxsim_batch(
@@ -441,7 +519,7 @@ class LodeLateInteractionIndex:
         ]
         # Deterministic order: score desc, then id asc to break ties stably.
         scored.sort(key=lambda hit: (-hit.score, hit.id))
-        return scored[: int(k)]
+        return scored[:k]
 
     def search_text(
         self,
@@ -558,6 +636,8 @@ class LodeLateInteractionIndex:
         for record in records:
             if self._db.remove(record["id"]):
                 removed += 1
+        if removed:
+            self._resident_cache = None  # serving cache is now stale
         return removed
 
     def _load_document(
@@ -589,8 +669,133 @@ class LodeLateInteractionIndex:
             return None, user_meta, patch_count
         return np.vstack(vectors), user_meta, patch_count
 
+    def _load_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, tuple[np.ndarray, dict[str, Any], int]]:
+        """Batch-loads several documents' ``(patches, metadata, patch_count)``.
+
+        One enumeration and one text read cover every requested document, instead
+        of two engine round-trips per document.
+        """
+
+        if not document_ids:
+            return {}
+        records = self._db.list_documents(filter={_PARENT_KEY: {"$in": list(document_ids)}})
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            parent = record.get("metadata", {}).get(_PARENT_KEY)
+            if isinstance(parent, str) and parent:
+                grouped.setdefault(parent, []).append(record)
+        all_ids = [record["id"] for rows in grouped.values() for record in rows]
+        texts = self._db.get_texts(all_ids)
+        out: dict[str, tuple[np.ndarray, dict[str, Any], int]] = {}
+        for parent, rows in grouped.items():
+            rows.sort(key=lambda record: record["id"])
+            vectors = [
+                _decode_vector(texts[record["id"]], self.dim)
+                for record in rows
+                if texts.get(record["id"]) is not None
+            ]
+            if not vectors:
+                continue
+            user_meta = _strip_internal_metadata(rows[0].get("metadata", {}))
+            patch_count = max(
+                (_patch_count_from_metadata(r.get("metadata", {})) for r in rows),
+                default=len(rows),
+            )
+            out[parent] = (np.vstack(vectors), user_meta, patch_count)
+        return out
+
+    def _resident_cache_get(self) -> dict[str, Any] | None:
+        """Returns the resident exact-MaxSim cache, building it if needed.
+
+        Returns ``None`` when the corpus exceeds ``resident_max_bytes`` under the
+        ``resident="auto"`` policy (so the caller falls back to the indexed path),
+        or when the index is empty.
+        """
+
+        if self._resident_cache is not None:
+            return self._resident_cache
+        cache = self._build_resident_cache()
+        self._resident_cache = cache
+        return cache
+
+    def _build_resident_cache(self) -> dict[str, Any] | None:
+        """Builds the in-memory exact-MaxSim cache from the stored patch sidecar.
+
+        Lays every document's patches out as one contiguous float32 matrix with a
+        per-document patch-count partition, so a query is one GEMM plus a segmented
+        reduction. Honors the ``resident_max_bytes`` budget under ``"auto"``.
+        """
+
+        records = self._db.list_documents(filter={_PARENT_KEY: {"$exists": True}})
+        if not records:
+            return _empty_resident_cache(self.dim)
+        order: list[str] = []
+        groups: dict[str, dict[str, Any]] = {}
+        for record in records:
+            metadata = record.get("metadata", {})
+            parent = metadata.get(_PARENT_KEY)
+            if not isinstance(parent, str) or not parent:
+                continue
+            group = groups.get(parent)
+            if group is None:
+                group = {"ids": [], "meta": metadata}
+                groups[parent] = group
+                order.append(parent)
+            group["ids"].append(record["id"])
+        total_patches = sum(len(groups[parent]["ids"]) for parent in order)
+        if (
+            self.resident == "auto"
+            and total_patches * self.dim * 4 > self.resident_max_bytes
+        ):
+            return None  # over budget: caller uses the indexed path instead
+
+        all_ids = [pid for parent in order for pid in groups[parent]["ids"]]
+        texts = self._db.get_texts(all_ids)
+        ids: list[str] = []
+        mats: list[np.ndarray] = []
+        metas: list[dict[str, Any]] = []
+        patch_counts: list[int] = []
+        for parent in order:
+            group = groups[parent]
+            vectors = [
+                _decode_vector(texts[pid], self.dim)
+                for pid in sorted(group["ids"])
+                if texts.get(pid) is not None
+            ]
+            if not vectors:
+                continue
+            ids.append(parent)
+            mats.append(np.vstack(vectors).astype(np.float32, copy=False))
+            metas.append(_strip_internal_metadata(group["meta"]))
+            patch_counts.append(max(_patch_count_from_metadata(group["meta"]), len(vectors)))
+        if not mats:
+            return _empty_resident_cache(self.dim)
+        return {
+            "ids": ids,
+            "flat": np.ascontiguousarray(np.vstack(mats), dtype=np.float32),
+            "counts": np.fromiter(
+                (m.shape[0] for m in mats), dtype=np.int64, count=len(mats)
+            ),
+            "metas": metas,
+            "patch_counts": patch_counts,
+        }
+
 
 # -- module helpers ---------------------------------------------------------
+
+
+def _empty_resident_cache(dim: int) -> dict[str, Any]:
+    """An empty resident cache (a no-document index), so search returns ``[]``."""
+
+    return {
+        "ids": [],
+        "flat": np.zeros((0, dim), dtype=np.float32),
+        "counts": np.zeros(0, dtype=np.int64),
+        "metas": [],
+        "patch_counts": [],
+    }
 
 
 def _maxsim(query: np.ndarray, document: np.ndarray) -> float:
@@ -634,19 +839,45 @@ def _maxsim_batch(
 
     if not documents:
         return np.empty(0, dtype=np.float32)
+    flat = np.ascontiguousarray(np.vstack(documents), dtype=np.float32)
+    counts = np.fromiter(
+        (doc.shape[0] for doc in documents), dtype=np.int64, count=len(documents)
+    )
+    return _maxsim_scores_flat(query, flat, counts, prefer_native=prefer_native)
+
+
+def _maxsim_scores_flat(
+    query: np.ndarray,
+    flat: np.ndarray,
+    counts: np.ndarray,
+    *,
+    prefer_native: bool = False,
+) -> np.ndarray:
+    """MaxSim of ``query`` against documents packed as one ``(total_patches, dim)``
+    matrix partitioned by ``counts`` (patches per document, in order).
+
+    The native path hands the buffers straight to the Rust kernel. The numpy path
+    is a single ``query @ flat.T`` GEMM followed by a segmented max
+    (``np.maximum.reduceat``) summed over query tokens -- fully vectorized across
+    all documents, no per-document Python loop. Both return identical scores. All
+    documents are assumed non-empty (``counts >= 1``), which the callers guarantee.
+    """
+
+    n_docs = int(counts.shape[0])
+    if n_docs == 0:
+        return np.empty(0, dtype=np.float32)
     native = _resolve_native_maxsim() if prefer_native else None
     if native is not None:
-        flat = np.ascontiguousarray(np.vstack(documents), dtype=np.float32)
-        counts = np.fromiter(
-            (doc.shape[0] for doc in documents), dtype=np.int64, count=len(documents)
-        )
         query_c = np.ascontiguousarray(query, dtype=np.float32)
         return np.asarray(native(query_c, flat, counts), dtype=np.float32)
-    return np.fromiter(
-        (_maxsim(query, doc) for doc in documents),
-        dtype=np.float32,
-        count=len(documents),
-    )
+    sims = np.ascontiguousarray(query, dtype=np.float32) @ flat.T
+    # Segment boundaries (start column of each document) for reduceat.
+    starts = np.empty(n_docs, dtype=np.intp)
+    starts[0] = 0
+    if n_docs > 1:
+        np.cumsum(counts[:-1], out=starts[1:])
+    segment_max = np.maximum.reduceat(sims, starts, axis=1)
+    return segment_max.sum(axis=0).astype(np.float32)
 
 
 def _as_matrix(matrix: Any, dim: int, *, normalize: bool) -> np.ndarray:

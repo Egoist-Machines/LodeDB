@@ -107,6 +107,55 @@ def test_remove_drops_all_patches(tmp_path):
     assert idx.remove("doc-a") is False  # already gone
 
 
+def test_resident_and_indexed_paths_agree(tmp_path):
+    # The resident exact scan (default) and the indexed two-stage path must return
+    # the same ranking and scores.
+    rng = np.random.default_rng(7)
+    docs = []
+    for i in range(40):
+        m = rng.standard_normal((6, DIM)).astype(np.float32)
+        m /= np.linalg.norm(m, axis=1, keepdims=True)
+        docs.append((f"d{i:03d}", m))
+    res_idx = LodeLateInteractionIndex(tmp_path / "res", dim=DIM, resident=True)
+    idx_idx = LodeLateInteractionIndex(
+        tmp_path / "idx", dim=DIM, resident=False, candidate_depth=64
+    )
+    for store in (res_idx, idx_idx):
+        for doc_id, m in docs:
+            store.add_document(doc_id, m, normalize=False)
+    q = rng.standard_normal((5, DIM)).astype(np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    res_hits = res_idx.search(q, k=10, normalize=False)
+    idx_hits = idx_idx.search(q, k=10, normalize=False)
+    assert [h.id for h in res_hits] == [h.id for h in idx_hits]
+    for a, b in zip(res_hits, idx_hits, strict=True):
+        assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_resident_budget_falls_back_to_indexed(tmp_path):
+    # A tiny resident budget under "auto" forces the indexed path, still correct.
+    idx = LodeLateInteractionIndex(
+        tmp_path, dim=DIM, resident="auto", resident_max_bytes=1
+    )
+    idx.add_document("doc-a", _onehot_matrix([0, 1]))
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))
+    assert idx._resident_cache_get() is None  # over budget
+    hits = idx.search(_onehot_matrix([0]), k=1)
+    assert hits[0].id == "doc-a"
+
+
+def test_resident_cache_invalidated_on_write(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("doc-a", _onehot_matrix([0, 1]))
+    assert idx.search(_onehot_matrix([0]), k=5)[0].id == "doc-a"  # builds cache
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))  # must invalidate
+    hits = idx.search(_onehot_matrix([5]), k=5)
+    assert hits[0].id == "doc-b"
+    assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"doc-a", "doc-b"}
+    idx.remove("doc-a")
+    assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"doc-b"}
+
+
 def test_add_documents_batch(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     ids = idx.add_documents(
