@@ -264,6 +264,8 @@ class LodeDB:
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
         self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._native_shadow_persist_count = 0
+        self._native_shadow_persist_verified = False
         # bit_width is only meaningful for vector-only / custom-embedder indexes (a
         # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
         # reject any other width at the boundary; ``None`` means "use the index default".
@@ -1404,6 +1406,8 @@ class LodeDB:
             "covered": self._native_vector_covered,
             "fallback_reason": self._native_core_fallback_reason,
             "document_count": int(stats.get("document_count", 0) or 0),
+            "shadow_persist_count": self._native_shadow_persist_count,
+            "shadow_persist_verified": self._native_shadow_persist_verified,
         }
 
     def _native_persist(self) -> None:
@@ -1417,13 +1421,28 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.persist()
+            self._verify_native_shadow_persist()
         except Exception as exc:
             self._native_vector_covered = False
+            self._native_shadow_persist_verified = False
             self._native_core_fallback_reason = "native_core_shadow_persist_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core shadow persist failed") from exc
             if self._native_core_strict_parity:
                 raise
+
+    def _verify_native_shadow_persist(self) -> None:
+        """Compares redacted native shadow counts to the Python authoritative store."""
+
+        native_stats = self._native_stats()
+        if native_stats is None:
+            raise RuntimeError("native core shadow stats unavailable")
+        python_stats = self._index.stats()
+        for key in ("document_count", "chunk_count"):
+            if key in native_stats and int(native_stats[key]) != int(python_stats.get(key, 0) or 0):
+                raise RuntimeError(f"native core shadow {key} mismatch")
+        self._native_shadow_persist_count += 1
+        self._native_shadow_persist_verified = True
 
     def _check_native_vector_parity(
         self,

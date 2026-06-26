@@ -103,6 +103,7 @@ class FakeNativeVectorEngine:
     def stats(self, index_id: str) -> dict:
         return {
             "document_count": len(self.documents),
+            "chunk_count": len(self.documents),
             "native_core_enabled": True,
         }
 
@@ -238,6 +239,8 @@ def test_native_write_shadow_persists_to_temp_native_handle(tmp_path, monkeypatc
     assert native.persist_calls == 1
     assert stats["write_mode"] == "shadow"
     assert stats["covered"] is True
+    assert stats["shadow_persist_count"] == 1
+    assert stats["shadow_persist_verified"] is True
     assert [hit.id for hit in db.search_by_vector(_onehot(0), k=1)] == ["a"]
 
 

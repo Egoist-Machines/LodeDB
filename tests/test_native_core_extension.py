@@ -254,6 +254,24 @@ def test_native_core_extension_written_vector_store_opens_in_python(tmp_path) ->
     assert db.get("native-a") == "Native retained text."
 
 
+def test_native_core_write_shadow_verifies_counts(tmp_path, monkeypatch) -> None:
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "shadow")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="shadow-a", metadata={"kind": "shadow"})
+    db.add_vectors(_onehot(1), id="shadow-b", metadata={"kind": "shadow"})
+
+    db.persist()
+    stats = db.stats()["native_core"]
+
+    assert stats["write_mode"] == "shadow"
+    assert stats["shadow_persist_count"] == 1
+    assert stats["shadow_persist_verified"] is True
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "shadow-b"
+
+
 def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) -> None:
     module = importlib.import_module("lodedb._native_core")
     monkeypatch.setattr("importlib.import_module", lambda name: module)

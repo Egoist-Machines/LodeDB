@@ -209,6 +209,10 @@ class NativeCoreAdapter:
             },
         )
 
+    @staticmethod
+    def _dumps(payload: Any) -> str:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
     def _require_module(self) -> NativeCoreModule:
         module = self._module_or_none()
         if module is None:

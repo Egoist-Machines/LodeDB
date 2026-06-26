@@ -9,8 +9,9 @@ from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreError
 
 
 class FakeNativeModule:
-    def CoreEngine(self) -> FakeCoreEngine:
-        return FakeCoreEngine()
+    @property
+    def CoreEngine(self) -> type[FakeCoreEngine]:
+        return FakeCoreEngine
 
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str:
         assert type_name in {"CoreDocument", "CoreVectorDocument", "CoreQuery"}
@@ -21,6 +22,20 @@ class FakeCoreEngine:
     def __init__(self) -> None:
         self.index: tuple[str, int, int] | None = None
         self.documents: list[dict] = []
+        self.open_options: dict | None = None
+
+    @staticmethod
+    def open(options_json: str) -> FakeCoreEngine:
+        engine = FakeCoreEngine()
+        engine.open_options = json.loads(options_json)
+        return engine
+
+    @staticmethod
+    def open_readonly(path: str, options_json: str) -> FakeCoreEngine:
+        engine = FakeCoreEngine()
+        engine.open_options = json.loads(options_json)
+        engine.open_options["path_arg"] = path
+        return engine
 
     def create_index(self, index_id: str, vector_dim: int, bit_width: int) -> None:
         self.index = (index_id, vector_dim, bit_width)
@@ -284,6 +299,46 @@ def test_adapter_wraps_native_engine_vector_flow() -> None:
     )
     assert hits["hits"][0]["document_id"] == "b"
     assert engine.stats("default")["document_count"] == 2
+
+
+def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
+    engine = NativeCoreAdapter(FakeNativeModule()).open_engine(
+        path=tmp_path,
+        read_only=False,
+        durability="relaxed",
+        commit_mode="generation",
+        store_text=False,
+        index_text=False,
+    )
+
+    assert engine._engine.open_options == {
+        "path": str(tmp_path),
+        "read_only": False,
+        "durability": "relaxed",
+        "commit_mode": "generation",
+        "store_text": False,
+        "index_text": False,
+    }
+
+
+def test_adapter_wraps_readonly_native_engine_open(tmp_path) -> None:
+    engine = NativeCoreAdapter(FakeNativeModule()).open_readonly_engine(
+        tmp_path,
+        durability="fsync",
+        commit_mode="generation",
+        store_text=True,
+        index_text=False,
+    )
+
+    assert engine._engine.open_options == {
+        "path": str(tmp_path),
+        "path_arg": str(tmp_path),
+        "read_only": True,
+        "durability": "fsync",
+        "commit_mode": "generation",
+        "store_text": True,
+        "index_text": False,
+    }
 
 
 def test_adapter_wraps_native_engine_text_prepare_apply_flow() -> None:
