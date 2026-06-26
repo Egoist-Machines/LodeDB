@@ -475,6 +475,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lodedb-ffi"
+version = "0.4.0"
+dependencies = [
+ "lodedb-core",
+]
+
+[[package]]
 name = "lodedb-python"
 version = "0.4.0"
 dependencies = [

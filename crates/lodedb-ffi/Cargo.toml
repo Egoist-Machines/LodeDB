@@ -1,0 +1,21 @@
+[package]
+name = "lodedb-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for the native LodeDB core"
+
+[lib]
+name = "lodedb_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+lodedb-core = { path = "../lodedb-core" }
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"

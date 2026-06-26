@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/lodedb-core",
+  "crates/lodedb-ffi",
   "crates/lodedb-python",
 ]
 resolver = "2"
