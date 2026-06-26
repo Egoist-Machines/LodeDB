@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::error::CoreErrorCode;
@@ -14,6 +15,7 @@ use lodedb_core::storage::{
 use serde_json::{json, Value};
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn persisted_fixture(name: &str) -> PathBuf {
     fixture_root(&format!("tests/fixtures/persisted/{name}"))
@@ -98,6 +100,93 @@ fn read_only_generation_load_ignores_wal_tail() {
         .wal_records
         .iter()
         .all(|record| record.op == "upsert_documents"));
+}
+
+#[test]
+fn python_wal_fixture_replays_in_rust() {
+    let wal_fixture = persisted_fixture("v0_4_wal");
+    let mut loaded = load_store(&wal_fixture, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(loaded.document_count(), 0);
+    let records = wal::read_records(&wal::wal_path(&wal_fixture, INDEX_KEY)).unwrap();
+    assert_eq!(
+        wal::replay_records_onto_store(&mut loaded, &records, 8192).unwrap(),
+        3
+    );
+    assert_eq!(loaded.document_count(), 3);
+    assert_eq!(loaded.chunk_count(), 3);
+    assert_eq!(
+        loaded.raw_text["doc-beta"],
+        "Beta incident report for serial AX-42 on 2024-06-13."
+    );
+    assert_eq!(
+        loaded.state["document_metadata"]["doc-gamma"]["tenant"],
+        "zen"
+    );
+}
+
+#[test]
+fn wal_append_checkpoint_then_truncate_is_idempotent() {
+    let temp = unique_temp_dir("rust_wal_checkpoint");
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 1,
+            base_epoch: 1,
+            state: &rust_state_payload(1, &[]),
+            tvim: None,
+            raw_text: None,
+            lexical_tokens: None,
+        },
+        GenerationWriteOptions::default(),
+    )
+    .unwrap();
+    let wal_path = wal::wal_path(&temp, INDEX_KEY);
+    wal::append_record(
+        &wal_path,
+        "upsert_documents",
+        &json!({
+            "client_id": "lodedb-local",
+            "index_id": "default",
+            "documents": [{
+                "document_id": "wal-a",
+                "text": "Rust WAL alpha",
+                "metadata": {"kind": "note"}
+            }]
+        }),
+        false,
+    )
+    .unwrap();
+    let stats = wal::scan_stats(&wal_path).unwrap();
+    assert!(wal::should_checkpoint(stats, 1, usize::MAX));
+
+    let mut loaded = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    let records = wal::read_records(&wal_path).unwrap();
+    wal::replay_records_onto_store(&mut loaded, &records, 8192).unwrap();
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 2,
+            base_epoch: 2,
+            state: &loaded.state,
+            tvim: None,
+            raw_text: Some(&loaded.raw_text),
+            lexical_tokens: Some(&loaded.lexical_tokens),
+        },
+        GenerationWriteOptions::default(),
+    )
+    .unwrap();
+    let before_truncate = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(before_truncate.document_count(), 1);
+    let mut replay_again = before_truncate.clone();
+    wal::replay_records_onto_store(&mut replay_again, &records, 8192).unwrap();
+    assert_eq!(replay_again.document_count(), 1);
+    wal::truncate(&wal_path, false).unwrap();
+    assert!(!wal_path.exists());
+    let after_truncate = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(after_truncate.document_count(), 1);
+    fs::remove_dir_all(temp).unwrap();
 }
 
 #[test]
@@ -231,8 +320,9 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "lodedb-core-{label}-{}-{nanos}",
+        "lodedb-core-{label}-{}-{nanos}-{counter}",
         std::process::id()
     ))
 }

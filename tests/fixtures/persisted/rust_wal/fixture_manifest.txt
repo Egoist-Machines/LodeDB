@@ -1,0 +1,8 @@
+{
+  "fixture_schema_version": 1,
+  "lodedb_version": "0.4.0",
+  "metadata": {
+    "commit_mode": "wal",
+    "mode": "rust_wal"
+  }
+}

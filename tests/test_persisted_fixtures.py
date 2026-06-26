@@ -90,3 +90,13 @@ def test_rust_generation_fixture_opens_in_python(tmp_path: Path) -> None:
         assert db.count() == 0
     finally:
         db.close()
+
+
+def test_rust_wal_fixture_replays_in_python(tmp_path: Path) -> None:
+    path = _copy_fixture("rust_wal", tmp_path)
+    db = LodeDB(path, commit_mode="wal", _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    try:
+        assert db.count() == 1
+        assert db.get("rust-wal-alpha") == "Rust authored WAL payload"
+    finally:
+        db.close()
