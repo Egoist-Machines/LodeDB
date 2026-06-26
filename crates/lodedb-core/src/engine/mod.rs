@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -515,6 +516,7 @@ impl CoreEngine {
             return invalid("read-only engine cannot persist");
         }
         for index in self.indexes.values() {
+            let tvim_base = tvim_base_for_index(index)?;
             let state = state_payload_for_index(index);
             let raw_text = if persistence.store_text {
                 index
@@ -547,7 +549,13 @@ impl CoreEngine {
                     generation: index.generation.max(1),
                     base_epoch: index.generation.max(1),
                     state: &state,
-                    tvim: None,
+                    tvim: tvim_base
+                        .as_ref()
+                        .map(|tvim| crate::storage::TvimBaseWrite {
+                            bytes: &tvim.bytes,
+                            rows: tvim.rows,
+                            calibration_fingerprint: tvim.calibration_fingerprint,
+                        }),
                     raw_text: Some(&raw_text),
                     lexical_tokens: Some(&lexical_tokens),
                 },
@@ -787,6 +795,66 @@ fn index_from_loaded_store(
 struct ReconstructedTvimVectors {
     vectors: BTreeMap<String, Vec<f32>>,
     query_rotation: Option<Vec<f32>>,
+}
+
+struct TvimBaseBytes {
+    bytes: Vec<u8>,
+    rows: usize,
+    calibration_fingerprint: u64,
+}
+
+fn tvim_base_for_index(index: &VectorOnlyIndex) -> Result<Option<TvimBaseBytes>, CoreError> {
+    if !index.vectors_seeded {
+        return Ok(None);
+    }
+    if index.query_rotation.is_some() {
+        return Err(CoreError::new(
+            CoreErrorCode::Unsupported,
+            "persisting reconstructed TurboVec-backed native indexes is not yet implemented",
+        ));
+    }
+    let chunks = index.persistable_chunks();
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+    let mut embeddings = Vec::with_capacity(chunks.len() * index.vector_dim);
+    let chunk_ids = chunks
+        .iter()
+        .map(|(chunk_id, _)| chunk_id.clone())
+        .collect::<Vec<_>>();
+    for (_, vector) in &chunks {
+        embeddings.extend_from_slice(vector);
+    }
+    let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
+    let mut tvim = IdMapIndex::new(index.vector_dim, index.bit_width).map_err(turbovec_error)?;
+    tvim.add_with_ids(&embeddings, &stable_ids)
+        .map_err(turbovec_error)?;
+    let scratch_path = scratch_tvim_path(&index.index_id, index.generation);
+    tvim.write(&scratch_path).map_err(core_io_error)?;
+    let bytes = match fs::read(&scratch_path).map_err(core_io_error) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&scratch_path);
+            return Err(error);
+        }
+    };
+    let _ = fs::remove_file(&scratch_path);
+    Ok(Some(TvimBaseBytes {
+        bytes,
+        rows: stable_ids.len(),
+        calibration_fingerprint: tvim.calibration_fingerprint(),
+    }))
+}
+
+fn scratch_tvim_path(index_id: &str, generation: u64) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "lodedb-core-tvim-{}-{index_id}-{generation}-{nanos}.tvim",
+        std::process::id()
+    ))
 }
 
 fn reconstruct_tvim_vectors(
@@ -1029,6 +1097,18 @@ impl VectorOnlyIndex {
         }
         chunks
     }
+
+    fn persistable_chunks(&self) -> Vec<(String, Vec<f32>)> {
+        self.documents
+            .values()
+            .flat_map(|record| {
+                record
+                    .chunks
+                    .iter()
+                    .map(|chunk| (chunk.chunk_id.clone(), chunk.vector.clone()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1157,4 +1237,8 @@ fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
 
 fn invalid_err(message: impl Into<String>) -> CoreError {
     CoreError::new(CoreErrorCode::InvalidArgument, message)
+}
+
+fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
+    CoreError::new(CoreErrorCode::Internal, error.to_string())
 }

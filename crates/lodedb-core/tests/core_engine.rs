@@ -303,16 +303,31 @@ fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
     let mut readonly =
         CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
     assert_eq!(readonly.stats("default").unwrap().document_count, 2);
-    let error = readonly
-        .query_vector(
-            "default",
-            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            1,
-            None,
-        )
-        .unwrap_err();
-    assert_eq!(error.code(), CoreErrorCode::Unsupported);
+    assert_eq!(
+        readonly
+            .query_vector(
+                "default",
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1,
+                None,
+            )
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "persist-a"
+    );
     assert!(readonly.persist().is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn persisted_native_tvim_backed_writable_open_rejects_rewrite() {
+    let path = copy_persisted_fixture("v0_4_store_text");
+    let mut writable = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(writable.stats("default").unwrap().document_count, 3);
+    let error = writable.persist().unwrap_err();
+    assert_eq!(error.code(), CoreErrorCode::Unsupported);
+    drop(writable);
     fs::remove_dir_all(path).unwrap();
 }
 
