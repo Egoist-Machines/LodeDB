@@ -1,0 +1,17 @@
+{
+  "batch_checksum": 6695989757820160036,
+  "batch_query_total_ms": 3.58,
+  "bit_width": 4,
+  "build_ms": 699.76,
+  "dim": 64,
+  "filtered_hits": 10,
+  "filtered_query_ms": 0.55,
+  "load_ms": 664.3,
+  "loaded_vectors": 512,
+  "queries": 64,
+  "single_checksum": 6695989757820160036,
+  "single_query_total_ms": 25.85,
+  "snapshot_bytes": 23058,
+  "suite": "native_migration_turbovec_adapter_smoke",
+  "vectors": 512
+}

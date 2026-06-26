@@ -1,0 +1,292 @@
+//! Native TurboVec adapter for chunk-vector search.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::Instant;
+
+use turbovec::IdMapIndex;
+
+use crate::error::{CoreError, CoreErrorCode};
+use crate::vector::index::{
+    CoreVectorChunk, VectorBackendMetadata, VectorIndexWriteMetrics, VectorSearchHit,
+};
+use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
+
+/// Native TurboVec serving index plus stable-id lookup metadata.
+pub struct TurboVecNativeIndex {
+    index: IdMapIndex,
+    chunk_ids_by_stable_id: BTreeMap<u64, String>,
+    document_ids_by_stable_id: BTreeMap<u64, String>,
+    stable_id_by_chunk_id: BTreeMap<String, u64>,
+    dim: usize,
+    bit_width: usize,
+    generation: u64,
+    build_seconds: f64,
+}
+
+impl TurboVecNativeIndex {
+    /// Builds an IdMapIndex from core chunk embeddings and stable chunk ids.
+    pub fn build(
+        chunks: &[CoreVectorChunk],
+        native_dim: usize,
+        bit_width: usize,
+        generation: u64,
+    ) -> Result<Self, CoreError> {
+        validate_config(native_dim, bit_width)?;
+        let started = Instant::now();
+        let mut embeddings = Vec::with_capacity(chunks.len() * native_dim);
+        for chunk in chunks {
+            if chunk.embedding.len() != native_dim {
+                return invalid("chunk embeddings do not match native_dim");
+            }
+            embeddings.extend_from_slice(&chunk.embedding);
+        }
+        let chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.chunk_id.clone())
+            .collect::<Vec<_>>();
+        let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
+        let mut index = IdMapIndex::new(native_dim, bit_width).map_err(core_error)?;
+        if !embeddings.is_empty() {
+            index
+                .add_with_ids(&embeddings, &stable_ids)
+                .map_err(core_error)?;
+            index.prepare();
+        }
+        Ok(Self::from_parts(
+            index,
+            chunks,
+            &stable_ids,
+            native_dim,
+            bit_width,
+            generation,
+            started.elapsed().as_secs_f64(),
+        ))
+    }
+
+    /// Loads a `.tvim` index and attaches chunk/document metadata.
+    pub fn load(
+        path: impl AsRef<Path>,
+        chunks: &[CoreVectorChunk],
+        generation: u64,
+    ) -> Result<Self, CoreError> {
+        let started = Instant::now();
+        let index = IdMapIndex::load(path).map_err(core_error)?;
+        let native_dim = index.dim();
+        let bit_width = index.bit_width();
+        validate_config(native_dim, bit_width)?;
+        let chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.chunk_id.clone())
+            .collect::<Vec<_>>();
+        let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
+        index.prepare();
+        Ok(Self::from_parts(
+            index,
+            chunks,
+            &stable_ids,
+            native_dim,
+            bit_width,
+            generation,
+            started.elapsed().as_secs_f64(),
+        ))
+    }
+
+    /// Searches one query vector.
+    pub fn search(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        allowlist_chunk_ids: &[String],
+    ) -> Result<Vec<VectorSearchHit>, CoreError> {
+        Ok(self
+            .search_batch(&[query_embedding.to_vec()], top_k, allowlist_chunk_ids)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// Searches a query batch with one shared chunk allowlist.
+    pub fn search_batch(
+        &self,
+        query_embeddings: &[Vec<f32>],
+        top_k: usize,
+        allowlist_chunk_ids: &[String],
+    ) -> Result<Vec<Vec<VectorSearchHit>>, CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        if query_embeddings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut queries = Vec::with_capacity(query_embeddings.len() * self.dim);
+        for query in query_embeddings {
+            if query.len() != self.dim {
+                return invalid("query dimension does not match TurboVec index");
+            }
+            queries.extend_from_slice(query);
+        }
+        let allowlist = self.stable_ids_for_chunks(allowlist_chunk_ids);
+        if !allowlist_chunk_ids.is_empty() && allowlist.is_empty() {
+            return Ok(vec![Vec::new(); query_embeddings.len()]);
+        }
+        let mut effective_top_k = top_k.min(self.index.len());
+        if !allowlist.is_empty() {
+            effective_top_k = effective_top_k.min(allowlist.len());
+        }
+        if effective_top_k == 0 {
+            return Ok(vec![Vec::new(); query_embeddings.len()]);
+        }
+
+        let (scores, stable_ids) = if allowlist.is_empty() {
+            self.index.search(&queries, effective_top_k)
+        } else {
+            self.index
+                .search_with_allowlist(&queries, effective_top_k, Some(&allowlist))
+        };
+        self.assemble_rows(
+            &scores,
+            &stable_ids,
+            query_embeddings.len(),
+            effective_top_k,
+        )
+    }
+
+    /// Returns active stable ids for chunk ids, filtering absent chunks.
+    pub fn stable_ids_for_chunks(&self, chunk_ids: &[String]) -> Vec<u64> {
+        let mut seen = BTreeSet::new();
+        let mut stable_ids = Vec::new();
+        for chunk_id in chunk_ids {
+            if let Some(stable_id) = self.stable_id_by_chunk_id.get(chunk_id) {
+                if seen.insert(*stable_id) {
+                    stable_ids.push(*stable_id);
+                }
+            }
+        }
+        stable_ids
+    }
+
+    /// Persists the `.tvim` payload and returns metrics-only write details.
+    pub fn write(&self, path: impl AsRef<Path>) -> Result<VectorIndexWriteMetrics, CoreError> {
+        let started = Instant::now();
+        self.index.write(path.as_ref()).map_err(core_error)?;
+        Ok(VectorIndexWriteMetrics {
+            compact_backend: "turbovec_idmap".to_string(),
+            snapshot_bytes: path.as_ref().metadata().map_err(core_error)?.len(),
+            persist_ms: started.elapsed().as_secs_f64() * 1000.0,
+            raw_payload_text_present: false,
+        })
+    }
+
+    /// Returns safe backend metadata.
+    pub fn backend_metadata(&self) -> VectorBackendMetadata {
+        VectorBackendMetadata {
+            compact_backend: "turbovec_idmap".to_string(),
+            native_backend: "turbovec".to_string(),
+            native_used: true,
+            dim: self.dim,
+            bit_width: self.bit_width,
+            generation: self.generation,
+            vector_count: self.index.len(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.len() == 0
+    }
+
+    pub fn build_seconds(&self) -> f64 {
+        self.build_seconds
+    }
+
+    fn from_parts(
+        index: IdMapIndex,
+        chunks: &[CoreVectorChunk],
+        stable_ids: &[u64],
+        dim: usize,
+        bit_width: usize,
+        generation: u64,
+        build_seconds: f64,
+    ) -> Self {
+        let mut chunk_ids_by_stable_id = BTreeMap::new();
+        let mut document_ids_by_stable_id = BTreeMap::new();
+        let mut stable_id_by_chunk_id = BTreeMap::new();
+        for (stable_id, chunk) in stable_ids.iter().zip(chunks) {
+            chunk_ids_by_stable_id.insert(*stable_id, chunk.chunk_id.clone());
+            document_ids_by_stable_id.insert(*stable_id, chunk.document_id.clone());
+            stable_id_by_chunk_id.insert(chunk.chunk_id.clone(), *stable_id);
+        }
+        Self {
+            index,
+            chunk_ids_by_stable_id,
+            document_ids_by_stable_id,
+            stable_id_by_chunk_id,
+            dim,
+            bit_width,
+            generation,
+            build_seconds,
+        }
+    }
+
+    fn assemble_rows(
+        &self,
+        scores: &[f32],
+        stable_ids: &[u64],
+        query_count: usize,
+        row_width: usize,
+    ) -> Result<Vec<Vec<VectorSearchHit>>, CoreError> {
+        if scores.len() != stable_ids.len() || scores.len() != query_count * row_width {
+            return invalid("TurboVec returned malformed result buffers");
+        }
+        let mut rows = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            let start = query_index * row_width;
+            let end = start + row_width;
+            let mut row = Vec::with_capacity(row_width);
+            for (&score, &stable_id) in scores[start..end].iter().zip(&stable_ids[start..end]) {
+                let chunk_id = self
+                    .chunk_ids_by_stable_id
+                    .get(&stable_id)
+                    .ok_or_else(|| invalid_err("TurboVec returned an unknown stable id"))?;
+                let document_id = self
+                    .document_ids_by_stable_id
+                    .get(&stable_id)
+                    .ok_or_else(|| invalid_err("TurboVec returned an unknown stable id"))?;
+                row.push(VectorSearchHit {
+                    chunk_id: chunk_id.clone(),
+                    document_id: document_id.clone(),
+                    stable_id,
+                    score,
+                });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+fn validate_config(native_dim: usize, bit_width: usize) -> Result<(), CoreError> {
+    if native_dim == 0 {
+        return invalid("native_dim must be positive");
+    }
+    if !matches!(bit_width, 2 | 4) {
+        return invalid("TurboVec bit_width must be 2 or 4");
+    }
+    Ok(())
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
+    Err(invalid_err(message))
+}
+
+fn invalid_err(message: impl Into<String>) -> CoreError {
+    CoreError::new(CoreErrorCode::InvalidArgument, message)
+}
+
+fn core_error(error: impl std::fmt::Display) -> CoreError {
+    CoreError::new(CoreErrorCode::Internal, error.to_string())
+}

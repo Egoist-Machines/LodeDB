@@ -14,6 +14,7 @@ name = "lodedb_core"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+turbovec = { path = "../../third_party/turbovec/turbovec" }
 
 [lints]
 workspace = true
