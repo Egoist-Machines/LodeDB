@@ -9,5 +9,9 @@ pub mod types;
 pub mod version;
 
 pub use error::{CoreError, CoreErrorCode};
-pub use types::CoreApiVersion;
+pub use types::{
+    CoreApiVersion, CoreDocument, CoreIndexConfig, CoreMetadata, CoreMutationResult,
+    CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchHit, CoreSearchResults,
+    CoreSecurityOptions, CoreStats, CoreVectorDocument,
+};
 pub use version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
