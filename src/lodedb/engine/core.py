@@ -110,10 +110,12 @@ logger = logging.getLogger("lodedb.engine")
 DIRECT_TURBOVEC_STORAGE_PROFILE = "turbovec_direct"
 # JSON files that may share a persistence directory but are NOT engine index
 # snapshots and must never be parsed as one. The SDK's LodeCollection writes a
-# ``collection.json`` manifest at the collection root; without this, pointing a
-# plain index open at a collection root would try to load it as a legacy snapshot
-# and fail with a confusing schema-version error.
-_NON_INDEX_JSON_FILES = frozenset({"collection.json"})
+# ``collection.json`` manifest at the collection root, and the migration toolkit
+# writes a payload-free ``migration.json`` manifest into a migrated store; without
+# this, pointing a plain index open (or the snapshot audit) at such a directory
+# would try to load the sidecar as a legacy snapshot and fail with a confusing
+# schema-version error.
+_NON_INDEX_JSON_FILES = frozenset({"collection.json", "migration.json"})
 # Cap on the per-index in-memory query-latency ring. Latency samples are
 # runtime telemetry (stats/audit percentiles), not durable state, so a long
 # query stream keeps only the most recent samples rather than growing without
@@ -6526,7 +6528,11 @@ def audit_persisted_index_snapshots(persistence_dir: str | Path) -> dict[str, An
         )
         audited_keys.add(key)
     for path in sorted(directory.glob("*.json")):
-        if is_commit_manifest_name(path.name) or path.stem in audited_keys:
+        if (
+            is_commit_manifest_name(path.name)
+            or path.name in _NON_INDEX_JSON_FILES
+            or path.stem in audited_keys
+        ):
             continue
         snapshot_rows.append(
             _audit_snapshot_row(

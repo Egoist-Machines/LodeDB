@@ -34,6 +34,31 @@ backend, or where its current local default makes LodeDB's strengths easy to sho
    can bind to a trusted private-network address for LAN demos; it is unauthenticated and is
    not a public-network service.
 
+## Migrating onto LodeDB
+
+The `lodedb migrate` toolkit moves an existing store onto LodeDB along an
+inspect -> plan -> dry-run -> run -> validate path, without hand-written export scripts and
+without touching the source store (it stays as the rollback path). Detection routes a framework
+owner (LangChain, LlamaIndex, mem0) to the framework path even when it is backed by pgvector or
+Qdrant, and a project that wires a provider such as pgvector directly to the provider-first path.
+Reports and the `migration.json` manifest are payload-free, and connection strings are redacted.
+
+Two public agent pages cover the two entry points:
+
+- [migrate-agent](migrate-agent.md) — framework-first migration (LangChain, LlamaIndex, mem0).
+  Source: `https://egoistmachines.com/lodedb/migrate-agent`.
+- [install-agent](install-agent.md) — provider-first install-and-migrate for direct providers
+  (pgvector first), which hands framework projects off to the page above.
+  Source: `https://egoistmachines.com/lodedb/install-agent`.
+
+```bash
+lodedb migrate inspect  --project . --json
+lodedb migrate plan     --project . --target ./data/lodedb --out lodedb-migration-plan.md
+lodedb migrate run      --plan lodedb-migration-plan.json --target ./data/lodedb --dry-run
+lodedb migrate run      --plan lodedb-migration-plan.json --target ./data/lodedb --write
+lodedb migrate validate --manifest ./data/lodedb/migration.json
+```
+
 ## Status
 
 | Target | Type | Stars≈ | Pattern | Status |

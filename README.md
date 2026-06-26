@@ -32,6 +32,10 @@ LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more com
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
+> **Like what you see?** Point the coding assistant in your project at
+> [egoistmachines.com/lodedb/install-agent](https://egoistmachines.com/lodedb/install-agent)
+> and it will migrate your existing store onto the LodeDB backend.
+
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index **on the
 GPU** when you have one: batched search hits *24k queries/sec on an A10 and 50k qps on an L40S*,
 2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
@@ -59,6 +63,10 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
   LlamaIndex adapter.
+- **Migrate onto LodeDB**: `lodedb migrate` moves an existing LangChain, LlamaIndex, or mem0
+  store, or a direct provider such as pgvector, onto a local LodeDB path along a
+  plan-first, non-destructive inspect/plan/dry-run/run/validate path.
+  [Migration guide](docs/integrations.md#migrating-onto-lodedb).
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
