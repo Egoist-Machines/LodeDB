@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use lodedb_core::engine::CoreEngine;
-use lodedb_core::types::CoreVectorDocument;
+use lodedb_core::types::{CoreDocument, CoreVectorDocument};
 use serde_json::json;
 
 fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -19,6 +19,14 @@ fn doc(id: &str, axis: usize, metadata: BTreeMap<String, String>) -> CoreVectorD
         vector,
         metadata,
         text: None,
+    }
+}
+
+fn text_doc(id: &str, text: &str, metadata: BTreeMap<String, String>) -> CoreDocument {
+    CoreDocument {
+        document_id: id.to_string(),
+        text: text.to_string(),
+        metadata,
     }
 }
 
@@ -137,4 +145,108 @@ fn update_delete_and_stats_are_metrics_only() {
     assert_eq!(stats.delete_count, 1);
     assert_eq!(stats.deleted_chunk_count, 1);
     assert!(!stats.raw_payload_text_present);
+}
+
+#[test]
+fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("text", 8, 4).unwrap();
+    let plan = engine
+        .prepare_text_upsert(
+            "text",
+            &[
+                text_doc("doc-a", "fault code E1234", metadata(&[("topic", "ops")])),
+                text_doc(
+                    "doc-b",
+                    "quarterly revenue",
+                    metadata(&[("topic", "finance")]),
+                ),
+            ],
+            true,
+            true,
+            100,
+        )
+        .unwrap();
+
+    assert_eq!(plan.documents.len(), 2);
+    assert_eq!(plan.chunks_to_embed.len(), 2);
+    assert_eq!(plan.chunks_to_embed[0].text, "fault code E1234");
+    assert_eq!(
+        plan.documents[0].chunks[0].tokens,
+        ["fault", "code", "e1234"]
+    );
+
+    let applied = engine
+        .apply_text_upsert(
+            &plan,
+            &[
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            12.5,
+        )
+        .unwrap();
+    assert_eq!(applied.embedded_chunks, 2);
+    assert_eq!(applied.reused_chunks, 0);
+    assert_eq!(applied.embedding_time_ms, 12.5);
+    assert_eq!(engine.stats("text").unwrap().chunk_count, 2);
+    assert_eq!(
+        engine.document_token_lists("text").unwrap()["doc-a"][0],
+        ["fault", "code", "e1234"]
+    );
+
+    let query_plan = engine.prepare_query_text("E1234", "vector").unwrap();
+    assert!(query_plan.requires_embedding);
+    assert_eq!(query_plan.query_tokens, ["e1234"]);
+    let hits = engine
+        .search_embedded_text(
+            "text",
+            &query_plan,
+            Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            2,
+            Some(&json!({"metadata": {"topic": "ops"}})),
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "doc-a");
+
+    let reuse_plan = engine
+        .prepare_text_upsert(
+            "text",
+            &[text_doc(
+                "doc-a",
+                "fault code E1234",
+                metadata(&[("topic", "ops")]),
+            )],
+            true,
+            true,
+            100,
+        )
+        .unwrap();
+    assert!(reuse_plan.chunks_to_embed.is_empty());
+    let reused = engine.apply_text_upsert(&reuse_plan, &[], 0.0).unwrap();
+    assert_eq!(reused.embedded_chunks, 0);
+    assert_eq!(reused.reused_chunks, 1);
+}
+
+#[test]
+fn stale_text_plan_is_rejected() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("text", 8, 4).unwrap();
+    let plan = engine
+        .prepare_text_upsert(
+            "text",
+            &[text_doc("doc-a", "alpha", metadata(&[]))],
+            true,
+            false,
+            100,
+        )
+        .unwrap();
+    engine
+        .upsert_vectors("text", &[doc("other", 7, metadata(&[]))])
+        .unwrap();
+
+    let error = engine
+        .apply_text_upsert(&plan, &[vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], 1.0)
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "PLAN_STALE");
 }

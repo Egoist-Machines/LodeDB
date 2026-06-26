@@ -7,8 +7,12 @@ use serde_json::Value;
 
 use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter};
+use crate::lexical::tokenize;
+use crate::text::chunk::{chunk_id_for_hash, chunk_text};
+use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
-    CoreMetadata, CoreMutationResult, CoreSearchHit, CoreSearchResults, CoreVectorDocument,
+    CoreDocument, CoreMetadata, CoreMutationResult, CoreSearchHit, CoreSearchResults,
+    CoreVectorDocument,
 };
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 
@@ -16,6 +20,7 @@ use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 #[derive(Debug, Default)]
 pub struct CoreEngine {
     indexes: BTreeMap<String, VectorOnlyIndex>,
+    next_plan_id: u64,
 }
 
 impl CoreEngine {
@@ -60,10 +65,14 @@ impl CoreEngine {
             }
             index.documents.insert(
                 document.document_id.clone(),
-                VectorRecord {
-                    vector: document.vector.clone(),
+                DocumentRecord {
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
+                    token_lists: Vec::new(),
+                    chunks: vec![ChunkRecord {
+                        chunk_id: document.document_id.clone(),
+                        vector: document.vector.clone(),
+                    }],
                 },
             );
             changed += 1;
@@ -88,25 +97,30 @@ impl CoreEngine {
     ) -> Result<CoreMutationResult, CoreError> {
         let index = self.index_mut(index_id)?;
         let mut deleted = 0usize;
+        let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
         for document_id in document_ids {
             if document_id.trim().is_empty() {
                 return invalid("document_id is required");
             }
-            if seen.insert(document_id.clone()) && index.documents.remove(document_id).is_some() {
+            if seen.insert(document_id.clone()) {
+                let Some(record) = index.documents.remove(document_id) else {
+                    continue;
+                };
                 deleted += 1;
+                deleted_chunks += record.chunks.len();
             }
         }
         if deleted > 0 {
             index.delete_count += deleted;
-            index.deleted_chunk_count += deleted;
+            index.deleted_chunk_count += deleted_chunks;
             index.generation += 1;
         }
         Ok(CoreMutationResult {
             documents_upserted: 0,
             documents_deleted: deleted,
             chunks_upserted: 0,
-            chunks_deleted: deleted,
+            chunks_deleted: deleted_chunks,
             generation: index.generation,
         })
     }
@@ -139,6 +153,194 @@ impl CoreEngine {
         })
     }
 
+    /// Plans a text upsert while embeddings stay in the binding layer.
+    pub fn prepare_text_upsert(
+        &mut self,
+        index_id: &str,
+        documents: &[CoreDocument],
+        store_text: bool,
+        index_text: bool,
+        chunk_character_limit: usize,
+    ) -> Result<IngestPlan, CoreError> {
+        let base_generation = self.index(index_id)?.generation;
+        let existing_chunks = self.index(index_id)?.chunk_vectors_by_id();
+        let mut prepared_documents = Vec::with_capacity(documents.len());
+        let mut chunks_to_embed = Vec::new();
+
+        for document in documents {
+            if document.document_id.trim().is_empty() {
+                return invalid("document_id is required");
+            }
+            if document.text.trim().is_empty() {
+                return invalid("document text is required");
+            }
+            let pieces = chunk_text(&document.text, chunk_character_limit)?;
+            let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+            let mut chunks = Vec::with_capacity(pieces.len());
+            for piece in pieces {
+                let chunk_hash = normalized_chunk_hash(&piece);
+                let occurrence = *occurrences.get(&chunk_hash).unwrap_or(&0);
+                occurrences.insert(chunk_hash.clone(), occurrence + 1);
+                let chunk_id = chunk_id_for_hash(&document.document_id, &chunk_hash, occurrence);
+                let tokens = if index_text {
+                    tokenize(&piece)
+                } else {
+                    Vec::new()
+                };
+                let needs_embedding = !existing_chunks.contains_key(&chunk_id);
+                if needs_embedding {
+                    chunks_to_embed.push(PlanEmbeddingChunk {
+                        document_id: document.document_id.clone(),
+                        chunk_id: chunk_id.clone(),
+                        text: piece.clone(),
+                    });
+                }
+                chunks.push(PlanDocumentChunk {
+                    chunk_id,
+                    text: piece,
+                    tokens,
+                    needs_embedding,
+                });
+            }
+            prepared_documents.push(PlanDocument {
+                document_id: document.document_id.clone(),
+                metadata: document.metadata.clone(),
+                text: if store_text {
+                    Some(document.text.clone())
+                } else {
+                    None
+                },
+                chunks,
+            });
+        }
+
+        let plan_id = self.next_plan_id;
+        self.next_plan_id += 1;
+        Ok(IngestPlan {
+            plan_id,
+            index_id: index_id.to_string(),
+            base_generation,
+            documents: prepared_documents,
+            chunks_to_embed,
+            store_text,
+            index_text,
+        })
+    }
+
+    /// Applies a text upsert plan with binding-provided embeddings.
+    pub fn apply_text_upsert(
+        &mut self,
+        plan: &IngestPlan,
+        embeddings: &[Vec<f32>],
+        embedding_time_ms: f64,
+    ) -> Result<TextApplyResult, CoreError> {
+        let index = self.index_mut(&plan.index_id)?;
+        if index.generation != plan.base_generation {
+            return Err(CoreError::new(
+                CoreErrorCode::PlanStale,
+                "ingest plan is stale",
+            ));
+        }
+        if embeddings.len() != plan.chunks_to_embed.len() {
+            return invalid("embedding count does not match ingest plan");
+        }
+        for embedding in embeddings {
+            if embedding.len() != index.vector_dim {
+                return invalid("embedding dimension does not match index");
+            }
+        }
+
+        let mut new_embeddings = plan
+            .chunks_to_embed
+            .iter()
+            .zip(embeddings)
+            .map(|(chunk, embedding)| (chunk.chunk_id.clone(), embedding.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let existing_chunks = index.chunk_vectors_by_id();
+        let mut chunks_upserted = 0usize;
+        let mut reused_chunks = 0usize;
+        for document in &plan.documents {
+            let mut chunks = Vec::with_capacity(document.chunks.len());
+            let token_lists = document
+                .chunks
+                .iter()
+                .map(|chunk| chunk.tokens.clone())
+                .collect::<Vec<_>>();
+            for chunk in &document.chunks {
+                let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
+                    chunks_upserted += 1;
+                    embedding
+                } else if let Some(existing) = existing_chunks.get(&chunk.chunk_id) {
+                    reused_chunks += 1;
+                    existing.clone()
+                } else {
+                    return invalid("ingest plan references a missing reusable chunk");
+                };
+                chunks.push(ChunkRecord {
+                    chunk_id: chunk.chunk_id.clone(),
+                    vector,
+                });
+            }
+            index.documents.insert(
+                document.document_id.clone(),
+                DocumentRecord {
+                    metadata: document.metadata.clone(),
+                    text: document.text.clone(),
+                    token_lists,
+                    chunks,
+                },
+            );
+        }
+        if !plan.documents.is_empty() {
+            index.generation += 1;
+        }
+        Ok(TextApplyResult {
+            mutation: CoreMutationResult {
+                documents_upserted: plan.documents.len(),
+                documents_deleted: 0,
+                chunks_upserted,
+                chunks_deleted: 0,
+                generation: index.generation,
+            },
+            embedded_chunks: chunks_upserted,
+            reused_chunks,
+            embedding_time_ms,
+        })
+    }
+
+    /// Prepares a text query; embeddings remain a binding responsibility.
+    pub fn prepare_query_text(&self, query: &str, mode: &str) -> Result<QueryPlan, CoreError> {
+        if query.trim().is_empty() {
+            return invalid("query must be a non-empty string");
+        }
+        if !matches!(mode, "vector" | "hybrid" | "lexical") {
+            return invalid("unsupported query mode");
+        }
+        Ok(QueryPlan {
+            query: query.to_string(),
+            mode: mode.to_string(),
+            query_tokens: tokenize(query),
+            requires_embedding: matches!(mode, "vector" | "hybrid"),
+        })
+    }
+
+    /// Executes a prepared text query with a binding-provided query embedding.
+    pub fn search_embedded_text(
+        &self,
+        index_id: &str,
+        query_plan: &QueryPlan,
+        query_embedding: Option<&[f32]>,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        if query_plan.requires_embedding {
+            let embedding = query_embedding
+                .ok_or_else(|| invalid_err("query embedding is required for this mode"))?;
+            return self.query_vector(index_id, embedding, top_k, filter);
+        }
+        invalid("lexical-only text search is not implemented in the prepare/apply protocol yet")
+    }
+
     /// Queries one vector.
     pub fn query_vector(
         &self,
@@ -158,14 +360,20 @@ impl CoreEngine {
         let total_considered = candidates.len();
         let mut hits = candidates
             .into_iter()
-            .filter_map(|document_id| {
-                let record = index.documents.get(&document_id)?;
-                Some(CoreSearchHit {
-                    document_id: document_id.clone(),
-                    chunk_id: document_id,
-                    score: dot(query_vector, &record.vector),
-                    metadata: record.metadata.clone(),
-                })
+            .flat_map(|document_id| {
+                let Some(record) = index.documents.get(&document_id) else {
+                    return Vec::new();
+                };
+                record
+                    .chunks
+                    .iter()
+                    .map(|chunk| CoreSearchHit {
+                        document_id: document_id.clone(),
+                        chunk_id: chunk.chunk_id.clone(),
+                        score: dot(query_vector, &chunk.vector),
+                        metadata: record.metadata.clone(),
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
@@ -202,8 +410,8 @@ impl CoreEngine {
         Ok(CoreEngineStats {
             index_id: index.index_id.clone(),
             document_count: index.documents.len(),
-            chunk_count: index.documents.len(),
-            embedded_chunk_count: index.documents.len(),
+            chunk_count: index.chunk_count(),
+            embedded_chunk_count: index.chunk_count(),
             delete_count: index.delete_count,
             deleted_chunk_count: index.deleted_chunk_count,
             generation: index.generation,
@@ -214,6 +422,19 @@ impl CoreEngine {
             bit_width: index.bit_width,
             raw_payload_text_present: false,
         })
+    }
+
+    /// Returns captured per-document, per-chunk lexical tokens.
+    pub fn document_token_lists(
+        &self,
+        index_id: &str,
+    ) -> Result<BTreeMap<String, Vec<Vec<String>>>, CoreError> {
+        let index = self.index(index_id)?;
+        Ok(index
+            .documents
+            .iter()
+            .map(|(document_id, record)| (document_id.clone(), record.token_lists.clone()))
+            .collect())
     }
 
     fn index(&self, index_id: &str) -> Result<&VectorOnlyIndex, CoreError> {
@@ -234,7 +455,7 @@ struct VectorOnlyIndex {
     index_id: String,
     vector_dim: usize,
     bit_width: usize,
-    documents: BTreeMap<String, VectorRecord>,
+    documents: BTreeMap<String, DocumentRecord>,
     generation: u64,
     delete_count: usize,
     deleted_chunk_count: usize,
@@ -295,13 +516,37 @@ impl VectorOnlyIndex {
         }
         Ok(candidates)
     }
+
+    fn chunk_count(&self) -> usize {
+        self.documents
+            .values()
+            .map(|record| record.chunks.len())
+            .sum()
+    }
+
+    fn chunk_vectors_by_id(&self) -> BTreeMap<String, Vec<f32>> {
+        let mut chunks = BTreeMap::new();
+        for record in self.documents.values() {
+            for chunk in &record.chunks {
+                chunks.insert(chunk.chunk_id.clone(), chunk.vector.clone());
+            }
+        }
+        chunks
+    }
 }
 
 #[derive(Debug, Clone)]
-struct VectorRecord {
-    vector: Vec<f32>,
+struct DocumentRecord {
     metadata: CoreMetadata,
     text: Option<String>,
+    token_lists: Vec<Vec<String>>,
+    chunks: Vec<ChunkRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkRecord {
+    chunk_id: String,
+    vector: Vec<f32>,
 }
 
 /// Metrics-only stats for the in-memory engine.
@@ -320,6 +565,59 @@ pub struct CoreEngineStats {
     pub vector_dim: usize,
     pub bit_width: usize,
     pub raw_payload_text_present: bool,
+}
+
+/// Text ingest plan returned to a binding before embeddings are computed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestPlan {
+    pub plan_id: u64,
+    pub index_id: String,
+    pub base_generation: u64,
+    pub documents: Vec<PlanDocument>,
+    pub chunks_to_embed: Vec<PlanEmbeddingChunk>,
+    pub store_text: bool,
+    pub index_text: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanDocument {
+    pub document_id: String,
+    pub metadata: CoreMetadata,
+    pub text: Option<String>,
+    pub chunks: Vec<PlanDocumentChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanDocumentChunk {
+    pub chunk_id: String,
+    pub text: String,
+    pub tokens: Vec<String>,
+    pub needs_embedding: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEmbeddingChunk {
+    pub document_id: String,
+    pub chunk_id: String,
+    pub text: String,
+}
+
+/// Result returned after applying binding-provided embeddings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextApplyResult {
+    pub mutation: CoreMutationResult,
+    pub embedded_chunks: usize,
+    pub reused_chunks: usize,
+    pub embedding_time_ms: f64,
+}
+
+/// Prepared text query returned to a binding before query embedding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlan {
+    pub query: String,
+    pub mode: String,
+    pub query_tokens: Vec<String>,
+    pub requires_embedding: bool,
 }
 
 fn validate_index_shape(vector_dim: usize, bit_width: usize) -> Result<(), CoreError> {
