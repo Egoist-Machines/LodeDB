@@ -1,0 +1,23 @@
+{
+  "fixture": "tests/fixtures/native_core_predicate/predicate.json",
+  "measurements": [
+    {
+      "cases": 18,
+      "checksum": 540000,
+      "documents": 8,
+      "elapsed_ms": 160.891,
+      "iterations": 10000,
+      "name": "python_set_planner"
+    },
+    {
+      "cases": 18,
+      "checksum": 540000,
+      "documents": 8,
+      "elapsed_ms": 486.98,
+      "iterations": 10000,
+      "name": "rust_planner"
+    }
+  ],
+  "rust_to_python_elapsed_ratio": 3.027,
+  "suite": "native_migration_filter_planner_compare"
+}

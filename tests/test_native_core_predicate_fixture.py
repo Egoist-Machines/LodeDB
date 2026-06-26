@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from lodedb.engine._filter_plan import build_field_indexes, resolve
 from lodedb.engine._predicate import (
     coerce_sdk_filter,
     compile_metadata_filter,
@@ -25,15 +26,19 @@ def _jsonable(value: object) -> object:
 def test_native_core_predicate_fixture_matches_python_oracle() -> None:
     fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     documents = fixture["documents"]
+    metadata_by_id = {document["id"]: document["metadata"] for document in documents}
+    fields, all_docs = build_field_indexes(metadata_by_id)
 
     for case in fixture["cases"]:
         engine_validated = validate_metadata_filter(case["filter"])
         assert _jsonable(engine_validated) == case["engine_validated"]
         assert _matches(documents, engine_validated) == case["engine_matches"]
+        assert resolve(engine_validated, fields, all_docs) == set(case["engine_matches"])
 
         sdk_validated = coerce_sdk_filter(case["filter"])
         assert _jsonable(sdk_validated) == case["sdk_validated"]
         assert _matches(documents, sdk_validated) == case["sdk_matches"]
+        assert resolve(sdk_validated, fields, all_docs) == set(case["sdk_matches"])
 
     for bad_filter in fixture["invalid_filters"]:
         try:

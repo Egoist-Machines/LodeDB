@@ -107,7 +107,7 @@ fn contains_string(values: &[Value], needle: &str) -> bool {
     values.iter().any(|value| value.as_str() == Some(needle))
 }
 
-fn compare_ordered(stored: &str, op: &str, operand: &str) -> bool {
+pub(crate) fn compare_ordered(stored: &str, op: &str, operand: &str) -> bool {
     let operand_number = as_number(operand);
     if let Some(operand_number) = operand_number {
         if let Some(stored_number) = as_number(stored) {
@@ -117,7 +117,7 @@ fn compare_ordered(stored: &str, op: &str, operand: &str) -> bool {
     compare_str(stored, op, operand)
 }
 
-fn as_number(text: &str) -> Option<f64> {
+pub(crate) fn as_number(text: &str) -> Option<f64> {
     let value = text.parse::<f64>().ok()?;
     if value.is_nan() {
         None
