@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable
@@ -723,19 +724,20 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--k", type=int, default=8)
     args = parser.parse_args()
-    print(
-        json.dumps(
-            run(
-                args.output,
-                documents=args.documents,
-                queries=args.queries,
-                dim=args.dim,
-                k=args.k,
-            ),
-            indent=2,
-            sort_keys=True,
-        )
+    payload = run(
+        args.output,
+        documents=args.documents,
+        queries=args.queries,
+        dim=args.dim,
+        k=args.k,
     )
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    # Exit nonzero when a gate fails so the command's status reflects pass/fail
+    # (e.g. a debug extension may miss the filtered-search gate that the release
+    # build meets). CI already inspects pass_fail_summary; this makes a local run
+    # fail visibly instead of looking green.
+    if not payload.get("pass_fail_summary", {}).get("passed", False):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
