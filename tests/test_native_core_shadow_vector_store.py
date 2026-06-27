@@ -343,7 +343,35 @@ def test_native_core_write_on_persists_vector_store_when_generation_mode(
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "write-b"
 
 
-def test_native_core_write_on_requires_generation_mode(tmp_path, monkeypatch) -> None:
+def test_native_core_write_on_vector_store_uses_wal_mode_until_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="wal-a", metadata={"topic": "ops"})
+    db.add_vectors(_onehot(1), id="wal-b", metadata={"topic": "ml"})
+    stats = db.stats()["native_core"]
+
+    assert adapter.opened_writable is True
+    assert native.persist_calls == 0
+    assert stats["write_mode"] == "on"
+    assert stats["write_through"] is True
+    assert stats["covered"] is True
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "wal-b"
+
+    db.persist()
+    assert native.persist_calls == 1
+
+
+def test_native_core_write_on_text_store_requires_generation_mode(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "lodedb.local.db.NativeCoreAdapter",
         lambda: FakeNativeAdapter(FakeNativeVectorEngine()),
@@ -351,8 +379,8 @@ def test_native_core_write_on_requires_generation_mode(tmp_path, monkeypatch) ->
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="commit_mode='generation'"):
-        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    with pytest.raises(RuntimeError, match="commit_mode='generation'.*text stores"):
+        LodeDB(tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
 
 
 def test_native_core_write_on_text_store_uses_prepare_apply(tmp_path, monkeypatch) -> None:
@@ -588,8 +616,8 @@ def test_native_on_readonly_existing_store_uses_persistent_seed(tmp_path, monkey
     assert db.stats()["native_core"]["fallback_reason"] == ""
 
 
-def test_native_write_on_fails_closed_until_cutover(tmp_path, monkeypatch) -> None:
-    native = FakeNativeVectorEngine()
+def test_native_write_on_shadow_vector_store_keeps_python_results(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine(score_offset=100)
     adapter = FakeNativeAdapter(native)
     monkeypatch.setattr(
         "lodedb.local.db.NativeCoreAdapter",
@@ -598,10 +626,14 @@ def test_native_write_on_fails_closed_until_cutover(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="LODEDB_NATIVE_CORE_WRITE=on"):
-        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="a", metadata={"topic": "ops"})
 
-    assert adapter.opened_writable is False
+    hits = db.search_by_vector(_onehot(0), k=1)
+    assert adapter.opened_writable is True
+    assert native.persist_calls == 0
+    assert hits[0].id == "a"
+    assert hits[0].score < 10.0
 
 
 def test_native_write_shadow_persists_to_temp_native_handle(tmp_path, monkeypatch) -> None:

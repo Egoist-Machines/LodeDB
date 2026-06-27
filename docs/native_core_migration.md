@@ -16,14 +16,15 @@ existing stores stable.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.
-- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only and text stores
-  opened with `commit_mode="generation"`; Rust writes the same generation artifacts that Python
-  can reopen. WAL-mode write-through and existing non-empty store rewrites remain on the Python
-  oracle until the storage cutover is complete.
+- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only stores in WAL or
+  generation mode, and for fresh text stores opened with `commit_mode="generation"`; Rust writes
+  compatible WAL/generation artifacts that Python can reopen. WAL-mode text write-through and
+  existing non-empty store rewrites remain on the Python oracle until the storage cutover is
+  complete.
 - Inside `lodedb-core`, WAL-mode persistent engines can append and replay native-authored vector,
   delete, and embedded-text records, then checkpoint them into generation artifacts. Python
-  rollout still keeps `LODEDB_NATIVE_CORE_WRITE=on` on generation mode until the SDK can avoid
-  double-logging alongside the Python oracle WAL.
+  rollout enables vector-only WAL write-through, while WAL-mode text write-through remains
+  generation-gated until mixed Python/native text WAL recovery is fully cut over.
 - Covered native Python handles can serve `get`, `get_texts`, `get_document`, and
   `list_documents` from Rust in `LODEDB_NATIVE_CORE=on`; shadow/default fallback still keeps the
   Python store as oracle when native coverage is absent or fails closed.

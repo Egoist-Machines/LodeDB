@@ -1294,12 +1294,12 @@ class LodeDB:
             self._native_vector_engine = native_engine
             self._native_vector_covered = True
             return
-        if write_through:
-            if commit_mode != "generation":
-                self._native_core_fallback_reason = "native_core_write_on_requires_generation"
-                raise RuntimeError(
-                    "LODEDB_NATIVE_CORE_WRITE=on currently requires commit_mode='generation'"
-                )
+        if write_through and not self.vector_only and commit_mode != "generation":
+            self._native_core_fallback_reason = "native_core_text_write_on_requires_generation"
+            raise RuntimeError(
+                "LODEDB_NATIVE_CORE_WRITE=on currently requires commit_mode='generation' "
+                "for text stores"
+            )
         try:
             if write_through:
                 native_engine = adapter.open_engine(
@@ -1370,7 +1370,7 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
-            if self._native_write_through_enabled:
+            if self._native_should_persist_after_mutation():
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
@@ -1415,7 +1415,7 @@ class LodeDB:
                 embeddings,
                 embedding_time_ms=embedding_time_ms,
             )
-            if self._native_write_through_enabled:
+            if self._native_should_persist_after_mutation():
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
@@ -1438,7 +1438,7 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
-            if self._native_write_through_enabled:
+            if self._native_should_persist_after_mutation():
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
@@ -1671,6 +1671,11 @@ class LodeDB:
                 raise RuntimeError("native core persist failed") from exc
             if self._native_core_strict_parity:
                 raise
+
+    def _native_should_persist_after_mutation(self) -> bool:
+        """Returns whether native writes should publish a generation immediately."""
+
+        return self._native_write_through_enabled and self.commit_mode.value == "generation"
 
     def _mark_native_read_failed(self, reason: str, exc: Exception) -> None:
         """Records a native read fallback and applies rollout failure policy."""

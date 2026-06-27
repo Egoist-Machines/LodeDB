@@ -346,6 +346,30 @@ def test_native_core_write_on_vector_store_persists_python_readable_store(
     assert reopened.get("write-a") == "Native write A"
 
 
+def test_native_core_write_on_vector_store_wal_mode_persists_python_readable_store(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(0), id="wal-a", metadata={"kind": "wal"}, text="Native WAL A")
+    db.add_vectors(_onehot(1), id="wal-b", metadata={"kind": "wal"}, text="Native WAL B")
+    stats = db.stats()["native_core"]
+
+    assert stats["write_mode"] == "on"
+    assert stats["write_through"] is True
+    assert stats["covered"] is True
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "wal-b"
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "wal-b"
+    assert reopened.get("wal-a") == "Native WAL A"
+
+
 def test_native_core_write_on_text_store_persists_python_readable_store(
     tmp_path, monkeypatch
 ) -> None:
