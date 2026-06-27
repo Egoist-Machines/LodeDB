@@ -131,6 +131,10 @@ Combined with the one-row-per-document layout, float16 is ~7x smaller on disk th
 the original one-row-per-patch float32 prototype and keeps 2x more pages resident
 in RAM; int8 is ~14x smaller. Scoring upcasts to float32 in bounded chunks, so a
 compact resident matrix never forces a full-precision copy of the whole corpus.
+The on-disk precision is the configured one; the resident in-memory matrix is
+float32 for `storage="float32"` and float16 otherwise (so `int8` halves resident
+RAM versus float32 and quarters on-disk size). Either way, a document scores
+identically whether served from the resident cache or a fresh reopen.
 
 ## Scoring backend
 

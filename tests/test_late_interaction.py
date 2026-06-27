@@ -652,6 +652,30 @@ def test_read_only_reopen_adopts_persisted_storage(tmp_path):
     assert reader.search(_onehot_matrix([0]), k=1)[0].id == "doc-a"
 
 
+@pytest.mark.parametrize("storage", ["float32", "float16", "int8"])
+def test_incremental_resident_matches_reopen(tmp_path, storage):
+    # Documents added AFTER the resident cache is built (the pending-delta path)
+    # must score identically to a fresh read-only reopen -- in particular int8
+    # writes must be quantized in the cache, not kept as raw float.
+    rng = np.random.default_rng(31)
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, storage=storage)
+    for i in range(20):
+        idx.add_document(f"d{i:02d}", _unit_rows(rng, 6), normalize=False)
+    idx.search(_unit_rows(rng, 4), k=3, normalize=False)  # build the resident cache
+    for i in range(20, 40):  # adds now go through the live pending delta
+        idx.add_document(f"d{i:02d}", _unit_rows(rng, 6), normalize=False)
+    queries = [_unit_rows(rng, 5) for _ in range(8)]
+    idx.persist()
+
+    fresh = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    for q in queries:
+        live = idx.search(q, k=5, normalize=False)
+        disk = fresh.search(q, k=5, normalize=False)
+        assert [h.id for h in live] == [h.id for h in disk]
+        for a, b in zip(live, disk, strict=True):
+            assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
 def test_storage_precision_recall_on_random_vectors(tmp_path):
     # float16 should match the float32 ranking; int8 should be close.
     rng = np.random.default_rng(11)

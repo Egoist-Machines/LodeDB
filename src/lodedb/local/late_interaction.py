@@ -636,9 +636,14 @@ class LodeLateInteractionIndex:
     ) -> tuple[dict[str, Any], str, np.ndarray, dict[str, Any]]:
         """Prepares one document write.
 
-        Returns ``(engine_row, document_id, matrix, user_metadata)``: the row to
-        upsert (pooled vector + encoded matrix + stamped metadata), plus the
-        normalized patch matrix and clean user metadata for the resident cache.
+        Returns ``(engine_row, document_id, cache_matrix, user_metadata)``: the row
+        to upsert (pooled vector + encoded matrix + stamped metadata), plus the
+        patch matrix to fold into the resident cache and the clean user metadata.
+
+        ``cache_matrix`` is the matrix as it would be read back from disk -- the
+        stored bytes decoded -- not the raw input, so that an ``int8`` (or
+        ``float16``) document scores identically whether it is served from the
+        live pending cache or from a fresh reopen.
         """
 
         document_id = _require_doc_id(id)
@@ -647,13 +652,15 @@ class LodeLateInteractionIndex:
         row_meta = dict(user_meta)
         row_meta[_PATCH_COUNT_KEY] = str(matrix.shape[0])
         row_meta[_DTYPE_KEY] = self.storage
+        text = _encode_matrix(matrix, self.storage)
+        cache_matrix = _decode_matrix(text, self.storage, self.dim)
         row = {
             "vector": _pool(matrix).tolist(),
             "id": document_id,
             "metadata": row_meta,
-            "text": _encode_matrix(matrix, self.storage),
+            "text": text,
         }
-        return row, document_id, matrix, user_meta
+        return row, document_id, cache_matrix, user_meta
 
     # -- resident cache maintenance -----------------------------------------
 
