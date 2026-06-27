@@ -666,6 +666,89 @@ def test_native_core_write_on_vector_store_wal_mode_persists_python_readable_sto
     assert reopened.get("wal-a") == "Native WAL A"
 
 
+def test_native_write_through_generation_commits_are_o_changed(tmp_path, monkeypatch) -> None:
+    """Native generation write-through must publish O(changed) deltas, not full bases.
+
+    Native is the sole durable writer in write-through (Python defers), so each
+    single-row add appends a generation delta onto native's own base. Per-add
+    latency must stay flat as the corpus grows instead of the prior O(corpus)
+    full-base rewrite (which grew to ~100 ms/add at ~1k rows).
+    """
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    dim = 16
+    rng = np.random.default_rng(0)
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=dim, commit_mode="generation")
+
+    def add_bucket(start, count):
+        elapsed = []
+        for i in range(start, start + count):
+            vec = rng.standard_normal(dim).astype(np.float32).tolist()
+            began = time.perf_counter()
+            db.add_vectors(vec, id=f"d{i}", metadata={"u": str(i)}, normalize=False)
+            elapsed.append((time.perf_counter() - began) * 1000.0)
+        return statistics.median(elapsed)
+
+    first = add_bucket(0, 200)
+    for i in range(200, 1800):
+        db.add_vectors(
+            rng.standard_normal(dim).astype(np.float32).tolist(), id=f"d{i}", normalize=False
+        )
+    last = add_bucket(1800, 200)
+    assert db.stats()["native_core"]["write_through"] is True
+    db.close()
+
+    # Flat within a generous bound: a full-base regression would be many times
+    # slower at the tail than at the head, while O(changed) deltas stay level.
+    assert last <= first * 4.0 + 1.0, (
+        f"per-add latency grew: first={first:.3f} ms last={last:.3f} ms"
+    )
+
+
+def test_native_write_through_generation_churn_round_trips(tmp_path, monkeypatch) -> None:
+    """Add/update/delete churn under native write-through reopens consistently.
+
+    Exercises the generation delta path (state + tvim + removed-id tracking) and
+    confirms the native-authored base+deltas reopen correctly under BOTH the native
+    reader and the Python reader (cross-read), with no tvim/state row drift."""
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    dim = 8
+    rng = np.random.default_rng(7)
+
+    def vec():
+        return rng.standard_normal(dim).astype(np.float32).tolist()
+
+    oracle: dict[str, list[float]] = {}
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=dim, commit_mode="generation")
+    for _ in range(400):
+        if rng.random() < 0.65 or not oracle:
+            doc_id = f"d{int(rng.integers(0, 120))}"  # reuse ids -> updates
+            v = vec()
+            db.add_vectors(
+                v, id=doc_id, metadata={"b": str(int(rng.integers(0, 8)))}, normalize=False
+            )
+            oracle[doc_id] = v
+        else:
+            doc_id = list(oracle)[int(rng.integers(0, len(oracle)))]
+            db.remove(doc_id)
+            oracle.pop(doc_id, None)
+    db.close()
+
+    for mode in ("on", "off"):
+        monkeypatch.setenv("LODEDB_NATIVE_CORE", mode)
+        ro = LodeDB.open_vector_store(tmp_path, vector_dim=dim, commit_mode="generation")
+        assert ro.stats()["document_count"] == len(oracle), f"[{mode}] count mismatch"
+        sample = list(oracle)[0]
+        hits = ro.search_by_vector(oracle[sample], k=1)
+        assert hits and hits[0].id == sample, f"[{mode}] search top != {sample}"
+        ro.close()
+
+
 def test_native_core_on_existing_vector_store_uses_readonly_seed(
     tmp_path, monkeypatch
 ) -> None:

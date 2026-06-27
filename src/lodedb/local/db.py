@@ -1540,6 +1540,12 @@ class LodeDB:
         self._native_vector_covered = True
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
+        # In generation-mode write-through the native core is the sole durable
+        # writer, so the Python engine stops publishing its own commits (two
+        # writers would collide on the shared generation store). The Python writer
+        # resumes durability automatically if native write-through falls back.
+        if self._native_should_persist_after_mutation():
+            self._engine.assign_native_durability_ownership()
 
     def _native_query_authoritative(self) -> bool:
         """True when explicit native-on should serve reads without the Python oracle.
@@ -1664,7 +1670,7 @@ class LodeDB:
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
-            self._native_write_through_enabled = False
+            self._disable_native_write_through()
             self._native_core_fallback_reason = "native_core_upsert_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector upsert failed") from exc
@@ -1715,7 +1721,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_text_shadow_enabled = False
-            self._native_write_through_enabled = False
+            self._disable_native_write_through()
             self._native_core_fallback_reason = "native_core_text_upsert_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core text upsert failed") from exc
@@ -1741,7 +1747,7 @@ class LodeDB:
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
-            self._native_write_through_enabled = False
+            self._disable_native_write_through()
             self._native_core_fallback_reason = "native_core_delete_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector delete failed") from exc
@@ -1961,7 +1967,7 @@ class LodeDB:
                 self._verify_native_shadow_persist()
         except Exception as exc:
             self._native_vector_covered = False
-            self._native_write_through_enabled = False
+            self._disable_native_write_through()
             self._native_vector_mutable = False
             self._native_shadow_persist_verified = False
             self._native_core_fallback_reason = (
@@ -1979,12 +1985,29 @@ class LodeDB:
 
         return self._native_write_through_enabled and self.commit_mode.value == "generation"
 
+    def _disable_native_write_through(self) -> None:
+        """Turns off native write-through and hands durability back to Python.
+
+        While native owned durability (generation write-through) the Python engine
+        deferred its commits, so on fallback it must republish the current
+        in-memory state and resume the durable-writer role; otherwise a mutation
+        could be left only in native's (now distrusted) store or in memory.
+        """
+
+        self._native_write_through_enabled = False
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            try:
+                engine.flush_native_fallback_state()
+            except Exception:  # noqa: BLE001 - best effort; next commit re-secures it
+                self._native_core_fallback_reason = "native_core_durability_flush_failed"
+
     def _mark_native_read_failed(self, reason: str, exc: Exception) -> None:
         """Records a native read fallback and applies rollout failure policy."""
 
         self._native_vector_covered = False
         self._native_text_shadow_enabled = False
-        self._native_write_through_enabled = False
+        self._disable_native_write_through()
         self._native_vector_mutable = False
         self._native_core_fallback_reason = reason
         if self._native_core_fail_closed:

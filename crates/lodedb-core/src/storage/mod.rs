@@ -10,10 +10,12 @@ pub mod wal;
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{
     base_json_path, base_tvim_path, base_tvlex_path, base_tvtext_path, build_commit_body,
-    commit_manifest_path, generation_dir, list_base_epochs, write_commit_manifest, CommitBodyInput,
-    CommitManifest,
+    commit_manifest_path, generation_dir, list_base_epochs, read_commit_manifest,
+    write_commit_manifest, CommitBodyInput, CommitManifest,
 };
 use crate::storage::lexical_store::TokenLists;
+use crate::storage::state_journal::StateJournalDeltaInput;
+use crate::storage::tvim_delta::{TvimDeltaAppendInput, TvimDeltaArray};
 use crate::storage::util::{corrupt, get_str, invalid, value_object, CoreResult};
 use crate::storage::wal::WalRecord;
 use serde_json::Value;
@@ -285,6 +287,235 @@ pub fn write_generation_commit(
         options.retained_epochs,
     )?;
     Ok(body)
+}
+
+/// Encoded tvim row changes for a generation delta. Owned so callers can build it
+/// from the live index without lifetime juggling across the export boundary.
+#[derive(Debug, Clone, Default)]
+pub struct TvimDeltaWrite {
+    pub upsert_stable_ids: Vec<u64>,
+    pub upsert_codes: Vec<u8>,
+    pub upsert_scales: Vec<f32>,
+    pub removed_stable_ids: Vec<u64>,
+    pub rows_after: usize,
+    pub calibration_fingerprint: u64,
+}
+
+impl TvimDeltaWrite {
+    fn is_empty(&self) -> bool {
+        self.upsert_stable_ids.is_empty() && self.removed_stable_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationDeltaInput<'a> {
+    pub index_key: &'a str,
+    pub generation: u64,
+    pub base_epoch: u64,
+    pub state_header: &'a Value,
+    pub upserted_documents: Vec<Value>,
+    pub deleted_document_ids: Vec<String>,
+    pub document_count_after: usize,
+    pub chunk_count_after: usize,
+    /// `Some` when the index has vectors; an empty write reuses the base manifest.
+    pub tvim: Option<TvimDeltaWrite>,
+    /// `Some` only when `store_text` is on; carries the changed documents' text.
+    pub raw_text_upserts: Option<BTreeMap<String, String>>,
+    /// `Some` only when `index_text` is on; carries the changed documents' tokens.
+    pub lexical_upserts: Option<BTreeMap<String, TokenLists>>,
+    pub document_deletes: Vec<String>,
+}
+
+/// Appends an O(changed) generation delta onto the live base and re-seals the
+/// commit manifest. Unlike [`write_generation_commit`], this never rewrites the
+/// full bases: it appends per-store delta segments for what changed and carries
+/// the unchanged stores' manifests forward from the previous commit, so a
+/// single-row write stays O(changed). The base epoch is unchanged; only the
+/// generation advances. Requires a prior commit at `base_epoch` (the engine falls
+/// back to a full base on a cold build or compaction).
+pub fn write_generation_delta(
+    persistence_dir: impl AsRef<Path>,
+    input: GenerationDeltaInput<'_>,
+    fsync: bool,
+) -> CoreResult<Value> {
+    let persistence_dir = persistence_dir.as_ref();
+    let previous =
+        read_commit_manifest(&commit_manifest_path(persistence_dir, input.index_key))?
+            .ok_or_else(|| corrupt("generation delta requires an existing commit manifest"))?;
+
+    let state_base_path = base_json_path(persistence_dir, input.index_key, input.base_epoch);
+    let json_manifest = state_journal::append_delta(
+        &state_base_path,
+        StateJournalDeltaInput {
+            upserted_documents: input.upserted_documents,
+            deleted_document_ids: input.deleted_document_ids,
+            state_header: input.state_header.clone(),
+            document_count_after: input.document_count_after,
+            chunk_count_after: input.chunk_count_after,
+            generation: input.generation,
+            fsync,
+        },
+    )?;
+
+    // tvim: append a delta when vectors changed, else carry the base manifest.
+    let tvim_manifest = match input.tvim {
+        Some(tvim) if !tvim.is_empty() => {
+            let base_tvim_path = base_tvim_path(persistence_dir, input.index_key, input.base_epoch);
+            let upsert_id_bytes = u64_slice_to_le_bytes(&tvim.upsert_stable_ids);
+            let removed_id_bytes = u64_slice_to_le_bytes(&tvim.removed_stable_ids);
+            let scale_bytes = f32_slice_to_le_bytes(&tvim.upsert_scales);
+            // Match the host writer's array layout exactly so the Python reader
+            // replays these deltas: ids and scales are 1-D, codes are 2-D
+            // (rows x bytes_per_vector). The native reader keys off byte length,
+            // but the Python reader reshapes by these stored shapes.
+            let code_width = if tvim.upsert_stable_ids.is_empty() {
+                0
+            } else {
+                tvim.upsert_codes.len() / tvim.upsert_stable_ids.len()
+            };
+            let arrays = [
+                TvimDeltaArray {
+                    name: "upsert_stable_ids",
+                    dtype: "uint64",
+                    shape: vec![tvim.upsert_stable_ids.len()],
+                    bytes: &upsert_id_bytes,
+                },
+                TvimDeltaArray {
+                    name: "upsert_codes",
+                    dtype: "uint8",
+                    shape: vec![tvim.upsert_stable_ids.len(), code_width],
+                    bytes: &tvim.upsert_codes,
+                },
+                TvimDeltaArray {
+                    name: "upsert_scales",
+                    dtype: "float32",
+                    shape: vec![tvim.upsert_scales.len()],
+                    bytes: &scale_bytes,
+                },
+                TvimDeltaArray {
+                    name: "removed_stable_ids",
+                    dtype: "uint64",
+                    shape: vec![tvim.removed_stable_ids.len()],
+                    bytes: &removed_id_bytes,
+                },
+            ];
+            Some(tvim_delta::append_delta_arrays(
+                &base_tvim_path,
+                TvimDeltaAppendInput {
+                    generation: input.generation,
+                    calibration_fingerprint: tvim.calibration_fingerprint,
+                    rows_after: tvim.rows_after,
+                    arrays: &arrays,
+                    upsert_rows: tvim.upsert_stable_ids.len(),
+                    removed_rows: tvim.removed_stable_ids.len(),
+                    fsync,
+                },
+            )?)
+        }
+        _ => previous.store_manifest("tvim").cloned(),
+    };
+    let tvim_present = previous
+        .body
+        .get("tvim_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(tvim_manifest.is_some());
+
+    let text_manifest = match input.raw_text_upserts {
+        Some(upserts) if !upserts.is_empty() || !input.document_deletes.is_empty() => {
+            Some(text_store::append_delta(
+                &base_tvtext_path(persistence_dir, input.index_key, input.base_epoch),
+                &upserts,
+                &input.document_deletes,
+                input.document_count_after,
+                fsync,
+            )?)
+        }
+        _ => previous.store_manifest("tvtext").cloned(),
+    };
+    let lexical_manifest = match input.lexical_upserts {
+        Some(upserts) if !upserts.is_empty() || !input.document_deletes.is_empty() => {
+            Some(lexical_store::append_delta(
+                &base_tvlex_path(persistence_dir, input.index_key, input.base_epoch),
+                &upserts,
+                &input.document_deletes,
+                input.document_count_after,
+                fsync,
+            )?)
+        }
+        _ => previous.store_manifest("tvlex").cloned(),
+    };
+
+    let body = build_commit_body(CommitBodyInput {
+        index_key: input.index_key,
+        generation: input.generation,
+        base_epoch: input.base_epoch,
+        document_count: input.document_count_after,
+        chunk_count: input.chunk_count_after,
+        json_manifest: Some(json_manifest),
+        tvim_present,
+        tvim_manifest,
+        tvtext_manifest: text_manifest,
+        tvlex_manifest: lexical_manifest,
+    });
+    write_commit_manifest(
+        &commit_manifest_path(persistence_dir, input.index_key),
+        &body,
+        fsync,
+    )?;
+    Ok(body)
+}
+
+/// Returns the state-journal delta backlog at `base_epoch` as
+/// `(segment_count, journaled_document_count)`, used to decide when a fresh base
+/// rewrite (compaction) is cheaper than another delta. Every generation commit
+/// appends exactly one state-journal segment.
+pub fn generation_delta_backlog(
+    persistence_dir: &Path,
+    index_key: &str,
+    base_epoch: u64,
+) -> CoreResult<(usize, usize)> {
+    let base_path = base_json_path(persistence_dir, index_key, base_epoch);
+    let Some(manifest) = state_journal::read_manifest_optional(&base_path)? else {
+        return Ok((0, 0));
+    };
+    let deltas = manifest
+        .as_object()
+        .and_then(|object| object.get("deltas"))
+        .and_then(Value::as_array);
+    let Some(deltas) = deltas else {
+        return Ok((0, 0));
+    };
+    let document_sum = deltas
+        .iter()
+        .map(|delta| {
+            let upserted = delta
+                .get("upserted_documents")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let deleted = delta
+                .get("deleted_documents")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (upserted + deleted) as usize
+        })
+        .sum();
+    Ok((deltas.len(), document_sum))
+}
+
+fn u64_slice_to_le_bytes(values: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn f32_slice_to_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 pub fn gc_after_base_rewrite(

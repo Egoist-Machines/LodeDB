@@ -1078,59 +1078,17 @@ impl CoreEngine {
         if persistence.read_only {
             return invalid("read-only engine cannot persist");
         }
-        for index in self.indexes.values() {
-            let tvim_base = tvim_base_for_index(index)?;
-            let state = state_payload_for_index(index);
-            let raw_text = if persistence.store_text {
-                index
-                    .documents
-                    .iter()
-                    .filter_map(|(document_id, record)| {
-                        record
-                            .text
-                            .as_ref()
-                            .map(|text| (document_id.clone(), text.clone()))
-                    })
-                    .collect::<BTreeMap<_, _>>()
-            } else {
-                BTreeMap::new()
-            };
-            let lexical_tokens = if persistence.index_text {
-                index
-                    .documents
-                    .iter()
-                    .filter(|(_, record)| !record.token_lists.is_empty())
-                    .map(|(document_id, record)| (document_id.clone(), record.token_lists.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            } else {
-                BTreeMap::new()
-            };
-            crate::storage::write_generation_commit(
-                &persistence.path,
-                crate::storage::GenerationCommitInput {
-                    index_key: &index.index_key,
-                    generation: index.generation.max(1),
-                    base_epoch: index.generation.max(1),
-                    state: &state,
-                    tvim: tvim_base
-                        .as_ref()
-                        .map(|tvim| crate::storage::TvimBaseWrite {
-                            bytes: &tvim.bytes,
-                            rows: tvim.rows,
-                            calibration_fingerprint: tvim.calibration_fingerprint,
-                        }),
-                    raw_text: Some(&raw_text),
-                    lexical_tokens: Some(&lexical_tokens),
-                },
-                crate::storage::GenerationWriteOptions {
-                    fsync: persistence.fsync,
-                    retained_epochs: 4,
-                },
-            )?;
-            if persistence.commit_mode == "wal" {
+        let dir = persistence.path.clone();
+        let fsync = persistence.fsync;
+        let store_text = persistence.store_text;
+        let index_text = persistence.index_text;
+        let commit_mode = persistence.commit_mode.clone();
+        for index in self.indexes.values_mut() {
+            persist_index_generation(index, &dir, fsync, store_text, index_text)?;
+            if commit_mode == "wal" {
                 crate::storage::wal::truncate(
-                    &crate::storage::wal::wal_path(&persistence.path, &index.index_key),
-                    persistence.fsync,
+                    &crate::storage::wal::wal_path(&dir, &index.index_key),
+                    fsync,
                 )?;
             }
         }
@@ -1796,6 +1754,14 @@ fn index_from_loaded_store(
         )?),
         _ => None,
     };
+    // Native owns the generation store as the write-through writer, so it keeps the
+    // loaded base epoch and calibration and appends further deltas onto that base
+    // across reopens (no co-writer to invalidate it). It opens with no pending
+    // changes since the loaded base+deltas are already durable.
+    let base_calibration_fingerprint = vector_index
+        .as_ref()
+        .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
+    let base_epoch = loaded.base_epoch;
     Ok(VectorOnlyIndex {
         index_id,
         index_key,
@@ -1849,6 +1815,11 @@ fn index_from_loaded_store(
         field_indexes,
         all_docs,
         chunk_owner_by_id,
+        base_epoch,
+        base_calibration_fingerprint,
+        pending_upserts: BTreeSet::new(),
+        pending_deletes: BTreeSet::new(),
+        pending_removed_stable_ids: BTreeSet::new(),
     })
 }
 
@@ -2064,6 +2035,71 @@ fn reconstruct_tvim_vectors(
     }))
 }
 
+/// Scalar state snapshot shared by full rewrites and journal deltas. The document
+/// collections are deliberately excluded: a delta replays documents individually,
+/// so embedding the full collections in every delta segment would make each
+/// commit O(corpus) again. Mirrors the host writer's `_state_header_payload`.
+fn state_header_for_index(index: &VectorOnlyIndex) -> serde_json::Map<String, Value> {
+    let serde_json::Value::Object(header) = serde_json::json!({
+        "cache_reuse_count": 0,
+        "client_id_hash": index.client_id_hash,
+        "columnar_generation": index.generation.max(1),
+        "created_at": "1970-01-01T00:00:00+00:00",
+        "delete_count": index.delete_count,
+        "deleted_chunk_count": index.deleted_chunk_count,
+        "embedded_chunk_count": index.chunk_count(),
+        "fallback_count": 0,
+        "fallback_reasons": {},
+        "index_id": index.index_id,
+        "index_key": index.index_key,
+        "metadata": {},
+        "model": index.model,
+        "name": index.name,
+        "native_dim": index.vector_dim,
+        "provider": index.provider,
+        "query_count": 0,
+        "route_profile": index.route_profile,
+        "schema_version": 1,
+        "status": "ready",
+        "storage_profile": index.storage_profile,
+        "task": index.task,
+        "turbovec_bit_width": index.bit_width,
+        "updated_at": "1970-01-01T00:00:00+00:00"
+    }) else {
+        unreachable!("state header literal is an object")
+    };
+    header
+}
+
+/// Serializes one document's redacted state-journal row (chunk ids, metadata, and
+/// per-chunk content hashes), matching the rows a full base writes for the same
+/// document so a delta replay reconstructs identical state.
+fn state_journal_document_entry(document_id: &str, record: &DocumentRecord) -> Value {
+    serde_json::json!({
+        "document_id": document_id,
+        "document_hash": record.content_hash,
+        "chunk_ids": record
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_id.clone())
+            .collect::<Vec<_>>(),
+        "metadata": record
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect::<serde_json::Map<_, _>>(),
+        "chunks": record
+            .chunks
+            .iter()
+            .map(|chunk| serde_json::json!({
+                "chunk_id": chunk.chunk_id,
+                "content_hash": crate::text::hash::sha256_text(&chunk.chunk_id),
+                "document_id": document_id,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
     let mut chunks = Vec::new();
     let mut document_hashes = serde_json::Map::new();
@@ -2107,36 +2143,279 @@ fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
             .and_then(Value::as_str)
             .cmp(&right.get("chunk_id").and_then(Value::as_str))
     });
-    serde_json::json!({
-        "cache_reuse_count": 0,
-        "chunks": chunks,
-        "client_id_hash": index.client_id_hash,
-        "columnar_generation": index.generation.max(1),
-        "created_at": "1970-01-01T00:00:00+00:00",
-        "delete_count": index.delete_count,
-        "deleted_chunk_count": index.deleted_chunk_count,
-        "document_chunk_ids": document_chunk_ids,
-        "document_hashes": document_hashes,
-        "document_metadata": document_metadata,
-        "embedded_chunk_count": index.chunk_count(),
-        "fallback_count": 0,
-        "fallback_reasons": {},
-        "index_id": index.index_id,
-        "index_key": index.index_key,
-        "metadata": {},
-        "model": index.model,
-        "name": index.name,
-        "native_dim": index.vector_dim,
-        "provider": index.provider,
-        "query_count": 0,
-        "route_profile": index.route_profile,
-        "schema_version": 1,
-        "status": "ready",
-        "storage_profile": index.storage_profile,
-        "task": index.task,
-        "turbovec_bit_width": index.bit_width,
-        "updated_at": "1970-01-01T00:00:00+00:00"
-    })
+    let mut payload = state_header_for_index(index);
+    payload.insert("chunks".to_string(), Value::Array(chunks));
+    payload.insert(
+        "document_hashes".to_string(),
+        Value::Object(document_hashes),
+    );
+    payload.insert(
+        "document_chunk_ids".to_string(),
+        Value::Object(document_chunk_ids),
+    );
+    payload.insert(
+        "document_metadata".to_string(),
+        Value::Object(document_metadata),
+    );
+    Value::Object(payload)
+}
+
+/// Rewrite a fresh base after this many delta segments, matching the host writer.
+const MAX_GENERATION_DELTA_SEGMENTS: usize = 64;
+
+/// Persists one index as a generation commit, appending an O(changed) delta onto
+/// the live base when possible and only rewriting a full base on a cold build, a
+/// calibration change, a compaction threshold, or a missing store base.
+fn persist_index_generation(
+    index: &mut VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    store_text: bool,
+    index_text: bool,
+) -> Result<(), CoreError> {
+    let nothing_pending = index.pending_upserts.is_empty()
+        && index.pending_deletes.is_empty()
+        && index.pending_removed_stable_ids.is_empty();
+    // A committed base with nothing pending is already durable on disk.
+    if index.base_epoch != 0 && nothing_pending {
+        return Ok(());
+    }
+    let generation = index.generation.max(1);
+    let live_fingerprint = index
+        .vector_index
+        .borrow()
+        .as_ref()
+        .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
+    let needs_base = index.base_epoch == 0
+        || !index.vectors_seeded
+        || live_fingerprint != index.base_calibration_fingerprint
+        || !native_base_appendable(
+            dir,
+            &index.index_key,
+            index.base_epoch,
+            store_text,
+            index_text,
+        )
+        || generation_should_compact(
+            dir,
+            &index.index_key,
+            index.base_epoch,
+            index.documents.len(),
+        )?;
+
+    if needs_base {
+        write_index_base(index, dir, fsync, store_text, index_text, generation)?;
+        index.base_epoch = generation;
+        index.base_calibration_fingerprint = live_fingerprint;
+    } else {
+        write_index_delta(index, dir, fsync, store_text, index_text, generation)?;
+    }
+    index.pending_upserts.clear();
+    index.pending_deletes.clear();
+    index.pending_removed_stable_ids.clear();
+    Ok(())
+}
+
+/// Returns whether native's own base at `base_epoch` still has the base files a
+/// delta needs to append onto. Defensive against a base file disappearing; the
+/// caller rewrites a fresh authored base when it returns false.
+fn native_base_appendable(
+    dir: &Path,
+    index_key: &str,
+    base_epoch: u64,
+    store_text: bool,
+    index_text: bool,
+) -> bool {
+    use crate::storage::commit_manifest::{base_json_path, base_tvlex_path, base_tvtext_path};
+    if base_epoch == 0 {
+        return false;
+    }
+    if !base_json_path(dir, index_key, base_epoch).is_file() {
+        return false;
+    }
+    if store_text && !base_tvtext_path(dir, index_key, base_epoch).is_file() {
+        return false;
+    }
+    if index_text && !base_tvlex_path(dir, index_key, base_epoch).is_file() {
+        return false;
+    }
+    true
+}
+
+/// Returns whether the delta backlog on native's own base warrants a fresh base.
+fn generation_should_compact(
+    dir: &Path,
+    index_key: &str,
+    base_epoch: u64,
+    document_count: usize,
+) -> Result<bool, CoreError> {
+    let (segments, delta_documents) =
+        crate::storage::generation_delta_backlog(dir, index_key, base_epoch)?;
+    if segments == 0 {
+        return Ok(false);
+    }
+    if segments >= MAX_GENERATION_DELTA_SEGMENTS {
+        return Ok(true);
+    }
+    // Fold when journaled documents reach 25% of the live document set.
+    Ok(delta_documents * 4 >= document_count.max(1))
+}
+
+/// Writes a full base for one index (the cold-build / compaction path).
+fn write_index_base(
+    index: &VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    store_text: bool,
+    index_text: bool,
+    generation: u64,
+) -> Result<(), CoreError> {
+    let tvim_base = tvim_base_for_index(index)?;
+    let state = state_payload_for_index(index);
+    let raw_text = if store_text {
+        raw_text_for_documents(index, index.documents.keys().map(String::as_str))
+    } else {
+        BTreeMap::new()
+    };
+    let lexical_tokens = if index_text {
+        lexical_tokens_for_documents(index, index.documents.keys().map(String::as_str))
+    } else {
+        BTreeMap::new()
+    };
+    crate::storage::write_generation_commit(
+        dir,
+        crate::storage::GenerationCommitInput {
+            index_key: &index.index_key,
+            generation,
+            base_epoch: generation,
+            state: &state,
+            tvim: tvim_base
+                .as_ref()
+                .map(|tvim| crate::storage::TvimBaseWrite {
+                    bytes: &tvim.bytes,
+                    rows: tvim.rows,
+                    calibration_fingerprint: tvim.calibration_fingerprint,
+                }),
+            raw_text: Some(&raw_text),
+            lexical_tokens: Some(&lexical_tokens),
+        },
+        crate::storage::GenerationWriteOptions {
+            fsync,
+            retained_epochs: 4,
+        },
+    )?;
+    Ok(())
+}
+
+/// Appends an O(changed) generation delta for one index onto the live base.
+fn write_index_delta(
+    index: &VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    store_text: bool,
+    index_text: bool,
+    generation: u64,
+) -> Result<(), CoreError> {
+    let upserted_documents = index
+        .pending_upserts
+        .iter()
+        .filter_map(|document_id| {
+            index
+                .documents
+                .get(document_id)
+                .map(|record| state_journal_document_entry(document_id, record))
+        })
+        .collect::<Vec<_>>();
+    let deleted_document_ids = index.pending_deletes.iter().cloned().collect::<Vec<_>>();
+    let raw_text_upserts = store_text
+        .then(|| raw_text_for_documents(index, index.pending_upserts.iter().map(String::as_str)));
+    let lexical_upserts = index_text.then(|| {
+        lexical_tokens_for_documents(index, index.pending_upserts.iter().map(String::as_str))
+    });
+    let state_header = Value::Object(state_header_for_index(index));
+    crate::storage::write_generation_delta(
+        dir,
+        crate::storage::GenerationDeltaInput {
+            index_key: &index.index_key,
+            generation,
+            base_epoch: index.base_epoch,
+            state_header: &state_header,
+            upserted_documents,
+            deleted_document_ids: deleted_document_ids.clone(),
+            document_count_after: index.documents.len(),
+            chunk_count_after: index.chunk_count(),
+            tvim: build_tvim_delta(index)?,
+            raw_text_upserts,
+            lexical_upserts,
+            document_deletes: deleted_document_ids,
+        },
+        fsync,
+    )?;
+    Ok(())
+}
+
+/// Builds the encoded tvim delta from the live index: current rows for the
+/// pending-upsert documents (overwriting in place) plus the stable ids dropped
+/// since the base. Returns `None` when the index holds no vector rows.
+fn build_tvim_delta(
+    index: &VectorOnlyIndex,
+) -> Result<Option<crate::storage::TvimDeltaWrite>, CoreError> {
+    let guard = index.vector_index.borrow();
+    let Some(live) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let mut upsert_chunk_ids = Vec::new();
+    for document_id in &index.pending_upserts {
+        if let Some(record) = index.documents.get(document_id) {
+            for chunk in &record.chunks {
+                upsert_chunk_ids.push(chunk.chunk_id.clone());
+            }
+        }
+    }
+    let upsert_stable_ids = live.stable_ids_for_chunks(&upsert_chunk_ids);
+    let (upsert_codes, upsert_scales) = if upsert_stable_ids.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        live.export_encoded(&upsert_stable_ids)?
+    };
+    Ok(Some(crate::storage::TvimDeltaWrite {
+        upsert_stable_ids,
+        upsert_codes,
+        upsert_scales,
+        removed_stable_ids: index.pending_removed_stable_ids.iter().copied().collect(),
+        rows_after: live.len(),
+        calibration_fingerprint: live.calibration_fingerprint(),
+    }))
+}
+
+fn raw_text_for_documents<'a>(
+    index: &VectorOnlyIndex,
+    document_ids: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    document_ids
+        .filter_map(|document_id| {
+            index
+                .documents
+                .get(document_id)
+                .and_then(|record| record.text.as_ref())
+                .map(|text| (document_id.to_string(), text.clone()))
+        })
+        .collect()
+}
+
+fn lexical_tokens_for_documents<'a>(
+    index: &VectorOnlyIndex,
+    document_ids: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, Vec<Vec<String>>> {
+    document_ids
+        .filter_map(|document_id| {
+            index
+                .documents
+                .get(document_id)
+                .filter(|record| !record.token_lists.is_empty())
+                .map(|record| (document_id.to_string(), record.token_lists.clone()))
+        })
+        .collect()
 }
 
 fn core_io_error(error: std::io::Error) -> CoreError {
@@ -2226,6 +2505,23 @@ struct VectorOnlyIndex {
     field_indexes: BTreeMap<String, FieldIndex>,
     all_docs: DocSet,
     chunk_owner_by_id: HashMap<String, String>,
+    /// Epoch of the current on-disk base; 0 until the first base is persisted.
+    /// Generation commits append deltas onto this base and only rewrite a fresh
+    /// base (bumping this) on cold build or compaction, keeping commits O(changed).
+    base_epoch: u64,
+    /// TurboVec calibration fingerprint of the current tvim base. A tvim delta is
+    /// only valid against a base with the same fingerprint (the read path rejects
+    /// a mismatch), so a fingerprint change forces a base rewrite.
+    base_calibration_fingerprint: u64,
+    /// Document ids upserted since the current base (drives the state/text/lexical
+    /// delta upsert sets). Disjoint from `pending_deletes`.
+    pending_upserts: BTreeSet<String>,
+    /// Document ids deleted since the current base.
+    pending_deletes: BTreeSet<String>,
+    /// TurboVec stable ids dropped from the live index since the current base and
+    /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
+    /// choke points because a removed chunk's stable id leaves the live id map.
+    pending_removed_stable_ids: BTreeSet<u64>,
 }
 
 impl VectorOnlyIndex {
@@ -2253,6 +2549,11 @@ impl VectorOnlyIndex {
             field_indexes: BTreeMap::new(),
             all_docs: DocSet::new(),
             chunk_owner_by_id: HashMap::new(),
+            base_epoch: 0,
+            base_calibration_fingerprint: 0,
+            pending_upserts: BTreeSet::new(),
+            pending_deletes: BTreeSet::new(),
+            pending_removed_stable_ids: BTreeSet::new(),
         }
     }
 
@@ -2270,17 +2571,58 @@ impl VectorOnlyIndex {
         self.require_vectors_seeded()
     }
 
-    fn sync_vector_index_upsert(&self, chunks: &[CoreVectorChunk]) -> Result<(), CoreError> {
-        if let Some(index) = self.vector_index.borrow_mut().as_mut() {
-            index.upsert_chunks(chunks)?;
+    fn sync_vector_index_upsert(&mut self, chunks: &[CoreVectorChunk]) -> Result<(), CoreError> {
+        // Build the live index on first use from all current documents (which
+        // already include these chunks), then maintain it incrementally. It must
+        // exist before any generation commit so it is the single calibrated source
+        // of truth for both the base write and the tvim deltas; otherwise a delta
+        // built against a separately-calibrated index would be rejected on replay.
+        let built_now = if self.vector_index.borrow().is_none() {
+            let built = TurboVecNativeIndex::build(
+                &self.vector_chunks(),
+                self.vector_dim,
+                self.bit_width,
+                self.generation,
+            )?;
+            *self.vector_index.borrow_mut() = Some(built);
+            true
+        } else {
+            false
+        };
+        let readded = {
+            let mut guard = self.vector_index.borrow_mut();
+            let Some(index) = guard.as_mut() else {
+                return Ok(());
+            };
+            // A just-built index already contains every current chunk; only an
+            // existing index needs the incremental upsert.
+            if !built_now {
+                index.upsert_chunks(chunks)?;
+            }
+            let chunk_ids: Vec<String> =
+                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
+            index.stable_ids_for_chunks(&chunk_ids)
+        };
+        // Rows written this cycle are no longer "removed" relative to the base.
+        for stable_id in readded {
+            self.pending_removed_stable_ids.remove(&stable_id);
         }
         Ok(())
     }
 
-    fn sync_vector_index_remove(&self, chunk_ids: &[String]) {
-        if let Some(index) = self.vector_index.borrow_mut().as_mut() {
+    fn sync_vector_index_remove(&mut self, chunk_ids: &[String]) {
+        let removed = {
+            let mut guard = self.vector_index.borrow_mut();
+            let Some(index) = guard.as_mut() else {
+                return;
+            };
+            // Read the stable ids before removal: a removed id leaves the live id
+            // map, so the tvim delta could not recover it at persist time.
+            let removed = index.stable_ids_for_chunks(chunk_ids);
             index.remove_chunks(chunk_ids);
-        }
+            removed
+        };
+        self.pending_removed_stable_ids.extend(removed);
     }
 
     fn add_document_indexes(
@@ -2300,6 +2642,10 @@ impl VectorOnlyIndex {
             self.chunk_owner_by_id
                 .insert(chunk.chunk_id.clone(), document_id.to_string());
         }
+        // Track this document as pending for the next generation delta; the tvim
+        // row set is tracked separately at the vector-sync choke points.
+        self.pending_deletes.remove(document_id);
+        self.pending_upserts.insert(document_id.to_string());
     }
 
     fn remove_document_indexes(
@@ -2316,6 +2662,10 @@ impl VectorOnlyIndex {
                 changed_filter_fields.insert(key.clone());
             }
         }
+        // Track the document-level removal for the next generation delta; the tvim
+        // row removals are tracked at the vector-sync choke points.
+        self.pending_upserts.remove(document_id);
+        self.pending_deletes.insert(document_id.to_string());
         for chunk in chunks {
             self.chunk_owner_by_id.remove(&chunk.chunk_id);
         }

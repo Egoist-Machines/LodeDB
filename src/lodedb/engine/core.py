@@ -676,6 +676,13 @@ class LodeEngine:
         # Set while replaying WAL records on open so the replayed mutations
         # re-drive the engine verbs without re-appending to the WAL.
         self._wal_replaying = False
+        # When the native core is the durable writer (``LODEDB_NATIVE_CORE_WRITE``
+        # write-through), the Python engine still maintains in-memory state and the
+        # oracle reads, but it must NOT also publish durable commits: two writers
+        # sharing one generation store collide on epoch-named base files and GC
+        # each other. While this is set, ``_persist_state`` is a no-op; the SDK
+        # flips it back off (and flushes) if native write-through falls back.
+        self._native_owns_durability = False
         # The logical mutation a verb stages for the next WAL append, keyed by
         # index key: ``(op, payload)``. Consumed by ``_append_wal_record`` so the
         # single ``_persist_state`` funnel records the right verb in WAL mode.
@@ -4468,6 +4475,33 @@ class LodeEngine:
             changeset=changeset,
         )
 
+    def assign_native_durability_ownership(self) -> None:
+        """Hands durable-commit ownership to the native core (write-through).
+
+        After this, the Python engine still tracks in-memory state and serves
+        oracle reads, but ``_persist_state`` stops publishing commits so the native
+        writer owns the single generation store exclusively.
+        """
+
+        self._native_owns_durability = True
+
+    def flush_native_fallback_state(self) -> None:
+        """Resumes Python durability and publishes the current state.
+
+        Called when native write-through falls back to the Python writer: native
+        had owned durability while the Python engine deferred its commits, so this
+        re-enables the commit funnel and durably republishes every index's current
+        in-memory state before normal commits continue.
+        """
+
+        if not self._native_owns_durability:
+            return
+        self._native_owns_durability = False
+        if self.persistence_dir is None:
+            return
+        for state in self._indexes.values():
+            self._persist_generation(state)
+
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
 
@@ -4482,6 +4516,12 @@ class LodeEngine:
         """
 
         if self.persistence_dir is None:
+            return
+        if self._native_owns_durability:
+            # Native core is the durable writer for this store (write-through);
+            # the Python engine keeps in-memory state and oracle reads but must not
+            # publish its own commits, or the two writers collide on the shared
+            # generation store. Falling back to Python re-enables this funnel.
             return
         self._require_writable()
         if self._commit_mode == CommitMode.WAL and not self._wal_replaying:

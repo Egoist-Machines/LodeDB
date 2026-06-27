@@ -263,6 +263,12 @@ impl TurboVecNativeIndex {
         self.index.calibration_fingerprint()
     }
 
+    /// Returns the quantized codes and scales for `stable_ids`, in order, for
+    /// writing a tvim delta. The ids must currently be present in the live index.
+    pub fn export_encoded(&self, stable_ids: &[u64]) -> Result<(Vec<u8>, Vec<f32>), CoreError> {
+        self.index.export_encoded(stable_ids).map_err(core_error)
+    }
+
     fn from_parts(
         index: IdMapIndex,
         chunks: &[CoreVectorChunk],
