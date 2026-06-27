@@ -1,6 +1,6 @@
 //! Native core engine.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -678,10 +678,33 @@ impl CoreEngine {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<Vec<CoreSearchResults>, CoreError> {
-        query_vectors
-            .iter()
-            .map(|query| self.query_vector(index_id, query, top_k, filter))
-            .collect()
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        let index = self.index(index_id)?;
+        index.require_vectors_seeded()?;
+        for query in query_vectors {
+            if query.len() != index.vector_dim {
+                return invalid("query dimension does not match index");
+            }
+        }
+        if index.chunk_count() == 0 {
+            return Ok(query_vectors
+                .iter()
+                .map(|_| CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered: 0,
+                })
+                .collect());
+        }
+        match index.query_vectors_batch_turbovec(query_vectors, top_k, filter) {
+            Ok(results) => Ok(results),
+            Err(error) if error.code() == CoreErrorCode::Unsupported => query_vectors
+                .iter()
+                .map(|query| self.query_vector_scalar(index_id, query, top_k, filter))
+                .collect(),
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns metrics-only stats for an index.
@@ -1499,24 +1522,7 @@ impl VectorOnlyIndex {
         } else {
             Vec::new()
         };
-        {
-            let mut cached = self.vector_index.borrow_mut();
-            if cached.is_none() {
-                *cached = Some(TurboVecNativeIndex::build(
-                    &self.vector_chunks(),
-                    self.vector_dim,
-                    self.bit_width,
-                    self.generation,
-                )?);
-            }
-        }
-        let cached = self.vector_index.borrow();
-        let Some(index) = cached.as_ref() else {
-            return Err(CoreError::new(
-                CoreErrorCode::Unsupported,
-                "native TurboVec index is unavailable",
-            ));
-        };
+        let index = self.turbovec_index()?;
         let hits = index
             .search(query_vector, top_k, &allowlist)?
             .into_iter()
@@ -1534,6 +1540,74 @@ impl VectorOnlyIndex {
         Ok(CoreSearchResults {
             hits,
             total_considered,
+        })
+    }
+
+    fn query_vectors_batch_turbovec(
+        &self,
+        query_vectors: &[Vec<f32>],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        let candidates = self.resolve_filter(filter)?;
+        let total_considered = candidates.len();
+        if filter.is_some() && candidates.is_empty() {
+            return Ok(query_vectors
+                .iter()
+                .map(|_| CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered,
+                })
+                .collect());
+        }
+        let allowlist = if filter.is_some() {
+            self.chunk_ids_for_documents(&candidates)
+        } else {
+            Vec::new()
+        };
+        let index = self.turbovec_index()?;
+        index
+            .search_batch(query_vectors, top_k, &allowlist)?
+            .into_iter()
+            .map(|row| {
+                let hits = row
+                    .into_iter()
+                    .filter_map(|hit| {
+                        self.documents
+                            .get(&hit.document_id)
+                            .map(|record| CoreSearchHit {
+                                document_id: hit.document_id,
+                                chunk_id: hit.chunk_id,
+                                score: hit.score,
+                                metadata: record.metadata.clone(),
+                            })
+                    })
+                    .collect();
+                Ok(CoreSearchResults {
+                    hits,
+                    total_considered,
+                })
+            })
+            .collect()
+    }
+
+    fn turbovec_index(&self) -> Result<Ref<'_, TurboVecNativeIndex>, CoreError> {
+        {
+            let mut cached = self.vector_index.borrow_mut();
+            if cached.is_none() {
+                *cached = Some(TurboVecNativeIndex::build(
+                    &self.vector_chunks(),
+                    self.vector_dim,
+                    self.bit_width,
+                    self.generation,
+                )?);
+            }
+        }
+        Ref::filter_map(self.vector_index.borrow(), Option::as_ref).map_err(|_| {
+            CoreError::new(
+                CoreErrorCode::Unsupported,
+                "native TurboVec index is unavailable",
+            )
         })
     }
 

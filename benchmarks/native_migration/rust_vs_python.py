@@ -154,7 +154,7 @@ def _python_vector_bench(
     *,
     dim: int,
     k: int,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="lodedb-py-vector-bench-") as tmp:
         db = LodeDB.open_vector_store(
             Path(tmp) / "vectors",
@@ -179,8 +179,24 @@ def _python_vector_bench(
                     and len(documents)
                 ),
             )
-            search = _measure(
-                "python_vector_search",
+            unfiltered_search = _measure(
+                "python_vector_search_unfiltered",
+                lambda: _hit_checksum(
+                    [
+                        [
+                            hit.id
+                            for hit in db.search_by_vector(
+                                query,
+                                k=k,
+                                normalize=False,
+                            )
+                        ]
+                        for query in queries
+                    ]
+                ),
+            )
+            filtered_search = _measure(
+                "python_vector_search_filtered",
                 lambda: _hit_checksum(
                     [
                         [
@@ -196,6 +212,22 @@ def _python_vector_bench(
                     ]
                 ),
             )
+            batch_search = _measure(
+                "python_vector_search_batch",
+                lambda: _hit_checksum(
+                    [
+                        [
+                            hit.id
+                            for hit in db.search_by_vector(
+                                query,
+                                k=k,
+                                normalize=False,
+                            )
+                        ]
+                        for query in queries
+                    ]
+                ),
+            )
             stats = db.stats()
             summary = {
                 "document_count": int(stats.get("document_count", 0) or 0),
@@ -203,7 +235,7 @@ def _python_vector_bench(
             }
         finally:
             db.close()
-    return upsert, search, summary
+    return upsert, unfiltered_search, filtered_search, batch_search, summary
 
 
 def _rust_vector_bench(
@@ -213,7 +245,7 @@ def _rust_vector_bench(
     *,
     dim: int,
     k: int,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     engine = adapter.new_engine()
     engine.create_index(_INDEX_ID, vector_dim=dim, bit_width=4)
     try:
@@ -224,8 +256,25 @@ def _rust_vector_bench(
                 and len(documents)
             ),
         )
-        search = _measure(
-            "rust_vector_search",
+        unfiltered_search = _measure(
+            "rust_vector_search_unfiltered",
+            lambda: _hit_checksum(
+                [
+                    [
+                        str(hit["document_id"])
+                        for hit in engine.query_vector(
+                            _INDEX_ID,
+                            query,
+                            top_k=k,
+                            filter=None,
+                        ).get("hits", [])
+                    ]
+                    for query in queries
+                ]
+            ),
+        )
+        filtered_search = _measure(
+            "rust_vector_search_filtered",
             lambda: _hit_checksum(
                 [
                     [
@@ -241,6 +290,20 @@ def _rust_vector_bench(
                 ]
             ),
         )
+        batch_search = _measure(
+            "rust_vector_search_batch",
+            lambda: _hit_checksum(
+                [
+                    [str(hit["document_id"]) for hit in row.get("hits", [])]
+                    for row in engine.query_vectors_batch(
+                        _INDEX_ID,
+                        queries,
+                        top_k=k,
+                        filter=None,
+                    )
+                ]
+            ),
+        )
         stats = engine.stats(_INDEX_ID)
         summary = {
             "document_count": int(stats.get("document_count", 0) or 0),
@@ -248,7 +311,7 @@ def _rust_vector_bench(
         }
     finally:
         engine.close()
-    return upsert, search, summary
+    return upsert, unfiltered_search, filtered_search, batch_search, summary
 
 
 def _python_text_bench(documents: list[EngineDocument], queries: list[str], *, k: int) -> tuple[
@@ -373,13 +436,25 @@ def run(
     text_documents = _text_documents(documents)
     text_queries = [f"E-{1000 + (i % 97)} vector recovery" for i in range(queries)]
 
-    py_vector_upsert, py_vector_search, py_vector_stats = _python_vector_bench(
+    (
+        py_vector_upsert,
+        py_vector_unfiltered_search,
+        py_vector_filtered_search,
+        py_vector_batch_search,
+        py_vector_stats,
+    ) = _python_vector_bench(
         vector_documents,
         query_vectors,
         dim=dim,
         k=k,
     )
-    rust_vector_upsert, rust_vector_search, rust_vector_stats = _rust_vector_bench(
+    (
+        rust_vector_upsert,
+        rust_vector_unfiltered_search,
+        rust_vector_filtered_search,
+        rust_vector_batch_search,
+        rust_vector_stats,
+    ) = _rust_vector_bench(
         adapter,
         vector_documents,
         query_vectors,
@@ -413,7 +488,17 @@ def run(
         },
         "comparisons": [
             _comparison("vector_upsert", py_vector_upsert, rust_vector_upsert),
-            _comparison("vector_search_filtered", py_vector_search, rust_vector_search),
+            _comparison(
+                "vector_search_unfiltered",
+                py_vector_unfiltered_search,
+                rust_vector_unfiltered_search,
+            ),
+            _comparison(
+                "vector_search_filtered",
+                py_vector_filtered_search,
+                rust_vector_filtered_search,
+            ),
+            _comparison("vector_search_batch", py_vector_batch_search, rust_vector_batch_search),
             _comparison("text_upsert_hash_embedder", py_text_upsert, rust_text_upsert),
             _comparison("text_lexical_search", py_text_search, rust_text_search),
         ],

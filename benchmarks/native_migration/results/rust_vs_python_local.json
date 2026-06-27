@@ -4,41 +4,61 @@
       "checksums_match": true,
       "name": "vector_upsert",
       "python_checksum": 2000,
-      "python_elapsed_ms": 221.912,
+      "python_elapsed_ms": 226.49,
       "rust_checksum": 2000,
-      "rust_elapsed_ms": 54.567,
-      "rust_speedup": 4.065,
-      "rust_to_python_elapsed_ratio": 0.246
+      "rust_elapsed_ms": 53.44,
+      "rust_speedup": 4.237,
+      "rust_to_python_elapsed_ratio": 0.236
+    },
+    {
+      "checksums_match": true,
+      "name": "vector_search_unfiltered",
+      "python_checksum": 870891335,
+      "python_elapsed_ms": 124.294,
+      "rust_checksum": 870891335,
+      "rust_elapsed_ms": 112.814,
+      "rust_speedup": 1.101,
+      "rust_to_python_elapsed_ratio": 0.908
     },
     {
       "checksums_match": true,
       "name": "vector_search_filtered",
       "python_checksum": 141441124,
-      "python_elapsed_ms": 152.258,
+      "python_elapsed_ms": 54.092,
       "rust_checksum": 141441124,
-      "rust_elapsed_ms": 127.402,
-      "rust_speedup": 1.195,
-      "rust_to_python_elapsed_ratio": 0.837
+      "rust_elapsed_ms": 33.853,
+      "rust_speedup": 1.597,
+      "rust_to_python_elapsed_ratio": 0.626
+    },
+    {
+      "checksums_match": true,
+      "name": "vector_search_batch",
+      "python_checksum": 870891335,
+      "python_elapsed_ms": 32.864,
+      "rust_checksum": 870891335,
+      "rust_elapsed_ms": 9.302,
+      "rust_speedup": 3.534,
+      "rust_to_python_elapsed_ratio": 0.283
     },
     {
       "checksums_match": true,
       "name": "text_upsert_hash_embedder",
       "python_checksum": 2000,
-      "python_elapsed_ms": 328.399,
+      "python_elapsed_ms": 326.68,
       "rust_checksum": 2000,
-      "rust_elapsed_ms": 450.078,
-      "rust_speedup": 0.729,
-      "rust_to_python_elapsed_ratio": 1.371
+      "rust_elapsed_ms": 449.985,
+      "rust_speedup": 0.726,
+      "rust_to_python_elapsed_ratio": 1.377
     },
     {
       "checksums_match": true,
       "name": "text_lexical_search",
       "python_checksum": 996602868,
-      "python_elapsed_ms": 221.436,
+      "python_elapsed_ms": 218.377,
       "rust_checksum": 996602868,
-      "rust_elapsed_ms": 73.129,
-      "rust_speedup": 3.03,
-      "rust_to_python_elapsed_ratio": 0.33
+      "rust_elapsed_ms": 74.978,
+      "rust_speedup": 2.915,
+      "rust_to_python_elapsed_ratio": 0.343
     }
   ],
   "native_core": {
