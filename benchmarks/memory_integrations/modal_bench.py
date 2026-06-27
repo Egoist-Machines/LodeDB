@@ -84,12 +84,33 @@ def _build_image() -> modal.Image:
             str(repo_root / "LICENSE"), remote_path="/root/lodedb-src/LICENSE", copy=True
         )
         .add_local_file(str(repo_root / "NOTICE"), remote_path="/root/lodedb-src/NOTICE", copy=True)
+        # The root Cargo workspace manifest + lock. crates/lodedb-core inherits
+        # version/edition/lints from [workspace.package]/[workspace.lints] here, so
+        # cargo must find this workspace root when maturin resolves the
+        # turbovec-python -> crates/lodedb-core path dependency (otherwise the
+        # build fails with "failed to find a workspace root").
+        .add_local_file(
+            str(repo_root / "Cargo.toml"), remote_path="/root/lodedb-src/Cargo.toml", copy=True
+        )
+        .add_local_file(
+            str(repo_root / "Cargo.lock"), remote_path="/root/lodedb-src/Cargo.lock", copy=True
+        )
         # maturin needs the full vendored turbovec workspace under the build dir,
         # exactly as `uv sync`/CI see it, or it errors that the manifest path
         # third_party/turbovec/turbovec-python/Cargo.toml does not exist.
         .add_local_dir(
             str(repo_root / "third_party" / "turbovec"),
             remote_path="/root/lodedb-src/third_party/turbovec",
+            copy=True,
+            ignore=["**/target/**", "**/__pycache__/**", "**/*.so", "**/*.pyd", "**/*.dylib"],
+        )
+        # The native Rust core: turbovec-python's Cargo.toml depends on
+        # crates/lodedb-core (path = ../../../crates/lodedb-core) and registers the
+        # native CoreEngine onto the _turbovec extension, so the maturin build
+        # needs the crates workspace present or it errors on the missing path dep.
+        .add_local_dir(
+            str(repo_root / "crates"),
+            remote_path="/root/lodedb-src/crates",
             copy=True,
             ignore=["**/target/**", "**/__pycache__/**", "**/*.so", "**/*.pyd", "**/*.dylib"],
         )
@@ -115,10 +136,24 @@ IMAGE = _build_image()
 app = modal.App("lodedb-memory-integrations-bench", image=IMAGE)
 
 
+def _log_native_core() -> None:
+    """Confirms the freshly built wheel exposes the native Rust core, so the run
+    reflects the native offering (not a stale-extension Python fallback)."""
+
+    import lodedb._turbovec as turbovec
+
+    present = hasattr(turbovec, "CoreEngine")
+    version = turbovec.native_core_version() if hasattr(turbovec, "native_core_version") else "?"
+    print(f"[native-core] CoreEngine present={present} version={version}")
+    if not present:
+        raise RuntimeError("native CoreEngine missing from the built extension")
+
+
 @app.function(gpu="A10", cpu=16.0, memory=65536, timeout=7200)
 def run_suite_a10(spec: dict) -> dict:
     """Runs the memory-integration suite in the Modal A10 CUDA image."""
 
+    _log_native_core()
     from run import run_memory_integrations_suite
 
     return run_memory_integrations_suite(**spec)
@@ -128,6 +163,7 @@ def run_suite_a10(spec: dict) -> dict:
 def run_suite_l40s(spec: dict) -> dict:
     """Runs the memory-integration suite in the Modal L40S CUDA image."""
 
+    _log_native_core()
     from run import run_memory_integrations_suite
 
     return run_memory_integrations_suite(**spec)

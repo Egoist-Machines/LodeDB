@@ -7,27 +7,30 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0** across all metrics that matter: the most
-compact on disk, GPU-accelerated, and sub-millisecond on durable writes. Point any of them at
-LodeDB instead of its default store. Over 17.5k documents, per framework default:
+LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're a
+strong **drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
+compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
+about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
+documents, per framework default (mean of 3 A10 runs):
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
 | On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~510× faster** (0.57 vs 294 ms) | **~610× faster** (0.57 vs 349 ms) | **~48× faster** (0.64 vs 31 ms) |
-| Batched retrieval, 64 (GPU) | **~1,900×** (6,602 vs ~4 qps) | **~2,200×** (6,414 vs ~3 qps) | **~160×** (4,649 vs 29 qps) |
-| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.6 vs 0.5 ms (both sub-ms) |
+| Single-query p50 (CPU) | **~440× faster** (0.68 vs 299 ms) | **~500× faster** (0.69 vs 346 ms) | **~44× faster** (0.74 vs 33 ms) |
+| Batched retrieval, 64 (GPU) | **~1,600×** (5,447 vs ~3 qps) | **~1,780×** (5,105 vs ~3 qps) | **~117×** (3,779 vs 32 qps) |
+| Durable add of one memory | **~8,000× faster** (1.1 ms vs 8.8 s) | **~16,000× faster** (1.2 ms vs 19.8 s) | 0.8 vs 0.6 ms (both sub-ms) |
 
-LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more compact footprint:
+Among embedded stores, LodeDB has the smallest footprint and the fastest single-query and batched
+search; its durable add is within ~2× of the fastest lazy-append stores (sqlite-vec, qdrant):
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
-| sqlite-vec | **0.4 ms** | 25.3 ms | 25.1 ms | 101 MB |
-| qdrant | **0.5 ms** | 27.3 ms | 27.0 ms | 85 MB |
-| **LodeDB** | **0.6 ms** | **0.49 ms** | **0.11 ms** | **29 MB** |
-| pgvector | 2.3 ms | 30.4 ms | 30.6 ms | 50 MB |
-| lancedb | 3.2 ms | 10.3 ms | 10.0 ms | 37 MB |
-| chroma | 6.5 ms | 3.0 ms | 3.1 ms | 151 MB |
+| sqlite-vec | **0.5 ms** | 25.5 ms | 27.1 ms | 96 MB |
+| qdrant | **0.6 ms** | 36.7 ms | 37.8 ms | 81 MB |
+| **LodeDB** | 1.1 ms | **0.68 ms** | **0.18 ms** | **28 MB** |
+| pgvector | 2.1 ms | 48.1 ms | 48.1 ms | 48 MB |
+| lancedb | 3.3 ms | 10.9 ms | 10.8 ms | 35 MB |
+| chroma | 6.3 ms | 3.3 ms | 3.4 ms | 144 MB |
 
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
