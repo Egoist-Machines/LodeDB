@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 
@@ -928,3 +930,64 @@ def test_native_write_through_vector_caption_survives_reopen(tmp_path, monkeypat
     hits = reopened.search("rarecaptiontoken", k=5, mode="lexical")
     assert [hit.id for hit in hits] == ["cap"]
     reopened.close()
+
+
+def test_close_persists_native_write_through_before_releasing_python_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """Native write-through must close (persist) before Python releases the lock."""
+
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr("lodedb.local.db.NativeCoreAdapter", lambda: adapter)
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
+    db.add_vectors(_onehot(0), id="a")
+
+    order: list[str] = []
+    native_handle = db._native_vector_engine
+    engine = db._engine
+    original_native_close = native_handle.close
+    original_engine_close = engine.close
+
+    def record_native_close() -> None:
+        order.append("native")
+        original_native_close()
+
+    def record_engine_close() -> None:
+        order.append("python")
+        original_engine_close()
+
+    native_handle.close = record_native_close  # type: ignore[method-assign]
+    engine.close = record_engine_close  # type: ignore[method-assign]
+    db.close()
+
+    # Native persist/close happens while the Python writer lock is still held; the
+    # Python engine (which releases the lock) closes last.
+    assert order == ["native", "python"]
+
+
+def test_close_surfaces_native_write_through_failure_but_releases_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """A native write-through close failure is raised, not swallowed, and the lock frees."""
+
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr("lodedb.local.db.NativeCoreAdapter", lambda: adapter)
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
+    db.add_vectors(_onehot(0), id="a")
+
+    def failing_close() -> None:
+        raise RuntimeError("simulated native persist failure")
+
+    db._native_vector_engine.close = failing_close  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        db.close()
+    # The Python engine still closed (lock released) despite the native failure.
+    assert db._engine is None

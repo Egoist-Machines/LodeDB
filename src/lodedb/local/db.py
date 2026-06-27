@@ -1300,32 +1300,44 @@ class LodeDB:
     def close(self) -> None:
         """Releases the single-writer lock and engine references; state stays on disk."""
 
-        if self._engine is not None:
-            self._engine.close()
-        if self._native_vector_engine is not None:
-            # Only close the unsendable native engine from its owning thread; a
-            # cross-thread close would panic (PanicException escapes except
-            # Exception). Dropping the reference suffices on a foreign thread:
-            # Python owns the single-writer lock and the OS reclaims the rest at
-            # process exit.
-            owns_thread = (
-                self._native_engine_thread_id is None
-                or threading.get_ident() == self._native_engine_thread_id
-            )
-            if owns_thread:
-                try:
-                    self._native_vector_engine.close()
-                except Exception:
-                    pass
-        if self._native_write_shadow_dir is not None:
-            self._native_write_shadow_dir.cleanup()
-            self._native_write_shadow_dir = None
-        self._native_vector_engine = None
-        self._native_vector_mutable = False
-        self._native_vector_covered = False
-        self._native_write_through_enabled = False
-        self._index = None  # type: ignore[assignment]
-        self._engine = None  # type: ignore[assignment]
+        native_close_error: Exception | None = None
+        try:
+            # Close (and thereby persist/checkpoint) the native write-through
+            # engine BEFORE the Python engine releases the shared writer lock. The
+            # native engine is opened with acquire_writer_lock=False because Python
+            # holds the lock for this process; if Python released it first, another
+            # writer could acquire it and commit before this handle's native close
+            # published its generation, rolling back the root manifest. Only close
+            # from the owning thread — a cross-thread close of the unsendable handle
+            # would panic; dropping the reference is enough on a foreign thread.
+            if self._native_vector_engine is not None:
+                owns_thread = (
+                    self._native_engine_thread_id is None
+                    or threading.get_ident() == self._native_engine_thread_id
+                )
+                if owns_thread:
+                    try:
+                        self._native_vector_engine.close()
+                    except Exception as exc:  # noqa: BLE001
+                        # A native close failure may mean write-through data was not
+                        # persisted; surface it (after releasing the Python lock in
+                        # finally) instead of silently dropping durable writes.
+                        if self._native_write_through_enabled or self._native_core_fail_closed:
+                            native_close_error = exc
+        finally:
+            if self._engine is not None:
+                self._engine.close()
+            if self._native_write_shadow_dir is not None:
+                self._native_write_shadow_dir.cleanup()
+                self._native_write_shadow_dir = None
+            self._native_vector_engine = None
+            self._native_vector_mutable = False
+            self._native_vector_covered = False
+            self._native_write_through_enabled = False
+            self._index = None  # type: ignore[assignment]
+            self._engine = None  # type: ignore[assignment]
+        if native_close_error is not None:
+            raise RuntimeError("native core write-through close failed") from native_close_error
 
     def __enter__(self) -> LodeDB:
         """Enters a context manager; state is already loaded on open."""
