@@ -373,6 +373,55 @@ def test_native_core_document_ids_filter_does_not_scale_with_corpus() -> None:
     )
 
 
+def test_native_core_upsert_skips_unchanged_vector() -> None:
+    """An identical vector re-add is a no-op; a same-vector metadata change skips re-encode."""
+    engine = native_core.CoreEngine()
+    engine.create_index("default", 8, 4)
+
+    def upsert(metadata):
+        doc = [{"document_id": "a", "vector": _onehot(0), "metadata": metadata, "text": None}]
+        return _loads(engine.upsert_vectors("default", json.dumps(doc)))
+
+    first = upsert({"k": "1"})
+    assert first["chunks_upserted"] == 1
+    # Identical re-add: full no-op, generation unchanged, no vector re-encode.
+    same = upsert({"k": "1"})
+    assert same["documents_upserted"] == 0
+    assert same["chunks_upserted"] == 0
+    assert same["generation"] == first["generation"]
+    # Same vector, changed metadata: state advances but the vector is not re-encoded.
+    meta_only = upsert({"k": "2"})
+    assert meta_only["chunks_upserted"] == 0
+    assert meta_only["generation"] == first["generation"] + 1
+    hit = _loads(
+        engine.query_vector(
+            "default", json.dumps(_onehot(0)), 1, json.dumps({"metadata": {"k": "2"}})
+        )
+    )
+    assert hit["hits"][0]["document_id"] == "a"
+
+
+def test_native_core_document_ids_filter_validates_like_sdk() -> None:
+    """Direct native document_ids filters fail closed on malformed input, matching the SDK."""
+    engine = native_core.CoreEngine()
+    engine.create_index("default", 8, 4)
+    engine.upsert_vectors(
+        "default",
+        json.dumps([{"document_id": "a", "vector": _onehot(0), "metadata": {}, "text": None}]),
+    )
+    for bad in ([], [123], ["a", 123], [""], ["  "]):
+        with pytest.raises(ValueError):
+            engine.query_vector(
+                "default", json.dumps(_onehot(0)), 2, json.dumps({"document_ids": bad})
+            )
+    valid = _loads(
+        engine.query_vector(
+            "default", json.dumps(_onehot(0)), 2, json.dumps({"document_ids": ["a"]})
+        )
+    )
+    assert valid["hits"][0]["document_id"] == "a"
+
+
 def test_native_core_extension_accepts_index_create_options() -> None:
     engine = native_core.CoreEngine()
     index_key = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205"

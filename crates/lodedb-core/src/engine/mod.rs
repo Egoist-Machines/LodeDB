@@ -164,6 +164,7 @@ impl CoreEngine {
             }
         }
         let mut changed = 0usize;
+        let mut chunks_upserted = 0usize;
         let mut changed_filter_fields = BTreeSet::new();
         // Collect every upserted chunk and sync the live TurboVec index once after
         // the loop instead of one `upsert_with_ids_2d` re-encode per document. The
@@ -171,10 +172,7 @@ impl CoreEngine {
         // n separate calibration-bound encode calls on a large add.
         let mut upserted_chunks: Vec<CoreVectorChunk> = Vec::with_capacity(documents.len());
         for document in documents {
-            let chunks = vec![ChunkRecord {
-                chunk_id: document.document_id.clone(),
-                vector: document.vector.clone(),
-            }];
+            let content_hash = crate::text::hash::sha256_f32_le(&document.vector);
             // Mirror Python's vector-in text policy: retain raw text only when
             // store_text is on, and tokenize the optional caption into the lexical
             // index only when index_text is on (a vector document is a single
@@ -194,6 +192,29 @@ impl CoreEngine {
             } else {
                 vec![caption_tokens.clone()]
             };
+            // Unchanged-vector fast path (mirrors Python's `_ingest_vectors`): an
+            // identical re-add is a full no-op (no generation bump, no delta), and
+            // a same-vector/changed-metadata refresh updates document state without
+            // re-encoding the vector or re-syncing TurboVec.
+            let (vector_unchanged, fully_unchanged) =
+                match index.documents.get(&document.document_id) {
+                    Some(record) => {
+                        let vector_unchanged = record.content_hash == content_hash;
+                        let fully_unchanged = vector_unchanged
+                            && record.metadata == document.metadata
+                            && record.text == retained_text
+                            && record.token_lists == token_lists;
+                        (vector_unchanged, fully_unchanged)
+                    }
+                    None => (false, false),
+                };
+            if fully_unchanged {
+                continue;
+            }
+            let chunks = vec![ChunkRecord {
+                chunk_id: document.document_id.clone(),
+                vector: document.vector.clone(),
+            }];
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
@@ -202,7 +223,7 @@ impl CoreEngine {
                     // content hash is identical across writers: `list_documents`
                     // output agrees and re-adding the same vector is recognized as
                     // unchanged regardless of which engine authored the store.
-                    content_hash: crate::text::hash::sha256_f32_le(&document.vector),
+                    content_hash,
                     metadata: document.metadata.clone(),
                     text: retained_text,
                     token_lists,
@@ -231,11 +252,16 @@ impl CoreEngine {
                     &[(document.document_id.clone(), caption_tokens)],
                 );
             }
-            upserted_chunks.push(CoreVectorChunk::new(
-                document.document_id.clone(),
-                document.document_id.clone(),
-                document.vector.clone(),
-            ));
+            // Only re-sync the vector when it actually changed; a same-vector
+            // metadata refresh keeps its existing live-index row.
+            if !vector_unchanged {
+                upserted_chunks.push(CoreVectorChunk::new(
+                    document.document_id.clone(),
+                    document.document_id.clone(),
+                    document.vector.clone(),
+                ));
+                chunks_upserted += 1;
+            }
             changed += 1;
         }
         // A document id repeated within one batch must collapse to its last
@@ -245,7 +271,10 @@ impl CoreEngine {
         for (pos, chunk) in upserted_chunks.iter().enumerate() {
             last_pos_by_doc.insert(chunk.document_id.as_str(), pos);
         }
-        if last_pos_by_doc.len() == upserted_chunks.len() {
+        if upserted_chunks.is_empty() {
+            // No vector changed this batch (all reused / metadata-only); avoid even
+            // building/touching the live index for a no-op sync.
+        } else if last_pos_by_doc.len() == upserted_chunks.len() {
             index.sync_vector_index_upsert(&upserted_chunks)?;
         } else {
             let mut keep: Vec<usize> = last_pos_by_doc.into_values().collect();
@@ -295,7 +324,7 @@ impl CoreEngine {
         Ok(CoreMutationResult {
             documents_upserted: changed,
             documents_deleted: 0,
-            chunks_upserted: changed,
+            chunks_upserted,
             chunks_deleted: 0,
             generation,
         })
@@ -2738,14 +2767,25 @@ impl VectorOnlyIndex {
                 let array = value
                     .as_array()
                     .ok_or_else(|| invalid_err("document_ids filter must be a list"))?;
-                Some(
-                    array
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .filter(|id| self.all_docs.contains(*id))
-                        .map(str::to_string)
-                        .collect::<BTreeSet<String>>(),
-                )
+                // Match the SDK's filter normalizer so every binding fails closed
+                // alike: a document_ids filter must be a non-empty list of non-blank
+                // strings rather than silently dropping malformed entries.
+                if array.is_empty() {
+                    return Err(invalid_err("document_ids filter must not be empty"));
+                }
+                let mut ids = BTreeSet::new();
+                for entry in array {
+                    let id = entry.as_str().ok_or_else(|| {
+                        invalid_err("document_ids filter entries must be strings")
+                    })?;
+                    if id.trim().is_empty() {
+                        return Err(invalid_err("document_ids filter entries must be non-blank"));
+                    }
+                    if self.all_docs.contains(id) {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Some(ids)
             }
             None => None,
         };
