@@ -24,6 +24,7 @@ import math
 import os
 import secrets
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -264,6 +265,11 @@ class LodeDB:
             and "LODEDB_NATIVE_CORE_WRITE" in os.environ
         )
         self._native_vector_engine: NativeCoreEngineHandle | None = None
+        # The native CoreEngine is an unsendable PyO3 object: it may only be
+        # touched from the thread that created it. Records that thread so the
+        # native path can fall back to the thread-safe Python oracle when a
+        # shared handle is used from worker threads (see _native_thread_local).
+        self._native_engine_thread_id: int | None = None
         self._native_vector_mutable = False
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
@@ -436,6 +442,8 @@ class LodeDB:
             provider=route_policy.provider,
             task=route_policy.task,
         )
+        if self._native_vector_engine is not None:
+            self._native_engine_thread_id = threading.get_ident()
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
         # Split by phase: "ingest" (add_image/add_images) vs "query" (search_by_image).
@@ -982,6 +990,7 @@ class LodeDB:
             for index in range(len(images))
         ]
         self._index.upsert_vectors_batch(tuple(payload))
+        self._native_upsert_vectors(tuple(payload))
         return ids
 
     def search_by_image(
@@ -1041,6 +1050,16 @@ class LodeDB:
             text=text,
             clear_text=clear_text,
         )
+        # Python is the durable authority for payload-only updates; the native
+        # core has no mirrored update path here. Invalidate native coverage so
+        # subsequent native reads (get/get_document/list/count/search) do not
+        # return the pre-update metadata or text. The Python oracle, which just
+        # applied the update, serves these reads, and a later reopen re-seeds
+        # native from the updated on-disk store.
+        if self._native_vector_engine is not None and self._native_vector_covered:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            self._native_core_fallback_reason = "native_core_payload_update_unmirrored"
 
     def get(self, id: str) -> str | None:
         """Returns the stored raw text for a document id, or ``None`` if absent.
@@ -1071,7 +1090,17 @@ class LodeDB:
         if not self.store_text:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
         native_handled, native_text = self._native_get_text(id)
-        if native_handled and self._native_core_mode == NativeCoreMode.ON:
+        # Return a native HIT directly, but fall through to the Python oracle on a
+        # native miss: an existing store seeded under an older raw-text sidecar
+        # layout the native reader does not understand counts its documents (so
+        # coverage is claimed) yet serves no text. Python loaded the same store and
+        # is authoritative; a fresh native store always has the text it wrote, so
+        # this adds no Python call on the covered fast path.
+        if (
+            native_handled
+            and native_text is not None
+            and self._native_core_mode == NativeCoreMode.ON
+        ):
             return native_text
         try:
             return self._index.get_document_text(id)
@@ -1099,7 +1128,16 @@ class LodeDB:
             return {}
         native_handled, native_texts = self._native_get_texts(ids)
         if native_handled and self._native_core_mode == NativeCoreMode.ON:
-            return native_texts
+            # Fall back to the Python oracle for any requested id native did not
+            # return (e.g. an existing store seeded under an older raw-text sidecar
+            # layout the native reader cannot serve). Native hits are preferred;
+            # only the misses consult Python.
+            missing = [value for value in ids if value not in native_texts]
+            if not missing:
+                return native_texts
+            merged = dict(native_texts)
+            merged.update(self._index.get_document_texts(missing))
+            return merged
         return self._index.get_document_texts(ids)
 
     def get_document(self, id: str) -> dict[str, Any] | None:
@@ -1222,10 +1260,20 @@ class LodeDB:
         if self._engine is not None:
             self._engine.close()
         if self._native_vector_engine is not None:
-            try:
-                self._native_vector_engine.close()
-            except Exception:
-                pass
+            # Only close the unsendable native engine from its owning thread; a
+            # cross-thread close would panic (PanicException escapes except
+            # Exception). Dropping the reference suffices on a foreign thread:
+            # Python owns the single-writer lock and the OS reclaims the rest at
+            # process exit.
+            owns_thread = (
+                self._native_engine_thread_id is None
+                or threading.get_ident() == self._native_engine_thread_id
+            )
+            if owns_thread:
+                try:
+                    self._native_vector_engine.close()
+                except Exception:
+                    pass
         if self._native_write_shadow_dir is not None:
             self._native_write_shadow_dir.cleanup()
             self._native_write_shadow_dir = None
@@ -1398,10 +1446,35 @@ class LodeDB:
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
 
+    def _native_thread_local(self) -> bool:
+        """True when the native engine exists and the caller owns its thread.
+
+        ``PyCoreEngine`` is an unsendable PyO3 object: touching it from a thread
+        other than the one that created it raises a ``PanicException`` (which is
+        not an ``Exception`` and so escapes the per-call fallback guards). The
+        Python engine is the thread-safe oracle, so the first cross-thread access
+        permanently disables native coverage for this handle and every thread
+        falls back to Python. Returns ``False`` (and trips that fallback) when the
+        engine is absent or the caller is on a different thread.
+        """
+
+        if self._native_vector_engine is None:
+            return False
+        if (
+            self._native_engine_thread_id is None
+            or threading.get_ident() == self._native_engine_thread_id
+        ):
+            return True
+        self._native_vector_covered = False
+        self._native_text_shadow_enabled = False
+        self._native_write_through_enabled = False
+        self._native_core_fallback_reason = "native_core_cross_thread_access"
+        return False
+
     def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
         """Mirrors vector mutations into native core while Python remains durable."""
 
-        if not documents or self._native_vector_engine is None or not self._native_vector_covered:
+        if not documents or not self._native_thread_local() or not self._native_vector_covered:
             return
         if not self._native_vector_mutable:
             self._native_vector_covered = False
@@ -1426,7 +1499,7 @@ class LodeDB:
         if (
             not documents
             or not self._native_text_shadow_enabled
-            or self._native_vector_engine is None
+            or not self._native_thread_local()
             or not self._native_vector_covered
             or self._embedding_backend is None
         ):
@@ -1476,7 +1549,7 @@ class LodeDB:
 
         if (
             not document_ids
-            or self._native_vector_engine is None
+            or not self._native_thread_local()
             or not self._native_vector_covered
         ):
             return
@@ -1506,7 +1579,7 @@ class LodeDB:
     ) -> list[LodeSearchHit] | None:
         """Returns native vector hits when this handle is covered by native state."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return None
         try:
             payload = self._native_vector_engine.query_vector(
@@ -1534,7 +1607,7 @@ class LodeDB:
     ) -> list[list[LodeSearchHit]] | None:
         """Returns native vector batch hits when this handle is covered by native state."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return None
         try:
             batches = self._native_vector_engine.query_vectors_batch(
@@ -1565,7 +1638,7 @@ class LodeDB:
 
         if (
             not self._native_text_shadow_enabled
-            or self._native_vector_engine is None
+            or not self._native_thread_local()
             or not self._native_vector_covered
         ):
             return None
@@ -1607,7 +1680,7 @@ class LodeDB:
     def _native_get_text(self, document_id: str) -> tuple[bool, str | None]:
         """Returns one native raw-text value when this handle is covered."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return False, None
         try:
             return True, self._native_vector_engine.get_document_text(
@@ -1621,7 +1694,7 @@ class LodeDB:
     def _native_get_texts(self, document_ids: list[str]) -> tuple[bool, dict[str, str]]:
         """Returns native raw-text values when this handle is covered."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return False, {}
         try:
             return True, self._native_vector_engine.get_document_texts(
@@ -1635,7 +1708,7 @@ class LodeDB:
     def _native_get_document(self, document_id: str) -> tuple[bool, dict[str, Any] | None]:
         """Returns one native payload-free document record when covered."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return False, None
         try:
             return True, self._native_vector_engine.get_document(
@@ -1652,7 +1725,7 @@ class LodeDB:
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Returns native payload-free document records when covered."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return False, []
         try:
             return True, self._native_vector_engine.list_documents(
@@ -1666,7 +1739,7 @@ class LodeDB:
     def _native_stats(self) -> dict[str, Any] | None:
         """Returns native stats only when this handle is covered by native state."""
 
-        if self._native_vector_engine is None or not self._native_vector_covered:
+        if not self._native_thread_local() or not self._native_vector_covered:
             return None
         try:
             return self._native_vector_engine.stats(_LOCAL_INDEX_ID)
@@ -1698,7 +1771,7 @@ class LodeDB:
 
         if (
             self._native_core_write_mode == NativeCoreMode.OFF
-            or self._native_vector_engine is None
+            or not self._native_thread_local()
             or not self._native_vector_covered
             or not self._native_vector_mutable
         ):
