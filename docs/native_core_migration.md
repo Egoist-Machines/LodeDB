@@ -26,8 +26,8 @@ existing stores stable.
   vector-only handles.
 - `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only and text stores in
   WAL or generation mode; Rust writes compatible WAL/generation artifacts that Python can reopen.
-  Existing non-empty store rewrites remain on the Python oracle until the storage cutover is
-  complete.
+  Existing non-empty store write-through remains on the Python oracle until native vector sidecar
+  writes are implemented.
 - Inside `lodedb-core`, WAL-mode persistent engines can append and replay native-authored vector,
   delete, and embedded-text records, then checkpoint them into generation artifacts. Python
   rollout enables fresh vector and text WAL write-through; mixed Python/native text WAL replay is

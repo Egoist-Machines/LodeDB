@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 
@@ -735,6 +737,29 @@ def test_native_on_existing_vector_store_uses_readonly_seed_until_mutation(
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "b"
 
 
+def test_native_write_on_existing_vector_store_fails_until_sidecar_writes(
+    tmp_path, monkeypatch
+) -> None:
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    writer.add_vectors(_onehot(0), id="a")
+    writer.close()
+
+    native = FakeNativeVectorEngine(score_offset=100)
+    native.documents["a"] = {"vector": _onehot(0), "metadata": {}, "text": None}
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+
+    assert adapter.opened_writable is False
+
+
 def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
     tmp_path, monkeypatch
 ) -> None:
@@ -775,3 +800,40 @@ def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
     assert db.stats()["native_core"]["covered"] is False
     assert db.stats()["native_core"]["fallback_reason"] == "native_core_readonly_seed_invalidated"
     assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
+
+
+def test_native_write_on_existing_index_text_store_fails_until_sidecar_writes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB(
+        tmp_path,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    writer.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    writer.close()
+
+    native = FakeNativeVectorEngine()
+    native.documents["doc-alpha"] = {
+        "vector": _onehot(0),
+        "metadata": {},
+        "text": "Alpha launch notes mention error code E-1001.",
+        "tokens": ["alpha", "launch"],
+    }
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
+        LodeDB(
+            tmp_path,
+            index_text=True,
+            _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        )
+
+    assert adapter.opened_writable is False

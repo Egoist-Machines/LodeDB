@@ -1323,6 +1323,17 @@ class LodeDB:
         if not write_through and document_count != 0 and not self.vector_only:
             self._native_core_fallback_reason = "native_core_existing_text_seed_requires_index_text"
             return
+        if write_through and document_count != 0 and not can_seed_existing:
+            self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
+            raise RuntimeError(
+                "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires index_text=True"
+            )
+        if write_through and document_count != 0:
+            self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
+            raise RuntimeError(
+                "LODEDB_NATIVE_CORE_WRITE=on for existing stores requires native vector "
+                "sidecar writes"
+            )
         try:
             if write_through:
                 native_engine = adapter.open_engine(
@@ -1375,16 +1386,19 @@ class LodeDB:
             if self._native_core_fail_closed:
                 raise RuntimeError("failed to initialize native core") from exc
             return
-        if write_through and document_count != 0:
-            self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
-            raise RuntimeError("LODEDB_NATIVE_CORE_WRITE=on requires a fresh vector store")
+        native_document_count = int(
+            native_engine.stats(_LOCAL_INDEX_ID).get("document_count", 0) or 0
+        )
+        if native_document_count != document_count:
+            self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
+            if write_through:
+                raise RuntimeError("native core existing-store seed mismatch")
+            return
         self._native_vector_engine = native_engine
         self._native_vector_mutable = True
-        self._native_vector_covered = document_count == 0
+        self._native_vector_covered = True
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
-        if not self._native_vector_covered:
-            self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
 
     def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
         """Mirrors vector mutations into native core while Python remains durable."""

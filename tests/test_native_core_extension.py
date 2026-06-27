@@ -389,6 +389,23 @@ def test_native_core_on_existing_vector_store_uses_readonly_seed(
     assert db.search_by_vector(_onehot(0), k=1)[0].id == "seed-a"
 
 
+def test_native_core_write_on_existing_vector_store_fails_until_sidecar_writes(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    writer.add_vectors(_onehot(0), id="seed-a", metadata={"kind": "seed"})
+    writer.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
+        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+
+
 def test_native_core_on_existing_index_text_store_uses_readonly_seed(
     tmp_path, monkeypatch
 ) -> None:
@@ -415,6 +432,32 @@ def test_native_core_on_existing_index_text_store_uses_readonly_seed(
     assert stats["enabled"] is True
     assert stats["covered"] is True
     assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
+
+
+def test_native_core_write_on_existing_index_text_store_fails_until_sidecar_writes(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB(
+        tmp_path,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    writer.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    writer.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
+        LodeDB(
+            tmp_path,
+            index_text=True,
+            _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        )
 
 
 def test_native_core_on_text_store_uses_native_query_without_write_through(
