@@ -138,6 +138,11 @@ impl CoreEngine {
         index.require_vectors_mutable()?;
         let mut changed = 0usize;
         let mut changed_filter_fields = BTreeSet::new();
+        // Collect every upserted chunk and sync the live TurboVec index once after
+        // the loop instead of one `upsert_with_ids_2d` re-encode per document. The
+        // result is identical (still O(changed)); the single batched encode avoids
+        // n separate calibration-bound encode calls on a large add.
+        let mut upserted_chunks: Vec<CoreVectorChunk> = Vec::with_capacity(documents.len());
         for document in documents {
             if document.document_id.trim().is_empty() {
                 return invalid("document_id is required");
@@ -178,12 +183,30 @@ impl CoreEngine {
                 &mut changed_filter_fields,
             );
             index.lexical_index.remove_group(&document.document_id);
-            index.sync_vector_index_upsert(&[CoreVectorChunk::new(
+            upserted_chunks.push(CoreVectorChunk::new(
                 document.document_id.clone(),
                 document.document_id.clone(),
                 document.vector.clone(),
-            )])?;
+            ));
             changed += 1;
+        }
+        // A document id repeated within one batch must collapse to its last
+        // vector: the per-document state above already applied last-wins, and
+        // TurboVec's batched upsert rejects duplicate ids in a single call.
+        let mut last_pos_by_doc: BTreeMap<&str, usize> = BTreeMap::new();
+        for (pos, chunk) in upserted_chunks.iter().enumerate() {
+            last_pos_by_doc.insert(chunk.document_id.as_str(), pos);
+        }
+        if last_pos_by_doc.len() == upserted_chunks.len() {
+            index.sync_vector_index_upsert(&upserted_chunks)?;
+        } else {
+            let mut keep: Vec<usize> = last_pos_by_doc.into_values().collect();
+            keep.sort_unstable();
+            let deduped: Vec<CoreVectorChunk> = keep
+                .into_iter()
+                .map(|pos| upserted_chunks[pos].clone())
+                .collect();
+            index.sync_vector_index_upsert(&deduped)?;
         }
         if changed > 0 {
             index.finalize_filter_fields(&changed_filter_fields);
@@ -2037,25 +2060,47 @@ impl VectorOnlyIndex {
         Ok(candidates)
     }
 
+    /// Resolves the chunk allowlist and considered-document count for a query.
+    ///
+    /// The unfiltered path must NOT clone `all_docs` (a `BTreeSet` of every
+    /// document id): for a 20k-corpus single-query loop that clone runs once per
+    /// query and dominates the per-call cost once JSON marshalling is removed.
+    /// Unfiltered queries scan the whole index, so the allowlist is empty and the
+    /// considered count is simply `all_docs.len()`.
+    fn query_allowlist(
+        &self,
+        filter: Option<&Value>,
+    ) -> Result<(usize, Vec<String>, bool), CoreError> {
+        match filter {
+            None => Ok((self.all_docs.len(), Vec::new(), false)),
+            Some(_) => {
+                let candidates = self.resolve_filter(filter)?;
+                let total_considered = candidates.len();
+                if candidates.is_empty() {
+                    return Ok((total_considered, Vec::new(), true));
+                }
+                Ok((
+                    total_considered,
+                    self.chunk_ids_for_documents(&candidates),
+                    false,
+                ))
+            }
+        }
+    }
+
     fn query_vector_turbovec(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
-        let candidates = self.resolve_filter(filter)?;
-        let total_considered = candidates.len();
-        if filter.is_some() && candidates.is_empty() {
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
             return Ok(CoreSearchResults {
                 hits: Vec::new(),
                 total_considered,
             });
         }
-        let allowlist = if filter.is_some() {
-            self.chunk_ids_for_documents(&candidates)
-        } else {
-            Vec::new()
-        };
         let index = self.turbovec_index()?;
         let hits = index
             .search(query_vector, top_k, &allowlist)?
@@ -2083,9 +2128,8 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<Vec<CoreSearchResults>, CoreError> {
-        let candidates = self.resolve_filter(filter)?;
-        let total_considered = candidates.len();
-        if filter.is_some() && candidates.is_empty() {
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
             return Ok(query_vectors
                 .iter()
                 .map(|_| CoreSearchResults {
@@ -2094,11 +2138,6 @@ impl VectorOnlyIndex {
                 })
                 .collect());
         }
-        let allowlist = if filter.is_some() {
-            self.chunk_ids_for_documents(&candidates)
-        } else {
-            Vec::new()
-        };
         let index = self.turbovec_index()?;
         index
             .search_batch(query_vectors, top_k, &allowlist)?

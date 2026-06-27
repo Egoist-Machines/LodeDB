@@ -276,6 +276,29 @@ class NativeCoreEngineHandle:
         index_id: str,
         documents: Iterable[EngineVectorDocument],
     ) -> dict[str, Any]:
+        documents = list(documents)
+        array_upsert = getattr(self._engine, "upsert_vectors_array", None)
+        if callable(array_upsert) and documents:
+            import numpy as np
+
+            # Ship the embedding matrix as one contiguous float32 array and only the
+            # ids/metadata/text as a small batched JSON sidecar, instead of
+            # JSON-encoding every float of every row (the bulk of a durable add).
+            matrix = np.ascontiguousarray(
+                [tuple(float(value) for value in document.vector) for document in documents],
+                dtype=np.float32,
+            )
+            sidecar = [
+                {
+                    "document_id": str(document.document_id),
+                    "metadata": {
+                        str(key): str(value) for key, value in document.metadata.items()
+                    },
+                    "text": None if document.text is None else str(document.text),
+                }
+                for document in documents
+            ]
+            return self._loads(array_upsert(str(index_id), matrix, self._dumps(sidecar)))
         payload = [NativeCoreAdapter.vector_document_payload(document) for document in documents]
         return self._loads(
             self._engine.upsert_vectors(
@@ -300,12 +323,23 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        filter_json = None if filter is None else self._dumps(dict(filter))
+        array_query = getattr(self._engine, "query_vector_array", None)
+        if callable(array_query):
+            import numpy as np
+
+            # Passing the query as a contiguous float32 array skips the per-query
+            # Python float list-build + json.dumps + Rust serde-parse, which is the
+            # dominant cost of the single-query native path. The top-k result stays
+            # JSON (small), so the return contract is unchanged.
+            query = np.ascontiguousarray(tuple(vector), dtype=np.float32)
+            return self._loads(array_query(str(index_id), query, int(top_k), filter_json))
         return self._loads(
             self._engine.query_vector(
                 str(index_id),
                 self._dumps([float(value) for value in vector]),
                 int(top_k),
-                None if filter is None else self._dumps(dict(filter)),
+                filter_json,
             )
         )
 
@@ -317,14 +351,24 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        value = json.loads(
-            self._engine.query_vectors_batch(
+        filter_json = None if filter is None else self._dumps(dict(filter))
+        array_batch = getattr(self._engine, "query_vectors_batch_array", None)
+        if callable(array_batch):
+            import numpy as np
+
+            rows = tuple(tuple(vector) for vector in vectors)
+            if not rows:
+                return []
+            matrix = np.ascontiguousarray(rows, dtype=np.float32)
+            raw = array_batch(str(index_id), matrix, int(top_k), filter_json)
+        else:
+            raw = self._engine.query_vectors_batch(
                 str(index_id),
                 self._dumps([[float(value) for value in vector] for vector in vectors]),
                 int(top_k),
-                None if filter is None else self._dumps(dict(filter)),
+                filter_json,
             )
-        )
+        value = json.loads(raw)
         if not isinstance(value, list):
             raise RuntimeError("native core returned a non-list JSON payload")
         return [dict(item) for item in value]

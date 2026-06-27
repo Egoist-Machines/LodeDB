@@ -622,7 +622,9 @@ fn maxsim_scores<'py>(
     let q_arr = query.as_array();
     let n_query = q_arr.nrows();
     let dim = q_arr.ncols();
-    let q_slice = q_arr.as_slice().ok_or_else(|| not_contiguous_err("query"))?;
+    let q_slice = q_arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("query"))?;
 
     let d_arr = docs.as_array();
     let total_patches = d_arr.nrows();
@@ -723,6 +725,64 @@ impl PyCoreEngine {
         )
     }
 
+    /// Array-input fast path for vector upsert.
+    ///
+    /// `vectors` is a contiguous `(n, dim)` `f32` matrix; `sidecar_json` is a
+    /// parallel array of `{document_id, metadata, text}` objects (no vector
+    /// floats). This removes the per-document JSON-encode of the embedding (the
+    /// bulk of the durable-add payload) while keeping ids/metadata as a small
+    /// batched sidecar.
+    fn upsert_vectors_array(
+        &mut self,
+        index_id: &str,
+        vectors: PyReadonlyArray2<f32>,
+        sidecar_json: &str,
+    ) -> PyResult<String> {
+        #[derive(serde::Deserialize)]
+        struct VectorRowSidecar {
+            document_id: String,
+            #[serde(default)]
+            metadata: std::collections::BTreeMap<String, String>,
+            #[serde(default)]
+            text: Option<String>,
+        }
+        let arr = vectors.as_array();
+        let dim = arr.ncols();
+        let rows = arr.nrows();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("vectors"))?;
+        let sidecars = native_from_json::<Vec<VectorRowSidecar>>(sidecar_json)?;
+        if sidecars.len() != rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vector row count {} does not match sidecar length {}",
+                rows,
+                sidecars.len(),
+            )));
+        }
+        if rows > 0 && dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "vectors must have a non-zero dimension",
+            ));
+        }
+        let documents: Vec<CoreVectorDocument> = sidecars
+            .into_iter()
+            .zip(slice.chunks(dim.max(1)))
+            .map(|(sidecar, vector)| CoreVectorDocument {
+                document_id: sidecar.document_id,
+                vector: vector.to_vec(),
+                metadata: sidecar.metadata,
+                text: sidecar.text,
+            })
+            .collect();
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
     fn delete_documents(&mut self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
         let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
         native_to_json(
@@ -781,6 +841,64 @@ impl PyCoreEngine {
             &self
                 .inner
                 .query_vectors_batch(index_id, &query_vectors, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Array-input fast path for a single vector query.
+    ///
+    /// Takes the query as a contiguous `f32` array instead of a JSON float list,
+    /// removing the per-query Python list-build + `json.dumps` + serde-parse cost
+    /// that dominates the single-query path. The top-k result stays JSON (it is
+    /// small) so the caller contract is identical to `query_vector`.
+    fn query_vector_array(
+        &self,
+        index_id: &str,
+        query_vector: PyReadonlyArray1<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_vector = query_embedding_from_array(query_vector)?;
+        if !query_vector.is_empty() {
+            validate_queries(&query_vector, query_vector.len())?;
+        }
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vector(index_id, &query_vector, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Array-input fast path for a batch of vector queries.
+    ///
+    /// `query_vectors` is a contiguous `(n_query, dim)` `f32` matrix. Mirrors
+    /// `query_vectors_batch` but skips JSON-encoding the query matrix.
+    fn query_vectors_batch_array(
+        &self,
+        index_id: &str,
+        query_vectors: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let arr = query_vectors.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_vectors"))?;
+        if dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "query_vectors must have a non-zero dimension",
+            ));
+        }
+        validate_queries(slice, dim)?;
+        let queries: Vec<Vec<f32>> = slice.chunks(dim).map(|row| row.to_vec()).collect();
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vectors_batch(index_id, &queries, top_k, filter.as_ref())
                 .map_err(native_core_error_to_py)?,
         )
     }

@@ -102,6 +102,60 @@ def test_native_core_extension_executes_vector_store_flow() -> None:
     assert stats["raw_payload_text_present"] is False
 
 
+def test_native_core_extension_array_vector_paths_match_json() -> None:
+    """The array-input vector fast paths return the same hits as the JSON paths."""
+
+    json_engine = native_core.CoreEngine()
+    json_engine.create_index("default", 8, 4)
+    array_engine = native_core.CoreEngine()
+    array_engine.create_index("default", 8, 4)
+
+    documents = [
+        {"document_id": "a", "vector": _onehot(0), "metadata": {"topic": "ops"}, "text": None},
+        {"document_id": "b", "vector": _onehot(1), "metadata": {"topic": "ml"}, "text": None},
+        {"document_id": "c", "vector": _onehot(2), "metadata": {"topic": "ml"}, "text": None},
+    ]
+    json_mutation = _loads(json_engine.upsert_vectors("default", json.dumps(documents)))
+
+    matrix = np.asarray([doc["vector"] for doc in documents], dtype=np.float32)
+    sidecar = [
+        {"document_id": doc["document_id"], "metadata": doc["metadata"], "text": doc["text"]}
+        for doc in documents
+    ]
+    array_mutation = _loads(
+        array_engine.upsert_vectors_array("default", matrix, json.dumps(sidecar))
+    )
+    assert array_mutation == json_mutation
+    assert array_mutation["documents_upserted"] == 3
+
+    query = np.asarray(_onehot(1), dtype=np.float32)
+    json_hits = _loads(json_engine.query_vector("default", json.dumps(_onehot(1)), 2, None))
+    array_hits = _loads(array_engine.query_vector_array("default", query, 2, None))
+    assert array_hits == json_hits
+    assert array_hits["hits"][0]["document_id"] == "b"
+
+    # Filtered + batch array paths match the JSON paths byte for byte.
+    filter_json = json.dumps({"metadata": {"topic": "ml"}})
+    json_filtered = _loads(
+        json_engine.query_vector("default", json.dumps(_onehot(2)), 3, filter_json)
+    )
+    array_filtered = _loads(
+        array_engine.query_vector_array(
+            "default", np.asarray(_onehot(2), dtype=np.float32), 3, filter_json
+        )
+    )
+    assert array_filtered == json_filtered
+
+    batch = np.asarray([_onehot(0), _onehot(1)], dtype=np.float32)
+    json_batch = _loads(
+        json_engine.query_vectors_batch(
+            "default", json.dumps([_onehot(0), _onehot(1)]), 2, None
+        )
+    )
+    array_batch = _loads(array_engine.query_vectors_batch_array("default", batch, 2, None))
+    assert array_batch == json_batch
+
+
 def test_native_core_extension_accepts_index_create_options() -> None:
     engine = native_core.CoreEngine()
     index_key = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205"
