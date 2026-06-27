@@ -309,6 +309,34 @@ def test_text_shadow_parity_mismatch_disables_native_text(tmp_path, monkeypatch)
     assert db.stats()["native_core"]["fallback_reason"] == "native_core_text_parity_mismatch"
 
 
+def test_text_shadow_write_persists_to_temp_native_handle(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "shadow")
+    db = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+
+    db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    db.persist()
+    stats = db.stats()["native_core"]
+
+    assert adapter.opened_writable is True
+    assert native.text_prepare_calls == 1
+    assert native.text_apply_calls == 1
+    assert native.persist_calls == 1
+    assert stats["write_mode"] == "shadow"
+    assert stats["covered"] is True
+    assert stats["shadow_persist_count"] == 1
+    assert stats["shadow_persist_verified"] is True
+
+
 def test_open_vector_store_native_on_uses_native_vector_results(tmp_path, monkeypatch) -> None:
     native = FakeNativeVectorEngine(score_offset=100)
     monkeypatch.setattr(
