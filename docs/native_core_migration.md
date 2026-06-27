@@ -9,6 +9,10 @@ existing stores stable.
 - Fresh vector-only handles (`LodeDB.open_vector_store(...)`) execute vector queries through the
   native `CoreEngine` when the bundled extension is available and the native handle covers all
   in-memory mutations for that handle.
+- Fresh text handles in `LODEDB_NATIVE_CORE=on` mirror prepare/apply into a covered native
+  in-memory text index and can return native lexical/hybrid/vector text query results after
+  Python/Rust parity succeeds. Python remains the durable writer unless native write-through is
+  explicitly enabled.
 - Python remains the durable oracle. Vector mutations still commit through the existing Python
   engine, and persisted stores open without migration.
 - Existing vector-only stores can seed covered native query state from the committed on-disk

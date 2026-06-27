@@ -1266,7 +1266,7 @@ class LodeDB:
             return
         write_through = self._native_core_write_mode == NativeCoreMode.ON
         text_native = not self.vector_only and (
-            self._native_core_mode == NativeCoreMode.SHADOW or write_through
+            self._native_core_mode != NativeCoreMode.OFF or write_through
         )
         if not self.vector_only and not text_native:
             return
