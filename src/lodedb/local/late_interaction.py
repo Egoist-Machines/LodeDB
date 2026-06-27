@@ -54,6 +54,7 @@ from typing import Any
 
 import numpy as np
 
+from lodedb.engine._atomic_io import durable_replace
 from lodedb.engine.index import EngineError
 from lodedb.local.db import LodeDB
 
@@ -88,8 +89,6 @@ _CONFIG_VERSION = 1
 # Cap the transient float32 work buffer when scoring a resident or streamed scan,
 # so peak memory stays bounded regardless of corpus size.
 _SCORE_CHUNK_BYTES = 64 * 1024 * 1024
-# Documents read per batch from disk on the streaming / filtered paths.
-_LOAD_BATCH_DOCS = 128
 
 
 def _resolve_native_maxsim() -> Callable[..., Any] | None:
@@ -243,8 +242,10 @@ class LodeLateInteractionIndex:
         ``store_text`` may not be set ``False``.
         """
 
-        if int(dim) <= 0:
-            raise ValueError("dim must be a positive integer")
+        if int(dim) <= 0 or int(dim) % 8 != 0:
+            # The TurboVec store requires a positive multiple of 8; fail fast here
+            # with a clear message instead of a cryptic engine error on first add.
+            raise ValueError("dim must be a positive multiple of 8")
         if storage is not None and storage not in _STORAGE_CHOICES:
             raise ValueError(f"storage must be one of {_STORAGE_CHOICES}")
         if scoring not in ("numpy", "native"):
@@ -421,14 +422,11 @@ class LodeLateInteractionIndex:
         budget = self._chunk_patch_budget(query_matrix.shape[0])
 
         if filter is not None:
-            try:
-                doc_ids = [
-                    record["id"] for record in self._db.list_documents(filter=dict(filter))
-                ]
-            except EngineError:
+            matching = self._filtered_documents_with_counts(filter)
+            if matching is None:
                 return []
             return self._topk_from_chunks(
-                query_matrix, self._disk_chunks(doc_ids, budget), int(k), prefer_native
+                query_matrix, self._disk_chunks(matching, budget), int(k), prefer_native
             )
 
         if self.resident is not False:
@@ -445,7 +443,7 @@ class LodeLateInteractionIndex:
         # Over the resident budget (or resident=False): stream from disk, exact.
         return self._topk_from_chunks(
             query_matrix,
-            self._disk_chunks(self._all_document_ids(), budget),
+            self._disk_chunks(self._all_documents_with_counts(), budget),
             int(k),
             prefer_native,
         )
@@ -510,14 +508,11 @@ class LodeLateInteractionIndex:
         budget = self._chunk_patch_budget(queries_concat.shape[0])
 
         if filter is not None:
-            try:
-                doc_ids = [
-                    record["id"] for record in self._db.list_documents(filter=dict(filter))
-                ]
-            except EngineError:
+            matching = self._filtered_documents_with_counts(filter)
+            if matching is None:
                 return [[] for _ in matrices]
             return self._topk_from_chunks_multi(
-                queries_concat, offsets, self._disk_chunks(doc_ids, budget), int(k), None
+                queries_concat, offsets, self._disk_chunks(matching, budget), int(k), None
             )
 
         if self.resident is not False:
@@ -534,7 +529,7 @@ class LodeLateInteractionIndex:
         return self._topk_from_chunks_multi(
             queries_concat,
             offsets,
-            self._disk_chunks(self._all_document_ids(), budget),
+            self._disk_chunks(self._all_documents_with_counts(), budget),
             int(k),
             None,
         )
@@ -778,14 +773,33 @@ class LodeLateInteractionIndex:
 
         return np.float32 if self.storage == "float32" else np.float16
 
-    def _all_document_ids(self) -> list[str]:
-        """Returns every document id (sorted for determinism)."""
+    def _all_documents_with_counts(self) -> list[tuple[str, int]]:
+        """Returns every ``(document_id, patch_count)`` (sorted by id)."""
 
         try:
             records = self._db.list_documents()
         except EngineError:
             return []
-        return sorted(record["id"] for record in records)
+        out = [
+            (record["id"], _patch_count_from_metadata(record.get("metadata", {})))
+            for record in records
+        ]
+        out.sort(key=lambda item: item[0])
+        return out
+
+    def _filtered_documents_with_counts(
+        self, filter: Mapping[str, Any]
+    ) -> list[tuple[str, int]] | None:
+        """Returns ``(id, patch_count)`` for filter matches, or ``None`` if empty store."""
+
+        try:
+            records = self._db.list_documents(filter=dict(filter))
+        except EngineError:
+            return None
+        return [
+            (record["id"], _patch_count_from_metadata(record.get("metadata", {})))
+            for record in records
+        ]
 
     def _load_documents(
         self, document_ids: list[str]
@@ -823,29 +837,52 @@ class LodeLateInteractionIndex:
         width = max(self.dim, int(total_query_tokens), 1)
         return max(1, _SCORE_CHUNK_BYTES // (width * 4))
 
-    def _disk_chunks(self, document_ids: list[str], max_patches: int) -> Iterator[tuple]:
-        """Yields bounded scoring chunks read from disk in batches of documents."""
+    def _disk_chunks(
+        self, documents: list[tuple[str, int]], max_patches: int
+    ) -> Iterator[tuple]:
+        """Yields bounded scoring chunks read from disk, batched by patch budget.
 
-        for start in range(0, len(document_ids), _LOAD_BATCH_DOCS):
-            batch = document_ids[start : start + _LOAD_BATCH_DOCS]
-            loaded = self._load_documents(batch)
-            mats: list[np.ndarray] = []
-            ids: list[str] = []
-            metas: list[dict[str, Any]] = []
-            patch_counts: list[int] = []
-            for doc_id in batch:
-                entry = loaded.get(doc_id)
-                if entry is None or entry[0].shape[0] == 0:
-                    continue
-                mats.append(entry[0])
-                ids.append(doc_id)
-                metas.append(entry[1])
-                patch_counts.append(entry[2])
-            if not mats:
+        ``documents`` is ``(id, patch_count)`` pairs. Documents are accumulated into
+        a load batch until adding the next would exceed ``max_patches`` (a single
+        document larger than the budget loads alone), so the decoded/vstacked
+        working set stays bounded -- the streaming path is constant-memory in the
+        patch budget, not in a fixed document count.
+        """
+
+        batch_ids: list[str] = []
+        batch_patches = 0
+        for doc_id, patch_count in documents:
+            estimate = max(int(patch_count), 1)
+            if batch_ids and batch_patches + estimate > max_patches:
+                yield from self._load_and_chunk(batch_ids, max_patches)
+                batch_ids = []
+                batch_patches = 0
+            batch_ids.append(doc_id)
+            batch_patches += estimate
+        if batch_ids:
+            yield from self._load_and_chunk(batch_ids, max_patches)
+
+    def _load_and_chunk(self, batch_ids: list[str], max_patches: int) -> Iterator[tuple]:
+        """Loads one document batch from disk and yields bounded scoring chunks."""
+
+        loaded = self._load_documents(batch_ids)
+        mats: list[np.ndarray] = []
+        ids: list[str] = []
+        metas: list[dict[str, Any]] = []
+        patch_counts: list[int] = []
+        for doc_id in batch_ids:
+            entry = loaded.get(doc_id)
+            if entry is None or entry[0].shape[0] == 0:
                 continue
-            flat = np.ascontiguousarray(np.vstack(mats), dtype=np.float32)
-            counts = np.fromiter((m.shape[0] for m in mats), dtype=np.int64, count=len(mats))
-            yield from _subchunk(flat, counts, ids, metas, patch_counts, max_patches)
+            mats.append(entry[0])
+            ids.append(doc_id)
+            metas.append(entry[1])
+            patch_counts.append(entry[2])
+        if not mats:
+            return
+        flat = np.ascontiguousarray(np.vstack(mats), dtype=np.float32)
+        counts = np.fromiter((m.shape[0] for m in mats), dtype=np.int64, count=len(mats))
+        yield from _subchunk(flat, counts, ids, metas, patch_counts, max_patches)
 
     def _resident_chunks(self, cache: dict[str, Any], max_patches: int) -> Iterator[tuple]:
         """Yields bounded scoring chunks over the resident base plus pending delta."""
@@ -885,26 +922,24 @@ class LodeLateInteractionIndex:
         prefer_native: bool,
         skip: set[str] | None = None,
     ) -> list[LodeLateInteractionHit]:
-        """Scores every chunk and returns the global top-``k`` (score desc, id asc).
+        """Returns the global top-``k`` (score desc, id asc) across the chunks.
 
-        ``skip`` ids (resident tombstones) are scored but dropped from the result.
+        The running top-``k`` is merged chunk by chunk and each chunk's score
+        block is discarded after merging, so retained memory is O(k) regardless of
+        corpus size. ``skip`` ids (resident tombstones) are excluded.
         """
 
-        collected: list[tuple[float, str, dict[str, Any], int]] = []
+        best: list[tuple[float, str, dict[str, Any], int]] = []
         for flat, counts, ids, metas, patch_counts in chunks:
             if len(ids) == 0:
                 continue
             scores = _maxsim_scores_flat(
                 query_matrix, flat, counts, prefer_native=prefer_native
             )
-            for i in range(len(ids)):
-                if skip and ids[i] in skip:
-                    continue
-                collected.append((float(scores[i]), ids[i], metas[i], int(patch_counts[i])))
-        collected.sort(key=lambda item: (-item[0], item[1]))
+            best = _merge_topk(best, scores, ids, metas, patch_counts, k, skip)
         return [
             LodeLateInteractionHit(score=s, id=i, metadata=m, patch_count=p)
-            for s, i, m, p in collected[:k]
+            for s, i, m, p in best
         ]
 
     def _topk_from_chunks_multi(
@@ -917,59 +952,30 @@ class LodeLateInteractionIndex:
     ) -> list[list[LodeLateInteractionHit]]:
         """Batched counterpart of :meth:`_topk_from_chunks` -- top-``k`` per query.
 
-        Accumulates an ``(n_queries, n_docs)`` score matrix across chunks, then
-        selects each query's top-``k`` with ``argpartition`` -- so only ``k`` hits
-        per query are materialized, not one tuple per (query, document).
+        Each chunk is scored once for the whole batch with one GEMM, then merged
+        into per-query running top-``k`` lists; the ``(n_queries, n_docs)`` score
+        block is discarded after the chunk, so retained memory is O(n_queries * k)
+        rather than O(n_queries * total_docs).
         """
 
-        all_ids: list[str] = []
-        all_metas: list[dict[str, Any]] = []
-        all_patch_counts: list[int] = []
-        score_blocks: list[np.ndarray] = []
+        best: list[list[tuple[float, str, dict[str, Any], int]]] = [
+            [] for _ in query_offsets
+        ]
         for flat, counts, ids, metas, patch_counts in chunks:
             if len(ids) == 0:
                 continue
             block = _maxsim_scores_flat_multi(queries_concat, query_offsets, flat, counts)
-            if skip:
-                keep = [j for j, doc_id in enumerate(ids) if doc_id not in skip]
-                if not keep:
-                    continue
-                if len(keep) != len(ids):
-                    block = block[:, keep]
-                    ids = [ids[j] for j in keep]
-                    metas = [metas[j] for j in keep]
-                    patch_counts = [patch_counts[j] for j in keep]
-            score_blocks.append(block)
-            all_ids.extend(ids)
-            all_metas.extend(metas)
-            all_patch_counts.extend(int(p) for p in patch_counts)
-        if not all_ids:
-            return [[] for _ in query_offsets]
-        scores = np.concatenate(score_blocks, axis=1)  # (n_queries, n_docs)
-        total = len(all_ids)
-        depth = min(k, total)
-        results: list[list[LodeLateInteractionHit]] = []
-        for query_index in range(len(query_offsets)):
-            row = scores[query_index]
-            if depth < total:
-                candidates = np.argpartition(-row, depth - 1)[:depth]
-            else:
-                candidates = np.arange(total)
-            ordered = sorted(
-                candidates.tolist(), key=lambda j: (-float(row[j]), all_ids[j])
-            )
-            results.append(
-                [
-                    LodeLateInteractionHit(
-                        score=float(row[j]),
-                        id=all_ids[j],
-                        metadata=all_metas[j],
-                        patch_count=all_patch_counts[j],
-                    )
-                    for j in ordered[:k]
-                ]
-            )
-        return results
+            for query_index in range(len(query_offsets)):
+                best[query_index] = _merge_topk(
+                    best[query_index], block[query_index], ids, metas, patch_counts, k, skip
+                )
+        return [
+            [
+                LodeLateInteractionHit(score=s, id=i, metadata=m, patch_count=p)
+                for s, i, m, p in bucket
+            ]
+            for bucket in best
+        ]
 
     def _resident_cache_get(self) -> dict[str, Any] | None:
         """Returns the resident cache, building it if needed; ``None`` if over budget."""
@@ -1047,29 +1053,44 @@ class LodeLateInteractionIndex:
 def _read_li_config(config_path: Path) -> str | None:
     """Returns the index's persisted storage precision, or ``None`` if unset.
 
-    Tolerates a missing or unreadable sidecar (treated as "no stored precision")
-    so a path created without one still opens.
+    A missing sidecar means "no stored precision" (a brand-new index, or one
+    written before this field existed) and returns ``None``. A sidecar that is
+    *present* but unparseable or carries an unknown precision is treated as
+    corruption and raises, rather than silently defaulting the index to a
+    different precision -- the file is written atomically, so a torn write never
+    produces a present-but-partial file in normal operation.
     """
 
     try:
         raw = config_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError, OSError):
+    except FileNotFoundError:
         return None
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    storage = data.get("storage") if isinstance(data, Mapping) else None
-    return storage if storage in _STORAGE_CHOICES else None
+        storage = data["storage"] if isinstance(data, Mapping) else None
+    except (ValueError, TypeError, KeyError):
+        storage = None
+    if storage not in _STORAGE_CHOICES:
+        raise ValueError(
+            f"corrupt late-interaction config at {config_path}: storage={storage!r}"
+        )
+    return storage
 
 
 def _write_li_config(config_path: Path, storage: str) -> None:
-    """Persists the index's storage precision to its config sidecar."""
+    """Atomically persists the index's storage precision to its config sidecar.
 
-    config_path.write_text(
+    Writes a sibling temp file and ``durable_replace``s it into place (the same
+    durable-write primitive the engine uses), so a crash mid-write leaves either
+    the old config or the new one, never a torn file.
+    """
+
+    tmp = config_path.with_name(config_path.name + ".tmp")
+    tmp.write_text(
         json.dumps({"version": _CONFIG_VERSION, "storage": storage}),
         encoding="utf-8",
     )
+    durable_replace(tmp, config_path, fsync=False)
 
 
 def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:
@@ -1154,6 +1175,43 @@ def _maxsim_scores_flat(
         np.cumsum(counts[:-1], out=starts[1:])
     segment_max = np.maximum.reduceat(sims, starts, axis=1)
     return segment_max.sum(axis=0).astype(np.float32)
+
+
+def _merge_topk(
+    current: list[tuple[float, str, dict[str, Any], int]],
+    scores_row: np.ndarray,
+    ids: list[str],
+    metas: list[dict[str, Any]],
+    patch_counts: list[int],
+    k: int,
+    skip: set[str] | None,
+) -> list[tuple[float, str, dict[str, Any], int]]:
+    """Merges one chunk's scores into a running top-``k`` (score desc, id asc).
+
+    ``current`` is the running top-``k`` (already sorted, length <= k). The chunk's
+    candidates are added, the combined set is sorted by ``(-score, id)`` and
+    truncated to ``k``. The chunk's score row is not retained, so a caller that
+    iterates many chunks keeps only O(k) state. The full sort makes the tie-break
+    (id ascending) exact and independent of how documents are chunked.
+    """
+
+    candidates = list(current)
+    if skip:
+        for index in range(len(ids)):
+            doc_id = ids[index]
+            if doc_id in skip:
+                continue
+            candidates.append(
+                (float(scores_row[index]), doc_id, metas[index], int(patch_counts[index]))
+            )
+    else:
+        for index in range(len(ids)):
+            candidates.append(
+                (float(scores_row[index]), ids[index], metas[index], int(patch_counts[index]))
+            )
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    del candidates[k:]
+    return candidates
 
 
 def _subchunk(

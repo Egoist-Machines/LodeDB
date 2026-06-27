@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import lodedb.local.late_interaction as li_module
 from lodedb import LodeLateInteractionHit, LodeLateInteractionIndex, ReadOnlyError
 from lodedb.local.late_interaction import (
     _maxsim,
@@ -32,6 +33,11 @@ def _onehot_matrix(indices: list[int], *, dim: int = DIM) -> list[list[float]]:
         row[i] = 1.0
         rows.append(row)
     return rows
+
+
+def _unit_rows(rng, rows: int) -> np.ndarray:
+    m = rng.standard_normal((rows, DIM)).astype(np.float32)
+    return m / np.linalg.norm(m, axis=1, keepdims=True)
 
 
 def test_count_and_patch_count(tmp_path):
@@ -250,6 +256,71 @@ def test_search_many_matches_single_search(tmp_path):
         assert [h.id for h in batch_hits] == [h.id for h in single]
         for a, b in zip(batch_hits, single, strict=True):
             assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_search_many_multichunk_matches_single(tmp_path, monkeypatch):
+    # Force many small scoring chunks; the incremental per-query top-k merge must
+    # still equal looped single-query search (covers bounded-memory search_many).
+    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 4096)
+    rng = np.random.default_rng(21)
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    for i in range(60):
+        idx.add_document(f"d{i:02d}", _unit_rows(rng, 6), normalize=False)
+    queries = [_unit_rows(rng, 5) for _ in range(4)]
+    batched = idx.search_many(queries, k=7, normalize=False)
+    for q, batch_hits in zip(queries, batched, strict=True):
+        single = idx.search(q, k=7, normalize=False)
+        assert [h.id for h in batch_hits] == [h.id for h in single]
+        for a, b in zip(batch_hits, single, strict=True):
+            assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_streaming_chunked_matches_resident(tmp_path, monkeypatch):
+    # A tiny chunk budget forces the streaming path to chunk during load; results
+    # must match the resident scan over the same documents.
+    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 8192)
+    rng = np.random.default_rng(22)
+    docs = [(f"d{i:02d}", _unit_rows(rng, 40)) for i in range(30)]
+    stream = LodeLateInteractionIndex(tmp_path / "s", dim=DIM, resident=False)
+    resident = LodeLateInteractionIndex(tmp_path / "r", dim=DIM, resident=True)
+    for doc_id, m in docs:
+        stream.add_document(doc_id, m, normalize=False)
+        resident.add_document(doc_id, m, normalize=False)
+    q = _unit_rows(rng, 8)
+    s_hits = stream.search(q, k=5, normalize=False)
+    r_hits = resident.search(q, k=5, normalize=False)
+    assert [h.id for h in s_hits] == [h.id for h in r_hits]
+    for a, b in zip(s_hits, r_hits, strict=True):
+        assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_single_document_larger_than_chunk_budget(tmp_path, monkeypatch):
+    # A document with more patches than the chunk budget is scored as one unit.
+    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 2048)
+    rng = np.random.default_rng(23)
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, resident=False)
+    big = _unit_rows(rng, 300)
+    idx.add_document("big", big, normalize=False)
+    idx.add_document("small", _onehot_matrix([0]))
+    hits = idx.search(big[:3], k=2, normalize=False)
+    assert hits[0].id == "big"
+
+
+def test_dim_must_be_multiple_of_8(tmp_path):
+    with pytest.raises(ValueError, match="multiple of 8"):
+        LodeLateInteractionIndex(tmp_path, dim=12)
+
+
+def test_corrupt_storage_config_rejected(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, storage="int8")
+    idx.add_document("a", _onehot_matrix([0]))
+    idx.persist()
+    idx.close()
+    # A present-but-unparseable sidecar is corruption, not "no config": reopening
+    # must raise rather than silently switch the index to the float32 default.
+    (tmp_path / li_module._CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt"):
+        LodeLateInteractionIndex(tmp_path, dim=DIM)
 
 
 def test_search_many_edges(tmp_path):
