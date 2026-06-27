@@ -18,6 +18,9 @@ existing stores stable.
 - Existing vector-only stores can seed covered native query state from the committed on-disk
   snapshot. Writable handles invalidate that read-only seed on the first mutation and fall back to
   Python unless explicit native write-through owns a fresh store.
+- Existing text stores opened with `index_text=True` can also seed native query state from the
+  committed vector and lexical sidecars. Existing raw-text-only text stores remain on the Python
+  oracle because their exact token/chunk source is not independently persisted.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.

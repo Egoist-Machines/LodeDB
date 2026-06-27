@@ -1298,7 +1298,8 @@ class LodeDB:
             self._native_vector_covered = True
             return
         document_count = int(self._index.stats().get("document_count", 0) or 0)
-        if not write_through and self.vector_only and document_count != 0:
+        can_seed_existing = self.vector_only or self.index_text
+        if not write_through and document_count != 0 and can_seed_existing:
             try:
                 native_engine = adapter.open_readonly_engine(
                     self.path,
@@ -1315,8 +1316,12 @@ class LodeDB:
                 self._native_vector_engine = native_engine
                 self._native_vector_mutable = False
                 self._native_vector_covered = True
+                self._native_text_shadow_enabled = text_native and not self.vector_only
                 return
             self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
+            return
+        if not write_through and document_count != 0 and not self.vector_only:
+            self._native_core_fallback_reason = "native_core_existing_text_seed_requires_index_text"
             return
         try:
             if write_through:
