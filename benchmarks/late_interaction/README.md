@@ -14,7 +14,7 @@ embeddings.
 
 ```bash
 uv run python benchmarks/late_interaction/run.py
-uv run python benchmarks/late_interaction/run.py --docs 2000 --queries 200 --candidate-depth 32
+uv run python benchmarks/late_interaction/run.py --docs 2000 --queries 200 --storage float16
 ```
 
 ## Result

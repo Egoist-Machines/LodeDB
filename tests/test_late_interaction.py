@@ -144,7 +144,7 @@ def test_resident_budget_falls_back_to_streaming(tmp_path):
     )
     idx.add_document("doc-a", _onehot_matrix([0, 1]))
     idx.add_document("doc-b", _onehot_matrix([5, 6]))
-    assert idx._resident_cache_get() is None  # over budget
+    assert idx._resident_snapshot() is None  # over budget -> streaming
     hits = idx.search(_onehot_matrix([0]), k=1)
     assert hits[0].id == "doc-a"
 
@@ -202,14 +202,87 @@ def test_incremental_compaction_folds_pending(tmp_path):
     idx.add_document("b", _onehot_matrix([5]))  # goes to pending
     idx.add_document("a", _onehot_matrix([2]))  # replace -> tombstone + pending
     cache = idx._resident_cache
-    assert cache["pending"]  # delta present before compaction
-    idx._cache_compact(cache)
+    idx._cache_compact(cache)  # idempotent if an auto-compaction already ran
     assert cache["pending"] == [] and cache["removed"] == set()
+    assert cache["removed_patches"] == 0
     assert set(cache["ids"]) == {"a", "b"}
     # Results still correct after compaction: "a" now matches dim 2, not 0/1.
     assert idx.search(_onehot_matrix([2]), k=1)[0].id == "a"
     assert idx.search(_onehot_matrix([5]), k=1)[0].id == "b"
     assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"a", "b"}
+
+
+def test_deletes_compact_resident_base(tmp_path, monkeypatch):
+    # Pure deletes must reclaim tombstoned base rows (compaction), not score them
+    # forever. Lower the floor so the logic exercises at unit-test scale.
+    monkeypatch.setattr(li_module, "_COMPACT_MIN_STALE_PATCHES", 4)
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    for i in range(12):
+        idx.add_document(f"d{i:02d}", _onehot_matrix([i % DIM]))
+    idx.search(_onehot_matrix([0]), k=1)  # build base with 12 docs
+    assert len(idx._resident_cache["ids"]) == 12
+    for i in range(10):
+        idx.remove(f"d{i:02d}")
+    cache = idx._resident_cache
+    # Base was compacted: tombstones reclaimed, not left in the scored matrix.
+    assert len(cache["ids"]) < 12
+    assert {h.id for h in idx.search(_onehot_matrix([0]), k=12)} == {"d10", "d11"}
+
+
+def test_config_sidecar_durability(tmp_path, monkeypatch):
+    # The precision sidecar fsyncs iff the DB's durability mode does.
+    import os
+
+    recorded: list[bool] = []
+
+    def fake_durable_replace(tmp, dst, *, fsync):
+        recorded.append(fsync)
+        os.replace(tmp, dst)
+
+    monkeypatch.setattr(li_module, "durable_replace", fake_durable_replace)
+    LodeLateInteractionIndex(tmp_path / "f", dim=DIM, storage="int8", durability="fsync")
+    LodeLateInteractionIndex(tmp_path / "x", dim=DIM, storage="int8", durability="fast")
+    assert recorded == [True, False]
+
+
+def test_concurrent_add_and_search_one_handle(tmp_path):
+    # A shared handle must tolerate concurrent mutation + query (the engine offers
+    # the same guarantee for `lodedb serve`); the resident cache lock + snapshot
+    # must prevent races between a query and an in-flight cache mutation.
+    import threading
+
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("seed", _onehot_matrix([0]))
+    idx.search(_onehot_matrix([0]), k=1)  # build the live cache
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(4)
+
+    def writer() -> None:
+        barrier.wait()
+        try:
+            for i in range(60):
+                idx.add_document(f"w{i:03d}", _onehot_matrix([i % DIM]))
+                if i % 5 == 0:
+                    idx.remove(f"w{max(i - 3, 0):03d}")
+        except BaseException as exc:  # noqa: BLE001 - capture for the assertion
+            errors.append(exc)
+
+    def reader() -> None:
+        barrier.wait()
+        try:
+            for _ in range(300):
+                idx.search(_onehot_matrix([0]), k=5)
+        except BaseException as exc:  # noqa: BLE001 - capture for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
 
 
 def test_incremental_growth_evicts_over_budget(tmp_path):
@@ -219,10 +292,10 @@ def test_incremental_growth_evicts_over_budget(tmp_path):
         tmp_path, dim=DIM, resident="auto", resident_max_bytes=DIM * 4 * 3
     )
     idx.add_document("a", _onehot_matrix([0]))
-    assert idx._resident_cache_get() is not None  # fits
+    assert idx._resident_snapshot() is not None  # fits
     for i in range(10):
         idx.add_document(f"x{i}", _onehot_matrix([i % DIM]))
-    assert idx._resident_cache is None  # evicted on growth
+    assert idx._resident_snapshot() is None  # evicted on growth -> streaming
     assert idx.search(_onehot_matrix([0]), k=1)[0].id == "a"  # streaming still exact
 
 

@@ -48,13 +48,18 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from lodedb.engine._atomic_io import durable_replace
+from lodedb.engine._atomic_io import (
+    durability_from_env,
+    durable_replace,
+    normalize_durability,
+)
 from lodedb.engine.index import EngineError
 from lodedb.local.db import LodeDB
 
@@ -86,9 +91,20 @@ _DEFAULT_STORAGE = "float32"
 _CONFIG_FILENAME = "lodedb_late_interaction.meta"
 _CONFIG_VERSION = 1
 
+# Sentinel stored in place of the resident cache once it is known to exceed the
+# budget, so an over-budget "auto" index streams without rebuilding (and
+# re-enumerating) the cache on every query. A remove resets it so the index can
+# become resident again as it shrinks.
+_RESIDENT_OVER_BUDGET = object()
+
 # Cap the transient float32 work buffer when scoring a resident or streamed scan,
 # so peak memory stays bounded regardless of corpus size.
 _SCORE_CHUNK_BYTES = 64 * 1024 * 1024
+# Resident-cache compaction triggers: when stale (pending + tombstoned) patches
+# reach max(this floor, half the base), or the pending delta reaches this many
+# documents. The floor keeps small indexes from compacting over trivial churn.
+_COMPACT_MIN_STALE_PATCHES = 50_000
+_COMPACT_MAX_PENDING_DOCS = 2_000
 
 
 def _resolve_native_maxsim() -> Callable[..., Any] | None:
@@ -264,9 +280,19 @@ class LodeLateInteractionIndex:
         self.candidate_depth = int(candidate_depth)
         self.encoder = encoder
         self.read_only = bool(read_only)
+        # Match the underlying DB's durability for the config sidecar write: fsync
+        # the precision marker when the DB fsyncs its own commits.
+        durability = lodedb_kwargs.get("durability")
+        self._fsync = (
+            durability_from_env() if durability is None else normalize_durability(durability)
+        )
         # In-memory serving cache (all patches as one compact matrix); built lazily
-        # on the first eligible search and invalidated on every write.
-        self._resident_cache: dict[str, Any] | None = None
+        # on the first eligible search and maintained in place on writes. Guarded by
+        # a lock so a query that reads it can run concurrently with a mutation on a
+        # shared handle (the engine offers the same in-process guarantee), and set
+        # to _RESIDENT_OVER_BUDGET once it is known not to fit.
+        self._resident_cache: dict[str, Any] | object | None = None
+        self._cache_lock = threading.Lock()
         lodedb_kwargs.pop("store_text", None)
         self._db = LodeDB.open_vector_store(
             path,
@@ -298,7 +324,7 @@ class LodeLateInteractionIndex:
             )
         resolved = requested or stored or _DEFAULT_STORAGE
         if not self.read_only and stored != resolved:
-            _write_li_config(config_path, resolved)
+            _write_li_config(config_path, resolved, fsync=self._fsync)
         return resolved
 
     # -- write path ---------------------------------------------------------
@@ -429,16 +455,15 @@ class LodeLateInteractionIndex:
                 query_matrix, self._disk_chunks(matching, budget), int(k), prefer_native
             )
 
-        if self.resident is not False:
-            cache = self._resident_cache_get()
-            if cache is not None:
-                return self._topk_from_chunks(
-                    query_matrix,
-                    self._resident_chunks(cache, budget),
-                    int(k),
-                    prefer_native,
-                    skip=cache["removed"],
-                )
+        snapshot = self._resident_snapshot()
+        if snapshot is not None:
+            return self._topk_from_chunks(
+                query_matrix,
+                self._resident_chunks(snapshot, budget),
+                int(k),
+                prefer_native,
+                skip=snapshot["removed"],
+            )
 
         # Over the resident budget (or resident=False): stream from disk, exact.
         return self._topk_from_chunks(
@@ -515,16 +540,15 @@ class LodeLateInteractionIndex:
                 queries_concat, offsets, self._disk_chunks(matching, budget), int(k), None
             )
 
-        if self.resident is not False:
-            cache = self._resident_cache_get()
-            if cache is not None:
-                return self._topk_from_chunks_multi(
-                    queries_concat,
-                    offsets,
-                    self._resident_chunks(cache, budget),
-                    int(k),
-                    cache["removed"],
-                )
+        snapshot = self._resident_snapshot()
+        if snapshot is not None:
+            return self._topk_from_chunks_multi(
+                queries_concat,
+                offsets,
+                self._resident_chunks(snapshot, budget),
+                int(k),
+                snapshot["removed"],
+            )
 
         return self._topk_from_chunks_multi(
             queries_concat,
@@ -629,33 +653,41 @@ class LodeLateInteractionIndex:
 
         New/updated documents land in a pending delta; the base matrix is compacted
         periodically, so an interleaved add/query workload never pays a full
-        from-disk rebuild per write.
+        from-disk rebuild per write. Adds only grow the corpus, so an index already
+        known to be over budget stays over budget and is left untouched.
         """
 
-        cache = self._resident_cache
-        if cache is None:
-            return
-        resident_dtype = self._resident_dtype()
-        for document_id, matrix, user_meta, patch_count in notes:
-            self._cache_replace(
-                cache,
-                document_id,
-                matrix.astype(resident_dtype, copy=False),
-                user_meta,
-                patch_count,
-            )
-        self._cache_maybe_compact_or_evict(cache)
+        with self._cache_lock:
+            cache = self._resident_cache
+            if not isinstance(cache, dict):
+                return
+            resident_dtype = self._resident_dtype()
+            for document_id, matrix, user_meta, patch_count in notes:
+                self._cache_replace(
+                    cache,
+                    document_id,
+                    matrix.astype(resident_dtype, copy=False),
+                    user_meta,
+                    patch_count,
+                )
+            self._cache_maybe_compact_or_evict(cache)
 
     def _cache_note_remove(self, document_id: str) -> None:
         """Reflects a removed document in the live resident cache, if built."""
 
-        cache = self._resident_cache
-        if cache is None:
-            return
-        if document_id in cache["pending_ids"]:
-            self._cache_drop_pending(cache, document_id)
-        if document_id in cache["base_ids_set"]:
-            cache["removed"].add(document_id)
+        with self._cache_lock:
+            cache = self._resident_cache
+            if cache is _RESIDENT_OVER_BUDGET:
+                # A delete may bring the corpus back under budget: drop the
+                # over-budget marker so the next query re-evaluates residency.
+                self._resident_cache = None
+                return
+            if not isinstance(cache, dict):
+                return
+            if document_id in cache["pending_ids"]:
+                self._cache_drop_pending(cache, document_id)
+            self._tombstone_base(cache, document_id)
+            self._cache_maybe_compact_or_evict(cache)
 
     def _cache_replace(
         self,
@@ -669,11 +701,22 @@ class LodeLateInteractionIndex:
 
         if document_id in cache["pending_ids"]:
             self._cache_drop_pending(cache, document_id)
-        if document_id in cache["base_ids_set"]:
-            cache["removed"].add(document_id)
+        self._tombstone_base(cache, document_id)
         cache["pending"].append((matrix, document_id, user_meta, int(patch_count)))
         cache["pending_ids"].add(document_id)
         cache["pending_patches"] += int(matrix.shape[0])
+
+    @staticmethod
+    def _tombstone_base(cache: dict[str, Any], document_id: str) -> None:
+        """Masks a base copy of the document and accounts its patch volume once.
+
+        Tracking removed patch volume lets a delete-heavy workload trigger
+        compaction, instead of scoring dead base rows on every query forever.
+        """
+
+        if document_id in cache["base_ids_set"] and document_id not in cache["removed"]:
+            cache["removed"].add(document_id)
+            cache["removed_patches"] += cache["base_pc_by_id"].get(document_id, 0)
 
     @staticmethod
     def _cache_drop_pending(cache: dict[str, Any], document_id: str) -> None:
@@ -687,21 +730,29 @@ class LodeLateInteractionIndex:
         cache["pending_ids"].discard(document_id)
 
     def _cache_maybe_compact_or_evict(self, cache: dict[str, Any]) -> None:
-        """Evicts the cache if it now exceeds the budget, else compacts if needed."""
+        """Compacts stale (pending + tombstoned) volume, then evicts if over budget.
+
+        Compaction runs first so reclaiming tombstones/pending can keep a
+        delete-heavy index resident; only if the *live* size still exceeds the
+        budget is the cache marked over budget. Called while holding the lock.
+        """
 
         base_patches = int(cache["counts"].sum()) if cache["counts"].size else 0
-        itemsize = np.dtype(self._resident_dtype()).itemsize
-        live_bytes = (base_patches + cache["pending_patches"]) * self.dim * itemsize
-        if self.resident == "auto" and live_bytes > self.resident_max_bytes:
-            self._resident_cache = None  # too big now: fall back to streaming
-            return
-        # Compact when the pending delta has grown to ~half the base (bounds the
-        # amortized compaction cost), or past a document-count cap (bounds the
-        # per-query pending vstack when documents are tiny).
-        if cache["pending_patches"] >= max(50_000, base_patches // 2) or len(
-            cache["pending"]
-        ) >= 2000:
+        # Stale = queued adds + tombstoned base patches. Compact when it reaches
+        # ~half the base (amortized O(N)), past a pending-doc cap (bounds the
+        # per-query pending vstack), or once the base is entirely tombstoned.
+        stale = cache["pending_patches"] + cache["removed_patches"]
+        all_base_removed = bool(cache["ids"]) and len(cache["removed"]) == len(cache["ids"])
+        if (
+            stale >= max(_COMPACT_MIN_STALE_PATCHES, base_patches // 2)
+            or len(cache["pending"]) >= _COMPACT_MAX_PENDING_DOCS
+            or all_base_removed
+        ):
             self._cache_compact(cache)
+        itemsize = np.dtype(self._resident_dtype()).itemsize
+        held_patches = int(cache["counts"].sum()) + cache["pending_patches"]
+        if self.resident == "auto" and held_patches * self.dim * itemsize > self.resident_max_bytes:
+            self._resident_cache = _RESIDENT_OVER_BUDGET
 
     def _cache_compact(self, cache: dict[str, Any]) -> None:
         """Folds the pending delta and tombstones into a fresh contiguous base."""
@@ -743,16 +794,12 @@ class LodeLateInteractionIndex:
         cache["base_ids_set"] = set(new_ids)
         cache["metas"] = new_metas
         cache["patch_counts"] = new_patch_counts
+        cache["base_pc_by_id"] = dict(zip(new_ids, new_patch_counts, strict=True))
         cache["pending"] = []
         cache["pending_ids"] = set()
         cache["pending_patches"] = 0
         cache["removed"] = set()
-        itemsize = np.dtype(resident_dtype).itemsize
-        if (
-            self.resident == "auto"
-            and int(cache["counts"].sum()) * self.dim * itemsize > self.resident_max_bytes
-        ):
-            self._resident_cache = None
+        cache["removed_patches"] = 0
 
     def _require_encoder(self) -> Any:
         """Returns the bring-your-own encoder or raises a clear error."""
@@ -978,13 +1025,48 @@ class LodeLateInteractionIndex:
         ]
 
     def _resident_cache_get(self) -> dict[str, Any] | None:
-        """Returns the resident cache, building it if needed; ``None`` if over budget."""
+        """Returns the resident cache, building it if needed; ``None`` if over budget.
 
-        if self._resident_cache is not None:
-            return self._resident_cache
-        cache = self._build_resident_cache()
-        self._resident_cache = cache
-        return cache
+        Must be called with ``self._cache_lock`` held (callers do). An index known
+        to be over budget returns ``None`` without re-enumerating/rebuilding.
+        """
+
+        cache = self._resident_cache
+        if isinstance(cache, dict):
+            return cache
+        if cache is _RESIDENT_OVER_BUDGET:
+            return None
+        built = self._build_resident_cache()
+        self._resident_cache = built if built is not None else _RESIDENT_OVER_BUDGET
+        return built
+
+    def _resident_snapshot(self) -> dict[str, Any] | None:
+        """Returns a consistent, scan-safe snapshot of the resident cache, or ``None``.
+
+        Taken under the cache lock so it is consistent with concurrent mutations:
+        the large arrays/lists are only ever replaced (never mutated in place), so
+        capturing their references is safe, while the in-place-mutated ``pending``
+        and ``removed`` are copied. The caller then scores the snapshot without
+        holding the lock, so a query runs concurrently with adds/removes on a
+        shared handle. Returns ``None`` when there is no resident cache to scan
+        (``resident=False`` or over budget).
+        """
+
+        if self.resident is False:
+            return None
+        with self._cache_lock:
+            cache = self._resident_cache_get()
+            if cache is None:
+                return None
+            return {
+                "flat": cache["flat"],
+                "counts": cache["counts"],
+                "ids": cache["ids"],
+                "metas": cache["metas"],
+                "patch_counts": cache["patch_counts"],
+                "pending": list(cache["pending"]),
+                "removed": frozenset(cache["removed"]),
+            }
 
     def _build_resident_cache(self) -> dict[str, Any] | None:
         """Builds the in-memory matrix from the stored documents.
@@ -1040,10 +1122,12 @@ class LodeLateInteractionIndex:
             "metas": metas,
             "patch_counts": patch_counts,
             "base_ids_set": set(kept_ids),
+            "base_pc_by_id": dict(zip(kept_ids, patch_counts, strict=True)),
             "pending": [],
             "pending_ids": set(),
             "pending_patches": 0,
             "removed": set(),
+            "removed_patches": 0,
         }
 
 
@@ -1077,12 +1161,13 @@ def _read_li_config(config_path: Path) -> str | None:
     return storage
 
 
-def _write_li_config(config_path: Path, storage: str) -> None:
+def _write_li_config(config_path: Path, storage: str, *, fsync: bool) -> None:
     """Atomically persists the index's storage precision to its config sidecar.
 
     Writes a sibling temp file and ``durable_replace``s it into place (the same
     durable-write primitive the engine uses), so a crash mid-write leaves either
-    the old config or the new one, never a torn file.
+    the old config or the new one, never a torn file. ``fsync`` matches the DB's
+    durability mode so the marker is power-loss durable when the DB's files are.
     """
 
     tmp = config_path.with_name(config_path.name + ".tmp")
@@ -1090,7 +1175,7 @@ def _write_li_config(config_path: Path, storage: str) -> None:
         json.dumps({"version": _CONFIG_VERSION, "storage": storage}),
         encoding="utf-8",
     )
-    durable_replace(tmp, config_path, fsync=False)
+    durable_replace(tmp, config_path, fsync=fsync)
 
 
 def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:
@@ -1103,10 +1188,12 @@ def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:
         "metas": [],
         "patch_counts": [],
         "base_ids_set": set(),
+        "base_pc_by_id": {},
         "pending": [],
         "pending_ids": set(),
         "pending_patches": 0,
         "removed": set(),
+        "removed_patches": 0,
     }
 
 
