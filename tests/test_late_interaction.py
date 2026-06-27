@@ -212,6 +212,32 @@ def test_incremental_compaction_folds_pending(tmp_path):
     assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"a", "b"}
 
 
+def test_replace_base_resident_doc_visible_before_compaction(tmp_path):
+    # Replacing (or remove-then-readd of) a document that is already in the
+    # resident BASE must keep the replacement visible immediately -- the tombstone
+    # masks only the base copy, not the pending replacement.
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("a", _onehot_matrix([0]))
+    idx.add_document("b", _onehot_matrix([5]))
+    idx.search(_onehot_matrix([0]), k=2)  # build the resident base with a and b
+    idx.add_document("a", _onehot_matrix([2]))  # replace base doc a (-> tombstone + pending)
+    cache = idx._resident_cache
+    assert "a" in cache["removed"] and "a" in cache["pending_ids"]  # pre-compaction state
+
+    # a must now match dim 2 (its new content), via the pending replacement.
+    single = idx.search(_onehot_matrix([2]), k=2)
+    assert single[0].id == "a" and single[0].score == pytest.approx(1.0, abs=1e-3)
+    assert {h.id for h in idx.search(_onehot_matrix([2]), k=5)} == {"a", "b"}
+    batched = idx.search_many([_onehot_matrix([2])], k=5)[0]
+    assert {h.id for h in batched} == {"a", "b"}
+    assert next(h for h in batched if h.id == "a").score == pytest.approx(1.0, abs=1e-3)
+
+    # Remove-then-readd of a base doc is likewise immediately visible.
+    idx.remove("b")
+    idx.add_document("b", _onehot_matrix([7]))
+    assert idx.search(_onehot_matrix([7]), k=1)[0].id == "b"
+
+
 def test_deletes_compact_resident_base(tmp_path, monkeypatch):
     # Pure deletes must reclaim tombstoned base rows (compaction), not score them
     # forever. Lower the floor so the logic exercises at unit-test scale.

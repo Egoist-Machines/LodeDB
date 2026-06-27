@@ -470,7 +470,6 @@ class LodeLateInteractionIndex:
                 self._resident_chunks(snapshot, budget),
                 int(k),
                 prefer_native,
-                skip=snapshot["removed"],
             )
 
         # Over the resident budget (or resident=False): stream from disk, exact.
@@ -543,7 +542,7 @@ class LodeLateInteractionIndex:
         if filter is not None:
             matching = self._filtered_documents_with_counts(filter)
             return self._topk_from_chunks_multi(
-                queries_concat, offsets, self._disk_chunks(matching, budget), int(k), None
+                queries_concat, offsets, self._disk_chunks(matching, budget), int(k)
             )
 
         snapshot = self._resident_snapshot()
@@ -553,7 +552,6 @@ class LodeLateInteractionIndex:
                 offsets,
                 self._resident_chunks(snapshot, budget),
                 int(k),
-                snapshot["removed"],
             )
 
         return self._topk_from_chunks_multi(
@@ -561,7 +559,6 @@ class LodeLateInteractionIndex:
             offsets,
             self._disk_chunks(self._all_documents_with_counts(), budget),
             int(k),
-            None,
         )
 
     def count(self) -> int:
@@ -939,11 +936,17 @@ class LodeLateInteractionIndex:
             return
         flat = np.ascontiguousarray(np.vstack(mats), dtype=np.float32)
         counts = np.fromiter((m.shape[0] for m in mats), dtype=np.int64, count=len(mats))
-        yield from _subchunk(flat, counts, ids, metas, patch_counts, max_patches)
+        yield from _subchunk(flat, counts, ids, metas, patch_counts, max_patches, None)
 
     def _resident_chunks(self, cache: dict[str, Any], max_patches: int) -> Iterator[tuple]:
-        """Yields bounded scoring chunks over the resident base plus pending delta."""
+        """Yields bounded scoring chunks over the resident base plus pending delta.
 
+        The tombstone set masks only the **base** chunks (a replaced/removed base
+        document); the pending delta carries the live replacements and is never
+        masked, so an updated document stays visible before compaction.
+        """
+
+        removed = cache["removed"]
         yield from _subchunk(
             cache["flat"],
             cache["counts"],
@@ -951,10 +954,8 @@ class LodeLateInteractionIndex:
             cache["metas"],
             cache["patch_counts"],
             max_patches,
+            removed if removed else None,
         )
-        # The pending delta (documents added since the last compaction) is scored
-        # alongside the base; its ids are all live (replaced copies are masked in
-        # the base via cache["removed"]).
         pending = cache["pending"]
         if pending:
             pending_flat = np.vstack([entry[0] for entry in pending])
@@ -969,6 +970,7 @@ class LodeLateInteractionIndex:
                 [entry[2] for entry in pending],
                 [entry[3] for entry in pending],
                 max_patches,
+                None,
             )
 
     def _topk_from_chunks(
@@ -977,17 +979,17 @@ class LodeLateInteractionIndex:
         chunks: Iterator[tuple],
         k: int,
         prefer_native: bool,
-        skip: set[str] | None = None,
     ) -> list[LodeLateInteractionHit]:
         """Returns the global top-``k`` (score desc, id asc) across the chunks.
 
         The running top-``k`` is merged chunk by chunk and each chunk's score
         block is discarded after merging, so retained memory is O(k) regardless of
-        corpus size. ``skip`` ids (resident tombstones) are excluded.
+        corpus size. Each chunk carries its own ``skip`` set (resident base
+        tombstones); pending and disk chunks carry none.
         """
 
         best: list[tuple[float, str, dict[str, Any], int]] = []
-        for flat, counts, ids, metas, patch_counts in chunks:
+        for flat, counts, ids, metas, patch_counts, skip in chunks:
             if len(ids) == 0:
                 continue
             scores = _maxsim_scores_flat(
@@ -1005,20 +1007,20 @@ class LodeLateInteractionIndex:
         query_offsets: list[tuple[int, int]],
         chunks: Iterator[tuple],
         k: int,
-        skip: set[str] | None,
     ) -> list[list[LodeLateInteractionHit]]:
         """Batched counterpart of :meth:`_topk_from_chunks` -- top-``k`` per query.
 
         Each chunk is scored once for the whole batch with one GEMM, then merged
         into per-query running top-``k`` lists; the ``(n_queries, n_docs)`` score
         block is discarded after the chunk, so retained memory is O(n_queries * k)
-        rather than O(n_queries * total_docs).
+        rather than O(n_queries * total_docs). Each chunk's own ``skip`` set masks
+        only its rows (resident base tombstones), not pending/disk rows.
         """
 
         best: list[list[tuple[float, str, dict[str, Any], int]]] = [
             [] for _ in query_offsets
         ]
-        for flat, counts, ids, metas, patch_counts in chunks:
+        for flat, counts, ids, metas, patch_counts, skip in chunks:
             if len(ids) == 0:
                 continue
             block = _maxsim_scores_flat_multi(queries_concat, query_offsets, flat, counts)
@@ -1315,12 +1317,16 @@ def _subchunk(
     metas: list[dict[str, Any]],
     patch_counts: list[int],
     max_patches: int,
+    skip: frozenset[str] | None,
 ) -> Iterator[tuple]:
     """Splits one (flat, counts, ids, ...) group into chunks of <= max_patches.
 
-    Each emitted chunk's patch rows are upcast to float32 for the GEMM, so the
-    transient score buffer (``query_tokens x chunk_patches``) and the upcast buffer
-    both stay bounded regardless of corpus size or query-batch width.
+    Each emitted chunk is ``(flat, counts, ids, metas, patch_counts, skip)``; its
+    patch rows are upcast to float32 for the GEMM, so the transient score buffer
+    (``query_tokens x chunk_patches``) and the upcast buffer both stay bounded
+    regardless of corpus size or query-batch width. ``skip`` travels with the chunk
+    so a tombstone set masks only the rows it belongs to (resident base rows), not
+    pending replacements or disk rows.
     """
 
     n_docs = len(ids)
@@ -1338,6 +1344,7 @@ def _subchunk(
             ids[start:doc],
             metas[start:doc],
             patch_counts[start:doc],
+            skip,
         )
         row += patches
 
