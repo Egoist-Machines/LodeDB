@@ -223,6 +223,56 @@ def test_native_core_extension_array_vector_paths_match_json() -> None:
     assert array_batch == json_batch
 
 
+def test_native_core_extension_array_paths_handle_edge_inputs() -> None:
+    """The hidden array PyO3 methods reject bad shapes and handle empties/dupes."""
+
+    engine = native_core.CoreEngine()
+    engine.create_index("default", 8, 4)
+
+    # Empty batch query (0 rows, valid dim) returns no result rows.
+    empty_batch = _loads(
+        engine.query_vectors_batch_array(
+            "default", np.empty((0, 8), dtype=np.float32), 3, None
+        )
+    )
+    assert empty_batch == []
+
+    # Mismatched sidecar length is rejected.
+    with pytest.raises(ValueError):
+        engine.upsert_vectors_array(
+            "default",
+            np.asarray([_onehot(0), _onehot(1)], dtype=np.float32),
+            json.dumps([{"document_id": "only-one", "metadata": {}, "text": None}]),
+        )
+
+    # Non-contiguous input is rejected with a typed error.
+    non_contiguous = np.zeros((2, 16), dtype=np.float32)[:, ::2]
+    assert not non_contiguous.flags["C_CONTIGUOUS"]
+    with pytest.raises(ValueError):
+        engine.query_vectors_batch_array("default", non_contiguous, 1, None)
+
+    # A duplicate document id within one array batch collapses to last-wins.
+    mutation = _loads(
+        engine.upsert_vectors_array(
+            "default",
+            np.asarray([_onehot(0), _onehot(1)], dtype=np.float32),
+            json.dumps(
+                [
+                    {"document_id": "dup", "metadata": {"v": "0"}, "text": None},
+                    {"document_id": "dup", "metadata": {"v": "1"}, "text": None},
+                ]
+            ),
+        )
+    )
+    assert mutation["documents_upserted"] == 2
+    assert _loads(engine.stats("default"))["document_count"] == 1
+    hit = _loads(
+        engine.query_vector_array("default", np.asarray(_onehot(1), dtype=np.float32), 1, None)
+    )
+    assert hit["hits"][0]["document_id"] == "dup"
+    assert hit["hits"][0]["metadata"] == {"v": "1"}
+
+
 def test_native_core_extension_accepts_index_create_options() -> None:
     engine = native_core.CoreEngine()
     index_key = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205"
