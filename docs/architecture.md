@@ -74,6 +74,12 @@ and persistence fallback for this release window. See
 [`native_core_migration.md`](native_core_migration.md) for the current migration status and
 remaining removal gate.
 
+The Swift package binds to the same native core through `lodedb-ffi`. In local development,
+`LODEDB_FFI_DYLIB` points the Swift wrapper at a built Rust dylib; for distribution,
+`swift/LodeDBCore/scripts/package_xcframework.sh` builds installed Apple Rust targets into a
+native `LodeDBCoreFFI.xcframework`. Swift embedders still run outside the core, matching the
+Python prepare/apply split.
+
 ## Package layout
 
 `pip install lodedb` installs one package, `lodedb`, imported as `import lodedb`. The CLI

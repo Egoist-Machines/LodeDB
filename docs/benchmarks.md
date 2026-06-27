@@ -37,6 +37,17 @@ PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 uv run pytest -q \
   tests/test_import_boundary.py
 ```
 
+Swift binding verification uses the same metrics-only native core fixtures and does not require
+Python at runtime. From the repo root:
+
+```bash
+cargo build -p lodedb-ffi
+LODEDB_FFI_DYLIB="$(pwd)/target/debug/liblodedb_ffi.dylib" \
+  swift test --package-path swift/LodeDBCore
+env -u LODEDB_FFI_DYLIB swift test --package-path swift/LodeDBCore
+swift/LodeDBCore/scripts/package_xcframework.sh
+```
+
 ## Launch benchmark: direct CUDA batch sweep
 
 The LodeDB-owned launch proof lives in

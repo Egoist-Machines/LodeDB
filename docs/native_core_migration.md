@@ -17,6 +17,19 @@ existing stores stable.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.
 
+## Swift / iOS Binding State
+
+- `swift/LodeDBCore` is a source Swift package with no Python dependency.
+- Local development loads the shared Rust C ABI dynamically through `LODEDB_FFI_DYLIB`.
+- When that dylib is configured, Swift text ingestion calls native `prepare_text_upsert` and
+  `apply_text_upsert`; Swift embedders still provide embeddings outside the core.
+- Unfiltered vector searches over native-ingested text can query the same native handle through
+  the C ABI. Filtered searches and locally diverged handles fall back to the Swift mirror.
+- `scripts/package_xcframework.sh` builds `lodedb-ffi` static libraries for installed Rust
+  Apple targets and assembles `LodeDBCoreFFI.xcframework`. It defaults to the host target for
+  local verification; set `LODEDB_XCFRAMEWORK_TARGETS` to include iOS device/simulator targets
+  after installing them with `rustup target add`.
+
 ## Removal Gate For Python Runtime Paths
 
 Do not remove the Python engine oracle from the runtime package until all of these are true:
@@ -49,4 +62,11 @@ PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 uv run pytest -q \
 LODEDB_NATIVE_CORE_EXTENSION_PATH=third_party/turbovec/target/debug/lib_turbovec.dylib \
 PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 \
   uv run pytest -q tests/test_native_core_extension.py
+
+cargo build -p lodedb-ffi
+LODEDB_FFI_DYLIB="$(pwd)/target/debug/liblodedb_ffi.dylib" \
+  swift test --package-path swift/LodeDBCore
+env -u LODEDB_FFI_DYLIB swift test --package-path swift/LodeDBCore
+LODEDB_XCFRAMEWORK_TARGETS="aarch64-apple-ios aarch64-apple-darwin" \
+  swift/LodeDBCore/scripts/package_xcframework.sh
 ```
