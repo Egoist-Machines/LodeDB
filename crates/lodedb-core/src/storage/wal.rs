@@ -20,7 +20,6 @@ pub struct WalRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalAppend {
     pub record_bytes: usize,
-    pub op_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,10 +69,13 @@ pub fn append_record(path: &Path, op: &str, payload: &Value, fsync: bool) -> Cor
     if first_write && fsync {
         fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
     }
-    let stats = scan_stats(path)?;
+    // Intentionally do NOT scan the WAL here. `scan_stats` reads and re-encodes
+    // every prior record, which made each append O(WAL size) and the whole write
+    // stream O(n^2) (a single multi-thousand-row seed record was re-parsed on
+    // every subsequent add). Callers that need op_count/byte_count call
+    // `scan_stats` explicitly, off the per-append hot path.
     Ok(WalAppend {
         record_bytes: frame.len(),
-        op_count: stats.op_count,
     })
 }
 
@@ -642,10 +644,10 @@ mod tests {
         .expect("append second");
 
         let records = read_records(&path).expect("read records");
-        assert_eq!(append.op_count, 2);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].op, "upsert_documents");
         assert_eq!(records[1].payload["document_ids"], json!(["alpha"]));
+        // op_count/byte_count come from an explicit scan, not the append hot path.
         let stats = scan_stats(&path).expect("scan stats");
         assert_eq!(stats.op_count, 2);
         assert!(stats.byte_count >= append.record_bytes);
