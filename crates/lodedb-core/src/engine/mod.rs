@@ -136,6 +136,18 @@ impl CoreEngine {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
+        // Validate the whole batch before mutating any state. A bad row found
+        // mid-loop must not leave earlier rows inserted in `documents` while the
+        // live TurboVec index and generation/WAL stay unwritten, which would make
+        // a failed request partially visible and committable on the next persist.
+        for document in documents {
+            if document.document_id.trim().is_empty() {
+                return invalid("document_id is required");
+            }
+            if document.vector.len() != index.vector_dim {
+                return invalid("vector dimension does not match index");
+            }
+        }
         let mut changed = 0usize;
         let mut changed_filter_fields = BTreeSet::new();
         // Collect every upserted chunk and sync the live TurboVec index once after
@@ -144,12 +156,6 @@ impl CoreEngine {
         // n separate calibration-bound encode calls on a large add.
         let mut upserted_chunks: Vec<CoreVectorChunk> = Vec::with_capacity(documents.len());
         for document in documents {
-            if document.document_id.trim().is_empty() {
-                return invalid("document_id is required");
-            }
-            if document.vector.len() != index.vector_dim {
-                return invalid("vector dimension does not match index");
-            }
             let chunks = vec![ChunkRecord {
                 chunk_id: document.document_id.clone(),
                 vector: document.vector.clone(),

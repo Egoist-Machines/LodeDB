@@ -70,6 +70,40 @@ fn seeded_engine() -> CoreEngine {
 }
 
 #[test]
+fn upsert_vectors_is_atomic_when_a_later_row_is_invalid() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    // A valid first row followed by a wrong-dimension row: the whole batch must
+    // fail without leaving the first row visible in documents/stats/search.
+    let bad = CoreVectorDocument {
+        document_id: "b".to_string(),
+        vector: vec![0.0; 4],
+        metadata: metadata(&[]),
+        text: None,
+    };
+    let result = engine.upsert_vectors("default", &[doc("a", 0, metadata(&[])), bad]);
+    assert!(result.is_err(), "wrong-dim batch must error");
+
+    let stats = engine.stats("default").unwrap();
+    assert_eq!(stats.document_count, 0, "no row may survive a failed batch");
+    let hits = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            5,
+            None,
+        )
+        .unwrap();
+    assert!(hits.hits.is_empty(), "failed batch must not be searchable");
+
+    // A subsequent valid batch still works (the index was left clean).
+    engine
+        .upsert_vectors("default", &[doc("a", 0, metadata(&[]))])
+        .unwrap();
+    assert_eq!(engine.stats("default").unwrap().document_count, 1);
+}
+
+#[test]
 fn vector_query_returns_ranked_hits_with_metadata() {
     let engine = seeded_engine();
     let hits = engine
