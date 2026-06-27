@@ -71,6 +71,10 @@ These numbers prove the current deterministic benchmark gates, not removal of th
 The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the
 default-native release cycle are complete.
 
+The `ci` workflow runs the same Rust-vs-Python benchmark on Linux and uploads the metrics-only
+`native-core-rust-vs-python-benchmark` artifact. That job fails closed when
+`pass_fail_summary.passed` is false.
+
 ## Verification Commands
 
 Focused checks used during the default-on cutover:

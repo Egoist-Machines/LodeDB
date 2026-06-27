@@ -64,6 +64,10 @@ from that run:
 | Hybrid search | 0.996 |
 | Persisted reopen/query | 0.598 |
 
+CI also runs this benchmark on Linux and uploads `rust_vs_python_ci.json` as the
+`native-core-rust-vs-python-benchmark` workflow artifact. The CI job fails if
+`pass_fail_summary.passed` is false.
+
 Swift binding verification uses the same metrics-only native core fixtures and does not require
 Python at runtime. From the repo root:
 
