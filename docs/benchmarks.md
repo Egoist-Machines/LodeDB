@@ -68,6 +68,11 @@ CI also runs this benchmark on Linux and uploads `rust_vs_python_ci.json` as the
 `native-core-rust-vs-python-benchmark` workflow artifact. The CI job fails if
 `pass_fail_summary.passed` is false.
 
+On those gates, the Rust core is comparable or faster for the covered native paths: it avoids
+per-query BM25 index rebuilds, uses maintained metadata indexes before falling back to scans for
+unsupported predicates, and serves native-covered vector queries through the Rust TurboVec
+adapter rather than the scalar Python path.
+
 Swift binding verification uses the same metrics-only native core fixtures and does not require
 Python at runtime. From the repo root:
 

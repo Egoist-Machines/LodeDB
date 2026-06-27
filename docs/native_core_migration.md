@@ -79,6 +79,18 @@ The `ci` workflow runs the same Rust-vs-Python benchmark on Linux and uploads th
 `native-core-rust-vs-python-benchmark` artifact. That job fails closed when
 `pass_fail_summary.passed` is false.
 
+## Usability Declaration
+
+The native Rust core is usable for the covered default-on paths: fresh vector-only Python
+handles, maintained metadata-filter and BM25 query indexes, batched vector search through the
+Rust TurboVec adapter, Swift vector search, and Swift text prepare/apply plus vector, lexical,
+and hybrid search while the native handle owns the current state.
+
+The core is not yet the only runtime authority. Existing persisted Python stores still open
+without migration through the Python oracle, and Python remains responsible for durable writes,
+embedding runtimes, CLI/server ergonomics, and integration adapters until the release-cycle
+removal gate above is met.
+
 ## Verification Commands
 
 Focused checks used during the default-on cutover:
