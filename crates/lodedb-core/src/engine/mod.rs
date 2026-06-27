@@ -11,7 +11,8 @@ use turbovec::IdMapIndex;
 
 use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter};
-use crate::lexical::tokenize;
+use crate::lexical::rrf::RRF_C;
+use crate::lexical::{reciprocal_rank_fusion, tokenize, Bm25Index};
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
@@ -408,12 +409,106 @@ impl CoreEngine {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
-        if query_plan.requires_embedding {
-            let embedding = query_embedding
-                .ok_or_else(|| invalid_err("query embedding is required for this mode"))?;
-            return self.query_vector(index_id, embedding, top_k, filter);
+        match query_plan.mode.as_str() {
+            "vector" => {
+                let embedding = query_embedding
+                    .ok_or_else(|| invalid_err("query embedding is required for this mode"))?;
+                self.query_vector(index_id, embedding, top_k, filter)
+            }
+            "lexical" => self.query_lexical_text(index_id, query_plan, top_k, filter),
+            "hybrid" => {
+                let embedding = query_embedding
+                    .ok_or_else(|| invalid_err("query embedding is required for this mode"))?;
+                let vector_results = self.query_vector(index_id, embedding, top_k, filter)?;
+                let lexical_results =
+                    self.query_lexical_text(index_id, query_plan, top_k, filter)?;
+                let rankings = [
+                    vector_results
+                        .hits
+                        .iter()
+                        .map(|hit| hit.chunk_id.clone())
+                        .collect::<Vec<_>>(),
+                    lexical_results
+                        .hits
+                        .iter()
+                        .map(|hit| hit.chunk_id.clone())
+                        .collect::<Vec<_>>(),
+                ];
+                let mut hits_by_chunk = vector_results
+                    .hits
+                    .into_iter()
+                    .chain(lexical_results.hits)
+                    .map(|hit| (hit.chunk_id.clone(), hit))
+                    .collect::<BTreeMap<_, _>>();
+                let mut hits = reciprocal_rank_fusion(&rankings, RRF_C, None)?
+                    .into_iter()
+                    .filter_map(|(chunk_id, score)| {
+                        hits_by_chunk.remove(&chunk_id).map(|mut hit| {
+                            hit.score = score as f32;
+                            hit
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                hits.truncate(top_k);
+                Ok(CoreSearchResults {
+                    hits,
+                    total_considered: vector_results.total_considered,
+                })
+            }
+            _ => invalid("unsupported query mode"),
         }
-        invalid("lexical-only text search is not implemented in the prepare/apply protocol yet")
+    }
+
+    fn query_lexical_text(
+        &self,
+        index_id: &str,
+        query_plan: &QueryPlan,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        let index = self.index(index_id)?;
+        let candidates = index.resolve_filter(filter)?;
+        let total_considered = candidates.len();
+        let mut unit_ids = Vec::new();
+        let mut token_lists = Vec::new();
+        let mut group_ids = Vec::new();
+        let mut hit_payloads = BTreeMap::new();
+        for document_id in &candidates {
+            let Some(record) = index.documents.get(document_id) else {
+                continue;
+            };
+            for (offset, chunk) in record.chunks.iter().enumerate() {
+                unit_ids.push(chunk.chunk_id.clone());
+                token_lists.push(record.token_lists.get(offset).cloned().unwrap_or_default());
+                group_ids.push(document_id.clone());
+                hit_payloads.insert(
+                    chunk.chunk_id.clone(),
+                    (document_id.clone(), record.metadata.clone()),
+                );
+            }
+        }
+        let lexical = Bm25Index::from_token_lists(&unit_ids, &token_lists, Some(&group_ids))?;
+        let hits = lexical
+            .rank(&query_plan.query, Some(top_k), None)
+            .into_iter()
+            .filter_map(|(chunk_id, score)| {
+                hit_payloads
+                    .get(&chunk_id)
+                    .map(|(document_id, metadata)| CoreSearchHit {
+                        document_id: document_id.clone(),
+                        chunk_id,
+                        score: score as f32,
+                        metadata: metadata.clone(),
+                    })
+            })
+            .collect();
+        Ok(CoreSearchResults {
+            hits,
+            total_considered,
+        })
     }
 
     /// Queries one vector.

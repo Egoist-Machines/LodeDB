@@ -165,6 +165,32 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     )
     assert hits["hits"][0]["document_id"] == "doc-alpha"
 
+    lexical_plan = _loads(engine.prepare_query_text("E-1001", "lexical"))
+    assert lexical_plan["requires_embedding"] is False
+    lexical_hits = _loads(
+        engine.search_embedded_text(
+            "text",
+            json.dumps(lexical_plan),
+            None,
+            1,
+            json.dumps({"metadata": {"topic": "ops"}}),
+        )
+    )
+    assert lexical_hits["hits"][0]["document_id"] == "doc-alpha"
+
+    hybrid_plan = _loads(engine.prepare_query_text("E-1001", "hybrid"))
+    assert hybrid_plan["requires_embedding"] is True
+    hybrid_hits = _loads(
+        engine.search_embedded_text(
+            "text",
+            json.dumps(hybrid_plan),
+            json.dumps(_onehot(3)),
+            1,
+            json.dumps({"metadata": {"topic": "ops"}}),
+        )
+    )
+    assert hybrid_hits["hits"][0]["document_id"] == "doc-alpha"
+
 
 def test_native_core_extension_opens_readonly_persisted_vector_fixture(tmp_path) -> None:
     source = Path(__file__).resolve().parent / "fixtures" / "persisted" / "v0_4_store_text"

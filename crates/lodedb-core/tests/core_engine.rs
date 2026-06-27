@@ -230,6 +230,26 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
         .unwrap();
     assert_eq!(hits.hits[0].document_id, "doc-a");
 
+    let lexical_plan = engine.prepare_query_text("revenue", "lexical").unwrap();
+    assert!(!lexical_plan.requires_embedding);
+    let lexical_hits = engine
+        .search_embedded_text("text", &lexical_plan, None, 2, None)
+        .unwrap();
+    assert_eq!(lexical_hits.hits[0].document_id, "doc-b");
+
+    let hybrid_plan = engine.prepare_query_text("revenue", "hybrid").unwrap();
+    assert!(hybrid_plan.requires_embedding);
+    let hybrid_hits = engine
+        .search_embedded_text(
+            "text",
+            &hybrid_plan,
+            Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(hybrid_hits.hits[0].document_id, "doc-b");
+
     let reuse_plan = engine
         .prepare_text_upsert(
             "text",
