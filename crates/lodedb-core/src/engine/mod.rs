@@ -378,6 +378,8 @@ impl CoreEngine {
         // clear / set), encoded below by key presence so replay is exact.
         let metadata_for_wal = metadata.clone();
         let text_for_wal = text.clone();
+        // Same raw-text/lexical retention policy as upsert_vectors.
+        let (store_text, index_text) = self.text_capture_policy();
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
         let Some(record) = index.documents.get(document_id) else {
@@ -407,7 +409,28 @@ impl CoreEngine {
                 .as_ref()
                 .map(|text| crate::text::hash::sha256_text(text))
                 .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
-            record.text = text;
+            // Retain raw text only when store_text is on (privacy); otherwise the
+            // updated caption must not be kept in memory or written to disk.
+            record.text = if store_text { text.clone() } else { None };
+            // The caption changed, so refresh its lexical postings: tokenize the
+            // new caption when index_text is on, otherwise clear stale postings.
+            let caption_tokens: Vec<String> = if index_text {
+                text.as_deref().map(tokenize).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            record.token_lists = if caption_tokens.is_empty() {
+                Vec::new()
+            } else {
+                vec![caption_tokens.clone()]
+            };
+            if caption_tokens.is_empty() {
+                index.lexical_index.remove_group(document_id);
+            } else {
+                index
+                    .lexical_index
+                    .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+            }
         }
         if metadata_changed {
             let metadata = record.metadata.clone();
@@ -429,7 +452,21 @@ impl CoreEngine {
             payload.insert("metadata".to_string(), serde_json::json!(metadata));
         }
         if let Some(text) = &text_for_wal {
-            payload.insert("text".to_string(), serde_json::json!(text));
+            // Privacy: write raw text to the WAL only when store_text is on. When
+            // index_text is on, write the derived caption tokens so replay can
+            // rebuild lexical postings without retaining the raw text.
+            if store_text {
+                payload.insert("text".to_string(), serde_json::json!(text));
+            }
+            if index_text {
+                let tokens = text.as_deref().map(tokenize).unwrap_or_default();
+                let token_lists: Vec<Vec<String>> = if tokens.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![tokens]
+                };
+                payload.insert("tokens".to_string(), serde_json::json!(token_lists));
+            }
         }
         self.append_wal_record(
             &index_key,
@@ -1215,6 +1252,16 @@ impl CoreEngine {
                     None => None,
                 };
                 self.update_document_payload(index_id, &document_id, metadata, text)?;
+                // Restore caption tokens captured in the WAL (needed when
+                // store_text was off, so the raw text was not written and the
+                // update above re-derived no tokens, but index_text retained them).
+                if record.payload.get("tokens").is_some() {
+                    let entry = serde_json::json!({
+                        "document_id": document_id,
+                        "tokens": record.payload.get("tokens").cloned().unwrap_or(Value::Null),
+                    });
+                    self.restore_wal_vector_tokens(index_id, std::slice::from_ref(&entry))?;
+                }
             }
             other => {
                 return Err(CoreError::new(
@@ -1436,7 +1483,6 @@ impl CoreEngine {
         };
         let persistence_path = persistence.path.clone();
         let persistence_read_only = persistence.read_only;
-        let persistence_fsync = persistence.fsync;
         let persistence_chunk_character_limit = persistence.chunk_character_limit;
         if !persistence_path.is_dir() {
             return Ok(());
@@ -1453,7 +1499,7 @@ impl CoreEngine {
             }
         }
         for index_key in index_keys {
-            let mut loaded = crate::storage::load_store(
+            let loaded = crate::storage::load_store(
                 &persistence_path,
                 &index_key,
                 crate::storage::LoadOptions {
@@ -1481,18 +1527,27 @@ impl CoreEngine {
                         self.persist()?;
                         continue;
                     } else {
-                        crate::storage::wal::replay_records_onto_store(
-                            &mut loaded,
-                            &records,
-                            8192,
-                        )?;
-                        crate::storage::wal::checkpoint_store(
-                            &persistence_path,
-                            &loaded,
-                            loaded.generation + 1,
-                            persistence_fsync,
-                        )?;
-                        loaded.generation += 1;
+                        // The WAL contains records native cannot faithfully replay
+                        // or checkpoint (e.g. Python `upsert_documents`, whose chunk
+                        // vectors live in the state journal with no committed
+                        // TurboVec snapshot to seed from). The previous code
+                        // checkpointed such a WAL with `tvim: None` and truncated
+                        // it, leaving a generation Python could no longer open
+                        // ("direct TurboVec snapshot is required but missing").
+                        //
+                        // Fail closed and leave the WAL untouched on disk so the
+                        // Python writer — which checkpoints its own WAL on open and
+                        // writes a complete snapshot — stays the owner of these
+                        // stores. In the Python SDK, Python opens (and checkpoints)
+                        // before the native engine, so the native engine never
+                        // reaches this branch; a native init failure here also
+                        // falls back to the Python oracle.
+                        return Err(CoreError::new(
+                            CoreErrorCode::Unsupported,
+                            "native writable open cannot checkpoint a WAL containing \
+                             non-native records; open this store with the Python \
+                             engine first",
+                        ));
                     }
                 }
             }

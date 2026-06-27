@@ -73,6 +73,55 @@ fn seeded_engine() -> CoreEngine {
 }
 
 #[test]
+fn payload_update_respects_store_text_privacy() {
+    // store_text=false must keep no raw text in memory or in the WAL, including
+    // after a payload-only text update (index_text=false, so no tokens either).
+    let path = unique_temp_dir("core_payload_privacy");
+    let mut options = open_options(&path, false, "wal");
+    options.store_text = false;
+    options.index_text = false;
+    let mut engine = CoreEngine::open(options).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "d".to_string(),
+                vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[]),
+                text: Some("initial secret caption".to_string()),
+            }],
+        )
+        .unwrap();
+    engine
+        .update_document_payload(
+            "default",
+            "d",
+            None,
+            Some(Some("updated secret caption".to_string())),
+        )
+        .unwrap();
+    // No raw text is retained when store_text is off.
+    assert!(engine
+        .get_document_texts("default", &["d".to_string()])
+        .unwrap()
+        .is_empty());
+    engine.close().unwrap();
+
+    // The on-disk WAL must contain neither the original nor the updated text.
+    let wal_bytes: Vec<u8> = fs::read_dir(&path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
+        .flat_map(|entry| fs::read(entry.path()).unwrap_or_default())
+        .collect();
+    let wal_text = String::from_utf8_lossy(&wal_bytes);
+    assert!(!wal_text.contains("initial secret caption"));
+    assert!(!wal_text.contains("updated secret caption"));
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn native_wal_payload_update_replays_after_crash() {
     let path = unique_temp_dir("core_payload_wal");
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
@@ -707,16 +756,21 @@ fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
 }
 
 #[test]
-fn writable_open_replays_and_checkpoints_wal_but_readonly_ignores_it() {
+fn writable_open_fails_closed_on_python_wal_and_readonly_ignores_it() {
     let path = copy_persisted_fixture("rust_wal");
+    // Read-only open ignores the WAL tail (lock-free committed snapshot).
     let readonly = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
     assert_eq!(readonly.stats("default").unwrap().document_count, 0);
     assert!(path.join(format!("{INDEX_KEY}.wal")).exists());
+    drop(readonly);
 
-    let mut writable = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
-    assert_eq!(writable.stats("default").unwrap().document_count, 1);
-    writable.close().unwrap();
-    assert!(!path.join(format!("{INDEX_KEY}.wal")).exists());
+    // The fixture WAL holds Python `upsert_documents` records, whose embeddings
+    // the logical replay cannot turn into a TurboVec snapshot. A writable native
+    // open must fail closed rather than checkpoint a tvim-less generation that
+    // Python can no longer read, and it must leave the WAL intact for the Python
+    // writer to own.
+    assert!(CoreEngine::open(open_options(&path, false, "wal")).is_err());
+    assert!(path.join(format!("{INDEX_KEY}.wal")).exists());
     fs::remove_dir_all(path).unwrap();
 }
 
