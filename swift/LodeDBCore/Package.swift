@@ -12,7 +12,8 @@ let package = Package(
         .library(name: "LodeDBCore", targets: ["LodeDBCore"])
     ],
     targets: [
-        .target(name: "LodeDBCore"),
+        .target(name: "CLodeDBCoreBridge", publicHeadersPath: "include"),
+        .target(name: "LodeDBCore", dependencies: ["CLodeDBCoreBridge"]),
         .testTarget(name: "LodeDBCoreTests", dependencies: ["LodeDBCore"])
     ]
 )

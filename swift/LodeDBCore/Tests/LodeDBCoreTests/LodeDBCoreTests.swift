@@ -62,6 +62,36 @@ import Testing
     #expect(hybrid.contains { $0.id == "doc-gamma" })
 }
 
+@Test func rustFFIPrepareApplyTextProtocolMatchesSwiftBinding() throws {
+    guard let dylib = ProcessInfo.processInfo.environment["LODEDB_FFI_DYLIB"] else {
+        return
+    }
+
+    let library = try NativeCoreLibrary(path: dylib)
+    #expect(library.abiVersion() == 1)
+
+    let core = try NativeTextCore(library: library, vectorDimension: 2)
+    let documentsJSON = """
+    [{"document_id":"doc-text","text":"Alpha launch notes mention error code E-1001.","metadata":{"topic":"ops"}}]
+    """
+    let planJSON = try core.prepareTextUpsertJSON(
+        documentsJSON,
+        storeText: true,
+        indexText: true,
+        chunkCharacterLimit: 900
+    )
+    #expect(planJSON.contains(#""chunk_id":"doc-text:d9041255442c:0000""#))
+    #expect(planJSON.contains(#""chunks_to_embed""#))
+
+    let resultJSON = try core.applyTextUpsertJSON(
+        planJSON: planJSON,
+        embeddingsJSON: "[[1.0,0.0]]",
+        embeddingTimeMS: 2.5
+    )
+    #expect(resultJSON.contains(#""embedded_chunks":1"#))
+    #expect(resultJSON.contains(#""embedding_time_ms":2.5"#))
+}
+
 private struct HashTestEmbedder: LodeEmbedder {
     let dimension: Int
 
