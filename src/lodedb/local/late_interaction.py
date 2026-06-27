@@ -348,15 +348,13 @@ class LodeLateInteractionIndex:
         re-adding an existing id replaces it. Commits atomically.
         """
 
-        row, document_id, matrix, user_meta = self._prepare_write(
-            id, patches, metadata, normalize
-        )
+        row, document_id = self._prepare_write(id, patches, metadata, normalize)
         # Serialize the commit and its cache note as one ordered mutation, so
         # concurrent writers can never apply the cache notes in a different order
         # than they committed to disk (which would leave the cache stale).
         with self._write_lock:
             self._db.add_vectors_many([row])
-            self._cache_note_writes([(document_id, matrix, user_meta, int(matrix.shape[0]))])
+            self._cache_note_writes([row])
         return document_id
 
     def add_documents(
@@ -372,23 +370,21 @@ class LodeLateInteractionIndex:
 
         rows: list[dict[str, Any]] = []
         ids: list[str] = []
-        notes: list[tuple[str, np.ndarray, dict[str, Any], int]] = []
         for document in documents:
             if not isinstance(document, Mapping):
                 raise ValueError("each document must be a mapping")
             patches = document.get("patches")
             if patches is None:
                 raise ValueError("each document needs a 'patches' matrix")
-            row, document_id, matrix, user_meta = self._prepare_write(
+            row, document_id = self._prepare_write(
                 document.get("id"), patches, document.get("metadata"), normalize
             )
             rows.append(row)
             ids.append(document_id)
-            notes.append((document_id, matrix, user_meta, int(matrix.shape[0])))
         if rows:
             with self._write_lock:
                 self._db.add_vectors_many(rows, normalize=False)
-                self._cache_note_writes(notes)
+                self._cache_note_writes(rows)
         return ids
 
     def add_texts(
@@ -625,66 +621,65 @@ class LodeLateInteractionIndex:
         patches: Any,
         metadata: Mapping[str, Any] | None,
         normalize: bool,
-    ) -> tuple[dict[str, Any], str, np.ndarray, dict[str, Any]]:
-        """Prepares one document write.
+    ) -> tuple[dict[str, Any], str]:
+        """Prepares one document write: returns ``(engine_row, document_id)``.
 
-        Returns ``(engine_row, document_id, cache_matrix, user_metadata)``: the row
-        to upsert (pooled vector + encoded matrix + stamped metadata), plus the
-        patch matrix to fold into the resident cache and the clean user metadata.
-
-        ``cache_matrix`` is the matrix as it would be read back from disk -- the
-        stored bytes decoded -- not the raw input, so that an ``int8`` (or
-        ``float16``) document scores identically whether it is served from the
-        live pending cache or from a fresh reopen.
+        Only the engine row is produced here (pooled vector + encoded matrix +
+        stamped metadata). The resident-cache representation is derived later, in
+        :meth:`_cache_note_writes`, and only when a cache actually exists -- so a
+        cold bulk ingest does not decode/retain a second copy of every matrix.
         """
 
         document_id = _require_doc_id(id)
         matrix = _as_matrix(patches, self.dim, normalize=normalize)
-        user_meta = _coerce_user_metadata(metadata)
-        row_meta = dict(user_meta)
+        row_meta = dict(_coerce_user_metadata(metadata))
         row_meta[_PATCH_COUNT_KEY] = str(matrix.shape[0])
         row_meta[_DTYPE_KEY] = self.storage
-        text = _encode_matrix(matrix, self.storage)
-        cache_matrix = _decode_matrix(text, self.storage, self.dim)
-        # Cache the metadata exactly as it persists and reopens: the engine
-        # stringifies scalar values, so the live pending-cache hit must too, or it
-        # would return ints/bools where a reopen / filtered / streaming hit returns
-        # strings for the same document.
-        cache_meta = _strip_internal_metadata(_coerce_metadata(row_meta))
         row = {
             "vector": _pool(matrix).tolist(),
             "id": document_id,
             "metadata": row_meta,
-            "text": text,
+            "text": _encode_matrix(matrix, self.storage),
         }
-        return row, document_id, cache_matrix, cache_meta
+        return row, document_id
 
     # -- resident cache maintenance -----------------------------------------
 
-    def _cache_note_writes(
-        self, notes: list[tuple[str, np.ndarray, dict[str, Any], int]]
-    ) -> None:
-        """Folds writes into the live resident cache (a no-op if it is not built).
+    def _cache_note_writes(self, rows: list[dict[str, Any]]) -> None:
+        """Folds just-committed rows into the live resident cache, if it is built.
 
-        New/updated documents land in a pending delta; the base matrix is compacted
-        periodically, so an interleaved add/query workload never pays a full
-        from-disk rebuild per write. Adds only grow the corpus, so an index already
-        known to be over budget stays over budget and is left untouched.
+        Called while holding ``_write_lock`` (so ``self._resident_cache`` is stable
+        and no build can race). When no cache exists -- e.g. a cold bulk ingest
+        before the first query, or an over-budget index -- this returns immediately
+        without decoding anything, so ingest does not pay for cache work it will not
+        use. New/updated documents land in a pending delta that is compacted
+        periodically; the cached representation is decoded from the stored row so it
+        matches a fresh reopen (int8/float16 precision and string metadata).
         """
 
+        if not isinstance(self._resident_cache, dict):
+            return
+        resident_dtype = self._resident_dtype()
+        notes: list[tuple[str, np.ndarray, dict[str, Any], int]] = []
+        for row in rows:
+            row_meta = row["metadata"]
+            matrix = _decode_matrix(row["text"], self.storage, self.dim).astype(
+                resident_dtype, copy=False
+            )
+            notes.append(
+                (
+                    row["id"],
+                    matrix,
+                    _strip_internal_metadata(_coerce_metadata(row_meta)),
+                    _patch_count_from_metadata(row_meta),
+                )
+            )
         with self._cache_lock:
             cache = self._resident_cache
             if not isinstance(cache, dict):
                 return
-            resident_dtype = self._resident_dtype()
             for document_id, matrix, user_meta, patch_count in notes:
-                self._cache_replace(
-                    cache,
-                    document_id,
-                    matrix.astype(resident_dtype, copy=False),
-                    user_meta,
-                    patch_count,
-                )
+                self._cache_replace(cache, document_id, matrix, user_meta, patch_count)
             self._cache_maybe_compact_or_evict(cache)
 
     def _cache_note_remove(self, document_id: str) -> None:
@@ -745,14 +740,25 @@ class LodeLateInteractionIndex:
         cache["pending_ids"].discard(document_id)
 
     def _cache_maybe_compact_or_evict(self, cache: dict[str, Any]) -> None:
-        """Compacts stale (pending + tombstoned) volume, then evicts if over budget.
+        """Evicts if the live corpus can't fit the budget, else compacts if stale.
 
-        Compaction runs first so reclaiming tombstones/pending can keep a
-        delete-heavy index resident; only if the *live* size still exceeds the
-        budget is the cache marked over budget. Called while holding the lock.
+        The eviction check uses the *post-compaction* live size (base minus
+        tombstones plus pending), so a growth-heavy index that cannot fit is
+        marked over budget directly -- without first paying a full base+pending
+        ``vstack`` only to discard it. When it can fit, stale (pending +
+        tombstoned) volume is compacted so reclaiming it keeps a delete-heavy index
+        resident. Called while holding the lock.
         """
 
         base_patches = int(cache["counts"].sum()) if cache["counts"].size else 0
+        live_patches = base_patches - cache["removed_patches"] + cache["pending_patches"]
+        itemsize = np.dtype(self._resident_dtype()).itemsize
+        if (
+            self.resident == "auto"
+            and live_patches * self.dim * itemsize > self.resident_max_bytes
+        ):
+            self._resident_cache = _RESIDENT_OVER_BUDGET
+            return
         # Stale = queued adds + tombstoned base patches. Compact when it reaches
         # ~half the base (amortized O(N)), past a pending-doc cap (bounds the
         # per-query pending vstack), or once the base is entirely tombstoned.
@@ -764,10 +770,6 @@ class LodeLateInteractionIndex:
             or all_base_removed
         ):
             self._cache_compact(cache)
-        itemsize = np.dtype(self._resident_dtype()).itemsize
-        held_patches = int(cache["counts"].sum()) + cache["pending_patches"]
-        if self.resident == "auto" and held_patches * self.dim * itemsize > self.resident_max_bytes:
-            self._resident_cache = _RESIDENT_OVER_BUDGET
 
     def _cache_compact(self, cache: dict[str, Any]) -> None:
         """Folds the pending delta and tombstones into a fresh contiguous base."""
@@ -1066,30 +1068,32 @@ class LodeLateInteractionIndex:
     def _resident_snapshot(self) -> dict[str, Any] | None:
         """Returns a consistent, scan-safe snapshot of the resident cache, or ``None``.
 
-        Taken under the cache lock so it is consistent with concurrent mutations:
-        the large arrays/lists are only ever replaced (never mutated in place), so
-        capturing their references is safe, while the in-place-mutated ``pending``
-        and ``removed`` are copied. The caller then scores the snapshot without
-        holding the lock, so a query runs concurrently with adds/removes on a
-        shared handle. Returns ``None`` when there is no resident cache to scan
-        (``resident=False`` or over budget).
+        Snapshots are consistent with concurrent mutations: the large arrays/lists
+        are only ever replaced (never mutated in place), so capturing their
+        references under the lock is safe, while the in-place-mutated ``pending``
+        and ``removed`` are copied. The caller then scores the snapshot without the
+        lock, so a query runs concurrently with adds/removes on a shared handle.
+
+        The fast path (cache already built) takes only ``_cache_lock``. Building
+        takes ``_write_lock`` first so the from-disk build is ordered against
+        writers -- a row committed before the build is captured by the build, one
+        committed after is folded by that writer's note, never both. Returns
+        ``None`` when there is no resident cache to scan (``resident=False`` or
+        over budget).
         """
 
         if self.resident is False:
             return None
-        with self._cache_lock:
+        if isinstance(self._resident_cache, dict):
+            with self._cache_lock:
+                cache = self._resident_cache
+                if isinstance(cache, dict):
+                    return _snapshot_cache(cache)
+        if self._resident_cache is _RESIDENT_OVER_BUDGET:
+            return None
+        with self._write_lock, self._cache_lock:
             cache = self._resident_cache_get()
-            if cache is None:
-                return None
-            return {
-                "flat": cache["flat"],
-                "counts": cache["counts"],
-                "ids": cache["ids"],
-                "metas": cache["metas"],
-                "patch_counts": cache["patch_counts"],
-                "pending": list(cache["pending"]),
-                "removed": frozenset(cache["removed"]),
-            }
+            return None if cache is None else _snapshot_cache(cache)
 
     def _build_resident_cache(self) -> dict[str, Any] | None:
         """Builds the in-memory matrix from the stored documents.
@@ -1196,6 +1200,24 @@ def _write_li_config(config_path: Path, storage: str, *, fsync: bool) -> None:
         encoding="utf-8",
     )
     durable_replace(tmp, config_path, fsync=fsync)
+
+
+def _snapshot_cache(cache: dict[str, Any]) -> dict[str, Any]:
+    """Captures a scan-safe snapshot of a resident cache (caller holds the lock).
+
+    Base arrays/lists are referenced (they are only ever replaced, not mutated in
+    place); the in-place-mutated pending delta and tombstone set are copied.
+    """
+
+    return {
+        "flat": cache["flat"],
+        "counts": cache["counts"],
+        "ids": cache["ids"],
+        "metas": cache["metas"],
+        "patch_counts": cache["patch_counts"],
+        "pending": list(cache["pending"]),
+        "removed": frozenset(cache["removed"]),
+    }
 
 
 def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:

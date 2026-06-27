@@ -349,6 +349,49 @@ def test_concurrent_same_id_writers_keep_cache_consistent(tmp_path):
     assert live.patch_count == disk.patch_count
 
 
+def test_cold_ingest_does_not_decode_cache_matrices(tmp_path, monkeypatch):
+    # A cold bulk ingest (no resident cache yet) must not decode/retain cache
+    # matrices; the storage roundtrip is deferred until a cache actually exists.
+    calls = [0]
+    real_decode = li_module._decode_matrix
+
+    def counting_decode(*args, **kwargs):
+        calls[0] += 1
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(li_module, "_decode_matrix", counting_decode)
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)  # no search -> cache not built
+    idx.add_documents(
+        [{"id": f"d{i:02d}", "patches": _onehot_matrix([i % DIM])} for i in range(20)]
+    )
+    assert calls[0] == 0  # cold ingest decoded nothing
+    idx.search(_onehot_matrix([0]), k=1)  # builds the cache (decodes the base once)
+    before = calls[0]
+    idx.add_document("new", _onehot_matrix([1]))  # now folds -> decodes this row
+    assert calls[0] > before
+    # and the post-cache add is live (findable without a rebuild/reopen)
+    assert "new" in {h.id for h in idx.search(_onehot_matrix([1]), k=25)}
+
+
+def test_over_budget_growth_evicts_without_compacting(tmp_path, monkeypatch):
+    # When live size cannot fit the budget, the cache evicts directly instead of
+    # paying a full base+pending vstack compaction first.
+    idx = LodeLateInteractionIndex(
+        tmp_path, dim=DIM, resident="auto", resident_max_bytes=DIM * 4 * 4
+    )
+    idx.add_document("a", _onehot_matrix([0]))
+    assert idx._resident_snapshot() is not None  # one patch fits
+    compacts = [0]
+    monkeypatch.setattr(
+        idx, "_cache_compact", lambda cache: compacts.__setitem__(0, compacts[0] + 1)
+    )
+    for i in range(20):  # grow well past the tiny budget
+        idx.add_document(f"x{i:02d}", _onehot_matrix([i % DIM]))
+    assert idx._resident_snapshot() is None  # evicted -> streaming
+    assert compacts[0] == 0  # never compacted on the way out
+    assert idx.search(_onehot_matrix([0]), k=1)[0].id == "a"  # streaming still exact
+
+
 def test_incremental_growth_evicts_over_budget(tmp_path):
     # Start within budget so the cache builds, then grow past it incrementally:
     # the cache evicts and queries fall back to the (exact) streaming path.
