@@ -820,7 +820,9 @@ class LodeDB:
             raise ValueError("k must be positive")
         prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
         normalized_filter = _normalize_filter(filter)
-        if self._native_query_authoritative():
+        if self._native_query_authoritative() and self._native_filter_shortcut_safe(
+            normalized_filter
+        ):
             # Explicit native-on with no parity/shadow validation: the native
             # result is authoritative, so skip the redundant Python oracle query
             # on the hot path. Fall back to Python only when this handle is not
@@ -877,7 +879,9 @@ class LodeDB:
         prepared_vectors = [
             _prepare_vector(vector, self._vector_dim, normalize=normalize) for vector in vectors
         ]
-        if self._native_query_authoritative():
+        if self._native_query_authoritative() and self._native_filter_shortcut_safe(
+            normalized_filter
+        ):
             native_batches = self._native_search_many_by_vector(
                 prepared_vectors, k=int(k), filter=normalized_filter
             )
@@ -1496,6 +1500,26 @@ class LodeDB:
             and not self._native_core_strict_parity
             and self._native_core_write_mode != NativeCoreMode.SHADOW
         )
+
+    @staticmethod
+    def _native_filter_shortcut_safe(normalized_filter: Mapping[str, Any] | None) -> bool:
+        """False when a ``document_ids`` filter would fail engine validation.
+
+        The native-authoritative read path skips the Python engine, which is where
+        ``document_ids`` is validated (nonempty list of nonblank strings). When the
+        filter would be rejected, return False so the caller falls back to the
+        Python path and raises the same error native-off raises, instead of
+        silently returning empty native results. The native path is not disabled.
+        """
+
+        if not normalized_filter:
+            return True
+        document_ids = normalized_filter.get("document_ids")
+        if document_ids is None:
+            return True
+        if not isinstance(document_ids, list) or not document_ids:
+            return False
+        return all(isinstance(item, str) and item.strip() for item in document_ids)
 
     def _native_thread_local(self) -> bool:
         """True when the native engine exists and the caller owns its thread.
