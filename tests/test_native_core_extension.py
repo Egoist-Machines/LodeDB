@@ -102,6 +102,11 @@ def test_native_core_extension_executes_vector_store_flow() -> None:
     assert stats["raw_payload_text_present"] is False
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="the native writer lock uses a BSD flock, implemented for unix only; "
+    "non-unix native standalone writers are not a target and skip the OS lock",
+)
 def test_native_writer_lock_contends_with_python_writer(tmp_path) -> None:
     """A standalone native writer shares the single-writer lock with Python."""
 

@@ -730,6 +730,7 @@ fn persisted_tvim_delta_replays_into_native_index() {
 }
 
 #[test]
+#[cfg(unix)]
 fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
     let path = unique_temp_dir("core_lock");
     // Standalone native writers take the shared <dir>/.lodedb.lock; fail fast on
