@@ -14,6 +14,7 @@ public enum RetrievalMode: String, Sendable {
 
 public final class LodeDB {
     private let vectorDimension: Int
+    private let nativeTextCore: NativeTextCore?
     private var documents: [String: VectorDocument]
 
     public init(vectorDimension: Int) throws {
@@ -21,12 +22,18 @@ public final class LodeDB {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
         self.vectorDimension = vectorDimension
+        self.nativeTextCore = try Self.nativeCoreFromEnvironment(vectorDimension: vectorDimension)
         self.documents = [:]
     }
 
     private init(vectorDimension: Int, documents: [String: VectorDocument]) {
         self.vectorDimension = vectorDimension
+        self.nativeTextCore = nil
         self.documents = documents
+    }
+
+    var nativeCoreEnabled: Bool {
+        nativeTextCore != nil
     }
 
     public var count: Int {
@@ -52,6 +59,17 @@ public final class LodeDB {
     ) throws {
         guard embedder.dimension == vectorDimension else {
             throw LodeDBError.invalidArgument("embedder dimension does not match index")
+        }
+        if let nativeTextCore {
+            try addTextWithNativeCore(
+                nativeTextCore,
+                text: text,
+                id: id,
+                metadata: metadata,
+                embedder: embedder,
+                chunkCharacterLimit: chunkCharacterLimit
+            )
+            return
         }
         let plan = try prepareTextUpsert(
             text,
@@ -221,6 +239,62 @@ public final class LodeDB {
         }
         return LodeDB(vectorDimension: vectorDimension, documents: documents)
     }
+
+    private static func nativeCoreFromEnvironment(vectorDimension: Int) throws -> NativeTextCore? {
+        guard let dylib = ProcessInfo.processInfo.environment["LODEDB_FFI_DYLIB"] else {
+            return nil
+        }
+        let library = try NativeCoreLibrary(path: dylib)
+        return try NativeTextCore(library: library, vectorDimension: vectorDimension)
+    }
+
+    private func addTextWithNativeCore(
+        _ nativeTextCore: NativeTextCore,
+        text: String,
+        id: String,
+        metadata: [String: String],
+        embedder: LodeEmbedder,
+        chunkCharacterLimit: Int
+    ) throws {
+        guard chunkCharacterLimit > 0 else {
+            throw LodeDBError.invalidArgument("chunkCharacterLimit must be positive")
+        }
+        let documentsJSON = try encodeJSON([
+            NativeCoreDocumentJSON(documentID: id, text: text, metadata: metadata)
+        ])
+        let planJSON = try nativeTextCore.prepareTextUpsertJSON(
+            documentsJSON,
+            storeText: true,
+            indexText: true,
+            chunkCharacterLimit: chunkCharacterLimit
+        )
+        let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
+        let chunkTexts = plan.chunksToEmbed.map(\.text)
+        let embeddingStarted = Date()
+        let embeddings = try embedder.embed(texts: chunkTexts)
+        let embeddingTimeMS = Date().timeIntervalSince(embeddingStarted) * 1000
+        guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
+            throw LodeDBError.invalidArgument("embedding dimension does not match index")
+        }
+        _ = try nativeTextCore.applyTextUpsertJSON(
+            planJSON: planJSON,
+            embeddingsJSON: try encodeJSON(embeddings),
+            embeddingTimeMS: embeddingTimeMS
+        )
+        guard let document = plan.documents.first(where: { $0.documentID == id }) else {
+            throw LodeDBError.invalidArgument("native core returned no document plan")
+        }
+        guard let vector = embeddings.first ?? documents[id]?.vector else {
+            throw LodeDBError.invalidArgument("text produced no chunks")
+        }
+        documents[id] = VectorDocument(
+            vector: vector,
+            metadata: document.metadata,
+            text: document.text,
+            chunkID: document.chunks.first?.chunkID ?? id,
+            tokens: document.chunks.flatMap(\.tokens)
+        )
+    }
 }
 
 public struct TextIngestPlan: Equatable, Sendable {
@@ -235,6 +309,58 @@ public struct TextChunk: Equatable, Sendable {
     public let chunkID: String
     public let text: String
     public let tokens: [String]
+}
+
+private struct NativeCoreDocumentJSON: Encodable {
+    let documentID: String
+    let text: String
+    let metadata: [String: String]
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case text
+        case metadata
+    }
+}
+
+private struct NativeIngestPlanJSON: Decodable {
+    let documents: [NativePlanDocumentJSON]
+    let chunksToEmbed: [NativePlanEmbeddingChunkJSON]
+
+    enum CodingKeys: String, CodingKey {
+        case documents
+        case chunksToEmbed = "chunks_to_embed"
+    }
+}
+
+private struct NativePlanDocumentJSON: Decodable {
+    let documentID: String
+    let metadata: [String: String]
+    let text: String?
+    let chunks: [NativePlanDocumentChunkJSON]
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case metadata
+        case text
+        case chunks
+    }
+}
+
+private struct NativePlanDocumentChunkJSON: Decodable {
+    let chunkID: String
+    let text: String
+    let tokens: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case chunkID = "chunk_id"
+        case text
+        case tokens
+    }
+}
+
+private struct NativePlanEmbeddingChunkJSON: Decodable {
+    let text: String
 }
 
 private struct VectorDocument {
@@ -257,6 +383,21 @@ private struct VectorDocument {
         self.chunkID = chunkID ?? ""
         self.tokens = tokens
     }
+}
+
+private func encodeJSON<T: Encodable>(_ value: T) throws -> String {
+    let data = try JSONEncoder().encode(value)
+    guard let text = String(data: data, encoding: .utf8) else {
+        throw LodeDBError.invalidArgument("failed to encode JSON as UTF-8")
+    }
+    return text
+}
+
+private func decodeJSON<T: Decodable>(_ type: T.Type, from text: String) throws -> T {
+    guard let data = text.data(using: .utf8) else {
+        throw LodeDBError.invalidArgument("JSON is not valid UTF-8")
+    }
+    return try JSONDecoder().decode(type, from: data)
 }
 
 private func dot(_ left: [Float], _ right: [Float]) -> Float {

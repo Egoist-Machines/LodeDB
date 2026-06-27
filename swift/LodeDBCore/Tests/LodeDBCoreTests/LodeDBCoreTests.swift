@@ -92,6 +92,29 @@ import Testing
     #expect(resultJSON.contains(#""embedding_time_ms":2.5"#))
 }
 
+@Test func publicTextAddUsesNativePrepareApplyWhenConfigured() throws {
+    guard ProcessInfo.processInfo.environment["LODEDB_FFI_DYLIB"] != nil else {
+        return
+    }
+
+    let db = try LodeDB(vectorDimension: 2)
+    #expect(db.nativeCoreEnabled)
+    let embedder = FixedTestEmbedder(vector: [1, 0])
+    try db.addText(
+        "Alpha launch notes mention error code E-1001.",
+        id: "doc-text",
+        metadata: ["topic": "ops"],
+        embedder: embedder
+    )
+
+    let lexical = try db.search(text: "error code", k: 1, mode: .lexical)
+    #expect(lexical.first?.id == "doc-text")
+    #expect(lexical.first?.chunkID == "doc-text:d9041255442c:0000")
+
+    let vector = try db.search(text: "anything", k: 1, mode: .vector, embedder: embedder)
+    #expect(vector.first?.id == "doc-text")
+}
+
 private struct HashTestEmbedder: LodeEmbedder {
     let dimension: Int
 
@@ -102,5 +125,17 @@ private struct HashTestEmbedder: LodeEmbedder {
             vector[bucket] = 1
             return vector
         }
+    }
+}
+
+private struct FixedTestEmbedder: LodeEmbedder {
+    let vector: [Float]
+
+    var dimension: Int {
+        vector.count
+    }
+
+    func embed(texts: [String]) throws -> [[Float]] {
+        texts.map { _ in vector }
     }
 }
