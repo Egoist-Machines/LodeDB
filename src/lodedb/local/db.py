@@ -709,10 +709,17 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
+        normalized_filter = _normalize_filter(filter)
+        # Text/lexical/hybrid search keeps the Python oracle + parity cross-check
+        # even in native-on: the native lexical/hybrid path still has divergences
+        # from Python (incremental lexical rebuilds, vector-caption lexical, commit
+        # drift), so Python stays authoritative here and native results are only
+        # returned when they match. The authoritative native fast path is applied
+        # to the vector-in search paths, where native is parity-clean.
         response = self._index.query(
             query,
             top_k=int(k),
-            filter=_normalize_filter(filter),
+            filter=normalized_filter,
             mode=resolved_mode,
             include=("metadata",),
         )
@@ -720,7 +727,7 @@ class LodeDB:
         native_hits = self._native_search_text(
             query,
             k=int(k),
-            filter=_normalize_filter(filter),
+            filter=normalized_filter,
             mode=resolved_mode,
         )
         if native_hits is not None:
@@ -812,17 +819,32 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        normalized_filter = _normalize_filter(filter)
+        if self._native_query_authoritative():
+            # Explicit native-on with no parity/shadow validation: the native
+            # result is authoritative, so skip the redundant Python oracle query
+            # on the hot path. Fall back to Python only when this handle is not
+            # natively covered.
+            native_hits = self._native_search_by_vector(
+                prepared, k=int(k), filter=normalized_filter
+            )
+            if native_hits is not None:
+                return native_hits
+            response = self._index.query_vector(
+                prepared, top_k=int(k), filter=normalized_filter, include=("metadata",)
+            )
+            return self._hits_from_result_rows(response.get("results", []))
         response = self._index.query_vector(
             prepared,
             top_k=int(k),
-            filter=_normalize_filter(filter),
+            filter=normalized_filter,
             include=("metadata",),
         )
         python_hits = self._hits_from_result_rows(response.get("results", []))
         native_hits = self._native_search_by_vector(
             prepared,
             k=int(k),
-            filter=_normalize_filter(filter),
+            filter=normalized_filter,
         )
         if native_hits is None:
             return python_hits
@@ -852,14 +874,24 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         normalized_filter = _normalize_filter(filter)
+        prepared_vectors = [
+            _prepare_vector(vector, self._vector_dim, normalize=normalize) for vector in vectors
+        ]
+        if self._native_query_authoritative():
+            native_batches = self._native_search_many_by_vector(
+                prepared_vectors, k=int(k), filter=normalized_filter
+            )
+            if native_batches is not None:
+                return native_batches
+            # Not natively covered: fall back to the Python oracle batch query.
         items = [
             {
-                "vector": _prepare_vector(vector, self._vector_dim, normalize=normalize),
+                "vector": prepared,
                 "top_k": int(k),
                 "filter": normalized_filter,
                 "include": ("metadata",),
             }
-            for vector in vectors
+            for prepared in prepared_vectors
         ]
         batches = self._index.query_vectors_batch(items).get("queries", [])
         if not isinstance(batches, list):
@@ -869,8 +901,11 @@ class LodeDB:
             if not isinstance(item, Mapping):
                 raise RuntimeError("invalid engine response: query item must be an object")
             out.append(self._hits_from_result_rows(item.get("results", [])))
+        if self._native_query_authoritative():
+            # Already tried native above and it was not covered; serve Python.
+            return out
         native_batches = self._native_search_many_by_vector(
-            [item["vector"] for item in items],
+            prepared_vectors,
             k=int(k),
             filter=normalized_filter,
         )
@@ -1446,6 +1481,22 @@ class LodeDB:
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
 
+    def _native_query_authoritative(self) -> bool:
+        """True when explicit native-on should serve reads without the Python oracle.
+
+        In ``NativeCoreMode.ON`` the native result is authoritative, so running the
+        Python query first is redundant work on the hot path (the original cause of
+        native-on being slower than native-off for the public API). The Python
+        oracle is still run for the cross-check when strict parity or shadow-write
+        validation is requested.
+        """
+
+        return (
+            self._native_core_mode == NativeCoreMode.ON
+            and not self._native_core_strict_parity
+            and self._native_core_write_mode != NativeCoreMode.SHADOW
+        )
+
     def _native_thread_local(self) -> bool:
         """True when the native engine exists and the caller owns its thread.
 
@@ -1851,6 +1902,18 @@ class LodeDB:
         python_ids = [hit.id for hit in python_hits]
         native_ids = [hit.id for hit in native_hits]
         if python_ids == native_ids:
+            return
+        # Equal-score ties are a valid ambiguity: with duplicate or exactly-tied
+        # vectors, Python and native may order tied hits differently, and at the
+        # top-k boundary may even select different members of a tie group. Both
+        # are correct top-k results. Treat the results as matching when they are
+        # the same length and every position's score agrees within tolerance; a
+        # genuinely wrong ranking surfaces as a score mismatch, while a
+        # differently-resolved tie does not.
+        if len(python_hits) == len(native_hits) and all(
+            math.isclose(p.score, n.score, rel_tol=1e-5, abs_tol=1e-6)
+            for p, n in zip(python_hits, native_hits, strict=True)
+        ):
             return
         self._native_vector_covered = False
         self._native_text_shadow_enabled = False
