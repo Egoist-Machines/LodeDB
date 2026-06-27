@@ -48,6 +48,29 @@ Do not remove the Python engine oracle from the runtime package until all of the
 Until then, Python engine paths are intentionally retained as compatibility and persistence
 fallbacks rather than archived.
 
+## Current Performance Gate Snapshot
+
+The metrics-only Rust-vs-Python closure benchmark is recorded at
+`benchmarks/native_migration/results/rust_vs_python_local.json`. The latest local run uses
+2,000 deterministic documents, 200 deterministic queries, `dim=64`, and `k=8`.
+
+The artifact reports `pass_fail_summary.passed=true`. Rust/Python elapsed ratios:
+
+| Path | Ratio |
+| --- | ---: |
+| Vector upsert | 0.242 |
+| Unfiltered vector search | 0.920 |
+| Filtered vector search | 0.652 |
+| Batch vector search | 0.303 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.529 |
+| Lexical search | 0.331 |
+| Hybrid search | 0.996 |
+| Persisted reopen/query | 0.598 |
+
+These numbers prove the current deterministic benchmark gates, not removal of the Python oracle.
+The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the
+default-native release cycle are complete.
+
 ## Verification Commands
 
 Focused checks used during the default-on cutover:

@@ -37,6 +37,33 @@ PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 uv run pytest -q \
   tests/test_import_boundary.py
 ```
 
+The side-by-side native-core closure benchmark compares the Python oracle against the Rust path
+on the same deterministic, metrics-only corpus:
+
+```bash
+cargo build --release --manifest-path third_party/turbovec/turbovec-python/Cargo.toml
+LODEDB_NATIVE_CORE_EXTENSION_PATH=third_party/turbovec/target/release/lib_turbovec.dylib \
+  uv run python -m benchmarks.native_migration.rust_vs_python \
+    --documents 2000 --queries 200 --dim 64 \
+    --output benchmarks/native_migration/results/rust_vs_python_local.json
+```
+
+Latest local artifact:
+[`benchmarks/native_migration/results/rust_vs_python_local.json`](../benchmarks/native_migration/results/rust_vs_python_local.json).
+It reports `pass_fail_summary.passed=true` on the migration gates. Rust/Python elapsed ratios
+from that run:
+
+| Row | Ratio |
+| --- | ---: |
+| Vector upsert | 0.242 |
+| Vector search, unfiltered | 0.920 |
+| Vector search, filtered | 0.652 |
+| Batch vector search | 0.303 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.529 |
+| Lexical search | 0.331 |
+| Hybrid search | 0.996 |
+| Persisted reopen/query | 0.598 |
+
 Swift binding verification uses the same metrics-only native core fixtures and does not require
 Python at runtime. From the repo root:
 

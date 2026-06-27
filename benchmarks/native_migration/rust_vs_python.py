@@ -25,6 +25,16 @@ from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.engine.native_adapter import NativeCoreAdapter
 
 _INDEX_ID = "default"
+_RATIO_GATES = {
+    "vector_upsert": 1.0,
+    "vector_search_unfiltered": 1.10,
+    "vector_search_filtered": 1.0,
+    "vector_search_batch": 1.0,
+    "text_upsert_hash_embedder": 1.0,
+    "text_lexical_search": 1.0,
+    "text_hybrid_search": 1.10,
+    "persisted_reopen_query": 1.0,
+}
 
 
 def _measure(label: str, func: Callable[[], int]) -> dict[str, Any]:
@@ -56,6 +66,31 @@ def _comparison(name: str, python_row: dict[str, Any], rust_row: dict[str, Any])
     if ratio is not None:
         out["rust_speedup"] = round(1.0 / ratio, 3) if ratio else None
     return out
+
+
+def _pass_fail_summary(comparisons: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = []
+    for comparison in comparisons:
+        name = str(comparison["name"])
+        ratio = comparison.get("rust_to_python_elapsed_ratio")
+        threshold = _RATIO_GATES[name]
+        checksums_match = bool(comparison["checksums_match"])
+        within_gate = ratio is not None and float(ratio) <= threshold
+        rows.append(
+            {
+                "name": name,
+                "checksums_match": checksums_match,
+                "rust_to_python_elapsed_ratio": ratio,
+                "ratio_threshold": threshold,
+                "passed": checksums_match and within_gate,
+            }
+        )
+    failures = [row["name"] for row in rows if not row["passed"]]
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "comparisons": rows,
+    }
 
 
 def _vector(seed: int, dim: int) -> list[float]:
@@ -629,6 +664,25 @@ def run(
         k=k,
     )
 
+    comparisons = [
+        _comparison("vector_upsert", py_vector_upsert, rust_vector_upsert),
+        _comparison(
+            "vector_search_unfiltered",
+            py_vector_unfiltered_search,
+            rust_vector_unfiltered_search,
+        ),
+        _comparison(
+            "vector_search_filtered",
+            py_vector_filtered_search,
+            rust_vector_filtered_search,
+        ),
+        _comparison("vector_search_batch", py_vector_batch_search, rust_vector_batch_search),
+        _comparison("text_upsert_hash_embedder", py_text_upsert, rust_text_upsert),
+        _comparison("text_lexical_search", py_text_search, rust_text_search),
+        _comparison("text_hybrid_search", py_text_hybrid, rust_text_hybrid),
+        _comparison("persisted_reopen_query", py_reopen, rust_reopen),
+    ]
+
     payload = {
         "suite": "native_migration_rust_vs_python",
         "parameters": {
@@ -642,24 +696,8 @@ def run(
             "abi_version": adapter.abi_version,
             "extension_override": bool(os.environ.get("LODEDB_NATIVE_CORE_EXTENSION_PATH")),
         },
-        "comparisons": [
-            _comparison("vector_upsert", py_vector_upsert, rust_vector_upsert),
-            _comparison(
-                "vector_search_unfiltered",
-                py_vector_unfiltered_search,
-                rust_vector_unfiltered_search,
-            ),
-            _comparison(
-                "vector_search_filtered",
-                py_vector_filtered_search,
-                rust_vector_filtered_search,
-            ),
-            _comparison("vector_search_batch", py_vector_batch_search, rust_vector_batch_search),
-            _comparison("text_upsert_hash_embedder", py_text_upsert, rust_text_upsert),
-            _comparison("text_lexical_search", py_text_search, rust_text_search),
-            _comparison("text_hybrid_search", py_text_hybrid, rust_text_hybrid),
-            _comparison("persisted_reopen_query", py_reopen, rust_reopen),
-        ],
+        "pass_fail_summary": _pass_fail_summary(comparisons),
+        "comparisons": comparisons,
         "summaries": {
             "python_vector": py_vector_stats,
             "rust_vector": rust_vector_stats,
