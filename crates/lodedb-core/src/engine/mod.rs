@@ -197,11 +197,12 @@ impl CoreEngine {
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
-                    content_hash: document
-                        .text
-                        .as_ref()
-                        .map(|text| crate::text::hash::sha256_text(text))
-                        .unwrap_or_else(|| crate::text::hash::sha256_text(&document.document_id)),
+                    // A vector-in document hashes its float32 vector bytes, matching
+                    // the Python writer's `_vector_content_hash`, so the persisted
+                    // content hash is identical across writers: `list_documents`
+                    // output agrees and re-adding the same vector is recognized as
+                    // unchanged regardless of which engine authored the store.
+                    content_hash: crate::text::hash::sha256_f32_le(&document.vector),
                     metadata: document.metadata.clone(),
                     text: retained_text,
                     token_lists,

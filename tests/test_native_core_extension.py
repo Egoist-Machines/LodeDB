@@ -782,6 +782,35 @@ def test_native_write_through_cross_thread_fallback_preserves_writes(tmp_path, m
     assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "thread"
 
 
+def test_native_write_through_vector_content_hash_matches_python(tmp_path, monkeypatch) -> None:
+    """Native write-through persists the same vector content_hash as the Python writer.
+
+    The content hash is public (`list_documents`) and powers the unchanged-vector
+    re-add fast path, so a native-authored store must hash a vector identically to
+    Python (`sha256` of the float32 bytes) or Python would re-encode an identical
+    re-add after reopen.
+    """
+    from lodedb import LodeDB
+
+    vector = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    monkeypatch.delenv("LODEDB_NATIVE_CORE_WRITE", raising=False)
+    py = LodeDB.open_vector_store(tmp_path / "py", vector_dim=8, commit_mode="generation")
+    py.add_vectors(vector, id="a", normalize=False)
+    python_hash = py.list_documents()[0]["content_hash"]
+    py.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    nat = LodeDB.open_vector_store(tmp_path / "nat", vector_dim=8, commit_mode="generation")
+    nat.add_vectors(vector, id="a", normalize=False)
+    native_hash = nat.list_documents()[0]["content_hash"]
+    nat.close()
+
+    assert native_hash == python_hash
+
+
 def test_native_core_on_existing_vector_store_uses_readonly_seed(
     tmp_path, monkeypatch
 ) -> None:

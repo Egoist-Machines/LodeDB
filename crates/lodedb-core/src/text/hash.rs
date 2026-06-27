@@ -13,6 +13,18 @@ pub fn normalized_chunk_hash(text: &str) -> String {
     sha256_text(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// Hashes a float32 vector's little-endian bytes, matching the Python oracle's
+/// `_vector_content_hash` (`sha256(np.float32(vector).tobytes())`). This is the
+/// content hash for a vector-in document, so re-adding an identical vector is a
+/// no-op and the native-authored hash matches the Python writer's.
+pub fn sha256_f32_le(vector: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    sha256_hex(&bytes)
+}
+
 pub(crate) fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0_u8; 32];
