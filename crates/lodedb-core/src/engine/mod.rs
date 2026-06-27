@@ -495,7 +495,6 @@ impl CoreEngine {
         let index = self.index(index_id)?;
         index.require_vectors_mutable()?;
         let base_generation = index.generation;
-        let existing_chunks = index.chunk_vectors_by_id();
         let mut prepared_documents = Vec::with_capacity(documents.len());
         let mut chunks_to_embed = Vec::new();
 
@@ -519,7 +518,10 @@ impl CoreEngine {
                 } else {
                     Vec::new()
                 };
-                let needs_embedding = !existing_chunks.contains_key(&chunk_id);
+                // O(1) existence check via the maintained chunk->owner map rather
+                // than cloning every chunk vector in the corpus just to test
+                // membership (the latter made each incremental text add O(corpus)).
+                let needs_embedding = !index.chunk_owner_by_id.contains_key(&chunk_id);
                 if needs_embedding {
                     chunks_to_embed.push(PlanEmbeddingChunk {
                         document_id: document.document_id.clone(),
@@ -595,7 +597,16 @@ impl CoreEngine {
             .zip(embeddings)
             .map(|(chunk, embedding)| (chunk.chunk_id.clone(), embedding.clone()))
             .collect::<BTreeMap<_, _>>();
-        let existing_chunks = index.chunk_vectors_by_id();
+        // Reusable chunk vectors for chunks the plan keeps but does not re-embed.
+        // Fetch only those (via the O(1) chunk->owner map) instead of cloning the
+        // whole corpus's vectors, which made each incremental text add O(corpus).
+        let existing_chunks = reusable_chunk_vectors(
+            index,
+            plan.documents
+                .iter()
+                .flat_map(|document| document.chunks.iter().map(|chunk| chunk.chunk_id.as_str())),
+            &new_embeddings,
+        );
         let mut chunks_upserted = 0usize;
         let mut reused_chunks = 0usize;
         let mut removed_chunk_ids = BTreeSet::new();
@@ -1355,13 +1366,27 @@ impl CoreEngine {
                 Ok((chunk_id, vector))
             })
             .collect::<Result<BTreeMap<_, _>, CoreError>>()?;
-        let existing_chunks = index.chunk_vectors_by_id();
-        let mut changed_filter_fields = BTreeSet::new();
-        let mut active_chunk_ids = BTreeSet::new();
         let documents = payload
             .get("documents")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_err("WAL embedded payload missing documents"))?;
+        // Reuse vectors only for the chunks these documents reference that are not
+        // in this record's added_chunks, via the O(1) owner map, rather than
+        // cloning the whole corpus on every replayed record.
+        let existing_chunks = reusable_chunk_vectors(
+            index,
+            documents.iter().flat_map(|document| {
+                document
+                    .get("chunk_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+            }),
+            &added_vectors,
+        );
+        let mut changed_filter_fields = BTreeSet::new();
+        let mut active_chunk_ids = BTreeSet::new();
         for document in documents {
             let document_id = document
                 .get("document_id")
@@ -2477,16 +2502,6 @@ impl VectorOnlyIndex {
             .sum()
     }
 
-    fn chunk_vectors_by_id(&self) -> BTreeMap<String, Vec<f32>> {
-        let mut chunks = BTreeMap::new();
-        for record in self.documents.values() {
-            for chunk in &record.chunks {
-                chunks.insert(chunk.chunk_id.clone(), chunk.vector.clone());
-            }
-        }
-        chunks
-    }
-
     fn persistable_chunks(&self) -> Vec<(String, Vec<f32>)> {
         self.documents
             .values()
@@ -2527,6 +2542,29 @@ impl VectorOnlyIndex {
         let record = self.documents.get(document_id)?;
         Some((document_id.clone(), record))
     }
+}
+
+/// Collects the current vectors for the given chunk ids that are NOT in `skip`
+/// (the chunks being freshly (re)embedded). Looks each one up via the O(1)
+/// chunk->owner map instead of cloning every chunk vector in the corpus, so an
+/// incremental text upsert/replay stays O(changed) rather than O(corpus).
+fn reusable_chunk_vectors<'a>(
+    index: &VectorOnlyIndex,
+    chunk_ids: impl Iterator<Item = &'a str>,
+    skip: &BTreeMap<String, Vec<f32>>,
+) -> BTreeMap<String, Vec<f32>> {
+    let mut reused: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    for chunk_id in chunk_ids {
+        if skip.contains_key(chunk_id) || reused.contains_key(chunk_id) {
+            continue;
+        }
+        if let Some((_, record)) = index.document_for_chunk(chunk_id) {
+            if let Some(existing) = record.chunks.iter().find(|chunk| chunk.chunk_id == chunk_id) {
+                reused.insert(chunk_id.to_string(), existing.vector.clone());
+            }
+        }
+    }
+    reused
 }
 
 #[derive(Debug, Clone)]
