@@ -883,3 +883,48 @@ def test_native_write_on_existing_index_text_store_uses_writable_seed(
     assert stats["covered"] is True
     assert stats["write_through"] is True
     assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
+
+
+def test_native_write_through_store_text_false_keeps_raw_text_off_disk(
+    tmp_path, monkeypatch
+) -> None:
+    """store_text=False write-through must not leave the vector caption on disk."""
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8, store_text=False)
+    db.add_vectors([0.0] * 7 + [1.0], id="x", text="SUPERSECRETCAPTION")
+    db.close()
+    on_disk = b"".join(
+        path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
+    )
+    assert b"SUPERSECRETCAPTION" not in on_disk
+
+
+def test_native_write_through_vector_caption_survives_reopen(tmp_path, monkeypatch) -> None:
+    """index_text=True write-through keeps the vector caption lexically searchable."""
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    db = LodeDB(
+        tmp_path,
+        store_text=False,
+        index_text=True,
+        commit_mode="generation",
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    vector = [0.0] * 384
+    vector[0] = 1.0
+    db.add_vectors(vector, id="cap", text="rarecaptiontoken")
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB(
+        tmp_path,
+        store_text=False,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    hits = reopened.search("rarecaptiontoken", k=5, mode="lexical")
+    assert [hit.id for hit in hits] == ["cap"]
+    reopened.close()

@@ -138,6 +138,9 @@ impl CoreEngine {
         documents: &[CoreVectorDocument],
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
+        // Capture the raw-text/lexical retention policy before borrowing the
+        // index (it lives on the persistence options).
+        let (store_text, index_text) = self.text_capture_policy();
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
         // Validate the whole batch before mutating any state. A bad row found
@@ -172,6 +175,25 @@ impl CoreEngine {
                 chunk_id: document.document_id.clone(),
                 vector: document.vector.clone(),
             }];
+            // Mirror Python's vector-in text policy: retain raw text only when
+            // store_text is on, and tokenize the optional caption into the lexical
+            // index only when index_text is on (a vector document is a single
+            // chunk keyed by its document id, so its caption is one token list).
+            let retained_text = if store_text {
+                document.text.clone()
+            } else {
+                None
+            };
+            let caption_tokens: Vec<String> = if index_text {
+                document.text.as_deref().map(tokenize).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let token_lists = if caption_tokens.is_empty() {
+                Vec::new()
+            } else {
+                vec![caption_tokens.clone()]
+            };
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
@@ -181,8 +203,8 @@ impl CoreEngine {
                         .map(|text| crate::text::hash::sha256_text(text))
                         .unwrap_or_else(|| crate::text::hash::sha256_text(&document.document_id)),
                     metadata: document.metadata.clone(),
-                    text: document.text.clone(),
-                    token_lists: Vec::new(),
+                    text: retained_text,
+                    token_lists,
                     chunks: chunks.clone(),
                 },
             );
@@ -200,7 +222,14 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            index.lexical_index.remove_group(&document.document_id);
+            if caption_tokens.is_empty() {
+                index.lexical_index.remove_group(&document.document_id);
+            } else {
+                index.lexical_index.replace_group(
+                    &document.document_id,
+                    &[(document.document_id.clone(), caption_tokens)],
+                );
+            }
             upserted_chunks.push(CoreVectorChunk::new(
                 document.document_id.clone(),
                 document.document_id.clone(),
@@ -237,13 +266,28 @@ impl CoreEngine {
                 &index_key,
                 "upsert_vectors",
                 serde_json::json!({
-                    "vectors": documents.iter().map(|document| serde_json::json!({
-                        "document_id": document.document_id,
-                        "vector": document.vector,
-                        "metadata": document.metadata,
-                        "text": document.text,
-                        "tokens": Value::Null,
-                    })).collect::<Vec<_>>()
+                    "vectors": documents.iter().map(|document| {
+                        // Never write raw text to the WAL when store_text is off
+                        // (privacy). When index_text is on, write the derived
+                        // caption tokens so replay can rebuild lexical postings
+                        // without retaining the raw text on disk.
+                        let text = if store_text {
+                            serde_json::json!(document.text)
+                        } else {
+                            Value::Null
+                        };
+                        let tokens = match (index_text, document.text.as_deref()) {
+                            (true, Some(text)) => serde_json::json!([tokenize(text)]),
+                            _ => Value::Null,
+                        };
+                        serde_json::json!({
+                            "document_id": document.document_id,
+                            "vector": document.vector,
+                            "metadata": document.metadata,
+                            "text": text,
+                            "tokens": tokens,
+                        })
+                    }).collect::<Vec<_>>()
                 }),
             )?;
         }
@@ -1079,6 +1123,17 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// The raw-text (store_text) and lexical-token (index_text) retention policy.
+    /// Persistent engines carry it on their open options; an in-memory engine has
+    /// no on-disk privacy surface, so it captures both (the binding still gates
+    /// what it mirrors).
+    fn text_capture_policy(&self) -> (bool, bool) {
+        match &self.persistence {
+            Some(persistence) => (persistence.store_text, persistence.index_text),
+            None => (true, true),
+        }
+    }
+
     fn append_wal_record(
         &self,
         index_key: &str,
@@ -1116,6 +1171,12 @@ impl CoreEngine {
                     .map(vector_document_from_wal)
                     .collect::<Result<Vec<_>, _>>()?;
                 self.upsert_vectors(index_id, &documents)?;
+                // Restore lexical caption tokens captured in the WAL. Needed when
+                // store_text was off (so raw text was not written and upsert_vectors
+                // re-derived no tokens) but index_text retained the caption tokens.
+                if let Some(vectors) = record.payload.get("vectors").and_then(Value::as_array) {
+                    self.restore_wal_vector_tokens(index_id, vectors)?;
+                }
             }
             "delete_documents" => {
                 let document_ids = record
@@ -1161,6 +1222,48 @@ impl CoreEngine {
                     format!("native WAL replay does not support {other}"),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Restores per-document lexical token lists for replayed vector upserts.
+    /// Each vector document is a single chunk keyed by its document id.
+    fn restore_wal_vector_tokens(
+        &mut self,
+        index_id: &str,
+        vectors: &[Value],
+    ) -> Result<(), CoreError> {
+        let index = self.index_mut(index_id)?;
+        for entry in vectors {
+            let Some(document_id) = entry.get("document_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let token_lists: Vec<Vec<String>> = match entry.get("tokens").and_then(Value::as_array)
+            {
+                Some(arrays) => arrays
+                    .iter()
+                    .map(|inner| {
+                        inner
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .collect(),
+                None => continue,
+            };
+            if let Some(record) = index.documents.get_mut(document_id) {
+                record.token_lists = token_lists.clone();
+            } else {
+                continue;
+            }
+            let units = vec![(
+                document_id.to_string(),
+                token_lists.into_iter().next().unwrap_or_default(),
+            )];
+            index.lexical_index.replace_group(document_id, &units);
         }
         Ok(())
     }
