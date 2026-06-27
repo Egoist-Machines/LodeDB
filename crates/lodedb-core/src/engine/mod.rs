@@ -2322,6 +2322,9 @@ impl VectorOnlyIndex {
     }
 
     fn finalize_filter_fields(&mut self, changed_filter_fields: &BTreeSet<String>) {
+        // Ordered-filter partitions are rebuilt lazily at query time (and invalidated
+        // by `FieldIndex::insert`/`remove`), so writes only need to drop fields that
+        // became empty. This keeps single-row mutations O(changed), not O(cardinality).
         for key in changed_filter_fields {
             if self
                 .field_indexes
@@ -2329,8 +2332,6 @@ impl VectorOnlyIndex {
                 .is_some_and(FieldIndex::is_empty)
             {
                 self.field_indexes.remove(key);
-            } else if let Some(field) = self.field_indexes.get_mut(key) {
-                field.finalize();
             }
         }
     }
@@ -2559,7 +2560,11 @@ fn reusable_chunk_vectors<'a>(
             continue;
         }
         if let Some((_, record)) = index.document_for_chunk(chunk_id) {
-            if let Some(existing) = record.chunks.iter().find(|chunk| chunk.chunk_id == chunk_id) {
+            if let Some(existing) = record
+                .chunks
+                .iter()
+                .find(|chunk| chunk.chunk_id == chunk_id)
+            {
                 reused.insert(chunk_id.to_string(), existing.vector.clone());
             }
         }

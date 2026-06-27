@@ -8,7 +8,6 @@ use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::ast::is_ordered_operator;
 use crate::filter::doc_set::DocSet;
 use crate::filter::field_index::FieldIndex;
-use crate::filter::predicate::{as_number, compare_ordered};
 
 /// Resolves a validated metadata filter to the matching document-id set.
 ///
@@ -175,36 +174,10 @@ fn resolve_operator(
             let operand = operand
                 .as_str()
                 .ok_or_else(|| invalid("validated ordered operand must be a string"))?;
-            Ok(resolve_ordered(ordered, operand, index))
+            Ok(index.resolve_ordered(ordered, operand))
         }
         _ => Err(invalid("unsupported validated operator")),
     }
-}
-
-fn resolve_ordered(op: &str, operand: &str, index: &FieldIndex) -> DocSet {
-    let mut docs = DocSet::new();
-    if let Some(operand_number) = as_number(operand) {
-        for value in index.numeric_values_satisfying(op, operand_number) {
-            if let Some(value_docs) = index.value_docs.get(value) {
-                docs.extend(value_docs.iter().cloned());
-            }
-        }
-        for value in index.nonnumeric_values() {
-            if compare_ordered(value, op, operand) {
-                if let Some(value_docs) = index.value_docs.get(value) {
-                    docs.extend(value_docs.iter().cloned());
-                }
-            }
-        }
-        return docs;
-    }
-
-    for (value, value_docs) in &index.value_docs {
-        if compare_ordered(value, op, operand) {
-            docs.extend(value_docs.iter().cloned());
-        }
-    }
-    docs
 }
 
 fn intersection(left: &DocSet, right: &DocSet) -> DocSet {
