@@ -145,6 +145,30 @@ def test_native_writer_lock_contends_with_python_writer(tmp_path) -> None:
     del native_engine
 
 
+def test_native_core_extension_apply_text_upsert_array_handles_empty_embeddings() -> None:
+    """Re-applying text with no new chunks sends an empty array and must not panic."""
+
+    engine = native_core.CoreEngine()
+    engine.create_index("text", 8, 4)
+    documents = json.dumps([{"document_id": "d", "text": "hello world", "metadata": {}}])
+    plan = _loads(engine.prepare_text_upsert("text", documents, True, True, 900))
+    engine.apply_text_upsert_array(
+        json.dumps(plan), np.asarray([_onehot(0)], dtype=np.float32), 0.0
+    )
+
+    # The same id + content needs no re-embedding, so chunks_to_embed is empty
+    # and the binding passes a (0, 0) float32 array; this must apply cleanly.
+    plan_again = _loads(engine.prepare_text_upsert("text", documents, True, True, 900))
+    assert plan_again["chunks_to_embed"] == []
+    applied = _loads(
+        engine.apply_text_upsert_array(
+            json.dumps(plan_again), np.empty((0, 0), dtype=np.float32), 0.0
+        )
+    )
+    assert applied["embedded_chunks"] == 0
+    assert _loads(engine.stats("text"))["document_count"] == 1
+
+
 def test_native_core_extension_array_vector_paths_match_json() -> None:
     """The array-input vector fast paths return the same hits as the JSON paths."""
 

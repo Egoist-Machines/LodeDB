@@ -1166,6 +1166,12 @@ fn native_optional_value(json: Option<&str>) -> PyResult<Option<Value>> {
 
 fn embeddings_from_array(embeddings: PyReadonlyArray2<f32>) -> PyResult<Vec<Vec<f32>>> {
     let arr = embeddings.as_array();
+    // No rows (e.g. a re-add whose chunks all already exist, so nothing needs
+    // embedding) is valid and must not reach `chunks(ncols)`: an empty `(0, 0)`
+    // array has `ncols == 0`, and `slice.chunks(0)` panics.
+    if arr.nrows() == 0 {
+        return Ok(Vec::new());
+    }
     let slice = arr
         .as_slice()
         .ok_or_else(|| not_contiguous_err("embeddings"))?;
