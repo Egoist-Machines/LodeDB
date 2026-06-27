@@ -78,7 +78,8 @@ The Swift package binds to the same native core through `lodedb-ffi`. In local d
 `LODEDB_FFI_DYLIB` points the Swift wrapper at a built Rust dylib; for distribution,
 `swift/LodeDBCore/scripts/package_xcframework.sh` builds installed Apple Rust targets into a
 native `LodeDBCoreFFI.xcframework`. Swift embedders still run outside the core, matching the
-Python prepare/apply split.
+Python prepare/apply split, and Swift text search uses the native query-plan/search protocol for
+vector, lexical, and hybrid modes while its native handle fully covers the current state.
 
 ## Package layout
 

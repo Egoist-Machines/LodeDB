@@ -23,8 +23,9 @@ existing stores stable.
 - Local development loads the shared Rust C ABI dynamically through `LODEDB_FFI_DYLIB`.
 - When that dylib is configured, Swift text ingestion calls native `prepare_text_upsert` and
   `apply_text_upsert`; Swift embedders still provide embeddings outside the core.
-- Unfiltered vector searches over native-ingested text can query the same native handle through
-  the C ABI. Filtered searches and locally diverged handles fall back to the Swift mirror.
+- Text searches over native-ingested text call the same native query-plan/search protocol for
+  vector, lexical, and hybrid modes while the handle remains covered by native state. Locally
+  diverged handles fall back to the Swift mirror.
 - `scripts/package_xcframework.sh` builds `lodedb-ffi` static libraries for installed Rust
   Apple targets and assembles `LodeDBCoreFFI.xcframework`. It defaults to the host target for
   local verification; set `LODEDB_XCFRAMEWORK_TARGETS` to include iOS device/simulator targets
