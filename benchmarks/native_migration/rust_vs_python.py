@@ -507,9 +507,10 @@ def _rust_text_bench(
                 [
                     [
                         str(hit["document_id"])
-                        for hit in engine.search_embedded_text(
+                        for hit in engine.search_text(
                             _INDEX_ID,
-                            engine.prepare_query_text(query, "lexical"),
+                            query,
+                            "lexical",
                             None,
                             top_k=k,
                         ).get("hits", [])
@@ -524,9 +525,10 @@ def _rust_text_bench(
                 [
                     [
                         str(hit["document_id"])
-                        for hit in engine.search_embedded_text(
+                        for hit in engine.search_text(
                             _INDEX_ID,
-                            engine.prepare_query_text(query, "hybrid"),
+                            query,
+                            "hybrid",
                             embedder.embed_query(query),
                             top_k=k,
                         ).get("hits", [])

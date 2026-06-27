@@ -9,6 +9,7 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -148,17 +149,23 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     assert plan["chunks_to_embed"][0]["document_id"] == "doc-alpha"
     assert plan["chunks_to_embed"][0]["text"] == "Alpha launch notes mention error code E-1001."
 
-    applied = _loads(engine.apply_text_upsert(json.dumps(plan), json.dumps([_onehot(3)]), 1.25))
+    applied = _loads(
+        engine.apply_text_upsert_array(
+            json.dumps(plan),
+            np.asarray([_onehot(3)], dtype=np.float32),
+            1.25,
+        )
+    )
     assert applied["embedded_chunks"] == 1
     assert applied["embedding_time_ms"] == 1.25
 
     query_plan = _loads(engine.prepare_query_text("E-1001", "vector"))
     assert query_plan["requires_embedding"] is True
     hits = _loads(
-        engine.search_embedded_text(
+        engine.search_embedded_text_array(
             "text",
             json.dumps(query_plan),
-            json.dumps(_onehot(3)),
+            np.asarray(_onehot(3), dtype=np.float32),
             1,
             json.dumps({"metadata": {"topic": "ops"}}),
         )

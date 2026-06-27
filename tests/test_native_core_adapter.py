@@ -174,6 +174,29 @@ class FakeCoreEngine:
             }
         )
 
+    def apply_text_upsert_array(
+        self,
+        plan_json: str,
+        embeddings,
+        embedding_time_ms: float,
+    ) -> str:
+        self.applied_plan_json = plan_json
+        plan = json.loads(plan_json)
+        return json.dumps(
+            {
+                "mutation": {
+                    "documents_upserted": len(plan["documents"]),
+                    "documents_deleted": 0,
+                    "chunks_upserted": int(embeddings.shape[0]),
+                    "chunks_deleted": 0,
+                    "generation": 1,
+                },
+                "embedded_chunks": int(embeddings.shape[0]),
+                "reused_chunks": 0,
+                "embedding_time_ms": embedding_time_ms,
+            }
+        )
+
     def prepare_query_text(self, query: str, mode: str) -> str:
         return json.dumps(
             {
@@ -205,6 +228,23 @@ class FakeCoreEngine:
                 ],
                 "total_considered": 1,
             }
+        )
+
+    def search_embedded_text_array(
+        self,
+        index_id: str,
+        query_plan_json: str,
+        query_embedding,
+        top_k: int,
+        filter_json: str | None,
+    ) -> str:
+        assert query_embedding.shape[0] == 2
+        return self.search_embedded_text(
+            index_id,
+            query_plan_json,
+            None,
+            top_k,
+            filter_json,
         )
 
     def stats(self, index_id: str) -> str:
@@ -372,6 +412,8 @@ def test_adapter_wraps_native_engine_text_prepare_apply_flow() -> None:
     query_plan = engine.prepare_query_text("Alpha", "vector")
     hits = engine.search_embedded_text("text", query_plan, (1.0, 0.0), top_k=1)
     assert hits["hits"][0]["document_id"] == "doc-alpha"
+    fast_hits = engine.search_text("text", "Alpha", "vector", (1.0, 0.0), top_k=1)
+    assert fast_hits["hits"][0]["document_id"] == "doc-alpha"
 
 
 def test_adapter_lazily_reports_missing_native_module(monkeypatch) -> None:

@@ -1471,19 +1471,29 @@ class LodeDB:
         ):
             return None
         try:
-            query_plan = self._native_vector_engine.prepare_query_text(query, mode)
             query_embedding = None
-            if bool(query_plan.get("requires_embedding")):
+            if mode in {"vector", "hybrid"}:
                 if self._embedding_backend is None:
                     raise RuntimeError("native text query requires an embedding backend")
                 query_embedding = self._embedding_backend.embed_query(query)
-            payload = self._native_vector_engine.search_embedded_text(
-                _LOCAL_INDEX_ID,
-                query_plan,
-                query_embedding,
-                top_k=k,
-                filter=filter,
-            )
+            if hasattr(self._native_vector_engine, "search_text"):
+                payload = self._native_vector_engine.search_text(
+                    _LOCAL_INDEX_ID,
+                    query,
+                    mode,
+                    query_embedding,
+                    top_k=k,
+                    filter=filter,
+                )
+            else:
+                query_plan = self._native_vector_engine.prepare_query_text(query, mode)
+                payload = self._native_vector_engine.search_embedded_text(
+                    _LOCAL_INDEX_ID,
+                    query_plan,
+                    query_embedding,
+                    top_k=k,
+                    filter=filter,
+                )
         except Exception as exc:
             self._native_vector_covered = False
             self._native_text_shadow_enabled = False

@@ -10,6 +10,7 @@ use lodedb_core::{
     CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchResults,
     CoreSecurityOptions, CoreStats, CoreVectorDocument,
 };
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde::de::DeserializeOwned;
@@ -179,6 +180,22 @@ impl PyCoreEngine {
         )
     }
 
+    fn apply_text_upsert_array(
+        &mut self,
+        plan_json: &str,
+        embeddings: PyReadonlyArray2<f32>,
+        embedding_time_ms: f64,
+    ) -> PyResult<String> {
+        let plan = from_json::<IngestPlan>(plan_json)?;
+        let embeddings = embeddings_from_array(embeddings)?;
+        to_json(
+            &self
+                .inner
+                .apply_text_upsert(&plan, &embeddings, embedding_time_ms)
+                .map_err(core_error_to_py)?,
+        )
+    }
+
     fn prepare_query_text(&self, query: &str, mode: &str) -> PyResult<String> {
         to_json(
             &self
@@ -206,6 +223,31 @@ impl PyCoreEngine {
                     index_id,
                     &query_plan,
                     query_embedding.as_deref(),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(core_error_to_py)?,
+        )
+    }
+
+    fn search_embedded_text_array(
+        &self,
+        index_id: &str,
+        query_plan_json: &str,
+        query_embedding: PyReadonlyArray1<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plan = from_json::<QueryPlan>(query_plan_json)?;
+        let query_embedding = query_embedding_from_array(query_embedding)?;
+        let filter = optional_value(filter_json)?;
+        to_json(
+            &self
+                .inner
+                .search_embedded_text(
+                    index_id,
+                    &query_plan,
+                    Some(&query_embedding),
                     top_k,
                     filter.as_ref(),
                 )
@@ -319,6 +361,29 @@ fn to_json<T: serde::Serialize>(value: &T) -> PyResult<String> {
 
 fn optional_value(json: Option<&str>) -> PyResult<Option<Value>> {
     json.map(from_json).transpose()
+}
+
+fn embeddings_from_array(embeddings: PyReadonlyArray2<f32>) -> PyResult<Vec<Vec<f32>>> {
+    let arr = embeddings.as_array();
+    let slice = arr.as_slice().ok_or_else(|| {
+        PyValueError::new_err(
+            "embeddings must be C-contiguous; call np.ascontiguousarray(...) first",
+        )
+    })?;
+    Ok(slice
+        .chunks(arr.ncols())
+        .map(|row| row.to_vec())
+        .collect::<Vec<_>>())
+}
+
+fn query_embedding_from_array(embedding: PyReadonlyArray1<f32>) -> PyResult<Vec<f32>> {
+    let arr = embedding.as_array();
+    let slice = arr.as_slice().ok_or_else(|| {
+        PyValueError::new_err(
+            "query_embedding must be C-contiguous; call np.ascontiguousarray(...) first",
+        )
+    })?;
+    Ok(slice.to_vec())
 }
 
 fn core_error_to_py(error: CoreError) -> PyErr {

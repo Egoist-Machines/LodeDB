@@ -349,12 +349,29 @@ class NativeCoreEngineHandle:
         *,
         embedding_time_ms: float,
     ) -> dict[str, Any]:
-        embedding_payload = [[float(value) for value in row] for row in embeddings]
         plan_json = (
             plan.native_json
             if isinstance(plan, NativeCorePayload)
             else self._dumps(dict(plan))
         )
+        embedding_rows = tuple(embeddings)
+        array_apply = getattr(self._engine, "apply_text_upsert_array", None)
+        if callable(array_apply):
+            import numpy as np
+
+            embedding_array = (
+                np.ascontiguousarray(embedding_rows, dtype=np.float32)
+                if embedding_rows
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            return self._loads(
+                array_apply(
+                    plan_json,
+                    embedding_array,
+                    float(embedding_time_ms),
+                )
+            )
+        embedding_payload = [[float(value) for value in row] for row in embedding_rows]
         return self._loads(
             self._engine.apply_text_upsert(
                 plan_json,
@@ -380,6 +397,63 @@ class NativeCoreEngineHandle:
             if isinstance(query_plan, NativeCorePayload)
             else self._dumps(dict(query_plan))
         )
+        return self._search_embedded_text_json(
+            index_id,
+            query_plan_json,
+            query_embedding,
+            top_k=top_k,
+            filter=filter,
+        )
+
+    def search_text(
+        self,
+        index_id: str,
+        query: str,
+        mode: str,
+        query_embedding: Iterable[float] | None,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query_plan_json = self._dumps(
+            {
+                "query": str(query),
+                "mode": str(mode),
+                "query_tokens": [],
+                "requires_embedding": mode in {"vector", "hybrid"},
+            }
+        )
+        return self._search_embedded_text_json(
+            index_id,
+            query_plan_json,
+            query_embedding,
+            top_k=top_k,
+            filter=filter,
+        )
+
+    def _search_embedded_text_json(
+        self,
+        index_id: str,
+        query_plan_json: str,
+        query_embedding: Iterable[float] | None,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        array_search = getattr(self._engine, "search_embedded_text_array", None)
+        if query_embedding is not None and callable(array_search):
+            import numpy as np
+
+            query_array = np.ascontiguousarray(tuple(query_embedding), dtype=np.float32)
+            return self._loads(
+                array_search(
+                    str(index_id),
+                    query_plan_json,
+                    query_array,
+                    int(top_k),
+                    None if filter is None else self._dumps(dict(filter)),
+                )
+            )
         return self._loads(
             self._engine.search_embedded_text(
                 str(index_id),
