@@ -19,6 +19,14 @@ from typing import Any, Protocol
 from lodedb.engine.core import EngineDocument, EngineQuery, EngineResponse, EngineVectorDocument
 
 
+class NativeCorePayload(dict[str, Any]):
+    """Native JSON-backed dict for private adapter round-trips."""
+
+    def __init__(self, payload: Mapping[str, Any], *, native_json: str) -> None:
+        super().__init__(payload)
+        self.native_json = native_json
+
+
 class NativeCoreModule(Protocol):
     """Subset of the hidden native module used by the adapter."""
 
@@ -325,15 +333,14 @@ class NativeCoreEngineHandle:
         chunk_character_limit: int,
     ) -> dict[str, Any]:
         payload = [NativeCoreAdapter.document_payload(document) for document in documents]
-        return self._loads(
-            self._engine.prepare_text_upsert(
-                str(index_id),
-                self._dumps(payload),
-                bool(store_text),
-                bool(index_text),
-                int(chunk_character_limit),
-            )
+        plan_json = self._engine.prepare_text_upsert(
+            str(index_id),
+            self._dumps(payload),
+            bool(store_text),
+            bool(index_text),
+            int(chunk_character_limit),
         )
+        return self._loads_native_payload(plan_json)
 
     def apply_text_upsert(
         self,
@@ -343,16 +350,21 @@ class NativeCoreEngineHandle:
         embedding_time_ms: float,
     ) -> dict[str, Any]:
         embedding_payload = [[float(value) for value in row] for row in embeddings]
+        plan_json = (
+            plan.native_json
+            if isinstance(plan, NativeCorePayload)
+            else self._dumps(dict(plan))
+        )
         return self._loads(
             self._engine.apply_text_upsert(
-                self._dumps(dict(plan)),
+                plan_json,
                 self._dumps(embedding_payload),
                 float(embedding_time_ms),
             )
         )
 
     def prepare_query_text(self, query: str, mode: str) -> dict[str, Any]:
-        return self._loads(self._engine.prepare_query_text(str(query), str(mode)))
+        return self._loads_native_payload(self._engine.prepare_query_text(str(query), str(mode)))
 
     def search_embedded_text(
         self,
@@ -363,10 +375,15 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        query_plan_json = (
+            query_plan.native_json
+            if isinstance(query_plan, NativeCorePayload)
+            else self._dumps(dict(query_plan))
+        )
         return self._loads(
             self._engine.search_embedded_text(
                 str(index_id),
-                self._dumps(dict(query_plan)),
+                query_plan_json,
                 None
                 if query_embedding is None
                 else self._dumps([float(value) for value in query_embedding]),
@@ -394,3 +411,10 @@ class NativeCoreEngineHandle:
         if not isinstance(value, dict):
             raise RuntimeError("native core returned a non-object JSON payload")
         return value
+
+    @staticmethod
+    def _loads_native_payload(payload: str) -> NativeCorePayload:
+        value = json.loads(payload)
+        if not isinstance(value, dict):
+            raise RuntimeError("native core returned a non-object JSON payload")
+        return NativeCorePayload(value, native_json=payload)

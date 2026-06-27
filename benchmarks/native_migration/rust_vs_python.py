@@ -314,6 +314,120 @@ def _rust_vector_bench(
     return upsert, unfiltered_search, filtered_search, batch_search, summary
 
 
+def _python_reopen_bench(
+    documents: list[EngineVectorDocument],
+    queries: list[list[float]],
+    *,
+    dim: int,
+    k: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="lodedb-py-reopen-bench-") as tmp:
+        path = Path(tmp) / "vectors"
+        db = LodeDB.open_vector_store(
+            path,
+            vector_dim=dim,
+            commit_mode="generation",
+        )
+        try:
+            db.add_vectors_many(
+                [
+                    {
+                        "id": document.document_id,
+                        "vector": document.vector,
+                        "metadata": document.metadata,
+                    }
+                    for document in documents
+                ],
+                normalize=False,
+            )
+        finally:
+            db.close()
+
+        def reopen_and_query() -> int:
+            reopened = LodeDB.open_vector_store(
+                path,
+                vector_dim=dim,
+                commit_mode="generation",
+                read_only=True,
+            )
+            try:
+                return _hit_checksum(
+                    [
+                        [
+                            hit.id
+                            for hit in reopened.search_by_vector(
+                                query,
+                                k=k,
+                                normalize=False,
+                            )
+                        ]
+                        for query in queries
+                    ]
+                )
+            finally:
+                reopened.close()
+
+        reopen = _measure("python_persisted_reopen_query", reopen_and_query)
+        summary = {"document_count": len(documents), "chunk_count": len(documents)}
+    return reopen, summary
+
+
+def _rust_reopen_bench(
+    adapter: NativeCoreAdapter,
+    documents: list[EngineVectorDocument],
+    queries: list[list[float]],
+    *,
+    dim: int,
+    k: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="lodedb-rust-reopen-bench-") as tmp:
+        path = Path(tmp) / "vectors"
+        engine = adapter.open_engine(
+            path=path,
+            read_only=False,
+            durability="relaxed",
+            commit_mode="generation",
+            store_text=True,
+            index_text=True,
+        )
+        try:
+            engine.create_index(_INDEX_ID, vector_dim=dim, bit_width=4)
+            engine.upsert_vectors(_INDEX_ID, documents)
+            engine.persist()
+        finally:
+            engine.close()
+
+        def reopen_and_query() -> int:
+            reopened = adapter.open_readonly_engine(
+                path,
+                durability="relaxed",
+                commit_mode="generation",
+                store_text=True,
+                index_text=True,
+            )
+            try:
+                return _hit_checksum(
+                    [
+                        [
+                            str(hit["document_id"])
+                            for hit in reopened.query_vector(
+                                _INDEX_ID,
+                                query,
+                                top_k=k,
+                                filter=None,
+                            ).get("hits", [])
+                        ]
+                        for query in queries
+                    ]
+                )
+            finally:
+                reopened.close()
+
+        reopen = _measure("rust_persisted_reopen_query", reopen_and_query)
+        summary = {"document_count": len(documents), "chunk_count": len(documents)}
+    return reopen, summary
+
+
 def _python_text_bench(documents: list[EngineDocument], queries: list[str], *, k: int) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -499,6 +613,19 @@ def run(
         text_queries,
         k=k,
     )
+    py_reopen, py_reopen_stats = _python_reopen_bench(
+        vector_documents,
+        query_vectors,
+        dim=dim,
+        k=k,
+    )
+    rust_reopen, rust_reopen_stats = _rust_reopen_bench(
+        adapter,
+        vector_documents,
+        query_vectors,
+        dim=dim,
+        k=k,
+    )
 
     payload = {
         "suite": "native_migration_rust_vs_python",
@@ -529,12 +656,15 @@ def run(
             _comparison("text_upsert_hash_embedder", py_text_upsert, rust_text_upsert),
             _comparison("text_lexical_search", py_text_search, rust_text_search),
             _comparison("text_hybrid_search", py_text_hybrid, rust_text_hybrid),
+            _comparison("persisted_reopen_query", py_reopen, rust_reopen),
         ],
         "summaries": {
             "python_vector": py_vector_stats,
             "rust_vector": rust_vector_stats,
             "python_text": py_text_stats,
             "rust_text": rust_text_stats,
+            "python_reopen": py_reopen_stats,
+            "rust_reopen": rust_reopen_stats,
         },
     }
     if output is not None:

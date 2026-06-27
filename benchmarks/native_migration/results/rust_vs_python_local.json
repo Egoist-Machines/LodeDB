@@ -4,71 +4,81 @@
       "checksums_match": true,
       "name": "vector_upsert",
       "python_checksum": 2000,
-      "python_elapsed_ms": 220.019,
+      "python_elapsed_ms": 238.416,
       "rust_checksum": 2000,
-      "rust_elapsed_ms": 53.138,
-      "rust_speedup": 4.132,
-      "rust_to_python_elapsed_ratio": 0.242
+      "rust_elapsed_ms": 57.923,
+      "rust_speedup": 4.115,
+      "rust_to_python_elapsed_ratio": 0.243
     },
     {
       "checksums_match": true,
       "name": "vector_search_unfiltered",
       "python_checksum": 870891335,
-      "python_elapsed_ms": 123.139,
+      "python_elapsed_ms": 133.112,
       "rust_checksum": 870891335,
-      "rust_elapsed_ms": 112.404,
-      "rust_speedup": 1.095,
-      "rust_to_python_elapsed_ratio": 0.913
+      "rust_elapsed_ms": 120.521,
+      "rust_speedup": 1.105,
+      "rust_to_python_elapsed_ratio": 0.905
     },
     {
       "checksums_match": true,
       "name": "vector_search_filtered",
       "python_checksum": 141441124,
-      "python_elapsed_ms": 51.241,
+      "python_elapsed_ms": 60.514,
       "rust_checksum": 141441124,
-      "rust_elapsed_ms": 32.928,
-      "rust_speedup": 1.555,
-      "rust_to_python_elapsed_ratio": 0.643
+      "rust_elapsed_ms": 38.067,
+      "rust_speedup": 1.59,
+      "rust_to_python_elapsed_ratio": 0.629
     },
     {
       "checksums_match": true,
       "name": "vector_search_batch",
       "python_checksum": 870891335,
-      "python_elapsed_ms": 33.082,
+      "python_elapsed_ms": 36.026,
       "rust_checksum": 870891335,
-      "rust_elapsed_ms": 8.898,
-      "rust_speedup": 3.717,
-      "rust_to_python_elapsed_ratio": 0.269
+      "rust_elapsed_ms": 9.632,
+      "rust_speedup": 3.745,
+      "rust_to_python_elapsed_ratio": 0.267
     },
     {
       "checksums_match": true,
       "name": "text_upsert_hash_embedder",
       "python_checksum": 2000,
-      "python_elapsed_ms": 321.716,
+      "python_elapsed_ms": 350.036,
       "rust_checksum": 2000,
-      "rust_elapsed_ms": 449.666,
-      "rust_speedup": 0.715,
-      "rust_to_python_elapsed_ratio": 1.398
+      "rust_elapsed_ms": 478.087,
+      "rust_speedup": 0.732,
+      "rust_to_python_elapsed_ratio": 1.366
     },
     {
       "checksums_match": true,
       "name": "text_lexical_search",
       "python_checksum": 996602868,
-      "python_elapsed_ms": 215.924,
+      "python_elapsed_ms": 238.358,
       "rust_checksum": 996602868,
-      "rust_elapsed_ms": 72.084,
-      "rust_speedup": 2.994,
-      "rust_to_python_elapsed_ratio": 0.334
+      "rust_elapsed_ms": 79.095,
+      "rust_speedup": 3.012,
+      "rust_to_python_elapsed_ratio": 0.332
     },
     {
       "checksums_match": true,
       "name": "text_hybrid_search",
       "python_checksum": 264958560,
-      "python_elapsed_ms": 225.337,
+      "python_elapsed_ms": 254.841,
       "rust_checksum": 264958560,
-      "rust_elapsed_ms": 253.62,
-      "rust_speedup": 0.888,
-      "rust_to_python_elapsed_ratio": 1.126
+      "rust_elapsed_ms": 283.054,
+      "rust_speedup": 0.9,
+      "rust_to_python_elapsed_ratio": 1.111
+    },
+    {
+      "checksums_match": true,
+      "name": "persisted_reopen_query",
+      "python_checksum": 870891335,
+      "python_elapsed_ms": 382.649,
+      "rust_checksum": 870891335,
+      "rust_elapsed_ms": 227.207,
+      "rust_speedup": 1.684,
+      "rust_to_python_elapsed_ratio": 0.594
     }
   ],
   "native_core": {
@@ -84,11 +94,19 @@
   },
   "suite": "native_migration_rust_vs_python",
   "summaries": {
+    "python_reopen": {
+      "chunk_count": 2000,
+      "document_count": 2000
+    },
     "python_text": {
       "chunk_count": 2000,
       "document_count": 2000
     },
     "python_vector": {
+      "chunk_count": 2000,
+      "document_count": 2000
+    },
+    "rust_reopen": {
       "chunk_count": 2000,
       "document_count": 2000
     },

@@ -29,6 +29,8 @@ class FakeCoreEngine:
         self.index: tuple[str, int, int] | None = None
         self.documents: list[dict] = []
         self.open_options: dict | None = None
+        self.last_plan_json: str | None = None
+        self.applied_plan_json: str | None = None
 
     @staticmethod
     def open(options_json: str) -> FakeCoreEngine:
@@ -115,7 +117,7 @@ class FakeCoreEngine:
     ) -> str:
         documents = json.loads(documents_json)
         document = documents[0]
-        return json.dumps(
+        self.last_plan_json = json.dumps(
             {
                 "plan_id": 0,
                 "index_id": index_id,
@@ -146,6 +148,7 @@ class FakeCoreEngine:
                 "index_text": index_text,
             }
         )
+        return self.last_plan_json
 
     def apply_text_upsert(
         self,
@@ -153,6 +156,7 @@ class FakeCoreEngine:
         embeddings_json: str,
         embedding_time_ms: float,
     ) -> str:
+        self.applied_plan_json = plan_json
         plan = json.loads(plan_json)
         embeddings = json.loads(embeddings_json)
         return json.dumps(
@@ -363,6 +367,7 @@ def test_adapter_wraps_native_engine_text_prepare_apply_flow() -> None:
     applied = engine.apply_text_upsert(plan, ([1.0, 0.0],), embedding_time_ms=2.5)
     assert applied["embedded_chunks"] == 1
     assert applied["embedding_time_ms"] == 2.5
+    assert engine._engine.applied_plan_json == engine._engine.last_plan_json
 
     query_plan = engine.prepare_query_text("Alpha", "vector")
     hits = engine.search_embedded_text("text", query_plan, (1.0, 0.0), top_k=1)
