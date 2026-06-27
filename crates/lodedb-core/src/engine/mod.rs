@@ -1,6 +1,7 @@
 //! Native core engine.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +11,8 @@ use serde_json::Value;
 use turbovec::IdMapIndex;
 
 use crate::error::{CoreError, CoreErrorCode};
-use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter};
+use crate::filter::doc_set::DocSet;
+use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter, FieldIndex};
 use crate::lexical::rrf::RRF_C;
 use crate::lexical::{reciprocal_rank_fusion, tokenize, Bm25Index};
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
@@ -19,11 +21,13 @@ use crate::types::{
     CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult, CoreOpenOptions,
     CoreSearchHit, CoreSearchResults, CoreVectorDocument,
 };
+use crate::vector::index::CoreVectorChunk;
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
+use crate::vector::turbovec::TurboVecNativeIndex;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 
 /// In-memory vector-only native core engine.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CoreEngine {
     indexes: BTreeMap<String, VectorOnlyIndex>,
     next_plan_id: u64,
@@ -123,6 +127,7 @@ impl CoreEngine {
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
         let mut changed = 0usize;
+        let mut changed_filter_fields = BTreeSet::new();
         for document in documents {
             if document.document_id.trim().is_empty() {
                 return invalid("document_id is required");
@@ -130,21 +135,39 @@ impl CoreEngine {
             if document.vector.len() != index.vector_dim {
                 return invalid("vector dimension does not match index");
             }
-            index.documents.insert(
+            let chunks = vec![ChunkRecord {
+                chunk_id: document.document_id.clone(),
+                vector: document.vector.clone(),
+            }];
+            let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
                     token_lists: Vec::new(),
-                    chunks: vec![ChunkRecord {
-                        chunk_id: document.document_id.clone(),
-                        vector: document.vector.clone(),
-                    }],
+                    chunks: chunks.clone(),
                 },
             );
+            if let Some(old_record) = old_record {
+                index.remove_document_indexes(
+                    &document.document_id,
+                    &old_record.metadata,
+                    &old_record.chunks,
+                    &mut changed_filter_fields,
+                );
+            }
+            index.add_document_indexes(
+                &document.document_id,
+                &document.metadata,
+                &chunks,
+                &mut changed_filter_fields,
+            );
+            index.lexical_index.remove_group(&document.document_id);
             changed += 1;
         }
         if changed > 0 {
+            index.finalize_filter_fields(&changed_filter_fields);
+            index.vector_index.replace(None);
             index.generation += 1;
         }
         Ok(CoreMutationResult {
@@ -168,6 +191,7 @@ impl CoreEngine {
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
+        let mut changed_filter_fields = BTreeSet::new();
         for document_id in document_ids {
             if document_id.trim().is_empty() {
                 return invalid("document_id is required");
@@ -176,11 +200,20 @@ impl CoreEngine {
                 let Some(record) = index.documents.remove(document_id) else {
                     continue;
                 };
+                index.remove_document_indexes(
+                    document_id,
+                    &record.metadata,
+                    &record.chunks,
+                    &mut changed_filter_fields,
+                );
+                index.lexical_index.remove_group(document_id);
                 deleted += 1;
                 deleted_chunks += record.chunks.len();
             }
         }
         if deleted > 0 {
+            index.finalize_filter_fields(&changed_filter_fields);
+            index.vector_index.replace(None);
             index.delete_count += deleted;
             index.deleted_chunk_count += deleted_chunks;
             index.generation += 1;
@@ -205,14 +238,35 @@ impl CoreEngine {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
-        let Some(record) = index.documents.get_mut(document_id) else {
+        let Some(record) = index.documents.get(document_id) else {
             return invalid("document not found");
         };
+        let old_metadata = record.metadata.clone();
+        let chunks = record.chunks.clone();
+        let metadata_changed = metadata.is_some();
+        let mut changed_filter_fields = BTreeSet::new();
+        if metadata_changed {
+            index.remove_document_indexes(
+                document_id,
+                &old_metadata,
+                &chunks,
+                &mut changed_filter_fields,
+            );
+        }
+        let record = index
+            .documents
+            .get_mut(document_id)
+            .ok_or_else(|| invalid_err("document not found"))?;
         if let Some(metadata) = metadata {
             record.metadata = metadata;
         }
         if let Some(text) = text {
             record.text = text;
+        }
+        if metadata_changed {
+            let metadata = record.metadata.clone();
+            index.add_document_indexes(document_id, &metadata, &chunks, &mut changed_filter_fields);
+            index.finalize_filter_fields(&changed_filter_fields);
         }
         index.generation += 1;
         Ok(CoreMutationResult {
@@ -256,7 +310,7 @@ impl CoreEngine {
                 let occurrence = *occurrences.get(&chunk_hash).unwrap_or(&0);
                 occurrences.insert(chunk_hash.clone(), occurrence + 1);
                 let chunk_id = chunk_id_for_hash(&document.document_id, &chunk_hash, occurrence);
-                let tokens = if index_text {
+                let tokens = if index_text || store_text {
                     tokenize(&piece)
                 } else {
                     Vec::new()
@@ -335,12 +389,18 @@ impl CoreEngine {
         let existing_chunks = index.chunk_vectors_by_id();
         let mut chunks_upserted = 0usize;
         let mut reused_chunks = 0usize;
+        let mut changed_filter_fields = BTreeSet::new();
         for document in &plan.documents {
             let mut chunks = Vec::with_capacity(document.chunks.len());
             let token_lists = document
                 .chunks
                 .iter()
                 .map(|chunk| chunk.tokens.clone())
+                .collect::<Vec<_>>();
+            let lexical_units = document
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.chunk_id.clone(), chunk.tokens.clone()))
                 .collect::<Vec<_>>();
             for chunk in &document.chunks {
                 let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
@@ -357,17 +417,36 @@ impl CoreEngine {
                     vector,
                 });
             }
-            index.documents.insert(
+            let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
                     token_lists,
-                    chunks,
+                    chunks: chunks.clone(),
                 },
             );
+            if let Some(old_record) = old_record {
+                index.remove_document_indexes(
+                    &document.document_id,
+                    &old_record.metadata,
+                    &old_record.chunks,
+                    &mut changed_filter_fields,
+                );
+            }
+            index.add_document_indexes(
+                &document.document_id,
+                &document.metadata,
+                &chunks,
+                &mut changed_filter_fields,
+            );
+            index
+                .lexical_index
+                .replace_group(&document.document_id, &lexical_units);
         }
         if !plan.documents.is_empty() {
+            index.finalize_filter_fields(&changed_filter_fields);
+            index.vector_index.replace(None);
             index.generation += 1;
         }
         Ok(TextApplyResult {
@@ -470,38 +549,38 @@ impl CoreEngine {
             return invalid("top_k must be positive");
         }
         let index = self.index(index_id)?;
-        let candidates = index.resolve_filter(filter)?;
-        let total_considered = candidates.len();
-        let mut unit_ids = Vec::new();
-        let mut token_lists = Vec::new();
-        let mut group_ids = Vec::new();
-        let mut hit_payloads = BTreeMap::new();
-        for document_id in &candidates {
-            let Some(record) = index.documents.get(document_id) else {
-                continue;
-            };
-            for (offset, chunk) in record.chunks.iter().enumerate() {
-                unit_ids.push(chunk.chunk_id.clone());
-                token_lists.push(record.token_lists.get(offset).cloned().unwrap_or_default());
-                group_ids.push(document_id.clone());
-                hit_payloads.insert(
-                    chunk.chunk_id.clone(),
-                    (document_id.clone(), record.metadata.clone()),
-                );
+        let candidates = filter
+            .map(|filter| index.resolve_filter(Some(filter)))
+            .transpose()?;
+        let total_considered = candidates
+            .as_ref()
+            .map_or(index.all_docs.len(), BTreeSet::len);
+        let allowed_positions = candidates.as_ref().map(|candidates| {
+            let mut positions = BTreeSet::new();
+            for document_id in candidates {
+                let Some(record) = index.documents.get(document_id) else {
+                    continue;
+                };
+                for chunk in &record.chunks {
+                    if let Some(position) = index.lexical_index.position_of(&chunk.chunk_id) {
+                        positions.insert(position);
+                    }
+                }
             }
-        }
-        let lexical = Bm25Index::from_token_lists(&unit_ids, &token_lists, Some(&group_ids))?;
-        let hits = lexical
-            .rank(&query_plan.query, Some(top_k), None)
+            positions
+        });
+        let hits = index
+            .lexical_index
+            .rank(&query_plan.query, Some(top_k), allowed_positions.as_ref())
             .into_iter()
             .filter_map(|(chunk_id, score)| {
-                hit_payloads
-                    .get(&chunk_id)
-                    .map(|(document_id, metadata)| CoreSearchHit {
-                        document_id: document_id.clone(),
+                index
+                    .document_for_chunk(&chunk_id)
+                    .map(|(document_id, record)| CoreSearchHit {
+                        document_id,
                         chunk_id,
                         score: score as f32,
-                        metadata: metadata.clone(),
+                        metadata: record.metadata.clone(),
                     })
             })
             .collect();
@@ -527,6 +606,29 @@ impl CoreEngine {
             return invalid("query dimension does not match index");
         }
         index.require_vectors_seeded()?;
+        if index.chunk_count() == 0 {
+            return Ok(CoreSearchResults {
+                hits: Vec::new(),
+                total_considered: 0,
+            });
+        }
+        match index.query_vector_turbovec(query_vector, top_k, filter) {
+            Ok(results) => Ok(results),
+            Err(error) if error.code() == CoreErrorCode::Unsupported => {
+                self.query_vector_scalar(index_id, query_vector, top_k, filter)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn query_vector_scalar(
+        &self,
+        index_id: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        let index = self.index(index_id)?;
         let rotated_query;
         let query = if let Some(rotation) = &index.query_rotation {
             rotated_query = rotate_query(query_vector, rotation, index.vector_dim)?;
@@ -890,6 +992,18 @@ fn index_from_loaded_store(
             },
         );
     }
+    let lexical_index = lexical_index_for_documents(&documents);
+    let (field_indexes, all_docs) = filter_indexes_for_documents(&documents);
+    let chunk_owner_by_id = chunk_owner_by_id_for_documents(&documents);
+    let vector_chunks = vector_chunks_for_documents(&documents);
+    let vector_index = match loaded.tvim_path.as_ref() {
+        Some(tvim_path) if vectors_seeded => Some(TurboVecNativeIndex::load(
+            tvim_path,
+            &vector_chunks,
+            loaded.generation,
+        )?),
+        _ => None,
+    };
     Ok(VectorOnlyIndex {
         index_id,
         index_key,
@@ -938,7 +1052,72 @@ fn index_from_loaded_store(
             .get("deleted_chunk_count")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
+        lexical_index,
+        vector_index: RefCell::new(vector_index),
+        field_indexes,
+        all_docs,
+        chunk_owner_by_id,
     })
+}
+
+fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> Bm25Index {
+    let mut lexical_index = Bm25Index::empty();
+    for (document_id, record) in documents {
+        let units = record
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(offset, chunk)| {
+                (
+                    chunk.chunk_id.clone(),
+                    record.token_lists.get(offset).cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        lexical_index.replace_group(document_id, &units);
+    }
+    lexical_index
+}
+
+fn vector_chunks_for_documents(
+    documents: &BTreeMap<String, DocumentRecord>,
+) -> Vec<CoreVectorChunk> {
+    documents
+        .iter()
+        .flat_map(|(document_id, record)| {
+            record.chunks.iter().map(|chunk| {
+                CoreVectorChunk::new(
+                    chunk.chunk_id.clone(),
+                    document_id.clone(),
+                    chunk.vector.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn filter_indexes_for_documents(
+    documents: &BTreeMap<String, DocumentRecord>,
+) -> (BTreeMap<String, FieldIndex>, DocSet) {
+    let metadata_by_id = documents
+        .iter()
+        .map(|(document_id, record)| (document_id.clone(), record.metadata.clone()))
+        .collect::<BTreeMap<_, _>>();
+    build_field_indexes(&metadata_by_id)
+}
+
+fn chunk_owner_by_id_for_documents(
+    documents: &BTreeMap<String, DocumentRecord>,
+) -> HashMap<String, String> {
+    documents
+        .iter()
+        .flat_map(|(document_id, record)| {
+            record
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.chunk_id.clone(), document_id.clone()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1139,7 +1318,6 @@ fn core_io_error(error: std::io::Error) -> CoreError {
     )
 }
 
-#[derive(Debug, Clone)]
 struct VectorOnlyIndex {
     index_id: String,
     index_key: String,
@@ -1158,6 +1336,11 @@ struct VectorOnlyIndex {
     query_rotation: Option<Vec<f32>>,
     delete_count: usize,
     deleted_chunk_count: usize,
+    lexical_index: Bm25Index,
+    vector_index: RefCell<Option<TurboVecNativeIndex>>,
+    field_indexes: BTreeMap<String, FieldIndex>,
+    all_docs: DocSet,
+    chunk_owner_by_id: HashMap<String, String>,
 }
 
 impl VectorOnlyIndex {
@@ -1180,6 +1363,11 @@ impl VectorOnlyIndex {
             query_rotation: None,
             delete_count: 0,
             deleted_chunk_count: 0,
+            lexical_index: Bm25Index::empty(),
+            vector_index: RefCell::new(None),
+            field_indexes: BTreeMap::new(),
+            all_docs: DocSet::new(),
+            chunk_owner_by_id: HashMap::new(),
         }
     }
 
@@ -1204,10 +1392,61 @@ impl VectorOnlyIndex {
         Ok(())
     }
 
+    fn add_document_indexes(
+        &mut self,
+        document_id: &str,
+        metadata: &CoreMetadata,
+        chunks: &[ChunkRecord],
+        changed_filter_fields: &mut BTreeSet<String>,
+    ) {
+        self.all_docs.insert(document_id.to_string());
+        for (key, value) in metadata {
+            let field = self.field_indexes.entry(key.clone()).or_default();
+            field.insert(document_id.to_string(), value.clone());
+            changed_filter_fields.insert(key.clone());
+        }
+        for chunk in chunks {
+            self.chunk_owner_by_id
+                .insert(chunk.chunk_id.clone(), document_id.to_string());
+        }
+    }
+
+    fn remove_document_indexes(
+        &mut self,
+        document_id: &str,
+        metadata: &CoreMetadata,
+        chunks: &[ChunkRecord],
+        changed_filter_fields: &mut BTreeSet<String>,
+    ) {
+        self.all_docs.remove(document_id);
+        for (key, value) in metadata {
+            if let Some(field) = self.field_indexes.get_mut(key) {
+                field.remove(document_id, value);
+                changed_filter_fields.insert(key.clone());
+            }
+        }
+        for chunk in chunks {
+            self.chunk_owner_by_id.remove(&chunk.chunk_id);
+        }
+    }
+
+    fn finalize_filter_fields(&mut self, changed_filter_fields: &BTreeSet<String>) {
+        for key in changed_filter_fields {
+            if self
+                .field_indexes
+                .get(key)
+                .is_some_and(FieldIndex::is_empty)
+            {
+                self.field_indexes.remove(key);
+            } else if let Some(field) = self.field_indexes.get_mut(key) {
+                field.finalize();
+            }
+        }
+    }
+
     fn resolve_filter(&self, filter: Option<&Value>) -> Result<BTreeSet<String>, CoreError> {
-        let all_docs = self.documents.keys().cloned().collect::<BTreeSet<_>>();
         let Some(filter) = filter else {
-            return Ok(all_docs);
+            return Ok(self.all_docs.clone());
         };
         let object = filter
             .as_object()
@@ -1218,7 +1457,7 @@ impl VectorOnlyIndex {
             && object
                 .keys()
                 .any(|key| key == "metadata" || key == "document_ids");
-        let mut candidates = all_docs;
+        let mut candidates = self.all_docs.clone();
         let metadata_filter = if structured {
             if let Some(document_ids) = object.get("document_ids") {
                 let ids = document_ids
@@ -1234,17 +1473,68 @@ impl VectorOnlyIndex {
             Some(filter)
         };
         if let Some(metadata_filter) = metadata_filter {
-            let metadata_by_id = self
-                .documents
-                .iter()
-                .map(|(document_id, record)| (document_id.clone(), record.metadata.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let (fields, all_docs) = build_field_indexes(&metadata_by_id);
             let coerced = coerce_sdk_filter(metadata_filter)?;
-            let metadata_docs = resolve_filter(&coerced, &fields, &all_docs)?;
+            let metadata_docs = resolve_filter(&coerced, &self.field_indexes, &self.all_docs)?;
             candidates = candidates.intersection(&metadata_docs).cloned().collect();
         }
         Ok(candidates)
+    }
+
+    fn query_vector_turbovec(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        let candidates = self.resolve_filter(filter)?;
+        let total_considered = candidates.len();
+        if filter.is_some() && candidates.is_empty() {
+            return Ok(CoreSearchResults {
+                hits: Vec::new(),
+                total_considered,
+            });
+        }
+        let allowlist = if filter.is_some() {
+            self.chunk_ids_for_documents(&candidates)
+        } else {
+            Vec::new()
+        };
+        {
+            let mut cached = self.vector_index.borrow_mut();
+            if cached.is_none() {
+                *cached = Some(TurboVecNativeIndex::build(
+                    &self.vector_chunks(),
+                    self.vector_dim,
+                    self.bit_width,
+                    self.generation,
+                )?);
+            }
+        }
+        let cached = self.vector_index.borrow();
+        let Some(index) = cached.as_ref() else {
+            return Err(CoreError::new(
+                CoreErrorCode::Unsupported,
+                "native TurboVec index is unavailable",
+            ));
+        };
+        let hits = index
+            .search(query_vector, top_k, &allowlist)?
+            .into_iter()
+            .filter_map(|hit| {
+                self.documents
+                    .get(&hit.document_id)
+                    .map(|record| CoreSearchHit {
+                        document_id: hit.document_id,
+                        chunk_id: hit.chunk_id,
+                        score: hit.score,
+                        metadata: record.metadata.clone(),
+                    })
+            })
+            .collect();
+        Ok(CoreSearchResults {
+            hits,
+            total_considered,
+        })
     }
 
     fn chunk_count(&self) -> usize {
@@ -1274,6 +1564,35 @@ impl VectorOnlyIndex {
                     .map(|chunk| (chunk.chunk_id.clone(), chunk.vector.clone()))
             })
             .collect()
+    }
+
+    fn vector_chunks(&self) -> Vec<CoreVectorChunk> {
+        self.documents
+            .iter()
+            .flat_map(|(document_id, record)| {
+                record.chunks.iter().map(|chunk| {
+                    CoreVectorChunk::new(
+                        chunk.chunk_id.clone(),
+                        document_id.clone(),
+                        chunk.vector.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn chunk_ids_for_documents(&self, document_ids: &BTreeSet<String>) -> Vec<String> {
+        document_ids
+            .iter()
+            .filter_map(|document_id| self.documents.get(document_id))
+            .flat_map(|record| record.chunks.iter().map(|chunk| chunk.chunk_id.clone()))
+            .collect()
+    }
+
+    fn document_for_chunk(&self, chunk_id: &str) -> Option<(String, &DocumentRecord)> {
+        let document_id = self.chunk_owner_by_id.get(chunk_id)?;
+        let record = self.documents.get(document_id)?;
+        Some((document_id.clone(), record))
     }
 }
 

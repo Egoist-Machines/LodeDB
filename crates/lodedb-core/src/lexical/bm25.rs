@@ -1,6 +1,6 @@
 //! Okapi BM25 inverted index matching the Python lexical oracle.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,14 +15,14 @@ pub const BM25_B: f64 = 0.75;
 /// In-memory Okapi BM25 index over a unit/chunk id space.
 #[derive(Debug, Clone)]
 pub struct Bm25Index {
-    postings: BTreeMap<String, BTreeMap<usize, usize>>,
-    doc_freq: BTreeMap<String, usize>,
-    doc_len: BTreeMap<usize, usize>,
-    unit_id_by_pos: BTreeMap<usize, String>,
-    pos_by_unit_id: BTreeMap<String, usize>,
-    terms_by_pos: BTreeMap<usize, Vec<String>>,
-    group_by_pos: BTreeMap<usize, String>,
-    positions_by_group: BTreeMap<String, BTreeSet<usize>>,
+    postings: HashMap<String, HashMap<usize, usize>>,
+    doc_freq: HashMap<String, usize>,
+    doc_len: HashMap<usize, usize>,
+    unit_id_by_pos: HashMap<usize, String>,
+    pos_by_unit_id: HashMap<String, usize>,
+    terms_by_pos: HashMap<usize, Vec<String>>,
+    group_by_pos: HashMap<usize, String>,
+    positions_by_group: HashMap<String, HashSet<usize>>,
     n: usize,
     total_len: usize,
     next_pos: usize,
@@ -69,14 +69,14 @@ impl Bm25Index {
     /// Creates an empty BM25 index.
     pub fn empty() -> Self {
         Self {
-            postings: BTreeMap::new(),
-            doc_freq: BTreeMap::new(),
-            doc_len: BTreeMap::new(),
-            unit_id_by_pos: BTreeMap::new(),
-            pos_by_unit_id: BTreeMap::new(),
-            terms_by_pos: BTreeMap::new(),
-            group_by_pos: BTreeMap::new(),
-            positions_by_group: BTreeMap::new(),
+            postings: HashMap::new(),
+            doc_freq: HashMap::new(),
+            doc_len: HashMap::new(),
+            unit_id_by_pos: HashMap::new(),
+            pos_by_unit_id: HashMap::new(),
+            terms_by_pos: HashMap::new(),
+            group_by_pos: HashMap::new(),
+            positions_by_group: HashMap::new(),
             n: 0,
             total_len: 0,
             next_pos: 0,
@@ -153,7 +153,7 @@ impl Bm25Index {
         if query_terms.is_empty() {
             return Vec::new();
         }
-        let mut scores: BTreeMap<usize, f64> = BTreeMap::new();
+        let mut scores: HashMap<usize, f64> = HashMap::new();
         let avgdl = if self.n == 0 {
             1.0
         } else {
@@ -218,7 +218,7 @@ impl Bm25Index {
             .or_default()
             .insert(pos);
 
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for token in tokens {
             *counts.entry(token.clone()).or_insert(0) += 1;
         }

@@ -27,6 +27,22 @@ impl FieldIndex {
             .insert(document_id);
     }
 
+    /// Removes one stored field value for a document.
+    pub fn remove(&mut self, document_id: &str, value: &str) {
+        self.docs.remove(document_id);
+        if let Some(value_docs) = self.value_docs.get_mut(value) {
+            value_docs.remove(document_id);
+            if value_docs.is_empty() {
+                self.value_docs.remove(value);
+            }
+        }
+    }
+
+    /// Returns whether this field has no indexed documents.
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
     /// Partitions distinct values into sorted numeric values and non-numeric values.
     pub fn finalize(&mut self) {
         let mut numeric = Vec::new();
