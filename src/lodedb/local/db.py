@@ -20,6 +20,7 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import secrets
@@ -141,6 +142,43 @@ class ImageEmbeddingUnsupportedError(RuntimeError):
     vector-only index cannot embed images; for the latter, embed the image with
     your own model and use ``add_vectors`` / ``search_by_vector``.
     """
+
+
+class _SharedEmbeddingCache:
+    """Per-write embedding memo shared by the Python writer and the native mirror.
+
+    With native core on, a text ``add`` is written durably by the Python engine
+    and then mirrored into the native engine so native keeps vector coverage (the
+    authoritative ``search_by_vector`` fast path depends on it). Both engines
+    embed the same chunk texts, which would double model inference on real
+    sentence-transformer/ONNX backends. Wrapping the shared backend for the span
+    of one write memoizes by chunk text, so each distinct chunk is embedded once
+    and the mirror reuses the writer's vectors. It is installed only for the
+    duration of a single ``add``/``add_many`` and then discarded, so it never
+    grows unboundedly or serves stale vectors to a later query.
+    """
+
+    def __init__(self, inner: EngineEmbeddingBackend) -> None:
+        self._inner = inner
+        self._cache: dict[str, tuple[float, ...]] = {}
+
+    @property
+    def native_dim(self) -> int:
+        return self._inner.native_dim
+
+    @property
+    def required_model_name(self) -> str | None:
+        return self._inner.required_model_name
+
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        missing = tuple(text for text in dict.fromkeys(texts) if text not in self._cache)
+        if missing:
+            for text, vector in zip(missing, self._inner.embed_documents(missing), strict=True):
+                self._cache[text] = vector
+        return tuple(self._cache[text] for text in texts)
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        return self._inner.embed_query(text)
 
 
 class LodeDB:
@@ -520,8 +558,9 @@ class LodeDB:
             text=text,
             metadata=_coerce_metadata(metadata),
         )
-        self._index.upsert_batch((document,))
-        self._native_upsert_text_documents((document,))
+        with self._shared_text_embeddings():
+            self._index.upsert_batch((document,))
+            self._native_upsert_text_documents((document,))
         return document_id
 
     def add_many(
@@ -551,8 +590,9 @@ class LodeDB:
                 )
             )
         if payload:
-            self._index.upsert_batch(tuple(payload))
-            self._native_upsert_text_documents(tuple(payload))
+            with self._shared_text_embeddings():
+                self._index.upsert_batch(tuple(payload))
+                self._native_upsert_text_documents(tuple(payload))
         return ids
 
     def add_vectors(
@@ -1517,6 +1557,53 @@ class LodeDB:
             and self._native_core_write_mode != NativeCoreMode.SHADOW
         )
 
+    @contextlib.contextmanager
+    def _shared_text_embeddings(self):
+        """Shares one embedding pass between the Python writer and native mirror.
+
+        Installs a :class:`_SharedEmbeddingCache` on both the Python engine and the
+        native mirror for the span of a single text write, so identical chunk texts
+        embed once instead of once per engine. A no-op when the native text mirror
+        is inactive (vector-only, native off, or shadow disabled), where only the
+        Python writer embeds.
+        """
+
+        if (
+            self._embedding_backend is None
+            or self.vector_only
+            or not self._native_text_shadow_enabled
+        ):
+            yield
+            return
+        original = self._embedding_backend
+        cache = _SharedEmbeddingCache(original)
+        self._embedding_backend = cache
+        if self._engine is not None:
+            self._engine.embedding_backend = cache
+        try:
+            yield
+        finally:
+            self._embedding_backend = original
+            if self._engine is not None:
+                self._engine.embedding_backend = original
+
+    def _native_text_search_runs(self) -> bool:
+        """True when the native text query should run alongside the Python oracle.
+
+        Text/lexical/hybrid search keeps Python authoritative (native lexical still
+        diverges), so in the plain read-on default the native text query only ever
+        reproduces the Python hits after re-embedding the query and re-running the
+        scan -- pure duplicate model inference. We therefore run it only when it
+        does real work: validating parity (strict parity or read-shadow) or
+        exercising the authoritative native writer (write-through).
+        """
+
+        return (
+            self._native_core_strict_parity
+            or self._native_core_mode == NativeCoreMode.SHADOW
+            or self._native_core_write_mode == NativeCoreMode.ON
+        )
+
     @staticmethod
     def _native_filter_shortcut_safe(normalized_filter: Mapping[str, Any] | None) -> bool:
         """False when a ``document_ids`` filter would fail engine validation.
@@ -1731,6 +1818,7 @@ class LodeDB:
             not self._native_text_shadow_enabled
             or not self._native_thread_local()
             or not self._native_vector_covered
+            or not self._native_text_search_runs()
         ):
             return None
         try:

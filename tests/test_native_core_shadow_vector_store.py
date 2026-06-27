@@ -476,7 +476,9 @@ def test_native_core_write_on_text_store_serves_document_reads(tmp_path, monkeyp
     assert native.list_documents_calls == 1
 
 
-def test_native_core_on_text_store_mirrors_prepare_apply_and_query(tmp_path, monkeypatch) -> None:
+def test_native_core_on_text_store_mirrors_writes_without_query_double_work(
+    tmp_path, monkeypatch
+) -> None:
     native = FakeNativeVectorEngine()
     adapter = FakeNativeAdapter(native)
     monkeypatch.setattr(
@@ -495,9 +497,12 @@ def test_native_core_on_text_store_mirrors_prepare_apply_and_query(tmp_path, mon
     stats = db.stats()["native_core"]
 
     assert adapter.opened_writable is False
+    # The write mirror still runs so native keeps vector coverage for
+    # search_by_vector, but the text query is Python-authoritative in plain
+    # read-on, so native must not re-embed + re-scan on every search.
     assert native.text_prepare_calls == 1
     assert native.text_apply_calls == 1
-    assert native.text_query_calls == 1
+    assert native.text_query_calls == 0
     assert native.persist_calls == 0
     assert stats["mode"] == "on"
     assert stats["write_through"] is False
@@ -536,7 +541,9 @@ def test_native_on_existing_raw_text_store_uses_readonly_seed_until_mutation(
 
     assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
     assert adapter.opened_readonly is True
-    assert native.text_query_calls == 1
+    # Plain read-on keeps text search Python-authoritative, so the native text
+    # query stays idle (no duplicate embed + scan) even on a readonly seed.
+    assert native.text_query_calls == 0
     assert db.stats()["native_core"]["covered"] is True
 
     db.add("Beta launch notes mention error code E-2002.", id="doc-beta")
@@ -837,7 +844,9 @@ def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
 
     assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
     assert adapter.opened_readonly is True
-    assert native.text_query_calls == 1
+    # Plain read-on keeps text search Python-authoritative, so the native text
+    # query stays idle (no duplicate embed + scan) even on a readonly seed.
+    assert native.text_query_calls == 0
     assert db.stats()["native_core"]["covered"] is True
 
     db.add("Beta launch notes mention error code E-2002.", id="doc-beta")

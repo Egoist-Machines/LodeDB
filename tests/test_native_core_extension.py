@@ -59,6 +59,51 @@ def _loads(payload: str) -> dict:
     return json.loads(payload)
 
 
+class _CountingEmbeddingBackend:
+    """Hash backend that counts how many texts/queries it embeds."""
+
+    required_model_name = None
+
+    def __init__(self, native_dim: int = 384) -> None:
+        from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+        self.native_dim = native_dim
+        self._inner = HashEmbeddingBackend(native_dim=native_dim)
+        self.doc_texts_embedded = 0
+        self.query_embeds = 0
+
+    def embed_documents(self, texts):
+        self.doc_texts_embedded += len(texts)
+        return self._inner.embed_documents(texts)
+
+    def embed_query(self, text):
+        self.query_embeds += 1
+        return self._inner.embed_query(text)
+
+
+def _text_add_search_embed_counts(mode, write_mode, store_dir, monkeypatch):
+    """Adds 8 text docs and runs one vector query, returning embed counts."""
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", mode)
+    if write_mode is None:
+        monkeypatch.delenv("LODEDB_NATIVE_CORE_WRITE", raising=False)
+    else:
+        monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", write_mode)
+    backend = _CountingEmbeddingBackend(native_dim=384)
+    db = LodeDB(store_dir, _embedding_backend=backend)
+    db.add_many(
+        [
+            {"id": f"doc-{i}", "text": f"launch code E-{1000 + i} report number {i}"}
+            for i in range(8)
+        ]
+    )
+    db.search("launch code", k=3, mode="vector")
+    covered = db.stats()["native_core"]["covered"]
+    db.close()
+    return backend.doc_texts_embedded, backend.query_embeds, covered
+
+
 def test_native_core_extension_executes_vector_store_flow() -> None:
     assert native_core.native_core_abi_version() == 1
     engine = native_core.CoreEngine()
@@ -496,6 +541,31 @@ def test_native_core_write_shadow_verifies_counts(tmp_path, monkeypatch) -> None
     assert stats["shadow_persist_count"] == 1
     assert stats["shadow_persist_verified"] is True
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "shadow-b"
+
+
+def test_default_native_on_text_does_not_double_embed(tmp_path, monkeypatch) -> None:
+    off_add, off_q, _ = _text_add_search_embed_counts("off", None, tmp_path / "off", monkeypatch)
+    on_add, on_q, on_cov = _text_add_search_embed_counts("on", None, tmp_path / "on", monkeypatch)
+
+    # Native still covers vectors (the mirror runs) so search_by_vector stays
+    # native-authoritative, but the default read-on path must not pay for a
+    # second model inference on either add or query while Python is the oracle.
+    assert on_cov is True
+    assert on_add == off_add
+    assert on_q == off_q
+
+
+def test_shadow_mode_runs_native_text_query_for_parity(tmp_path, monkeypatch) -> None:
+    off_add, off_q, _ = _text_add_search_embed_counts("off", None, tmp_path / "off", monkeypatch)
+    sh_add, sh_q, _ = _text_add_search_embed_counts(
+        "shadow", None, tmp_path / "shadow", monkeypatch
+    )
+
+    # Validation modes intentionally pay for the cross-check: the native text
+    # query runs (re-embedding the query) so parity can be verified, while the
+    # write mirror still shares the writer's document embeddings.
+    assert sh_add == off_add
+    assert sh_q > off_q
 
 
 def test_native_core_write_on_vector_store_persists_python_readable_store(
