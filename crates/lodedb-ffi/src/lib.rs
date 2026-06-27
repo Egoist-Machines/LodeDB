@@ -677,7 +677,7 @@ mod tests {
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
             assert_eq!(
-                lodedb_engine_create_index(engine, index_id, 2, 4, &mut error),
+                lodedb_engine_create_index(engine, index_id, 8, 4, &mut error),
                 0
             );
         }
@@ -716,7 +716,7 @@ mod tests {
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
             assert_eq!(
-                lodedb_engine_create_index(engine, index_id, 2, 4, &mut error),
+                lodedb_engine_create_index(engine, index_id, 8, 4, &mut error),
                 0
             );
         }

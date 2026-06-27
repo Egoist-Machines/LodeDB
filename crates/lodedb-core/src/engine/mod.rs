@@ -2352,6 +2352,13 @@ fn validate_index_shape(vector_dim: usize, bit_width: usize) -> Result<(), CoreE
     if vector_dim == 0 || vector_dim > 65_536 {
         return invalid("vector_dim must be between 1 and 65536");
     }
+    // The TurboVec serving index requires a positive multiple of 8 (its bit-plane
+    // layout), and the index is built lazily on the first query. Reject an
+    // unsupported dimension at create time rather than accepting an index that
+    // upserts successfully but becomes unsearchable when the serving index builds.
+    if vector_dim % 8 != 0 {
+        return invalid("vector_dim must be a positive multiple of 8");
+    }
     if !matches!(bit_width, 2 | 4) {
         return invalid("bit_width must be 2 or 4");
     }

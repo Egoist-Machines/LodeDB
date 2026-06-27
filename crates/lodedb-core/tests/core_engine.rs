@@ -70,6 +70,24 @@ fn seeded_engine() -> CoreEngine {
 }
 
 #[test]
+fn create_index_rejects_dimensions_turbovec_cannot_serve() {
+    let mut engine = CoreEngine::new_in_memory();
+    // TurboVec requires a positive multiple of 8; reject at create time rather
+    // than accept an index that upserts but cannot build a serving index.
+    assert!(engine.create_index("bad", 2, 4).is_err());
+    assert!(engine.create_index("bad", 10, 4).is_err());
+    // A valid multiple-of-8 dimension still works end to end.
+    engine.create_index("ok", 8, 4).unwrap();
+    engine
+        .upsert_vectors("ok", &[doc("a", 0, metadata(&[]))])
+        .unwrap();
+    let hits = engine
+        .query_vector("ok", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, None)
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "a");
+}
+
+#[test]
 fn upsert_vectors_is_atomic_when_a_later_row_is_invalid() {
     let mut engine = CoreEngine::new_in_memory();
     engine.create_index("default", 8, 4).unwrap();

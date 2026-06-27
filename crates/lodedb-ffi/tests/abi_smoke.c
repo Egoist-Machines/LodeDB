@@ -33,9 +33,10 @@ int main(void) {
   assert(lodedb_engine_new_in_memory(&engine, &error) == LODE_OK);
   assert(engine != 0);
 
-  assert(lodedb_engine_create_index(engine, sv("default"), 2, 4, &error) == LODE_OK);
+  // TurboVec requires a positive-multiple-of-8 dimension; use 8 here.
+  assert(lodedb_engine_create_index(engine, sv("default"), 8, 4, &error) == LODE_OK);
 
-  float vector[2] = {1.0f, 0.0f};
+  float vector[8] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   LodeMetadataPair metadata[1];
   metadata[0].size = sizeof(LodeMetadataPair);
   metadata[0].version = LODEDB_ABI_VERSION;
@@ -47,7 +48,7 @@ int main(void) {
   document.version = LODEDB_ABI_VERSION;
   document.document_id = sv("doc-a");
   document.vector = vector;
-  document.vector_len = 2;
+  document.vector_len = 8;
   document.metadata = metadata;
   document.metadata_len = 1;
   document.text = sv("");
@@ -59,7 +60,7 @@ int main(void) {
   request.version = LODEDB_ABI_VERSION;
   request.index_id = sv("default");
   request.query = vector;
-  request.query_len = 2;
+  request.query_len = 8;
   request.top_k = 1;
 
   LodeSearchResults *results = 0;
@@ -82,7 +83,8 @@ int main(void) {
 
   LodeOwnedString *applied = 0;
   assert(lodedb_engine_apply_text_upsert_json(
-             engine, owned_sv(plan), sv("[[1.0,0.0]]"), 2.5, &applied, &error) == LODE_OK);
+             engine, owned_sv(plan), sv("[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]]"), 2.5, &applied,
+             &error) == LODE_OK);
   assert(applied != 0);
   assert(strstr(applied->data, "\"embedded_chunks\":1") != 0);
   assert(strstr(applied->data, "\"embedding_time_ms\":2.5") != 0);
@@ -111,7 +113,8 @@ int main(void) {
 
   LodeOwnedString *hybrid_search = 0;
   assert(lodedb_engine_search_embedded_text_json(
-             engine, sv("default"), owned_sv(hybrid_plan), sv("[1.0,0.0]"), 1, 2,
+             engine, sv("default"), owned_sv(hybrid_plan), sv("[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]"),
+             1, 2,
              sv("{\"metadata\":{\"topic\":\"ops\"}}"), 1, &hybrid_search, &error) == LODE_OK);
   assert(hybrid_search != 0);
   assert(strstr(hybrid_search->data, "\"document_id\":\"doc-text\"") != 0);
