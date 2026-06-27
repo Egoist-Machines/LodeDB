@@ -147,6 +147,14 @@ impl CoreEngine {
             if document.vector.len() != index.vector_dim {
                 return invalid("vector dimension does not match index");
             }
+            // Reject NaN / Inf / out-of-range coordinates here, at the core, so
+            // every binding (PyO3 array upsert, FFI, Swift) is covered. The JSON
+            // path cannot carry NaN, but the raw-array paths can, and a poisoned
+            // row makes later TurboVec searches fail. Same finiteness contract as
+            // TurboVec's own input check.
+            if turbovec::first_invalid_coord(&document.vector, index.vector_dim).is_some() {
+                return invalid("vector contains a non-finite or out-of-range value");
+            }
         }
         let mut changed = 0usize;
         let mut changed_filter_fields = BTreeSet::new();
@@ -462,6 +470,11 @@ impl CoreEngine {
         for embedding in embeddings {
             if embedding.len() != index.vector_dim {
                 return invalid("embedding dimension does not match index");
+            }
+            // Same core-level finiteness guard as upsert_vectors: a NaN/Inf
+            // embedding from a binding's array path must not enter the index.
+            if turbovec::first_invalid_coord(embedding, index.vector_dim).is_some() {
+                return invalid("embedding contains a non-finite or out-of-range value");
             }
         }
 
