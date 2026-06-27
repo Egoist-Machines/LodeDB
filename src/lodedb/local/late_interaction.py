@@ -1317,27 +1317,40 @@ def _merge_topk(
 ) -> list[tuple[float, str, dict[str, Any], int]]:
     """Merges one chunk's scores into a running top-``k`` (score desc, id asc).
 
-    ``current`` is the running top-``k`` (already sorted, length <= k). The chunk's
-    candidates are added, the combined set is sorted by ``(-score, id)`` and
-    truncated to ``k``. The chunk's score row is not retained, so a caller that
-    iterates many chunks keeps only O(k) state. The full sort makes the tie-break
-    (id ascending) exact and independent of how documents are chunked.
+    ``current`` is the running top-``k`` (already sorted, length <= k). Rather than
+    building a Python tuple per document and sorting all of them -- O(n_docs) tuples
+    and O(n_docs log n_docs) per chunk -- this selects the chunk's top-``k`` with
+    ``np.partition`` and materializes a tuple only for the few candidates at or
+    above the k-th score. Selecting *all* rows tied at the k-th score keeps the
+    ``(-score, id)`` tie-break exact and chunk-order independent. The chunk's score
+    row is not retained, so a caller that iterates many chunks keeps only O(k)
+    state.
     """
 
-    candidates = list(current)
+    row = scores_row
+    index_map = None  # maps positions in `row` back to original chunk indices
     if skip:
-        for index in range(len(ids)):
-            doc_id = ids[index]
-            if doc_id in skip:
-                continue
-            candidates.append(
-                (float(scores_row[index]), doc_id, metas[index], int(patch_counts[index]))
-            )
+        keep = [i for i in range(len(ids)) if ids[i] not in skip]
+        if not keep:
+            return current
+        row = scores_row[keep]
+        index_map = keep
+    n = row.shape[0]
+    if n == 0:
+        return current
+    depth = min(k, n)
+    if depth < n:
+        # k-th largest score; take every row >= it (ties included) as candidates.
+        threshold = np.partition(row, n - depth)[n - depth]
+        selected = np.flatnonzero(row >= threshold)
     else:
-        for index in range(len(ids)):
-            candidates.append(
-                (float(scores_row[index]), ids[index], metas[index], int(patch_counts[index]))
-            )
+        selected = np.arange(n)
+    candidates = list(current)
+    for position in selected.tolist():
+        index = index_map[position] if index_map is not None else position
+        candidates.append(
+            (float(scores_row[index]), ids[index], metas[index], int(patch_counts[index]))
+        )
     candidates.sort(key=lambda item: (-item[0], item[1]))
     del candidates[k:]
     return candidates

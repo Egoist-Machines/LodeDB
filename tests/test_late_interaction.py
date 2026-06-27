@@ -621,6 +621,38 @@ def test_hit_equality():
     )
 
 
+def test_merge_topk_matches_full_sort_with_ties():
+    # The argpartition-based top-k must equal a full (-score, id) sort, including
+    # the id tie-break when many scores tie, with skip, and across incremental
+    # merges -- this is what keeps the fast path exact.
+    rng = np.random.default_rng(7)
+    n, k = 50, 10
+    scores = rng.integers(0, 5, size=n).astype(np.float32)  # many ties
+    ids = [f"d{i:03d}" for i in range(n)]
+    metas = [{} for _ in range(n)]
+    pcs = [1] * n
+
+    def ref(indices):
+        ordered = sorted(
+            ((float(scores[i]), ids[i]) for i in indices), key=lambda t: (-t[0], t[1])
+        )
+        return ordered[:k]
+
+    got = li_module._merge_topk([], scores, ids, metas, pcs, k, None)
+    assert [(g[0], g[1]) for g in got] == ref(range(n))
+
+    skip = frozenset(ids[:5])
+    got_skip = li_module._merge_topk([], scores, ids, metas, pcs, k, skip)
+    assert [(g[0], g[1]) for g in got_skip] == ref(i for i in range(n) if ids[i] not in skip)
+
+    # Incremental merge across two chunks equals the one-shot result.
+    first = li_module._merge_topk([], scores[:20], ids[:20], metas[:20], pcs[:20], k, None)
+    merged = li_module._merge_topk(
+        first, scores[20:], ids[20:], metas[20:], pcs[20:], k, None
+    )
+    assert [(g[0], g[1]) for g in merged] == ref(range(n))
+
+
 def test_maxsim_kernel_matches_reference():
     rng = np.random.default_rng(0)
     q = rng.standard_normal((4, DIM)).astype(np.float32)
