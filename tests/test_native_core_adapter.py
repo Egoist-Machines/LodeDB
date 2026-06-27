@@ -361,6 +361,7 @@ def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
         commit_mode="generation",
         store_text=False,
         index_text=False,
+        chunk_character_limit=512,
     )
 
     assert engine._engine.open_options == {
@@ -370,6 +371,7 @@ def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
         "commit_mode": "generation",
         "store_text": False,
         "index_text": False,
+        "chunk_character_limit": 512,
     }
 
 
@@ -380,6 +382,7 @@ def test_adapter_wraps_readonly_native_engine_open(tmp_path) -> None:
         commit_mode="generation",
         store_text=True,
         index_text=False,
+        chunk_character_limit=768,
     )
 
     assert engine._engine.open_options == {
@@ -390,6 +393,7 @@ def test_adapter_wraps_readonly_native_engine_open(tmp_path) -> None:
         "commit_mode": "generation",
         "store_text": True,
         "index_text": False,
+        "chunk_character_limit": 768,
     }
 
 

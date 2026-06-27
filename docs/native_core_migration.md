@@ -18,9 +18,10 @@ existing stores stable.
 - Existing vector-only stores can seed covered native query state from the committed on-disk
   snapshot. Writable handles invalidate that read-only seed on the first mutation and fall back to
   Python unless explicit native write-through owns a fresh store.
-- Existing text stores opened with `index_text=True` can also seed native query state from the
-  committed vector and lexical sidecars. Existing raw-text-only text stores remain on the Python
-  oracle because their exact token/chunk source is not independently persisted.
+- Existing text stores can also seed native query state from committed vector sidecars. When
+  `index_text=True`, Rust uses the committed lexical sidecar; otherwise, retained raw text
+  (`store_text=True`) is re-chunked with the handle's configured chunk limit, matching Python's
+  raw-text BM25 rebuild strategy.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.
@@ -81,14 +82,14 @@ The artifact reports `pass_fail_summary.passed=true`. Rust/Python elapsed ratios
 
 | Path | Ratio |
 | --- | ---: |
-| Vector upsert | 0.261 |
-| Unfiltered vector search | 0.908 |
-| Filtered vector search | 0.648 |
-| Batch vector search | 0.301 |
-| Text prepare/apply with `HashEmbeddingBackend` | 0.367 |
+| Vector upsert | 0.260 |
+| Unfiltered vector search | 0.914 |
+| Filtered vector search | 0.681 |
+| Batch vector search | 0.277 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.370 |
 | Lexical search | 0.250 |
-| Hybrid search | 0.486 |
-| Persisted reopen/query | 0.601 |
+| Hybrid search | 0.481 |
+| Persisted reopen/query | 0.602 |
 
 These numbers prove the current deterministic benchmark gates, not removal of the Python oracle.
 The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the

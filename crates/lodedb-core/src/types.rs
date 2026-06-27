@@ -40,6 +40,12 @@ pub struct CoreOpenOptions {
     pub commit_mode: String,
     pub store_text: bool,
     pub index_text: bool,
+    #[serde(default = "default_chunk_character_limit")]
+    pub chunk_character_limit: usize,
+}
+
+fn default_chunk_character_limit() -> usize {
+    900
 }
 
 /// Local-first security and telemetry options.
@@ -288,6 +294,7 @@ mod tests {
             commit_mode: "wal".to_string(),
             store_text: true,
             index_text: false,
+            chunk_character_limit: 900,
         });
         assert_round_trip(&CoreSecurityOptions {
             bind_host: "127.0.0.1".to_string(),

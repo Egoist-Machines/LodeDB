@@ -505,6 +505,46 @@ def test_native_core_on_text_store_mirrors_prepare_apply_and_query(tmp_path, mon
     assert hits[0].id == "doc-alpha"
 
 
+def test_native_on_existing_raw_text_store_uses_readonly_seed_until_mutation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    writer.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    writer.close()
+
+    native = FakeNativeVectorEngine()
+    native.documents["doc-alpha"] = {
+        "vector": _onehot(0),
+        "metadata": {},
+        "text": "Alpha launch notes mention error code E-1001.",
+        "tokens": ["alpha", "launch"],
+    }
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    db = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+
+    assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
+    assert adapter.opened_readonly is True
+    assert native.text_query_calls == 1
+    assert db.stats()["native_core"]["covered"] is True
+
+    db.add("Beta launch notes mention error code E-2002.", id="doc-beta")
+    assert db.stats()["native_core"]["covered"] is False
+    assert db.stats()["native_core"]["fallback_reason"] == "native_core_readonly_seed_invalidated"
+    assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
+
+
 def test_text_shadow_mode_mirrors_prepare_apply_and_query(tmp_path, monkeypatch) -> None:
     native = FakeNativeVectorEngine()
     monkeypatch.setattr(

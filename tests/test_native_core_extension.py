@@ -460,6 +460,32 @@ def test_native_core_write_on_existing_index_text_store_fails_until_sidecar_writ
         )
 
 
+def test_native_core_on_existing_raw_text_store_uses_readonly_seed(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    writer.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    writer.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    db = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    stats = db.stats()["native_core"]
+
+    assert stats["enabled"] is True
+    assert stats["covered"] is True
+    assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
+
+
 def test_native_core_on_text_store_uses_native_query_without_write_through(
     tmp_path, monkeypatch
 ) -> None:

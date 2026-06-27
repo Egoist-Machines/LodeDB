@@ -48,6 +48,7 @@ fn open_options(path: &Path, read_only: bool, commit_mode: &str) -> CoreOpenOpti
         commit_mode: commit_mode.to_string(),
         store_text: true,
         index_text: true,
+        chunk_character_limit: 900,
     }
 }
 
@@ -491,6 +492,28 @@ fn persisted_v0_4_tvim_vectors_seed_readonly_queries() {
     assert_eq!(error.code(), CoreErrorCode::Unsupported);
     drop(writable);
 
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn persisted_store_text_rebuilds_lexical_from_raw_text() {
+    let path = copy_persisted_fixture("v0_4_store_text");
+    let readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    let query_plan = readonly
+        .prepare_query_text("retained payload", "lexical")
+        .unwrap();
+
+    let hits = readonly
+        .search_embedded_text("default", &query_plan, None, 3, None)
+        .unwrap();
+
+    assert_eq!(hits.hits.len(), 3);
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("vec-")));
+    drop(readonly);
     fs::remove_dir_all(path).unwrap();
 }
 

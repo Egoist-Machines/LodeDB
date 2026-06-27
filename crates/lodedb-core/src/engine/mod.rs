@@ -59,6 +59,7 @@ impl CoreEngine {
                 commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
+                chunk_character_limit: options.chunk_character_limit,
                 _lock: Some(lock),
             }),
             replaying_wal: false,
@@ -84,6 +85,7 @@ impl CoreEngine {
                 commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
+                chunk_character_limit: options.chunk_character_limit,
                 _lock: None,
             }),
             replaying_wal: false,
@@ -1198,6 +1200,7 @@ impl CoreEngine {
         let persistence_path = persistence.path.clone();
         let persistence_read_only = persistence.read_only;
         let persistence_fsync = persistence.fsync;
+        let persistence_chunk_character_limit = persistence.chunk_character_limit;
         if !persistence_path.is_dir() {
             return Ok(());
         }
@@ -1228,7 +1231,8 @@ impl CoreEngine {
                 ))?;
                 if !records.is_empty() {
                     if records.iter().all(is_native_replayable_wal_record) {
-                        let index = index_from_loaded_store(&loaded)?;
+                        let index =
+                            index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
                         let index_id = index.index_id.clone();
                         self.indexes.insert(index_id.clone(), index);
                         self.replaying_wal = true;
@@ -1255,7 +1259,7 @@ impl CoreEngine {
                     }
                 }
             }
-            let index = index_from_loaded_store(&loaded)?;
+            let index = index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
             self.indexes.insert(index.index_id.clone(), index);
         }
         Ok(())
@@ -1270,6 +1274,7 @@ struct PersistenceState {
     commit_mode: String,
     store_text: bool,
     index_text: bool,
+    chunk_character_limit: usize,
     _lock: Option<PersistentLock>,
 }
 
@@ -1307,6 +1312,7 @@ impl Drop for PersistentLock {
 
 fn index_from_loaded_store(
     loaded: &crate::storage::LoadedStore,
+    chunk_character_limit: usize,
 ) -> Result<VectorOnlyIndex, CoreError> {
     let state = loaded
         .state
@@ -1379,6 +1385,17 @@ fn index_from_loaded_store(
                     .unwrap_or_else(|| vec![0.0; vector_dim]),
             })
             .collect();
+        let token_lists = loaded
+            .lexical_tokens
+            .get(&document_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                loaded
+                    .raw_text
+                    .get(&document_id)
+                    .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
+                    .unwrap_or_default()
+            });
         documents.insert(
             document_id.clone(),
             DocumentRecord {
@@ -1391,11 +1408,7 @@ fn index_from_loaded_store(
                     .to_string(),
                 metadata,
                 text: loaded.raw_text.get(&document_id).cloned(),
-                token_lists: loaded
-                    .lexical_tokens
-                    .get(&document_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                token_lists,
                 chunks,
             },
         );
@@ -1466,6 +1479,14 @@ fn index_from_loaded_store(
         all_docs,
         chunk_owner_by_id,
     })
+}
+
+fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Vec<String>> {
+    chunk_text(text, chunk_character_limit)
+        .unwrap_or_default()
+        .iter()
+        .map(|chunk| tokenize(chunk))
+        .collect()
 }
 
 fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> Bm25Index {

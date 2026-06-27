@@ -424,6 +424,7 @@ def _rust_reopen_bench(
             commit_mode="generation",
             store_text=True,
             index_text=True,
+            chunk_character_limit=900,
         )
         try:
             engine.create_index(_INDEX_ID, vector_dim=dim, bit_width=4)
@@ -439,6 +440,7 @@ def _rust_reopen_bench(
                 commit_mode="generation",
                 store_text=True,
                 index_text=True,
+                chunk_character_limit=900,
             )
             try:
                 return _hit_checksum(

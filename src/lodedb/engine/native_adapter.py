@@ -99,6 +99,7 @@ class NativeCoreAdapter:
         commit_mode: str,
         store_text: bool,
         index_text: bool,
+        chunk_character_limit: int,
     ) -> NativeCoreEngineHandle:
         """Opens a persistent native engine handle through the hidden extension."""
 
@@ -110,6 +111,7 @@ class NativeCoreAdapter:
             commit_mode=commit_mode,
             store_text=store_text,
             index_text=index_text,
+            chunk_character_limit=chunk_character_limit,
         )
         return NativeCoreEngineHandle(module.CoreEngine.open(self._dumps(options)))
 
@@ -121,6 +123,7 @@ class NativeCoreAdapter:
         commit_mode: str,
         store_text: bool,
         index_text: bool,
+        chunk_character_limit: int,
     ) -> NativeCoreEngineHandle:
         """Opens a lock-free read-only native engine snapshot."""
 
@@ -132,6 +135,7 @@ class NativeCoreAdapter:
             commit_mode=commit_mode,
             store_text=store_text,
             index_text=index_text,
+            chunk_character_limit=chunk_character_limit,
         )
         return NativeCoreEngineHandle(
             module.CoreEngine.open_readonly(str(path), self._dumps(options))
@@ -176,6 +180,7 @@ class NativeCoreAdapter:
         commit_mode: str,
         store_text: bool,
         index_text: bool,
+        chunk_character_limit: int,
     ) -> dict[str, Any]:
         return {
             "path": str(path),
@@ -184,6 +189,7 @@ class NativeCoreAdapter:
             "commit_mode": str(commit_mode),
             "store_text": bool(store_text),
             "index_text": bool(index_text),
+            "chunk_character_limit": int(chunk_character_limit),
         }
 
     @staticmethod

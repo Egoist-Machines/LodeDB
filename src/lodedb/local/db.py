@@ -1286,6 +1286,7 @@ class LodeDB:
                     commit_mode=commit_mode,
                     store_text=self.store_text,
                     index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
                 )
                 native_engine.stats(_LOCAL_INDEX_ID)
             except Exception as exc:
@@ -1298,7 +1299,7 @@ class LodeDB:
             self._native_vector_covered = True
             return
         document_count = int(self._index.stats().get("document_count", 0) or 0)
-        can_seed_existing = self.vector_only or self.index_text
+        can_seed_existing = self.vector_only or self.index_text or self.store_text
         if not write_through and document_count != 0 and can_seed_existing:
             try:
                 native_engine = adapter.open_readonly_engine(
@@ -1307,6 +1308,7 @@ class LodeDB:
                     commit_mode=commit_mode,
                     store_text=self.store_text,
                     index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
                 )
                 native_stats = native_engine.stats(_LOCAL_INDEX_ID)
             except Exception:
@@ -1321,12 +1323,12 @@ class LodeDB:
             self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
             return
         if not write_through and document_count != 0 and not self.vector_only:
-            self._native_core_fallback_reason = "native_core_existing_text_seed_requires_index_text"
+            self._native_core_fallback_reason = "native_core_existing_text_seed_requires_text"
             return
         if write_through and document_count != 0 and not can_seed_existing:
             self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
             raise RuntimeError(
-                "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires index_text=True"
+                "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires retained text"
             )
         if write_through and document_count != 0:
             self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
@@ -1343,6 +1345,7 @@ class LodeDB:
                     commit_mode=commit_mode,
                     store_text=self.store_text,
                     index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
                 )
             elif self._native_core_write_mode == NativeCoreMode.SHADOW:
                 shadow_dir = tempfile.TemporaryDirectory(prefix="lodedb-native-shadow-")
@@ -1354,6 +1357,7 @@ class LodeDB:
                         commit_mode="generation",
                         store_text=self.store_text,
                         index_text=self.index_text,
+                        chunk_character_limit=self._chunk_character_limit,
                     )
                 except Exception:
                     shadow_dir.cleanup()
