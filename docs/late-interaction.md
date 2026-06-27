@@ -77,9 +77,14 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
   by reading documents back from disk in bounded chunks -- slower (disk-bound) but
   exact and near-constant-memory, so the exact path is never capped by RAM.
 
-Scoring memory is bounded to the chunk budget, with one exception: a single
-document whose patch matrix exceeds the budget is scored whole (its score buffer
-is proportional to that one document), since a document is the unit of MaxSim.
+Memory note: *patch decode and scoring* are bounded to the chunk budget (the one
+exception is a single document whose patch matrix exceeds the budget -- it is
+scored whole, since a document is the unit of MaxSim). Two things are not bounded
+by the chunk budget: the streaming path first enumerates the document
+`(id, patch_count)` list, which is O(number of documents) in metadata; and the
+resident *cold build* briefly holds the sidecar blobs plus decoded matrices plus
+the final packed matrix, so peak build memory can exceed `resident_max_bytes`
+(which bounds the steady-state resident size, not the one-time build peak).
 
 The original prototype instead ran a two-stage quantized-candidate-then-rescore
 query: ~110 ms/query at recall 0.73 (profile: candidate generation ~61%, patch
