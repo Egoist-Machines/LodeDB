@@ -215,6 +215,42 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
         engine.document_token_lists("text").unwrap()["doc-a"][0],
         ["fault", "code", "e1234"]
     );
+    assert_eq!(
+        engine
+            .get_document_text("text", "doc-a")
+            .unwrap()
+            .as_deref(),
+        Some("fault code E1234")
+    );
+    assert_eq!(
+        engine
+            .get_document_text("text", "missing")
+            .unwrap()
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        engine
+            .get_document_texts("text", &["doc-a".to_string(), "missing".to_string()])
+            .unwrap()
+            .get("doc-a")
+            .map(String::as_str),
+        Some("fault code E1234")
+    );
+    let record = engine
+        .get_document("text", "doc-a")
+        .unwrap()
+        .expect("doc-a should exist");
+    assert_eq!(record["document_id"], "doc-a");
+    assert_eq!(record["metadata"], json!({"topic": "ops"}));
+    assert_eq!(record["chunk_count"], 1);
+    assert!(!record["content_hash"].as_str().unwrap().is_empty());
+    assert!(!record.as_object().unwrap().contains_key("text"));
+    let listed = engine
+        .list_documents("text", Some(&json!({"metadata": {"topic": "ops"}})))
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["document_id"], "doc-a");
 
     let query_plan = engine.prepare_query_text("E1234", "vector").unwrap();
     assert!(query_plan.requires_embedding);

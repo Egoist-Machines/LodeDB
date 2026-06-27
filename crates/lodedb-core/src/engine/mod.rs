@@ -150,6 +150,11 @@ impl CoreEngine {
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
+                    content_hash: document
+                        .text
+                        .as_ref()
+                        .map(|text| crate::text::hash::sha256_text(text))
+                        .unwrap_or_else(|| crate::text::hash::sha256_text(&document.document_id)),
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
                     token_lists: Vec::new(),
@@ -297,6 +302,10 @@ impl CoreEngine {
             record.metadata = metadata;
         }
         if let Some(text) = text {
+            record.content_hash = text
+                .as_ref()
+                .map(|text| crate::text::hash::sha256_text(text))
+                .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
             record.text = text;
         }
         if metadata_changed {
@@ -479,6 +488,7 @@ impl CoreEngine {
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
+                    content_hash: content_hash.clone(),
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
                     token_lists: token_lists.clone(),
@@ -824,6 +834,80 @@ impl CoreEngine {
             .collect())
     }
 
+    /// Returns one stored raw-text payload by document id.
+    pub fn get_document_text(
+        &self,
+        index_id: &str,
+        document_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        if document_id.trim().is_empty() {
+            return invalid("document_id is required");
+        }
+        let index = self.index(index_id)?;
+        Ok(index
+            .documents
+            .get(document_id)
+            .and_then(|record| record.text.clone()))
+    }
+
+    /// Returns stored raw-text payloads for the requested document ids.
+    pub fn get_document_texts(
+        &self,
+        index_id: &str,
+        document_ids: &[String],
+    ) -> Result<BTreeMap<String, String>, CoreError> {
+        let index = self.index(index_id)?;
+        let mut out = BTreeMap::new();
+        for document_id in document_ids {
+            if document_id.trim().is_empty() {
+                return invalid("document_id is required");
+            }
+            if let Some(text) = index
+                .documents
+                .get(document_id)
+                .and_then(|record| record.text.as_ref())
+            {
+                out.insert(document_id.clone(), text.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns one payload-free document record.
+    pub fn get_document(
+        &self,
+        index_id: &str,
+        document_id: &str,
+    ) -> Result<Option<Value>, CoreError> {
+        if document_id.trim().is_empty() {
+            return invalid("document_id is required");
+        }
+        let index = self.index(index_id)?;
+        Ok(index
+            .documents
+            .get(document_id)
+            .map(|record| document_resource_payload(document_id, record)))
+    }
+
+    /// Lists payload-free document records, optionally through the metadata/doc-id planner.
+    pub fn list_documents(
+        &self,
+        index_id: &str,
+        filter: Option<&Value>,
+    ) -> Result<Vec<Value>, CoreError> {
+        let index = self.index(index_id)?;
+        let document_ids = index.resolve_filter(filter)?;
+        Ok(document_ids
+            .into_iter()
+            .filter_map(|document_id| {
+                index
+                    .documents
+                    .get(&document_id)
+                    .map(|record| document_resource_payload(&document_id, record))
+            })
+            .collect())
+    }
+
     /// Persists every open index through generation-mode storage.
     pub fn persist(&mut self) -> Result<(), CoreError> {
         let Some(persistence) = &self.persistence else {
@@ -1080,6 +1164,11 @@ impl CoreEngine {
             let old_record = index.documents.insert(
                 document_id.clone(),
                 DocumentRecord {
+                    content_hash: document
+                        .get("content_hash")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     metadata: metadata.clone(),
                     text,
                     token_lists: token_lists.clone(),
@@ -1320,6 +1409,13 @@ fn index_from_loaded_store(
         documents.insert(
             document_id.clone(),
             DocumentRecord {
+                content_hash: state
+                    .get("document_hashes")
+                    .and_then(Value::as_object)
+                    .and_then(|object| object.get(&document_id))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 metadata,
                 text: loaded.raw_text.get(&document_id).cloned(),
                 token_lists: loaded
@@ -1579,12 +1675,10 @@ fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
     let mut document_chunk_ids = serde_json::Map::new();
     let mut document_metadata = serde_json::Map::new();
     for (document_id, record) in &index.documents {
-        let content_hash = record
-            .text
-            .as_ref()
-            .map(|text| crate::text::hash::sha256_text(text))
-            .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
-        document_hashes.insert(document_id.clone(), Value::String(content_hash));
+        document_hashes.insert(
+            document_id.clone(),
+            Value::String(record.content_hash.clone()),
+        );
         document_chunk_ids.insert(
             document_id.clone(),
             Value::Array(
@@ -1700,6 +1794,15 @@ fn metadata_from_value(value: &Value) -> CoreMetadata {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn document_resource_payload(document_id: &str, record: &DocumentRecord) -> Value {
+    serde_json::json!({
+        "document_id": document_id,
+        "metadata": record.metadata.clone(),
+        "chunk_count": record.chunks.len(),
+        "content_hash": record.content_hash.clone(),
+    })
 }
 
 struct VectorOnlyIndex {
@@ -2033,6 +2136,7 @@ impl VectorOnlyIndex {
 
 #[derive(Debug, Clone)]
 struct DocumentRecord {
+    content_hash: String,
     metadata: CoreMetadata,
     text: Option<String>,
     token_lists: Vec<Vec<String>>,

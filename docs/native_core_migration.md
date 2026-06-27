@@ -24,6 +24,9 @@ existing stores stable.
   delete, and embedded-text records, then checkpoint them into generation artifacts. Python
   rollout still keeps `LODEDB_NATIVE_CORE_WRITE=on` on generation mode until the SDK can avoid
   double-logging alongside the Python oracle WAL.
+- Covered native Python handles can serve `get`, `get_texts`, `get_document`, and
+  `list_documents` from Rust in `LODEDB_NATIVE_CORE=on`; shadow/default fallback still keeps the
+  Python store as oracle when native coverage is absent or fails closed.
 
 ## Swift / iOS Binding State
 

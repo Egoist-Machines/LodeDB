@@ -469,6 +469,49 @@ class NativeCoreEngineHandle:
     def stats(self, index_id: str) -> dict[str, Any]:
         return self._loads(self._engine.stats(str(index_id)))
 
+    def get_document_text(self, index_id: str, document_id: str) -> str | None:
+        value = json.loads(self._engine.get_document_text(str(index_id), str(document_id)))
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise RuntimeError("native core returned a non-string document text payload")
+        return value
+
+    def get_document_texts(self, index_id: str, document_ids: Iterable[str]) -> dict[str, str]:
+        value = json.loads(
+            self._engine.get_document_texts(
+                str(index_id),
+                self._dumps([str(document_id) for document_id in document_ids]),
+            )
+        )
+        if not isinstance(value, dict):
+            raise RuntimeError("native core returned a non-object text map payload")
+        return {str(key): str(text) for key, text in value.items()}
+
+    def get_document(self, index_id: str, document_id: str) -> dict[str, Any] | None:
+        value = json.loads(self._engine.get_document(str(index_id), str(document_id)))
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise RuntimeError("native core returned a non-object document payload")
+        return dict(value)
+
+    def list_documents(
+        self,
+        index_id: str,
+        *,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        value = json.loads(
+            self._engine.list_documents(
+                str(index_id),
+                None if filter is None else self._dumps(dict(filter)),
+            )
+        )
+        if not isinstance(value, list):
+            raise RuntimeError("native core returned a non-list document payload")
+        return [dict(item) for item in value]
+
     def persist(self) -> None:
         self._engine.persist()
 

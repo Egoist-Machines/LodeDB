@@ -47,6 +47,10 @@ class FakeNativeVectorEngine:
         self.text_prepare_calls = 0
         self.text_apply_calls = 0
         self.text_query_calls = 0
+        self.get_text_calls = 0
+        self.get_texts_calls = 0
+        self.get_document_calls = 0
+        self.list_documents_calls = 0
         self.persist_calls = 0
         self.close_calls = 0
 
@@ -61,6 +65,8 @@ class FakeNativeVectorEngine:
             self.documents[document.document_id] = {
                 "vector": list(document.vector),
                 "metadata": dict(document.metadata),
+                "text": document.text,
+                "content_hash": f"hash:{document.document_id}",
             }
         return {
             "documents_upserted": len(tuple(documents)),
@@ -166,7 +172,9 @@ class FakeNativeVectorEngine:
             self.documents[document["document_id"]] = {
                 "vector": list(embedding),
                 "metadata": dict(document["metadata"]),
+                "text": document.get("text"),
                 "tokens": document["chunks"][0]["tokens"],
+                "content_hash": f"hash:{document['document_id']}",
             }
         return {
             "embedded_chunks": len(embeddings),
@@ -222,6 +230,57 @@ class FakeNativeVectorEngine:
             "chunk_count": len(self.documents),
             "native_core_enabled": True,
         }
+
+    def get_document_text(self, index_id: str, document_id: str) -> str | None:
+        self.get_text_calls += 1
+        document = self.documents.get(document_id)
+        if document is None:
+            return None
+        return document.get("text")
+
+    def get_document_texts(self, index_id: str, document_ids) -> dict[str, str]:
+        self.get_texts_calls += 1
+        out = {}
+        for document_id in document_ids:
+            document = self.documents.get(str(document_id))
+            if document is not None and document.get("text") is not None:
+                out[str(document_id)] = document["text"]
+        return out
+
+    def get_document(self, index_id: str, document_id: str) -> dict | None:
+        self.get_document_calls += 1
+        document = self.documents.get(document_id)
+        if document is None:
+            return None
+        return {
+            "document_id": document_id,
+            "metadata": dict(document["metadata"]),
+            "chunk_count": 1,
+            "content_hash": document.get("content_hash", f"hash:{document_id}"),
+        }
+
+    def list_documents(self, index_id: str, *, filter=None) -> list[dict]:
+        self.list_documents_calls += 1
+        metadata_filter = (filter or {}).get("metadata", {})
+        document_ids = set((filter or {}).get("document_ids", self.documents.keys()))
+        records = []
+        for document_id in sorted(document_ids):
+            document = self.documents.get(document_id)
+            if document is None:
+                continue
+            if any(
+                document["metadata"].get(key) != value for key, value in metadata_filter.items()
+            ):
+                continue
+            records.append(
+                {
+                    "document_id": document_id,
+                    "metadata": dict(document["metadata"]),
+                    "chunk_count": 1,
+                    "content_hash": document.get("content_hash", f"hash:{document_id}"),
+                }
+            )
+        return records
 
     def persist(self) -> None:
         self.persist_calls += 1
@@ -323,6 +382,51 @@ def test_native_core_write_on_text_store_uses_prepare_apply(tmp_path, monkeypatc
     assert stats["write_mode"] == "on"
     assert stats["write_through"] is True
     assert hits[0].id == "doc-alpha"
+
+
+def test_native_core_write_on_text_store_serves_document_reads(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine()
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: FakeNativeAdapter(native),
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    db = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        commit_mode="generation",
+    )
+    db.add(
+        "Alpha launch notes mention error code E-1001.",
+        id="doc-alpha",
+        metadata={"topic": "ops"},
+    )
+
+    assert db.get("doc-alpha") == "Alpha launch notes mention error code E-1001."
+    assert db.get("missing") is None
+    assert db.get_texts(["doc-alpha", "missing"]) == {
+        "doc-alpha": "Alpha launch notes mention error code E-1001."
+    }
+    assert db.get_document("doc-alpha") == {
+        "id": "doc-alpha",
+        "metadata": {"topic": "ops"},
+        "chunk_count": 1,
+        "content_hash": "hash:doc-alpha",
+    }
+    assert db.list_documents(filter={"topic": "ops"}) == [
+        {
+            "id": "doc-alpha",
+            "metadata": {"topic": "ops"},
+            "chunk_count": 1,
+            "content_hash": "hash:doc-alpha",
+        }
+    ]
+    assert native.get_text_calls == 2
+    assert native.get_texts_calls == 1
+    assert native.get_document_calls == 1
+    assert native.list_documents_calls == 1
 
 
 def test_text_shadow_mode_mirrors_prepare_apply_and_query(tmp_path, monkeypatch) -> None:

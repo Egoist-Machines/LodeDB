@@ -158,6 +158,20 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     )
     assert applied["embedded_chunks"] == 1
     assert applied["embedding_time_ms"] == 1.25
+    assert _loads(engine.get_document_text("text", "doc-alpha")) == (
+        "Alpha launch notes mention error code E-1001."
+    )
+    assert _loads(engine.get_document_texts("text", json.dumps(["doc-alpha", "missing"]))) == {
+        "doc-alpha": "Alpha launch notes mention error code E-1001."
+    }
+    record = _loads(engine.get_document("text", "doc-alpha"))
+    assert record["document_id"] == "doc-alpha"
+    assert record["metadata"] == {"topic": "ops"}
+    assert record["chunk_count"] == 1
+    assert "text" not in record
+    assert _loads(
+        engine.list_documents("text", json.dumps({"metadata": {"topic": "ops"}}))
+    )[0]["document_id"] == "doc-alpha"
 
     query_plan = _loads(engine.prepare_query_text("E-1001", "vector"))
     assert query_plan["requires_embedding"] is True

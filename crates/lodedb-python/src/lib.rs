@@ -268,6 +268,44 @@ impl PyCoreEngine {
         )
     }
 
+    fn get_document_text(&self, index_id: &str, document_id: &str) -> PyResult<String> {
+        to_json(
+            &self
+                .inner
+                .get_document_text(index_id, document_id)
+                .map_err(core_error_to_py)?,
+        )
+    }
+
+    fn get_document_texts(&self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
+        let document_ids = from_json::<Vec<String>>(document_ids_json)?;
+        to_json(
+            &self
+                .inner
+                .get_document_texts(index_id, &document_ids)
+                .map_err(core_error_to_py)?,
+        )
+    }
+
+    fn get_document(&self, index_id: &str, document_id: &str) -> PyResult<String> {
+        to_json(
+            &self
+                .inner
+                .get_document(index_id, document_id)
+                .map_err(core_error_to_py)?,
+        )
+    }
+
+    fn list_documents(&self, index_id: &str, filter_json: Option<&str>) -> PyResult<String> {
+        let filter = optional_value(filter_json)?;
+        to_json(
+            &self
+                .inner
+                .list_documents(index_id, filter.as_ref())
+                .map_err(core_error_to_py)?,
+        )
+    }
+
     fn persist(&mut self) -> PyResult<()> {
         self.inner.persist().map_err(core_error_to_py)
     }

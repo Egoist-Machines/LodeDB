@@ -1069,6 +1069,9 @@ class LodeDB:
             raise ValueError("id must be a non-empty string")
         if not self.store_text:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
+        native_handled, native_text = self._native_get_text(id)
+        if native_handled and self._native_core_mode == NativeCoreMode.ON:
+            return native_text
         try:
             return self._index.get_document_text(id)
         except EngineError as exc:
@@ -1093,6 +1096,9 @@ class LodeDB:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
         if not ids:
             return {}
+        native_handled, native_texts = self._native_get_texts(ids)
+        if native_handled and self._native_core_mode == NativeCoreMode.ON:
+            return native_texts
         return self._index.get_document_texts(ids)
 
     def get_document(self, id: str) -> dict[str, Any] | None:
@@ -1107,6 +1113,9 @@ class LodeDB:
 
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
+        native_handled, native_record = self._native_get_document(id)
+        if native_handled and self._native_core_mode == NativeCoreMode.ON:
+            return None if native_record is None else _public_document_record(native_record)
         try:
             record = self._index.get_document(id)
         except EngineError as exc:
@@ -1136,8 +1145,12 @@ class LodeDB:
         flat as the corpus grows while the match set stays small.
         """
 
+        normalized_filter = _normalize_filter(filter)
+        native_handled, native_records = self._native_list_documents(normalized_filter)
+        if native_handled and self._native_core_mode == NativeCoreMode.ON:
+            return [_public_document_record(record) for record in native_records]
         try:
-            raw = self._index.list_documents(filter=_normalize_filter(filter))
+            raw = self._index.list_documents(filter=normalized_filter)
         except EngineError as exc:
             # A read-only handle on a not-yet-written path has no index yet;
             # that is an empty store, not an error.
@@ -1543,6 +1556,65 @@ class LodeDB:
             return None
         return self._hits_from_native_rows(payload.get("hits", []))
 
+    def _native_get_text(self, document_id: str) -> tuple[bool, str | None]:
+        """Returns one native raw-text value when this handle is covered."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return False, None
+        try:
+            return True, self._native_vector_engine.get_document_text(
+                _LOCAL_INDEX_ID,
+                document_id,
+            )
+        except Exception as exc:
+            self._mark_native_read_failed("native_core_get_text_failed", exc)
+            return False, None
+
+    def _native_get_texts(self, document_ids: list[str]) -> tuple[bool, dict[str, str]]:
+        """Returns native raw-text values when this handle is covered."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return False, {}
+        try:
+            return True, self._native_vector_engine.get_document_texts(
+                _LOCAL_INDEX_ID,
+                document_ids,
+            )
+        except Exception as exc:
+            self._mark_native_read_failed("native_core_get_texts_failed", exc)
+            return False, {}
+
+    def _native_get_document(self, document_id: str) -> tuple[bool, dict[str, Any] | None]:
+        """Returns one native payload-free document record when covered."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return False, None
+        try:
+            return True, self._native_vector_engine.get_document(
+                _LOCAL_INDEX_ID,
+                document_id,
+            )
+        except Exception as exc:
+            self._mark_native_read_failed("native_core_get_document_failed", exc)
+            return False, None
+
+    def _native_list_documents(
+        self,
+        filter: Mapping[str, Any] | None,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Returns native payload-free document records when covered."""
+
+        if self._native_vector_engine is None or not self._native_vector_covered:
+            return False, []
+        try:
+            return True, self._native_vector_engine.list_documents(
+                _LOCAL_INDEX_ID,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._mark_native_read_failed("native_core_list_documents_failed", exc)
+            return False, []
+
     def _native_stats(self) -> dict[str, Any] | None:
         """Returns native stats only when this handle is covered by native state."""
 
@@ -1599,6 +1671,18 @@ class LodeDB:
                 raise RuntimeError("native core persist failed") from exc
             if self._native_core_strict_parity:
                 raise
+
+    def _mark_native_read_failed(self, reason: str, exc: Exception) -> None:
+        """Records a native read fallback and applies rollout failure policy."""
+
+        self._native_vector_covered = False
+        self._native_text_shadow_enabled = False
+        self._native_write_through_enabled = False
+        self._native_core_fallback_reason = reason
+        if self._native_core_fail_closed:
+            raise RuntimeError("native core document read failed") from exc
+        if self._native_core_strict_parity:
+            raise RuntimeError("native core document read failed") from exc
 
     def _verify_native_shadow_persist(self) -> None:
         """Compares redacted native shadow counts to the Python authoritative store."""
