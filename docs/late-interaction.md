@@ -75,11 +75,23 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
   narrows and stays exact.
 - **Streaming**: a corpus over the resident budget (or `resident=False`) is scored
   by reading documents back from disk in bounded chunks -- slower (disk-bound) but
-  exact and constant-memory, so the exact path is never capped by RAM.
+  exact and near-constant-memory, so the exact path is never capped by RAM.
+
+Scoring memory is bounded to the chunk budget, with one exception: a single
+document whose patch matrix exceeds the budget is scored whole (its score buffer
+is proportional to that one document), since a document is the unit of MaxSim.
 
 The original prototype instead ran a two-stage quantized-candidate-then-rescore
 query: ~110 ms/query at recall 0.73 (profile: candidate generation ~61%, patch
 read-back ~38%, scoring ~1%). The resident scan removes both dominant costs.
+
+### Concurrency
+
+A single index handle is safe to use from multiple threads -- `add` / `remove` and
+`search` / `search_many` can run concurrently (as with the underlying `LodeDB`,
+e.g. behind `lodedb serve`). Each mutation's commit and resident-cache update are
+applied as one ordered unit, and a query scores a consistent snapshot of the
+cache, so a query never observes a half-applied write or a stale cache.
 
 ### Batched queries
 

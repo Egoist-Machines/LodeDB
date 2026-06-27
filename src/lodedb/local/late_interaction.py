@@ -292,6 +292,10 @@ class LodeLateInteractionIndex:
         # shared handle (the engine offers the same in-process guarantee), and set
         # to _RESIDENT_OVER_BUDGET once it is known not to fit.
         self._resident_cache: dict[str, Any] | object | None = None
+        # _write_lock orders each mutation's (DB commit + cache note) as one unit so
+        # concurrent writers cannot reorder cache notes vs commits; _cache_lock
+        # guards the cache structure so a reader's snapshot is consistent.
+        self._write_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         lodedb_kwargs.pop("store_text", None)
         self._db = LodeDB.open_vector_store(
@@ -348,8 +352,12 @@ class LodeLateInteractionIndex:
         row, document_id, matrix, user_meta = self._prepare_write(
             id, patches, metadata, normalize
         )
-        self._db.add_vectors_many([row])
-        self._cache_note_writes([(document_id, matrix, user_meta, int(matrix.shape[0]))])
+        # Serialize the commit and its cache note as one ordered mutation, so
+        # concurrent writers can never apply the cache notes in a different order
+        # than they committed to disk (which would leave the cache stale).
+        with self._write_lock:
+            self._db.add_vectors_many([row])
+            self._cache_note_writes([(document_id, matrix, user_meta, int(matrix.shape[0]))])
         return document_id
 
     def add_documents(
@@ -379,8 +387,9 @@ class LodeLateInteractionIndex:
             ids.append(document_id)
             notes.append((document_id, matrix, user_meta, int(matrix.shape[0])))
         if rows:
-            self._db.add_vectors_many(rows, normalize=False)
-            self._cache_note_writes(notes)
+            with self._write_lock:
+                self._db.add_vectors_many(rows, normalize=False)
+                self._cache_note_writes(notes)
         return ids
 
     def add_texts(
@@ -414,9 +423,11 @@ class LodeLateInteractionIndex:
         """Removes a document; returns True if it existed."""
 
         document_id = _require_doc_id(id)
-        removed = self._db.remove(document_id)
-        if removed:
-            self._cache_note_remove(document_id)
+        # Same ordered-mutation discipline as add: commit and cache note together.
+        with self._write_lock:
+            removed = self._db.remove(document_id)
+            if removed:
+                self._cache_note_remove(document_id)
         return removed
 
     # -- read path ----------------------------------------------------------

@@ -285,6 +285,44 @@ def test_concurrent_add_and_search_one_handle(tmp_path):
     assert not errors
 
 
+def test_concurrent_same_id_writers_keep_cache_consistent(tmp_path):
+    # Concurrent writers re-adding one id must leave the resident cache consistent
+    # with disk: the commit and its cache note are serialized as one mutation, so
+    # the cache cannot end on a different version than the last commit.
+    import threading
+
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("same", _onehot_matrix([0]), metadata={"label": "init"})
+    idx.search(_onehot_matrix([0]), k=1)  # build the live cache
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def writer(label: str, dim_idx: int) -> None:
+        try:
+            barrier.wait()
+            for _ in range(40):
+                idx.add_document("same", _onehot_matrix([dim_idx]), metadata={"label": label})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=(f"w{i}", i % DIM)) for i in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    idx.persist()  # checkpoint so a read-only reopen sees the latest commit
+
+    # The live resident cache's view of "same" must equal the durable disk state.
+    live = idx.search(_onehot_matrix([0]), k=1)[0]
+    fresh = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    disk = fresh.search(_onehot_matrix([0]), k=1)[0]
+    assert live.metadata == disk.metadata
+    assert live.patch_count == disk.patch_count
+
+
 def test_incremental_growth_evicts_over_budget(tmp_path):
     # Start within budget so the cache builds, then grow past it incrementally:
     # the cache evicts and queries fall back to the (exact) streaming path.
