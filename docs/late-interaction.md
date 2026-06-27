@@ -133,8 +133,12 @@ in RAM; int8 is ~14x smaller. Scoring upcasts to float32 in bounded chunks, so a
 compact resident matrix never forces a full-precision copy of the whole corpus.
 The on-disk precision is the configured one; the resident in-memory matrix is
 float32 for `storage="float32"` and float16 otherwise (so `int8` halves resident
-RAM versus float32 and quarters on-disk size). Either way, a document scores
-identically whether served from the resident cache or a fresh reopen.
+RAM versus float32 and quarters on-disk size). Scoring uses that serving
+representation uniformly across the resident, streaming, and filtered paths, so a
+document scores identically regardless of path or whether it is served from the
+resident cache or a fresh reopen. For `int8` and `float16`, "exact MaxSim" means
+exact against that serving representation (the resident path is exhaustive, with no
+candidate-recall loss); `float32` is bit-exact.
 
 ## Scoring backend
 

@@ -702,6 +702,47 @@ def test_read_only_reopen_adopts_persisted_storage(tmp_path):
     assert reader.search(_onehot_matrix([0]), k=1)[0].id == "doc-a"
 
 
+def test_int8_paths_agree_on_random_vectors(tmp_path):
+    # int8 resident, streaming, and filtered scans must return the same top-k on
+    # random (non-one-hot) vectors -- all paths score the same serving precision.
+    rng = np.random.default_rng(41)
+    docs = [(f"d{i:02d}", _unit_rows(rng, 6)) for i in range(40)]
+    res = LodeLateInteractionIndex(tmp_path / "res", dim=DIM, storage="int8", resident=True)
+    stream = LodeLateInteractionIndex(
+        tmp_path / "stream", dim=DIM, storage="int8", resident=False
+    )
+    filt = LodeLateInteractionIndex(tmp_path / "filt", dim=DIM, storage="int8")
+    for doc_id, m in docs:
+        res.add_document(doc_id, m, normalize=False)
+        stream.add_document(doc_id, m, normalize=False)
+        filt.add_document(doc_id, m, metadata={"all": "x"}, normalize=False)
+    for _ in range(8):
+        q = _unit_rows(rng, 5)
+        r = res.search(q, k=10, normalize=False)
+        s = stream.search(q, k=10, normalize=False)
+        f = filt.search(q, k=10, filter={"all": "x"}, normalize=False)
+        assert [h.id for h in r] == [h.id for h in s] == [h.id for h in f]
+        for a, b in zip(r, s, strict=True):
+            assert a.score == pytest.approx(b.score, abs=1e-5)
+
+
+def test_pending_cache_metadata_coerced_like_disk(tmp_path):
+    # Metadata from a doc added after the cache is built must be string-coerced the
+    # same way the engine persists it, so live search matches filtered/reopen.
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("a", _onehot_matrix([0]))
+    idx.search(_onehot_matrix([0]), k=1)  # build the resident cache
+    idx.add_document("b", _onehot_matrix([5]), metadata={"n": 2, "b": False, "s": "x"})
+    expected = {"n": "2", "b": "false", "s": "x"}
+    live = idx.search(_onehot_matrix([5]), k=1)[0]
+    assert live.metadata == expected
+    filtered = idx.search(_onehot_matrix([5]), k=1, filter={"n": "2"})[0]
+    assert filtered.metadata == expected
+    idx.persist()
+    fresh = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    assert fresh.search(_onehot_matrix([5]), k=1)[0].metadata == expected
+
+
 @pytest.mark.parametrize("storage", ["float32", "float16", "int8"])
 def test_incremental_resident_matches_reopen(tmp_path, storage):
     # Documents added AFTER the resident cache is built (the pending-delta path)

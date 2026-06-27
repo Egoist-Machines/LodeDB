@@ -60,7 +60,7 @@ from lodedb.engine._atomic_io import (
     durable_replace,
     normalize_durability,
 )
-from lodedb.local.db import LodeDB
+from lodedb.local.db import LodeDB, _coerce_metadata
 
 # The bundled TurboVec extension exposes a native MaxSim kernel (`maxsim_scores`)
 # that scores documents in parallel Rust. It is resolved once and cached; a build
@@ -646,13 +646,18 @@ class LodeLateInteractionIndex:
         row_meta[_DTYPE_KEY] = self.storage
         text = _encode_matrix(matrix, self.storage)
         cache_matrix = _decode_matrix(text, self.storage, self.dim)
+        # Cache the metadata exactly as it persists and reopens: the engine
+        # stringifies scalar values, so the live pending-cache hit must too, or it
+        # would return ints/bools where a reopen / filtered / streaming hit returns
+        # strings for the same document.
+        cache_meta = _strip_internal_metadata(_coerce_metadata(row_meta))
         row = {
             "vector": _pool(matrix).tolist(),
             "id": document_id,
             "metadata": row_meta,
             "text": text,
         }
-        return row, document_id, cache_matrix, user_meta
+        return row, document_id, cache_matrix, cache_meta
 
     # -- resident cache maintenance -----------------------------------------
 
@@ -876,7 +881,13 @@ class LodeLateInteractionIndex:
                 continue
             meta = meta_by_id.get(doc_id, {})
             row_dtype = str(meta.get(_DTYPE_KEY, "float32"))
-            matrix = _decode_matrix(blob, row_dtype, self.dim)
+            # Cast to the resident serving dtype so every path (resident, streaming,
+            # filtered) scores int8/float16 at the same precision and returns the
+            # same top-k; otherwise streaming would score int8 at float32 while the
+            # resident cache scores it at float16.
+            matrix = _decode_matrix(blob, row_dtype, self.dim).astype(
+                self._resident_dtype(), copy=False
+            )
             patch_count = _patch_count_from_metadata(meta) or matrix.shape[0]
             out[doc_id] = (matrix, _strip_internal_metadata(meta), patch_count)
         return out
