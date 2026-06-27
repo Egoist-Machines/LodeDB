@@ -1224,9 +1224,13 @@ class LodeDB:
         """
 
         normalized_filter = _normalize_filter(filter)
-        native_handled, native_records = self._native_list_documents(normalized_filter)
-        if native_handled and self._native_core_mode == NativeCoreMode.ON:
-            return [_public_document_record(record) for record in native_records]
+        # Skip the native enumeration when a document_ids filter would fail engine
+        # validation, so the Python engine raises the same error as native-off
+        # instead of native silently returning empty results (parity with search).
+        if self._native_filter_shortcut_safe(normalized_filter):
+            native_handled, native_records = self._native_list_documents(normalized_filter)
+            if native_handled and self._native_core_mode == NativeCoreMode.ON:
+                return [_public_document_record(record) for record in native_records]
         try:
             raw = self._index.list_documents(filter=normalized_filter)
         except EngineError as exc:
