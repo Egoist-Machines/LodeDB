@@ -141,6 +141,11 @@ impl CoreEngine {
         // Capture the raw-text/lexical retention policy before borrowing the
         // index (it lives on the persistence options).
         let (store_text, index_text) = self.text_capture_policy();
+        // Decide once whether a WAL record is needed (WAL mode, writable, not
+        // replaying). When true, only the rows that actually change are collected
+        // into the WAL payload below, so a mixed batch with unchanged rows does not
+        // serialize them.
+        let append_wal = self.should_append_wal();
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
         // Validate the whole batch before mutating any state. A bad row found
@@ -165,6 +170,7 @@ impl CoreEngine {
         }
         let mut changed = 0usize;
         let mut chunks_upserted = 0usize;
+        let mut wal_vectors: Vec<Value> = Vec::new();
         let mut changed_filter_fields = BTreeSet::new();
         // Collect every upserted chunk and sync the live TurboVec index once after
         // the loop instead of one `upsert_with_ids_2d` re-encode per document. The
@@ -262,6 +268,28 @@ impl CoreEngine {
                 ));
                 chunks_upserted += 1;
             }
+            if append_wal {
+                // Collect only changed rows for the WAL: never write raw text when
+                // store_text is off (privacy); when index_text is on, write derived
+                // caption tokens so replay rebuilds lexical postings without
+                // retaining raw text on disk.
+                let text = if store_text {
+                    serde_json::json!(document.text)
+                } else {
+                    Value::Null
+                };
+                let tokens = match (index_text, document.text.as_deref()) {
+                    (true, Some(text)) => serde_json::json!([tokenize(text)]),
+                    _ => Value::Null,
+                };
+                wal_vectors.push(serde_json::json!({
+                    "document_id": document.document_id,
+                    "vector": document.vector,
+                    "metadata": document.metadata,
+                    "text": text,
+                    "tokens": tokens,
+                }));
+            }
             changed += 1;
         }
         // A document id repeated within one batch must collapse to its last
@@ -291,34 +319,11 @@ impl CoreEngine {
         }
         let generation = index.generation;
         let index_key = index.index_key.clone();
-        if changed > 0 && self.should_append_wal() {
+        if !wal_vectors.is_empty() {
             self.append_wal_record(
                 &index_key,
                 "upsert_vectors",
-                serde_json::json!({
-                    "vectors": documents.iter().map(|document| {
-                        // Never write raw text to the WAL when store_text is off
-                        // (privacy). When index_text is on, write the derived
-                        // caption tokens so replay can rebuild lexical postings
-                        // without retaining the raw text on disk.
-                        let text = if store_text {
-                            serde_json::json!(document.text)
-                        } else {
-                            Value::Null
-                        };
-                        let tokens = match (index_text, document.text.as_deref()) {
-                            (true, Some(text)) => serde_json::json!([tokenize(text)]),
-                            _ => Value::Null,
-                        };
-                        serde_json::json!({
-                            "document_id": document.document_id,
-                            "vector": document.vector,
-                            "metadata": document.metadata,
-                            "text": text,
-                            "tokens": tokens,
-                        })
-                    }).collect::<Vec<_>>()
-                }),
+                serde_json::json!({ "vectors": wal_vectors }),
             )?;
         }
         Ok(CoreMutationResult {
