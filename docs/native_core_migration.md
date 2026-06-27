@@ -64,6 +64,7 @@ PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 \
   uv run pytest -q tests/test_native_core_extension.py
 
 cargo build -p lodedb-ffi
+LODEDB_FFI_SANITIZERS=1 cargo test -p lodedb-ffi --test abi_smoke -- --nocapture
 LODEDB_FFI_DYLIB="$(pwd)/target/debug/liblodedb_ffi.dylib" \
   swift test --package-path swift/LodeDBCore
 env -u LODEDB_FFI_DYLIB swift test --package-path swift/LodeDBCore
