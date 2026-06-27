@@ -143,16 +143,81 @@ def test_resident_budget_falls_back_to_streaming(tmp_path):
     assert hits[0].id == "doc-a"
 
 
-def test_resident_cache_invalidated_on_write(tmp_path):
+def test_resident_cache_reflects_incremental_writes(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     idx.add_document("doc-a", _onehot_matrix([0, 1]))
     assert idx.search(_onehot_matrix([0]), k=5)[0].id == "doc-a"  # builds cache
-    idx.add_document("doc-b", _onehot_matrix([5, 6]))  # must invalidate
+    idx.add_document("doc-b", _onehot_matrix([5, 6]))  # folds into the live cache
     hits = idx.search(_onehot_matrix([5]), k=5)
     assert hits[0].id == "doc-b"
     assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"doc-a", "doc-b"}
     idx.remove("doc-a")
     assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"doc-b"}
+    # Re-adding an id updates the live cache to the new content (doc-b -> dim 9).
+    idx.add_document("doc-b", _onehot_matrix([9]))
+    hit = idx.search(_onehot_matrix([9]), k=1)[0]
+    assert hit.id == "doc-b" and hit.patch_count == 1
+
+
+def test_incremental_cache_matches_fresh_rebuild(tmp_path):
+    # An interleaved add/remove/re-add sequence against the live cache must give
+    # the same results as a fresh handle that rebuilds the cache from disk.
+    rng = np.random.default_rng(5)
+
+    def mat():
+        m = rng.standard_normal((6, DIM)).astype(np.float32)
+        return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("seed", mat(), normalize=False)
+    idx.search(_onehot_matrix([0]), k=1)  # build the live cache
+    for i in range(30):
+        idx.add_document(f"d{i:02d}", mat(), normalize=False)
+        if i % 5 == 0:
+            idx.add_document("d00", mat(), normalize=False)  # re-add (replace)
+        if i % 7 == 0 and i:
+            idx.remove(f"d{i - 1:02d}")
+    idx.persist()
+
+    fresh = LodeLateInteractionIndex(tmp_path, dim=DIM, read_only=True)
+    for _ in range(10):
+        q = mat()
+        live_hits = idx.search(q, k=8, normalize=False)
+        fresh_hits = fresh.search(q, k=8, normalize=False)
+        assert [h.id for h in live_hits] == [h.id for h in fresh_hits]
+        for a, b in zip(live_hits, fresh_hits, strict=True):
+            assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_incremental_compaction_folds_pending(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("a", _onehot_matrix([0, 1]))
+    idx.search(_onehot_matrix([0]), k=1)  # build cache
+    idx.add_document("b", _onehot_matrix([5]))  # goes to pending
+    idx.add_document("a", _onehot_matrix([2]))  # replace -> tombstone + pending
+    cache = idx._resident_cache
+    assert cache["pending"]  # delta present before compaction
+    idx._cache_compact(cache)
+    assert cache["pending"] == [] and cache["removed"] == set()
+    assert set(cache["ids"]) == {"a", "b"}
+    # Results still correct after compaction: "a" now matches dim 2, not 0/1.
+    assert idx.search(_onehot_matrix([2]), k=1)[0].id == "a"
+    assert idx.search(_onehot_matrix([5]), k=1)[0].id == "b"
+    assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"a", "b"}
+
+
+def test_incremental_growth_evicts_over_budget(tmp_path):
+    # Start within budget so the cache builds, then grow past it incrementally:
+    # the cache evicts and queries fall back to the (exact) streaming path.
+    idx = LodeLateInteractionIndex(
+        tmp_path, dim=DIM, resident="auto", resident_max_bytes=DIM * 4 * 3
+    )
+    idx.add_document("a", _onehot_matrix([0]))
+    assert idx._resident_cache_get() is not None  # fits
+    for i in range(10):
+        idx.add_document(f"x{i}", _onehot_matrix([i % DIM]))
+    assert idx._resident_cache is None  # evicted on growth
+    assert idx.search(_onehot_matrix([0]), k=1)[0].id == "a"  # streaming still exact
 
 
 def test_add_documents_batch(tmp_path):

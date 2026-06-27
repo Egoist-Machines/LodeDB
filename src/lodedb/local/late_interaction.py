@@ -318,9 +318,12 @@ class LodeLateInteractionIndex:
         re-adding an existing id replaces it. Commits atomically.
         """
 
-        self._db.add_vectors_many([self._build_row(id, patches, metadata, normalize)])
-        self._resident_cache = None  # serving cache is now stale
-        return _require_doc_id(id)
+        row, document_id, matrix, user_meta = self._prepare_write(
+            id, patches, metadata, normalize
+        )
+        self._db.add_vectors_many([row])
+        self._cache_note_writes([(document_id, matrix, user_meta, int(matrix.shape[0]))])
+        return document_id
 
     def add_documents(
         self,
@@ -335,20 +338,22 @@ class LodeLateInteractionIndex:
 
         rows: list[dict[str, Any]] = []
         ids: list[str] = []
+        notes: list[tuple[str, np.ndarray, dict[str, Any], int]] = []
         for document in documents:
             if not isinstance(document, Mapping):
                 raise ValueError("each document must be a mapping")
             patches = document.get("patches")
             if patches is None:
                 raise ValueError("each document needs a 'patches' matrix")
-            row = self._build_row(
+            row, document_id, matrix, user_meta = self._prepare_write(
                 document.get("id"), patches, document.get("metadata"), normalize
             )
             rows.append(row)
-            ids.append(row["id"])
+            ids.append(document_id)
+            notes.append((document_id, matrix, user_meta, int(matrix.shape[0])))
         if rows:
             self._db.add_vectors_many(rows, normalize=False)
-            self._resident_cache = None
+            self._cache_note_writes(notes)
         return ids
 
     def add_texts(
@@ -381,9 +386,10 @@ class LodeLateInteractionIndex:
     def remove(self, id: str) -> bool:
         """Removes a document; returns True if it existed."""
 
-        removed = self._db.remove(_require_doc_id(id))
+        document_id = _require_doc_id(id)
+        removed = self._db.remove(document_id)
         if removed:
-            self._resident_cache = None
+            self._cache_note_remove(document_id)
         return removed
 
     # -- read path ----------------------------------------------------------
@@ -428,7 +434,11 @@ class LodeLateInteractionIndex:
             cache = self._resident_cache_get()
             if cache is not None:
                 return self._topk_from_chunks(
-                    query_matrix, self._resident_chunks(cache), int(k), prefer_native
+                    query_matrix,
+                    self._resident_chunks(cache),
+                    int(k),
+                    prefer_native,
+                    skip=cache["removed"],
                 )
 
         # Over the resident budget (or resident=False): stream from disk, exact.
@@ -521,26 +531,167 @@ class LodeLateInteractionIndex:
 
     # -- internals ----------------------------------------------------------
 
-    def _build_row(
+    def _prepare_write(
         self,
         id: Any,
         patches: Any,
         metadata: Mapping[str, Any] | None,
         normalize: bool,
-    ) -> dict[str, Any]:
-        """Builds the single engine row (pooled vector + encoded matrix) for a doc."""
+    ) -> tuple[dict[str, Any], str, np.ndarray, dict[str, Any]]:
+        """Prepares one document write.
+
+        Returns ``(engine_row, document_id, matrix, user_metadata)``: the row to
+        upsert (pooled vector + encoded matrix + stamped metadata), plus the
+        normalized patch matrix and clean user metadata for the resident cache.
+        """
 
         document_id = _require_doc_id(id)
         matrix = _as_matrix(patches, self.dim, normalize=normalize)
-        row_meta = _coerce_user_metadata(metadata)
+        user_meta = _coerce_user_metadata(metadata)
+        row_meta = dict(user_meta)
         row_meta[_PATCH_COUNT_KEY] = str(matrix.shape[0])
         row_meta[_DTYPE_KEY] = self.storage
-        return {
+        row = {
             "vector": _pool(matrix).tolist(),
             "id": document_id,
             "metadata": row_meta,
             "text": _encode_matrix(matrix, self.storage),
         }
+        return row, document_id, matrix, user_meta
+
+    # -- resident cache maintenance -----------------------------------------
+
+    def _cache_note_writes(
+        self, notes: list[tuple[str, np.ndarray, dict[str, Any], int]]
+    ) -> None:
+        """Folds writes into the live resident cache (a no-op if it is not built).
+
+        New/updated documents land in a pending delta; the base matrix is compacted
+        periodically, so an interleaved add/query workload never pays a full
+        from-disk rebuild per write.
+        """
+
+        cache = self._resident_cache
+        if cache is None:
+            return
+        resident_dtype = self._resident_dtype()
+        for document_id, matrix, user_meta, patch_count in notes:
+            self._cache_replace(
+                cache,
+                document_id,
+                matrix.astype(resident_dtype, copy=False),
+                user_meta,
+                patch_count,
+            )
+        self._cache_maybe_compact_or_evict(cache)
+
+    def _cache_note_remove(self, document_id: str) -> None:
+        """Reflects a removed document in the live resident cache, if built."""
+
+        cache = self._resident_cache
+        if cache is None:
+            return
+        if document_id in cache["pending_ids"]:
+            self._cache_drop_pending(cache, document_id)
+        if document_id in cache["base_ids_set"]:
+            cache["removed"].add(document_id)
+
+    def _cache_replace(
+        self,
+        cache: dict[str, Any],
+        document_id: str,
+        matrix: np.ndarray,
+        user_meta: dict[str, Any],
+        patch_count: int,
+    ) -> None:
+        """Upserts one document into the pending delta (masking any prior copy)."""
+
+        if document_id in cache["pending_ids"]:
+            self._cache_drop_pending(cache, document_id)
+        if document_id in cache["base_ids_set"]:
+            cache["removed"].add(document_id)
+        cache["pending"].append((matrix, document_id, user_meta, int(patch_count)))
+        cache["pending_ids"].add(document_id)
+        cache["pending_patches"] += int(matrix.shape[0])
+
+    @staticmethod
+    def _cache_drop_pending(cache: dict[str, Any], document_id: str) -> None:
+        """Removes a document's entry from the pending delta."""
+
+        for index, entry in enumerate(cache["pending"]):
+            if entry[1] == document_id:
+                cache["pending_patches"] -= int(entry[0].shape[0])
+                del cache["pending"][index]
+                break
+        cache["pending_ids"].discard(document_id)
+
+    def _cache_maybe_compact_or_evict(self, cache: dict[str, Any]) -> None:
+        """Evicts the cache if it now exceeds the budget, else compacts if needed."""
+
+        base_patches = int(cache["counts"].sum()) if cache["counts"].size else 0
+        itemsize = np.dtype(self._resident_dtype()).itemsize
+        live_bytes = (base_patches + cache["pending_patches"]) * self.dim * itemsize
+        if self.resident == "auto" and live_bytes > self.resident_max_bytes:
+            self._resident_cache = None  # too big now: fall back to streaming
+            return
+        # Compact when the pending delta has grown to ~half the base (bounds the
+        # amortized compaction cost), or past a document-count cap (bounds the
+        # per-query pending vstack when documents are tiny).
+        if cache["pending_patches"] >= max(50_000, base_patches // 2) or len(
+            cache["pending"]
+        ) >= 2000:
+            self._cache_compact(cache)
+
+    def _cache_compact(self, cache: dict[str, Any]) -> None:
+        """Folds the pending delta and tombstones into a fresh contiguous base."""
+
+        resident_dtype = self._resident_dtype()
+        counts = cache["counts"]
+        offsets = np.zeros(len(counts), dtype=np.intp)
+        if len(counts) > 1:
+            np.cumsum(counts[:-1], out=offsets[1:])
+        flat = cache["flat"]
+        new_ids: list[str] = []
+        new_mats: list[np.ndarray] = []
+        new_metas: list[dict[str, Any]] = []
+        new_patch_counts: list[int] = []
+        removed = cache["removed"]
+        for index, document_id in enumerate(cache["ids"]):
+            if document_id in removed:
+                continue
+            start = int(offsets[index])
+            count = int(counts[index])
+            new_ids.append(document_id)
+            new_mats.append(flat[start : start + count])
+            new_metas.append(cache["metas"][index])
+            new_patch_counts.append(cache["patch_counts"][index])
+        for matrix, document_id, user_meta, patch_count in cache["pending"]:
+            new_ids.append(document_id)
+            new_mats.append(matrix)
+            new_metas.append(user_meta)
+            new_patch_counts.append(patch_count)
+        if new_mats:
+            cache["flat"] = np.ascontiguousarray(np.vstack(new_mats), dtype=resident_dtype)
+            cache["counts"] = np.fromiter(
+                (m.shape[0] for m in new_mats), dtype=np.int64, count=len(new_mats)
+            )
+        else:
+            cache["flat"] = np.zeros((0, self.dim), dtype=resident_dtype)
+            cache["counts"] = np.zeros(0, dtype=np.int64)
+        cache["ids"] = new_ids
+        cache["base_ids_set"] = set(new_ids)
+        cache["metas"] = new_metas
+        cache["patch_counts"] = new_patch_counts
+        cache["pending"] = []
+        cache["pending_ids"] = set()
+        cache["pending_patches"] = 0
+        cache["removed"] = set()
+        itemsize = np.dtype(resident_dtype).itemsize
+        if (
+            self.resident == "auto"
+            and int(cache["counts"].sum()) * self.dim * itemsize > self.resident_max_bytes
+        ):
+            self._resident_cache = None
 
     def _require_encoder(self) -> Any:
         """Returns the bring-your-own encoder or raises a clear error."""
@@ -653,14 +804,38 @@ class LodeLateInteractionIndex:
             )
             row += patches
 
+        # The pending delta (documents added since the last compaction) is a small
+        # chunk scored alongside the base; its ids are all live (replaced copies are
+        # masked in the base via cache["removed"]).
+        pending = cache["pending"]
+        if pending:
+            pending_flat = np.ascontiguousarray(
+                np.vstack([entry[0] for entry in pending]), dtype=np.float32
+            )
+            yield (
+                pending_flat,
+                np.fromiter(
+                    (entry[0].shape[0] for entry in pending),
+                    dtype=np.int64,
+                    count=len(pending),
+                ),
+                [entry[1] for entry in pending],
+                [entry[2] for entry in pending],
+                [entry[3] for entry in pending],
+            )
+
     def _topk_from_chunks(
         self,
         query_matrix: np.ndarray,
         chunks: Iterator[tuple],
         k: int,
         prefer_native: bool,
+        skip: set[str] | None = None,
     ) -> list[LodeLateInteractionHit]:
-        """Scores every chunk and returns the global top-``k`` (score desc, id asc)."""
+        """Scores every chunk and returns the global top-``k`` (score desc, id asc).
+
+        ``skip`` ids (resident tombstones) are scored but dropped from the result.
+        """
 
         collected: list[tuple[float, str, dict[str, Any], int]] = []
         for flat, counts, ids, metas, patch_counts in chunks:
@@ -670,6 +845,8 @@ class LodeLateInteractionIndex:
                 query_matrix, flat, counts, prefer_native=prefer_native
             )
             for i in range(len(ids)):
+                if skip and ids[i] in skip:
+                    continue
                 collected.append((float(scores[i]), ids[i], metas[i], int(patch_counts[i])))
         collected.sort(key=lambda item: (-item[0], item[1]))
         return [
@@ -739,6 +916,11 @@ class LodeLateInteractionIndex:
             ),
             "metas": metas,
             "patch_counts": patch_counts,
+            "base_ids_set": set(kept_ids),
+            "pending": [],
+            "pending_ids": set(),
+            "pending_patches": 0,
+            "removed": set(),
         }
 
 
@@ -782,6 +964,11 @@ def _empty_resident_cache(dim: int, dtype: type[np.floating]) -> dict[str, Any]:
         "counts": np.zeros(0, dtype=np.int64),
         "metas": [],
         "patch_counts": [],
+        "base_ids_set": set(),
+        "pending": [],
+        "pending_ids": set(),
+        "pending_patches": 0,
+        "removed": set(),
     }
 
 
