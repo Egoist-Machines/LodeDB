@@ -483,7 +483,7 @@ fn add_chunk_row(store: &mut LoadedStore, row: Value) -> CoreResult<()> {
         existing
             .get("chunk_id")
             .and_then(Value::as_str)
-            .is_none_or(|existing_id| existing_id != chunk_id)
+            .map_or(true, |existing_id| existing_id != chunk_id)
     });
     chunks.push(row);
     chunks.sort_by(|left, right| {
