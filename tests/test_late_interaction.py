@@ -232,6 +232,37 @@ def test_add_documents_batch(tmp_path):
     assert idx.count() == 2
 
 
+def test_search_many_matches_single_search(tmp_path):
+    rng = np.random.default_rng(13)
+
+    def mat(rows):
+        m = rng.standard_normal((rows, DIM)).astype(np.float32)
+        return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    for i in range(50):
+        idx.add_document(f"d{i:02d}", mat(6), normalize=False)
+    queries = [mat(rows) for rows in (5, 3, 8, 4)]  # ragged query lengths
+    batched = idx.search_many(queries, k=7, normalize=False)
+    assert len(batched) == len(queries)
+    for q, batch_hits in zip(queries, batched, strict=True):
+        single = idx.search(q, k=7, normalize=False)
+        assert [h.id for h in batch_hits] == [h.id for h in single]
+        for a, b in zip(batch_hits, single, strict=True):
+            assert a.score == pytest.approx(b.score, abs=1e-4)
+
+
+def test_search_many_edges(tmp_path):
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    assert idx.search_many([], k=5) == []  # no queries
+    assert idx.search_many([_onehot_matrix([0])], k=5) == [[]]  # empty index
+    idx.add_document("a", _onehot_matrix([0, 1]), metadata={"t": "x"})
+    idx.add_document("b", _onehot_matrix([5]), metadata={"t": "y"})
+    # Filter applies to every query in the batch.
+    out = idx.search_many([_onehot_matrix([0]), _onehot_matrix([5])], k=5, filter={"t": "y"})
+    assert [[h.id for h in hits] for hits in out] == [["b"], ["b"]]
+
+
 def test_filter_narrows_candidates_to_matching_documents(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     idx.add_document("public", _onehot_matrix([0, 1]), metadata={"tenant": "a"})

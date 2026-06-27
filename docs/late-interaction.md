@@ -64,9 +64,12 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
 - **Resident** (default, unfiltered, within the memory budget): every patch is held
   in one in-memory matrix and the whole corpus is scored in a single GEMM plus a
   segmented max -- a few milliseconds on thousands of pages. Built on the first
-  query (`resident_build_seconds` in the benchmark) and rebuilt after any write.
-  Control with `resident=True|False|"auto"` (default `"auto"`) and
-  `resident_max_bytes` (default 512 MB).
+  query (`resident_build_seconds` in the benchmark) and then **maintained in place**
+  on each `add`/`remove` (new documents fold into a pending delta, replaced/removed
+  ones are tombstoned, and the base is compacted periodically), so an interleaved
+  add-then-query workload never pays a full rebuild. Control with
+  `resident=True|False|"auto"` (default `"auto"`) and `resident_max_bytes` (default
+  512 MB); a corpus that grows past the budget evicts to the streaming path.
 - **Filtered**: a query with a `filter` resolves the matching documents
   engine-side and scores that subset exhaustively -- so a metadata filter both
   narrows and stays exact.
@@ -77,6 +80,14 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
 The original prototype instead ran a two-stage quantized-candidate-then-rescore
 query: ~110 ms/query at recall 0.73 (profile: candidate generation ~61%, patch
 read-back ~38%, scoring ~1%). The resident scan removes both dominant costs.
+
+### Batched queries
+
+`search_many(queries, k=...)` scores a list of multi-vector queries together --
+all queries' tokens go through one GEMM per document chunk instead of one GEMM per
+query -- and returns the top-k for each, in order. Use it to evaluate or answer
+many queries at once (~3x throughput in a 2k-document benchmark); single-query
+`search` latency is unchanged.
 
 ## Storage precision
 

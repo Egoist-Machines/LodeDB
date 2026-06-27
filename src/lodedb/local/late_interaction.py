@@ -418,6 +418,7 @@ class LodeLateInteractionIndex:
             raise ValueError("k must be positive")
         query_matrix = _as_matrix(query, self.dim, normalize=normalize)
         prefer_native = self.scoring == "native"
+        budget = self._chunk_patch_budget(query_matrix.shape[0])
 
         if filter is not None:
             try:
@@ -427,7 +428,7 @@ class LodeLateInteractionIndex:
             except EngineError:
                 return []
             return self._topk_from_chunks(
-                query_matrix, self._disk_chunks(doc_ids), int(k), prefer_native
+                query_matrix, self._disk_chunks(doc_ids, budget), int(k), prefer_native
             )
 
         if self.resident is not False:
@@ -435,7 +436,7 @@ class LodeLateInteractionIndex:
             if cache is not None:
                 return self._topk_from_chunks(
                     query_matrix,
-                    self._resident_chunks(cache),
+                    self._resident_chunks(cache, budget),
                     int(k),
                     prefer_native,
                     skip=cache["removed"],
@@ -443,7 +444,10 @@ class LodeLateInteractionIndex:
 
         # Over the resident budget (or resident=False): stream from disk, exact.
         return self._topk_from_chunks(
-            query_matrix, self._disk_chunks(self._all_document_ids()), int(k), prefer_native
+            query_matrix,
+            self._disk_chunks(self._all_document_ids(), budget),
+            int(k),
+            prefer_native,
         )
 
     def search_text(
@@ -471,6 +475,68 @@ class LodeLateInteractionIndex:
             candidate_depth=candidate_depth,
             filter=filter,
             normalize=normalize,
+        )
+
+    def search_many(
+        self,
+        queries: Sequence[Any],
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+    ) -> list[list[LodeLateInteractionHit]]:
+        """Scores several multi-vector queries together; returns top-``k`` per query.
+
+        Each item of ``queries`` is a 2-D ``(num_query_tokens, dim)`` matrix. The
+        whole batch is scored with one GEMM per document chunk (all queries'
+        tokens stacked) instead of one GEMM per query, so this is the throughput
+        path for evaluating or answering many queries at once; single-query latency
+        is unchanged from :meth:`search`. The same ``filter`` applies to every
+        query. Results preserve query order. (This path always uses the numpy BLAS
+        scorer; ``scoring="native"`` applies to single-query :meth:`search`.)
+        """
+
+        if int(k) <= 0:
+            raise ValueError("k must be positive")
+        matrices = [_as_matrix(q, self.dim, normalize=normalize) for q in queries]
+        if not matrices:
+            return []
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        for matrix in matrices:
+            offsets.append((cursor, cursor + matrix.shape[0]))
+            cursor += matrix.shape[0]
+        queries_concat = np.ascontiguousarray(np.vstack(matrices), dtype=np.float32)
+        budget = self._chunk_patch_budget(queries_concat.shape[0])
+
+        if filter is not None:
+            try:
+                doc_ids = [
+                    record["id"] for record in self._db.list_documents(filter=dict(filter))
+                ]
+            except EngineError:
+                return [[] for _ in matrices]
+            return self._topk_from_chunks_multi(
+                queries_concat, offsets, self._disk_chunks(doc_ids, budget), int(k), None
+            )
+
+        if self.resident is not False:
+            cache = self._resident_cache_get()
+            if cache is not None:
+                return self._topk_from_chunks_multi(
+                    queries_concat,
+                    offsets,
+                    self._resident_chunks(cache, budget),
+                    int(k),
+                    cache["removed"],
+                )
+
+        return self._topk_from_chunks_multi(
+            queries_concat,
+            offsets,
+            self._disk_chunks(self._all_document_ids(), budget),
+            int(k),
+            None,
         )
 
     def count(self) -> int:
@@ -747,8 +813,18 @@ class LodeLateInteractionIndex:
             out[doc_id] = (matrix, _strip_internal_metadata(meta), patch_count)
         return out
 
-    def _disk_chunks(self, document_ids: list[str]) -> Iterator[tuple]:
-        """Yields scoring chunks read from disk in bounded batches of documents."""
+    def _chunk_patch_budget(self, total_query_tokens: int) -> int:
+        """Patches per scoring chunk that keeps the work buffers under the cap.
+
+        Bounded so neither the float32 upcast (``patches x dim``) nor the score
+        matrix (``total_query_tokens x patches``) exceeds ``_SCORE_CHUNK_BYTES``.
+        """
+
+        width = max(self.dim, int(total_query_tokens), 1)
+        return max(1, _SCORE_CHUNK_BYTES // (width * 4))
+
+    def _disk_chunks(self, document_ids: list[str], max_patches: int) -> Iterator[tuple]:
+        """Yields bounded scoring chunks read from disk in batches of documents."""
 
         for start in range(0, len(document_ids), _LOAD_BATCH_DOCS):
             batch = document_ids[start : start + _LOAD_BATCH_DOCS]
@@ -769,50 +845,26 @@ class LodeLateInteractionIndex:
                 continue
             flat = np.ascontiguousarray(np.vstack(mats), dtype=np.float32)
             counts = np.fromiter((m.shape[0] for m in mats), dtype=np.int64, count=len(mats))
-            yield flat, counts, ids, metas, patch_counts
+            yield from _subchunk(flat, counts, ids, metas, patch_counts, max_patches)
 
-    def _resident_chunks(self, cache: dict[str, Any]) -> Iterator[tuple]:
-        """Yields scoring chunks by slicing the resident matrix to a patch budget.
+    def _resident_chunks(self, cache: dict[str, Any], max_patches: int) -> Iterator[tuple]:
+        """Yields bounded scoring chunks over the resident base plus pending delta."""
 
-        Each chunk's patch rows are upcast to float32 just for the GEMM, so the
-        transient float32 buffer stays bounded even when the resident matrix is a
-        compact dtype and the corpus is large.
-        """
-
-        flat = cache["flat"]
-        counts = cache["counts"]
-        ids = cache["ids"]
-        metas = cache["metas"]
-        patch_counts = cache["patch_counts"]
-        budget = max(1, _SCORE_CHUNK_BYTES // (self.dim * 4))
-        n_docs = len(ids)
-        doc = 0
-        row = 0
-        while doc < n_docs:
-            start_doc = doc
-            patches = 0
-            while doc < n_docs and (patches == 0 or patches + int(counts[doc]) <= budget):
-                patches += int(counts[doc])
-                doc += 1
-            sub = np.ascontiguousarray(flat[row : row + patches], dtype=np.float32)
-            yield (
-                sub,
-                counts[start_doc:doc],
-                ids[start_doc:doc],
-                metas[start_doc:doc],
-                patch_counts[start_doc:doc],
-            )
-            row += patches
-
-        # The pending delta (documents added since the last compaction) is a small
-        # chunk scored alongside the base; its ids are all live (replaced copies are
-        # masked in the base via cache["removed"]).
+        yield from _subchunk(
+            cache["flat"],
+            cache["counts"],
+            cache["ids"],
+            cache["metas"],
+            cache["patch_counts"],
+            max_patches,
+        )
+        # The pending delta (documents added since the last compaction) is scored
+        # alongside the base; its ids are all live (replaced copies are masked in
+        # the base via cache["removed"]).
         pending = cache["pending"]
         if pending:
-            pending_flat = np.ascontiguousarray(
-                np.vstack([entry[0] for entry in pending]), dtype=np.float32
-            )
-            yield (
+            pending_flat = np.vstack([entry[0] for entry in pending])
+            yield from _subchunk(
                 pending_flat,
                 np.fromiter(
                     (entry[0].shape[0] for entry in pending),
@@ -822,6 +874,7 @@ class LodeLateInteractionIndex:
                 [entry[1] for entry in pending],
                 [entry[2] for entry in pending],
                 [entry[3] for entry in pending],
+                max_patches,
             )
 
     def _topk_from_chunks(
@@ -853,6 +906,70 @@ class LodeLateInteractionIndex:
             LodeLateInteractionHit(score=s, id=i, metadata=m, patch_count=p)
             for s, i, m, p in collected[:k]
         ]
+
+    def _topk_from_chunks_multi(
+        self,
+        queries_concat: np.ndarray,
+        query_offsets: list[tuple[int, int]],
+        chunks: Iterator[tuple],
+        k: int,
+        skip: set[str] | None,
+    ) -> list[list[LodeLateInteractionHit]]:
+        """Batched counterpart of :meth:`_topk_from_chunks` -- top-``k`` per query.
+
+        Accumulates an ``(n_queries, n_docs)`` score matrix across chunks, then
+        selects each query's top-``k`` with ``argpartition`` -- so only ``k`` hits
+        per query are materialized, not one tuple per (query, document).
+        """
+
+        all_ids: list[str] = []
+        all_metas: list[dict[str, Any]] = []
+        all_patch_counts: list[int] = []
+        score_blocks: list[np.ndarray] = []
+        for flat, counts, ids, metas, patch_counts in chunks:
+            if len(ids) == 0:
+                continue
+            block = _maxsim_scores_flat_multi(queries_concat, query_offsets, flat, counts)
+            if skip:
+                keep = [j for j, doc_id in enumerate(ids) if doc_id not in skip]
+                if not keep:
+                    continue
+                if len(keep) != len(ids):
+                    block = block[:, keep]
+                    ids = [ids[j] for j in keep]
+                    metas = [metas[j] for j in keep]
+                    patch_counts = [patch_counts[j] for j in keep]
+            score_blocks.append(block)
+            all_ids.extend(ids)
+            all_metas.extend(metas)
+            all_patch_counts.extend(int(p) for p in patch_counts)
+        if not all_ids:
+            return [[] for _ in query_offsets]
+        scores = np.concatenate(score_blocks, axis=1)  # (n_queries, n_docs)
+        total = len(all_ids)
+        depth = min(k, total)
+        results: list[list[LodeLateInteractionHit]] = []
+        for query_index in range(len(query_offsets)):
+            row = scores[query_index]
+            if depth < total:
+                candidates = np.argpartition(-row, depth - 1)[:depth]
+            else:
+                candidates = np.arange(total)
+            ordered = sorted(
+                candidates.tolist(), key=lambda j: (-float(row[j]), all_ids[j])
+            )
+            results.append(
+                [
+                    LodeLateInteractionHit(
+                        score=float(row[j]),
+                        id=all_ids[j],
+                        metadata=all_metas[j],
+                        patch_count=all_patch_counts[j],
+                    )
+                    for j in ordered[:k]
+                ]
+            )
+        return results
 
     def _resident_cache_get(self) -> dict[str, Any] | None:
         """Returns the resident cache, building it if needed; ``None`` if over budget."""
@@ -1037,6 +1154,70 @@ def _maxsim_scores_flat(
         np.cumsum(counts[:-1], out=starts[1:])
     segment_max = np.maximum.reduceat(sims, starts, axis=1)
     return segment_max.sum(axis=0).astype(np.float32)
+
+
+def _subchunk(
+    flat: np.ndarray,
+    counts: np.ndarray,
+    ids: list[str],
+    metas: list[dict[str, Any]],
+    patch_counts: list[int],
+    max_patches: int,
+) -> Iterator[tuple]:
+    """Splits one (flat, counts, ids, ...) group into chunks of <= max_patches.
+
+    Each emitted chunk's patch rows are upcast to float32 for the GEMM, so the
+    transient score buffer (``query_tokens x chunk_patches``) and the upcast buffer
+    both stay bounded regardless of corpus size or query-batch width.
+    """
+
+    n_docs = len(ids)
+    doc = 0
+    row = 0
+    while doc < n_docs:
+        start = doc
+        patches = 0
+        while doc < n_docs and (patches == 0 or patches + int(counts[doc]) <= max_patches):
+            patches += int(counts[doc])
+            doc += 1
+        yield (
+            np.ascontiguousarray(flat[row : row + patches], dtype=np.float32),
+            counts[start:doc],
+            ids[start:doc],
+            metas[start:doc],
+            patch_counts[start:doc],
+        )
+        row += patches
+
+
+def _maxsim_scores_flat_multi(
+    queries: np.ndarray,
+    query_offsets: list[tuple[int, int]],
+    flat: np.ndarray,
+    counts: np.ndarray,
+) -> np.ndarray:
+    """Batched MaxSim: scores several queries against the same packed documents.
+
+    ``queries`` is every query's tokens concatenated into one ``(total_tokens,
+    dim)`` matrix, with ``query_offsets[i] = (start, end)`` the row range of query
+    ``i``. Returns an ``(n_queries, n_docs)`` score matrix from a single
+    ``queries @ flat.T`` GEMM plus one segmented max -- so a batch of queries costs
+    one GEMM instead of one per query.
+    """
+
+    n_docs = int(counts.shape[0])
+    if n_docs == 0:
+        return np.zeros((len(query_offsets), 0), dtype=np.float32)
+    sims = np.ascontiguousarray(queries, dtype=np.float32) @ flat.T
+    starts = np.empty(n_docs, dtype=np.intp)
+    starts[0] = 0
+    if n_docs > 1:
+        np.cumsum(counts[:-1], out=starts[1:])
+    segment_max = np.maximum.reduceat(sims, starts, axis=1)  # (total_tokens, n_docs)
+    out = np.empty((len(query_offsets), n_docs), dtype=np.float32)
+    for index, (start, end) in enumerate(query_offsets):
+        out[index] = segment_max[start:end].sum(axis=0)
+    return out
 
 
 def _as_matrix(matrix: Any, dim: int, *, normalize: bool) -> np.ndarray:
