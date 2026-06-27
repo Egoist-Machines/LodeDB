@@ -720,6 +720,8 @@ class LodeDB:
                 native_hits,
                 reason="native_core_text_parity_mismatch",
             )
+            if self._native_vector_covered and self._native_core_mode == NativeCoreMode.ON:
+                return native_hits
         return python_hits
 
     def search_many(
@@ -1247,8 +1249,11 @@ class LodeDB:
 
         if self._native_core_mode == NativeCoreMode.OFF:
             return
-        text_shadow = not self.vector_only and self._native_core_mode == NativeCoreMode.SHADOW
-        if not self.vector_only and not text_shadow:
+        write_through = self._native_core_write_mode == NativeCoreMode.ON
+        text_native = not self.vector_only and (
+            self._native_core_mode == NativeCoreMode.SHADOW or write_through
+        )
+        if not self.vector_only and not text_native:
             return
         adapter = NativeCoreAdapter()
         if not adapter.available:
@@ -1276,13 +1281,7 @@ class LodeDB:
             self._native_vector_engine = native_engine
             self._native_vector_covered = True
             return
-        write_through = self._native_core_write_mode == NativeCoreMode.ON
         if write_through:
-            if not self.vector_only:
-                self._native_core_fallback_reason = "native_core_write_on_text_unavailable"
-                raise RuntimeError(
-                    "LODEDB_NATIVE_CORE_WRITE=on is only available for vector stores"
-                )
             if commit_mode != "generation":
                 self._native_core_fallback_reason = "native_core_write_on_requires_generation"
                 raise RuntimeError(
@@ -1347,7 +1346,7 @@ class LodeDB:
         self._native_vector_engine = native_engine
         self._native_vector_covered = document_count == 0
         self._native_write_through_enabled = write_through and self._native_vector_covered
-        self._native_text_shadow_enabled = text_shadow and self._native_vector_covered
+        self._native_text_shadow_enabled = text_native and self._native_vector_covered
         if not self._native_vector_covered:
             self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
 
@@ -1403,9 +1402,12 @@ class LodeDB:
                 embeddings,
                 embedding_time_ms=embedding_time_ms,
             )
+            if self._native_write_through_enabled:
+                self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
             self._native_text_shadow_enabled = False
+            self._native_write_through_enabled = False
             self._native_core_fallback_reason = "native_core_text_upsert_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core text upsert failed") from exc

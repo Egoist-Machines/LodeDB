@@ -296,6 +296,35 @@ def test_native_core_write_on_requires_generation_mode(tmp_path, monkeypatch) ->
         LodeDB.open_vector_store(tmp_path, vector_dim=8)
 
 
+def test_native_core_write_on_text_store_uses_prepare_apply(tmp_path, monkeypatch) -> None:
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
+    monkeypatch.setattr(
+        "lodedb.local.db.NativeCoreAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+
+    db = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        commit_mode="generation",
+    )
+    db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    hits = db.search("Alpha", k=1, mode="lexical")
+    stats = db.stats()["native_core"]
+
+    assert adapter.opened_writable is True
+    assert native.text_prepare_calls == 1
+    assert native.text_apply_calls == 1
+    assert native.text_query_calls == 1
+    assert native.persist_calls == 1
+    assert stats["write_mode"] == "on"
+    assert stats["write_through"] is True
+    assert hits[0].id == "doc-alpha"
+
+
 def test_text_shadow_mode_mirrors_prepare_apply_and_query(tmp_path, monkeypatch) -> None:
     native = FakeNativeVectorEngine()
     monkeypatch.setattr(

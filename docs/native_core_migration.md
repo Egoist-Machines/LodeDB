@@ -16,10 +16,10 @@ existing stores stable.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.
-- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only stores opened with
-  `commit_mode="generation"`; Rust writes the same generation artifacts that Python can reopen.
-  WAL-mode and text-store write-through remain on the Python oracle until the storage cutover is
-  complete.
+- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only and text stores
+  opened with `commit_mode="generation"`; Rust writes the same generation artifacts that Python
+  can reopen. WAL-mode write-through and existing non-empty store rewrites remain on the Python
+  oracle until the storage cutover is complete.
 
 ## Swift / iOS Binding State
 

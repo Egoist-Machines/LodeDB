@@ -332,6 +332,35 @@ def test_native_core_write_on_vector_store_persists_python_readable_store(
     assert reopened.get("write-a") == "Native write A"
 
 
+def test_native_core_write_on_text_store_persists_python_readable_store(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    backend = HashEmbeddingBackend(native_dim=384)
+    db = LodeDB(tmp_path, _embedding_backend=backend, commit_mode="generation")
+    db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    stats = db.stats()["native_core"]
+
+    assert stats["write_mode"] == "on"
+    assert stats["write_through"] is True
+    assert stats["covered"] is True
+    assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB(
+        tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        commit_mode="generation",
+    )
+    assert reopened.get("doc-alpha") == "Alpha launch notes mention error code E-1001."
+    assert reopened.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
+
+
 def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) -> None:
     module = importlib.import_module("lodedb._native_core")
     monkeypatch.setattr("importlib.import_module", lambda name: module)
