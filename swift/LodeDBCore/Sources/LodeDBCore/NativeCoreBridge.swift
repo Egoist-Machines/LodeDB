@@ -48,6 +48,25 @@ final class NativeCoreLibrary {
         UnsafeMutablePointer<UnsafeMutablePointer<LodeSearchResults>?>?,
         UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>?
     ) -> UInt32
+    private typealias PrepareQueryTextJSONFn = @convention(c) (
+        UnsafeMutableRawPointer?,
+        LodeStringView,
+        LodeStringView,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>?,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>?
+    ) -> UInt32
+    private typealias SearchEmbeddedTextJSONFn = @convention(c) (
+        UnsafeMutableRawPointer?,
+        LodeStringView,
+        LodeStringView,
+        LodeStringView,
+        UInt8,
+        UInt,
+        LodeStringView,
+        UInt8,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>?,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>?
+    ) -> UInt32
 
     private let handle: UnsafeMutableRawPointer
     private let abiVersionFn: ABIVersionFn
@@ -60,6 +79,8 @@ final class NativeCoreLibrary {
     private let prepareTextUpsertJSONFn: PrepareTextUpsertJSONFn
     private let applyTextUpsertJSONFn: ApplyTextUpsertJSONFn
     private let queryVectorFn: QueryVectorFn
+    private let prepareQueryTextJSONFn: PrepareQueryTextJSONFn
+    private let searchEmbeddedTextJSONFn: SearchEmbeddedTextJSONFn
 
     init(path: String) throws {
         guard let opened = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
@@ -77,6 +98,8 @@ final class NativeCoreLibrary {
             prepareTextUpsertJSONFn = try Self.load("lodedb_engine_prepare_text_upsert_json", from: opened)
             applyTextUpsertJSONFn = try Self.load("lodedb_engine_apply_text_upsert_json", from: opened)
             queryVectorFn = try Self.load("lodedb_engine_query_vector", from: opened)
+            prepareQueryTextJSONFn = try Self.load("lodedb_engine_prepare_query_text_json", from: opened)
+            searchEmbeddedTextJSONFn = try Self.load("lodedb_engine_search_embedded_text_json", from: opened)
         } catch {
             dlclose(opened)
             throw error
@@ -182,6 +205,52 @@ final class NativeCoreLibrary {
         }
         try check(status, error: error)
         return copySearchResults(out)
+    }
+
+    func prepareQueryTextJSON(engine: UnsafeMutableRawPointer, query: String, mode: String) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(query) { queryView in
+            withStringView(mode) { modeView in
+                prepareQueryTextJSONFn(engine, queryView, modeView, &out, &error)
+            }
+        }
+        try check(status, error: error)
+        return try copyOwnedString(out)
+    }
+
+    func searchEmbeddedTextJSON(
+        engine: UnsafeMutableRawPointer,
+        indexID: String,
+        queryPlanJSON: String,
+        queryEmbeddingJSON: String?,
+        k: Int,
+        filterJSON: String?
+    ) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) { indexView in
+            withStringView(queryPlanJSON) { queryPlanView in
+                withStringView(queryEmbeddingJSON ?? "") { embeddingView in
+                    withStringView(filterJSON ?? "") { filterView in
+                        searchEmbeddedTextJSONFn(
+                            engine,
+                            indexView,
+                            queryPlanView,
+                            embeddingView,
+                            queryEmbeddingJSON == nil ? 0 : 1,
+                            UInt(k),
+                            filterView,
+                            filterJSON == nil ? 0 : 1,
+                            &out,
+                            &error
+                        )
+                    }
+                }
+            }
+        }
+        try check(status, error: error)
+        return try copyOwnedString(out)
     }
 
     private func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
@@ -306,6 +375,26 @@ final class NativeTextCore {
 
     func queryVector(_ vector: [Float], k: Int) throws -> [NativeSearchHit] {
         try library.queryVector(engine: engine, indexID: indexID, vector: vector, k: k)
+    }
+
+    func prepareQueryTextJSON(_ query: String, mode: String) throws -> String {
+        try library.prepareQueryTextJSON(engine: engine, query: query, mode: mode)
+    }
+
+    func searchEmbeddedTextJSON(
+        queryPlanJSON: String,
+        queryEmbeddingJSON: String?,
+        k: Int,
+        filterJSON: String?
+    ) throws -> String {
+        try library.searchEmbeddedTextJSON(
+            engine: engine,
+            indexID: indexID,
+            queryPlanJSON: queryPlanJSON,
+            queryEmbeddingJSON: queryEmbeddingJSON,
+            k: k,
+            filterJSON: filterJSON
+        )
     }
 }
 

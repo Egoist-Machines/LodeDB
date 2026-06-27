@@ -9,6 +9,10 @@ public struct MetadataFilter: Equatable, Sendable {
         expected.isEmpty
     }
 
+    var exactMatches: [String: String] {
+        expected
+    }
+
     public func matches(_ metadata: [String: String]) -> Bool {
         for (key, value) in expected where metadata[key] != value {
             return false

@@ -99,6 +99,16 @@ public final class LodeDB {
         embedder: LodeEmbedder? = nil,
         filter: MetadataFilter = MetadataFilter()
     ) throws -> [SearchHit] {
+        if let nativeTextCore, nativeVectorSearchComplete {
+            return try searchTextWithNativeCore(
+                nativeTextCore,
+                text: text,
+                k: k,
+                mode: mode,
+                embedder: embedder,
+                filter: filter
+            )
+        }
         let queryTokens = tokenize(text)
         let vectorHits: [SearchHit]
         if mode == .vector || mode == .hybrid {
@@ -319,6 +329,52 @@ public final class LodeDB {
             tokens: document.chunks.flatMap(\.tokens)
         )
     }
+
+    private func searchTextWithNativeCore(
+        _ nativeTextCore: NativeTextCore,
+        text: String,
+        k: Int,
+        mode: RetrievalMode,
+        embedder: LodeEmbedder?,
+        filter: MetadataFilter
+    ) throws -> [SearchHit] {
+        let queryPlanJSON = try nativeTextCore.prepareQueryTextJSON(text, mode: mode.rawValue)
+        let queryEmbeddingJSON: String?
+        if mode == .vector || mode == .hybrid {
+            guard let embedder else {
+                throw LodeDBError.invalidArgument("embedder is required for vector search")
+            }
+            guard embedder.dimension == vectorDimension else {
+                throw LodeDBError.invalidArgument("embedder dimension does not match index")
+            }
+            let embeddings = try embedder.embed(texts: [text])
+            guard let query = embeddings.first else {
+                throw LodeDBError.invalidArgument("embedder returned no query embedding")
+            }
+            guard query.count == vectorDimension else {
+                throw LodeDBError.invalidArgument("query dimension does not match index")
+            }
+            queryEmbeddingJSON = try encodeJSON(query)
+        } else {
+            queryEmbeddingJSON = nil
+        }
+        let filterJSON = filter.isEmpty ? nil : try encodeJSON(["metadata": filter.exactMatches])
+        let resultsJSON = try nativeTextCore.searchEmbeddedTextJSON(
+            queryPlanJSON: queryPlanJSON,
+            queryEmbeddingJSON: queryEmbeddingJSON,
+            k: k,
+            filterJSON: filterJSON
+        )
+        let results = try decodeJSON(NativeSearchResultsJSON.self, from: resultsJSON)
+        return results.hits.map { hit in
+            SearchHit(
+                id: hit.documentID,
+                chunkID: hit.chunkID,
+                score: hit.score,
+                metadata: hit.metadata
+            )
+        }
+    }
 }
 
 public struct TextIngestPlan: Equatable, Sendable {
@@ -385,6 +441,24 @@ private struct NativePlanDocumentChunkJSON: Decodable {
 
 private struct NativePlanEmbeddingChunkJSON: Decodable {
     let text: String
+}
+
+private struct NativeSearchResultsJSON: Decodable {
+    let hits: [NativeSearchHitJSON]
+}
+
+private struct NativeSearchHitJSON: Decodable {
+    let documentID: String
+    let chunkID: String
+    let score: Float
+    let metadata: [String: String]
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case chunkID = "chunk_id"
+        case score
+        case metadata
+    }
 }
 
 private struct VectorDocument {

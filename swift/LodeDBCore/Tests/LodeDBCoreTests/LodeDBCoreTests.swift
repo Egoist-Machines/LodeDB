@@ -93,6 +93,24 @@ import Testing
 
     let hits = try core.queryVector([1, 0], k: 1)
     #expect(hits.first == NativeSearchHit(id: "doc-text", chunkID: "doc-text:d9041255442c:0000", score: 1))
+
+    let lexicalPlan = try core.prepareQueryTextJSON("E-1001", mode: "lexical")
+    let lexicalHits = try core.searchEmbeddedTextJSON(
+        queryPlanJSON: lexicalPlan,
+        queryEmbeddingJSON: nil,
+        k: 1,
+        filterJSON: #"{"metadata":{"topic":"ops"}}"#
+    )
+    #expect(lexicalHits.contains(#""document_id":"doc-text""#))
+
+    let hybridPlan = try core.prepareQueryTextJSON("E-1001", mode: "hybrid")
+    let hybridHits = try core.searchEmbeddedTextJSON(
+        queryPlanJSON: hybridPlan,
+        queryEmbeddingJSON: "[1.0,0.0]",
+        k: 1,
+        filterJSON: #"{"metadata":{"topic":"ops"}}"#
+    )
+    #expect(hybridHits.contains(#""document_id":"doc-text""#))
 }
 
 @Test func publicTextAddUsesNativePrepareApplyWhenConfigured() throws {
