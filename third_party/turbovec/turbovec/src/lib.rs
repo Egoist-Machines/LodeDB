@@ -48,12 +48,14 @@ pub mod encode;
 pub mod error;
 pub mod id_map;
 pub mod io;
+pub mod maxsim;
 pub mod pack;
 pub mod rotation;
 pub mod search;
 
 pub use error::{AddError, ConstructError, EncodedRowsError};
 pub use id_map::IdMapIndex;
+pub use maxsim::maxsim_scores;
 
 use std::path::Path;
 use std::sync::OnceLock;
