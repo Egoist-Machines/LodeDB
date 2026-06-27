@@ -90,6 +90,9 @@ import Testing
     )
     #expect(resultJSON.contains(#""embedded_chunks":1"#))
     #expect(resultJSON.contains(#""embedding_time_ms":2.5"#))
+
+    let hits = try core.queryVector([1, 0], k: 1)
+    #expect(hits.first == NativeSearchHit(id: "doc-text", chunkID: "doc-text:d9041255442c:0000", score: 1))
 }
 
 @Test func publicTextAddUsesNativePrepareApplyWhenConfigured() throws {
@@ -106,6 +109,7 @@ import Testing
         metadata: ["topic": "ops"],
         embedder: embedder
     )
+    #expect(db.nativeVectorSearchReady)
 
     let lexical = try db.search(text: "error code", k: 1, mode: .lexical)
     #expect(lexical.first?.id == "doc-text")

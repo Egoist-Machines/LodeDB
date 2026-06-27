@@ -15,6 +15,7 @@ public enum RetrievalMode: String, Sendable {
 public final class LodeDB {
     private let vectorDimension: Int
     private let nativeTextCore: NativeTextCore?
+    private var nativeVectorSearchComplete: Bool
     private var documents: [String: VectorDocument]
 
     public init(vectorDimension: Int) throws {
@@ -22,18 +23,25 @@ public final class LodeDB {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
         self.vectorDimension = vectorDimension
-        self.nativeTextCore = try Self.nativeCoreFromEnvironment(vectorDimension: vectorDimension)
+        let nativeTextCore = try Self.nativeCoreFromEnvironment(vectorDimension: vectorDimension)
+        self.nativeTextCore = nativeTextCore
+        self.nativeVectorSearchComplete = nativeTextCore != nil
         self.documents = [:]
     }
 
     private init(vectorDimension: Int, documents: [String: VectorDocument]) {
         self.vectorDimension = vectorDimension
         self.nativeTextCore = nil
+        self.nativeVectorSearchComplete = false
         self.documents = documents
     }
 
     var nativeCoreEnabled: Bool {
         nativeTextCore != nil
+    }
+
+    var nativeVectorSearchReady: Bool {
+        nativeTextCore != nil && nativeVectorSearchComplete
     }
 
     public var count: Int {
@@ -46,6 +54,9 @@ public final class LodeDB {
         }
         guard vector.count == vectorDimension else {
             throw LodeDBError.invalidArgument("vector dimension does not match index")
+        }
+        if nativeTextCore != nil {
+            nativeVectorSearchComplete = false
         }
         documents[id] = VectorDocument(vector: vector, metadata: metadata)
     }
@@ -122,6 +133,16 @@ public final class LodeDB {
         guard k > 0 else {
             throw LodeDBError.invalidArgument("k must be positive")
         }
+        if let nativeTextCore, nativeVectorSearchComplete, filter.isEmpty {
+            return try nativeTextCore.queryVector(vector, k: k).map { hit in
+                SearchHit(
+                    id: hit.id,
+                    chunkID: hit.chunkID,
+                    score: hit.score,
+                    metadata: documents[hit.id]?.metadata ?? [:]
+                )
+            }
+        }
         return documents
             .filter { filter.matches($0.value.metadata) }
             .map { id, document in
@@ -175,6 +196,9 @@ public final class LodeDB {
         }
         guard first.count == vectorDimension else {
             throw LodeDBError.invalidArgument("embedding dimension does not match index")
+        }
+        if nativeTextCore != nil {
+            nativeVectorSearchComplete = false
         }
         documents[plan.id] = VectorDocument(
             vector: first,

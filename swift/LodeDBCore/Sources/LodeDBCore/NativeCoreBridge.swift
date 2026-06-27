@@ -16,6 +16,7 @@ final class NativeCoreLibrary {
     private typealias EngineFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
     private typealias ErrorFreeFn = @convention(c) (UnsafeMutablePointer<LodeError>?) -> Void
     private typealias OwnedStringFreeFn = @convention(c) (UnsafeMutablePointer<LodeOwnedString>?) -> Void
+    private typealias SearchResultsFreeFn = @convention(c) (UnsafeMutablePointer<LodeSearchResults>?) -> Void
     private typealias EngineCreateIndexFn = @convention(c) (
         UnsafeMutableRawPointer?,
         LodeStringView,
@@ -41,6 +42,12 @@ final class NativeCoreLibrary {
         UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>?,
         UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>?
     ) -> UInt32
+    private typealias QueryVectorFn = @convention(c) (
+        UnsafeMutableRawPointer?,
+        UnsafePointer<LodeSearchRequest>?,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeSearchResults>?>?,
+        UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>?
+    ) -> UInt32
 
     private let handle: UnsafeMutableRawPointer
     private let abiVersionFn: ABIVersionFn
@@ -48,9 +55,11 @@ final class NativeCoreLibrary {
     private let engineFreeFn: EngineFreeFn
     private let errorFreeFn: ErrorFreeFn
     private let ownedStringFreeFn: OwnedStringFreeFn
+    private let searchResultsFreeFn: SearchResultsFreeFn
     private let engineCreateIndexFn: EngineCreateIndexFn
     private let prepareTextUpsertJSONFn: PrepareTextUpsertJSONFn
     private let applyTextUpsertJSONFn: ApplyTextUpsertJSONFn
+    private let queryVectorFn: QueryVectorFn
 
     init(path: String) throws {
         guard let opened = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
@@ -63,9 +72,11 @@ final class NativeCoreLibrary {
             engineFreeFn = try Self.load("lodedb_engine_free", from: opened)
             errorFreeFn = try Self.load("lodedb_error_free", from: opened)
             ownedStringFreeFn = try Self.load("lodedb_owned_string_free", from: opened)
+            searchResultsFreeFn = try Self.load("lodedb_search_results_free", from: opened)
             engineCreateIndexFn = try Self.load("lodedb_engine_create_index", from: opened)
             prepareTextUpsertJSONFn = try Self.load("lodedb_engine_prepare_text_upsert_json", from: opened)
             applyTextUpsertJSONFn = try Self.load("lodedb_engine_apply_text_upsert_json", from: opened)
+            queryVectorFn = try Self.load("lodedb_engine_query_vector", from: opened)
         } catch {
             dlclose(opened)
             throw error
@@ -148,6 +159,31 @@ final class NativeCoreLibrary {
         return try copyOwnedString(out)
     }
 
+    func queryVector(
+        engine: UnsafeMutableRawPointer,
+        indexID: String,
+        vector: [Float],
+        k: Int
+    ) throws -> [NativeSearchHit] {
+        var out: UnsafeMutablePointer<LodeSearchResults>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) { indexView in
+            vector.withUnsafeBufferPointer { queryBuffer in
+                var request = LodeSearchRequest(
+                    size: UInt32(MemoryLayout<LodeSearchRequest>.size),
+                    version: 1,
+                    index_id: indexView,
+                    query: queryBuffer.baseAddress,
+                    query_len: UInt(vector.count),
+                    top_k: UInt(k)
+                )
+                return queryVectorFn(engine, &request, &out, &error)
+            }
+        }
+        try check(status, error: error)
+        return copySearchResults(out)
+    }
+
     private func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
         guard status != 0 else {
             return
@@ -183,6 +219,25 @@ final class NativeCoreLibrary {
         return text
     }
 
+    private func copySearchResults(_ out: UnsafeMutablePointer<LodeSearchResults>?) -> [NativeSearchHit] {
+        guard let out else {
+            return []
+        }
+        defer { searchResultsFreeFn(out) }
+        let results = out.pointee
+        guard let hits = results.hits else {
+            return []
+        }
+        return (0..<Int(results.hits_len)).map { offset in
+            let hit = hits[offset]
+            return NativeSearchHit(
+                id: String(cString: hit.document_id),
+                chunkID: String(cString: hit.chunk_id),
+                score: hit.score
+            )
+        }
+    }
+
     private static func load<T>(_ name: String, from handle: UnsafeMutableRawPointer) throws -> T {
         guard let symbol = dlsym(handle, name) else {
             throw LodeDBError.invalidArgument("missing native core symbol \(name): \(dynamicLoaderError())")
@@ -196,6 +251,12 @@ final class NativeCoreLibrary {
         }
         return String(cString: message)
     }
+}
+
+struct NativeSearchHit: Equatable, Sendable {
+    let id: String
+    let chunkID: String
+    let score: Float
 }
 
 final class NativeTextCore {
@@ -241,6 +302,10 @@ final class NativeTextCore {
             embeddingsJSON: embeddingsJSON,
             embeddingTimeMS: embeddingTimeMS
         )
+    }
+
+    func queryVector(_ vector: [Float], k: Int) throws -> [NativeSearchHit] {
+        try library.queryVector(engine: engine, indexID: indexID, vector: vector, k: k)
     }
 }
 
