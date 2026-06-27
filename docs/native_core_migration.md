@@ -33,6 +33,8 @@ existing stores stable.
   delete, and embedded-text records, then checkpoint them into generation artifacts. Python
   rollout enables fresh vector and text WAL write-through; mixed Python/native text WAL replay is
   idempotent for repeated embedded chunk rows.
+- Rust storage loads committed `.tvim` bases plus committed `.tvd` delta segments through the
+  same TurboVec encoded-row replay strategy as Python.
 - Covered native Python handles can serve `get`, `get_texts`, `get_document`, and
   `list_documents` from Rust in `LODEDB_NATIVE_CORE=on`; shadow/default fallback still keeps the
   Python store as oracle when native coverage is absent or fails closed.
@@ -82,14 +84,14 @@ The artifact reports `pass_fail_summary.passed=true`. Rust/Python elapsed ratios
 
 | Path | Ratio |
 | --- | ---: |
-| Vector upsert | 0.260 |
-| Unfiltered vector search | 0.913 |
-| Filtered vector search | 0.648 |
-| Batch vector search | 0.271 |
-| Text prepare/apply with `HashEmbeddingBackend` | 0.369 |
-| Lexical search | 0.249 |
-| Hybrid search | 0.484 |
-| Persisted reopen/query | 0.603 |
+| Vector upsert | 0.259 |
+| Unfiltered vector search | 0.914 |
+| Filtered vector search | 0.647 |
+| Batch vector search | 0.278 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.368 |
+| Lexical search | 0.248 |
+| Hybrid search | 0.481 |
+| Persisted reopen/query | 0.604 |
 
 These numbers prove the current deterministic benchmark gates, not removal of the Python oracle.
 The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the

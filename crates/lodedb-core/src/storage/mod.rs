@@ -35,6 +35,7 @@ pub struct LoadedStore {
     pub base_epoch: u64,
     pub state: Value,
     pub tvim_path: Option<PathBuf>,
+    pub tvim_manifest: Option<Value>,
     pub raw_text: BTreeMap<String, String>,
     pub lexical_tokens: BTreeMap<String, TokenLists>,
     pub wal_records: Vec<WalRecord>,
@@ -92,6 +93,7 @@ pub fn load_store(
             base_epoch: 0,
             state: legacy.payload,
             tvim_path: legacy_tvim_path(persistence_dir, index_key),
+            tvim_manifest: None,
             raw_text: legacy.raw_text,
             lexical_tokens: BTreeMap::new(),
             wal_records: Vec::new(),
@@ -122,7 +124,7 @@ pub fn load_generation_store(
     let tvim_base_path = base_tvim_path(persistence_dir, &index_key, base_epoch);
     let tvim_manifest = manifest.store_manifest("tvim");
     tvim_delta::validate(&tvim_base_path, tvim_manifest)?;
-    let tvim_path = if tvim_manifest.is_some_and(manifest_has_no_deltas) {
+    let tvim_path = if tvim_manifest.is_some() {
         Some(tvim_base_path)
     } else {
         None
@@ -154,6 +156,7 @@ pub fn load_generation_store(
         base_epoch,
         state,
         tvim_path,
+        tvim_manifest: tvim_manifest.cloned(),
         raw_text,
         lexical_tokens,
         wal_records,
@@ -163,13 +166,6 @@ pub fn load_generation_store(
 fn legacy_tvim_path(persistence_dir: &Path, index_key: &str) -> Option<PathBuf> {
     let path = persistence_dir.join(format!("{index_key}.tvim"));
     path.is_file().then_some(path)
-}
-
-fn manifest_has_no_deltas(manifest: &Value) -> bool {
-    manifest
-        .get("deltas")
-        .and_then(Value::as_array)
-        .map_or(true, Vec::is_empty)
 }
 
 pub fn fixture_root(relative: &str) -> PathBuf {

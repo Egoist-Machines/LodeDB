@@ -8,7 +8,9 @@ use lodedb_core::engine::CoreEngine;
 use lodedb_core::types::{
     CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreVectorDocument,
 };
-use serde_json::json;
+use lodedb_core::vector::index::CoreVectorChunk;
+use lodedb_core::vector::turbovec::TurboVecNativeIndex;
+use serde_json::{json, Value};
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -549,6 +551,28 @@ fn persisted_store_text_rebuilds_lexical_from_raw_text() {
 }
 
 #[test]
+fn persisted_tvim_delta_replays_into_native_index() {
+    let fixture = lodedb_core::storage::fixture_root(
+        "tests/fixtures/persisted/v0_4_generation/6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205.gen",
+    );
+    let manifest = read_json_value(&fixture.join("g2.tvim.tvim-delta/manifest.json"));
+    let chunks = vec![
+        CoreVectorChunk::new("doc-alpha:6ed29ed824c2:0000", "doc-alpha", vec![0.0; 384]),
+        CoreVectorChunk::new("doc-beta:7508a2274b7f:0000", "doc-beta", vec![0.0; 384]),
+    ];
+
+    let index = TurboVecNativeIndex::load_with_manifest(
+        fixture.join("g2.tvim"),
+        Some(&manifest),
+        &chunks,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
 fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
     let path = unique_temp_dir("core_lock");
     let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
@@ -732,4 +756,8 @@ fn copy_dir_all(source: &Path, target: &Path) {
             fs::copy(&path, &destination).unwrap();
         }
     }
+}
+
+fn read_json_value(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }

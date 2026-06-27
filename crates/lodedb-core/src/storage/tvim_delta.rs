@@ -18,6 +18,15 @@ pub struct TvimDeltaSummary {
     pub removed_rows: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TvimDeltaSegment {
+    pub header: Value,
+    pub upsert_stable_ids: Vec<u64>,
+    pub upsert_codes: Vec<u8>,
+    pub upsert_scales: Vec<f32>,
+    pub removed_stable_ids: Vec<u64>,
+}
+
 pub fn manifest_path(base_path: &Path) -> PathBuf {
     base_path
         .with_file_name(format!(
@@ -103,6 +112,26 @@ pub fn validate(base_path: &Path, manifest: Option<&Value>) -> CoreResult<TvimDe
 }
 
 pub fn read_delta_segment_header(path: &Path) -> CoreResult<Value> {
+    Ok(read_delta_segment_payload(path)?.0)
+}
+
+pub fn read_delta_segment(path: &Path) -> CoreResult<TvimDeltaSegment> {
+    let (header, arrays) = read_delta_segment_payload(path)?;
+    Ok(TvimDeltaSegment {
+        upsert_stable_ids: decode_u64_array(&arrays, "upsert_stable_ids")?,
+        upsert_codes: arrays
+            .get("upsert_codes")
+            .cloned()
+            .ok_or_else(|| corrupt("TurboVec delta segment is missing upsert_codes"))?,
+        upsert_scales: decode_f32_array(&arrays, "upsert_scales")?,
+        removed_stable_ids: decode_u64_array(&arrays, "removed_stable_ids")?,
+        header,
+    })
+}
+
+fn read_delta_segment_payload(
+    path: &Path,
+) -> CoreResult<(Value, std::collections::BTreeMap<String, Vec<u8>>)> {
     let data = std::fs::read(path)
         .map_err(|error| corrupt(format!("TurboVec delta segment could not be read: {error}")))?;
     let prefix = TVIM_DELTA_MAGIC.len() + 8;
@@ -126,6 +155,7 @@ pub fn read_delta_segment_header(path: &Path) -> CoreResult<Value> {
         return Err(corrupt("unsupported TurboVec delta segment schema version"));
     }
     let mut offset = header_stop;
+    let mut arrays = std::collections::BTreeMap::new();
     for spec in header_object
         .get("arrays")
         .and_then(Value::as_array)
@@ -148,9 +178,69 @@ pub fn read_delta_segment_header(path: &Path) -> CoreResult<Value> {
                 get_str(spec, "name")
             )));
         }
+        arrays.insert(
+            get_str(spec, "name").to_string(),
+            data[offset..stop].to_vec(),
+        );
         offset = stop;
     }
-    Ok(header)
+    for required in [
+        "upsert_stable_ids",
+        "upsert_codes",
+        "upsert_scales",
+        "removed_stable_ids",
+    ] {
+        if !arrays.contains_key(required) {
+            return Err(corrupt(format!(
+                "TurboVec delta segment is missing {required}"
+            )));
+        }
+    }
+    Ok((header, arrays))
+}
+
+fn decode_u64_array(
+    arrays: &std::collections::BTreeMap<String, Vec<u8>>,
+    name: &str,
+) -> CoreResult<Vec<u64>> {
+    let bytes = arrays
+        .get(name)
+        .ok_or_else(|| corrupt(format!("TurboVec delta segment is missing {name}")))?;
+    if bytes.len() % 8 != 0 {
+        return Err(corrupt(format!(
+            "TurboVec delta array {name} has invalid byte length"
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|chunk| {
+            let mut value = [0_u8; 8];
+            value.copy_from_slice(chunk);
+            u64::from_le_bytes(value)
+        })
+        .collect())
+}
+
+fn decode_f32_array(
+    arrays: &std::collections::BTreeMap<String, Vec<u8>>,
+    name: &str,
+) -> CoreResult<Vec<f32>> {
+    let bytes = arrays
+        .get(name)
+        .ok_or_else(|| corrupt(format!("TurboVec delta segment is missing {name}")))?;
+    if bytes.len() % 4 != 0 {
+        return Err(corrupt(format!(
+            "TurboVec delta array {name} has invalid byte length"
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut value = [0_u8; 4];
+            value.copy_from_slice(chunk);
+            f32::from_le_bytes(value)
+        })
+        .collect())
 }
 
 pub fn persist_base_bytes(

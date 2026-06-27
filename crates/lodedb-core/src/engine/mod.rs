@@ -1457,8 +1457,9 @@ fn index_from_loaded_store(
     let chunk_owner_by_id = chunk_owner_by_id_for_documents(&documents);
     let vector_chunks = vector_chunks_for_documents(&documents);
     let vector_index = match loaded.tvim_path.as_ref() {
-        Some(tvim_path) if vectors_seeded => Some(TurboVecNativeIndex::load(
+        Some(tvim_path) if vectors_seeded => Some(TurboVecNativeIndex::load_with_manifest(
             tvim_path,
+            loaded.tvim_manifest.as_ref(),
             &vector_chunks,
             loaded.generation,
         )?),
@@ -1705,7 +1706,10 @@ fn reconstruct_tvim_vectors(
         return Ok(Some(ReconstructedTvimVectors::default()));
     }
     let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
-    let index = IdMapIndex::load(tvim_path).map_err(core_io_error)?;
+    let index = crate::vector::turbovec::load_id_map_with_manifest(
+        tvim_path,
+        loaded.tvim_manifest.as_ref(),
+    )?;
     if index.dim() != vector_dim {
         return invalid("persisted TurboVec dimension does not match JSON state");
     }

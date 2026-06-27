@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
+use serde_json::Value;
 use turbovec::IdMapIndex;
 
 use crate::error::{CoreError, CoreErrorCode};
+use crate::storage::tvim_delta::{read_delta_segment, TVIM_DELTA_DIR_SUFFIX};
 use crate::vector::index::{
     CoreVectorChunk, VectorBackendMetadata, VectorIndexWriteMetrics, VectorSearchHit,
 };
@@ -70,8 +72,18 @@ impl TurboVecNativeIndex {
         chunks: &[CoreVectorChunk],
         generation: u64,
     ) -> Result<Self, CoreError> {
+        Self::load_with_manifest(path, None, chunks, generation)
+    }
+
+    /// Loads a `.tvim` index, replays committed `.tvd` deltas, and attaches metadata.
+    pub fn load_with_manifest(
+        path: impl AsRef<Path>,
+        manifest: Option<&Value>,
+        chunks: &[CoreVectorChunk],
+        generation: u64,
+    ) -> Result<Self, CoreError> {
         let started = Instant::now();
-        let index = IdMapIndex::load(path).map_err(core_error)?;
+        let index = load_id_map_with_manifest(path.as_ref(), manifest)?;
         let native_dim = index.dim();
         let bit_width = index.bit_width();
         validate_config(native_dim, bit_width)?;
@@ -315,6 +327,99 @@ impl TurboVecNativeIndex {
         }
         Ok(rows)
     }
+}
+
+fn replay_deltas(
+    base_path: &Path,
+    index: &mut IdMapIndex,
+    manifest: Option<&Value>,
+) -> Result<(), CoreError> {
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    if let Some(base_fingerprint) = manifest
+        .get("base")
+        .and_then(Value::as_object)
+        .and_then(|base| base.get("calibration_fingerprint"))
+        .and_then(Value::as_u64)
+    {
+        if base_fingerprint != 0 && base_fingerprint != index.calibration_fingerprint() {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec delta replay rejected: base calibration fingerprint mismatch",
+            ));
+        }
+    }
+    let delta_dir = base_path.with_file_name(format!(
+        "{}{}",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        TVIM_DELTA_DIR_SUFFIX
+    ));
+    let mut previous_seq = None;
+    for delta in manifest
+        .get("deltas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let sequence = delta.get("seq").and_then(Value::as_i64).unwrap_or(-1);
+        if previous_seq.is_some_and(|previous| sequence <= previous) {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec delta manifest has out-of-order segments",
+            ));
+        }
+        previous_seq = Some(sequence);
+        let file_name = delta.get("file_name").and_then(Value::as_str).unwrap_or("");
+        let segment = read_delta_segment(&delta_dir.join(file_name)).map_err(core_error)?;
+        if segment
+            .header
+            .get("calibration_fingerprint")
+            .and_then(Value::as_u64)
+            != Some(index.calibration_fingerprint())
+        {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec delta replay rejected: segment calibration fingerprint mismatch",
+            ));
+        }
+        if !segment.removed_stable_ids.is_empty() {
+            let removed = index.remove_many(&segment.removed_stable_ids);
+            if removed != segment.removed_stable_ids.len() {
+                return Err(CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "TurboVec delta replay rejected: removed-id count mismatch",
+                ));
+            }
+        }
+        if !segment.upsert_stable_ids.is_empty() {
+            index
+                .add_encoded(
+                    &segment.upsert_stable_ids,
+                    &segment.upsert_codes,
+                    &segment.upsert_scales,
+                )
+                .map_err(core_error)?;
+        }
+        if let Some(rows_after) = segment.header.get("rows_after").and_then(Value::as_u64) {
+            if index.len() != rows_after as usize {
+                return Err(CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "TurboVec delta replay rejected: row count mismatch",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn load_id_map_with_manifest(
+    path: &Path,
+    manifest: Option<&Value>,
+) -> Result<IdMapIndex, CoreError> {
+    let mut index = IdMapIndex::load(path).map_err(core_error)?;
+    replay_deltas(path, &mut index, manifest)?;
+    Ok(index)
 }
 
 fn validate_config(native_dim: usize, bit_width: usize) -> Result<(), CoreError> {
