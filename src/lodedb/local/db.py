@@ -259,6 +259,9 @@ class LodeDB:
         self._native_core_strict_parity = native_core_strict_parity_from_env()
         self._native_core_fail_closed = (
             self._native_core_mode == NativeCoreMode.ON and "LODEDB_NATIVE_CORE" in os.environ
+        ) or (
+            self._native_core_write_mode == NativeCoreMode.ON
+            and "LODEDB_NATIVE_CORE_WRITE" in os.environ
         )
         self._native_vector_engine: NativeCoreEngineHandle | None = None
         self._native_vector_covered = False
@@ -266,6 +269,7 @@ class LodeDB:
         self._native_core_version = ""
         self._native_core_abi_version = 0
         self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._native_write_through_enabled = False
         self._native_shadow_persist_count = 0
         self._native_shadow_persist_verified = False
         self._native_text_shadow_enabled = False
@@ -1211,6 +1215,7 @@ class LodeDB:
             self._native_write_shadow_dir = None
         self._native_vector_engine = None
         self._native_vector_covered = False
+        self._native_write_through_enabled = False
         self._index = None  # type: ignore[assignment]
         self._engine = None  # type: ignore[assignment]
 
@@ -1271,11 +1276,29 @@ class LodeDB:
             self._native_vector_engine = native_engine
             self._native_vector_covered = True
             return
-        if self._native_core_write_mode == NativeCoreMode.ON:
-            self._native_core_fallback_reason = "native_core_write_on_unimplemented"
-            raise RuntimeError("LODEDB_NATIVE_CORE_WRITE=on is not available yet")
+        write_through = self._native_core_write_mode == NativeCoreMode.ON
+        if write_through:
+            if not self.vector_only:
+                self._native_core_fallback_reason = "native_core_write_on_text_unavailable"
+                raise RuntimeError(
+                    "LODEDB_NATIVE_CORE_WRITE=on is only available for vector stores"
+                )
+            if commit_mode != "generation":
+                self._native_core_fallback_reason = "native_core_write_on_requires_generation"
+                raise RuntimeError(
+                    "LODEDB_NATIVE_CORE_WRITE=on currently requires commit_mode='generation'"
+                )
         try:
-            if self._native_core_write_mode == NativeCoreMode.SHADOW:
+            if write_through:
+                native_engine = adapter.open_engine(
+                    path=self.path,
+                    read_only=False,
+                    durability=durability,
+                    commit_mode=commit_mode,
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                )
+            elif self._native_core_write_mode == NativeCoreMode.SHADOW:
                 shadow_dir = tempfile.TemporaryDirectory(prefix="lodedb-native-shadow-")
                 try:
                     native_engine = adapter.open_engine(
@@ -1292,31 +1315,38 @@ class LodeDB:
                 self._native_write_shadow_dir = shadow_dir
             else:
                 native_engine = adapter.new_engine()
-            native_engine.create_index_with_options(
-                _native_vector_index_options(
-                    index_id=_LOCAL_INDEX_ID,
-                    index_key=index_state_key_for_client_hash(
-                        _LOCAL_CLIENT_ID_HASH, _LOCAL_INDEX_ID
-                    ),
-                    client_id_hash=_LOCAL_CLIENT_ID_HASH,
-                    name="lodedb-local",
-                    model=model,
-                    provider=provider,
-                    task=task,
-                    route_profile=route_profile,
-                    storage_profile=storage_profile,
-                    vector_dim=self._vector_dim,
-                    bit_width=bit_width,
+            try:
+                native_engine.stats(_LOCAL_INDEX_ID)
+            except Exception:
+                native_engine.create_index_with_options(
+                    _native_vector_index_options(
+                        index_id=_LOCAL_INDEX_ID,
+                        index_key=index_state_key_for_client_hash(
+                            _LOCAL_CLIENT_ID_HASH, _LOCAL_INDEX_ID
+                        ),
+                        client_id_hash=_LOCAL_CLIENT_ID_HASH,
+                        name="lodedb-local",
+                        model=model,
+                        provider=provider,
+                        task=task,
+                        route_profile=route_profile,
+                        storage_profile=storage_profile,
+                        vector_dim=self._vector_dim,
+                        bit_width=bit_width,
+                    )
                 )
-            )
         except Exception as exc:
             self._native_core_fallback_reason = "native_core_init_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("failed to initialize native core") from exc
             return
         document_count = int(self._index.stats().get("document_count", 0) or 0)
+        if write_through and document_count != 0:
+            self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
+            raise RuntimeError("LODEDB_NATIVE_CORE_WRITE=on requires a fresh vector store")
         self._native_vector_engine = native_engine
         self._native_vector_covered = document_count == 0
+        self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_shadow and self._native_vector_covered
         if not self._native_vector_covered:
             self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
@@ -1328,8 +1358,11 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
+            if self._native_write_through_enabled:
+                self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
+            self._native_write_through_enabled = False
             self._native_core_fallback_reason = "native_core_upsert_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector upsert failed") from exc
@@ -1390,8 +1423,11 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
+            if self._native_write_through_enabled:
+                self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
+            self._native_write_through_enabled = False
             self._native_core_fallback_reason = "native_core_delete_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector delete failed") from exc
@@ -1530,6 +1566,7 @@ class LodeDB:
             "covered": self._native_vector_covered,
             "fallback_reason": self._native_core_fallback_reason,
             "document_count": int(stats.get("document_count", 0) or 0),
+            "write_through": self._native_write_through_enabled,
             "shadow_persist_count": self._native_shadow_persist_count,
             "shadow_persist_verified": self._native_shadow_persist_verified,
         }
@@ -1538,20 +1575,26 @@ class LodeDB:
         """Persists the native shadow writer when write rollout requests it."""
 
         if (
-            self._native_core_write_mode != NativeCoreMode.SHADOW
+            self._native_core_write_mode == NativeCoreMode.OFF
             or self._native_vector_engine is None
             or not self._native_vector_covered
         ):
             return
         try:
             self._native_vector_engine.persist()
-            self._verify_native_shadow_persist()
+            if self._native_core_write_mode == NativeCoreMode.SHADOW:
+                self._verify_native_shadow_persist()
         except Exception as exc:
             self._native_vector_covered = False
+            self._native_write_through_enabled = False
             self._native_shadow_persist_verified = False
-            self._native_core_fallback_reason = "native_core_shadow_persist_failed"
+            self._native_core_fallback_reason = (
+                "native_core_shadow_persist_failed"
+                if self._native_core_write_mode == NativeCoreMode.SHADOW
+                else "native_core_write_persist_failed"
+            )
             if self._native_core_fail_closed:
-                raise RuntimeError("native core shadow persist failed") from exc
+                raise RuntimeError("native core persist failed") from exc
             if self._native_core_strict_parity:
                 raise
 
