@@ -87,6 +87,36 @@ int main(void) {
   assert(strstr(applied->data, "\"embedded_chunks\":1") != 0);
   assert(strstr(applied->data, "\"embedding_time_ms\":2.5") != 0);
   lodedb_owned_string_free(applied);
+
+  LodeOwnedString *query_plan = 0;
+  assert(lodedb_engine_prepare_query_text_json(
+             engine, sv("E-1001"), sv("lexical"), &query_plan, &error) == LODE_OK);
+  assert(query_plan != 0);
+  assert(strstr(query_plan->data, "\"requires_embedding\":false") != 0);
+
+  LodeOwnedString *search = 0;
+  assert(lodedb_engine_search_embedded_text_json(
+             engine, sv("default"), owned_sv(query_plan), sv(""), 0, 1,
+             sv("{\"metadata\":{\"topic\":\"ops\"}}"), 1, &search, &error) == LODE_OK);
+  assert(search != 0);
+  assert(strstr(search->data, "\"document_id\":\"doc-text\"") != 0);
+  lodedb_owned_string_free(search);
+  lodedb_owned_string_free(query_plan);
+
+  LodeOwnedString *hybrid_plan = 0;
+  assert(lodedb_engine_prepare_query_text_json(
+             engine, sv("E-1001"), sv("hybrid"), &hybrid_plan, &error) == LODE_OK);
+  assert(hybrid_plan != 0);
+  assert(strstr(hybrid_plan->data, "\"requires_embedding\":true") != 0);
+
+  LodeOwnedString *hybrid_search = 0;
+  assert(lodedb_engine_search_embedded_text_json(
+             engine, sv("default"), owned_sv(hybrid_plan), sv("[1.0,0.0]"), 1, 2,
+             sv("{\"metadata\":{\"topic\":\"ops\"}}"), 1, &hybrid_search, &error) == LODE_OK);
+  assert(hybrid_search != 0);
+  assert(strstr(hybrid_search->data, "\"document_id\":\"doc-text\"") != 0);
+  lodedb_owned_string_free(hybrid_search);
+  lodedb_owned_string_free(hybrid_plan);
   lodedb_owned_string_free(plan);
 
   lodedb_engine_free(engine);

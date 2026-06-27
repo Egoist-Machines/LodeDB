@@ -1,7 +1,7 @@
 //! C ABI for the native LodeDB core.
 
 use lodedb_core::engine::CoreEngine;
-use lodedb_core::engine::IngestPlan;
+use lodedb_core::engine::{IngestPlan, QueryPlan};
 use lodedb_core::types::{CoreDocument, CoreVectorDocument};
 use lodedb_core::{CoreError, CoreErrorCode};
 use std::collections::BTreeMap;
@@ -365,6 +365,90 @@ pub unsafe extern "C" fn lodedb_engine_apply_text_upsert_json(
         let embeddings = read_json_view::<Vec<Vec<f32>>>(embeddings_json)?;
         let result = engine.apply_text_upsert(&plan, &embeddings, embedding_time_ms)?;
         let result = owned_json(&result)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Prepares a text query as JSON while embeddings stay in the caller.
+///
+/// The returned JSON is a `QueryPlan` and must be released with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `query`, `mode`, and `out` must be valid for the duration of the
+/// call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_prepare_query_text_json(
+    engine: *const LodeEngine,
+    query: LodeStringView,
+    mode: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let query = read_string(query)?;
+        let mode = read_string(mode)?;
+        let plan = engine.prepare_query_text(&query, &mode)?;
+        let result = owned_json(&plan)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Searches text using a JSON `QueryPlan` and optional caller-provided embedding.
+///
+/// The returned JSON is `CoreSearchResults` and must be released with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `query_plan_json`, `out`, and any present optional JSON
+/// views must be valid for the duration of the call. String views must contain
+/// valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_search_embedded_text_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    query_plan_json: LodeStringView,
+    query_embedding_json: LodeStringView,
+    has_query_embedding: u8,
+    top_k: usize,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let query_plan = read_json_view::<QueryPlan>(query_plan_json)?;
+        let query_embedding = if has_query_embedding == 0 {
+            None
+        } else {
+            Some(read_json_view::<Vec<f32>>(query_embedding_json)?)
+        };
+        let filter = if has_filter == 0 {
+            None
+        } else {
+            Some(read_json_view::<serde_json::Value>(filter_json)?)
+        };
+        let results = engine.search_embedded_text(
+            &index_id,
+            &query_plan,
+            query_embedding.as_deref(),
+            top_k,
+            filter.as_ref(),
+        )?;
+        let result = owned_json(&results)?;
         unsafe {
             *out = Box::into_raw(result);
         }

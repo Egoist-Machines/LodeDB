@@ -127,6 +127,23 @@ uint32_t lodedb_engine_apply_text_upsert_json(
     double embedding_time_ms,
     LodeOwnedString **out,
     LodeError **error);
+uint32_t lodedb_engine_prepare_query_text_json(
+    const LodeEngine *engine,
+    LodeStringView query,
+    LodeStringView mode,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_search_embedded_text_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView query_plan_json,
+    LodeStringView query_embedding_json,
+    uint8_t has_query_embedding,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
 
 #ifdef __cplusplus
 }
