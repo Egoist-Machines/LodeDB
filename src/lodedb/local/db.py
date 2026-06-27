@@ -268,6 +268,8 @@ class LodeDB:
         self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
         self._native_shadow_persist_count = 0
         self._native_shadow_persist_verified = False
+        self._native_text_shadow_enabled = False
+        self._chunk_character_limit = int(chunk_character_limit)
         # bit_width is only meaningful for vector-only / custom-embedder indexes (a
         # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
         # reject any other width at the boundary; ``None`` means "use the index default".
@@ -401,7 +403,7 @@ class LodeDB:
                 if route_registry_path is not None
                 else default_route_registry()
             ),
-            chunk_character_limit=int(chunk_character_limit),
+            chunk_character_limit=self._chunk_character_limit,
             persistence_dir=self.path,
             read_only=self.read_only,
             fsync_on_commit=fsync_on_commit,
@@ -506,6 +508,7 @@ class LodeDB:
             metadata=_coerce_metadata(metadata),
         )
         self._index.upsert_batch((document,))
+        self._native_upsert_text_documents((document,))
         return document_id
 
     def add_many(
@@ -536,6 +539,7 @@ class LodeDB:
             )
         if payload:
             self._index.upsert_batch(tuple(payload))
+            self._native_upsert_text_documents(tuple(payload))
         return ids
 
     def add_vectors(
@@ -699,7 +703,20 @@ class LodeDB:
             mode=resolved_mode,
             include=("metadata",),
         )
-        return self._hits_from_result_rows(response.get("results", []))
+        python_hits = self._hits_from_result_rows(response.get("results", []))
+        native_hits = self._native_search_text(
+            query,
+            k=int(k),
+            filter=_normalize_filter(filter),
+            mode=resolved_mode,
+        )
+        if native_hits is not None:
+            self._check_native_hit_parity(
+                python_hits,
+                native_hits,
+                reason="native_core_text_parity_mismatch",
+            )
+        return python_hits
 
     def search_many(
         self,
@@ -1223,7 +1240,10 @@ class LodeDB:
     ) -> None:
         """Initializes the native vector engine when the rollout policy allows it."""
 
-        if self._native_core_mode == NativeCoreMode.OFF or not self.vector_only:
+        if self._native_core_mode == NativeCoreMode.OFF:
+            return
+        text_shadow = not self.vector_only and self._native_core_mode == NativeCoreMode.SHADOW
+        if not self.vector_only and not text_shadow:
             return
         adapter = NativeCoreAdapter()
         if not adapter.available:
@@ -1297,6 +1317,7 @@ class LodeDB:
         document_count = int(self._index.stats().get("document_count", 0) or 0)
         self._native_vector_engine = native_engine
         self._native_vector_covered = document_count == 0
+        self._native_text_shadow_enabled = text_shadow and self._native_vector_covered
         if not self._native_vector_covered:
             self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
 
@@ -1312,6 +1333,49 @@ class LodeDB:
             self._native_core_fallback_reason = "native_core_upsert_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector upsert failed") from exc
+            if self._native_core_strict_parity:
+                raise
+
+    def _native_upsert_text_documents(self, documents: tuple[EngineDocument, ...]) -> None:
+        """Mirrors text mutations into native core while Python remains durable."""
+
+        if (
+            not documents
+            or not self._native_text_shadow_enabled
+            or self._native_vector_engine is None
+            or not self._native_vector_covered
+            or self._embedding_backend is None
+        ):
+            return
+        try:
+            plan = self._native_vector_engine.prepare_text_upsert(
+                _LOCAL_INDEX_ID,
+                documents,
+                store_text=self.store_text,
+                index_text=self.index_text,
+                chunk_character_limit=self._chunk_character_limit,
+            )
+            chunks_to_embed = tuple(
+                str(chunk.get("text", "")) for chunk in plan.get("chunks_to_embed", [])
+            )
+            started = time.perf_counter()
+            embeddings = (
+                self._embedding_backend.embed_documents(chunks_to_embed)
+                if chunks_to_embed
+                else ()
+            )
+            embedding_time_ms = (time.perf_counter() - started) * 1000.0
+            self._native_vector_engine.apply_text_upsert(
+                plan,
+                embeddings,
+                embedding_time_ms=embedding_time_ms,
+            )
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            self._native_core_fallback_reason = "native_core_text_upsert_failed"
+            if self._native_core_fail_closed:
+                raise RuntimeError("native core text upsert failed") from exc
             if self._native_core_strict_parity:
                 raise
 
@@ -1390,6 +1454,47 @@ class LodeDB:
             return None
         return [self._hits_from_native_rows(batch.get("hits", [])) for batch in batches]
 
+    def _native_search_text(
+        self,
+        query: str,
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+        mode: str,
+    ) -> list[LodeSearchHit] | None:
+        """Returns native text hits when explicit shadow text coverage is active."""
+
+        if (
+            not self._native_text_shadow_enabled
+            or self._native_vector_engine is None
+            or not self._native_vector_covered
+        ):
+            return None
+        try:
+            query_plan = self._native_vector_engine.prepare_query_text(query, mode)
+            query_embedding = None
+            if bool(query_plan.get("requires_embedding")):
+                if self._embedding_backend is None:
+                    raise RuntimeError("native text query requires an embedding backend")
+                query_embedding = self._embedding_backend.embed_query(query)
+            payload = self._native_vector_engine.search_embedded_text(
+                _LOCAL_INDEX_ID,
+                query_plan,
+                query_embedding,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            self._native_core_fallback_reason = "native_core_text_query_failed"
+            if self._native_core_fail_closed:
+                raise RuntimeError("native core text query failed") from exc
+            if self._native_core_strict_parity:
+                raise
+            return None
+        return self._hits_from_native_rows(payload.get("hits", []))
+
     def _native_stats(self) -> dict[str, Any] | None:
         """Returns native stats only when this handle is covered by native state."""
 
@@ -1460,12 +1565,28 @@ class LodeDB:
     ) -> None:
         """Raises on native/Python hit mismatch when strict parity is active."""
 
+        self._check_native_hit_parity(
+            python_hits,
+            native_hits,
+            reason="native_core_vector_parity_mismatch",
+        )
+
+    def _check_native_hit_parity(
+        self,
+        python_hits: list[LodeSearchHit],
+        native_hits: list[LodeSearchHit],
+        *,
+        reason: str,
+    ) -> None:
+        """Raises on native/Python hit-order mismatch when strict parity is active."""
+
         python_ids = [hit.id for hit in python_hits]
         native_ids = [hit.id for hit in native_hits]
         if python_ids == native_ids:
             return
         self._native_vector_covered = False
-        self._native_core_fallback_reason = "native_core_vector_parity_mismatch"
+        self._native_text_shadow_enabled = False
+        self._native_core_fallback_reason = reason
         if self._native_core_fail_closed or self._native_core_strict_parity:
             raise RuntimeError(
                 f"native core vector parity mismatch: python={python_ids!r} native={native_ids!r}"
