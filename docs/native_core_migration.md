@@ -11,8 +11,9 @@ existing stores stable.
   in-memory mutations for that handle.
 - Python remains the durable oracle. Vector mutations still commit through the existing Python
   engine, and persisted stores open without migration.
-- Existing non-empty stores fall back to Python until native storage can reload exact persisted
-  vectors. This avoids scoring against incomplete native state.
+- Existing vector-only stores can seed covered native query state from the committed on-disk
+  snapshot. Writable handles invalidate that read-only seed on the first mutation and fall back to
+  Python unless explicit native write-through owns a fresh store.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.

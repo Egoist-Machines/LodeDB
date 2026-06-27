@@ -264,6 +264,7 @@ class LodeDB:
             and "LODEDB_NATIVE_CORE_WRITE" in os.environ
         )
         self._native_vector_engine: NativeCoreEngineHandle | None = None
+        self._native_vector_mutable = False
         self._native_vector_covered = False
         self._native_core_fallback_reason = ""
         self._native_core_version = ""
@@ -1229,6 +1230,7 @@ class LodeDB:
             self._native_write_shadow_dir.cleanup()
             self._native_write_shadow_dir = None
         self._native_vector_engine = None
+        self._native_vector_mutable = False
         self._native_vector_covered = False
         self._native_write_through_enabled = False
         self._index = None  # type: ignore[assignment]
@@ -1292,7 +1294,29 @@ class LodeDB:
                     raise RuntimeError("failed to initialize read-only native core") from exc
                 return
             self._native_vector_engine = native_engine
+            self._native_vector_mutable = False
             self._native_vector_covered = True
+            return
+        document_count = int(self._index.stats().get("document_count", 0) or 0)
+        if not write_through and self.vector_only and document_count != 0:
+            try:
+                native_engine = adapter.open_readonly_engine(
+                    self.path,
+                    durability=durability,
+                    commit_mode=commit_mode,
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                )
+                native_stats = native_engine.stats(_LOCAL_INDEX_ID)
+            except Exception:
+                self._native_core_fallback_reason = "native_core_existing_store_seed_unavailable"
+                return
+            if int(native_stats.get("document_count", 0) or 0) == document_count:
+                self._native_vector_engine = native_engine
+                self._native_vector_mutable = False
+                self._native_vector_covered = True
+                return
+            self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
             return
         if write_through and not self.vector_only and commit_mode != "generation":
             self._native_core_fallback_reason = "native_core_text_write_on_requires_generation"
@@ -1352,11 +1376,11 @@ class LodeDB:
             if self._native_core_fail_closed:
                 raise RuntimeError("failed to initialize native core") from exc
             return
-        document_count = int(self._index.stats().get("document_count", 0) or 0)
         if write_through and document_count != 0:
             self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
             raise RuntimeError("LODEDB_NATIVE_CORE_WRITE=on requires a fresh vector store")
         self._native_vector_engine = native_engine
+        self._native_vector_mutable = True
         self._native_vector_covered = document_count == 0
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
@@ -1367,6 +1391,10 @@ class LodeDB:
         """Mirrors vector mutations into native core while Python remains durable."""
 
         if not documents or self._native_vector_engine is None or not self._native_vector_covered:
+            return
+        if not self._native_vector_mutable:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_readonly_seed_invalidated"
             return
         try:
             self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
@@ -1391,6 +1419,11 @@ class LodeDB:
             or not self._native_vector_covered
             or self._embedding_backend is None
         ):
+            return
+        if not self._native_vector_mutable:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            self._native_core_fallback_reason = "native_core_readonly_seed_invalidated"
             return
         try:
             plan = self._native_vector_engine.prepare_text_upsert(
@@ -1435,6 +1468,10 @@ class LodeDB:
             or self._native_vector_engine is None
             or not self._native_vector_covered
         ):
+            return
+        if not self._native_vector_mutable:
+            self._native_vector_covered = False
+            self._native_core_fallback_reason = "native_core_readonly_seed_invalidated"
             return
         try:
             self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
@@ -1652,6 +1689,7 @@ class LodeDB:
             self._native_core_write_mode == NativeCoreMode.OFF
             or self._native_vector_engine is None
             or not self._native_vector_covered
+            or not self._native_vector_mutable
         ):
             return
         try:
@@ -1661,6 +1699,7 @@ class LodeDB:
         except Exception as exc:
             self._native_vector_covered = False
             self._native_write_through_enabled = False
+            self._native_vector_mutable = False
             self._native_shadow_persist_verified = False
             self._native_core_fallback_reason = (
                 "native_core_shadow_persist_failed"
@@ -1683,6 +1722,7 @@ class LodeDB:
         self._native_vector_covered = False
         self._native_text_shadow_enabled = False
         self._native_write_through_enabled = False
+        self._native_vector_mutable = False
         self._native_core_fallback_reason = reason
         if self._native_core_fail_closed:
             raise RuntimeError("native core document read failed") from exc

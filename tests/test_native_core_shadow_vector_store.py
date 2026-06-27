@@ -660,23 +660,30 @@ def test_native_write_shadow_persists_to_temp_native_handle(tmp_path, monkeypatc
     assert [hit.id for hit in db.search_by_vector(_onehot(0), k=1)] == ["a"]
 
 
-def test_native_on_existing_store_falls_back_to_python_until_seeded(tmp_path, monkeypatch) -> None:
+def test_native_on_existing_vector_store_uses_readonly_seed_until_mutation(
+    tmp_path, monkeypatch
+) -> None:
     writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
     writer.add_vectors(_onehot(0), id="a")
     writer.close()
 
     native = FakeNativeVectorEngine(score_offset=100)
+    native.documents["a"] = {"vector": _onehot(0), "metadata": {}, "text": None}
+    adapter = FakeNativeAdapter(native)
     monkeypatch.setattr(
         "lodedb.local.db.NativeCoreAdapter",
-        lambda: FakeNativeAdapter(native),
+        lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
 
     hits = db.search_by_vector(_onehot(0), k=1)
     assert [hit.id for hit in hits] == ["a"]
-    assert hits[0].score < 10.0
+    assert hits[0].score > 100.0
+    assert adapter.opened_readonly is True
+    assert db.stats()["native_core"]["covered"] is True
+
+    db.add_vectors(_onehot(1), id="b")
     assert db.stats()["native_core"]["covered"] is False
-    assert db.stats()["native_core"]["fallback_reason"] == (
-        "native_core_existing_store_seed_unavailable"
-    )
+    assert db.stats()["native_core"]["fallback_reason"] == "native_core_readonly_seed_invalidated"
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "b"

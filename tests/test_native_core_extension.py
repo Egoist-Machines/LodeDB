@@ -370,6 +370,25 @@ def test_native_core_write_on_vector_store_wal_mode_persists_python_readable_sto
     assert reopened.get("wal-a") == "Native WAL A"
 
 
+def test_native_core_on_existing_vector_store_uses_readonly_seed(
+    tmp_path, monkeypatch
+) -> None:
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    writer.add_vectors(_onehot(0), id="seed-a", metadata={"kind": "seed"})
+    writer.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    stats = db.stats()["native_core"]
+
+    assert stats["enabled"] is True
+    assert stats["covered"] is True
+    assert db.search_by_vector(_onehot(0), k=1)[0].id == "seed-a"
+
+
 def test_native_core_write_on_text_store_persists_python_readable_store(
     tmp_path, monkeypatch
 ) -> None:
