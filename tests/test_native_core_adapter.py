@@ -372,6 +372,7 @@ def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
         "store_text": False,
         "index_text": False,
         "chunk_character_limit": 512,
+        "acquire_writer_lock": False,
     }
 
 
@@ -394,6 +395,7 @@ def test_adapter_wraps_readonly_native_engine_open(tmp_path) -> None:
         "store_text": True,
         "index_text": False,
         "chunk_character_limit": 768,
+        "acquire_writer_lock": False,
     }
 
 

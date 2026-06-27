@@ -42,10 +42,22 @@ pub struct CoreOpenOptions {
     pub index_text: bool,
     #[serde(default = "default_chunk_character_limit")]
     pub chunk_character_limit: usize,
+    /// Whether a writable open should take the shared single-writer lock on
+    /// ``<dir>/.lodedb.lock``. Standalone native/FFI/Swift writers default to
+    /// ``true`` so they contend with each other and with a Python writer. The
+    /// Python SDK passes ``false`` for its write-through engine because the
+    /// Python side already holds that lock in the same process (and a BSD
+    /// advisory lock would self-conflict across two descriptors in one process).
+    #[serde(default = "default_acquire_writer_lock")]
+    pub acquire_writer_lock: bool,
 }
 
 fn default_chunk_character_limit() -> usize {
     900
+}
+
+fn default_acquire_writer_lock() -> bool {
+    true
 }
 
 /// Local-first security and telemetry options.
@@ -295,6 +307,7 @@ mod tests {
             store_text: true,
             index_text: false,
             chunk_character_limit: 900,
+            acquire_writer_lock: true,
         });
         assert_round_trip(&CoreSecurityOptions {
             bind_host: "127.0.0.1".to_string(),

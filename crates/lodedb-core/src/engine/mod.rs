@@ -4,7 +4,7 @@ use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,7 +48,11 @@ impl CoreEngine {
     pub fn open(options: CoreOpenOptions) -> Result<Self, CoreError> {
         let path = PathBuf::from(&options.path);
         fs::create_dir_all(&path).map_err(core_io_error)?;
-        let lock = PersistentLock::acquire(&path)?;
+        let lock = if options.acquire_writer_lock {
+            Some(PersistentLock::acquire(&path)?)
+        } else {
+            None
+        };
         let mut engine = Self {
             indexes: BTreeMap::new(),
             next_plan_id: 0,
@@ -60,7 +64,7 @@ impl CoreEngine {
                 store_text: options.store_text,
                 index_text: options.index_text,
                 chunk_character_limit: options.chunk_character_limit,
-                _lock: Some(lock),
+                _lock: lock,
             }),
             replaying_wal: false,
         };
@@ -1361,33 +1365,86 @@ struct PersistenceState {
 
 #[derive(Debug)]
 struct PersistentLock {
-    path: PathBuf,
+    // The BSD advisory lock is released when this descriptor is dropped (closed);
+    // the sentinel file is intentionally left in place, matching the Python lock.
     _file: File,
 }
 
 impl PersistentLock {
+    /// Takes the shared single-writer lock on ``<dir>/.lodedb.lock`` — the same
+    /// sentinel and BSD advisory-lock mechanism the Python writer uses
+    /// (``fcntl.flock(LOCK_EX|LOCK_NB)``), so a standalone native/FFI/Swift writer
+    /// contends with a Python writer (and another native writer) across processes.
+    /// The lock releases when the file descriptor is dropped; the sentinel file is
+    /// left in place, matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
     fn acquire(path: &Path) -> Result<Self, CoreError> {
-        let lock_path = path.join(".lodedb.native.lock");
+        let lock_path = path.join(".lodedb.lock");
         let file = OpenOptions::new()
-            .create_new(true)
+            .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|error| {
                 CoreError::new(
                     CoreErrorCode::InvalidArgument,
-                    format!("could not acquire native writer lock: {error}"),
+                    format!(
+                        "could not open writer lock {}: {error}",
+                        lock_path.display()
+                    ),
                 )
             })?;
-        Ok(Self {
-            path: lock_path,
-            _file: file,
-        })
+        Self::lock_blocking(&file)?;
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(unix)]
+    fn lock_blocking(file: &File) -> Result<(), CoreError> {
+        use rustix::fs::{flock, FlockOperation};
+        let deadline = Instant::now() + Duration::from_secs_f64(lock_timeout_seconds());
+        loop {
+            match flock(file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(CoreError::new(
+                            CoreErrorCode::InvalidArgument,
+                            "another writer holds the lodedb lock".to_string(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    return Err(CoreError::new(
+                        CoreErrorCode::InvalidArgument,
+                        format!("could not acquire writer lock: {err}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Non-unix platforms do not have BSD flock; the Python SDK opens its native
+    // engine with acquire_writer_lock=false (Python's own lock guards the store),
+    // so this path only affects standalone non-unix native writers, which are not
+    // a current target. Opening the sentinel is enough to keep behaviour uniform.
+    #[cfg(not(unix))]
+    fn lock_blocking(_file: &File) -> Result<(), CoreError> {
+        Ok(())
     }
 }
 
-impl Drop for PersistentLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+fn lock_timeout_seconds() -> f64 {
+    match std::env::var("LODEDB_PERSIST_LOCK_TIMEOUT") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(30.0),
+        Err(_) => 30.0,
     }
 }
 

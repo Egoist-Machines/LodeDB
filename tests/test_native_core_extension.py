@@ -102,6 +102,49 @@ def test_native_core_extension_executes_vector_store_flow() -> None:
     assert stats["raw_payload_text_present"] is False
 
 
+def test_native_writer_lock_contends_with_python_writer(tmp_path) -> None:
+    """A standalone native writer shares the single-writer lock with Python."""
+
+    from lodedb import LodeDB
+
+    store = tmp_path / "store"
+    db = LodeDB.open_vector_store(store, vector_dim=8)
+    options = json.dumps(
+        {
+            "path": str(store),
+            "read_only": False,
+            "durability": "relaxed",
+            "commit_mode": "wal",
+            "store_text": False,
+            "index_text": False,
+            "chunk_character_limit": 900,
+            "acquire_writer_lock": True,
+        }
+    )
+    previous = os.environ.get("LODEDB_PERSIST_LOCK_TIMEOUT")
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        # Python already holds <store>/.lodedb.lock; a native writer taking the
+        # same shared lock must fail instead of opening a second writer. The
+        # contended-lock CoreError maps to ValueError at the binding boundary.
+        with pytest.raises(ValueError):
+            native_core.CoreEngine.open(options)
+    finally:
+        if previous is None:
+            os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+        else:
+            os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = previous
+        db.close()
+
+    # After the Python writer closes, a native writer can take the lock.
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        native_engine = native_core.CoreEngine.open(options)
+    finally:
+        os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+    del native_engine
+
+
 def test_native_core_extension_array_vector_paths_match_json() -> None:
     """The array-input vector fast paths return the same hits as the JSON paths."""
 

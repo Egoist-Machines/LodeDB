@@ -16,5 +16,11 @@ serde_json = "1.0"
 sha2 = "0.10"
 turbovec = { path = "../../third_party/turbovec/turbovec" }
 
+# BSD advisory file locking for the shared single-writer lock; the same
+# mechanism the Python writer uses (fcntl.flock). rustix exposes a safe flock,
+# so the crate keeps unsafe_code = forbid. Unix targets only.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [lints]
 workspace = true

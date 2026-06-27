@@ -190,6 +190,12 @@ class NativeCoreAdapter:
             "store_text": bool(store_text),
             "index_text": bool(index_text),
             "chunk_character_limit": int(chunk_character_limit),
+            # The Python SDK already holds the shared <dir>/.lodedb.lock for this
+            # process before opening its write-through native engine. A BSD
+            # advisory lock is per-descriptor, so a second lock on the same file in
+            # the same process would self-deadlock; the native engine must not take
+            # it. Standalone native/FFI/Swift writers default to acquiring it.
+            "acquire_writer_lock": False,
         }
 
     @staticmethod

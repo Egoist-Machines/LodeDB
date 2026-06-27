@@ -50,6 +50,9 @@ fn open_options(path: &Path, read_only: bool, commit_mode: &str) -> CoreOpenOpti
         store_text: true,
         index_text: true,
         chunk_character_limit: 900,
+        // Most tests open unique temp paths; the dedicated lock-contention test
+        // builds its own options with the lock enabled.
+        acquire_writer_lock: false,
     }
 }
 
@@ -627,13 +630,26 @@ fn persisted_tvim_delta_replays_into_native_index() {
 #[test]
 fn persistent_engine_enforces_single_writer_but_readonly_takes_no_lock() {
     let path = unique_temp_dir("core_lock");
-    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    assert!(CoreEngine::open(open_options(&path, false, "generation")).is_err());
-    let readonly = CoreEngine::open_readonly(&path, open_options(&path, true, "generation"));
+    // Standalone native writers take the shared <dir>/.lodedb.lock; fail fast on
+    // contention instead of waiting the default timeout.
+    std::env::set_var("LODEDB_PERSIST_LOCK_TIMEOUT", "0");
+    let locked = |read_only: bool| {
+        let mut options = open_options(&path, read_only, "generation");
+        options.acquire_writer_lock = true;
+        options
+    };
+    let mut writer = CoreEngine::open(locked(false)).unwrap();
+    // A second writable open contends with the held lock and must fail (a
+    // separate descriptor in this process still conflicts with a BSD flock).
+    assert!(CoreEngine::open(locked(false)).is_err());
+    // A read-only open never takes the writer lock.
+    let readonly = CoreEngine::open_readonly(&path, locked(true));
     assert!(readonly.is_ok());
     writer.close().unwrap();
-    let reopened = CoreEngine::open(open_options(&path, false, "generation"));
+    // Closing the writer releases the lock, so a new writer can acquire it.
+    let reopened = CoreEngine::open(locked(false));
     assert!(reopened.is_ok());
+    std::env::remove_var("LODEDB_PERSIST_LOCK_TIMEOUT");
     fs::remove_dir_all(path).unwrap();
 }
 
