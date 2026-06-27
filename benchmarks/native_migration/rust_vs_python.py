@@ -318,6 +318,7 @@ def _python_text_bench(documents: list[EngineDocument], queries: list[str], *, k
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
+    dict[str, Any],
 ]:
     with tempfile.TemporaryDirectory(prefix="lodedb-py-text-bench-") as tmp:
         db = LodeDB(
@@ -352,6 +353,15 @@ def _python_text_bench(documents: list[EngineDocument], queries: list[str], *, k
                     ]
                 ),
             )
+            hybrid = _measure(
+                "python_text_hybrid_search",
+                lambda: _hit_checksum(
+                    [
+                        [hit.id for hit in db.search(query, k=k, mode="hybrid")]
+                        for query in queries
+                    ]
+                ),
+            )
             stats = db.stats()
             summary = {
                 "document_count": int(stats.get("document_count", 0) or 0),
@@ -359,7 +369,7 @@ def _python_text_bench(documents: list[EngineDocument], queries: list[str], *, k
             }
         finally:
             db.close()
-    return upsert, lexical, summary
+    return upsert, lexical, hybrid, summary
 
 
 def _rust_text_bench(
@@ -394,6 +404,23 @@ def _rust_text_bench(
                 ]
             ),
         )
+        hybrid = _measure(
+            "rust_text_hybrid_search",
+            lambda: _hit_checksum(
+                [
+                    [
+                        str(hit["document_id"])
+                        for hit in engine.search_embedded_text(
+                            _INDEX_ID,
+                            engine.prepare_query_text(query, "hybrid"),
+                            embedder.embed_query(query),
+                            top_k=k,
+                        ).get("hits", [])
+                    ]
+                    for query in queries
+                ]
+            ),
+        )
         stats = engine.stats(_INDEX_ID)
         summary = {
             "document_count": int(stats.get("document_count", 0) or 0),
@@ -401,7 +428,7 @@ def _rust_text_bench(
         }
     finally:
         engine.close()
-    return upsert, lexical, summary
+    return upsert, lexical, hybrid, summary
 
 
 def _rust_apply_text_documents(
@@ -461,12 +488,12 @@ def run(
         dim=dim,
         k=k,
     )
-    py_text_upsert, py_text_search, py_text_stats = _python_text_bench(
+    py_text_upsert, py_text_search, py_text_hybrid, py_text_stats = _python_text_bench(
         text_documents,
         text_queries,
         k=k,
     )
-    rust_text_upsert, rust_text_search, rust_text_stats = _rust_text_bench(
+    rust_text_upsert, rust_text_search, rust_text_hybrid, rust_text_stats = _rust_text_bench(
         adapter,
         text_documents,
         text_queries,
@@ -501,6 +528,7 @@ def run(
             _comparison("vector_search_batch", py_vector_batch_search, rust_vector_batch_search),
             _comparison("text_upsert_hash_embedder", py_text_upsert, rust_text_upsert),
             _comparison("text_lexical_search", py_text_search, rust_text_search),
+            _comparison("text_hybrid_search", py_text_hybrid, rust_text_hybrid),
         ],
         "summaries": {
             "python_vector": py_vector_stats,

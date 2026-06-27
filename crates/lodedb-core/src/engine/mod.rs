@@ -26,6 +26,9 @@ use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 use crate::vector::turbovec::TurboVecNativeIndex;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
 
+const LEXICAL_POOL_FACTOR: usize = 5;
+const LEXICAL_POOL_FLOOR: usize = 50;
+
 /// In-memory vector-only native core engine.
 #[derive(Default)]
 pub struct CoreEngine {
@@ -498,9 +501,10 @@ impl CoreEngine {
             "hybrid" => {
                 let embedding = query_embedding
                     .ok_or_else(|| invalid_err("query embedding is required for this mode"))?;
-                let vector_results = self.query_vector(index_id, embedding, top_k, filter)?;
+                let pool = lexical_pool_width(top_k);
+                let vector_results = self.query_vector(index_id, embedding, pool, filter)?;
                 let lexical_results =
-                    self.query_lexical_text(index_id, query_plan, top_k, filter)?;
+                    self.query_lexical_text(index_id, query_plan, pool, filter)?;
                 let rankings = [
                     vector_results
                         .hits
@@ -1789,6 +1793,10 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
         .zip(right)
         .map(|(left, right)| left * right)
         .sum()
+}
+
+fn lexical_pool_width(top_k: usize) -> usize {
+    (top_k * LEXICAL_POOL_FACTOR).max(LEXICAL_POOL_FLOOR)
 }
 
 fn rotate_query(query: &[f32], rotation: &[f32], dim: usize) -> Result<Vec<f32>, CoreError> {
