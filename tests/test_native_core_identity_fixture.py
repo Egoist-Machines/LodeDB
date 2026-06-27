@@ -6,7 +6,6 @@ from pathlib import Path
 from lodedb.engine.core import _chunk_id_for_hash, chunk_text, normalized_chunk_hash, sha256_text
 from lodedb.engine.turbovec_index import stable_uint64_ids_for_chunk_ids
 
-
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "native_core_identity" / "identity.json"
 
 

@@ -10,7 +10,6 @@ from lodedb.engine._predicate import (
     validate_metadata_filter,
 )
 
-
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "native_core_predicate" / "predicate.json"
 
 
