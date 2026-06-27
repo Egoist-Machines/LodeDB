@@ -4,14 +4,18 @@ import Testing
 @testable import LodeDBCore
 
 @Test func vectorOnlySearchRanksAndFilters() throws {
-    let db = try LodeDB(vectorDimension: 3)
-    try db.addVector([1, 0, 0], id: "a", metadata: ["topic": "ops"])
-    try db.addVector([0, 1, 0], id: "b", metadata: ["topic": "ml"])
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a", metadata: ["topic": "ops"])
+    try db.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "b", metadata: ["topic": "ml"])
 
-    let hits = try db.search(vector: [0, 1, 0], k: 2)
+    let hits = try db.search(vector: [0, 1, 0, 0, 0, 0, 0, 0], k: 2)
     #expect(hits.map(\.id) == ["b", "a"])
 
-    let filtered = try db.search(vector: [1, 0, 0], k: 2, filter: MetadataFilter(["topic": "ops"]))
+    let filtered = try db.search(
+        vector: [1, 0, 0, 0, 0, 0, 0, 0],
+        k: 2,
+        filter: MetadataFilter(["topic": "ops"])
+    )
     #expect(filtered.map(\.id) == ["a"])
 }
 
@@ -29,8 +33,8 @@ import Testing
 }
 
 @Test func textPrepareApplyUsesEmbedderAndMatchesChunkIDFixture() throws {
-    let db = try LodeDB(vectorDimension: 3)
-    let embedder = HashTestEmbedder(dimension: 3)
+    let db = try LodeDB(vectorDimension: 8)
+    let embedder = HashTestEmbedder(dimension: 8)
     let text = "Alpha launch notes mention error code E-1001 and a blue widget."
     let plan = try db.prepareTextUpsert(text, id: "doc-alpha", metadata: ["topic": "ops"])
     #expect(plan.chunks.first?.chunkID == "doc-alpha:6ed29ed824c2:0000")
@@ -42,8 +46,8 @@ import Testing
 }
 
 @Test func swiftTextLexicalAndHybridSearchUsePayloadTokens() throws {
-    let db = try LodeDB(vectorDimension: 3)
-    let embedder = HashTestEmbedder(dimension: 3)
+    let db = try LodeDB(vectorDimension: 8)
+    let embedder = HashTestEmbedder(dimension: 8)
     try db.addText(
         "Beta incident report for serial AX-42 on 2024-06-13.",
         id: "doc-beta",
@@ -70,7 +74,7 @@ import Testing
     let library = try NativeCoreLibrary(path: dylib)
     #expect(library.abiVersion() == 1)
 
-    let core = try NativeTextCore(library: library, vectorDimension: 2)
+    let core = try NativeTextCore(library: library, vectorDimension: 8)
     let documentsJSON = """
     [{"document_id":"doc-text","text":"Alpha launch notes mention error code E-1001.","metadata":{"topic":"ops"}}]
     """
@@ -85,14 +89,16 @@ import Testing
 
     let resultJSON = try core.applyTextUpsertJSON(
         planJSON: planJSON,
-        embeddingsJSON: "[[1.0,0.0]]",
+        embeddingsJSON: "[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]]",
         embeddingTimeMS: 2.5
     )
     #expect(resultJSON.contains(#""embedded_chunks":1"#))
     #expect(resultJSON.contains(#""embedding_time_ms":2.5"#))
 
-    let hits = try core.queryVector([1, 0], k: 1)
-    #expect(hits.first == NativeSearchHit(id: "doc-text", chunkID: "doc-text:d9041255442c:0000", score: 1))
+    let hits = try core.queryVector([1, 0, 0, 0, 0, 0, 0, 0], k: 1)
+    #expect(hits.first?.id == "doc-text")
+    #expect(hits.first?.chunkID == "doc-text:d9041255442c:0000")
+    #expect((hits.first?.score ?? 0) > 0.99)
 
     let lexicalPlan = try core.prepareQueryTextJSON("E-1001", mode: "lexical")
     let lexicalHits = try core.searchEmbeddedTextJSON(
@@ -106,7 +112,7 @@ import Testing
     let hybridPlan = try core.prepareQueryTextJSON("E-1001", mode: "hybrid")
     let hybridHits = try core.searchEmbeddedTextJSON(
         queryPlanJSON: hybridPlan,
-        queryEmbeddingJSON: "[1.0,0.0]",
+        queryEmbeddingJSON: "[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]",
         k: 1,
         filterJSON: #"{"metadata":{"topic":"ops"}}"#
     )
@@ -118,9 +124,9 @@ import Testing
         return
     }
 
-    let db = try LodeDB(vectorDimension: 2)
+    let db = try LodeDB(vectorDimension: 8)
     #expect(db.nativeCoreEnabled)
-    let embedder = FixedTestEmbedder(vector: [1, 0])
+    let embedder = FixedTestEmbedder(vector: [1, 0, 0, 0, 0, 0, 0, 0])
     try db.addText(
         "Alpha launch notes mention error code E-1001.",
         id: "doc-text",

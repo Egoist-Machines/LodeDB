@@ -30,6 +30,10 @@ existing stores stable.
   Apple targets and assembles `LodeDBCoreFFI.xcframework`. It defaults to the host target for
   local verification; set `LODEDB_XCFRAMEWORK_TARGETS` to include iOS device/simulator targets
   after installing them with `rustup target add`.
+- The `release` workflow builds the Swift/iOS artifact for
+  `aarch64-apple-darwin`, `aarch64-apple-ios`, and `aarch64-apple-ios-sim`, uploads
+  `LodeDBCoreFFI.xcframework.zip`, and attaches it to tagged GitHub Releases alongside the
+  Python wheels and sdist.
 
 ## Removal Gate For Python Runtime Paths
 
