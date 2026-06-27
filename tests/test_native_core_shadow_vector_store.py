@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 
@@ -371,16 +369,35 @@ def test_native_core_write_on_vector_store_uses_wal_mode_until_checkpoint(
     assert native.persist_calls == 1
 
 
-def test_native_core_write_on_text_store_requires_generation_mode(tmp_path, monkeypatch) -> None:
+def test_native_core_write_on_text_store_uses_wal_mode_until_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    native = FakeNativeVectorEngine()
+    adapter = FakeNativeAdapter(native)
     monkeypatch.setattr(
         "lodedb.local.db.NativeCoreAdapter",
-        lambda: FakeNativeAdapter(FakeNativeVectorEngine()),
+        lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="commit_mode='generation'.*text stores"):
-        LodeDB(tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    db = LodeDB(tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
+    hits = db.search("Alpha", k=1, mode="lexical")
+    stats = db.stats()["native_core"]
+
+    assert adapter.opened_writable is True
+    assert native.text_prepare_calls == 1
+    assert native.text_apply_calls == 1
+    assert native.text_query_calls == 1
+    assert native.persist_calls == 0
+    assert stats["write_mode"] == "on"
+    assert stats["write_through"] is True
+    assert stats["covered"] is True
+    assert hits[0].id == "doc-alpha"
+
+    db.persist()
+    assert native.persist_calls == 1
 
 
 def test_native_core_write_on_text_store_uses_prepare_apply(tmp_path, monkeypatch) -> None:

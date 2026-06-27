@@ -469,11 +469,22 @@ fn remove_chunks(
 }
 
 fn add_chunk_row(store: &mut LoadedStore, row: Value) -> CoreResult<()> {
+    let chunk_id = row
+        .get("chunk_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| corrupt("chunk row missing chunk_id"))?
+        .to_string();
     let chunks = store
         .state
         .get_mut("chunks")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| corrupt("loaded state chunks must be an array"))?;
+    chunks.retain(|existing| {
+        existing
+            .get("chunk_id")
+            .and_then(Value::as_str)
+            .is_none_or(|existing_id| existing_id != chunk_id)
+    });
     chunks.push(row);
     chunks.sort_by(|left, right| {
         left.get("chunk_id")
@@ -682,6 +693,84 @@ mod tests {
 
         let error = read_records(&path).expect_err("interior corruption should fail");
         assert!(error.to_string().contains("interior corruption"));
+    }
+
+    #[test]
+    fn mixed_text_wal_replay_replaces_embedded_chunk_rows() {
+        let index_key = "mixed-text-key";
+        let chunk_id = chunk_id_for_hash("alpha", &normalized_chunk_hash("Alpha text."), 0);
+        let records = vec![
+            WalRecord {
+                op: "upsert_documents".to_string(),
+                payload: json!({
+                    "documents": [{
+                        "document_id": "alpha",
+                        "text": "Alpha text.",
+                        "metadata": {"kind": "text"}
+                    }]
+                }),
+            },
+            WalRecord {
+                op: "apply_embedded_documents".to_string(),
+                payload: json!({
+                    "documents": [{
+                        "document_id": "alpha",
+                        "content_hash": sha256_text("Alpha text."),
+                        "metadata": {"kind": "text"},
+                        "chunk_ids": [chunk_id.clone()],
+                        "tokens": [["alpha", "text"]]
+                    }],
+                    "added_chunks": [{
+                        "chunk_id": chunk_id.clone(),
+                        "document_id": "alpha",
+                        "content_hash": normalized_chunk_hash("Alpha text."),
+                        "embedding": [1.0, 0.0, 0.0]
+                    }],
+                    "removed_chunk_ids": []
+                }),
+            },
+            WalRecord {
+                op: "apply_embedded_documents".to_string(),
+                payload: json!({
+                    "documents": [{
+                        "document_id": "alpha",
+                        "content_hash": sha256_text("Alpha text."),
+                        "metadata": {"kind": "text"},
+                        "chunk_ids": [chunk_id.clone()],
+                        "tokens": [["alpha", "text"]]
+                    }],
+                    "added_chunks": [{
+                        "chunk_id": chunk_id.clone(),
+                        "document_id": "alpha",
+                        "content_hash": normalized_chunk_hash("Alpha text."),
+                        "embedding": [1.0, 0.0, 0.0]
+                    }],
+                    "removed_chunk_ids": []
+                }),
+            },
+        ];
+        let mut store = LoadedStore {
+            layout: StoreLayout::Generation,
+            index_key: index_key.to_string(),
+            generation: 1,
+            base_epoch: 1,
+            state: empty_state(index_key),
+            tvim_path: None,
+            raw_text: BTreeMap::new(),
+            lexical_tokens: BTreeMap::new(),
+            wal_records: Vec::new(),
+        };
+
+        replay_records_onto_store(&mut store, &records, 8192).expect("replay mixed text wal");
+
+        let chunks = store.state["chunks"].as_array().expect("chunks array");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["chunk_id"], json!(chunk_id));
+        assert_eq!(chunks[0]["embedding"], json!([1.0, 0.0, 0.0]));
+        assert_eq!(
+            store.raw_text.get("alpha").map(String::as_str),
+            Some("Alpha text.")
+        );
     }
 
     #[test]

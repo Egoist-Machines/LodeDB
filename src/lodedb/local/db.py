@@ -1318,12 +1318,6 @@ class LodeDB:
                 return
             self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
             return
-        if write_through and not self.vector_only and commit_mode != "generation":
-            self._native_core_fallback_reason = "native_core_text_write_on_requires_generation"
-            raise RuntimeError(
-                "LODEDB_NATIVE_CORE_WRITE=on currently requires commit_mode='generation' "
-                "for text stores"
-            )
         try:
             if write_through:
                 native_engine = adapter.open_engine(
