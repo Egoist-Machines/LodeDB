@@ -515,6 +515,30 @@ def test_empty_doc_rejected(tmp_path):
         idx.add_document("doc-a", np.zeros((0, DIM), dtype=np.float32))
 
 
+def test_engine_errors_propagate_not_swallowed(tmp_path):
+    # A real (non-404) engine failure must fail closed, not silently return no
+    # hits. LodeDB.list_documents already maps the empty-store 404 to []; anything
+    # else is a true error and should surface from search/search_many.
+    from lodedb.engine.index import EngineError
+
+    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
+    idx.add_document("a", _onehot_matrix([0]))
+    idx.search(_onehot_matrix([0]), k=1)  # build cache (so resident path is live)
+    idx._resident_cache = None  # force a rebuild on next query
+
+    def boom(*args, **kwargs):
+        raise EngineError("boom", status_code=500, response={})
+
+    idx._db.list_documents = boom  # type: ignore[assignment]
+    with pytest.raises(EngineError):
+        idx.search(_onehot_matrix([0]), k=1)  # resident rebuild -> list_documents
+    with pytest.raises(EngineError):
+        idx.search(_onehot_matrix([0]), k=1, filter={"x": "y"})  # filtered path
+    idx.resident = False
+    with pytest.raises(EngineError):
+        idx.search(_onehot_matrix([0]), k=1)  # streaming path
+
+
 def test_search_empty_index_returns_nothing(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     assert idx.search(_onehot_matrix([0]), k=5) == []

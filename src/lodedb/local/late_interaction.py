@@ -60,7 +60,6 @@ from lodedb.engine._atomic_io import (
     durable_replace,
     normalize_durability,
 )
-from lodedb.engine.index import EngineError
 from lodedb.local.db import LodeDB
 
 # The bundled TurboVec extension exposes a native MaxSim kernel (`maxsim_scores`)
@@ -460,8 +459,6 @@ class LodeLateInteractionIndex:
 
         if filter is not None:
             matching = self._filtered_documents_with_counts(filter)
-            if matching is None:
-                return []
             return self._topk_from_chunks(
                 query_matrix, self._disk_chunks(matching, budget), int(k), prefer_native
             )
@@ -545,8 +542,6 @@ class LodeLateInteractionIndex:
 
         if filter is not None:
             matching = self._filtered_documents_with_counts(filter)
-            if matching is None:
-                return [[] for _ in matrices]
             return self._topk_from_chunks_multi(
                 queries_concat, offsets, self._disk_chunks(matching, budget), int(k), None
             )
@@ -839,31 +834,28 @@ class LodeLateInteractionIndex:
         return np.float32 if self.storage == "float32" else np.float16
 
     def _all_documents_with_counts(self) -> list[tuple[str, int]]:
-        """Returns every ``(document_id, patch_count)`` (sorted by id)."""
+        """Returns every ``(document_id, patch_count)`` (sorted by id).
 
-        try:
-            records = self._db.list_documents()
-        except EngineError:
-            return []
+        ``LodeDB.list_documents`` already returns ``[]`` for an empty / not-yet-
+        written store; any other engine error is a real failure and propagates, so
+        a corrupt store fails closed rather than silently scoring nothing.
+        """
+
         out = [
             (record["id"], _patch_count_from_metadata(record.get("metadata", {})))
-            for record in records
+            for record in self._db.list_documents()
         ]
         out.sort(key=lambda item: item[0])
         return out
 
     def _filtered_documents_with_counts(
         self, filter: Mapping[str, Any]
-    ) -> list[tuple[str, int]] | None:
-        """Returns ``(id, patch_count)`` for filter matches, or ``None`` if empty store."""
+    ) -> list[tuple[str, int]]:
+        """Returns ``(id, patch_count)`` for the filter matches (``[]`` if none)."""
 
-        try:
-            records = self._db.list_documents(filter=dict(filter))
-        except EngineError:
-            return None
         return [
             (record["id"], _patch_count_from_metadata(record.get("metadata", {})))
-            for record in records
+            for record in self._db.list_documents(filter=dict(filter))
         ]
 
     def _load_documents(
@@ -1095,10 +1087,7 @@ class LodeLateInteractionIndex:
         """
 
         resident_dtype = self._resident_dtype()
-        try:
-            records = self._db.list_documents()
-        except EngineError:
-            return _empty_resident_cache(self.dim, resident_dtype)
+        records = self._db.list_documents()  # [] for an empty store; real errors raise
         if not records:
             return _empty_resident_cache(self.dim, resident_dtype)
         records.sort(key=lambda record: record["id"])
