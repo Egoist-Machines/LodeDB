@@ -149,7 +149,7 @@ return identical scores:
   with an optimized BLAS (Apple Accelerate, OpenBLAS) this is the fastest path and
   needs no compiled kernel.
 - `scoring="native"`: the TurboVec `maxsim_scores` Rust kernel (per-document faer
-  GEMM, parallel across documents, GIL released). Provided for builds without a
+  GEMM, parallel across documents). Provided for builds without a
   fast BLAS; falls back to numpy if the compiled kernel is absent.
 
 See [issue #25](https://github.com/Egoist-Machines/LodeDB/issues/25) for the

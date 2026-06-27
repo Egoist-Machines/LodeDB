@@ -644,11 +644,12 @@ fn maxsim_scores<'py>(
         )));
     }
 
-    // Detach from the interpreter (release the GIL): the kernel touches only the
-    // borrowed slices, which the PyReadonlyArray guards keep alive for the
-    // borrow's lifetime.
-    let scores =
-        py.detach(|| turbovec_core::maxsim_scores(q_slice, n_query, dim, d_slice, &counts));
+    // The GIL is held while the kernel reads the borrowed NumPy buffers. A
+    // PyReadonlyArray keeps the arrays alive but does NOT stop other Python threads
+    // from mutating the same memory, so releasing the GIL here would let the kernel
+    // read moving buffers (unsound for a public binding). Holding it keeps the read
+    // of `q_slice` / `d_slice` consistent; the kernel is a bounded GEMM + reduction.
+    let scores = turbovec_core::maxsim_scores(q_slice, n_query, dim, d_slice, &counts);
     Ok(scores.into_pyarray(py))
 }
 

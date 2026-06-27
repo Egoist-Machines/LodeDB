@@ -631,6 +631,43 @@ def test_maxsim_kernel_matches_reference():
     assert _maxsim(q, d) == pytest.approx(expected, abs=1e-5)
 
 
+def test_native_kernel_concurrent_calls_are_consistent():
+    # The native binding holds the GIL while reading the borrowed buffers, so
+    # concurrent calls (on their own arrays) stay correct and never crash.
+    import threading
+
+    native = _resolve_native_maxsim()
+    if native is None:
+        pytest.skip("native maxsim_scores kernel not available")
+    rng = np.random.default_rng(2)
+    q = rng.standard_normal((6, DIM)).astype(np.float32)
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    docs = []
+    for n in (5, 8, 3):
+        d = rng.standard_normal((n, DIM)).astype(np.float32)
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        docs.append(d)
+    flat = np.ascontiguousarray(np.vstack(docs), dtype=np.float32)
+    counts = np.array([d.shape[0] for d in docs], dtype=np.int64)
+    reference = np.array([(q @ d.T).max(axis=1).sum() for d in docs], dtype=np.float32)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(200):
+                scores = native(np.ascontiguousarray(q), flat, counts)
+                assert np.allclose(scores, reference, atol=1e-4)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+
+
 def test_native_kernel_is_available_and_matches_numpy():
     # Stage 3: the bundled extension exposes the native MaxSim kernel. (If a build
     # predates it, the SDK falls back to numpy; this asserts the bundled build.)

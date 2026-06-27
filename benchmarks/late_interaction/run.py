@@ -22,8 +22,9 @@ directions (shared across pages) plus background patches, and each query is a
 handful of a target page's concept directions with noise. That structure is what
 makes MaxSim meaningful -- a query token matches the one page patch that carries
 its concept, which mean-pooling dilutes. Real ViDoRe numbers need a bring-your-own
-ColPali encoder; pass precomputed patches with ``--vectors`` (see ``--help``) to
-run the identical comparison on real embeddings.
+ColPali encoder: feed its per-page patch matrices to ``LodeLateInteractionIndex``
+(see ``docs/late-interaction.md``) and the same comparison applies on real
+embeddings.
 
     uv run python benchmarks/late_interaction/run.py
     uv run python benchmarks/late_interaction/run.py --docs 2000 --queries 200 --dim 128

@@ -87,8 +87,9 @@ Added for LodeDB's late-interaction retrieval (multi-vector / MaxSim, issue #25)
   documents, and mixed empty/non-empty bands.
 - `turbovec/src/lib.rs`: `pub mod maxsim;` + `pub use maxsim::maxsim_scores;`.
 - `turbovec-python/src/lib.rs`: `maxsim_scores(query, docs, doc_patch_counts)`
-  module function (validates shapes, raises `ValueError` on mismatch, releases the
-  GIL for the kernel) registered on the `_turbovec` module.
+  module function (validates shapes, raises `ValueError` on mismatch, holds the GIL
+  while the kernel reads the borrowed NumPy buffers so a concurrent mutation cannot
+  race the read) registered on the `_turbovec` module.
 
 This is purely additive (a new module + one exported function + one binding); it
 does not touch the quantized index, its storage format, or any existing API.
