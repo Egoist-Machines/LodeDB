@@ -73,6 +73,59 @@ fn seeded_engine() -> CoreEngine {
 }
 
 #[test]
+fn native_wal_payload_update_replays_after_crash() {
+    let path = unique_temp_dir("core_payload_wal");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "d".to_string(),
+                vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("topic", "old")]),
+                text: Some("old text".to_string()),
+            }],
+        )
+        .unwrap();
+    engine.persist().unwrap();
+
+    // Payload-only update in WAL mode, then a crash (drop without close): the
+    // update must be in the WAL and replay on the next writable open.
+    engine
+        .update_document_payload(
+            "default",
+            "d",
+            Some(metadata(&[("topic", "new")])),
+            Some(Some("new text".to_string())),
+        )
+        .unwrap();
+    // The update lives only in the WAL (persist() checkpointed the pre-update
+    // generation); dropping without close simulates a crash.
+    drop(engine);
+
+    let mut replayed = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let hits = replayed
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].metadata["topic"], "new");
+    assert_eq!(
+        replayed
+            .get_document_text("default", "d")
+            .unwrap()
+            .as_deref(),
+        Some("new text")
+    );
+    replayed.close().unwrap();
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn create_index_rejects_dimensions_turbovec_cannot_serve() {
     let mut engine = CoreEngine::new_in_memory();
     // TurboVec requires a positive multiple of 8; reject at create time rather

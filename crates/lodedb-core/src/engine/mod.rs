@@ -329,6 +329,11 @@ impl CoreEngine {
         text: Option<Option<String>>,
     ) -> Result<CoreMutationResult, CoreError> {
         self.require_writable()?;
+        // Capture the inputs for the WAL record before they are moved into the
+        // document. `text` is a three-state Option<Option<String>> (unchanged /
+        // clear / set), encoded below by key presence so replay is exact.
+        let metadata_for_wal = metadata.clone();
+        let text_for_wal = text.clone();
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
         let Some(record) = index.documents.get(document_id) else {
@@ -366,12 +371,33 @@ impl CoreEngine {
             index.finalize_filter_fields(&changed_filter_fields);
         }
         index.generation += 1;
+        let generation = index.generation;
+        let index_key = index.index_key.clone();
+        // Make payload-only updates crash-durable in WAL mode like the other
+        // native mutations: encode metadata only when set, and the three text
+        // states by key presence (absent = unchanged, null = clear, string = set).
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "document_id".to_string(),
+            Value::String(document_id.to_string()),
+        );
+        if let Some(metadata) = &metadata_for_wal {
+            payload.insert("metadata".to_string(), serde_json::json!(metadata));
+        }
+        if let Some(text) = &text_for_wal {
+            payload.insert("text".to_string(), serde_json::json!(text));
+        }
+        self.append_wal_record(
+            &index_key,
+            "update_document_payload",
+            Value::Object(payload),
+        )?;
         Ok(CoreMutationResult {
             documents_upserted: 1,
             documents_deleted: 0,
             chunks_upserted: 0,
             chunks_deleted: 0,
-            generation: index.generation,
+            generation,
         })
     }
 
@@ -1105,6 +1131,29 @@ impl CoreEngine {
             }
             "apply_embedded_documents" => {
                 self.apply_embedded_documents_wal(index_id, &record.payload)?;
+            }
+            "update_document_payload" => {
+                let document_id = record
+                    .payload
+                    .get("document_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_err("wal update_document_payload missing document_id"))?
+                    .to_string();
+                // Key presence distinguishes the three states: an absent
+                // "metadata"/"text" key means "leave unchanged"; a present "text"
+                // with null means "clear".
+                let metadata = record.payload.get("metadata").map(metadata_from_value);
+                let text = match record.payload.get("text") {
+                    Some(Value::Null) => Some(None),
+                    Some(Value::String(text)) => Some(Some(text.clone())),
+                    Some(_) => {
+                        return Err(invalid_err(
+                            "wal update_document_payload text must be a string or null",
+                        ))
+                    }
+                    None => None,
+                };
+                self.update_document_payload(index_id, &document_id, metadata, text)?;
             }
             other => {
                 return Err(CoreError::new(
@@ -1917,7 +1966,10 @@ fn core_io_error(error: std::io::Error) -> CoreError {
 fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> bool {
     matches!(
         record.op.as_str(),
-        "upsert_vectors" | "delete_documents" | "apply_embedded_documents"
+        "upsert_vectors"
+            | "delete_documents"
+            | "apply_embedded_documents"
+            | "update_document_payload"
     )
 }
 
