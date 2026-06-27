@@ -2349,27 +2349,53 @@ impl VectorOnlyIndex {
             && object
                 .keys()
                 .any(|key| key == "metadata" || key == "document_ids");
-        let mut candidates = self.all_docs.clone();
-        let metadata_filter = if structured {
-            if let Some(document_ids) = object.get("document_ids") {
-                let ids = document_ids
-                    .as_array()
-                    .ok_or_else(|| invalid_err("document_ids filter must be a list"))?
-                    .iter()
-                    .map(|value| value.as_str().unwrap_or("").to_string())
-                    .collect::<BTreeSet<_>>();
-                candidates = candidates.intersection(&ids).cloned().collect();
-            }
-            object.get("metadata")
+        let (document_ids, metadata_filter) = if structured {
+            (object.get("document_ids"), object.get("metadata"))
         } else {
-            Some(filter)
+            (None, Some(filter))
         };
-        if let Some(metadata_filter) = metadata_filter {
-            let coerced = coerce_sdk_filter(metadata_filter)?;
-            let metadata_docs = resolve_filter(&coerced, &self.field_indexes, &self.all_docs)?;
-            candidates = candidates.intersection(&metadata_docs).cloned().collect();
-        }
-        Ok(candidates)
+
+        // Build candidates straight from the constraints rather than cloning the
+        // whole corpus first: a `document_ids` allowlist is bounded by the
+        // requested ids, and a metadata filter already resolves to a subset of
+        // `all_docs` (it uses `all_docs` internally for $ne/$nin/$exists:false).
+        // Cloning `all_docs` up front made every filtered query O(corpus).
+        let id_candidates = match document_ids {
+            Some(value) => {
+                let array = value
+                    .as_array()
+                    .ok_or_else(|| invalid_err("document_ids filter must be a list"))?;
+                Some(
+                    array
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .filter(|id| self.all_docs.contains(*id))
+                        .map(str::to_string)
+                        .collect::<BTreeSet<String>>(),
+                )
+            }
+            None => None,
+        };
+        let metadata_docs = match metadata_filter {
+            Some(metadata_filter) => {
+                let coerced = coerce_sdk_filter(metadata_filter)?;
+                Some(resolve_filter(
+                    &coerced,
+                    &self.field_indexes,
+                    &self.all_docs,
+                )?)
+            }
+            None => None,
+        };
+
+        Ok(match (id_candidates, metadata_docs) {
+            (Some(ids), Some(metadata)) => ids.intersection(&metadata).cloned().collect(),
+            (Some(ids), None) => ids,
+            (None, Some(metadata)) => metadata,
+            // Unreachable: a structured filter always carries at least one of the
+            // two keys, and a non-structured filter sets `metadata_filter`.
+            (None, None) => self.all_docs.clone(),
+        })
     }
 
     /// Resolves the chunk allowlist and considered-document count for a query.

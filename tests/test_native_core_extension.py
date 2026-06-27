@@ -6,7 +6,9 @@ import importlib.util
 import json
 import os
 import shutil
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -321,6 +323,54 @@ def test_native_core_extension_array_paths_handle_edge_inputs() -> None:
     )
     assert hit["hits"][0]["document_id"] == "dup"
     assert hit["hits"][0]["metadata"] == {"v": "1"}
+
+
+def test_native_core_document_ids_filter_does_not_scale_with_corpus() -> None:
+    """A small document_ids allowlist must not pay O(corpus) filter resolution.
+
+    `resolve_filter` builds candidates straight from the requested ids rather than
+    cloning the whole corpus, so a one-id filtered query costs the same as an
+    unfiltered query (both pay only TurboVec's shared scan). The earlier
+    clone-then-intersect made the filtered query several times slower than the
+    unfiltered one at scale; this guards against that regression.
+    """
+
+    dim = 32
+    n = 16000
+    engine = native_core.CoreEngine()
+    engine.create_index("default", dim, 4)
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, dim)).astype(np.float32)
+    engine.upsert_vectors_array(
+        "default",
+        vectors,
+        json.dumps([{"document_id": f"d{i}", "metadata": {}, "text": None} for i in range(n)]),
+    )
+    query = vectors[0]
+    one_id_filter = json.dumps({"document_ids": ["d0"]})
+
+    # Correctness: the one-id allowlist returns exactly that document.
+    hit = _loads(engine.query_vector_array("default", query, 5, one_id_filter))
+    assert [h["document_id"] for h in hit["hits"]] == ["d0"]
+
+    def median_ms(filter_json) -> float:
+        for _ in range(20):  # warm the quantized layout + caches
+            engine.query_vector_array("default", query, 5, filter_json)
+        samples = []
+        for _ in range(80):
+            start = time.perf_counter()
+            engine.query_vector_array("default", query, 5, filter_json)
+            samples.append((time.perf_counter() - start) * 1000.0)
+        return statistics.median(samples)
+
+    filtered = median_ms(one_id_filter)
+    unfiltered = median_ms(None)
+    # Generous bound: the fixed path is ~1x unfiltered; a corpus clone regression
+    # was 5-8x at this size. 4x cleanly separates the two without CI flakiness.
+    assert filtered <= unfiltered * 4.0 + 0.05, (
+        f"one-id document_ids query {filtered:.4f} ms vs unfiltered {unfiltered:.4f} ms "
+        "suggests O(corpus) filter resolution"
+    )
 
 
 def test_native_core_extension_accepts_index_create_options() -> None:
