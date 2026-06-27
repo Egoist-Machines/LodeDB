@@ -166,6 +166,50 @@ impl TurboVecNativeIndex {
         stable_ids
     }
 
+    /// Upserts chunks into the live TurboVec index without rebuilding existing rows.
+    pub fn upsert_chunks(&mut self, chunks: &[CoreVectorChunk]) -> Result<(), CoreError> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let mut embeddings = Vec::with_capacity(chunks.len() * self.dim);
+        for chunk in chunks {
+            if chunk.embedding.len() != self.dim {
+                return invalid("chunk embeddings do not match native_dim");
+            }
+            embeddings.extend_from_slice(&chunk.embedding);
+        }
+        let chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.chunk_id.clone())
+            .collect::<Vec<_>>();
+        let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
+        self.index
+            .upsert_with_ids_2d(&embeddings, self.dim, &stable_ids)
+            .map_err(core_error)?;
+        for (stable_id, chunk) in stable_ids.iter().zip(chunks) {
+            self.chunk_ids_by_stable_id
+                .insert(*stable_id, chunk.chunk_id.clone());
+            self.document_ids_by_stable_id
+                .insert(*stable_id, chunk.document_id.clone());
+            self.stable_id_by_chunk_id
+                .insert(chunk.chunk_id.clone(), *stable_id);
+        }
+        Ok(())
+    }
+
+    /// Removes chunks from the live TurboVec index if they are present.
+    pub fn remove_chunks(&mut self, chunk_ids: &[String]) -> usize {
+        let stable_ids = self.stable_ids_for_chunks(chunk_ids);
+        let removed = self.index.remove_many(&stable_ids);
+        for stable_id in stable_ids {
+            if let Some(chunk_id) = self.chunk_ids_by_stable_id.remove(&stable_id) {
+                self.stable_id_by_chunk_id.remove(&chunk_id);
+            }
+            self.document_ids_by_stable_id.remove(&stable_id);
+        }
+        removed
+    }
+
     /// Persists the `.tvim` payload and returns metrics-only write details.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<VectorIndexWriteMetrics, CoreError> {
         let started = Instant::now();
@@ -201,6 +245,10 @@ impl TurboVecNativeIndex {
 
     pub fn build_seconds(&self) -> f64 {
         self.build_seconds
+    }
+
+    pub fn calibration_fingerprint(&self) -> u64 {
+        self.index.calibration_fingerprint()
     }
 
     fn from_parts(

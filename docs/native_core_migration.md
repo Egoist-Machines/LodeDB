@@ -17,7 +17,7 @@ existing stores stable.
   engine, and persisted stores open without migration.
 - Existing vector-only stores can seed covered native query state from the committed on-disk
   snapshot. Writable handles invalidate that read-only seed on the first mutation and fall back to
-  Python unless explicit native write-through owns a fresh store.
+  Python unless explicit native write-through owns the native writer.
 - Existing text stores can also seed native query state from committed vector sidecars. When
   `index_text=True`, Rust uses the committed lexical sidecar; otherwise, retained raw text
   (`store_text=True`) is re-chunked with the handle's configured chunk limit, matching Python's
@@ -25,10 +25,10 @@ existing stores stable.
 - `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
 - `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
   vector-only handles.
-- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh vector-only and text stores in
-  WAL or generation mode; Rust writes compatible WAL/generation artifacts that Python can reopen.
-  Existing non-empty store write-through remains on the Python oracle until native vector sidecar
-  writes are implemented.
+- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh and seedable existing vector-only
+  and text stores in WAL or generation mode; Rust writes compatible WAL/generation artifacts that
+  Python can reopen. Existing stores with neither retained raw text nor lexical sidecars still
+  remain on the Python oracle for text query coverage.
 - Inside `lodedb-core`, WAL-mode persistent engines can append and replay native-authored vector,
   delete, and embedded-text records, then checkpoint them into generation artifacts. Python
   rollout enables fresh vector and text WAL write-through; mixed Python/native text WAL replay is
@@ -83,13 +83,13 @@ The artifact reports `pass_fail_summary.passed=true`. Rust/Python elapsed ratios
 | Path | Ratio |
 | --- | ---: |
 | Vector upsert | 0.260 |
-| Unfiltered vector search | 0.914 |
-| Filtered vector search | 0.681 |
-| Batch vector search | 0.277 |
-| Text prepare/apply with `HashEmbeddingBackend` | 0.370 |
-| Lexical search | 0.250 |
-| Hybrid search | 0.481 |
-| Persisted reopen/query | 0.602 |
+| Unfiltered vector search | 0.913 |
+| Filtered vector search | 0.648 |
+| Batch vector search | 0.271 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.369 |
+| Lexical search | 0.249 |
+| Hybrid search | 0.484 |
+| Persisted reopen/query | 0.603 |
 
 These numbers prove the current deterministic benchmark gates, not removal of the Python oracle.
 The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the

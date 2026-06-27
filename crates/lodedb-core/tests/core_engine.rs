@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::CoreEngine;
-use lodedb_core::error::CoreErrorCode;
 use lodedb_core::types::{
     CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreVectorDocument,
 };
@@ -443,13 +442,32 @@ fn persistent_engine_writes_python_compatible_vector_metadata() {
 }
 
 #[test]
-fn persisted_native_tvim_backed_writable_open_rejects_rewrite() {
+fn persisted_native_tvim_backed_writable_open_persists_live_index() {
     let path = copy_persisted_fixture("v0_4_store_text");
     let mut writable = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
     assert_eq!(writable.stats("default").unwrap().document_count, 3);
-    let error = writable.persist().unwrap_err();
-    assert_eq!(error.code(), CoreErrorCode::Unsupported);
+    writable
+        .upsert_vectors(
+            "default",
+            &[doc("vec-delta", 3, metadata(&[("tenant", "new")]))],
+        )
+        .unwrap();
+    writable.persist().unwrap();
     drop(writable);
+
+    let readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    assert_eq!(readonly.stats("default").unwrap().document_count, 4);
+    let hits = readonly
+        .query_vector(
+            "default",
+            &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "vec-delta");
+    drop(readonly);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -483,13 +501,26 @@ fn persisted_v0_4_tvim_vectors_seed_readonly_queries() {
     drop(readonly);
 
     let mut writable = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    let error = writable
+    let mutation = writable
         .upsert_vectors(
             "default",
             &[doc("vec-delta", 3, metadata(&[("tenant", "new")]))],
         )
-        .unwrap_err();
-    assert_eq!(error.code(), CoreErrorCode::Unsupported);
+        .unwrap();
+    assert_eq!(mutation.documents_upserted, 1);
+    assert_eq!(
+        writable
+            .query_vector(
+                "default",
+                &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                1,
+                None,
+            )
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "vec-delta"
+    );
     drop(writable);
 
     fs::remove_dir_all(path).unwrap();

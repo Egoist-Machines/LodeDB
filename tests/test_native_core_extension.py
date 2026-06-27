@@ -389,7 +389,7 @@ def test_native_core_on_existing_vector_store_uses_readonly_seed(
     assert db.search_by_vector(_onehot(0), k=1)[0].id == "seed-a"
 
 
-def test_native_core_write_on_existing_vector_store_fails_until_sidecar_writes(
+def test_native_core_write_on_existing_vector_store_uses_writable_seed(
     tmp_path, monkeypatch
 ) -> None:
     from lodedb import LodeDB
@@ -402,8 +402,19 @@ def test_native_core_write_on_existing_vector_store_fails_until_sidecar_writes(
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
-        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(1), id="seed-b", metadata={"kind": "seed"})
+    stats = db.stats()["native_core"]
+
+    assert stats["enabled"] is True
+    assert stats["covered"] is True
+    assert stats["write_through"] is True
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "seed-b"
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "seed-b"
 
 
 def test_native_core_on_existing_index_text_store_uses_readonly_seed(
@@ -434,7 +445,7 @@ def test_native_core_on_existing_index_text_store_uses_readonly_seed(
     assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
 
 
-def test_native_core_write_on_existing_index_text_store_fails_until_sidecar_writes(
+def test_native_core_write_on_existing_index_text_store_uses_writable_seed(
     tmp_path, monkeypatch
 ) -> None:
     from lodedb import LodeDB
@@ -452,12 +463,27 @@ def test_native_core_write_on_existing_index_text_store_fails_until_sidecar_writ
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
-        LodeDB(
-            tmp_path,
-            index_text=True,
-            _embedding_backend=HashEmbeddingBackend(native_dim=384),
-        )
+    db = LodeDB(
+        tmp_path,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    db.add("Beta launch notes mention error code E-2002.", id="doc-beta")
+    stats = db.stats()["native_core"]
+
+    assert stats["enabled"] is True
+    assert stats["covered"] is True
+    assert stats["write_through"] is True
+    assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB(
+        tmp_path,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    assert reopened.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
 
 
 def test_native_core_on_existing_raw_text_store_uses_readonly_seed(

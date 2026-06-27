@@ -178,11 +178,15 @@ impl CoreEngine {
                 &mut changed_filter_fields,
             );
             index.lexical_index.remove_group(&document.document_id);
+            index.sync_vector_index_upsert(&[CoreVectorChunk::new(
+                document.document_id.clone(),
+                document.document_id.clone(),
+                document.vector.clone(),
+            )])?;
             changed += 1;
         }
         if changed > 0 {
             index.finalize_filter_fields(&changed_filter_fields);
-            index.vector_index.replace(None);
             index.generation += 1;
         }
         let generation = index.generation;
@@ -239,13 +243,18 @@ impl CoreEngine {
                     &mut changed_filter_fields,
                 );
                 index.lexical_index.remove_group(document_id);
+                let chunk_ids = record
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.chunk_id.clone())
+                    .collect::<Vec<_>>();
+                index.sync_vector_index_remove(&chunk_ids);
                 deleted += 1;
                 deleted_chunks += record.chunks.len();
             }
         }
         if deleted > 0 {
             index.finalize_filter_fields(&changed_filter_fields);
-            index.vector_index.replace(None);
             index.delete_count += deleted;
             index.deleted_chunk_count += deleted_chunks;
             index.generation += 1;
@@ -437,7 +446,9 @@ impl CoreEngine {
         let mut chunks_upserted = 0usize;
         let mut reused_chunks = 0usize;
         let mut removed_chunk_ids = BTreeSet::new();
+        let mut active_chunk_ids = BTreeSet::new();
         let mut added_chunks = Vec::new();
+        let mut added_vector_chunks = Vec::new();
         let mut wal_documents = Vec::new();
         let mut changed_filter_fields = BTreeSet::new();
         for document in &plan.documents {
@@ -455,6 +466,11 @@ impl CoreEngine {
             for chunk in &document.chunks {
                 let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
                     chunks_upserted += 1;
+                    added_vector_chunks.push(CoreVectorChunk::new(
+                        chunk.chunk_id.clone(),
+                        document.document_id.clone(),
+                        embedding.clone(),
+                    ));
                     added_chunks.push(serde_json::json!({
                         "chunk_id": chunk.chunk_id,
                         "document_id": document.document_id,
@@ -472,6 +488,7 @@ impl CoreEngine {
                     chunk_id: chunk.chunk_id.clone(),
                     vector,
                 });
+                active_chunk_ids.insert(chunk.chunk_id.clone());
             }
             let content_hash = document
                 .text
@@ -527,8 +544,14 @@ impl CoreEngine {
             }));
         }
         if !plan.documents.is_empty() {
+            let removed_chunk_ids_vec = removed_chunk_ids
+                .iter()
+                .filter(|chunk_id| !active_chunk_ids.contains(*chunk_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            index.sync_vector_index_remove(&removed_chunk_ids_vec);
+            index.sync_vector_index_upsert(&added_vector_chunks)?;
             index.finalize_filter_fields(&changed_filter_fields);
-            index.vector_index.replace(None);
             index.generation += 1;
         }
         let generation = index.generation;
@@ -1089,6 +1112,7 @@ impl CoreEngine {
             .collect::<Result<BTreeMap<_, _>, CoreError>>()?;
         let existing_chunks = index.chunk_vectors_by_id();
         let mut changed_filter_fields = BTreeSet::new();
+        let mut active_chunk_ids = BTreeSet::new();
         let documents = payload
             .get("documents")
             .and_then(Value::as_array)
@@ -1136,6 +1160,7 @@ impl CoreEngine {
                     .clone();
                 chunks.push(ChunkRecord { chunk_id, vector });
             }
+            active_chunk_ids.extend(chunks.iter().map(|chunk| chunk.chunk_id.clone()));
             let old_record = index.documents.insert(
                 document_id.clone(),
                 DocumentRecord {
@@ -1178,16 +1203,30 @@ impl CoreEngine {
                 .lexical_index
                 .replace_group(&document_id, &lexical_units);
         }
-        if !removed_chunk_ids.is_empty() {
+        let removed_chunk_ids_vec = removed_chunk_ids
+            .iter()
+            .filter(|chunk_id| !active_chunk_ids.contains(*chunk_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !removed_chunk_ids_vec.is_empty() {
             for record in index.documents.values_mut() {
                 record
                     .chunks
-                    .retain(|chunk| !removed_chunk_ids.contains(&chunk.chunk_id));
+                    .retain(|chunk| !removed_chunk_ids_vec.contains(&chunk.chunk_id));
             }
         }
         if !documents.is_empty() || !removed_chunk_ids.is_empty() {
+            let added_vector_chunks = added_vectors
+                .iter()
+                .filter_map(|(chunk_id, vector)| {
+                    index.chunk_owner_by_id.get(chunk_id).map(|document_id| {
+                        CoreVectorChunk::new(chunk_id, document_id, vector.clone())
+                    })
+                })
+                .collect::<Vec<_>>();
+            index.sync_vector_index_remove(&removed_chunk_ids_vec);
+            index.sync_vector_index_upsert(&added_vector_chunks)?;
             index.finalize_filter_fields(&changed_filter_fields);
-            index.vector_index.replace(None);
             index.generation += 1;
         }
         Ok(())
@@ -1565,11 +1604,8 @@ fn tvim_base_for_index(index: &VectorOnlyIndex) -> Result<Option<TvimBaseBytes>,
     if !index.vectors_seeded {
         return Ok(None);
     }
-    if index.query_rotation.is_some() {
-        return Err(CoreError::new(
-            CoreErrorCode::Unsupported,
-            "persisting reconstructed TurboVec-backed native indexes is not yet implemented",
-        ));
+    if let Some(tvim) = tvim_base_from_cached_index(index)? {
+        return Ok(Some(tvim));
     }
     let chunks = index.persistable_chunks();
     if chunks.is_empty() {
@@ -1600,6 +1636,36 @@ fn tvim_base_for_index(index: &VectorOnlyIndex) -> Result<Option<TvimBaseBytes>,
     Ok(Some(TvimBaseBytes {
         bytes,
         rows: stable_ids.len(),
+        calibration_fingerprint: tvim.calibration_fingerprint(),
+    }))
+}
+
+fn tvim_base_from_cached_index(
+    index: &VectorOnlyIndex,
+) -> Result<Option<TvimBaseBytes>, CoreError> {
+    let cached = index.vector_index.borrow();
+    let Some(tvim) = cached.as_ref() else {
+        return Ok(None);
+    };
+    if tvim.len() != index.chunk_count() {
+        return Err(CoreError::new(
+            CoreErrorCode::CorruptStore,
+            "live TurboVec index row count does not match JSON state",
+        ));
+    }
+    let scratch_path = scratch_tvim_path(&index.index_id, index.generation);
+    tvim.write(&scratch_path)?;
+    let bytes = match fs::read(&scratch_path).map_err(core_io_error) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&scratch_path);
+            return Err(error);
+        }
+    };
+    let _ = fs::remove_file(&scratch_path);
+    Ok(Some(TvimBaseBytes {
+        bytes,
+        rows: tvim.len(),
         calibration_fingerprint: tvim.calibration_fingerprint(),
     }))
 }
@@ -1863,14 +1929,20 @@ impl VectorOnlyIndex {
     }
 
     fn require_vectors_mutable(&self) -> Result<(), CoreError> {
-        self.require_vectors_seeded()?;
-        if self.query_rotation.is_some() {
-            return Err(CoreError::new(
-                CoreErrorCode::Unsupported,
-                "persisted TurboVec-backed native indexes are read-only until native vector sidecar writes are implemented",
-            ));
+        self.require_vectors_seeded()
+    }
+
+    fn sync_vector_index_upsert(&self, chunks: &[CoreVectorChunk]) -> Result<(), CoreError> {
+        if let Some(index) = self.vector_index.borrow_mut().as_mut() {
+            index.upsert_chunks(chunks)?;
         }
         Ok(())
+    }
+
+    fn sync_vector_index_remove(&self, chunk_ids: &[String]) {
+        if let Some(index) = self.vector_index.borrow_mut().as_mut() {
+            index.remove_chunks(chunk_ids);
+        }
     }
 
     fn add_document_indexes(

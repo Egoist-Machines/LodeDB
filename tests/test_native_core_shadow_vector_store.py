@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 
@@ -777,7 +775,7 @@ def test_native_on_existing_vector_store_uses_readonly_seed_until_mutation(
     assert db.search_by_vector(_onehot(1), k=1)[0].id == "b"
 
 
-def test_native_write_on_existing_vector_store_fails_until_sidecar_writes(
+def test_native_write_on_existing_vector_store_uses_writable_seed(
     tmp_path, monkeypatch
 ) -> None:
     writer = LodeDB.open_vector_store(tmp_path, vector_dim=8)
@@ -794,10 +792,14 @@ def test_native_write_on_existing_vector_store_fails_until_sidecar_writes(
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
-        LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    db.add_vectors(_onehot(1), id="b")
 
-    assert adapter.opened_writable is False
+    stats = db.stats()["native_core"]
+    assert adapter.opened_writable is True
+    assert stats["covered"] is True
+    assert stats["write_through"] is True
+    assert db.search_by_vector(_onehot(1), k=1)[0].id == "b"
 
 
 def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
@@ -842,7 +844,7 @@ def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
     assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"
 
 
-def test_native_write_on_existing_index_text_store_fails_until_sidecar_writes(
+def test_native_write_on_existing_index_text_store_uses_writable_seed(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
@@ -869,11 +871,15 @@ def test_native_write_on_existing_index_text_store_fails_until_sidecar_writes(
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
     monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
 
-    with pytest.raises(RuntimeError, match="existing stores requires native vector sidecar writes"):
-        LodeDB(
-            tmp_path,
-            index_text=True,
-            _embedding_backend=HashEmbeddingBackend(native_dim=384),
-        )
+    db = LodeDB(
+        tmp_path,
+        index_text=True,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    db.add("Beta launch notes mention error code E-2002.", id="doc-beta")
 
-    assert adapter.opened_writable is False
+    stats = db.stats()["native_core"]
+    assert adapter.opened_writable is True
+    assert stats["covered"] is True
+    assert stats["write_through"] is True
+    assert db.search("Beta", k=1, mode="lexical")[0].id == "doc-beta"

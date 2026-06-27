@@ -1330,12 +1330,6 @@ class LodeDB:
             raise RuntimeError(
                 "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires retained text"
             )
-        if write_through and document_count != 0:
-            self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
-            raise RuntimeError(
-                "LODEDB_NATIVE_CORE_WRITE=on for existing stores requires native vector "
-                "sidecar writes"
-            )
         try:
             if write_through:
                 native_engine = adapter.open_engine(
