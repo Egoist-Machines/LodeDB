@@ -749,6 +749,39 @@ def test_native_write_through_generation_churn_round_trips(tmp_path, monkeypatch
         ro.close()
 
 
+def test_native_write_through_cross_thread_fallback_preserves_writes(tmp_path, monkeypatch) -> None:
+    """A cross-thread write under native write-through must not be lost.
+
+    Native is thread-confined and owns durability in generation write-through, so a
+    write from a non-owner thread disables native. The Python engine must then
+    reclaim durability and republish the current state; otherwise the acknowledged
+    cross-thread mutation (applied to Python memory but with native's commit
+    deferred) would vanish on reopen.
+    """
+    import threading
+
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
+    db.add_vectors(_onehot(0), id="main", normalize=False)
+
+    def add_from_other_thread() -> None:
+        db.add_vectors(_onehot(1), id="thread", normalize=False)
+
+    worker = threading.Thread(target=add_from_other_thread)
+    worker.start()
+    worker.join()
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
+    assert reopened.stats()["document_count"] == 2
+    assert reopened.search_by_vector(_onehot(0), k=1)[0].id == "main"
+    assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "thread"
+
+
 def test_native_core_on_existing_vector_store_uses_readonly_seed(
     tmp_path, monkeypatch
 ) -> None:

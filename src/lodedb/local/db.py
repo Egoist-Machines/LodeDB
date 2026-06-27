@@ -1651,7 +1651,11 @@ class LodeDB:
             return True
         self._native_vector_covered = False
         self._native_text_shadow_enabled = False
-        self._native_write_through_enabled = False
+        # Hand durability back to Python (and republish current state) before
+        # dropping native write-through: a cross-thread write was already applied
+        # to Python's in-memory state, and if native owned durability its commit
+        # was deferred, so this prevents losing the acknowledged mutation.
+        self._disable_native_write_through()
         self._native_core_fallback_reason = "native_core_cross_thread_access"
         return False
 
@@ -1997,10 +2001,10 @@ class LodeDB:
         self._native_write_through_enabled = False
         engine = getattr(self, "_engine", None)
         if engine is not None:
-            try:
-                engine.flush_native_fallback_state()
-            except Exception:  # noqa: BLE001 - best effort; next commit re-secures it
-                self._native_core_fallback_reason = "native_core_durability_flush_failed"
+            # Fail closed: once Python yielded durable ownership, a failed republish
+            # means a mutation may be non-durable, so let it propagate rather than
+            # acknowledge the write. The flush resumes Python durability either way.
+            engine.flush_native_fallback_state()
 
     def _mark_native_read_failed(self, reason: str, exc: Exception) -> None:
         """Records a native read fallback and applies rollout failure policy."""

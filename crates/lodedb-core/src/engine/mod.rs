@@ -261,7 +261,7 @@ impl CoreEngine {
         }
         let generation = index.generation;
         let index_key = index.index_key.clone();
-        if changed > 0 {
+        if changed > 0 && self.should_append_wal() {
             self.append_wal_record(
                 &index_key,
                 "upsert_vectors",
@@ -569,6 +569,10 @@ impl CoreEngine {
         embedding_time_ms: f64,
     ) -> Result<TextApplyResult, CoreError> {
         self.require_writable()?;
+        // Decide once whether a WAL record is needed; when not (in-memory mirror,
+        // generation write-through, read-only, or replay) we skip building the WAL
+        // payload below, avoiding per-chunk embedding clones and JSON construction.
+        let append_wal = self.should_append_wal();
         let index = self.index_mut(&plan.index_id)?;
         index.require_vectors_mutable()?;
         if index.generation != plan.base_generation {
@@ -635,12 +639,14 @@ impl CoreEngine {
                         document.document_id.clone(),
                         embedding.clone(),
                     ));
-                    added_chunks.push(serde_json::json!({
-                        "chunk_id": chunk.chunk_id,
-                        "document_id": document.document_id,
-                        "content_hash": crate::text::hash::sha256_text(&chunk.text),
-                        "embedding": embedding.clone(),
-                    }));
+                    if append_wal {
+                        added_chunks.push(serde_json::json!({
+                            "chunk_id": chunk.chunk_id,
+                            "document_id": document.document_id,
+                            "content_hash": crate::text::hash::sha256_text(&chunk.text),
+                            "embedding": embedding.clone(),
+                        }));
+                    }
                     embedding
                 } else if let Some(existing) = existing_chunks.get(&chunk.chunk_id) {
                     reused_chunks += 1;
@@ -698,14 +704,16 @@ impl CoreEngine {
             index
                 .lexical_index
                 .replace_group(&document.document_id, &lexical_units);
-            wal_documents.push(serde_json::json!({
-                "document_id": document.document_id,
-                "content_hash": content_hash,
-                "metadata": document.metadata,
-                "text": document.text,
-                "chunk_ids": chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect::<Vec<_>>(),
-                "tokens": token_lists,
-            }));
+            if append_wal {
+                wal_documents.push(serde_json::json!({
+                    "document_id": document.document_id,
+                    "content_hash": content_hash,
+                    "metadata": document.metadata,
+                    "text": document.text,
+                    "chunk_ids": chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect::<Vec<_>>(),
+                    "tokens": token_lists,
+                }));
+            }
         }
         if !plan.documents.is_empty() {
             let removed_chunk_ids_vec = removed_chunk_ids
@@ -720,7 +728,7 @@ impl CoreEngine {
         }
         let generation = index.generation;
         let index_key = index.index_key.clone();
-        if !plan.documents.is_empty() {
+        if append_wal && !plan.documents.is_empty() {
             self.append_wal_record(
                 &index_key,
                 "apply_embedded_documents",
@@ -1137,6 +1145,20 @@ impl CoreEngine {
         match &self.persistence {
             Some(persistence) => (persistence.store_text, persistence.index_text),
             None => (true, true),
+        }
+    }
+
+    /// Whether a mutation should stage a WAL record. False for in-memory engines,
+    /// read-only handles, WAL replay, and non-WAL commit modes -- callers check
+    /// this before building the (potentially large) WAL payload so they do not
+    /// clone vectors/JSON only to discard them (e.g. the default in-memory native
+    /// mirror or a generation write-through writer).
+    fn should_append_wal(&self) -> bool {
+        match &self.persistence {
+            Some(persistence) => {
+                !self.replaying_wal && !persistence.read_only && persistence.commit_mode == "wal"
+            }
+            None => false,
         }
     }
 

@@ -4475,6 +4475,7 @@ class LodeEngine:
             changeset=changeset,
         )
 
+    @_synchronized
     def assign_native_durability_ownership(self) -> None:
         """Hands durable-commit ownership to the native core (write-through).
 
@@ -4485,22 +4486,34 @@ class LodeEngine:
 
         self._native_owns_durability = True
 
+    @_synchronized
     def flush_native_fallback_state(self) -> None:
         """Resumes Python durability and publishes the current state.
 
         Called when native write-through falls back to the Python writer: native
         had owned durability while the Python engine deferred its commits, so this
         re-enables the commit funnel and durably republishes every index's current
-        in-memory state before normal commits continue.
+        in-memory state before normal commits continue. Runs under the engine lock
+        so it is safe even when triggered from a non-owner thread (the case that
+        prompted the fallback). It clears the ownership flag only after the
+        republish succeeds, so a failed flush does not silently acknowledge a
+        non-durable mutation.
         """
 
         if not self._native_owns_durability:
             return
-        self._native_owns_durability = False
         if self.persistence_dir is None:
+            self._native_owns_durability = False
             return
-        for state in self._indexes.values():
-            self._persist_generation(state)
+        try:
+            for state in self._indexes.values():
+                self._persist_generation(state)
+        finally:
+            # Resume Python durability regardless of outcome: on success the state
+            # is published; on failure future writes must still attempt durable
+            # commits rather than no-op. A failure still propagates to the caller,
+            # so a non-durable mutation is never silently acknowledged.
+            self._native_owns_durability = False
 
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
