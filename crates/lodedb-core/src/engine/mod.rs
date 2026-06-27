@@ -1,7 +1,7 @@
 //! Native core engine.
 
 use std::cell::{Ref, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::doc_set::DocSet;
 use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter, FieldIndex};
 use crate::lexical::rrf::RRF_C;
-use crate::lexical::{reciprocal_rank_fusion, tokenize, Bm25Index};
+use crate::lexical::{tokenize, Bm25Index};
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
@@ -595,34 +595,7 @@ impl CoreEngine {
                 let vector_results = self.query_vector(index_id, embedding, pool, filter)?;
                 let lexical_results =
                     self.query_lexical_text(index_id, query_plan, pool, filter)?;
-                let rankings = [
-                    vector_results
-                        .hits
-                        .iter()
-                        .map(|hit| hit.chunk_id.clone())
-                        .collect::<Vec<_>>(),
-                    lexical_results
-                        .hits
-                        .iter()
-                        .map(|hit| hit.chunk_id.clone())
-                        .collect::<Vec<_>>(),
-                ];
-                let mut hits_by_chunk = vector_results
-                    .hits
-                    .into_iter()
-                    .chain(lexical_results.hits)
-                    .map(|hit| (hit.chunk_id.clone(), hit))
-                    .collect::<BTreeMap<_, _>>();
-                let mut hits = reciprocal_rank_fusion(&rankings, RRF_C, None)?
-                    .into_iter()
-                    .filter_map(|(chunk_id, score)| {
-                        hits_by_chunk.remove(&chunk_id).map(|mut hit| {
-                            hit.score = score as f32;
-                            hit
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                hits.truncate(top_k);
+                let hits = fuse_hybrid_hits(vector_results.hits, lexical_results.hits, top_k);
                 Ok(CoreSearchResults {
                     hits,
                     total_considered: vector_results.total_considered,
@@ -2258,6 +2231,47 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
 
 fn lexical_pool_width(top_k: usize) -> usize {
     (top_k * LEXICAL_POOL_FACTOR).max(LEXICAL_POOL_FLOOR)
+}
+
+fn fuse_hybrid_hits(
+    vector_hits: Vec<CoreSearchHit>,
+    lexical_hits: Vec<CoreSearchHit>,
+    top_k: usize,
+) -> Vec<CoreSearchHit> {
+    let mut fused = HashMap::<String, (f64, CoreSearchHit)>::with_capacity(
+        vector_hits.len() + lexical_hits.len(),
+    );
+    add_rrf_hits(&mut fused, vector_hits);
+    add_rrf_hits(&mut fused, lexical_hits);
+    let mut rows = fused.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.chunk_id.cmp(&right.1.chunk_id))
+    });
+    rows.truncate(top_k);
+    rows.into_iter()
+        .map(|(score, mut hit)| {
+            hit.score = score as f32;
+            hit
+        })
+        .collect()
+}
+
+fn add_rrf_hits(fused: &mut HashMap<String, (f64, CoreSearchHit)>, hits: Vec<CoreSearchHit>) {
+    let mut seen = HashSet::new();
+    for (position, hit) in hits.into_iter().enumerate() {
+        if !seen.insert(hit.chunk_id.clone()) {
+            continue;
+        }
+        let contribution = 1.0 / (RRF_C + position as f64 + 1.0);
+        fused
+            .entry(hit.chunk_id.clone())
+            .and_modify(|(score, _)| *score += contribution)
+            .or_insert((contribution, hit));
+    }
 }
 
 fn rotate_query(query: &[f32], rotation: &[f32], dim: usize) -> Result<Vec<f32>, CoreError> {

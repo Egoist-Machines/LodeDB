@@ -75,14 +75,14 @@ The artifact reports `pass_fail_summary.passed=true`. Rust/Python elapsed ratios
 
 | Path | Ratio |
 | --- | ---: |
-| Vector upsert | 0.242 |
-| Unfiltered vector search | 0.920 |
-| Filtered vector search | 0.652 |
-| Batch vector search | 0.303 |
-| Text prepare/apply with `HashEmbeddingBackend` | 0.529 |
-| Lexical search | 0.331 |
-| Hybrid search | 0.996 |
-| Persisted reopen/query | 0.598 |
+| Vector upsert | 0.260 |
+| Unfiltered vector search | 0.907 |
+| Filtered vector search | 0.645 |
+| Batch vector search | 0.276 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.604 |
+| Lexical search | 0.337 |
+| Hybrid search | 0.989 |
+| Persisted reopen/query | 0.601 |
 
 These numbers prove the current deterministic benchmark gates, not removal of the Python oracle.
 The oracle remains in the runtime until broader CI publication, compatibility fixtures, and the
