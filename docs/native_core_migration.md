@@ -20,6 +20,10 @@ existing stores stable.
   opened with `commit_mode="generation"`; Rust writes the same generation artifacts that Python
   can reopen. WAL-mode write-through and existing non-empty store rewrites remain on the Python
   oracle until the storage cutover is complete.
+- Inside `lodedb-core`, WAL-mode persistent engines can append and replay native-authored vector,
+  delete, and embedded-text records, then checkpoint them into generation artifacts. Python
+  rollout still keeps `LODEDB_NATIVE_CORE_WRITE=on` on generation mode until the SDK can avoid
+  double-logging alongside the Python oracle WAL.
 
 ## Swift / iOS Binding State
 

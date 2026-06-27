@@ -485,6 +485,129 @@ fn writable_open_replays_and_checkpoints_wal_but_readonly_ignores_it() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[test]
+fn native_wal_vector_records_replay_and_checkpoint() {
+    let path = unique_temp_dir("core_vector_wal");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+        })
+        .unwrap();
+    engine.persist().unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "wal-vec".to_string(),
+                vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: Some("WAL vector text".to_string()),
+            }],
+        )
+        .unwrap();
+    assert!(path.join(format!("{INDEX_KEY}.wal")).is_file());
+    drop(engine);
+
+    let readonly = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(readonly.stats("default").unwrap().document_count, 0);
+    drop(readonly);
+
+    let writable = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert_eq!(writable.stats("default").unwrap().document_count, 1);
+    assert_eq!(
+        writable
+            .query_vector(
+                "default",
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                1,
+                None,
+            )
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "wal-vec"
+    );
+    assert!(!path.join(format!("{INDEX_KEY}.wal")).exists());
+    drop(writable);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn native_wal_text_apply_records_replay_and_checkpoint() {
+    let path = unique_temp_dir("core_text_wal");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "text".to_string(),
+            route_profile: "text".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+        })
+        .unwrap();
+    engine.persist().unwrap();
+    let plan = engine
+        .prepare_text_upsert(
+            "default",
+            &[text_doc(
+                "wal-text",
+                "Alpha WAL text mentions E-1001.",
+                metadata(&[("kind", "wal")]),
+            )],
+            true,
+            true,
+            900,
+        )
+        .unwrap();
+    engine
+        .apply_text_upsert(&plan, &[vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], 1.0)
+        .unwrap();
+    assert!(path.join(format!("{INDEX_KEY}.wal")).is_file());
+    drop(engine);
+
+    let writable = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert_eq!(writable.stats("default").unwrap().document_count, 1);
+    let query_plan = writable.prepare_query_text("E-1001", "lexical").unwrap();
+    assert_eq!(
+        writable
+            .search_embedded_text("default", &query_plan, None, 1, None)
+            .unwrap()
+            .hits[0]
+            .document_id,
+        "wal-text"
+    );
+    assert!(!path.join(format!("{INDEX_KEY}.wal")).exists());
+    drop(writable);
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        INDEX_KEY,
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded.raw_text.get("wal-text").map(String::as_str),
+        Some("Alpha WAL text mentions E-1001.")
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

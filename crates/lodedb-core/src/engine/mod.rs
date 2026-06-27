@@ -35,6 +35,7 @@ pub struct CoreEngine {
     indexes: BTreeMap<String, VectorOnlyIndex>,
     next_plan_id: u64,
     persistence: Option<PersistenceState>,
+    replaying_wal: bool,
 }
 
 impl CoreEngine {
@@ -55,10 +56,12 @@ impl CoreEngine {
                 path,
                 read_only: false,
                 fsync: options.durability == "fsync",
+                commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
                 _lock: Some(lock),
             }),
+            replaying_wal: false,
         };
         engine.load_persisted_indexes(options.commit_mode == "wal")?;
         Ok(engine)
@@ -78,10 +81,12 @@ impl CoreEngine {
                 path: path.as_ref().to_path_buf(),
                 read_only: true,
                 fsync: options.durability == "fsync",
+                commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
                 _lock: None,
             }),
+            replaying_wal: false,
         };
         engine.load_persisted_indexes(false)?;
         Ok(engine)
@@ -173,12 +178,29 @@ impl CoreEngine {
             index.vector_index.replace(None);
             index.generation += 1;
         }
+        let generation = index.generation;
+        let index_key = index.index_key.clone();
+        if changed > 0 {
+            self.append_wal_record(
+                &index_key,
+                "upsert_vectors",
+                serde_json::json!({
+                    "vectors": documents.iter().map(|document| serde_json::json!({
+                        "document_id": document.document_id,
+                        "vector": document.vector,
+                        "metadata": document.metadata,
+                        "text": document.text,
+                        "tokens": Value::Null,
+                    })).collect::<Vec<_>>()
+                }),
+            )?;
+        }
         Ok(CoreMutationResult {
             documents_upserted: changed,
             documents_deleted: 0,
             chunks_upserted: changed,
             chunks_deleted: 0,
-            generation: index.generation,
+            generation,
         })
     }
 
@@ -221,12 +243,23 @@ impl CoreEngine {
             index.deleted_chunk_count += deleted_chunks;
             index.generation += 1;
         }
+        let generation = index.generation;
+        let index_key = index.index_key.clone();
+        if deleted > 0 {
+            self.append_wal_record(
+                &index_key,
+                "delete_documents",
+                serde_json::json!({
+                    "document_ids": document_ids,
+                }),
+            )?;
+        }
         Ok(CoreMutationResult {
             documents_upserted: 0,
             documents_deleted: deleted,
             chunks_upserted: 0,
             chunks_deleted: deleted_chunks,
-            generation: index.generation,
+            generation,
         })
     }
 
@@ -392,6 +425,9 @@ impl CoreEngine {
         let existing_chunks = index.chunk_vectors_by_id();
         let mut chunks_upserted = 0usize;
         let mut reused_chunks = 0usize;
+        let mut removed_chunk_ids = BTreeSet::new();
+        let mut added_chunks = Vec::new();
+        let mut wal_documents = Vec::new();
         let mut changed_filter_fields = BTreeSet::new();
         for document in &plan.documents {
             let mut chunks = Vec::with_capacity(document.chunks.len());
@@ -408,6 +444,12 @@ impl CoreEngine {
             for chunk in &document.chunks {
                 let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
                     chunks_upserted += 1;
+                    added_chunks.push(serde_json::json!({
+                        "chunk_id": chunk.chunk_id,
+                        "document_id": document.document_id,
+                        "content_hash": crate::text::hash::sha256_text(&chunk.text),
+                        "embedding": embedding.clone(),
+                    }));
                     embedding
                 } else if let Some(existing) = existing_chunks.get(&chunk.chunk_id) {
                     reused_chunks += 1;
@@ -420,16 +462,33 @@ impl CoreEngine {
                     vector,
                 });
             }
+            let content_hash = document
+                .text
+                .as_ref()
+                .map(|text| crate::text::hash::sha256_text(text))
+                .unwrap_or_else(|| {
+                    crate::text::hash::sha256_text(
+                        &document
+                            .chunks
+                            .iter()
+                            .map(|chunk| chunk.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                });
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
                     metadata: document.metadata.clone(),
                     text: document.text.clone(),
-                    token_lists,
+                    token_lists: token_lists.clone(),
                     chunks: chunks.clone(),
                 },
             );
             if let Some(old_record) = old_record {
+                for chunk in &old_record.chunks {
+                    removed_chunk_ids.insert(chunk.chunk_id.clone());
+                }
                 index.remove_document_indexes(
                     &document.document_id,
                     &old_record.metadata,
@@ -446,11 +505,32 @@ impl CoreEngine {
             index
                 .lexical_index
                 .replace_group(&document.document_id, &lexical_units);
+            wal_documents.push(serde_json::json!({
+                "document_id": document.document_id,
+                "content_hash": content_hash,
+                "metadata": document.metadata,
+                "text": document.text,
+                "chunk_ids": chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect::<Vec<_>>(),
+                "tokens": token_lists,
+            }));
         }
         if !plan.documents.is_empty() {
             index.finalize_filter_fields(&changed_filter_fields);
             index.vector_index.replace(None);
             index.generation += 1;
+        }
+        let generation = index.generation;
+        let index_key = index.index_key.clone();
+        if !plan.documents.is_empty() {
+            self.append_wal_record(
+                &index_key,
+                "apply_embedded_documents",
+                serde_json::json!({
+                    "documents": wal_documents,
+                    "added_chunks": added_chunks,
+                    "removed_chunk_ids": removed_chunk_ids.into_iter().collect::<Vec<_>>(),
+                }),
+            )?;
         }
         Ok(TextApplyResult {
             mutation: CoreMutationResult {
@@ -458,7 +538,7 @@ impl CoreEngine {
                 documents_deleted: 0,
                 chunks_upserted,
                 chunks_deleted: 0,
-                generation: index.generation,
+                generation,
             },
             embedded_chunks: chunks_upserted,
             reused_chunks,
@@ -801,6 +881,12 @@ impl CoreEngine {
                     retained_epochs: 4,
                 },
             )?;
+            if persistence.commit_mode == "wal" {
+                crate::storage::wal::truncate(
+                    &crate::storage::wal::wal_path(&persistence.path, &index.index_key),
+                    persistence.fsync,
+                )?;
+            }
         }
         Ok(())
     }
@@ -839,15 +925,222 @@ impl CoreEngine {
         Ok(())
     }
 
+    fn append_wal_record(
+        &self,
+        index_key: &str,
+        op: &str,
+        payload: Value,
+    ) -> Result<(), CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        if self.replaying_wal || persistence.read_only || persistence.commit_mode != "wal" {
+            return Ok(());
+        }
+        crate::storage::wal::append_record(
+            &crate::storage::wal::wal_path(&persistence.path, index_key),
+            op,
+            &payload,
+            persistence.fsync,
+        )?;
+        Ok(())
+    }
+
+    fn apply_native_wal_record(
+        &mut self,
+        index_id: &str,
+        record: &crate::storage::wal::WalRecord,
+    ) -> Result<(), CoreError> {
+        match record.op.as_str() {
+            "upsert_vectors" => {
+                let documents = record
+                    .payload
+                    .get("vectors")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(vector_document_from_wal)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.upsert_vectors(index_id, &documents)?;
+            }
+            "delete_documents" => {
+                let document_ids = record
+                    .payload
+                    .get("document_ids")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                self.delete_documents(index_id, &document_ids)?;
+            }
+            "apply_embedded_documents" => {
+                self.apply_embedded_documents_wal(index_id, &record.payload)?;
+            }
+            other => {
+                return Err(CoreError::new(
+                    CoreErrorCode::Unsupported,
+                    format!("native WAL replay does not support {other}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_embedded_documents_wal(
+        &mut self,
+        index_id: &str,
+        payload: &Value,
+    ) -> Result<(), CoreError> {
+        self.require_writable()?;
+        let index = self.index_mut(index_id)?;
+        index.require_vectors_mutable()?;
+        let removed_chunk_ids = payload
+            .get("removed_chunk_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let added_vectors = payload
+            .get("added_chunks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|chunk| {
+                let chunk_id = chunk
+                    .get("chunk_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_err("WAL added chunk missing chunk_id"))?
+                    .to_string();
+                let vector = chunk
+                    .get("embedding")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| invalid_err("WAL added chunk missing embedding"))?
+                    .iter()
+                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+                    .collect::<Vec<_>>();
+                if vector.len() != index.vector_dim {
+                    return invalid("WAL added chunk embedding dimension does not match index");
+                }
+                Ok((chunk_id, vector))
+            })
+            .collect::<Result<BTreeMap<_, _>, CoreError>>()?;
+        let existing_chunks = index.chunk_vectors_by_id();
+        let mut changed_filter_fields = BTreeSet::new();
+        let documents = payload
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_err("WAL embedded payload missing documents"))?;
+        for document in documents {
+            let document_id = document
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL embedded document missing document_id"))?
+                .to_string();
+            let metadata = metadata_from_value(document.get("metadata").unwrap_or(&Value::Null));
+            let text = document
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let token_lists = document
+                .get("tokens")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|tokens| {
+                    tokens
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let chunk_ids = document
+                .get("chunk_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let mut chunks = Vec::with_capacity(chunk_ids.len());
+            for chunk_id in chunk_ids {
+                let vector = added_vectors
+                    .get(&chunk_id)
+                    .or_else(|| existing_chunks.get(&chunk_id))
+                    .ok_or_else(|| invalid_err("WAL embedded payload references missing chunk"))?
+                    .clone();
+                chunks.push(ChunkRecord { chunk_id, vector });
+            }
+            let old_record = index.documents.insert(
+                document_id.clone(),
+                DocumentRecord {
+                    metadata: metadata.clone(),
+                    text,
+                    token_lists: token_lists.clone(),
+                    chunks: chunks.clone(),
+                },
+            );
+            if let Some(old_record) = old_record {
+                index.remove_document_indexes(
+                    &document_id,
+                    &old_record.metadata,
+                    &old_record.chunks,
+                    &mut changed_filter_fields,
+                );
+            }
+            index.add_document_indexes(
+                &document_id,
+                &metadata,
+                &chunks,
+                &mut changed_filter_fields,
+            );
+            let lexical_units = chunks
+                .iter()
+                .enumerate()
+                .map(|(offset, chunk)| {
+                    (
+                        chunk.chunk_id.clone(),
+                        token_lists.get(offset).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .lexical_index
+                .replace_group(&document_id, &lexical_units);
+        }
+        if !removed_chunk_ids.is_empty() {
+            for record in index.documents.values_mut() {
+                record
+                    .chunks
+                    .retain(|chunk| !removed_chunk_ids.contains(&chunk.chunk_id));
+            }
+        }
+        if !documents.is_empty() || !removed_chunk_ids.is_empty() {
+            index.finalize_filter_fields(&changed_filter_fields);
+            index.vector_index.replace(None);
+            index.generation += 1;
+        }
+        Ok(())
+    }
+
     fn load_persisted_indexes(&mut self, replay_wal: bool) -> Result<(), CoreError> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        if !persistence.path.is_dir() {
+        let persistence_path = persistence.path.clone();
+        let persistence_read_only = persistence.read_only;
+        let persistence_fsync = persistence.fsync;
+        if !persistence_path.is_dir() {
             return Ok(());
         }
         let mut index_keys = Vec::new();
-        for entry in fs::read_dir(&persistence.path).map_err(core_io_error)? {
+        for entry in fs::read_dir(&persistence_path).map_err(core_io_error)? {
             let entry = entry.map_err(core_io_error)?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -859,27 +1152,45 @@ impl CoreEngine {
         }
         for index_key in index_keys {
             let mut loaded = crate::storage::load_store(
-                &persistence.path,
+                &persistence_path,
                 &index_key,
                 crate::storage::LoadOptions {
-                    read_only: persistence.read_only,
-                    read_wal: replay_wal && !persistence.read_only,
+                    read_only: persistence_read_only,
+                    read_wal: false,
                 },
             )?;
-            if replay_wal && !persistence.read_only {
+            if replay_wal && !persistence_read_only {
                 let records = crate::storage::wal::read_records(&crate::storage::wal::wal_path(
-                    &persistence.path,
+                    &persistence_path,
                     &index_key,
                 ))?;
                 if !records.is_empty() {
-                    crate::storage::wal::replay_records_onto_store(&mut loaded, &records, 8192)?;
-                    crate::storage::wal::checkpoint_store(
-                        &persistence.path,
-                        &loaded,
-                        loaded.generation + 1,
-                        persistence.fsync,
-                    )?;
-                    loaded.generation += 1;
+                    if records.iter().all(is_native_replayable_wal_record) {
+                        let index = index_from_loaded_store(&loaded)?;
+                        let index_id = index.index_id.clone();
+                        self.indexes.insert(index_id.clone(), index);
+                        self.replaying_wal = true;
+                        let replay_result = records
+                            .iter()
+                            .try_for_each(|record| self.apply_native_wal_record(&index_id, record));
+                        self.replaying_wal = false;
+                        replay_result?;
+                        self.persist()?;
+                        continue;
+                    } else {
+                        crate::storage::wal::replay_records_onto_store(
+                            &mut loaded,
+                            &records,
+                            8192,
+                        )?;
+                        crate::storage::wal::checkpoint_store(
+                            &persistence_path,
+                            &loaded,
+                            loaded.generation + 1,
+                            persistence_fsync,
+                        )?;
+                        loaded.generation += 1;
+                    }
                 }
             }
             let index = index_from_loaded_store(&loaded)?;
@@ -894,6 +1205,7 @@ struct PersistenceState {
     path: PathBuf,
     read_only: bool,
     fsync: bool,
+    commit_mode: String,
     store_text: bool,
     index_text: bool,
     _lock: Option<PersistentLock>,
@@ -1343,6 +1655,51 @@ fn core_io_error(error: std::io::Error) -> CoreError {
         CoreErrorCode::Internal,
         format!("persistent engine I/O failed: {error}"),
     )
+}
+
+fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> bool {
+    matches!(
+        record.op.as_str(),
+        "upsert_vectors" | "delete_documents" | "apply_embedded_documents"
+    )
+}
+
+fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreError> {
+    let document_id = value
+        .get("document_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_err("WAL vector payload missing document_id"))?
+        .to_string();
+    let vector = value
+        .get("vector")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_err("WAL vector payload missing vector"))?
+        .iter()
+        .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+        .collect::<Vec<_>>();
+    let metadata = metadata_from_value(value.get("metadata").unwrap_or(&Value::Null));
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Ok(CoreVectorDocument {
+        document_id,
+        vector,
+        metadata,
+        text,
+    })
+}
+
+fn metadata_from_value(value: &Value) -> CoreMetadata {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 struct VectorOnlyIndex {
