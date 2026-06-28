@@ -715,6 +715,42 @@ def test_native_core_write_on_vector_store_wal_mode_persists_python_readable_sto
     assert reopened.get("wal-a") == "Native WAL A"
 
 
+def test_native_write_through_persists_non_ascii_text_python_readable(
+    tmp_path, monkeypatch
+) -> None:
+    """Non-ASCII document text survives a native write then a Python reopen.
+
+    The native engine is the sole durable writer in write-through: it writes the
+    document text base, and Python re-verifies that base's body checksum on
+    reopen. Both sides canonicalize the body like ``json.dumps(ensure_ascii=True)``,
+    so the native writer must escape every non-ASCII scalar to ``\\uXXXX`` (a
+    surrogate pair above the BMP), exactly like the Python writer. Emitting raw
+    UTF-8 instead diverges the shared checksum and fails the reopen on real text
+    (the failure was invisible to synthetic ASCII corpora).
+    """
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    texts = {
+        "u-a": "café — naïve résumé § 12",
+        "u-b": "smart “quotes”, an en dash – and an emoji \U0001F600",
+        "u-c": "Über größe Straße",
+    }
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    for axis, (doc_id, text) in enumerate(texts.items()):
+        db.add_vectors(_onehot(axis), id=doc_id, metadata={"kind": "unicode"}, text=text)
+    db.persist()
+    assert db.stats()["native_core"]["write_through"] is True
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    for doc_id, text in texts.items():
+        assert reopened.get(doc_id) == text
+    reopened.close()
+
+
 def test_native_write_through_generation_commits_are_o_changed(tmp_path, monkeypatch) -> None:
     """Native generation write-through publishes O(changed) deltas, not full bases.
 
@@ -817,14 +853,15 @@ def test_native_write_through_generation_churn_round_trips(tmp_path, monkeypatch
         ro.close()
 
 
-def test_native_write_through_cross_thread_fallback_preserves_writes(tmp_path, monkeypatch) -> None:
-    """A cross-thread write under native write-through must not be lost.
+def test_native_write_through_cross_thread_is_thread_confined(tmp_path, monkeypatch) -> None:
+    """Under native sole-writer write-through, a cross-thread write fails closed.
 
-    Native is thread-confined and owns durability in generation write-through, so a
-    write from a non-owner thread disables native. The Python engine must then
-    reclaim durability and republish the current state; otherwise the acknowledged
-    cross-thread mutation (applied to Python memory but with native's commit
-    deferred) would vanish on reopen.
+    Native is thread-confined and is the sole durable writer in generation
+    write-through (the Python engine's redundant upsert is skipped). A write from a
+    non-owner thread therefore cannot be served, and the Python fallback is disabled
+    in sole-writer mode, so it raises rather than silently dropping an acknowledged
+    write. The owner-thread write stays durable in the native store and is readable
+    on reopen.
     """
     import threading
 
@@ -835,19 +872,26 @@ def test_native_write_through_cross_thread_fallback_preserves_writes(tmp_path, m
     db = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
     db.add_vectors(_onehot(0), id="main", normalize=False)
 
+    errors: list[BaseException] = []
+
     def add_from_other_thread() -> None:
-        db.add_vectors(_onehot(1), id="thread", normalize=False)
+        try:
+            db.add_vectors(_onehot(1), id="thread", normalize=False)
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion below
+            errors.append(exc)
 
     worker = threading.Thread(target=add_from_other_thread)
     worker.start()
     worker.join()
+    # The cross-thread write fails closed rather than being silently dropped.
+    assert errors and isinstance(errors[0], RuntimeError)
     db.close()
 
+    # The owner-thread write is durable in the native store and reopens cleanly.
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
     reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
-    assert reopened.stats()["document_count"] == 2
+    assert reopened.stats()["document_count"] == 1
     assert reopened.search_by_vector(_onehot(0), k=1)[0].id == "main"
-    assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "thread"
 
 
 def test_native_write_through_vector_content_hash_matches_python(tmp_path, monkeypatch) -> None:

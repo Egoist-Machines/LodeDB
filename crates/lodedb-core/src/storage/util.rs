@@ -51,14 +51,52 @@ pub(crate) fn verify_file_sha256(path: &Path, expected: &str, context: &str) -> 
     Ok(())
 }
 
+/// Encodes a string as a JSON string literal byte-for-byte identical to
+/// CPython's ``json.dumps`` default (``ensure_ascii=True``): ``"``, ``\`` and the
+/// five short control escapes map to their named forms, ``0x20..=0x7E`` pass
+/// through raw, and every other scalar (other control chars, ``0x7F`` and all
+/// non-ASCII) becomes a lowercase ``\uXXXX`` escape, with a UTF-16 surrogate pair
+/// above the BMP. The native engine and the Python engine both checksum a
+/// canonical body and verify each other's writes across the FFI boundary, so the
+/// two encoders must agree to the byte. ``serde_json::to_string`` emits raw UTF-8
+/// for non-ASCII instead, which silently diverges on real document text.
+fn encode_json_string_ascii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{09}' => out.push_str("\\t"),
+            '\u{0a}' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\u{0d}' => out.push_str("\\r"),
+            ' '..='~' => out.push(ch),
+            _ => {
+                let cp = ch as u32;
+                if cp <= 0xffff {
+                    out.push_str(&format!("\\u{cp:04x}"));
+                } else {
+                    let value = cp - 0x1_0000;
+                    let high = 0xd800 + (value >> 10);
+                    let low = 0xdc00 + (value & 0x3ff);
+                    out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
     match value {
         Value::Null => Ok("null".to_string()),
         Value::Bool(true) => Ok("true".to_string()),
         Value::Bool(false) => Ok("false".to_string()),
         Value::Number(number) => Ok(number.to_string()),
-        Value::String(text) => serde_json::to_string(text)
-            .map_err(|error| corrupt(format!("could not encode JSON string: {error}"))),
+        Value::String(text) => Ok(encode_json_string_ascii(text)),
         Value::Array(items) => {
             let rendered = items
                 .iter()
@@ -69,8 +107,7 @@ pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
         Value::Object(object) => {
             let mut parts = Vec::with_capacity(object.len());
             for (key, item) in object.iter() {
-                let key_json = serde_json::to_string(key)
-                    .map_err(|error| corrupt(format!("could not encode JSON key: {error}")))?;
+                let key_json = encode_json_string_ascii(key);
                 parts.push(format!("{key_json}: {}", py_canonical_json(item)?));
             }
             Ok(format!("{{{}}}", parts.join(", ")))
@@ -161,4 +198,53 @@ pub(crate) fn value_object<'a>(
     value
         .as_object()
         .ok_or_else(|| corrupt(format!("{context} must be a JSON object")))
+}
+
+#[cfg(test)]
+mod canonical_json_tests {
+    use super::*;
+    use serde_json::json;
+
+    // py_canonical_json must equal CPython's json.dumps(value, sort_keys=True)
+    // byte-for-byte: the native and Python engines checksum a canonical body and
+    // verify each other's persisted writes across the FFI boundary.
+    #[test]
+    fn matches_python_ensure_ascii_escaping() {
+        let cases = [
+            ("plain ascii", "\"plain ascii\""),
+            ("é", "\"\\u00e9\""),
+            ("§", "\"\\u00a7\""),
+            ("—", "\"\\u2014\""),
+            ("\u{201c}", "\"\\u201c\""),
+            ("\u{1F600}", "\"\\ud83d\\ude00\""),
+            ("\u{7f}", "\"\\u007f\""),
+            ("\u{2028}", "\"\\u2028\""),
+            ("\t", "\"\\t\""),
+            ("\u{0}", "\"\\u0000\""),
+            ("\u{0b}", "\"\\u000b\""),
+            ("\\", "\"\\\\\""),
+            ("/", "\"/\""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                py_canonical_json(&Value::String(input.to_string())).unwrap(),
+                expected,
+                "escaping mismatch for {input:?}"
+            );
+        }
+    }
+
+    // The body checksum survives serialize -> parse -> re-serialize for non-ASCII
+    // document text (the real-corpus reopen path), and the on-disk form is ASCII.
+    #[test]
+    fn canonical_form_is_idempotent_for_non_ascii() {
+        let body = json!({
+            "schema_version": 2,
+            "documents": {"doc-1": "café — naïve résumé § 12 \u{1F600}"},
+        });
+        let written = py_canonical_json(&body).unwrap();
+        let parsed: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(written, py_canonical_json(&parsed).unwrap());
+        assert!(written.is_ascii(), "canonical body must be ASCII: {written}");
+    }
 }
