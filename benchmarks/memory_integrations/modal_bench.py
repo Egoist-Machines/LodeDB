@@ -239,6 +239,114 @@ def _write(bundle: dict, out: str) -> None:
         print(line)
 
 
+def _run_with_native(spec: dict, mode: str) -> dict:
+    """Runs the suite with LodeDB's native core forced on (Rust) or off (Python).
+
+    The mode is read per-LodeDB handle at construction, so toggling the env
+    between two suite runs in one container cleanly switches the LodeDB driver
+    between the Rust native core and the Python engine while everything else
+    (GPU, image, embeddings, baselines) is held identical.
+    """
+
+    import os
+
+    from run import run_memory_integrations_suite
+
+    os.environ["LODEDB_NATIVE_CORE"] = mode
+    os.environ.pop("LODEDB_NATIVE_CORE_WRITE", None)
+    return run_memory_integrations_suite(**spec)
+
+
+@app.function(gpu="L40S", cpu=16.0, memory=131072, timeout=7200)
+def run_compare_l40s(spec: dict) -> dict:
+    """Runs the suite twice on one L40S, LodeDB native-on (Rust) vs native-off
+    (Python), so the only thing that changes between bundles is LodeDB's engine."""
+
+    _log_native_core()
+    rust = _run_with_native(dict(spec), "on")
+    python = _run_with_native(dict(spec), "off")
+    return {"rust": rust, "python": python}
+
+
+def _compare_spec(output_dir: str) -> dict:
+    """GovReport suite sized to engage the CUDA GPU-resident scan within a
+    reasonable two-pass (Rust + Python) run."""
+
+    return {
+        "output_dir": output_dir,
+        "dataset_name": "govreport",
+        "model": "minilm",
+        "max_documents": 20000,
+        "query_count": 256,
+        "device": "cuda",
+        "top_k": 10,
+        "incremental_count": 30,
+        "n_users": 50,
+        "batch_size": 64,
+    }
+
+
+def _write_compare(bundle: dict, out: str) -> None:
+    """Writes the {rust, python} bundle and prints the LodeDB Rust-vs-Python and
+    LodeDB-vs-baseline headline per framework."""
+
+    path = Path(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(bundle, indent=2, sort_keys=True), encoding="utf-8")
+    rust = bundle.get("rust", {})
+    python = bundle.get("python", {})
+    print(f"[compare] wrote {path} | docs={rust.get('document_count')}")
+
+    def backends(b, framework):
+        return {
+            row["backend"]: row
+            for row in b.get("suites", {}).get(framework, {}).get("backends", [])
+            if not row.get("skipped") and not row.get("failed")
+        }
+
+    for framework in rust.get("suites", {}):
+        r = backends(rust, framework).get("lodedb")
+        p = backends(python, framework).get("lodedb")
+        if not r or not p:
+            continue
+        print(f"  [{framework}] LodeDB Rust vs Python:")
+        for metric, path_keys, unit in (
+            ("single-query p50", ("query", "p50_ms"), "ms"),
+            ("batch per-query", ("query_batch", "mean_per_query_ms"), "ms"),
+            ("durable add p50", ("incremental_add", "p50_ms"), "ms"),
+        ):
+            rv = r.get(path_keys[0], {}).get(path_keys[1])
+            pv = p.get(path_keys[0], {}).get(path_keys[1])
+            if rv is not None and pv is not None:
+                speedup = pv / rv if rv else float("inf")
+                print(
+                    f"    {metric:18s}: rust={rv:.4f}{unit} "
+                    f"python={pv:.4f}{unit} ({speedup:.2f}x)"
+                )
+        print(
+            f"    batch path         : rust={r.get('query_batch', {}).get('path')!r} "
+            f"python={p.get('query_batch', {}).get('path')!r}"
+        )
+        baselines = backends(rust, framework)
+        others = ", ".join(
+            f"{name} batch/q="
+            f"{baselines[name].get('query_batch', {}).get('mean_per_query_ms'):.4f}ms"
+            for name in baselines
+            if name != "lodedb"
+        )
+        if others:
+            print(f"    baselines          : {others}")
+
+
+@app.local_entrypoint()
+def compare_l40s(
+    out: str = "benchmarks/memory_integrations/results/results_compare_l40s.json",
+) -> None:
+    """LodeDB Rust (native on) vs Python (native off) on one L40S, with baselines."""
+
+    _write_compare(run_compare_l40s.remote(_compare_spec("/root/mi-compare")), out)
+
+
 @app.local_entrypoint()
 def smoke(out: str = "benchmarks/memory_integrations/results/results_smoke.json") -> None:
     """Tiny synthetic A10 validation run before the full GovReport suite."""
