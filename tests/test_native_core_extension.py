@@ -716,13 +716,19 @@ def test_native_core_write_on_vector_store_wal_mode_persists_python_readable_sto
 
 
 def test_native_write_through_generation_commits_are_o_changed(tmp_path, monkeypatch) -> None:
-    """Native generation write-through must publish O(changed) deltas, not full bases.
+    """Native generation write-through publishes O(changed) deltas, not full bases.
 
-    Native is the sole durable writer in write-through (Python defers), so each
-    single-row add appends a generation delta onto native's own base. Per-add
-    latency must stay flat as the corpus grows instead of the prior O(corpus)
-    full-base rewrite (which grew to ~100 ms/add at ~1k rows).
+    Native is the sole durable writer in write-through (Python defers), so a
+    single-row add appends a generation delta onto native's own base and only
+    rewrites a fresh base on cold build / calibration change / compaction. This is
+    asserted structurally rather than by timing (which is flaky on shared CI): a
+    full-base-per-add regression would advance the commit's ``base_epoch`` in
+    lockstep with its ``generation`` (every commit a fresh base), whereas O(changed)
+    deltas leave ``base_epoch`` fixed while ``generation`` advances.
     """
+    import json
+    import pathlib
+
     from lodedb import LodeDB
 
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
@@ -731,29 +737,42 @@ def test_native_write_through_generation_commits_are_o_changed(tmp_path, monkeyp
     rng = np.random.default_rng(0)
     db = LodeDB.open_vector_store(tmp_path, vector_dim=dim, commit_mode="generation")
 
-    def add_bucket(start, count):
-        elapsed = []
-        for i in range(start, start + count):
-            vec = rng.standard_normal(dim).astype(np.float32).tolist()
-            began = time.perf_counter()
-            db.add_vectors(vec, id=f"d{i}", metadata={"u": str(i)}, normalize=False)
-            elapsed.append((time.perf_counter() - began) * 1000.0)
-        return statistics.median(elapsed)
+    def commit_body():
+        manifest = next(pathlib.Path(tmp_path).glob("*.commit.json"))
+        return json.loads(manifest.read_text())["body"]
 
-    first = add_bucket(0, 200)
-    for i in range(200, 1800):
+    def add(doc_id):
         db.add_vectors(
-            rng.standard_normal(dim).astype(np.float32).tolist(), id=f"d{i}", normalize=False
+            rng.standard_normal(dim).astype(np.float32).tolist(), id=doc_id, normalize=False
         )
-    last = add_bucket(1800, 200)
+
+    # Seed past the tiny-corpus phase (where the 25%-of-docs rule compacts on
+    # nearly every add) so the post-compaction add below is unambiguously a delta.
+    for i in range(16):
+        add(f"seed-{i}")
+
+    # Advance until a compaction lands (base_epoch jumps); the backlog is then 0.
+    before = None
+    prev_base = commit_body()["base_epoch"]
+    for i in range(16, 96):
+        add(f"d{i}")
+        body = commit_body()
+        if body["base_epoch"] > prev_base:
+            before = body  # just compacted: a fresh, native-authored base
+            break
+        prev_base = body["base_epoch"]
+    assert before is not None, "expected a compaction (fresh base) during the seed"
+
+    # The next add must be an O(changed) delta: base unchanged, generation advances.
+    add("post-compaction")
+    after = commit_body()
     assert db.stats()["native_core"]["write_through"] is True
     db.close()
-
-    # Flat within a generous bound: a full-base regression would be many times
-    # slower at the tail than at the head, while O(changed) deltas stay level.
-    assert last <= first * 4.0 + 1.0, (
-        f"per-add latency grew: first={first:.3f} ms last={last:.3f} ms"
+    assert after["base_epoch"] == before["base_epoch"], (
+        "post-compaction add rewrote a fresh base instead of appending a delta "
+        "(O(corpus) full-base-per-add regression)"
     )
+    assert after["generation"] == before["generation"] + 1
 
 
 def test_native_write_through_generation_churn_round_trips(tmp_path, monkeypatch) -> None:

@@ -2243,6 +2243,24 @@ fn persist_index_generation(
         .borrow()
         .as_ref()
         .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
+    // A text/lexical delta is appended only when this commit actually changes
+    // text/lexical state, so the base only needs those store files when there is
+    // such a pending change. (A store_text store written while every document is
+    // text-free has no `.tvtext` base, and must still be delta-appendable.)
+    let pending_text = store_text
+        && (!index.pending_deletes.is_empty()
+            || index
+                .pending_upserts
+                .iter()
+                .any(|id| index.documents.get(id).is_some_and(|r| r.text.is_some())));
+    let pending_lexical = index_text
+        && (!index.pending_deletes.is_empty()
+            || index.pending_upserts.iter().any(|id| {
+                index
+                    .documents
+                    .get(id)
+                    .is_some_and(|r| !r.token_lists.is_empty())
+            }));
     let needs_base = index.base_epoch == 0
         || !index.vectors_seeded
         || live_fingerprint != index.base_calibration_fingerprint
@@ -2250,8 +2268,8 @@ fn persist_index_generation(
             dir,
             &index.index_key,
             index.base_epoch,
-            store_text,
-            index_text,
+            pending_text,
+            pending_lexical,
         )
         || generation_should_compact(
             dir,
@@ -2273,15 +2291,20 @@ fn persist_index_generation(
     Ok(())
 }
 
-/// Returns whether native's own base at `base_epoch` still has the base files a
-/// delta needs to append onto. Defensive against a base file disappearing; the
-/// caller rewrites a fresh authored base when it returns false.
+/// Returns whether native's own base at `base_epoch` has the base files the
+/// pending delta needs to append onto. The state-journal base is always required;
+/// the text/lexical bases are required only when this commit actually changes
+/// text/lexical state (`need_text`/`need_lexical`), since a store can be
+/// text-capable yet have written a base with no `.tvtext`/`.tvlex` (every document
+/// text-free). Returns false when a required base is absent (a co-writer GC'd it,
+/// or text/lexical just appeared on a base that lacked it), so the caller rewrites
+/// a fresh authored base that establishes those store files.
 fn native_base_appendable(
     dir: &Path,
     index_key: &str,
     base_epoch: u64,
-    store_text: bool,
-    index_text: bool,
+    need_text: bool,
+    need_lexical: bool,
 ) -> bool {
     use crate::storage::commit_manifest::{base_json_path, base_tvlex_path, base_tvtext_path};
     if base_epoch == 0 {
@@ -2290,10 +2313,10 @@ fn native_base_appendable(
     if !base_json_path(dir, index_key, base_epoch).is_file() {
         return false;
     }
-    if store_text && !base_tvtext_path(dir, index_key, base_epoch).is_file() {
+    if need_text && !base_tvtext_path(dir, index_key, base_epoch).is_file() {
         return false;
     }
-    if index_text && !base_tvlex_path(dir, index_key, base_epoch).is_file() {
+    if need_lexical && !base_tvlex_path(dir, index_key, base_epoch).is_file() {
         return false;
     }
     true
