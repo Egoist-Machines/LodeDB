@@ -11,26 +11,27 @@ LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-
 strong **drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
 compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
 about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
-documents, per framework default (mean of 3 A10 runs):
+documents, per framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
-| On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~440× faster** (0.68 vs 299 ms) | **~500× faster** (0.69 vs 346 ms) | **~44× faster** (0.74 vs 33 ms) |
-| Batched retrieval, 64 (GPU) | **~1,600×** (5,447 vs ~3 qps) | **~1,780×** (5,105 vs ~3 qps) | **~117×** (3,779 vs 32 qps) |
-| Durable add of one memory | **~8,000× faster** (1.1 ms vs 8.8 s) | **~16,000× faster** (1.2 ms vs 19.8 s) | 0.8 vs 0.6 ms (both sub-ms) |
+| On-disk footprint | **7.4× smaller** (27 vs 199 MB) | **5.4× smaller** (27 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
+| Single-query p50 (CPU) | **~660× faster** (0.36 vs 241 ms) | **~800× faster** (0.36 vs 288 ms) | **~44× faster** (0.74 vs 33 ms) |
+| Batched retrieval, 64 (GPU) | **~2,490×** (10,444 vs ~4 qps) | **~2,490×** (8,725 vs ~4 qps) | **~117×** (3,779 vs 32 qps) |
+| Durable add of one memory | **~29,000× faster** (0.24 ms vs 7.1 s) | **~69,000× faster** (0.22 ms vs 15.4 s) | 0.8 vs 0.6 ms (both sub-ms) |
 
 Among embedded stores, LodeDB has the smallest footprint and the fastest single-query and batched
-search; its durable add is within ~2× of the fastest lazy-append stores (sqlite-vec, qdrant):
+search, and its durable add leads the fastest lazy-append stores
+(sqlite-vec, qdrant) too:
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
-| sqlite-vec | **0.5 ms** | 25.5 ms | 27.1 ms | 96 MB |
-| qdrant | **0.6 ms** | 36.7 ms | 37.8 ms | 81 MB |
-| **LodeDB** | 1.1 ms | **0.68 ms** | **0.18 ms** | **28 MB** |
-| pgvector | 2.1 ms | 48.1 ms | 48.1 ms | 48 MB |
-| lancedb | 3.3 ms | 10.9 ms | 10.8 ms | 35 MB |
-| chroma | 6.3 ms | 3.3 ms | 3.4 ms | 144 MB |
+| **LodeDB** | **0.24 ms** | **0.36 ms** | **0.10 ms** | **27 MB** |
+| sqlite-vec | 0.47 ms | 24.8 ms | 23.7 ms | 96 MB |
+| qdrant | 0.52 ms | 25.1 ms | 26.7 ms | 81 MB |
+| pgvector | 2.07 ms | 49.5 ms | 41.7 ms | 48 MB |
+| lancedb | 3.42 ms | 11.2 ms | 10.7 ms | 35 MB |
+| chroma | 7.03 ms | 3.79 ms | 3.83 ms | 144 MB |
 
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)

@@ -136,6 +136,52 @@ IMAGE = _build_image()
 app = modal.App("lodedb-memory-integrations-bench", image=IMAGE)
 
 
+def _register_cuda_libs() -> None:
+    """Makes the image's bundled CUDA libraries resolvable by cudarc's dlopen.
+
+    torch and the nvidia-*-cu12 wheels ship libcublas/libnvrtc as versioned
+    sonames under site-packages, which are not on the loader's default search
+    path; cudarc dlopens them by soname and would otherwise fall back to the CPU
+    kernel. Discovering the dirs from the running interpreter (so the paths match
+    whichever python Modal uses), registering them with ldconfig, and refreshing
+    the cache before the native core's first GPU touch lets the GPU path engage.
+    Best effort: any failure simply leaves the native core on its CPU kernel."""
+
+    import glob
+    import os
+    import subprocess
+
+    dirs: set[str] = set()
+    try:
+        import nvidia  # nvidia-*-cu12 wheels expose a `nvidia` namespace package
+
+        for base in nvidia.__path__:
+            for lib_dir in glob.glob(os.path.join(base, "*", "lib")):
+                if glob.glob(os.path.join(lib_dir, "lib*.so*")):
+                    dirs.add(lib_dir)
+    except Exception as exc:  # noqa: BLE001 - discovery is best effort
+        print(f"[gpu-libs] nvidia wheels not found: {exc}")
+    try:
+        import torch
+
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            dirs.add(torch_lib)
+    except Exception as exc:  # noqa: BLE001 - discovery is best effort
+        print(f"[gpu-libs] torch libs not found: {exc}")
+
+    if not dirs:
+        print("[gpu-libs] no CUDA lib dirs discovered; native core stays on CPU")
+        return
+    try:
+        with open("/etc/ld.so.conf.d/lodedb-cuda.conf", "w", encoding="utf-8") as handle:
+            handle.write("\n".join(sorted(dirs)) + "\n")
+        subprocess.run(["ldconfig"], check=False)
+        print(f"[gpu-libs] registered CUDA lib dirs: {sorted(dirs)}")
+    except Exception as exc:  # noqa: BLE001 - never fail the run over this
+        print(f"[gpu-libs] ldconfig registration failed: {exc}")
+
+
 def _log_native_core() -> None:
     """Confirms the freshly built wheel exposes the native Rust core, so the run
     reflects the native offering (not a stale-extension Python fallback)."""
@@ -149,24 +195,227 @@ def _log_native_core() -> None:
         raise RuntimeError("native CoreEngine missing from the built extension")
 
 
+def _run_suite(spec: dict) -> dict:
+    """Runs the suite, honoring an optional ``native_core`` spec key that forces
+    LodeDB's engine on (Rust) or off (Python) for this container."""
+
+    import os
+
+    _register_cuda_libs()
+    _log_native_core()
+    # One-time stderr confirmation that the native GPU scan actually engaged on the
+    # rust container (a no-op for the Python container, which logs its own backend).
+    os.environ["LODEDB_GPU_DEBUG"] = "1"
+    spec = dict(spec)
+    mode = spec.pop("native_core", None)
+    if mode is not None:
+        os.environ["LODEDB_NATIVE_CORE"] = mode
+        # Default WAL commit mode both sides (the fast path). With write-through the
+        # rust container is the sole writer: native appends its own durable WAL
+        # record per add and skips the Python engine entirely, while the generation
+        # publish is deferred to checkpoint/close.
+        os.environ.pop("LODEDB_COMMIT_MODE", None)
+        if mode == "on":
+            os.environ["LODEDB_NATIVE_CORE_WRITE"] = "on"
+        else:
+            os.environ.pop("LODEDB_NATIVE_CORE_WRITE", None)
+    from run import run_memory_integrations_suite
+
+    return run_memory_integrations_suite(**spec)
+
+
 @app.function(gpu="A10", cpu=16.0, memory=65536, timeout=7200)
 def run_suite_a10(spec: dict) -> dict:
     """Runs the memory-integration suite in the Modal A10 CUDA image."""
 
-    _log_native_core()
-    from run import run_memory_integrations_suite
-
-    return run_memory_integrations_suite(**spec)
+    return _run_suite(spec)
 
 
 @app.function(gpu="L40S", cpu=16.0, memory=131072, timeout=7200)
 def run_suite_l40s(spec: dict) -> dict:
     """Runs the memory-integration suite in the Modal L40S CUDA image."""
 
-    _log_native_core()
-    from run import run_memory_integrations_suite
+    return _run_suite(spec)
 
-    return run_memory_integrations_suite(**spec)
+
+def _gpu_smoke(n: int = 17500, dim: int = 384, nq: int = 64, k: int = 10) -> dict:
+    """Validates the native GPU scan end to end: engagement, GPU-vs-CPU parity,
+    and a rough timing, on synthetic precomputed vectors (no dataset/model).
+
+    Native vector reads are authoritative on; LODEDB_GPU_DEBUG=1 makes the Rust
+    core print a one-time "GPU scan engaged" line, so the function logs prove the
+    GPU path served rather than silently falling back to the CPU kernel."""
+
+    import os
+    import tempfile
+    import time
+
+    import numpy as np
+
+    _register_cuda_libs()
+    _log_native_core()
+    os.environ["LODEDB_NATIVE_CORE"] = "on"
+    os.environ.pop("LODEDB_NATIVE_CORE_WRITE", None)
+    os.environ["LODEDB_GPU_DEBUG"] = "1"
+
+    from lodedb import LodeDB
+
+    rng = np.random.default_rng(7)
+    vectors = rng.standard_normal((n, dim)).astype("float32")
+    queries = list(rng.standard_normal((nq, dim)).astype("float32"))
+
+    tmp = tempfile.mkdtemp()
+    db = LodeDB(path=os.path.join(tmp, "lode"), vector_dim=dim, device="cpu")
+    db.add_vectors_many(
+        [{"vector": vectors[i], "id": str(i)} for i in range(n)],
+        normalize=False,
+    )
+
+    def run_batch() -> list[list[str]]:
+        return [[h.id for h in hits] for hits in db.search_many_by_vector(queries, k=k)]
+
+    def timed(label: str) -> tuple[list[list[str]], float]:
+        run_batch()  # warm
+        start = time.perf_counter()
+        result: list[list[str]] = []
+        for _ in range(100):
+            result = run_batch()
+        ms_per_query = (time.perf_counter() - start) / 100 / nq * 1000.0
+        print(f"[gpu-smoke] {label}: {ms_per_query:.4f} ms/query")
+        return result, ms_per_query
+
+    os.environ["LODEDB_GPU_DIRECT_TURBOVEC"] = "auto"
+    gpu_res, gpu_ms = timed("gpu-on ")
+    os.environ["LODEDB_GPU_DIRECT_TURBOVEC"] = "off"
+    cpu_res, cpu_ms = timed("gpu-off")
+
+    # The GPU path scores exact-reconstructed rows while the CPU kernel scores the
+    # uint8 LUT quantization of the same rows, so the two legitimately diverge at
+    # the top-k boundary. Recall against the brute-force float ground truth is the
+    # meaningful check: the GPU path should recall at least as well as the CPU
+    # kernel (it is the more faithful estimator), and both should stay high.
+    queries_mat = np.stack(queries)
+    truth_idx = np.argsort(-(queries_mat @ vectors.T), axis=1)[:, :k]
+    truth = [{str(int(slot)) for slot in row} for row in truth_idx]
+
+    def recall(result: list[list[str]]) -> float:
+        hit = sum(len(set(r) & t) for r, t in zip(result, truth, strict=True))
+        return hit / (nq * k)
+
+    out = {
+        "n": n,
+        "dim": dim,
+        "nq": nq,
+        "k": k,
+        "gpu_ms_per_query": round(gpu_ms, 4),
+        "cpu_ms_per_query": round(cpu_ms, 4),
+        "gpu_recall_vs_float": round(recall(gpu_res), 4),
+        "cpu_recall_vs_float": round(recall(cpu_res), 4),
+        "gpu_cpu_overlap": round(
+            sum(len(set(a) & set(b)) for a, b in zip(gpu_res, cpu_res, strict=True)) / (nq * k),
+            4,
+        ),
+    }
+    print(f"[gpu-smoke] result: {out}")
+    return out
+
+
+@app.function(gpu="L40S", cpu=8.0, memory=32768, timeout=1800)
+def run_gpu_smoke_l40s() -> dict:
+    """Runs the native GPU-scan smoke on a Modal L40S."""
+
+    return _gpu_smoke()
+
+
+def _textstore_repro(n: int = 20000) -> str:
+    """Runs the LodeDB LangChain backend over the real GovReport corpus in
+    isolation (native write-through, CUDA, ingest -> query -> persist ->
+    incremental -> reopen). The reopen re-reads and checksums the native-written
+    document text base; real document text exercises the non-ASCII canonical-JSON
+    path that synthetic ASCII corpora never reach."""
+
+    import json
+    import os
+    import tempfile
+    import traceback
+    from pathlib import Path
+
+    _register_cuda_libs()
+    os.environ["LODEDB_NATIVE_CORE"] = "on"
+    os.environ["LODEDB_NATIVE_CORE_WRITE"] = "on"
+
+    from bench_langchain import _LodeDBDriver, _make_cached_embeddings
+    from common import (
+        embed_corpus,
+        exact_topk,
+        load_corpus,
+        rag_metadata,
+        run_core_phases,
+        uuid_ids,
+    )
+
+    docs, queries = load_corpus("govreport", n, 64)
+    embedded = embed_corpus(docs, queries, model="minilm", device="cuda")
+    cache = {text: embedded.doc_vectors[i].tolist() for i, text in enumerate(docs)}
+    emb = _make_cached_embeddings(cache, embedded)
+    ids = uuid_ids(len(docs), "langchain")
+    inc_ids = uuid_ids(30, "langchain-inc")
+    metadatas = [rag_metadata(i) for i in range(len(docs))]
+    truth = exact_topk(ids, embedded.doc_vectors, embedded.query_vectors, 10)
+    workdir = Path(tempfile.mkdtemp())
+    driver = _LodeDBDriver("lodedb", workdir, emb, model="minilm", device="cuda")
+    try:
+        metrics = run_core_phases(
+            driver,
+            embedded,
+            ids,
+            docs,
+            metadatas,
+            truth,
+            k=10,
+            incremental_count=30,
+            incremental_ids=inc_ids,
+            batch_size=64,
+        )
+        out = "OK reopen=" + json.dumps(metrics.get("reopen"))
+    except Exception:
+        out = "EXCEPTION:\n" + traceback.format_exc()
+    print(out)
+    return out
+
+
+@app.function(gpu="L40S", cpu=8.0, memory=65536, timeout=1800)
+def run_textstore_repro_l40s() -> str:
+    """Runs the GovReport text-store checksum repro on a Modal L40S."""
+
+    return _textstore_repro()
+
+
+@app.function(gpu="L40S", cpu=8.0, memory=32768, timeout=1800)
+def run_gpu_unit_tests_l40s() -> str:
+    """Runs the lodedb-gpu cargo tests on a real GPU.
+
+    The parity test compares the GPU top-k against an exact CPU reference over raw
+    rows (no TurboVec quantization), so it isolates the GEMM + top-k kernel math
+    from the quantization divergence the CPU serving kernel carries."""
+
+    import os
+    import subprocess
+
+    _register_cuda_libs()
+    env = dict(os.environ)
+    env["PATH"] = os.path.expanduser("~/.cargo/bin") + ":" + env.get("PATH", "")
+    proc = subprocess.run(
+        ["cargo", "test", "-p", "lodedb-gpu", "--release", "--", "--nocapture"],
+        cwd="/root/lodedb-src",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(proc.stdout)
+    print(proc.stderr)
+    return f"returncode={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
 
 
 def _full_spec(output_dir: str) -> dict:
@@ -237,35 +486,6 @@ def _write(bundle: dict, out: str) -> None:
                 f"(lodedb {ratio:.1f}x smaller)"
             )
         print(line)
-
-
-def _run_with_native(spec: dict, mode: str) -> dict:
-    """Runs the suite with LodeDB's native core forced on (Rust) or off (Python).
-
-    The mode is read per-LodeDB handle at construction, so toggling the env
-    between two suite runs in one container cleanly switches the LodeDB driver
-    between the Rust native core and the Python engine while everything else
-    (GPU, image, embeddings, baselines) is held identical.
-    """
-
-    import os
-
-    from run import run_memory_integrations_suite
-
-    os.environ["LODEDB_NATIVE_CORE"] = mode
-    os.environ.pop("LODEDB_NATIVE_CORE_WRITE", None)
-    return run_memory_integrations_suite(**spec)
-
-
-@app.function(gpu="L40S", cpu=16.0, memory=131072, timeout=7200)
-def run_compare_l40s(spec: dict) -> dict:
-    """Runs the suite twice on one L40S, LodeDB native-on (Rust) vs native-off
-    (Python), so the only thing that changes between bundles is LodeDB's engine."""
-
-    _log_native_core()
-    rust = _run_with_native(dict(spec), "on")
-    python = _run_with_native(dict(spec), "off")
-    return {"rust": rust, "python": python}
 
 
 def _compare_spec(output_dir: str) -> dict:
@@ -339,12 +559,41 @@ def _write_compare(bundle: dict, out: str) -> None:
 
 
 @app.local_entrypoint()
+def gpu_smoke_l40s() -> None:
+    """Confirms the native GPU scan engages and matches the CPU kernel on an L40S."""
+
+    result = run_gpu_smoke_l40s.remote()
+    print(f"[gpu-smoke] {result}")
+
+
+@app.local_entrypoint()
+def gpu_unit_tests_l40s() -> None:
+    """Runs the lodedb-gpu cargo parity tests on a real L40S GPU."""
+
+    print(run_gpu_unit_tests_l40s.remote())
+
+
+@app.local_entrypoint()
+def textstore_repro_l40s() -> None:
+    """Runs the GovReport text-store write-through + reopen repro on an L40S."""
+
+    print(run_textstore_repro_l40s.remote())
+
+
+@app.local_entrypoint()
 def compare_l40s(
     out: str = "benchmarks/memory_integrations/results/results_compare_l40s.json",
 ) -> None:
-    """LodeDB Rust (native on) vs Python (native off) on one L40S, with baselines."""
+    """LodeDB Rust (native on) vs Python (native off) with baselines.
 
-    _write_compare(run_compare_l40s.remote(_compare_spec("/root/mi-compare")), out)
+    Each engine runs in its OWN fresh L40S container, so cold-start warmup (GPU
+    context, cupy, embedding model) is paid independently and neither engine gets
+    a second-run advantage. This is the fair counterpart to a single-container
+    two-pass run, where the engine that runs second inherits a warm GPU."""
+
+    rust = run_suite_l40s.remote(dict(_compare_spec("/root/mi-rust"), native_core="on"))
+    python = run_suite_l40s.remote(dict(_compare_spec("/root/mi-python"), native_core="off"))
+    _write_compare({"rust": rust, "python": python}, out)
 
 
 @app.local_entrypoint()
