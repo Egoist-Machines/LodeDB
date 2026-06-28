@@ -942,3 +942,70 @@ fn copy_dir_all(source: &Path, target: &Path) {
 fn read_json_value(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
+
+#[test]
+fn query_multivector_ranks_documents_by_maxsim() {
+    use lodedb_core::storage::multivec_store::MultiVecRecord;
+
+    fn unit(axis: usize) -> [f32; 8] {
+        let mut row = [0.0_f32; 8];
+        row[axis] = 1.0;
+        row
+    }
+    fn encode(rows: &[[f32; 8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+    fn mv_doc(id: &str, pooled_axis: usize, rows: &[[f32; 8]]) -> CoreVectorDocument {
+        let mut pooled = vec![0.0_f32; 8];
+        pooled[pooled_axis] = 1.0;
+        CoreVectorDocument {
+            document_id: id.to_string(),
+            vector: pooled,
+            metadata: metadata(&[]),
+            text: None,
+            patch_matrix: Some(MultiVecRecord {
+                dtype: "float32".to_string(),
+                patch_count: rows.len(),
+                bytes: encode(rows),
+            }),
+        }
+    }
+
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    // doc-a carries patches on axes 0 and 2; doc-b only on axis 1.
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                mv_doc("a", 0, &[unit(0), unit(2)]),
+                mv_doc("b", 1, &[unit(1)]),
+            ],
+        )
+        .unwrap();
+
+    // A single query patch on axis 0: MaxSim favors doc-a (dot 1.0) over doc-b (0).
+    let query = unit(0);
+    let results = engine
+        .query_multivector("default", &query, 1, 5, None)
+        .unwrap();
+    assert_eq!(results.total_considered, 2);
+    assert_eq!(results.hits[0].document_id, "a");
+    assert!((results.hits[0].score - 1.0).abs() < 1e-6);
+    assert!(results.hits[0].score > results.hits[1].score);
+
+    // Two query patches (axes 1 and 2): doc-a matches axis 2, doc-b matches axis 1.
+    let two = [unit(1), unit(2)].concat();
+    let results = engine
+        .query_multivector("default", &two, 2, 5, None)
+        .unwrap();
+    // doc-a: max(axis1)=0 + max(axis2)=1 = 1; doc-b: max(axis1)=1 + max(axis2)=0 = 1.
+    assert_eq!(results.hits.len(), 2);
+    assert!((results.hits[0].score - 1.0).abs() < 1e-6);
+}

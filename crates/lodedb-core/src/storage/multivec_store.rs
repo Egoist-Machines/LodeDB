@@ -41,6 +41,68 @@ pub struct MultiVecRecord {
 
 pub type MultiVecMap = BTreeMap<String, MultiVecRecord>;
 
+impl MultiVecRecord {
+    /// Decodes the stored patch matrix to row-major f32 (`patch_count * dim`),
+    /// the inverse of the Python `_decode_matrix` for each storage dtype:
+    /// little-endian f4/f2 for float32/float16, or per-vector symmetric int8
+    /// (`n` f32 scales followed by `n * dim` i8 codes, value = code * scale / 127).
+    pub fn decode(&self, dim: usize) -> Vec<f32> {
+        match self.dtype.as_str() {
+            "float16" => self
+                .bytes
+                .chunks_exact(2)
+                .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect(),
+            "int8" => {
+                if dim == 0 {
+                    return Vec::new();
+                }
+                let rows = self.bytes.len() / (4 + dim);
+                let (scale_bytes, code_bytes) = self.bytes.split_at(rows * 4);
+                let mut out = Vec::with_capacity(rows * dim);
+                for row in 0..rows {
+                    let scale = f32::from_le_bytes([
+                        scale_bytes[row * 4],
+                        scale_bytes[row * 4 + 1],
+                        scale_bytes[row * 4 + 2],
+                        scale_bytes[row * 4 + 3],
+                    ]);
+                    let factor = scale / 127.0;
+                    for col in 0..dim {
+                        out.push(code_bytes[row * dim + col] as i8 as f32 * factor);
+                    }
+                }
+                out
+            }
+            // float32 and any unknown dtype fall back to raw little-endian f32.
+            _ => self
+                .bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect(),
+        }
+    }
+}
+
+/// IEEE 754 half-precision bits to f32, matching numpy's float16->float32.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = if (bits >> 15) & 1 == 1 { -1.0_f32 } else { 1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = (bits & 0x3ff) as f32;
+    let magnitude = match exponent {
+        0 => mantissa * 2.0_f32.powi(-24),
+        0x1f => {
+            if mantissa == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent as i32 - 15),
+    };
+    sign * magnitude
+}
+
 fn delta_dir(base_path: &Path) -> PathBuf {
     base_path.with_file_name(format!(
         "{}{}",
@@ -346,6 +408,29 @@ mod tests {
         expected.insert("a".to_string(), record("float16", 3, &[7, 7, 7, 7, 7, 7]));
         expected.insert("c".to_string(), record("float32", 1, &[5, 6]));
         assert_eq!(load(&base, Some(&manifest)).unwrap(), expected);
+    }
+
+    #[test]
+    fn decode_matches_storage_encoding() {
+        // float32: raw little-endian f32.
+        let mut f32_bytes = Vec::new();
+        for value in [1.0_f32, -2.5, 3.0, 0.0] {
+            f32_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(record("float32", 2, &f32_bytes).decode(2), vec![1.0, -2.5, 3.0, 0.0]);
+
+        // int8: 1 patch, dim 2, scale 2.0, codes [127, -64].
+        let mut int_bytes = 2.0_f32.to_le_bytes().to_vec();
+        int_bytes.push(127_i8 as u8);
+        int_bytes.push((-64_i8) as u8);
+        let decoded = record("int8", 1, &int_bytes).decode(2);
+        assert!((decoded[0] - 2.0).abs() < 1e-6);
+        assert!((decoded[1] - (-64.0 * 2.0 / 127.0)).abs() < 1e-6);
+
+        // float16: 1.0 == 0x3c00, -2.0 == 0xc000.
+        let mut f16_bytes = 0x3c00_u16.to_le_bytes().to_vec();
+        f16_bytes.extend_from_slice(&0xc000_u16.to_le_bytes());
+        assert_eq!(record("float16", 1, &f16_bytes).decode(2), vec![1.0, -2.0]);
     }
 
     #[test]

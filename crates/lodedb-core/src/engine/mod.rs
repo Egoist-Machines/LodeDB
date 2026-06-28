@@ -990,6 +990,80 @@ impl CoreEngine {
         })
     }
 
+    /// Late-interaction MaxSim query. Scores the multi-vector `query`
+    /// (`n_query * dim`, row-major, L2-normalized) against each candidate
+    /// document's stored patch matrix -- decoded to f32 -- with the shared
+    /// `turbovec::maxsim_scores` kernel, and returns the top-k documents. The
+    /// `filter` reuses the standard metadata resolver; documents without a patch
+    /// matrix are skipped.
+    pub fn query_multivector(
+        &self,
+        index_id: &str,
+        query: &[f32],
+        n_query: usize,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        let index = self.index(index_id)?;
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        let dim = index.vector_dim;
+        if n_query == 0 || query.len() != n_query.saturating_mul(dim) {
+            return invalid("query dimension does not match index");
+        }
+        let candidates = index.resolve_filter(filter)?;
+        let mut kept: Vec<(String, CoreMetadata)> = Vec::new();
+        let mut docs: Vec<f32> = Vec::new();
+        let mut patch_counts: Vec<usize> = Vec::new();
+        for document_id in candidates {
+            let Some(record) = index.documents.get(&document_id) else {
+                continue;
+            };
+            let Some(matrix) = record.patch_matrix.as_ref() else {
+                continue;
+            };
+            let decoded = matrix.decode(dim);
+            let count = if dim == 0 { 0 } else { decoded.len() / dim };
+            if count == 0 {
+                continue;
+            }
+            docs.extend_from_slice(&decoded);
+            patch_counts.push(count);
+            kept.push((document_id, record.metadata.clone()));
+        }
+        let total_considered = kept.len();
+        if kept.is_empty() {
+            return Ok(CoreSearchResults {
+                hits: Vec::new(),
+                total_considered: 0,
+            });
+        }
+        let scores = turbovec::maxsim_scores(query, n_query, dim, &docs, &patch_counts);
+        let mut hits: Vec<CoreSearchHit> = kept
+            .into_iter()
+            .zip(scores)
+            .map(|((document_id, metadata), score)| CoreSearchHit {
+                chunk_id: document_id.clone(),
+                document_id,
+                score,
+                metadata,
+            })
+            .collect();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+        });
+        hits.truncate(top_k);
+        Ok(CoreSearchResults {
+            hits,
+            total_considered,
+        })
+    }
+
     /// Queries a batch of vectors with one shared filter.
     pub fn query_vectors_batch(
         &self,
