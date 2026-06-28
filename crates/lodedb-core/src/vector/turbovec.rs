@@ -105,14 +105,42 @@ impl TurboVecNativeIndex {
     }
 
     /// Searches one query vector.
+    ///
+    /// Passes the borrowed query slice straight to the kernel instead of routing
+    /// through `search_batch(&[query.to_vec()])`, which copied the query into an
+    /// owned `Vec` and then again into the batch's flat query buffer. A single
+    /// query already is the flat buffer, so neither copy is needed.
     pub fn search(
         &self,
         query_embedding: &[f32],
         top_k: usize,
         allowlist_chunk_ids: &[String],
     ) -> Result<Vec<VectorSearchHit>, CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        if query_embedding.len() != self.dim {
+            return invalid("query dimension does not match TurboVec index");
+        }
+        let allowlist = self.stable_ids_for_chunks(allowlist_chunk_ids);
+        if !allowlist_chunk_ids.is_empty() && allowlist.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut effective_top_k = top_k.min(self.index.len());
+        if !allowlist.is_empty() {
+            effective_top_k = effective_top_k.min(allowlist.len());
+        }
+        if effective_top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let (scores, stable_ids) = if allowlist.is_empty() {
+            self.index.search(query_embedding, effective_top_k)
+        } else {
+            self.index
+                .search_with_allowlist(query_embedding, effective_top_k, Some(&allowlist))
+        };
         Ok(self
-            .search_batch(&[query_embedding.to_vec()], top_k, allowlist_chunk_ids)?
+            .assemble_rows(&scores, &stable_ids, 1, effective_top_k)?
             .into_iter()
             .next()
             .unwrap_or_default())

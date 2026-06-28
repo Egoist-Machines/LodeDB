@@ -337,8 +337,10 @@ class NativeCoreEngineHandle:
             # Passing the query as a contiguous float32 array skips the per-query
             # Python float list-build + json.dumps + Rust serde-parse, which is the
             # dominant cost of the single-query native path. The top-k result stays
-            # JSON (small), so the return contract is unchanged.
-            query = np.ascontiguousarray(tuple(vector), dtype=np.float32)
+            # JSON (small), so the return contract is unchanged. Convert the input
+            # directly (no intermediate tuple), so an ndarray query is reused
+            # in place and the borrowed buffer reaches the kernel without a copy.
+            query = np.ascontiguousarray(vector, dtype=np.float32)
             return self._loads(array_query(str(index_id), query, int(top_k), filter_json))
         return self._loads(
             self._engine.query_vector(

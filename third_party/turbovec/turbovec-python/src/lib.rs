@@ -858,15 +858,21 @@ impl PyCoreEngine {
         top_k: usize,
         filter_json: Option<&str>,
     ) -> PyResult<String> {
-        let query_vector = query_embedding_from_array(query_vector)?;
-        if !query_vector.is_empty() {
-            validate_queries(&query_vector, query_vector.len())?;
+        // Borrow the contiguous NumPy buffer directly rather than copying it into
+        // an owned Vec; the core query path takes a `&[f32]` slice, so a single
+        // query reaches the kernel with no boundary copy.
+        let array = query_vector.as_array();
+        let query = array
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_embedding"))?;
+        if !query.is_empty() {
+            validate_queries(query, query.len())?;
         }
         let filter = native_optional_value(filter_json)?;
         native_to_json(
             &self
                 .inner
-                .query_vector(index_id, &query_vector, top_k, filter.as_ref())
+                .query_vector(index_id, query, top_k, filter.as_ref())
                 .map_err(native_core_error_to_py)?,
         )
     }
