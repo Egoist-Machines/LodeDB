@@ -1,6 +1,7 @@
 pub mod commit_manifest;
 pub mod legacy;
 pub mod lexical_store;
+pub mod multivec_store;
 pub mod state_journal;
 pub mod text_store;
 pub mod tvim_delta;
