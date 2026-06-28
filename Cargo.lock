@@ -130,6 +130,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "dbgf"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -469,6 +478,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,6 +503,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "lodedb-core"
 version = "0.4.0"
 dependencies = [
+ "lodedb-gpu",
  "rustix",
  "serde",
  "serde_json",
@@ -498,6 +518,13 @@ dependencies = [
  "lodedb-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "lodedb-gpu"
+version = "0.4.0"
+dependencies = [
+ "cudarc",
 ]
 
 [[package]]

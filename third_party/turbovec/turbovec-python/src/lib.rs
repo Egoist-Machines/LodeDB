@@ -909,6 +909,44 @@ impl PyCoreEngine {
         )
     }
 
+    /// Near-zero-copy batch query: flat query matrix in, arrays out.
+    ///
+    /// Borrows the contiguous query matrix straight through to the core (no
+    /// per-query `Vec`), and returns `(scores, document_ids, metadata_json, k)`:
+    /// `scores` is a flat `[nq*k]` f32 ndarray, `document_ids` a flat `[nq*k]`
+    /// string list, and only `metadata` crosses as a single JSON array — so a batch
+    /// no longer serializes and reparses one JSON object per hit. The caller
+    /// reshapes by `k`.
+    fn query_vectors_batch_array_out<'py>(
+        &self,
+        py: Python<'py>,
+        index_id: &str,
+        query_vectors: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Vec<String>, String, usize)> {
+        let arr = query_vectors.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_vectors"))?;
+        if dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "query_vectors must have a non-zero dimension",
+            ));
+        }
+        validate_queries(slice, dim)?;
+        let filter = native_optional_value(filter_json)?;
+        let arrays = self
+            .inner
+            .query_vectors_batch_arrays(index_id, slice, dim, top_k, filter.as_ref())
+            .map_err(native_core_error_to_py)?;
+        let metadata_json = serde_json::to_string(&arrays.metadata)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let scores = arrays.scores.into_pyarray(py);
+        Ok((scores, arrays.document_ids, metadata_json, arrays.k))
+    }
+
     fn prepare_text_upsert(
         &mut self,
         index_id: &str,

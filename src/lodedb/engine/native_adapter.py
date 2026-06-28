@@ -290,8 +290,10 @@ class NativeCoreEngineHandle:
             # Ship the embedding matrix as one contiguous float32 array and only the
             # ids/metadata/text as a small batched JSON sidecar, instead of
             # JSON-encoding every float of every row (the bulk of a durable add).
+            # Stack the vectors at the C level (np.asarray per row) rather than a
+            # per-coordinate Python `float(...)` loop over every embedding.
             matrix = np.ascontiguousarray(
-                [tuple(float(value) for value in document.vector) for document in documents],
+                [np.asarray(document.vector, dtype=np.float32) for document in documents],
                 dtype=np.float32,
             )
             sidecar = [
@@ -380,6 +382,38 @@ class NativeCoreEngineHandle:
         if not isinstance(value, list):
             raise RuntimeError("native core returned a non-list JSON payload")
         return [dict(item) for item in value]
+
+    def query_vectors_batch_arrays(
+        self,
+        index_id: str,
+        vectors: Any,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, list[str], list[dict[str, Any]], int] | None:
+        """Near-zero-copy batch query.
+
+        Returns ``(scores, document_ids, metadata, k)`` as flat ``[nq * k]`` buffers
+        (scores a numpy array, ids a string list, metadata a dict list) when the
+        native array-out path is available, else ``None`` so the caller uses the
+        JSON path. The query matrix is built once via numpy rather than a Python
+        tuple-of-tuples, and only metadata crosses as JSON.
+        """
+
+        array_out = getattr(self._engine, "query_vectors_batch_array_out", None)
+        if not callable(array_out):
+            return None
+        import numpy as np
+
+        matrix = np.ascontiguousarray(vectors, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] == 0:
+            return None
+        filter_json = None if filter is None else self._dumps(dict(filter))
+        scores, document_ids, metadata_json, k = array_out(
+            str(index_id), matrix, int(top_k), filter_json
+        )
+        metadata = json.loads(metadata_json) if metadata_json else []
+        return scores, list(document_ids), list(metadata), int(k)
 
     def prepare_text_upsert(
         self,

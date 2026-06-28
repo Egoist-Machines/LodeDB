@@ -19,7 +19,7 @@ use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
     CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult, CoreOpenOptions,
-    CoreSearchHit, CoreSearchResults, CoreVectorDocument,
+    CoreSearchHit, CoreSearchResults, CoreVectorDocument, VectorBatchArrays,
 };
 use crate::vector::index::CoreVectorChunk;
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
@@ -1004,6 +1004,45 @@ impl CoreEngine {
                 .collect(),
             Err(error) => Err(error),
         }
+    }
+
+    /// Flat-input, arrays-output batch vector query for the near-zero-copy boundary.
+    ///
+    /// `queries` is a flat `[nq * dim]` buffer. Returns flat `[nq * k]`
+    /// `VectorBatchArrays` (scores, document ids, metadata) so the PyO3 layer hands
+    /// scores to numpy and ids to a string list with only metadata batched, instead
+    /// of one JSON object per hit. Errors (including an unavailable TurboVec route)
+    /// propagate so the SDK can fall back to its existing path.
+    pub fn query_vectors_batch_arrays(
+        &self,
+        index_id: &str,
+        queries: &[f32],
+        dim: usize,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<VectorBatchArrays, CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        let index = self.index(index_id)?;
+        index.require_vectors_seeded()?;
+        if dim == 0 || dim != index.vector_dim {
+            return invalid("query dimension does not match index");
+        }
+        let nq = queries.len() / dim;
+        if nq * dim != queries.len() {
+            return invalid("query batch length is not a multiple of dim");
+        }
+        if index.chunk_count() == 0 || nq == 0 {
+            return Ok(VectorBatchArrays {
+                nq,
+                k: 0,
+                scores: Vec::new(),
+                document_ids: Vec::new(),
+                metadata: Vec::new(),
+            });
+        }
+        index.query_vectors_batch_arrays_turbovec(queries, nq, top_k, filter)
     }
 
     /// Returns metrics-only stats for an index.
@@ -2941,6 +2980,49 @@ impl VectorOnlyIndex {
                 })
             })
             .collect()
+    }
+
+    /// Arrays-output counterpart of [`Self::query_vectors_batch_turbovec`]: runs the
+    /// flat batch scan and attaches metadata per document id, returning flat
+    /// `[nq * k]` arrays rather than per-hit structs. Metadata is looked up the same
+    /// way; a hit whose document is absent keeps its slot with empty metadata so the
+    /// `[nq, k]` shape is preserved.
+    fn query_vectors_batch_arrays_turbovec(
+        &self,
+        queries: &[f32],
+        nq: usize,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<VectorBatchArrays, CoreError> {
+        let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
+            return Ok(VectorBatchArrays {
+                nq,
+                k: 0,
+                scores: Vec::new(),
+                document_ids: Vec::new(),
+                metadata: Vec::new(),
+            });
+        }
+        let index = self.turbovec_index()?;
+        let (scores, document_ids, k) =
+            index.search_batch_arrays(queries, nq, top_k, &allowlist)?;
+        let metadata = document_ids
+            .iter()
+            .map(|document_id| {
+                self.documents
+                    .get(document_id)
+                    .map(|record| record.metadata.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        Ok(VectorBatchArrays {
+            nq,
+            k,
+            scores,
+            document_ids,
+            metadata,
+        })
     }
 
     fn turbovec_index(&self) -> Result<Ref<'_, TurboVecNativeIndex>, CoreError> {

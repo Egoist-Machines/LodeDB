@@ -315,6 +315,11 @@ class LodeDB:
         self._native_core_abi_version = 0
         self._native_write_shadow_dir: tempfile.TemporaryDirectory[str] | None = None
         self._native_write_through_enabled = False
+        # Set once native serves a write as the SOLE writer (write-through, Python
+        # upsert skipped). The durable data then lives only in the native store
+        # (Python-readable on reopen), so a fallback must NOT republish the empty
+        # Python state over it.
+        self._native_sole_writes_made = False
         self._native_shadow_persist_count = 0
         self._native_shadow_persist_verified = False
         self._native_text_shadow_enabled = False
@@ -632,26 +637,20 @@ class LodeDB:
         self._require_writable()
         document_id = str(id) if id is not None else self._next_auto_id()
         prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
-        self._index.upsert_vectors_batch(
-            (
-                EngineVectorDocument(
-                    document_id=document_id,
-                    vector=prepared,
-                    metadata=_coerce_metadata(metadata),
-                    text=_coerce_optional_text(text),
-                ),
-            )
+        document = EngineVectorDocument(
+            document_id=document_id,
+            vector=prepared,
+            metadata=_coerce_metadata(metadata),
+            text=_coerce_optional_text(text),
         )
-        self._native_upsert_vectors(
-            (
-                EngineVectorDocument(
-                    document_id=document_id,
-                    vector=prepared,
-                    metadata=_coerce_metadata(metadata),
-                    text=_coerce_optional_text(text),
-                ),
-            )
-        )
+        # When native is the sole writer (write-through), skip the Python engine's
+        # redundant in-memory upsert + WAL staging so a durable add runs through one
+        # engine, not two.
+        if self._native_is_sole_writer():
+            self._native_sole_writes_made = True
+        else:
+            self._index.upsert_vectors_batch((document,))
+        self._native_upsert_vectors((document,))
         return document_id
 
     def add_vectors_many(
@@ -685,7 +684,11 @@ class LodeDB:
                 )
             )
         if payload:
-            self._index.upsert_vectors_batch(tuple(payload))
+            # Native sole writer in write-through: skip the redundant Python upsert.
+            if self._native_is_sole_writer():
+                self._native_sole_writes_made = True
+            else:
+                self._index.upsert_vectors_batch(tuple(payload))
             self._native_upsert_vectors(tuple(payload))
         return ids
 
@@ -1335,6 +1338,12 @@ class LodeDB:
                 phase: dict(counters) for phase, counters in self._image_metrics.items()
             }
             stats["native_core"] = self._native_core_stats()
+            # When native is authoritative (and the sole writer in write-through),
+            # the Python engine may hold no copy of the documents, so report the
+            # native document count rather than the Python engine's.
+            native_stats = self._native_stats()
+            if native_stats is not None and self._native_core_mode == NativeCoreMode.ON:
+                stats["document_count"] = int(native_stats.get("document_count", 0) or 0)
         return stats
 
     def close(self) -> None:
@@ -1525,7 +1534,7 @@ class LodeDB:
         except Exception as exc:
             self._native_core_fallback_reason = "native_core_init_failed"
             if self._native_core_fail_closed:
-                raise RuntimeError("failed to initialize native core") from exc
+                raise RuntimeError(f"failed to initialize native core: {exc!r}") from exc
             return
         native_document_count = int(
             native_engine.stats(_LOCAL_INDEX_ID).get("document_count", 0) or 0
@@ -1662,7 +1671,24 @@ class LodeDB:
     def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
         """Mirrors vector mutations into native core while Python remains durable."""
 
-        if not documents or not self._native_thread_local() or not self._native_vector_covered:
+        if not documents:
+            return
+        is_sole = self._native_is_sole_writer()
+        # Per-add generation publish only in generation mode; in WAL mode the upsert
+        # already appended a durable WAL record, so persisting per add is redundant.
+        persist_now = self._native_should_persist_after_mutation()
+        if not self._native_thread_local() or not self._native_vector_covered:
+            if is_sole:
+                # Native is the sole writer (write-through) and the Python upsert was
+                # skipped, but native is thread-confined and cannot serve this write
+                # from the current thread. With the Python fallback disabled in
+                # sole-writer mode, there is no durable home for it: fail closed
+                # rather than silently drop an acknowledged write.
+                self._native_core_fallback_reason = "native_core_sole_writer_unavailable"
+                raise RuntimeError(
+                    "native write-through is thread-confined: this write cannot be "
+                    "served from the current thread while native is the sole writer"
+                )
             return
         if not self._native_vector_mutable:
             self._native_vector_covered = False
@@ -1670,10 +1696,17 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
-            if self._native_should_persist_after_mutation():
+            if persist_now:
                 self._native_vector_engine.persist()
         except Exception as exc:
             self._native_vector_covered = False
+            if is_sole:
+                # Native is the sole writer here (write-through): the Python engine
+                # never recorded this mutation, so there is no in-memory state to
+                # fall back to. Fail closed rather than republish an empty Python
+                # state over the native store.
+                self._native_core_fallback_reason = "native_core_sole_writer_upsert_failed"
+                raise RuntimeError("native core vector upsert failed") from exc
             self._disable_native_write_through()
             self._native_core_fallback_reason = "native_core_upsert_failed"
             if self._native_core_fail_closed:
@@ -1798,6 +1831,17 @@ class LodeDB:
         if not self._native_thread_local() or not self._native_vector_covered:
             return None
         try:
+            # Near-zero-copy path: flat query matrix in, arrays out (scores, ids,
+            # batched metadata) with no per-hit JSON. Optional on the engine, so it
+            # falls back to the JSON batch query for older extensions and minimal
+            # engine stubs that only implement query_vectors_batch.
+            arrays_query = getattr(
+                self._native_vector_engine, "query_vectors_batch_arrays", None
+            )
+            if callable(arrays_query):
+                arrays = arrays_query(_LOCAL_INDEX_ID, vectors, top_k=k, filter=filter)
+                if arrays is not None:
+                    return self._hits_from_native_arrays(*arrays, query_count=len(vectors))
             batches = self._native_vector_engine.query_vectors_batch(
                 _LOCAL_INDEX_ID,
                 vectors,
@@ -1984,8 +2028,27 @@ class LodeDB:
             if self._native_core_strict_parity:
                 raise
 
+    def _native_is_sole_writer(self) -> bool:
+        """Whether native is the sole engine (the Python upsert is skipped).
+
+        Requires write-through AND that native is the authoritative reader: only
+        then is the Python engine redundant for both writes and reads. In shadow or
+        strict-parity modes Python still serves reads, so its upsert must run. In any
+        commit mode native's upsert is durable on its own (a WAL record in WAL mode,
+        an O(changed) generation in generation mode).
+        """
+
+        return self._native_write_through_enabled and self._native_query_authoritative()
+
     def _native_should_persist_after_mutation(self) -> bool:
-        """Returns whether native writes should publish a generation immediately."""
+        """Whether native must publish a generation immediately after a mutation.
+
+        Generation mode only: there a per-add generation publish IS the durability.
+        In WAL mode the native upsert already appended a durable WAL record, so a
+        per-add ``persist()`` would only republish a full generation redundantly
+        (the real cost behind native's slow per-add WAL durability); the generation
+        publish is deferred to checkpoint/close instead.
+        """
 
         return self._native_write_through_enabled and self.commit_mode.value == "generation"
 
@@ -2000,7 +2063,15 @@ class LodeDB:
 
         self._native_write_through_enabled = False
         engine = getattr(self, "_engine", None)
-        if engine is not None:
+        if engine is None:
+            return
+        if self._native_sole_writes_made:
+            # Native was the sole writer: its store holds the durable, Python-readable
+            # data and the Python engine has no in-memory copy, so republishing the
+            # empty Python state would overwrite it. Release ownership without a
+            # republish; reopening reads the native store directly.
+            engine.clear_native_durability_ownership()
+        else:
             # Fail closed: once Python yielded durable ownership, a failed republish
             # means a mutation may be non-durable, so let it propagate rather than
             # acknowledge the write. The flush resumes Python durability either way.
@@ -2096,6 +2167,42 @@ class LodeDB:
                 )
             )
         return hits
+
+    @staticmethod
+    def _hits_from_native_arrays(
+        scores: Any,
+        document_ids: list[str],
+        metadata: list[Mapping[str, Any]],
+        k: int,
+        *,
+        query_count: int,
+    ) -> list[list[LodeSearchHit]]:
+        """Builds hit rows from flat ``[query_count * k]`` native arrays.
+
+        The near-zero-copy counterpart of :meth:`_hits_from_native_rows`: scores
+        arrive as a numpy array, ids as a string list, and metadata as a dict list,
+        all flat and row-major by query, so no per-hit JSON object is parsed.
+        """
+
+        if k == 0:
+            return [[] for _ in range(query_count)]
+        scores_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+        metadata_len = len(metadata)
+        rows: list[list[LodeSearchHit]] = []
+        for query_index in range(query_count):
+            base = query_index * k
+            row = [
+                LodeSearchHit(
+                    score=float(scores_list[base + offset]),
+                    id=str(document_ids[base + offset]),
+                    metadata=dict(metadata[base + offset])
+                    if base + offset < metadata_len
+                    else {},
+                )
+                for offset in range(k)
+            ]
+            rows.append(row)
+        return rows
 
     @property
     def _vector_dim(self) -> int:

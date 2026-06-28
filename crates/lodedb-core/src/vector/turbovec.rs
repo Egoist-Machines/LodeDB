@@ -1,5 +1,6 @@
 //! Native TurboVec adapter for chunk-vector search.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
@@ -14,6 +15,37 @@ use crate::vector::index::{
 };
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 
+/// Smallest query batch worth the GPU's per-call host/device overhead; smaller
+/// batches stay on the CPU kernel (single queries always do).
+const GPU_MIN_BATCH: usize = 4;
+/// Smallest corpus worth a GPU-resident scan; below this the CPU kernel wins.
+const GPU_MIN_CORPUS: usize = 256;
+
+/// Lazily built GPU-resident scan state for one index instance.
+///
+/// `unavailable` latches when no CUDA driver loads (permanent for the host, never
+/// retried). `build_failed` latches a device/build error for the current rows and
+/// is cleared on mutation so a healthy host rebuilds; both keep the hot query path
+/// from re-attempting a failing GPU build every batch.
+#[derive(Default)]
+struct GpuState {
+    session: Option<lodedb_gpu::GpuScanSession>,
+    unavailable: bool,
+    build_failed: bool,
+}
+
+/// Returns whether the GPU-resident scan is enabled by policy.
+///
+/// Shares the Python serving layer's knob: `LODEDB_GPU_DIRECT_TURBOVEC=off`
+/// disables the GPU scan everywhere. Any other value (or unset) leaves it enabled,
+/// still subject to runtime driver availability and the batch/corpus gates.
+fn gpu_scan_enabled() -> bool {
+    match std::env::var("LODEDB_GPU_DIRECT_TURBOVEC") {
+        Ok(value) => !value.trim().eq_ignore_ascii_case("off"),
+        Err(_) => true,
+    }
+}
+
 /// Native TurboVec serving index plus stable-id lookup metadata.
 pub struct TurboVecNativeIndex {
     index: IdMapIndex,
@@ -24,6 +56,7 @@ pub struct TurboVecNativeIndex {
     bit_width: usize,
     generation: u64,
     build_seconds: f64,
+    gpu: RefCell<GpuState>,
 }
 
 impl TurboVecNativeIndex {
@@ -133,6 +166,26 @@ impl TurboVecNativeIndex {
         if effective_top_k == 0 {
             return Ok(Vec::new());
         }
+
+        // Eligible unfiltered single queries also serve from the GPU-resident scan
+        // (a batch of one); the cached device buffers keep the per-call overhead
+        // small. Filtered/ineligible queries and any GPU error fall to the CPU
+        // kernel below. No batch-size gate here: a single query is the batch.
+        if allowlist.is_empty()
+            && self.index.len() >= GPU_MIN_CORPUS
+            && gpu_scan_enabled()
+            && lodedb_gpu::cuda_runtime_available()
+        {
+            if let Some((scores, stable_ids)) = self.gpu_search(query_embedding, 1, effective_top_k)
+            {
+                return Ok(self
+                    .assemble_rows(&scores, &stable_ids, 1, effective_top_k)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default());
+            }
+        }
+
         let (scores, stable_ids) = if allowlist.is_empty() {
             self.index.search(query_embedding, effective_top_k)
         } else {
@@ -166,30 +219,151 @@ impl TurboVecNativeIndex {
             }
             queries.extend_from_slice(query);
         }
+        let nq = query_embeddings.len();
+        let (scores, stable_ids, k) =
+            self.scan_batch_flat(&queries, nq, top_k, allowlist_chunk_ids)?;
+        if k == 0 {
+            return Ok(vec![Vec::new(); nq]);
+        }
+        self.assemble_rows(&scores, &stable_ids, nq, k)
+    }
+
+    /// Flat-input, arrays-output batch search for the near-zero-copy boundary.
+    ///
+    /// `queries` is the flat `[nq * dim]` query buffer (no per-query `Vec`), and the
+    /// result is flat `[nq * k]` `(scores, document_ids, k)` — no per-hit struct or
+    /// JSON. `k` is 0 when nothing matches. The PyO3 layer turns scores into a
+    /// numpy array and document ids into a string list directly, so a batch query
+    /// crosses the boundary without the per-hit serialize/parse `search_batch` pays.
+    pub fn search_batch_arrays(
+        &self,
+        queries: &[f32],
+        nq: usize,
+        top_k: usize,
+        allowlist_chunk_ids: &[String],
+    ) -> Result<(Vec<f32>, Vec<String>, usize), CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        if nq == 0 {
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
+        if queries.len() != nq * self.dim {
+            return invalid("query batch length does not match nq*dim");
+        }
+        let (scores, stable_ids, k) = self.scan_batch_flat(queries, nq, top_k, allowlist_chunk_ids)?;
+        if k == 0 {
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
+        let mut document_ids = Vec::with_capacity(stable_ids.len());
+        for stable_id in &stable_ids {
+            let document_id = self
+                .document_ids_by_stable_id
+                .get(stable_id)
+                .ok_or_else(|| invalid_err("TurboVec returned an unknown stable id"))?;
+            document_ids.push(document_id.clone());
+        }
+        Ok((scores, document_ids, k))
+    }
+
+    /// Shared batch scan: resolves the allowlist, runs the GPU-resident scan when
+    /// eligible (else the CPU kernel), and returns flat `[nq * k]` `(scores,
+    /// stable_ids, k)`. `k` is 0 when the (possibly filtered) result set is empty.
+    fn scan_batch_flat(
+        &self,
+        queries: &[f32],
+        nq: usize,
+        top_k: usize,
+        allowlist_chunk_ids: &[String],
+    ) -> Result<(Vec<f32>, Vec<u64>, usize), CoreError> {
         let allowlist = self.stable_ids_for_chunks(allowlist_chunk_ids);
         if !allowlist_chunk_ids.is_empty() && allowlist.is_empty() {
-            return Ok(vec![Vec::new(); query_embeddings.len()]);
+            return Ok((Vec::new(), Vec::new(), 0));
         }
         let mut effective_top_k = top_k.min(self.index.len());
         if !allowlist.is_empty() {
             effective_top_k = effective_top_k.min(allowlist.len());
         }
         if effective_top_k == 0 {
-            return Ok(vec![Vec::new(); query_embeddings.len()]);
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
+
+        // Eligible unfiltered batches on a CUDA host serve from the GPU-resident
+        // scan; filtered/small batches and any GPU error fall to the CPU kernel.
+        if allowlist.is_empty()
+            && nq >= GPU_MIN_BATCH
+            && self.index.len() >= GPU_MIN_CORPUS
+            && gpu_scan_enabled()
+            && lodedb_gpu::cuda_runtime_available()
+        {
+            if let Some((scores, stable_ids)) = self.gpu_search(queries, nq, effective_top_k) {
+                return Ok((scores, stable_ids, effective_top_k));
+            }
         }
 
         let (scores, stable_ids) = if allowlist.is_empty() {
-            self.index.search(&queries, effective_top_k)
+            self.index.search(queries, effective_top_k)
         } else {
             self.index
-                .search_with_allowlist(&queries, effective_top_k, Some(&allowlist))
+                .search_with_allowlist(queries, effective_top_k, Some(&allowlist))
         };
-        self.assemble_rows(
-            &scores,
-            &stable_ids,
-            query_embeddings.len(),
-            effective_top_k,
-        )
+        Ok((scores, stable_ids, effective_top_k))
+    }
+
+    /// Attempts the GPU-resident scan, building the session lazily.
+    ///
+    /// Returns `None` (caller uses the CPU kernel) when no GPU is available, when a
+    /// build or device error occurs, or while a prior failure is latched. A build
+    /// or search device error latches `build_failed` so the hot path does not
+    /// re-attempt a failing GPU every batch; a missing driver latches `unavailable`
+    /// permanently. Both are cleared (except `unavailable`) on the next mutation.
+    fn gpu_search(&self, queries: &[f32], nq: usize, k: usize) -> Option<(Vec<f32>, Vec<u64>)> {
+        let mut state = self.gpu.borrow_mut();
+        if state.unavailable || state.build_failed {
+            return None;
+        }
+        if state.session.is_none() {
+            match self.build_gpu_session() {
+                Ok(session) => state.session = Some(session),
+                Err(lodedb_gpu::GpuScanError::Unavailable(_)) => {
+                    state.unavailable = true;
+                    return None;
+                }
+                Err(_) => {
+                    state.build_failed = true;
+                    return None;
+                }
+            }
+        }
+        let session = state.session.as_ref()?;
+        match session.search(queries, nq, k) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                state.session = None;
+                state.build_failed = true;
+                None
+            }
+        }
+    }
+
+    /// Reconstructs the rotated-calibrated rows and uploads them to a GPU session.
+    fn build_gpu_session(&self) -> Result<lodedb_gpu::GpuScanSession, lodedb_gpu::GpuScanError> {
+        let rotation = self
+            .index
+            .rotation_matrix()
+            .ok_or_else(|| lodedb_gpu::GpuScanError::Invalid("rotation unavailable".into()))?;
+        let (stable_ids, rows) = self.index.reconstruct_all();
+        lodedb_gpu::GpuScanSession::build(&rows, &stable_ids, &rotation, self.dim)
+    }
+
+    /// Drops any resident GPU session so the next eligible batch rebuilds it.
+    ///
+    /// Clears a latched build failure (a healthy host may now succeed) but leaves
+    /// `unavailable` set, since a host with no driver stays without one.
+    fn invalidate_gpu_session(&self) {
+        let mut state = self.gpu.borrow_mut();
+        state.session = None;
+        state.build_failed = false;
     }
 
     /// Returns active stable ids for chunk ids, filtering absent chunks.
@@ -234,6 +408,7 @@ impl TurboVecNativeIndex {
             self.stable_id_by_chunk_id
                 .insert(chunk.chunk_id.clone(), *stable_id);
         }
+        self.invalidate_gpu_session();
         Ok(())
     }
 
@@ -247,6 +422,7 @@ impl TurboVecNativeIndex {
             }
             self.document_ids_by_stable_id.remove(&stable_id);
         }
+        self.invalidate_gpu_session();
         removed
     }
 
@@ -323,6 +499,7 @@ impl TurboVecNativeIndex {
             bit_width,
             generation,
             build_seconds,
+            gpu: RefCell::new(GpuState::default()),
         }
     }
 

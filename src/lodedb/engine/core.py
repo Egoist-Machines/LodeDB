@@ -4515,6 +4515,19 @@ class LodeEngine:
             # so a non-durable mutation is never silently acknowledged.
             self._native_owns_durability = False
 
+    @_synchronized
+    def clear_native_durability_ownership(self) -> None:
+        """Releases native durable-commit ownership WITHOUT republishing.
+
+        Used when native was the sole writer: its store already holds the durable,
+        Python-readable data, and the Python engine has no in-memory copy. Calling
+        :meth:`flush_native_fallback_state` here would republish that empty Python
+        state and overwrite the native store, so ownership is simply released;
+        future Python commits resume from the next mutation.
+        """
+
+        self._native_owns_durability = False
+
     def _persist_state(self, state: ClientIndexState) -> None:
         """Persists one mutation, dispatching on the configured commit mode.
 

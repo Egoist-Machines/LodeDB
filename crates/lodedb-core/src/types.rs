@@ -211,6 +211,22 @@ pub struct CoreSearchResults {
     pub total_considered: usize,
 }
 
+/// Flat batch-search arrays for the near-zero-copy PyO3 boundary.
+///
+/// `scores`, `document_ids`, and `metadata` are flat `[nq * k]` buffers laid out
+/// row-major by query; `k` is 0 when the result set is empty. The binding hands
+/// `scores` to numpy and `document_ids` to a string list directly, and only
+/// `metadata` crosses as a single batched payload, instead of serializing one JSON
+/// object per hit and reparsing it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorBatchArrays {
+    pub nq: usize,
+    pub k: usize,
+    pub scores: Vec<f32>,
+    pub document_ids: Vec<String>,
+    pub metadata: Vec<CoreMetadata>,
+}
+
 /// Mutation response shared by text and vector ingest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreMutationResult {
