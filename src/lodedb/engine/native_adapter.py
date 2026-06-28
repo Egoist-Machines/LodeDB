@@ -357,6 +357,72 @@ class NativeCoreEngineHandle:
             )
         )
 
+    def upsert_multivector(
+        self,
+        index_id: str,
+        documents: Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Upserts late-interaction documents (pooled vector + patch matrix).
+
+        Each document is ``{document_id, vector, metadata, dtype, patch_count,
+        patch_bytes}``. The pooled vectors ship as one contiguous float32 matrix
+        and every encoded patch matrix is concatenated into one uint8 buffer
+        partitioned by the per-document ``nbytes`` in the sidecar.
+        """
+
+        import numpy as np
+
+        documents = list(documents)
+        matrix = (
+            np.ascontiguousarray(
+                [np.asarray(document["vector"], dtype=np.float32) for document in documents],
+                dtype=np.float32,
+            )
+            if documents
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+        blobs = [bytes(document["patch_bytes"]) for document in documents]
+        joined = b"".join(blobs)
+        patch_bytes = np.frombuffer(joined, dtype=np.uint8)
+        sidecar = [
+            {
+                "document_id": str(document["document_id"]),
+                "metadata": {
+                    str(key): str(value)
+                    for key, value in dict(document.get("metadata", {})).items()
+                },
+                "dtype": str(document["dtype"]),
+                "patch_count": int(document["patch_count"]),
+                "nbytes": len(blob),
+            }
+            for document, blob in zip(documents, blobs)
+        ]
+        return self._loads(
+            self._engine.upsert_multivector(
+                str(index_id), matrix, patch_bytes, self._dumps(sidecar)
+            )
+        )
+
+    def query_multivector(
+        self,
+        index_id: str,
+        query: Any,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Late-interaction MaxSim query; ``query`` is an ``(n_query, dim)`` matrix."""
+
+        import numpy as np
+
+        matrix = np.ascontiguousarray(np.asarray(query, dtype=np.float32))
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1)
+        filter_json = None if filter is None else self._dumps(dict(filter))
+        return self._loads(
+            self._engine.query_multivector(str(index_id), matrix, int(top_k), filter_json)
+        )
+
     def query_vector(
         self,
         index_id: str,

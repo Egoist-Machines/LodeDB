@@ -784,6 +784,103 @@ impl PyCoreEngine {
         )
     }
 
+    /// Array-input upsert for late-interaction documents. `vectors` is the pooled
+    /// `(n, dim)` f32 matrix (the indexed coarse rows); `patch_bytes` is every
+    /// document's encoded patch matrix concatenated into one `u8` buffer,
+    /// partitioned by the sidecar `nbytes`; `sidecar_json` is a parallel list of
+    /// `{document_id, metadata, dtype, patch_count, nbytes}`.
+    fn upsert_multivector(
+        &mut self,
+        index_id: &str,
+        vectors: PyReadonlyArray2<f32>,
+        patch_bytes: PyReadonlyArray1<u8>,
+        sidecar_json: &str,
+    ) -> PyResult<String> {
+        #[derive(serde::Deserialize)]
+        struct MultiVecSidecar {
+            document_id: String,
+            #[serde(default)]
+            metadata: std::collections::BTreeMap<String, String>,
+            dtype: String,
+            patch_count: usize,
+            nbytes: usize,
+        }
+        let arr = vectors.as_array();
+        let dim = arr.ncols();
+        let rows = arr.nrows();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let bytes_arr = patch_bytes.as_array();
+        let all_bytes = bytes_arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("patch_bytes"))?;
+        let sidecars = native_from_json::<Vec<MultiVecSidecar>>(sidecar_json)?;
+        if sidecars.len() != rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vector row count {} does not match sidecar length {}",
+                rows,
+                sidecars.len(),
+            )));
+        }
+        if rows > 0 && dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "vectors must have a non-zero dimension",
+            ));
+        }
+        let total: usize = sidecars.iter().map(|sidecar| sidecar.nbytes).sum();
+        if total != all_bytes.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "patch_bytes length {} does not match sidecar nbytes sum {total}",
+                all_bytes.len(),
+            )));
+        }
+        let mut offset = 0usize;
+        let mut documents: Vec<CoreVectorDocument> = Vec::with_capacity(rows);
+        for (sidecar, vector) in sidecars.into_iter().zip(slice.chunks(dim.max(1))) {
+            let stop = offset + sidecar.nbytes;
+            let patch_matrix = lodedb_core::storage::multivec_store::MultiVecRecord {
+                dtype: sidecar.dtype,
+                patch_count: sidecar.patch_count,
+                bytes: all_bytes[offset..stop].to_vec(),
+            };
+            offset = stop;
+            documents.push(CoreVectorDocument {
+                document_id: sidecar.document_id,
+                vector: vector.to_vec(),
+                metadata: sidecar.metadata,
+                text: None,
+                patch_matrix: Some(patch_matrix),
+            });
+        }
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Late-interaction MaxSim query: `query` is the multi-vector query as a
+    /// contiguous `(n_query, dim)` f32 matrix; returns the top-k documents scored
+    /// by MaxSim against each candidate's stored patch matrix.
+    fn query_multivector(
+        &self,
+        index_id: &str,
+        query: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let arr = query.as_array();
+        let n_query = arr.nrows();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("query"))?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_multivector(index_id, slice, n_query, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
     fn delete_documents(&mut self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
         let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
         native_to_json(
