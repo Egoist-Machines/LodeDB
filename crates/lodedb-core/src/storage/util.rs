@@ -90,12 +90,100 @@ fn encode_json_string_ascii(text: &str) -> String {
     out
 }
 
+/// Encodes a JSON number byte-for-byte identical to CPython's ``json.dumps``.
+///
+/// Integers (``i64``/``u64``) already render identically in serde_json and
+/// CPython, so they pass through ``Number::to_string``. Floats do not: serde_json
+/// formats with Ryu (``1e20``, ``1e-7``) while CPython uses ``repr(float)``
+/// (``1e+20``, ``1e-07``) -- a different exponent sign/padding and a different
+/// fixed-vs-scientific threshold. Both engines checksum a canonical body and
+/// verify each other's writes across the FFI boundary, so a float in any
+/// re-checksummed body would diverge the shared hash and fail the peer's reopen,
+/// exactly like the non-ASCII string bug did (see [`encode_json_string_ascii`]).
+/// ``serde_json::Number`` can only hold a finite ``f64`` (``Number::from_f64``
+/// rejects NaN/inf), so no non-finite case reaches the float branch.
+fn encode_json_number(number: &serde_json::Number) -> String {
+    if number.is_f64() {
+        if let Some(value) = number.as_f64() {
+            return format_python_float(value);
+        }
+    }
+    number.to_string()
+}
+
+/// Renders a finite ``f64`` exactly like CPython's ``repr`` / ``json.dumps``.
+///
+/// Rust's ``{:e}`` yields the shortest round-tripping digits with one leading
+/// digit and a base-10 exponent (``[-]d[.ddd]e[-]EXP``). CPython's dtoa produces
+/// the same (unique) shortest digits, so only the layout differs: CPython uses
+/// scientific notation iff the decimal point falls at ``decpt <= -4`` or
+/// ``decpt > 16`` (with ``decpt == EXP + 1``), always writes the exponent sign,
+/// zero-pads the exponent magnitude to at least two digits, and appends ``.0`` to
+/// an integral value written in fixed notation.
+fn format_python_float(value: f64) -> String {
+    // Shortest digits + exponent, e.g. "-1.5e20", "1e-7", "0e0", "-0e0".
+    let exponential = format!("{value:e}");
+    let (negative, rest) = match exponential.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, exponential.as_str()),
+    };
+    let (mantissa, exponent) = rest
+        .split_once('e')
+        .expect("Rust `{:e}` always emits an exponent");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("Rust `{:e}` emits an integer exponent");
+    // Significant digits with the point removed: "1.5" -> "15", "1" -> "1".
+    let digits: String = mantissa.chars().filter(|&ch| ch != '.').collect();
+    let digit_count = digits.len() as i32;
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    // CPython 'r' format uses scientific notation iff decpt <= -4 or decpt > 16,
+    // with decpt == exponent + 1, i.e. exponent < -4 or exponent >= 16.
+    if !(-4..16).contains(&exponent) {
+        // Scientific: leading digit, optional fraction, signed >=2-digit exponent.
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        let magnitude = exponent.unsigned_abs();
+        if magnitude < 10 {
+            out.push('0');
+        }
+        out.push_str(&magnitude.to_string());
+    } else {
+        // Fixed: place the decimal point `exponent + 1` digits from the left.
+        let point = exponent + 1;
+        if point <= 0 {
+            out.push_str("0.");
+            out.push_str(&"0".repeat((-point) as usize));
+            out.push_str(&digits);
+        } else if point >= digit_count {
+            out.push_str(&digits);
+            out.push_str(&"0".repeat((point - digit_count) as usize));
+            out.push_str(".0");
+        } else {
+            let split = point as usize;
+            out.push_str(&digits[..split]);
+            out.push('.');
+            out.push_str(&digits[split..]);
+        }
+    }
+    out
+}
+
 pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
     match value {
         Value::Null => Ok("null".to_string()),
         Value::Bool(true) => Ok("true".to_string()),
         Value::Bool(false) => Ok("false".to_string()),
-        Value::Number(number) => Ok(number.to_string()),
+        Value::Number(number) => Ok(encode_json_number(number)),
         Value::String(text) => Ok(encode_json_string_ascii(text)),
         Value::Array(items) => {
             let rendered = items
@@ -246,5 +334,73 @@ mod canonical_json_tests {
         let parsed: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(written, py_canonical_json(&parsed).unwrap());
         assert!(written.is_ascii(), "canonical body must be ASCII: {written}");
+    }
+
+    // The number branch must match CPython's json.dumps(float) byte-for-byte;
+    // serde_json's Ryu output (1e20, 1e-7) diverges from CPython's repr (1e+20,
+    // 1e-07) on exponent layout and the fixed/scientific threshold.
+    #[test]
+    fn numbers_match_python_json_dumps() {
+        // (value, json.dumps(value)) pairs captured from CPython 3.
+        let floats: &[(f64, &str)] = &[
+            (1e+20, "1e+20"),
+            (1e-07, "1e-07"),
+            (1.0, "1.0"),
+            (0.1, "0.1"),
+            (1e+16, "1e+16"),
+            (1000000000000000.0, "1000000000000000.0"),
+            (0.0001, "0.0001"),
+            (1e-05, "1e-05"),
+            (-0.0, "-0.0"),
+            (0.0, "0.0"),
+            (123.456, "123.456"),
+            (1e+100, "1e+100"),
+            (1e-100, "1e-100"),
+            (2.5, "2.5"),
+            (100.0, "100.0"),
+            (300.0, "300.0"),
+            (9999999999999998.0, "9999999999999998.0"),
+            (1.5e-10, "1.5e-10"),
+            (45.125, "45.125"),
+            (6.022e+23, "6.022e+23"),
+            (5.0, "5.0"),
+            (0.5, "0.5"),
+            (-2.5e-08, "-2.5e-08"),
+            (1234567890123456.0, "1234567890123456.0"),
+            (1.2345678901234568e+16, "1.2345678901234568e+16"),
+        ];
+        for &(value, expected) in floats {
+            assert_eq!(
+                py_canonical_json(&json!(value)).unwrap(),
+                expected,
+                "float repr mismatch for {value}"
+            );
+        }
+        // Integers carry no decimal point, matching json.dumps(int).
+        for (value, expected) in [(0_i64, "0"), (42, "42"), (-7, "-7")] {
+            assert_eq!(py_canonical_json(&json!(value)).unwrap(), expected);
+        }
+        assert_eq!(
+            py_canonical_json(&json!(9007199254740993_i64)).unwrap(),
+            "9007199254740993"
+        );
+    }
+
+    // A float-bearing body survives serialize -> parse -> re-serialize and equals
+    // CPython's json.dumps(body, sort_keys=True), so a native write of float
+    // metadata re-checksums identically under the Python reader.
+    #[test]
+    fn canonical_form_is_idempotent_for_floats() {
+        let body = json!({
+            "schema_version": 2,
+            "metadata": {"score": 0.1, "scale": 1e20, "tiny": 1e-7, "whole": 5.0},
+        });
+        let written = py_canonical_json(&body).unwrap();
+        assert_eq!(
+            written,
+            "{\"metadata\": {\"scale\": 1e+20, \"score\": 0.1, \"tiny\": 1e-07, \"whole\": 5.0}, \"schema_version\": 2}"
+        );
+        let parsed: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(written, py_canonical_json(&parsed).unwrap());
     }
 }

@@ -177,6 +177,12 @@ impl CoreEngine {
         // result is identical (still O(changed)); the single batched encode avoids
         // n separate calibration-bound encode calls on a large add.
         let mut upserted_chunks: Vec<CoreVectorChunk> = Vec::with_capacity(documents.len());
+        // Live-index rows of a replaced document's old chunks whose ids differ from
+        // the new single vector chunk (its document id). Replacing a multi-chunk
+        // text document with a captionless vector/image leaves those text rows in
+        // the live TurboVec index otherwise, so its row count drifts from the JSON
+        // state and the consistency check fails on persist/close.
+        let mut removed_chunk_ids: Vec<String> = Vec::new();
         for document in documents {
             let content_hash = crate::text::hash::sha256_f32_le(&document.vector);
             // Mirror Python's vector-in text policy: retain raw text only when
@@ -243,6 +249,13 @@ impl CoreEngine {
                     &old_record.chunks,
                     &mut changed_filter_fields,
                 );
+                // Drop the old chunks' live-index rows except one reused under the
+                // document id (the new vector chunk overwrites that row in place).
+                for chunk in &old_record.chunks {
+                    if chunk.chunk_id != document.document_id {
+                        removed_chunk_ids.push(chunk.chunk_id.clone());
+                    }
+                }
             }
             index.add_document_indexes(
                 &document.document_id,
@@ -291,6 +304,12 @@ impl CoreEngine {
                 }));
             }
             changed += 1;
+        }
+        // Remove replaced documents' stale live-index rows (e.g. a text document's
+        // chunks) before upserting the new vector rows, so the live row count stays
+        // in step with the JSON state.
+        if !removed_chunk_ids.is_empty() {
+            index.sync_vector_index_remove(&removed_chunk_ids);
         }
         // A document id repeated within one batch must collapse to its last
         // vector: the per-document state above already applied last-wins, and

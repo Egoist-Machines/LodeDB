@@ -751,6 +751,56 @@ def test_native_write_through_persists_non_ascii_text_python_readable(
     reopened.close()
 
 
+def test_native_write_through_persists_float_metadata_python_readable(
+    tmp_path, monkeypatch
+) -> None:
+    """Native write-through of float-valued payloads reopens cleanly under Python.
+
+    The float analogue of the non-ASCII text guard above. ``py_canonical_json``'s
+    number branch is hardened to render floats like CPython's ``repr`` /
+    ``json.dumps`` (``1e+20`` / ``1e-07``) rather than serde's Ryu form (``1e20`` /
+    ``1e-7``); that byte-identity is asserted directly by the Rust unit test
+    ``storage::util::canonical_json_tests::numbers_match_python_json_dumps``.
+
+    No user float actually reaches a re-canonicalized ``body_sha256`` body: the
+    local store coerces metadata scalars to strings, and every other float-capable
+    value (TurboVec scales, calibration) is byte- or file-checksummed, never
+    re-serialized on reopen. This test guards the end-to-end contract that
+    native-authored numeric payloads round-trip under a Python reopen, so a future
+    change that did route a float through a shared checksum would surface here as
+    well as in the encoder unit test.
+    """
+    from lodedb import LodeDB
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "on")
+    # Floats whose serde (Ryu) and CPython reprs diverge, plus an int.
+    payloads = {
+        "f-a": {"scale": 1e20, "tiny": 1e-7, "whole": 5.0, "count": 42},
+        "f-b": {"ratio": 0.1, "neg": -2.5e-8},
+        "f-c": {"big": 6.022e23, "boundary": 1e16},
+    }
+    expected = {
+        doc: {key: str(value) for key, value in fields.items()}
+        for doc, fields in payloads.items()
+    }
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    for axis, (doc_id, fields) in enumerate(payloads.items()):
+        db.add_vectors(_onehot(axis), id=doc_id, metadata=fields, text=f"doc {doc_id}")
+    db.persist()
+    assert db.stats()["native_core"]["write_through"] is True
+    db.close()
+
+    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8)
+    for doc_id, fields in expected.items():
+        record = reopened.get_document(doc_id)
+        assert record is not None, doc_id
+        assert record["metadata"] == fields
+    assert reopened.get("f-a") == "doc f-a"
+    reopened.close()
+
+
 def test_native_write_through_generation_commits_are_o_changed(tmp_path, monkeypatch) -> None:
     """Native generation write-through publishes O(changed) deltas, not full bases.
 
@@ -1072,7 +1122,9 @@ def test_native_core_on_text_store_uses_native_query_without_write_through(
     from lodedb.engine.embedding_backends import HashEmbeddingBackend
 
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
-    monkeypatch.delenv("LODEDB_NATIVE_CORE_WRITE", raising=False)
+    # The read-only-native path (no write-through) is now opt-in: write-through
+    # defaults on, so select the no-write-through behavior explicitly.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     db = LodeDB(tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
     db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
     stats = db.stats()["native_core"]

@@ -129,13 +129,17 @@ def native_core_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCor
 def native_core_write_mode_from_env(env: Mapping[str, str] | None = None) -> NativeCoreMode:
     """Returns the native-core durable-write mode.
 
-    This flag is independent from query/mutation execution because storage
-    cutover must be staged behind shadow writes and cross-read checks.
+    Defaults to ``on``: the native core is the default durable writer. The flag
+    stays independent from query/mutation execution so the storage cutover can be
+    staged behind shadow writes and cross-read checks. A *default* ``on`` falls
+    back to the Python writer when native write-through cannot engage (for example
+    reopening an existing text store that retained no text); an *explicit*
+    ``LODEDB_NATIVE_CORE_WRITE=on`` fails closed in that case instead.
     """
 
     source = os.environ if env is None else env
     return parse_native_core_mode(
-        source.get("LODEDB_NATIVE_CORE_WRITE", "off"), "LODEDB_NATIVE_CORE_WRITE"
+        source.get("LODEDB_NATIVE_CORE_WRITE", "on"), "LODEDB_NATIVE_CORE_WRITE"
     )
 
 

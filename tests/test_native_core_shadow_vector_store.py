@@ -486,7 +486,9 @@ def test_native_core_on_text_store_mirrors_writes_without_query_double_work(
         lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
-    monkeypatch.delenv("LODEDB_NATIVE_CORE_WRITE", raising=False)
+    # Read-only-native (no write-through) is opt-in now that write-through is the
+    # default; select it explicitly to exercise the mirror-without-query path.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
 
     db = LodeDB(
         tmp_path,
@@ -534,6 +536,9 @@ def test_native_on_existing_raw_text_store_uses_readonly_seed_until_mutation(
         lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    # Readonly-seed-until-mutation is the read-only-native (no write-through)
+    # behavior, now opt-in since write-through defaults on.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     db = LodeDB(
         tmp_path,
         _embedding_backend=HashEmbeddingBackend(native_dim=384),
@@ -770,6 +775,8 @@ def test_native_on_existing_vector_store_uses_readonly_seed_until_mutation(
         lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    # Readonly-seed-until-mutation is opt-in now that write-through defaults on.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
 
     hits = db.search_by_vector(_onehot(0), k=1)
@@ -836,6 +843,8 @@ def test_native_on_existing_index_text_store_uses_readonly_seed_until_mutation(
         lambda: adapter,
     )
     monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
+    # Readonly-seed-until-mutation is opt-in now that write-through defaults on.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     db = LodeDB(
         tmp_path,
         index_text=True,

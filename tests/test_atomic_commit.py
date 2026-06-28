@@ -84,6 +84,10 @@ def test_commit_layout_and_round_trip(tmp_path):
 def test_delta_commit_crash_recovers_to_last_good(tmp_path, monkeypatch):
     """A crash at a delta commit's root swap rolls back to the last committed generation."""
 
+    # The crash is injected by patching the Python committer (core.write_commit_manifest).
+    # Under default native write-through the committer is the native core (a Rust atomic
+    # root-manifest swap), so select the Python writer to exercise its crash path.
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     writer = _writer(tmp_path)
     writer.add_many([{"text": f"doc {i}", "id": f"d{i}"} for i in range(10)])
     assert writer.count() == 10
@@ -122,6 +126,9 @@ def test_base_rewrite_crash_recovers_to_last_good(tmp_path, monkeypatch):
     names, so the previous epoch stays fully intact for recovery.
     """
 
+    # Crash injected at the Python committer; pin the Python writer (native
+    # write-through commits via the Rust core, which this patch does not reach).
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     writer = _writer(tmp_path)
     writer.add_many([{"text": f"doc {i}", "id": f"d{i}"} for i in range(10)])
     assert writer.count() == 10
@@ -314,6 +321,9 @@ def test_text_rolls_back_with_torn_commit(tmp_path, monkeypatch):
     surfaced by the public ``get`` after rollback.
     """
 
+    # Crash injected at the Python committer; pin the Python writer (native
+    # write-through commits via the Rust core, which this patch does not reach).
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     writer = _writer(tmp_path)
     writer.add("committed text", id="a")
     assert writer.get("a") == "committed text"
@@ -347,6 +357,9 @@ def test_audit_reflects_committed_generation_after_torn_commit(tmp_path, monkeyp
     is not replayed into the audited counts.
     """
 
+    # Crash injected at the Python committer; pin the Python writer (native
+    # write-through commits via the Rust core, which this patch does not reach).
+    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
     writer = _writer(tmp_path)
     writer.add("only committed doc", id="a")
     assert writer.count() == 1

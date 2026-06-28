@@ -676,6 +676,13 @@ class LodeEngine:
         # Set while replaying WAL records on open so the replayed mutations
         # re-drive the engine verbs without re-appending to the WAL.
         self._wal_replaying = False
+        # The single index whose WAL is being replayed. A WAL authored by the
+        # native write-through writer carries no client_id/index_id envelope (the
+        # native core only knows the client_id_hash), so an envelope-less record
+        # resolves the loaded state's empty client_id to the wrong key. Each
+        # ``<key>.wal`` is per-index, so every record in it targets this one state;
+        # ``_index_for_context`` falls back to it when the hashed lookup misses.
+        self._wal_replay_target: ClientIndexState | None = None
         # When the native core is the durable writer (``LODEDB_NATIVE_CORE_WRITE``
         # write-through), the Python engine still maintains in-memory state and the
         # oracle reads, but it must NOT also publish durable commits: two writers
@@ -2562,6 +2569,15 @@ class LodeEngine:
         state_key = index_state_key(context.client_id, requested_index_id)
         state = self._indexes.get(state_key)
         if state is None:
+            # A native-authored WAL record carries no identity envelope, so the
+            # loaded state's empty client_id hashes to the wrong key on replay.
+            # Each WAL is per-index, so resolve to the index being recovered.
+            if (
+                self._wal_replaying
+                and self._wal_replay_target is not None
+                and normalize_index_id(self._wal_replay_target.index_id) == requested_index_id
+            ):
+                return self._wal_replay_target
             return self._error(404, "client index not found", operation, context.client_id)
         return state
 
@@ -4312,11 +4328,13 @@ class LodeEngine:
             return {"wal_records_replayed": 0.0}
         started = perf_counter()
         self._wal_replaying = True
+        self._wal_replay_target = state
         try:
             for record in records:
                 self._apply_wal_record(state, record.op, record.payload)
         finally:
             self._wal_replaying = False
+            self._wal_replay_target = None
         return {
             "wal_records_replayed": float(len(records)),
             "wal_replay_ms": float((perf_counter() - started) * 1000.0),
@@ -4452,6 +4470,17 @@ class LodeEngine:
                 state.document_tokens[document_id] = [
                     [str(token) for token in chunk_tokens] for chunk_tokens in tokens
                 ]
+            if self.raw_text_storage_enabled:
+                # The native write-through mirror logs the raw text/caption in its
+                # apply_embedded_documents record (the Python store_text=False path
+                # never does, so raw_text_storage_enabled gates this), so restore it
+                # on replay. A null text (a vector re-add that cleared the caption)
+                # drops the stored text so it does not resurface after recovery.
+                text = item.get("text")
+                if text is None:
+                    state.document_text.pop(document_id, None)
+                else:
+                    state.document_text[document_id] = str(text)
         self._record_pending_state_journal_documents(
             state, upserted_document_ids=tuple(document_ids)
         )

@@ -323,6 +323,40 @@ class NativeCoreEngineHandle:
             )
         )
 
+    def update_document_payload(
+        self,
+        index_id: str,
+        document_id: str,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+    ) -> dict[str, Any]:
+        """Applies a metadata/raw-text update without re-embedding the vector.
+
+        ``text_json`` is the JSON of an ``Option<Option<String>>``: ``"null"``
+        clears the stored text, a JSON string sets it, and ``None`` (omitted)
+        leaves it unchanged. ``metadata_json`` is ``None`` to leave metadata
+        unchanged, else the full replacement string->string map.
+        """
+
+        metadata_json = (
+            None
+            if metadata is None
+            else self._dumps({str(key): str(value) for key, value in metadata.items()})
+        )
+        if clear_text:
+            text_json: str | None = self._dumps(None)
+        elif text is not None:
+            text_json = self._dumps(text)
+        else:
+            text_json = None
+        return self._loads(
+            self._engine.update_document_payload(
+                str(index_id), str(document_id), metadata_json, text_json
+            )
+        )
+
     def query_vector(
         self,
         index_id: str,

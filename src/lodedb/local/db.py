@@ -296,12 +296,16 @@ class LodeDB:
         self._native_core_mode = native_core_mode_from_env()
         self._native_core_write_mode = native_core_write_mode_from_env()
         self._native_core_strict_parity = native_core_strict_parity_from_env()
-        self._native_core_fail_closed = (
-            self._native_core_mode == NativeCoreMode.ON and "LODEDB_NATIVE_CORE" in os.environ
-        ) or (
+        # Write-through defaults on (native is the default durable writer). Only an
+        # *explicit* opt-in fails closed; a defaulted-on write-through falls back to
+        # the Python writer when the native core cannot engage.
+        self._native_core_write_explicit = (
             self._native_core_write_mode == NativeCoreMode.ON
             and "LODEDB_NATIVE_CORE_WRITE" in os.environ
         )
+        self._native_core_fail_closed = (
+            self._native_core_mode == NativeCoreMode.ON and "LODEDB_NATIVE_CORE" in os.environ
+        ) or self._native_core_write_explicit
         self._native_vector_engine: NativeCoreEngineHandle | None = None
         # The native CoreEngine is an unsendable PyO3 object: it may only be
         # touched from the thread that created it. Records that thread so the
@@ -753,6 +757,20 @@ class LodeDB:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
+        if self._native_reads_authoritative():
+            # Native is the sole writer and Python is stale (vector-in / image adds
+            # skipped the Python upsert), so the Python oracle cannot serve this
+            # query (it would raise on an empty snapshot). Serve from native, which
+            # owns the documents.
+            native_hits = self._native_search_text(
+                query,
+                k=int(k),
+                filter=normalized_filter,
+                mode=resolved_mode,
+                authoritative=True,
+            )
+            if native_hits is not None:
+                return native_hits
         # Text/lexical/hybrid search keeps the Python oracle + parity cross-check
         # even in native-on: the native lexical/hybrid path still has divergences
         # from Python (incremental lexical rebuilds, vector-caption lexical, commit
@@ -1105,9 +1123,21 @@ class LodeDB:
         self._require_writable()
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
-        # `delete_documents` reports `document_count` as the number of unique
-        # ids *requested* (not necessarily existing); `deleted_chunks` counts
-        # chunks actually removed, so a positive value means the doc existed.
+        if self._native_reads_authoritative():
+            # Native is the sole writer and Python is stale (its vector-in upsert was
+            # skipped), so the doc may be absent from Python entirely. Route the
+            # delete through native only and read the authoritative deleted count;
+            # routing to Python would miscount and (with native owning durability)
+            # leave the delete non-durable.
+            native_response = self._native_delete_documents((id,))
+            if native_response is None:
+                return False
+            return int(native_response.get("documents_deleted", 0) or 0) > 0
+        # Python still serves reads (in sync), so delete there; the native mirror
+        # below keeps native consistent and durable (native owns the commit in
+        # write-through). `delete_documents` reports `document_count` as the number
+        # of unique ids *requested*; `deleted_chunks` counts chunks actually
+        # removed, so a positive value means the doc existed.
         response = self._index.delete_batch((id,))
         deleted = int(response.get("deleted_chunks", 0) or 0) > 0
         self._native_delete_documents((id,))
@@ -1126,22 +1156,81 @@ class LodeDB:
         self._require_writable()
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
+        if self._native_reads_authoritative():
+            # Native is the sole writer and Python is stale (a vector-in document may
+            # be absent from Python entirely), so apply the update to native
+            # authoritatively; routing it to Python would raise "document not found".
+            self._native_update_document_payload(
+                id, metadata=metadata, text=text, clear_text=clear_text
+            )
+            return
+        # Python still serves reads (in sync), so update it there, then mirror to
+        # native so native stays consistent and durable. Native owns the commit in
+        # write-through, so without the mirror a payload-only update would be lost on
+        # reopen (the path mem0's metadata-only update on a fresh reopen takes).
         self._index.update_document_payload(
             id,
             metadata=_coerce_metadata(metadata) if metadata is not None else None,
             text=text,
             clear_text=clear_text,
         )
-        # Python is the durable authority for payload-only updates; the native
-        # core has no mirrored update path here. Invalidate native coverage so
-        # subsequent native reads (get/get_document/list/count/search) do not
-        # return the pre-update metadata or text. The Python oracle, which just
-        # applied the update, serves these reads, and a later reopen re-seeds
-        # native from the updated on-disk store.
-        if self._native_vector_engine is not None and self._native_vector_covered:
+        self._native_update_document_payload(
+            id, metadata=metadata, text=text, clear_text=clear_text
+        )
+
+    def _native_update_document_payload(
+        self,
+        document_id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+    ) -> None:
+        """Applies a payload update to native: authoritative read route or mirror.
+
+        Native owns the commit in write-through, so the update must reach native or
+        the change is not durable. When native is read-authoritative (Python is
+        stale) a failure fails closed (no Python copy to fall back to); as a mirror
+        alongside a Python write it disables write-through and the Python writer
+        resumes durability. Mirrors :meth:`_native_delete_documents`.
+        """
+
+        authoritative = self._native_reads_authoritative()
+        if not self._native_thread_local() or not self._native_vector_covered:
+            if authoritative:
+                self._native_core_fallback_reason = "native_core_sole_writer_unavailable"
+                raise RuntimeError(
+                    "native write-through is thread-confined: this update cannot be "
+                    "served from the current thread while native is the sole writer"
+                )
+            return
+        if not self._native_vector_mutable:
             self._native_vector_covered = False
             self._native_text_shadow_enabled = False
-            self._native_core_fallback_reason = "native_core_payload_update_unmirrored"
+            self._native_core_fallback_reason = "native_core_readonly_seed_invalidated"
+            return
+        try:
+            self._native_vector_engine.update_document_payload(
+                _LOCAL_INDEX_ID,
+                document_id,
+                metadata=_coerce_metadata(metadata) if metadata is not None else None,
+                text=text,
+                clear_text=clear_text,
+            )
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            if authoritative:
+                self._native_core_fallback_reason = "native_core_sole_writer_payload_update_failed"
+                raise RuntimeError("native core payload update failed") from exc
+            self._disable_native_write_through()
+            self._native_core_fallback_reason = "native_core_payload_update_failed"
+            if self._native_core_fail_closed:
+                raise RuntimeError("native core payload update failed") from exc
+            if self._native_core_strict_parity:
+                raise
 
     def get(self, id: str) -> str | None:
         """Returns the stored raw text for a document id, or ``None`` if absent.
@@ -1172,12 +1261,18 @@ class LodeDB:
         if not self.store_text:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
         native_handled, native_text = self._native_get_text(id)
-        # Return a native HIT directly, but fall through to the Python oracle on a
-        # native miss: an existing store seeded under an older raw-text sidecar
-        # layout the native reader does not understand counts its documents (so
-        # coverage is claimed) yet serves no text. Python loaded the same store and
-        # is authoritative; a fresh native store always has the text it wrote, so
-        # this adds no Python call on the covered fast path.
+        # When native is the sole writer and Python is stale, native is the only
+        # authority: return its answer verbatim (including None = no text, e.g. a
+        # vector re-added without text that cleared the prior sidecar) instead of
+        # falling through to the stale Python copy.
+        if native_handled and self._native_reads_authoritative():
+            return native_text
+        # Otherwise return a native HIT directly, but fall through to the Python
+        # oracle on a native miss: an existing store seeded under an older raw-text
+        # sidecar layout the native reader does not understand counts its documents
+        # (so coverage is claimed) yet serves no text. Python loaded the same store
+        # and is authoritative; a fresh native store always has the text it wrote,
+        # so this adds no Python call on the covered fast path.
         if (
             native_handled
             and native_text is not None
@@ -1209,6 +1304,10 @@ class LodeDB:
         if not ids:
             return {}
         native_handled, native_texts = self._native_get_texts(ids)
+        if native_handled and self._native_reads_authoritative():
+            # Native is the sole authority (Python is stale); its map is complete
+            # for the stored ids, so do not consult the stale Python oracle.
+            return native_texts
         if native_handled and self._native_core_mode == NativeCoreMode.ON:
             # Fall back to the Python oracle for any requested id native did not
             # return (e.g. an existing store seeded under an older raw-text sidecar
@@ -1316,7 +1415,16 @@ class LodeDB:
             if stats is not None and self._native_core_mode == NativeCoreMode.ON:
                 return int(stats.get("document_count", 0) or 0)
             return int(self._index.stats().get("document_count", 0) or 0)
-        return self._index.count_documents(filter=_normalize_filter(filter))
+        normalized_filter = _normalize_filter(filter)
+        if self._native_reads_authoritative() and self._native_filter_shortcut_safe(
+            normalized_filter
+        ):
+            # Native is the sole authority; counting via the stale Python engine
+            # would undercount. Enumerate the matching ids natively (O(matches)).
+            native_handled, native_records = self._native_list_documents(normalized_filter)
+            if native_handled:
+                return len(native_records)
+        return self._index.count_documents(filter=normalized_filter)
 
     def stats(self) -> dict[str, Any]:
         """Returns redacted engine stats (counts, storage bytes, telemetry).
@@ -1479,9 +1587,13 @@ class LodeDB:
             return
         if write_through and document_count != 0 and not can_seed_existing:
             self._native_core_fallback_reason = "native_core_write_on_existing_store_unavailable"
-            raise RuntimeError(
-                "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires retained text"
-            )
+            # Default-on write-through degrades to the Python writer here; only an
+            # explicit LODEDB_NATIVE_CORE_WRITE=on fails closed (see __init__).
+            if self._native_core_write_explicit:
+                raise RuntimeError(
+                    "LODEDB_NATIVE_CORE_WRITE=on for existing text stores requires retained text"
+                )
+            return
         try:
             if write_through:
                 native_engine = adapter.open_engine(
@@ -1541,7 +1653,11 @@ class LodeDB:
         )
         if native_document_count != document_count:
             self._native_core_fallback_reason = "native_core_existing_store_seed_mismatch"
-            if write_through:
+            # A legacy / pre-commit-manifest store the native reader cannot
+            # enumerate seeds as empty (count 0) against Python's real count. A
+            # *default* write-through degrades to the Python writer (which migrates
+            # the layout on its next commit); only an explicit opt-in fails closed.
+            if write_through and self._native_core_write_explicit:
                 raise RuntimeError("native core existing-store seed mismatch")
             return
         self._native_vector_engine = native_engine
@@ -1549,11 +1665,16 @@ class LodeDB:
         self._native_vector_covered = True
         self._native_write_through_enabled = write_through and self._native_vector_covered
         self._native_text_shadow_enabled = text_native and self._native_vector_covered
-        # In generation-mode write-through the native core is the sole durable
-        # writer, so the Python engine stops publishing its own commits (two
-        # writers would collide on the shared generation store). The Python writer
-        # resumes durability automatically if native write-through falls back.
-        if self._native_should_persist_after_mutation():
+        # In write-through the native core is the sole durable writer in BOTH commit
+        # modes: it owns durability for vectors AND text (its WAL records carry raw
+        # text, tokens, and embeddings; `_apply_embedded_documents` restores them on
+        # replay). The Python engine keeps in-memory state and oracle reads but stops
+        # publishing its own commits, so two writers never collide on the shared
+        # generation/WAL store — without this a text add (Python+mirror) and a vector
+        # sole-write would both checkpoint on close and the Python checkpoint could
+        # resurrect the stale text/lexical the vector write cleared. The Python
+        # writer resumes durability automatically if write-through falls back.
+        if self._native_write_through_enabled:
             self._engine.assign_native_durability_ownership()
 
     def _native_query_authoritative(self) -> bool:
@@ -1606,17 +1727,20 @@ class LodeDB:
         """True when the native text query should run alongside the Python oracle.
 
         Text/lexical/hybrid search keeps Python authoritative (native lexical still
-        diverges), so in the plain read-on default the native text query only ever
+        diverges), so in the plain read-on path the native text query only ever
         reproduces the Python hits after re-embedding the query and re-running the
         scan -- pure duplicate model inference. We therefore run it only when it
-        does real work: validating parity (strict parity or read-shadow) or
-        exercising the authoritative native writer (write-through).
+        does real work: validating parity (strict parity or read-shadow) or an
+        *explicit* native write-through opt-in. The *default* write-through (native
+        is the default durable writer) deliberately stays off this validation hot
+        path -- durability does not depend on the native text query, only the
+        write mirror, so the default read stays as cheap as plain read-on.
         """
 
         return (
             self._native_core_strict_parity
             or self._native_core_mode == NativeCoreMode.SHADOW
-            or self._native_core_write_mode == NativeCoreMode.ON
+            or self._native_core_write_explicit
         )
 
     @staticmethod
@@ -1765,31 +1889,51 @@ class LodeDB:
             if self._native_core_strict_parity:
                 raise
 
-    def _native_delete_documents(self, document_ids: tuple[str, ...]) -> None:
-        """Mirrors vector deletes into native core while Python remains durable."""
+    def _native_delete_documents(self, document_ids: tuple[str, ...]) -> dict[str, Any] | None:
+        """Deletes documents in native core; returns the native response or None.
 
-        if (
-            not document_ids
-            or not self._native_thread_local()
-            or not self._native_vector_covered
-        ):
-            return
+        Returns the native delete response when native applied the delete (so a
+        sole-writer caller can read the authoritative ``documents_deleted`` count),
+        or None when native did not run and the Python engine remains the authority.
+        """
+
+        if not document_ids:
+            return None
+        # Authoritative when Python is stale (the doc may be absent from Python),
+        # so a failure has no fallback and fails closed; as a mirror alongside a
+        # Python delete it disables write-through and Python resumes durability.
+        authoritative = self._native_reads_authoritative()
+        if not self._native_thread_local() or not self._native_vector_covered:
+            if authoritative:
+                # Python holds no copy of this data, so a delete native cannot serve
+                # from this thread has no durable home: fail closed, don't drop it.
+                self._native_core_fallback_reason = "native_core_sole_writer_unavailable"
+                raise RuntimeError(
+                    "native write-through is thread-confined: this delete cannot be "
+                    "served from the current thread while native is the sole writer"
+                )
+            return None
         if not self._native_vector_mutable:
             self._native_vector_covered = False
             self._native_core_fallback_reason = "native_core_readonly_seed_invalidated"
-            return
+            return None
         try:
-            self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
+            response = self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
             if self._native_should_persist_after_mutation():
                 self._native_vector_engine.persist()
+            return response
         except Exception as exc:
             self._native_vector_covered = False
+            if authoritative:
+                self._native_core_fallback_reason = "native_core_sole_writer_delete_failed"
+                raise RuntimeError("native core vector delete failed") from exc
             self._disable_native_write_through()
             self._native_core_fallback_reason = "native_core_delete_failed"
             if self._native_core_fail_closed:
                 raise RuntimeError("native core vector delete failed") from exc
             if self._native_core_strict_parity:
                 raise
+            return None
 
     def _native_search_by_vector(
         self,
@@ -1865,13 +2009,20 @@ class LodeDB:
         k: int,
         filter: Mapping[str, Any] | None,
         mode: str,
+        authoritative: bool = False,
     ) -> list[LodeSearchHit] | None:
-        """Returns native text hits when explicit shadow text coverage is active."""
+        """Returns native text hits when text coverage is active.
 
-        if (
+        ``authoritative=True`` is the sole-writer path: native is the only source
+        of truth, so serve it whenever the handle is natively covered, bypassing
+        the validation gates (shadow / strict-parity / explicit-write) that only
+        decide whether to run native *alongside* the Python oracle.
+        """
+
+        if not self._native_thread_local() or not self._native_vector_covered:
+            return None
+        if not authoritative and (
             not self._native_text_shadow_enabled
-            or not self._native_thread_local()
-            or not self._native_vector_covered
             or not self._native_text_search_runs()
         ):
             return None
@@ -2039,6 +2190,20 @@ class LodeDB:
         """
 
         return self._native_write_through_enabled and self._native_query_authoritative()
+
+    def _native_reads_authoritative(self) -> bool:
+        """Whether native must serve every read because the Python oracle is stale.
+
+        When native is the sole writer (write-through) the vector add path skips
+        the Python engine's in-memory upsert, so once a sole write has happened the
+        Python engine is missing those documents. Every read (text, payload,
+        count, search) and every subsequent delete/update must therefore route to
+        native and must NOT fall back to the (stale) Python oracle. Text-only
+        stores never set ``_native_sole_writes_made`` (their add path keeps Python
+        in sync), so they keep Python authoritative for the divergent lexical path.
+        """
+
+        return self._native_is_sole_writer() and self._native_sole_writes_made
 
     def _native_should_persist_after_mutation(self) -> bool:
         """Whether native must publish a generation immediately after a mutation.

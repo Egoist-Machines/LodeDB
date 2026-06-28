@@ -305,6 +305,14 @@ class LodeLateInteractionIndex:
             read_only=self.read_only,
             **lodedb_kwargs,
         )
+        # Late interaction is a multi-vector store (the patch matrix rides the
+        # per-row text sidecar). The native core has no late-interaction concept
+        # and its sole-writer model is thread-confined, so keep the Python engine
+        # the durable writer here: it serves multi-vector reads/removes correctly
+        # and supports the shared-handle concurrent writers `lodedb serve` needs.
+        # No write has happened yet, so this is a clean handoff (a no-op on disk).
+        if not self.read_only:
+            self._db._disable_native_write_through()
         # Resolve the storage precision against any value persisted with the index,
         # so the choice survives reopen and stays consistent across writes.
         self.storage = self._resolve_storage(storage)

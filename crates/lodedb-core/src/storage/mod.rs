@@ -133,10 +133,25 @@ pub fn load_generation_store(
     };
 
     let raw_text = match manifest.store_manifest("tvtext") {
-        Some(tvtext_manifest) => text_store::load(
-            &base_tvtext_path(persistence_dir, &index_key, base_epoch),
-            Some(tvtext_manifest),
-        )?,
+        Some(tvtext_manifest) => {
+            // A journaled tvtext manifest carries a `base` object (text_store
+            // writes and reads it). The unreleased pre-journal shape is
+            // `{present, sha256}`, pinning a single `text-g<gen>.tvtext` file the
+            // native reader cannot load: it would silently yield empty text and
+            // then overwrite the real text on the next durable write. Refuse so
+            // the caller falls back to the Python reader, which understands the
+            // legacy shape and migrates it into the journal.
+            if tvtext_manifest.get("base").is_none() {
+                return Err(invalid(
+                    "unsupported pre-journal raw-text layout (no journaled base); \
+                     the Python reader must migrate this store",
+                ));
+            }
+            text_store::load(
+                &base_tvtext_path(persistence_dir, &index_key, base_epoch),
+                Some(tvtext_manifest),
+            )?
+        }
         None => BTreeMap::new(),
     };
     let lexical_tokens = match manifest.store_manifest("tvlex") {
