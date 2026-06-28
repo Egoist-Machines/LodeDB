@@ -55,6 +55,7 @@ fn main() {
             tvim: None,
             raw_text: None,
             lexical_tokens: None,
+            multivec: None,
         },
         GenerationWriteOptions::default(),
     )

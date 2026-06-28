@@ -10,11 +10,12 @@ pub mod wal;
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{
-    base_json_path, base_tvim_path, base_tvlex_path, base_tvtext_path, build_commit_body,
-    commit_manifest_path, generation_dir, list_base_epochs, read_commit_manifest,
-    write_commit_manifest, CommitBodyInput, CommitManifest,
+    base_json_path, base_tvim_path, base_tvlex_path, base_tvmv_path, base_tvtext_path,
+    build_commit_body, commit_manifest_path, generation_dir, list_base_epochs,
+    read_commit_manifest, write_commit_manifest, CommitBodyInput, CommitManifest,
 };
 use crate::storage::lexical_store::TokenLists;
+use crate::storage::multivec_store::MultiVecMap;
 use crate::storage::state_journal::StateJournalDeltaInput;
 use crate::storage::tvim_delta::{TvimDeltaAppendInput, TvimDeltaArray};
 use crate::storage::util::{corrupt, get_str, invalid, value_object, CoreResult};
@@ -41,6 +42,7 @@ pub struct LoadedStore {
     pub tvim_manifest: Option<Value>,
     pub raw_text: BTreeMap<String, String>,
     pub lexical_tokens: BTreeMap<String, TokenLists>,
+    pub multivec: MultiVecMap,
     pub wal_records: Vec<WalRecord>,
 }
 
@@ -99,6 +101,7 @@ pub fn load_store(
             tvim_manifest: None,
             raw_text: legacy.raw_text,
             lexical_tokens: BTreeMap::new(),
+            multivec: MultiVecMap::new(),
             wal_records: Vec::new(),
         });
     }
@@ -162,6 +165,13 @@ pub fn load_generation_store(
         )?,
         None => BTreeMap::new(),
     };
+    let multivec = match manifest.store_manifest("tvmv") {
+        Some(tvmv_manifest) => multivec_store::load(
+            &base_tvmv_path(persistence_dir, &index_key, base_epoch),
+            Some(tvmv_manifest),
+        )?,
+        None => MultiVecMap::new(),
+    };
     let wal_records = if options.read_wal && !options.read_only {
         wal::read_records(&wal::wal_path(persistence_dir, &index_key))?
     } else {
@@ -177,6 +187,7 @@ pub fn load_generation_store(
         tvim_manifest: tvim_manifest.cloned(),
         raw_text,
         lexical_tokens,
+        multivec,
         wal_records,
     })
 }
@@ -223,6 +234,7 @@ pub struct GenerationCommitInput<'a> {
     pub tvim: Option<TvimBaseWrite<'a>>,
     pub raw_text: Option<&'a BTreeMap<String, String>>,
     pub lexical_tokens: Option<&'a BTreeMap<String, TokenLists>>,
+    pub multivec: Option<&'a MultiVecMap>,
 }
 
 pub fn write_generation_commit(
@@ -279,6 +291,14 @@ pub fn write_generation_commit(
         )?),
         _ => None,
     };
+    let multivec_manifest = match input.multivec {
+        Some(multivec) if !multivec.is_empty() => Some(multivec_store::record_base(
+            &base_tvmv_path(persistence_dir, input.index_key, input.base_epoch),
+            multivec,
+            options.fsync,
+        )?),
+        _ => None,
+    };
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
@@ -290,6 +310,7 @@ pub fn write_generation_commit(
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
+        tvmv_manifest: multivec_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),
@@ -339,6 +360,8 @@ pub struct GenerationDeltaInput<'a> {
     pub raw_text_upserts: Option<BTreeMap<String, String>>,
     /// `Some` only when `index_text` is on; carries the changed documents' tokens.
     pub lexical_upserts: Option<BTreeMap<String, TokenLists>>,
+    /// `Some` only for late-interaction stores; the changed documents' matrices.
+    pub multivec_upserts: Option<MultiVecMap>,
     pub document_deletes: Vec<String>,
 }
 
@@ -460,6 +483,26 @@ pub fn write_generation_delta(
         }
         _ => previous.store_manifest("tvlex").cloned(),
     };
+    // Only append a multi-vector delta for a store that actually has a tvmv base:
+    // a patch-matrix upsert, or a delete against an existing multi-vector base.
+    // A non-late-interaction store never wrote a tvmv base, so its deletes must not
+    // try to append one (there is no manifest to read).
+    let multivec_manifest = match input.multivec_upserts {
+        Some(upserts)
+            if !upserts.is_empty()
+                || (!input.document_deletes.is_empty()
+                    && previous.store_manifest("tvmv").is_some()) =>
+        {
+            Some(multivec_store::append_delta(
+                &base_tvmv_path(persistence_dir, input.index_key, input.base_epoch),
+                &upserts,
+                &input.document_deletes,
+                input.document_count_after,
+                fsync,
+            )?)
+        }
+        _ => previous.store_manifest("tvmv").cloned(),
+    };
 
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
@@ -472,6 +515,7 @@ pub fn write_generation_delta(
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
+        tvmv_manifest: multivec_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),

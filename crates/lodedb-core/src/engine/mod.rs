@@ -240,6 +240,7 @@ impl CoreEngine {
                     text: retained_text,
                     token_lists,
                     chunks: chunks.clone(),
+                    patch_matrix: document.patch_matrix.clone(),
                 },
             );
             if let Some(old_record) = old_record {
@@ -736,6 +737,7 @@ impl CoreEngine {
                     text: document.text.clone(),
                     token_lists: token_lists.clone(),
                     chunks: chunks.clone(),
+                    patch_matrix: None,
                 },
             );
             if let Some(old_record) = old_record {
@@ -1516,6 +1518,7 @@ impl CoreEngine {
                     text,
                     token_lists: token_lists.clone(),
                     chunks: chunks.clone(),
+                    patch_matrix: None,
                 },
             );
             if let Some(old_record) = old_record {
@@ -1853,6 +1856,7 @@ fn index_from_loaded_store(
                 text: loaded.raw_text.get(&document_id).cloned(),
                 token_lists,
                 chunks,
+                patch_matrix: loaded.multivec.get(&document_id).cloned(),
             },
         );
     }
@@ -2420,6 +2424,9 @@ fn write_index_base(
     } else {
         BTreeMap::new()
     };
+    // Late-interaction patch matrices for every document (empty for non-LI stores,
+    // where the multi-vector base is skipped).
+    let multivec = multivec_for_documents(index, index.documents.keys().map(String::as_str));
     crate::storage::write_generation_commit(
         dir,
         crate::storage::GenerationCommitInput {
@@ -2436,6 +2443,7 @@ fn write_index_base(
                 }),
             raw_text: Some(&raw_text),
             lexical_tokens: Some(&lexical_tokens),
+            multivec: Some(&multivec),
         },
         crate::storage::GenerationWriteOptions {
             fsync,
@@ -2485,6 +2493,10 @@ fn write_index_delta(
             tvim: build_tvim_delta(index)?,
             raw_text_upserts,
             lexical_upserts,
+            multivec_upserts: Some(multivec_for_documents(
+                index,
+                index.pending_upserts.iter().map(String::as_str),
+            )),
             document_deletes: deleted_document_ids,
         },
         fsync,
@@ -2556,6 +2568,21 @@ fn lexical_tokens_for_documents<'a>(
         .collect()
 }
 
+fn multivec_for_documents<'a>(
+    index: &VectorOnlyIndex,
+    document_ids: impl Iterator<Item = &'a str>,
+) -> crate::storage::multivec_store::MultiVecMap {
+    document_ids
+        .filter_map(|document_id| {
+            index
+                .documents
+                .get(document_id)
+                .and_then(|record| record.patch_matrix.as_ref())
+                .map(|matrix| (document_id.to_string(), matrix.clone()))
+        })
+        .collect()
+}
+
 fn core_io_error(error: std::io::Error) -> CoreError {
     CoreError::new(
         CoreErrorCode::Internal,
@@ -2596,6 +2623,7 @@ fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreErr
         vector,
         metadata,
         text,
+        patch_matrix: None,
     })
 }
 
@@ -3147,6 +3175,10 @@ struct DocumentRecord {
     text: Option<String>,
     token_lists: Vec<Vec<String>>,
     chunks: Vec<ChunkRecord>,
+    /// Late-interaction patch matrix (the multi-vector payload), present only for
+    /// documents written through the multi-vector path; threaded to the native
+    /// multi-vector store on persist exactly like `text`/`token_lists`.
+    patch_matrix: Option<crate::storage::multivec_store::MultiVecRecord>,
 }
 
 #[derive(Debug, Clone)]

@@ -773,6 +773,7 @@ impl PyCoreEngine {
                 vector: vector.to_vec(),
                 metadata: sidecar.metadata,
                 text: sidecar.text,
+                patch_matrix: None,
             })
             .collect();
         native_to_json(

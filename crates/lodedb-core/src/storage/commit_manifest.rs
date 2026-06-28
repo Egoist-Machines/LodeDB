@@ -72,6 +72,10 @@ pub fn base_tvlex_path(persistence_dir: &Path, index_key: &str, epoch: u64) -> P
     generation_dir(persistence_dir, index_key).join(format!("g{epoch}.tvlex"))
 }
 
+pub fn base_tvmv_path(persistence_dir: &Path, index_key: &str, epoch: u64) -> PathBuf {
+    generation_dir(persistence_dir, index_key).join(format!("g{epoch}.tvmv"))
+}
+
 pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
     if !path.is_file() {
         return Ok(None);
@@ -104,6 +108,7 @@ pub struct CommitBodyInput<'a> {
     pub tvim_present: bool,
     pub tvtext_manifest: Option<Value>,
     pub tvlex_manifest: Option<Value>,
+    pub tvmv_manifest: Option<Value>,
 }
 
 pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
@@ -118,6 +123,7 @@ pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
         "tvim_present": input.tvim_present,
         "tvtext": input.tvtext_manifest,
         "tvlex": input.tvlex_manifest,
+        "tvmv": input.tvmv_manifest,
     })
 }
 

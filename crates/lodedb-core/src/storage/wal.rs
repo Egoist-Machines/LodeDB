@@ -183,6 +183,7 @@ pub fn checkpoint_store(
         tvim: None,
         raw_text: Some(&store.raw_text),
         lexical_tokens: Some(&store.lexical_tokens),
+        multivec: Some(&store.multivec),
     };
     crate::storage::write_generation_commit(
         persistence_dir,
@@ -761,6 +762,7 @@ mod tests {
             tvim_manifest: None,
             raw_text: BTreeMap::new(),
             lexical_tokens: BTreeMap::new(),
+            multivec: Default::default(),
             wal_records: Vec::new(),
         };
 
@@ -808,6 +810,7 @@ mod tests {
             tvim_manifest: None,
             raw_text,
             lexical_tokens: BTreeMap::new(),
+            multivec: Default::default(),
             wal_records: Vec::new(),
         };
 

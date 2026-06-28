@@ -137,6 +137,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
             tvim: None,
             raw_text: None,
             lexical_tokens: None,
+            multivec: None,
         },
         GenerationWriteOptions::default(),
     )
@@ -173,6 +174,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
             tvim: None,
             raw_text: Some(&loaded.raw_text),
             lexical_tokens: Some(&loaded.lexical_tokens),
+            multivec: None,
         },
         GenerationWriteOptions::default(),
     )
@@ -368,6 +370,7 @@ fn rust_generation_writer_round_trips_state_and_sidecars() {
             tvim: None,
             raw_text: Some(&raw_text),
             lexical_tokens: Some(&lexical_tokens),
+            multivec: None,
         },
         GenerationWriteOptions::default(),
     )
@@ -394,6 +397,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
             tvim: None,
             raw_text: None,
             lexical_tokens: None,
+            multivec: None,
         },
         GenerationWriteOptions {
             fsync: false,
@@ -422,6 +426,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
             tvim: None,
             raw_text: None,
             lexical_tokens: None,
+            multivec: None,
         },
         GenerationWriteOptions {
             fsync: false,
@@ -447,6 +452,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
                 tvim: None,
                 raw_text: None,
                 lexical_tokens: None,
+                multivec: None,
             },
             GenerationWriteOptions {
                 fsync: false,
@@ -509,4 +515,42 @@ fn rust_state_payload(generation: u64, document_ids: &[&str]) -> Value {
         "turbovec_bit_width": 4,
         "updated_at": "2026-06-26T00:00:00+00:00"
     })
+}
+
+#[test]
+fn multivec_persists_through_generation_commit() {
+    use lodedb_core::storage::multivec_store::{MultiVecMap, MultiVecRecord};
+
+    let temp = unique_temp_dir("rust_multivec");
+    let record = |dtype: &str, n: usize, bytes: &[u8]| MultiVecRecord {
+        dtype: dtype.to_string(),
+        patch_count: n,
+        bytes: bytes.to_vec(),
+    };
+
+    // A late-interaction base commit carries each document's patch matrix in the
+    // tvmv store, and a reopen restores it byte-for-byte. (O(changed) delta append
+    // is covered by multivec_store's own unit tests and mirrors the tvtext/tvlex
+    // wiring exactly.)
+    let mut base = MultiVecMap::new();
+    base.insert("doc-a".to_string(), record("float32", 2, &[1, 2, 3, 4, 5, 6, 7, 8]));
+    base.insert("doc-b".to_string(), record("int8", 1, &[9, 9]));
+    lodedb_core::storage::write_generation_commit(
+        &temp,
+        GenerationCommitInput {
+            index_key: INDEX_KEY,
+            generation: 1,
+            base_epoch: 1,
+            state: &rust_state_payload(1, &["doc-a", "doc-b"]),
+            tvim: None,
+            raw_text: None,
+            lexical_tokens: None,
+            multivec: Some(&base),
+        },
+        GenerationWriteOptions::default(),
+    )
+    .unwrap();
+    let loaded = load_store(&temp, INDEX_KEY, LoadOptions::default()).unwrap();
+    assert_eq!(loaded.multivec, base);
+    fs::remove_dir_all(temp).unwrap();
 }

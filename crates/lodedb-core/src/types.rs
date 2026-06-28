@@ -171,6 +171,12 @@ pub struct CoreVectorDocument {
     pub vector: Vec<f32>,
     pub metadata: CoreMetadata,
     pub text: Option<String>,
+    /// Late-interaction patch matrix. Carried programmatically via the array
+    /// upsert sidecar / WAL payload (not this struct's JSON), so it is skipped by
+    /// serde; the engine threads it onto the document record and the native
+    /// multi-vector store.
+    #[serde(skip)]
+    pub patch_matrix: Option<crate::storage::multivec_store::MultiVecRecord>,
 }
 
 impl CoreVectorDocument {
@@ -344,6 +350,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             metadata: metadata(),
             text: Some("retained text".to_string()),
+            patch_matrix: None,
         });
         assert_round_trip(&CoreQuery {
             text: "alpha".to_string(),

@@ -30,6 +30,7 @@ fn doc(id: &str, axis: usize, metadata: BTreeMap<String, String>) -> CoreVectorD
         vector,
         metadata,
         text: None,
+        patch_matrix: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn payload_update_respects_store_text_privacy() {
                 vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 metadata: metadata(&[]),
                 text: Some("initial secret caption".to_string()),
+                patch_matrix: None,
             }],
         )
         .unwrap();
@@ -134,6 +136,7 @@ fn native_wal_payload_update_replays_after_crash() {
                 vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 metadata: metadata(&[("topic", "old")]),
                 text: Some("old text".to_string()),
+                patch_matrix: None,
             }],
         )
         .unwrap();
@@ -203,6 +206,7 @@ fn upsert_vectors_is_atomic_when_a_later_row_is_invalid() {
         vector: vec![0.0; 4],
         metadata: metadata(&[]),
         text: None,
+        patch_matrix: None,
     };
     let result = engine.upsert_vectors("default", &[doc("a", 0, metadata(&[])), bad]);
     assert!(result.is_err(), "wrong-dim batch must error");
@@ -803,6 +807,7 @@ fn native_wal_vector_records_replay_and_checkpoint() {
                 vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 metadata: metadata(&[("kind", "wal")]),
                 text: Some("WAL vector text".to_string()),
+                patch_matrix: None,
             }],
         )
         .unwrap();
