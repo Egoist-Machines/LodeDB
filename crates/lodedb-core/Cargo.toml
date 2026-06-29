@@ -16,6 +16,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 turbovec = { path = "../../third_party/turbovec/turbovec" }
+# Compresses the retained document-text base/segments (e.g. mem0 full payloads),
+# which are otherwise stored as raw canonical JSON. The crate's public API is
+# safe, so lodedb-core keeps unsafe_code = forbid.
+zstd = "0.13"
 
 # BSD advisory file locking for the shared single-writer lock; the same
 # mechanism the Python writer uses (fcntl.flock). rustix exposes a safe flock,
