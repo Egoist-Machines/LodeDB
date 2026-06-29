@@ -160,8 +160,17 @@ jobs:
           path: dist/LodeDBCoreFFI.xcframework.zip
 
   publish:
-    # Only a real tag push publishes; workflow_dispatch stops after the build jobs above.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Publish on a tag push once the Python artifacts (wheels + sdist) are built;
+    # workflow_dispatch stops after the build jobs above. The Swift/iOS xcframework
+    # is still awaited and attached to the GitHub Release when it builds, but it does
+    # not gate the PyPI publish, so an iOS-toolchain failure never blocks a Python
+    # release.
+    if: >-
+      !cancelled()
+      && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && needs.wheels.result == 'success'
+      && needs.sdist.result == 'success'
     needs: [wheels, sdist, swift-xcframework]
     runs-on: ubuntu-latest
     environment: pypi
