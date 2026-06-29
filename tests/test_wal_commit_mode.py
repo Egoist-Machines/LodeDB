@@ -24,7 +24,6 @@ from lodedb.engine.runtime_policy import (
     commit_mode_from_env,
     parse_commit_mode,
 )
-from lodedb.engine.wal_store import wal_path
 from lodedb.local.db import LodeDB
 
 
@@ -320,7 +319,7 @@ def test_torn_wal_tail_recovers_prior_records(tmp_path):
     db.add("beta two", id="b")
     del db
     gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
-    wal = wal_path(tmp_path, _only_wal_key(tmp_path))
+    wal = Path(tmp_path) / f"{_only_wal_key(tmp_path)}.wal"
     with wal.open("ab") as handle:
         handle.write(b"\x00\x00\x10\x00partial-frame-without-crc")
 
@@ -341,7 +340,7 @@ def test_interior_wal_corruption_fails_closed(tmp_path):
     db.add("gamma three", id="c")
     del db
     gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
-    wal = wal_path(tmp_path, _only_wal_key(tmp_path))
+    wal = Path(tmp_path) / f"{_only_wal_key(tmp_path)}.wal"
     raw = bytearray(wal.read_bytes())
     raw[40] ^= 0xFF  # flip a byte inside an early (non-trailing) record
     wal.write_bytes(bytes(raw))

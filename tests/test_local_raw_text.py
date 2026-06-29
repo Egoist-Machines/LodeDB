@@ -21,7 +21,6 @@ from pathlib import Path
 import pytest
 
 from lodedb.engine.core import audit_persisted_index_snapshots
-from lodedb.engine.document_text_store import DocumentTextStore
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB
 
@@ -343,11 +342,7 @@ def test_text_store_checksum_mismatch_fails_closed(tmp_path):
     }
     base.write_text(json.dumps(tampered), encoding="utf-8")
 
-    # Loading the tampered base through its store fails closed on the checksum.
-    with pytest.raises(RuntimeError, match="checksum"):
-        DocumentTextStore(base).load()
-
-    # And reopening the DB fails closed rather than serving the tampered text.
+    # Reopening the DB fails closed on the checksum rather than serving tampered text.
     with pytest.raises(RuntimeError, match="checksum"):
         _open(tmp_path, store_text=True)
 
