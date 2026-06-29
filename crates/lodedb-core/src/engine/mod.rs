@@ -63,6 +63,7 @@ impl CoreEngine {
                 commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
+                compress_text: options.compress_text,
                 chunk_character_limit: options.chunk_character_limit,
                 _lock: lock,
             }),
@@ -89,6 +90,7 @@ impl CoreEngine {
                 commit_mode: options.commit_mode.clone(),
                 store_text: options.store_text,
                 index_text: options.index_text,
+                compress_text: options.compress_text,
                 chunk_character_limit: options.chunk_character_limit,
                 _lock: None,
             }),
@@ -1329,9 +1331,10 @@ impl CoreEngine {
         let fsync = persistence.fsync;
         let store_text = persistence.store_text;
         let index_text = persistence.index_text;
+        let compress_text = persistence.compress_text;
         let commit_mode = persistence.commit_mode.clone();
         for index in self.indexes.values_mut() {
-            persist_index_generation(index, &dir, fsync, store_text, index_text)?;
+            persist_index_generation(index, &dir, fsync, store_text, index_text, compress_text)?;
             if commit_mode == "wal" {
                 crate::storage::wal::truncate(
                     &crate::storage::wal::wal_path(&dir, &index.index_key),
@@ -1752,6 +1755,23 @@ impl CoreEngine {
                     read_wal: false,
                 },
             )?;
+            // The text store records the compression it was created with in its
+            // manifest. Adopt that persisted value so it wins over the seeded
+            // open-option default before any write-back (the WAL-replay
+            // checkpoint below included): a store keeps the compression it was
+            // created with. A store with no `.tvtext` manifest (no text written,
+            // or a store from before the flag existed) leaves the seeded value.
+            if let Some(persisted) = crate::storage::text_store::persisted_compress(
+                &crate::storage::commit_manifest::base_tvtext_path(
+                    &persistence_path,
+                    &loaded.index_key,
+                    loaded.base_epoch,
+                ),
+            ) {
+                if let Some(persistence) = self.persistence.as_mut() {
+                    persistence.compress_text = persisted;
+                }
+            }
             if replay_wal && !persistence_read_only {
                 let records = crate::storage::wal::read_records(&crate::storage::wal::wal_path(
                     &persistence_path,
@@ -1811,6 +1831,11 @@ struct PersistenceState {
     commit_mode: String,
     store_text: bool,
     index_text: bool,
+    /// Effective document-text compression for this open. Seeded from
+    /// ``CoreOpenOptions.compress_text`` and then overwritten by the text store's
+    /// persisted manifest value on open, so a store keeps the compression it was
+    /// created with (the passed value only seeds a freshly created store).
+    compress_text: bool,
     chunk_character_limit: usize,
     _lock: Option<PersistentLock>,
 }
@@ -2485,6 +2510,7 @@ fn persist_index_generation(
     fsync: bool,
     store_text: bool,
     index_text: bool,
+    compress_text: bool,
 ) -> Result<(), CoreError> {
     let nothing_pending = index.pending_upserts.is_empty()
         && index.pending_deletes.is_empty()
@@ -2535,11 +2561,27 @@ fn persist_index_generation(
         )?;
 
     if needs_base {
-        write_index_base(index, dir, fsync, store_text, index_text, generation)?;
+        write_index_base(
+            index,
+            dir,
+            fsync,
+            store_text,
+            index_text,
+            compress_text,
+            generation,
+        )?;
         index.base_epoch = generation;
         index.base_calibration_fingerprint = live_fingerprint;
     } else {
-        write_index_delta(index, dir, fsync, store_text, index_text, generation)?;
+        write_index_delta(
+            index,
+            dir,
+            fsync,
+            store_text,
+            index_text,
+            compress_text,
+            generation,
+        )?;
     }
     index.pending_upserts.clear();
     index.pending_deletes.clear();
@@ -2604,6 +2646,7 @@ fn write_index_base(
     fsync: bool,
     store_text: bool,
     index_text: bool,
+    compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
     let tvim_base = tvim_base_for_index(index)?;
@@ -2638,6 +2681,7 @@ fn write_index_base(
             raw_text: Some(&raw_text),
             lexical_tokens: Some(&lexical_tokens),
             multivec: Some(&multivec),
+            compress_text,
         },
         crate::storage::GenerationWriteOptions {
             fsync,
@@ -2654,6 +2698,7 @@ fn write_index_delta(
     fsync: bool,
     store_text: bool,
     index_text: bool,
+    compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
     let upserted_documents = index
@@ -2692,6 +2737,7 @@ fn write_index_delta(
                 index.pending_upserts.iter().map(String::as_str),
             )),
             document_deletes: deleted_document_ids,
+            compress_text,
         },
         fsync,
     )?;

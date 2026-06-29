@@ -371,6 +371,8 @@ def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
         "commit_mode": "generation",
         "store_text": False,
         "index_text": False,
+        # compression defaults to True (text-store zstd compression on).
+        "compress_text": True,
         "chunk_character_limit": 512,
         # The native engine is the sole writer, so a writable open takes the
         # single-writer lock by default.
@@ -396,6 +398,7 @@ def test_adapter_wraps_readonly_native_engine_open(tmp_path) -> None:
         "commit_mode": "generation",
         "store_text": True,
         "index_text": False,
+        "compress_text": True,
         "chunk_character_limit": 768,
         "acquire_writer_lock": False,
     }

@@ -233,6 +233,7 @@ class LodeDB:
         chunk_character_limit: int = 900,
         store_text: bool = True,
         index_text: bool = False,
+        compression: bool = True,
         read_only: bool = False,
         durability: str | None = None,
         commit_mode: str | None = None,
@@ -294,12 +295,21 @@ class LodeDB:
         sidecar, never reaches telemetry, audit, or the redacted snapshot. The
         default leaves the on-disk layout byte-for-byte unchanged. Reopen the same
         path with the same ``index_text`` value you wrote with.
+        ``compression`` controls whether the retained raw-text store (the
+        ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
+        ``True``; it has no effect when ``store_text=False``. The setting is
+        persisted in the text-store manifest and the persisted value wins on
+        reopen, so a store keeps the compression it was created with and the
+        passed value only seeds a freshly created store. Reads are unaffected (the
+        reader detects compression on disk), so a store written either way always
+        reads back, and an existing store created before this option keeps loading.
         ``_embedding_backend`` is an internal hook for tests/fixtures.
         """
 
         self.path = Path(path)
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
+        self.compression = bool(compression)
         self.read_only = bool(read_only)
         # The native core is the sole reader/writer for this handle. It is an
         # unsendable PyO3 object, so it is opened on (and only ever touched from) a
@@ -1312,6 +1322,7 @@ class LodeDB:
                     store_text=self.store_text,
                     index_text=self.index_text,
                     chunk_character_limit=self._chunk_character_limit,
+                    compression=self.compression,
                 )
                 return _finalize_open(handle)
             if commit_mode != "wal" and _has_leftover_wal(self.path):
@@ -1329,6 +1340,7 @@ class LodeDB:
                     store_text=self.store_text,
                     index_text=self.index_text,
                     chunk_character_limit=self._chunk_character_limit,
+                    compression=self.compression,
                     acquire_writer_lock=True,
                 )
                 try:
@@ -1346,6 +1358,7 @@ class LodeDB:
                 store_text=self.store_text,
                 index_text=self.index_text,
                 chunk_character_limit=self._chunk_character_limit,
+                compression=self.compression,
                 acquire_writer_lock=True,
             )
             return _finalize_open(handle)

@@ -49,7 +49,8 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
 - **O(changed) persistence**: commits only the rows that changed, 173× to 1,308× faster
   than a full rewrite. [How it works](#delta-persistence).
 - **Compact storage**: the MIT [TurboVec](#turbovec) core packs vectors into 2/4-bit codes
-  and scans them with SIMD CPU kernels.
+  and scans them with SIMD CPU kernels; retained document text is stored zstd-compressed
+  (on by default, set at create time with `compression=`).
 - **In-process, on-disk** (`.tvim`/`.tvd`/`.jsd`): no daemon, no account, no API key.
 - **Safe concurrency**: one writer and many lock-free readers per path; every commit is
   crash-atomic and rolls back to the last committed state on failure, never a torn store.

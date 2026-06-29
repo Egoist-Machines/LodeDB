@@ -50,6 +50,7 @@ fn open_options(path: &Path, read_only: bool, commit_mode: &str) -> CoreOpenOpti
         commit_mode: commit_mode.to_string(),
         store_text: true,
         index_text: true,
+        compress_text: true,
         chunk_character_limit: 900,
         // Most tests open unique temp paths; the dedicated lock-contention test
         // builds its own options with the lock enabled.

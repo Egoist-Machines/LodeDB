@@ -113,6 +113,7 @@ class NativeCoreAdapter:
         store_text: bool,
         index_text: bool,
         chunk_character_limit: int,
+        compression: bool = True,
         acquire_writer_lock: bool = True,
     ) -> NativeCoreEngineHandle:
         """Opens a persistent native engine handle through the hidden extension.
@@ -132,6 +133,7 @@ class NativeCoreAdapter:
             store_text=store_text,
             index_text=index_text,
             chunk_character_limit=chunk_character_limit,
+            compression=compression,
             acquire_writer_lock=acquire_writer_lock,
         )
         return NativeCoreEngineHandle(module.CoreEngine.open(self._dumps(options)))
@@ -145,6 +147,7 @@ class NativeCoreAdapter:
         store_text: bool,
         index_text: bool,
         chunk_character_limit: int,
+        compression: bool = True,
     ) -> NativeCoreEngineHandle:
         """Opens a lock-free read-only native engine snapshot."""
 
@@ -157,6 +160,7 @@ class NativeCoreAdapter:
             store_text=store_text,
             index_text=index_text,
             chunk_character_limit=chunk_character_limit,
+            compression=compression,
         )
         return NativeCoreEngineHandle(
             module.CoreEngine.open_readonly(str(path), self._dumps(options))
@@ -202,6 +206,7 @@ class NativeCoreAdapter:
         store_text: bool,
         index_text: bool,
         chunk_character_limit: int,
+        compression: bool = True,
         acquire_writer_lock: bool = True,
     ) -> dict[str, Any]:
         return {
@@ -211,6 +216,11 @@ class NativeCoreAdapter:
             "commit_mode": str(commit_mode),
             "store_text": bool(store_text),
             "index_text": bool(index_text),
+            # Whether NEW writes to the retained document-text store are
+            # zstd-compressed. The native core records the chosen value in the
+            # text-store manifest and the persisted value wins on reopen, so this
+            # only seeds a freshly created store.
+            "compress_text": bool(compression),
             "chunk_character_limit": int(chunk_character_limit),
             # The native engine is the sole writer for a LodeDB handle, so it
             # takes the shared <dir>/.lodedb.lock single-writer lock itself. A

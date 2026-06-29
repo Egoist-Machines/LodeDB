@@ -138,6 +138,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
             raw_text: None,
             lexical_tokens: None,
             multivec: None,
+            compress_text: true,
         },
         GenerationWriteOptions::default(),
     )
@@ -175,6 +176,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
             raw_text: Some(&loaded.raw_text),
             lexical_tokens: Some(&loaded.lexical_tokens),
             multivec: None,
+            compress_text: true,
         },
         GenerationWriteOptions::default(),
     )
@@ -371,6 +373,7 @@ fn rust_generation_writer_round_trips_state_and_sidecars() {
             raw_text: Some(&raw_text),
             lexical_tokens: Some(&lexical_tokens),
             multivec: None,
+            compress_text: true,
         },
         GenerationWriteOptions::default(),
     )
@@ -398,6 +401,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
             raw_text: None,
             lexical_tokens: None,
             multivec: None,
+            compress_text: true,
         },
         GenerationWriteOptions {
             fsync: false,
@@ -427,6 +431,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
             raw_text: None,
             lexical_tokens: None,
             multivec: None,
+            compress_text: true,
         },
         GenerationWriteOptions {
             fsync: false,
@@ -453,6 +458,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
                 raw_text: None,
                 lexical_tokens: None,
                 multivec: None,
+                compress_text: true,
             },
             GenerationWriteOptions {
                 fsync: false,
@@ -546,6 +552,7 @@ fn multivec_persists_through_generation_commit() {
             raw_text: None,
             lexical_tokens: None,
             multivec: Some(&base),
+            compress_text: true,
         },
         GenerationWriteOptions::default(),
     )

@@ -175,6 +175,18 @@ pub fn checkpoint_store(
     next_generation: u64,
     fsync: bool,
 ) -> CoreResult<()> {
+    // Keep the compression the store was created with: read the persisted flag
+    // from the loaded base's text-store manifest, defaulting to compressed when
+    // the store has no `.tvtext` manifest (no text written, or a store from
+    // before the flag existed).
+    let compress_text = crate::storage::text_store::persisted_compress(
+        &crate::storage::commit_manifest::base_tvtext_path(
+            persistence_dir,
+            &store.index_key,
+            store.base_epoch,
+        ),
+    )
+    .unwrap_or(true);
     let input = crate::storage::GenerationCommitInput {
         index_key: &store.index_key,
         generation: next_generation,
@@ -184,6 +196,7 @@ pub fn checkpoint_store(
         raw_text: Some(&store.raw_text),
         lexical_tokens: Some(&store.lexical_tokens),
         multivec: Some(&store.multivec),
+        compress_text,
     };
     crate::storage::write_generation_commit(
         persistence_dir,

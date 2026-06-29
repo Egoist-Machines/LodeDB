@@ -40,6 +40,16 @@ pub struct CoreOpenOptions {
     pub commit_mode: String,
     pub store_text: bool,
     pub index_text: bool,
+    /// Whether NEW writes to the retained document-text store (``.tvtext`` base /
+    /// ``.txd`` segments) are zstd-compressed. Defaults to ``true``. This only
+    /// seeds a freshly created store: the text-store manifest records the chosen
+    /// value and the persisted value wins on reopen (see
+    /// ``text_store::persisted_compress``). Reads are unaffected (the reader
+    /// detects the zstd frame magic), so an existing store with no manifest
+    /// ``compress`` field keeps loading and a store written uncompressed reopens
+    /// uncompressed.
+    #[serde(default = "default_compress_text")]
+    pub compress_text: bool,
     #[serde(default = "default_chunk_character_limit")]
     pub chunk_character_limit: usize,
     /// Whether a writable open should take the shared single-writer lock on
@@ -54,6 +64,10 @@ pub struct CoreOpenOptions {
 
 fn default_chunk_character_limit() -> usize {
     900
+}
+
+fn default_compress_text() -> bool {
+    true
 }
 
 fn default_acquire_writer_lock() -> bool {
@@ -328,6 +342,7 @@ mod tests {
             commit_mode: "wal".to_string(),
             store_text: true,
             index_text: false,
+            compress_text: true,
             chunk_character_limit: 900,
             acquire_writer_lock: true,
         });

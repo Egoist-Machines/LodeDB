@@ -235,6 +235,10 @@ pub struct GenerationCommitInput<'a> {
     pub raw_text: Option<&'a BTreeMap<String, String>>,
     pub lexical_tokens: Option<&'a BTreeMap<String, TokenLists>>,
     pub multivec: Option<&'a MultiVecMap>,
+    /// Whether the retained document-text base is zstd-compressed. Threaded from
+    /// the engine's effective (persisted-or-seeded) flag down to
+    /// [`text_store::record_base`].
+    pub compress_text: bool,
 }
 
 pub fn write_generation_commit(
@@ -280,6 +284,7 @@ pub fn write_generation_commit(
             &base_tvtext_path(persistence_dir, input.index_key, input.base_epoch),
             raw_text,
             options.fsync,
+            input.compress_text,
         )?),
         _ => None,
     };
@@ -363,6 +368,10 @@ pub struct GenerationDeltaInput<'a> {
     /// `Some` only for late-interaction stores; the changed documents' matrices.
     pub multivec_upserts: Option<MultiVecMap>,
     pub document_deletes: Vec<String>,
+    /// Whether a new document-text delta segment is zstd-compressed. Threaded
+    /// from the engine's effective (persisted-or-seeded) flag down to
+    /// [`text_store::append_delta`].
+    pub compress_text: bool,
 }
 
 /// Appends an O(changed) generation delta onto the live base and re-seals the
@@ -467,6 +476,7 @@ pub fn write_generation_delta(
                 &input.document_deletes,
                 input.document_count_after,
                 fsync,
+                input.compress_text,
             )?)
         }
         _ => previous.store_manifest("tvtext").cloned(),

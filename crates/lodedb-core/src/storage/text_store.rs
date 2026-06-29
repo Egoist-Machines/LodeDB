@@ -1,6 +1,7 @@
 use crate::storage::util::{
-    body_sha256, corrupt, get_i64, get_str, read_json, read_maybe_zstd_json, sha256_file_hex,
-    value_object, verify_file_sha256, write_pretty_json_atomic, write_py_json_zstd, CoreResult,
+    body_sha256, corrupt, get_i64, get_str, read_json, read_json_object, read_maybe_zstd_json,
+    sha256_file_hex, value_object, verify_file_sha256, write_pretty_json_atomic, write_py_json,
+    write_py_json_zstd, CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -98,6 +99,7 @@ pub fn record_base(
     base_path: &Path,
     documents: &BTreeMap<String, String>,
     fsync: bool,
+    compress: bool,
 ) -> CoreResult<Value> {
     let body = serde_json::json!({
         "schema_version": DOCUMENT_TEXT_SCHEMA_VERSION,
@@ -108,7 +110,7 @@ pub fn record_base(
         "body_sha256": body_sha256(&body)?,
         "body": body,
     });
-    write_py_json_zstd(base_path, &payload, fsync)?;
+    write_base_payload(base_path, &payload, fsync, compress)?;
     let manifest_path = manifest_path(base_path);
     let previous = if manifest_path.is_file() {
         Some(read_json(&manifest_path, "document text manifest")?)
@@ -131,6 +133,7 @@ pub fn record_base(
     }
     let manifest = serde_json::json!({
         "schema_version": DOCUMENT_TEXT_SCHEMA_VERSION,
+        "compress": compress,
         "base": {
             "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
             "sha256": sha256_file_hex(base_path)?,
@@ -150,6 +153,7 @@ pub fn append_delta(
     deleted: &[String],
     document_count_after: usize,
     fsync: bool,
+    compress: bool,
 ) -> CoreResult<Value> {
     let manifest_path = manifest_path(base_path);
     let mut manifest = read_json(&manifest_path, "document text manifest")?;
@@ -179,7 +183,7 @@ pub fn append_delta(
         DOCUMENT_TEXT_DELTA_DIR_SUFFIX
     ));
     let segment_path = delta_dir.join(&segment_name);
-    write_py_json_zstd(&segment_path, &segment, fsync)?;
+    write_base_payload(&segment_path, &segment, fsync, compress)?;
     let deltas = manifest_object
         .entry("deltas")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -196,6 +200,38 @@ pub fn append_delta(
     manifest_object.insert("next_seq".to_string(), Value::from(sequence + 1));
     write_pretty_json_atomic(&manifest_path, &manifest, fsync)?;
     Ok(manifest)
+}
+
+/// Returns the persisted ``compress`` flag from the text-store manifest, or
+/// ``None`` when there is no manifest or it has no ``compress`` field (a store
+/// written before the flag existed). The engine seeds its effective value from
+/// the open options and lets this persisted value win on reopen, so a store
+/// keeps the compression it was created with.
+pub fn persisted_compress(base_path: &Path) -> Option<bool> {
+    let manifest_path = manifest_path(base_path);
+    if !manifest_path.is_file() {
+        return None;
+    }
+    read_json_object(&manifest_path, "document text manifest")
+        .ok()?
+        .get("compress")
+        .and_then(Value::as_bool)
+}
+
+/// Writes a text base/segment payload, zstd-compressed when ``compress`` is set
+/// (the default) or as plain canonical JSON otherwise. The read path detects the
+/// zstd frame magic, so either form loads back the same way.
+fn write_base_payload(
+    path: &Path,
+    payload: &Value,
+    fsync: bool,
+    compress: bool,
+) -> CoreResult<usize> {
+    if compress {
+        write_py_json_zstd(path, payload, fsync)
+    } else {
+        write_py_json(path, payload, fsync)
+    }
 }
 
 fn read_wrapped_document_map(
@@ -242,4 +278,85 @@ fn read_segment_body(path: &Path, schema_version: i64, context: &str) -> CoreRes
         return Err(corrupt(format!("{context} segment failed checksum")));
     }
     Ok(body.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The first bytes of a zstd frame (little-endian magic ``0xFD2FB528``).
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+    fn unique_dir(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "lodedb_text_{name}_{}_{}_{nanos}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn documents() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("doc-1".to_string(), "first body".to_string()),
+            ("doc-2".to_string(), "second body".to_string()),
+        ])
+    }
+
+    #[test]
+    fn record_base_uncompressed_round_trips_and_persists_flag() {
+        let base_path = unique_dir("uncompressed").join("g00000001.tvtext");
+        let documents = documents();
+
+        let manifest = record_base(&base_path, &documents, false, false).expect("record base");
+
+        // The on-disk base is plain canonical JSON (no zstd frame magic).
+        let raw = fs::read(&base_path).expect("read base");
+        assert!(
+            !raw.starts_with(&ZSTD_MAGIC),
+            "uncompressed base must not start with the zstd magic"
+        );
+
+        // The persisted flag is readable and reflects the uncompressed write.
+        assert_eq!(persisted_compress(&base_path), Some(false));
+        assert_eq!(
+            manifest.get("compress").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // The uncompressed base loads back to the same documents.
+        let loaded = load(&base_path, Some(&manifest)).expect("load base");
+        assert_eq!(loaded, documents);
+    }
+
+    #[test]
+    fn record_base_compressed_writes_zstd_and_persists_flag() {
+        let base_path = unique_dir("compressed").join("g00000001.tvtext");
+        let documents = documents();
+
+        let manifest = record_base(&base_path, &documents, false, true).expect("record base");
+
+        let raw = fs::read(&base_path).expect("read base");
+        assert!(
+            raw.starts_with(&ZSTD_MAGIC),
+            "compressed base must start with the zstd magic"
+        );
+        assert_eq!(persisted_compress(&base_path), Some(true));
+        let loaded = load(&base_path, Some(&manifest)).expect("load base");
+        assert_eq!(loaded, documents);
+    }
+
+    #[test]
+    fn persisted_compress_is_none_without_a_manifest() {
+        let base_path = unique_dir("no_manifest").join("g00000001.tvtext");
+        assert_eq!(persisted_compress(&base_path), None);
+    }
 }
