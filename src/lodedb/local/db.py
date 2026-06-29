@@ -1175,7 +1175,15 @@ class LodeDB:
                 # decref lands here, on the thread that created it.
                 if holder:
                     engine = holder.pop()
-                    engine.close()
+                    try:
+                        engine.close()
+                    finally:
+                        # Drop the unsendable native handle here on the home
+                        # worker even if close() raised: otherwise it stays
+                        # reachable through the raised exception's traceback and
+                        # is decref'd on the calling thread, which panics (the
+                        # handle is thread-confined).
+                        engine._engine = None
 
             native_close_error: Exception | None = None
             try:

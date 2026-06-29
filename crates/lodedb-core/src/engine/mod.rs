@@ -1817,49 +1817,54 @@ struct PersistenceState {
 
 #[derive(Debug)]
 struct PersistentLock {
-    // The BSD advisory lock is released when this descriptor is dropped (closed);
-    // the sentinel file is intentionally left in place, matching the Python lock.
+    // Dropping this handle releases the lock (the unix flock, or the Windows
+    // exclusive share-mode hold); the sentinel file is intentionally left in
+    // place, matching the Python lock.
     _file: File,
 }
 
+/// Outcome of one non-blocking attempt to take the writer lock.
+enum TryLock {
+    /// Another writer holds the sentinel; retry until the timeout elapses.
+    Contended,
+    /// A failure that retrying will not resolve.
+    Fatal(CoreError),
+}
+
+/// Opens (creating if needed) the lock sentinel without taking the lock. Used by
+/// platforms that lock in a separate step after the open; Windows instead opens
+/// with an exclusive share mode, so it does not use this.
+#[cfg(not(windows))]
+fn open_sentinel(lock_path: &Path) -> Result<File, CoreError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|error| {
+            CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                format!("could not open writer lock {}: {error}", lock_path.display()),
+            )
+        })
+}
+
 impl PersistentLock {
-    /// Takes the shared single-writer lock on ``<dir>/.lodedb.lock`` — the same
-    /// sentinel and BSD advisory-lock mechanism the Python writer uses
-    /// (``fcntl.flock(LOCK_EX|LOCK_NB)``), so a standalone native/FFI/Swift writer
-    /// contends with a Python writer (and another native writer) across processes.
-    /// The lock releases when the file descriptor is dropped; the sentinel file is
-    /// left in place, matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
+    /// Takes the single-writer lock on ``<dir>/.lodedb.lock`` — the same sentinel
+    /// the Python writer uses, so a native/FFI/Swift writer contends with a Python
+    /// writer (and another native writer) across processes. Unix takes a BSD
+    /// advisory lock (``flock(LOCK_EX|LOCK_NB)``); Windows opens the sentinel with
+    /// an exclusive share mode a second open cannot share. Either way the lock
+    /// releases when the handle is dropped and the sentinel file is left in place,
+    /// matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
     fn acquire(path: &Path) -> Result<Self, CoreError> {
         let lock_path = path.join(".lodedb.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| {
-                CoreError::new(
-                    CoreErrorCode::InvalidArgument,
-                    format!(
-                        "could not open writer lock {}: {error}",
-                        lock_path.display()
-                    ),
-                )
-            })?;
-        Self::lock_blocking(&file)?;
-        Ok(Self { _file: file })
-    }
-
-    #[cfg(unix)]
-    fn lock_blocking(file: &File) -> Result<(), CoreError> {
-        use rustix::fs::{flock, FlockOperation};
         let deadline = Instant::now() + Duration::from_secs_f64(lock_timeout_seconds());
         loop {
-            match flock(file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(()),
-                Err(err)
-                    if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
-                {
+            match Self::try_lock(&lock_path) {
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(TryLock::Contended) => {
                     if Instant::now() >= deadline {
                         return Err(CoreError::new(
                             CoreErrorCode::InvalidArgument,
@@ -1868,23 +1873,68 @@ impl PersistentLock {
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(err) => {
-                    return Err(CoreError::new(
-                        CoreErrorCode::InvalidArgument,
-                        format!("could not acquire writer lock: {err}"),
-                    ));
-                }
+                Err(TryLock::Fatal(err)) => return Err(err),
             }
         }
     }
 
-    // Non-unix platforms do not have BSD flock; the Python SDK opens its native
-    // engine with acquire_writer_lock=false (Python's own lock guards the store),
-    // so this path only affects standalone non-unix native writers, which are not
-    // a current target. Opening the sentinel is enough to keep behaviour uniform.
-    #[cfg(not(unix))]
-    fn lock_blocking(_file: &File) -> Result<(), CoreError> {
-        Ok(())
+    /// One non-blocking attempt to open and exclusively lock the sentinel.
+    #[cfg(unix)]
+    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+        use rustix::fs::{flock, FlockOperation};
+        let file = open_sentinel(lock_path).map_err(TryLock::Fatal)?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(file),
+            Err(err)
+                if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
+            {
+                Err(TryLock::Contended)
+            }
+            Err(err) => Err(TryLock::Fatal(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                format!("could not acquire writer lock: {err}"),
+            ))),
+        }
+    }
+
+    /// Windows has no BSD flock; an exclusive (no-sharing) open of the sentinel is
+    /// the equivalent. A second writer's open fails with ``ERROR_SHARING_VIOLATION``
+    /// until the holding handle drops on close or process exit.
+    #[cfg(windows)]
+    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(lock_path)
+        {
+            Ok(file) => Ok(file),
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+                ) =>
+            {
+                Err(TryLock::Contended)
+            }
+            Err(err) => Err(TryLock::Fatal(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                format!("could not open writer lock {}: {err}", lock_path.display()),
+            ))),
+        }
+    }
+
+    // Other platforms have neither flock nor Windows share modes; opening the
+    // sentinel keeps behaviour uniform (no cross-process exclusion, but these are
+    // not a multi-writer target).
+    #[cfg(not(any(unix, windows)))]
+    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+        open_sentinel(lock_path).map_err(TryLock::Fatal)
     }
 }
 
