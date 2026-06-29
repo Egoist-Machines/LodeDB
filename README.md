@@ -7,8 +7,7 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're a
-strong **drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
+LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
 compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
 about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
 documents, per framework default:
@@ -18,7 +17,7 @@ documents, per framework default:
 | On-disk footprint | **7.4× smaller** (27 vs 199 MB) | **5.4× smaller** (27 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
 | Single-query p50 (CPU) | **~540× faster** (0.43 vs 234 ms) | **~570× faster** (0.43 vs 247 ms) | **~47× faster** (0.56 vs 27 ms) |
 | Batched retrieval, 64 (GPU) | **~2,630×** (11,650 vs ~4 qps) | **~2,810×** (11,326 vs ~4 qps) | **~139×** (5,052 vs 36 qps) |
-| Durable add of one memory | **~24,000× faster** (0.27 ms vs 6.5 s) | **~55,000× faster** (0.25 ms vs 13.9 s) | 0.27 vs 0.41 ms (both sub-ms) |
+| Durable add of one memory | **~24,000× faster** (0.27 ms vs 6.5 s) | **~55,000× faster** (0.25 ms vs 13.9 s) | **0.27** vs 0.41 ms (both sub-ms) |
 
 Among embedded stores, LodeDB has the smallest footprint and the fastest single-query and batched
 search, and its durable add leads the fastest lazy-append stores
@@ -33,7 +32,7 @@ search, and its durable add leads the fastest lazy-append stores
 | lancedb | 3.42 ms | 10.6 ms | 10.3 ms | 35 MB |
 | chroma | 5.96 ms | 3.11 ms | 3.12 ms | 144 MB |
 
-[Full benchmark, all backends
+All numbers are reported as the mean of 3 independent runs on a L40S server. [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
 > **Like what you see?** Point the coding assistant in your project at
