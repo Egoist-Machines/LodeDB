@@ -5,39 +5,27 @@ existing stores stable.
 
 ## Current Runtime State
 
-- `LODEDB_NATIVE_CORE=on` is the default.
-- Fresh vector-only handles (`LodeDB.open_vector_store(...)`) execute vector queries through the
-  native `CoreEngine` when the bundled extension is available and the native handle covers all
-  in-memory mutations for that handle.
-- Fresh text handles in `LODEDB_NATIVE_CORE=on` mirror prepare/apply into a covered native
-  in-memory text index and can return native lexical/hybrid/vector text query results after
-  Python/Rust parity succeeds. Python remains the durable writer unless native write-through is
-  explicitly enabled.
-- Python remains the durable oracle. Vector mutations still commit through the existing Python
-  engine, and persisted stores open without migration.
-- Existing vector-only stores can seed covered native query state from the committed on-disk
-  snapshot. Writable handles invalidate that read-only seed on the first mutation and fall back to
-  Python unless explicit native write-through owns the native writer.
-- Existing text stores can also seed native query state from committed vector sidecars. When
-  `index_text=True`, Rust uses the committed lexical sidecar; otherwise, retained raw text
-  (`store_text=True`) is re-chunked with the handle's configured chunk limit, matching Python's
-  raw-text BM25 rebuild strategy.
-- `LODEDB_NATIVE_CORE=off` remains available for one deprecation cycle.
-- `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative while checking native parity on covered
-  vector-only handles.
-- `LODEDB_NATIVE_CORE_WRITE=on` is available for explicit fresh and seedable existing vector-only
-  and text stores in WAL or generation mode; Rust writes compatible WAL/generation artifacts that
-  Python can reopen. Existing stores with neither retained raw text nor lexical sidecars still
-  remain on the Python oracle for text query coverage.
-- Inside `lodedb-core`, WAL-mode persistent engines can append and replay native-authored vector,
-  delete, and embedded-text records, then checkpoint them into generation artifacts. Python
-  rollout enables fresh vector and text WAL write-through; mixed Python/native text WAL replay is
-  idempotent for repeated embedded chunk rows.
+LodeDB runs entirely on the native Rust `CoreEngine`; the Python engine and its `LodeIndex`
+facade have been removed. Each handle opens one native engine on a dedicated worker thread
+(the engine is thread-confined) and routes every read and write through it, so a handle shared
+across threads serializes onto that worker. Embedding stays in Python: the SDK embeds, the
+native core stores and scores.
+
+- The native engine is the sole reader and writer. A writable handle takes the cross-process
+  single-writer lock on `<dir>/.lodedb.lock`; a second writer surfaces as `ConcurrentWriterError`.
+  Read-only handles open lock-free.
+- Vector, batch vector, text, lexical (BM25), hybrid (BM25 + RRF), filtered, payload, and
+  enumeration reads (`get`/`get_texts`/`get_document`/`list_documents`, with `after`/`limit`
+  keyset paging) all resolve natively. `search_many` shares one native batched scan.
+- Reopen enforces the persisted index identity (model, provider, task, dimension, storage
+  profile, bit width); a mismatch fails closed.
+- WAL and generation commit modes are native. A native-authored leftover WAL is replayed on the
+  next open; a generation-mode reopen folds a leftover WAL via a transient WAL-mode open.
 - Rust storage loads committed `.tvim` bases plus committed `.tvd` delta segments through the
-  same TurboVec encoded-row replay strategy as Python.
-- Covered native Python handles can serve `get`, `get_texts`, `get_document`, and
-  `list_documents` from Rust in `LODEDB_NATIVE_CORE=on`; shadow/default fallback still keeps the
-  Python store as oracle when native coverage is absent or fails closed.
+  TurboVec encoded-row replay strategy.
+- The `LODEDB_NATIVE_CORE` off/shadow modes, `LODEDB_NATIVE_CORE_WRITE`,
+  `LODEDB_NATIVE_CORE_STRICT_PARITY`, and the Python-side MPS / GPU-direct resident-scan knobs are
+  removed. Acceleration is native NEON plus the optional native CUDA scan (`crates/lodedb-gpu`).
 
 ## Swift / iOS Binding State
 
@@ -57,22 +45,23 @@ existing stores stable.
   `LodeDBCoreFFI.xcframework.zip`, and attaches it to tagged GitHub Releases alongside the
   Python wheels and sdist.
 
-## Removal Gate For Python Runtime Paths
+## Python Engine Removed
 
-Do not remove the Python engine oracle from the runtime package until all of these are true:
+The Python engine oracle and the `LodeIndex` facade have been removed; the native Rust
+`CoreEngine` is the sole engine (see "Current Runtime State"). The gate's parity,
+text-orchestration, query-assembly, and benchmark conditions were met: the full suite passes
+under `LODEDB_NATIVE_CORE_STRICT_PARITY=1` (both engines cross-checked) with the native result
+matching on every functional test before the Python engine was removed.
 
-- Native storage can load existing generation, WAL, text, lexical, and vector sidecars with exact
-  query parity.
-- Native text prepare/apply can replace Python text mutation orchestration while bindings keep
-  embeddings outside the core.
-- Native query assembly covers vector, batch vector, lexical, hybrid, filters, and metadata
-  inclusion for existing stores.
-- Golden fixtures and differential tests cover v0.4 generation, WAL, raw-text, lexical-text, and
-  legacy top-level JSON stores.
-- Benchmarks show no unacceptable regression on the performance gates in `GOAL.md`.
+Two pre-native store states are not covered native-only and form a migration boundary; open
+such a store with a pre-removal release to re-checkpoint it into the native layout before
+upgrading:
 
-Until then, Python engine paths are intentionally retained as compatibility and persistence
-fallbacks rather than archived.
+- Pre-commit-manifest v0.4 stores (the legacy top-level `<key>.json` layout): the native loader
+  reads `<key>.commit.json` generation manifests only.
+- A leftover pre-native text-ingest WAL (`upsert_documents` records): the native core cannot
+  re-embed during recovery, so it fails closed with the WAL left intact (no data loss) rather
+  than replaying it.
 
 ## Current Performance Gate Snapshot
 
