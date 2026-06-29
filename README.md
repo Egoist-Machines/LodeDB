@@ -14,7 +14,7 @@ documents, per framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
-| On-disk footprint | **7.4× smaller** (27 vs 199 MB) | **5.4× smaller** (27 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
+| On-disk footprint | **13.6× smaller** (15 vs 199 MB) | **9.9× smaller** (15 vs 145 MB) | **5.7× smaller** (12 vs 70 MB) |
 | Single-query p50 (CPU) | **~540× faster** (0.43 vs 234 ms) | **~570× faster** (0.43 vs 247 ms) | **~47× faster** (0.56 vs 27 ms) |
 | Batched retrieval, 64 (GPU) | **~2,630×** (11,650 vs ~4 qps) | **~2,810×** (11,326 vs ~4 qps) | **~139×** (5,052 vs 36 qps) |
 | Durable add of one memory | **~24,000× faster** (0.27 ms vs 6.5 s) | **~55,000× faster** (0.25 ms vs 13.9 s) | **0.27** vs 0.41 ms (both sub-ms) |
@@ -25,7 +25,7 @@ search, and its durable add leads the fastest lazy-append stores
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
-| **LodeDB** | **0.27 ms** | **0.43 ms** | **0.09 ms** | **27 MB** |
+| **LodeDB** | **0.27 ms** | **0.43 ms** | **0.09 ms** | **15 MB** |
 | sqlite-vec | 0.40 ms | 29.3 ms | 26.7 ms | 96 MB |
 | qdrant | 0.46 ms | 14.3 ms | 14.5 ms | 81 MB |
 | pgvector | 2.44 ms | 34.2 ms | 32.4 ms | 48 MB |
