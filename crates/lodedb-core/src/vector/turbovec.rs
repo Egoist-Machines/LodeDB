@@ -366,6 +366,44 @@ impl TurboVecNativeIndex {
         state.build_failed = false;
     }
 
+    /// Patches the resident GPU session in place for a set of in-place row updates.
+    ///
+    /// Called only when an upsert overwrote existing rows without appending, so each
+    /// changed id keeps its slot. Reconstructs just those rows (`O(changed)`) and
+    /// patches them into the resident buffer, avoiding a full rebuild. Any obstacle
+    /// (no live session, missing rotation, a reconstruct or device error) drops the
+    /// session so the next eligible query rebuilds it. The immutable index reads run
+    /// before the `gpu` borrow so the two never overlap.
+    fn patch_gpu_session(&self, updated_ids: &[u64]) {
+        if updated_ids.is_empty() {
+            return;
+        }
+        // Nothing resident yet means the next query builds fresh; do not pay for a
+        // reconstruct we would only throw away.
+        if self.gpu.borrow().session.is_none() {
+            return;
+        }
+        let Some(rotation) = self.index.rotation_matrix() else {
+            self.invalidate_gpu_session();
+            return;
+        };
+        let rows = match self.index.reconstruct_rows(updated_ids) {
+            Ok(rows) => rows,
+            Err(_) => {
+                self.invalidate_gpu_session();
+                return;
+            }
+        };
+        let mut state = self.gpu.borrow_mut();
+        let Some(session) = state.session.as_mut() else {
+            return;
+        };
+        if session.patch(updated_ids, &rows, &rotation).is_err() {
+            state.session = None;
+            state.build_failed = false;
+        }
+    }
+
     /// Returns active stable ids for chunk ids, filtering absent chunks.
     pub fn stable_ids_for_chunks(&self, chunk_ids: &[String]) -> Vec<u64> {
         let mut seen = BTreeSet::new();
@@ -397,7 +435,8 @@ impl TurboVecNativeIndex {
             .map(|chunk| chunk.chunk_id.clone())
             .collect::<Vec<_>>();
         let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
-        self.index
+        let (_replaced, appended) = self
+            .index
             .upsert_with_ids_2d(&embeddings, self.dim, &stable_ids)
             .map_err(core_error)?;
         for (stable_id, chunk) in stable_ids.iter().zip(chunks) {
@@ -408,7 +447,15 @@ impl TurboVecNativeIndex {
             self.stable_id_by_chunk_id
                 .insert(chunk.chunk_id.clone(), *stable_id);
         }
-        self.invalidate_gpu_session();
+        if appended == 0 {
+            // Pure in-place update: existing rows keep their slots, so patch only
+            // the changed rows on the GPU instead of rebuilding the whole session.
+            self.patch_gpu_session(&stable_ids);
+        } else {
+            // New rows extend the corpus (and grow the resident buffer), so drop the
+            // session and let the next eligible query rebuild it.
+            self.invalidate_gpu_session();
+        }
         Ok(())
     }
 

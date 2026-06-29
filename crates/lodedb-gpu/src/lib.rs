@@ -31,7 +31,7 @@
 //! error the caller turns into a CPU fallback.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cudarc::cublas::sys::cublasOperation_t;
@@ -44,13 +44,22 @@ use cudarc::nvrtc::compile_ptx;
 /// shared-memory reduction.
 const TOPK_BLOCK: u32 = 256;
 
-/// Exact per-query top-k over a dense `batch x corpus` score matrix.
+/// Threads per block for the scatter (in-place patch) kernel.
+const SCATTER_BLOCK: u32 = 256;
+
+/// The CUDA kernels compiled into the session's module.
 ///
-/// One block scores one query: each pass finds the block-wide argmax of its score
-/// row with a shared-memory reduction (ties resolve to the lower slot), records it
-/// in descending order, then masks it to the sentinel for the next pass. `k` is
-/// bounded by the corpus size by the caller, so every pass finds a real row.
-const TOPK_KERNEL: &str = r#"
+/// `topk_argmax` is the exact per-query top-k over a dense `batch x corpus` score
+/// matrix: one block scores one query, each pass finds the block-wide argmax of
+/// its score row with a shared-memory reduction (ties resolve to the lower slot),
+/// records it in descending order, then masks it to the sentinel for the next
+/// pass. `k` is bounded by the corpus size by the caller, so every pass finds a
+/// real row.
+///
+/// `scatter_rows` writes `c` already-baked rows into the resident row buffer at
+/// arbitrary slots, so an in-place patch touches only the changed rows. One
+/// thread copies one element: `dst[slots[i]*dim + d] = baked[i*dim + d]`.
+const KERNELS: &str = r#"
 #define NEG_SENTINEL (-3.4028234e38f)
 extern "C" __global__ void topk_argmax(
     float* scores,
@@ -97,6 +106,21 @@ extern "C" __global__ void topk_argmax(
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void scatter_rows(
+    const float* baked,
+    const unsigned int* slots,
+    float* dst,
+    const int c,
+    const int dim)
+{
+    size_t tid = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t total = (size_t)c * (size_t)dim;
+    if (tid >= total) return;
+    size_t i = tid / (size_t)dim;
+    size_t d = tid % (size_t)dim;
+    dst[(size_t)slots[i] * (size_t)dim + d] = baked[i * (size_t)dim + d];
 }
 "#;
 
@@ -167,13 +191,19 @@ struct GpuScratch {
 pub struct GpuScanSession {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
-    // Keeps the loaded module alive for as long as `func` references it.
+    // Keeps the loaded module alive for as long as `func`/`scatter_func` reference it.
     _module: Arc<CudaModule>,
     func: CudaFunction,
+    // Scatters baked rows into `rows_dev` at given slots for an in-place patch.
+    scatter_func: CudaFunction,
     // Resident rows pre-multiplied by the rotation (rows @ rotation), so queries
     // are scored raw (no per-query rotation). See `build_inner`.
     rows_dev: CudaSlice<f32>,
     stable_ids: Vec<u64>,
+    // Reverse of `stable_ids` (id -> slot), so an in-place patch resolves the
+    // resident slot of each changed id in O(1). Stays valid across in-place
+    // updates (which keep ids at their slots) and is rebuilt with the session.
+    slot_by_id: HashMap<u64, usize>,
     dim: usize,
     n: usize,
     // Device scratch reused across calls, keyed by (nq, k). Interior mutability so
@@ -288,7 +318,7 @@ impl GpuScanSession {
         drop(recon_dev);
         drop(rotation_dev);
 
-        let ptx = compile_ptx(TOPK_KERNEL)
+        let ptx = compile_ptx(KERNELS)
             .map_err(|err| GpuScanError::Device(format!("nvrtc compile failed: {err}")))?;
         let module = ctx
             .load_module(ptx)
@@ -296,6 +326,19 @@ impl GpuScanSession {
         let func = module
             .load_function("topk_argmax")
             .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let scatter_func = module
+            .load_function("scatter_rows")
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        // Reverse map for O(1) slot resolution during a patch. Slot order is the
+        // index's slot order, which is unique by construction; guard anyway.
+        let mut slot_by_id = HashMap::with_capacity(n);
+        for (slot, &id) in stable_ids.iter().enumerate() {
+            if slot_by_id.insert(id, slot).is_some() {
+                return Err(GpuScanError::Invalid(format!(
+                    "duplicate stable id {id} among session rows"
+                )));
+            }
+        }
         if debug_enabled() {
             eprintln!("lodedb_gpu: resident GPU session built (rows={n}, dim={dim})");
         }
@@ -304,8 +347,10 @@ impl GpuScanSession {
             blas,
             _module: module,
             func,
+            scatter_func,
             rows_dev,
             stable_ids: stable_ids.to_vec(),
+            slot_by_id,
             dim,
             n,
             scratch: RefCell::new(HashMap::new()),
@@ -320,6 +365,157 @@ impl GpuScanSession {
     /// Whether the session holds no rows (never true for a built session).
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Patches the resident rows for a set of already-present ids, in place.
+    ///
+    /// `ids` are stable ids that must already be resident (an upsert that only
+    /// overwrote existing rows leaves their slots unchanged); `rows` is the flat
+    /// `[ids.len() * dim]` buffer of their freshly reconstructed calibrated rows (as
+    /// from `IdMapIndex::reconstruct_rows`), and `rotation` the `[dim * dim]`
+    /// row-major rotation. Only the changed rows are re-baked and written, so the
+    /// cost is `O(changed)` rather than a full rebuild. Returns
+    /// [`GpuScanError::Invalid`] (the caller rebuilds the session) when an id is not
+    /// resident, ids resolve to duplicate slots, or shapes disagree, and
+    /// [`GpuScanError::Device`] on a CUDA failure.
+    pub fn patch(
+        &mut self,
+        ids: &[u64],
+        rows: &[f32],
+        rotation: &[f32],
+    ) -> Result<(), GpuScanError> {
+        // A built session has already loaded its CUDA libraries, so a panic is not
+        // expected, but a patch must never crash the host; a panic fails the patch
+        // and the caller rebuilds the session from scratch.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.patch_inner(ids, rows, rotation)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(GpuScanError::Device("CUDA patch panicked; rebuild session".into())),
+        }
+    }
+
+    fn patch_inner(
+        &mut self,
+        ids: &[u64],
+        rows: &[f32],
+        rotation: &[f32],
+    ) -> Result<(), GpuScanError> {
+        let c = ids.len();
+        if c == 0 {
+            return Err(GpuScanError::Invalid("patch needs at least one row".into()));
+        }
+        let elems = c
+            .checked_mul(self.dim)
+            .ok_or_else(|| GpuScanError::Invalid("patch row count overflow".into()))?;
+        if rows.len() != elems {
+            return Err(GpuScanError::Invalid(format!(
+                "rows length {} does not match ids*dim {}",
+                rows.len(),
+                elems
+            )));
+        }
+        let rot_elems = self
+            .dim
+            .checked_mul(self.dim)
+            .ok_or_else(|| GpuScanError::Invalid("rotation size overflow".into()))?;
+        if rotation.len() != rot_elems {
+            return Err(GpuScanError::Invalid(format!(
+                "rotation length {} does not match dim*dim {}",
+                rotation.len(),
+                rot_elems
+            )));
+        }
+        // Resolve each id to its resident slot, rejecting unknown ids and duplicate
+        // slots (duplicate destinations would race in the scatter kernel).
+        let mut slots = Vec::with_capacity(c);
+        let mut seen = HashSet::with_capacity(c);
+        for &id in ids {
+            let slot = *self
+                .slot_by_id
+                .get(&id)
+                .ok_or_else(|| GpuScanError::Invalid(format!("patch id {id} is not resident")))?;
+            if !seen.insert(slot) {
+                return Err(GpuScanError::Invalid(
+                    "patch ids resolve to duplicate slots".into(),
+                ));
+            }
+            slots.push(
+                u32::try_from(slot)
+                    .map_err(|_| GpuScanError::Invalid("resident slot exceeds u32".into()))?,
+            );
+        }
+        let c_i32 =
+            i32::try_from(c).map_err(|_| GpuScanError::Invalid("patch rows exceed i32".into()))?;
+        let dim_i32 = i32::try_from(self.dim)
+            .map_err(|_| GpuScanError::Invalid("dim exceeds i32".into()))?;
+        let total = u32::try_from(elems)
+            .map_err(|_| GpuScanError::Invalid("patch elements exceed u32".into()))?;
+
+        // Upload the changed rows + rotation, then bake `rows @ rotation` into a
+        // contiguous temp with the SAME column-major GEMM as `build_inner` (n = c),
+        // so `baked[i*dim + d]` matches the resident `rows_dev` row-major layout.
+        let raw_dev = self
+            .stream
+            .clone_htod(rows)
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let rotation_dev = self
+            .stream
+            .clone_htod(rotation)
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let mut baked_dev = self
+            .stream
+            .alloc_zeros::<f32>(elems)
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let bake = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: dim_i32,
+            n: c_i32,
+            k: dim_i32,
+            alpha: 1.0f32,
+            lda: dim_i32,
+            ldb: dim_i32,
+            beta: 0.0f32,
+            ldc: dim_i32,
+        };
+        // SAFETY: rotation_dev is dim*dim, raw_dev is c*dim, baked_dev is c*dim; the
+        // GEMM result is consumed by the scatter launch + synchronize below before
+        // the transient inputs drop.
+        unsafe { self.blas.gemm(bake, &rotation_dev, &raw_dev, &mut baked_dev) }
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+
+        let slots_dev = self
+            .stream
+            .clone_htod(slots.as_slice())
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        // ceil(total / SCATTER_BLOCK) without `div_ceil` (MSRV 1.70) or overflow.
+        let grid = (total / SCATTER_BLOCK) + u32::from(total % SCATTER_BLOCK != 0);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (SCATTER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.stream.launch_builder(&self.scatter_func);
+        builder
+            .arg(&baked_dev)
+            .arg(&slots_dev)
+            .arg(&mut self.rows_dev)
+            .arg(&c_i32)
+            .arg(&dim_i32);
+        // SAFETY: the kernel writes only `dst[slots[i]*dim + d]` for i in 0..c and
+        // d in 0..dim; every slot is < self.n (resolved via slot_by_id) and unique,
+        // so all writes land in distinct, in-bounds elements of rows_dev (n*dim);
+        // baked_dev is c*dim and slots_dev is c, matching the bound c/dim scalars.
+        unsafe { builder.launch(cfg) }
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        if debug_enabled() {
+            eprintln!("lodedb_gpu: patched {c} resident row(s) in place");
+        }
+        Ok(())
     }
 
     /// Scores a query batch and returns flat `[nq * k]` `(scores, stable_ids)`.
@@ -618,6 +814,58 @@ mod tests {
                     ids[q * k + j]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gpu_patch_matches_rebuild() {
+        // An in-place patch of a subset of rows must leave the session scoring
+        // identically to a session freshly built over the same patched corpus.
+        // Runs only where a CUDA driver is present; a no-op elsewhere (CI/macOS).
+        if !cuda_runtime_available() {
+            eprintln!("skipping gpu_patch_matches_rebuild: no CUDA runtime");
+            return;
+        }
+        let (n, dim, nq, k) = (256usize, 64usize, 6usize, 8usize);
+        let rows = pseudo_fill(n * dim, 0x0f0f_1111);
+        let rotation = pseudo_fill(dim * dim, 0x2222_3333);
+        let queries = pseudo_fill(nq * dim, 0x4444_5555);
+        let stable_ids: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(2_654_435_761) | 1).collect();
+
+        let mut session = GpuScanSession::build(&rows, &stable_ids, &rotation, dim)
+            .expect("session build on a CUDA host");
+
+        // Fresh content for a scattered subset of slots (boundaries included).
+        let changed_slots = [0usize, 7, 63, 128, 200, 255];
+        let changed_ids: Vec<u64> = changed_slots.iter().map(|&slot| stable_ids[slot]).collect();
+        let new_rows = pseudo_fill(changed_slots.len() * dim, 0x6666_7777);
+
+        // Reference: the whole corpus with the same edits applied, built from scratch.
+        let mut patched_rows = rows.clone();
+        for (i, &slot) in changed_slots.iter().enumerate() {
+            patched_rows[slot * dim..(slot + 1) * dim]
+                .copy_from_slice(&new_rows[i * dim..(i + 1) * dim]);
+        }
+        let rebuilt = GpuScanSession::build(&patched_rows, &stable_ids, &rotation, dim)
+            .expect("rebuild on a CUDA host");
+
+        // Patch the live session in place; it must then agree with the rebuild.
+        session
+            .patch(&changed_ids, &new_rows, &rotation)
+            .expect("in-place patch on a CUDA host");
+
+        let (patched_scores, patched_ids) =
+            session.search(&queries, nq, k).expect("patched search");
+        let (rebuilt_scores, rebuilt_ids) =
+            rebuilt.search(&queries, nq, k).expect("rebuilt search");
+        assert_eq!(patched_ids, rebuilt_ids, "patched ranking != rebuilt ranking");
+        for (patched, rebuilt) in patched_scores.iter().zip(&rebuilt_scores) {
+            let tol = 1e-3 * rebuilt.abs().max(1.0);
+            assert!(
+                (patched - rebuilt).abs() <= tol,
+                "patched score {patched} != rebuilt score {rebuilt}"
+            );
         }
     }
 }
