@@ -3,7 +3,6 @@ members = [
   "crates/lodedb-core",
   "crates/lodedb-ffi",
   "crates/lodedb-gpu",
-  "crates/lodedb-python",
 ]
 resolver = "2"
 
