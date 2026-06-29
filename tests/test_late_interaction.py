@@ -3,9 +3,9 @@
 These run fully offline: documents and queries are supplied as precomputed patch
 matrices (a deterministic fake encoder stands in for ColPali on the
 encoder-convenience path), so no model is downloaded. They exercise the
-one-row-per-document storage layout, the float16/float32/int8 precisions, the
-exact-MaxSim retrieval paths (resident, filtered, streaming), durability across
-reopen, metadata filtering, and the read-only / validation contracts.
+one-row-per-document storage layout, the float16/float32/int8 precisions, native
+exact-MaxSim retrieval (including metadata-filtered queries), durability across
+reopen, concurrent shared-handle access, and the read-only / validation contracts.
 
 The patch dimension is a multiple of 8 because the TurboVec store requires it.
 """
@@ -17,11 +17,6 @@ import pytest
 
 import lodedb.local.late_interaction as li_module
 from lodedb import LodeLateInteractionHit, LodeLateInteractionIndex, ReadOnlyError
-from lodedb.local.late_interaction import (
-    _maxsim,
-    _maxsim_batch,
-    _resolve_native_maxsim,
-)
 
 DIM = 16
 
@@ -137,18 +132,6 @@ def test_resident_and_streaming_paths_agree(tmp_path):
         assert a.score == pytest.approx(b.score, abs=1e-4)
 
 
-def test_resident_budget_falls_back_to_streaming(tmp_path):
-    # A tiny resident budget under "auto" forces the streaming path, still correct.
-    idx = LodeLateInteractionIndex(
-        tmp_path, dim=DIM, resident="auto", resident_max_bytes=1
-    )
-    idx.add_document("doc-a", _onehot_matrix([0, 1]))
-    idx.add_document("doc-b", _onehot_matrix([5, 6]))
-    assert idx._resident_snapshot() is None  # over budget -> streaming
-    hits = idx.search(_onehot_matrix([0]), k=1)
-    assert hits[0].id == "doc-a"
-
-
 def test_resident_cache_reflects_incremental_writes(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     idx.add_document("doc-a", _onehot_matrix([0, 1]))
@@ -193,66 +176,6 @@ def test_incremental_cache_matches_fresh_rebuild(tmp_path):
         assert [h.id for h in live_hits] == [h.id for h in fresh_hits]
         for a, b in zip(live_hits, fresh_hits, strict=True):
             assert a.score == pytest.approx(b.score, abs=1e-4)
-
-
-def test_incremental_compaction_folds_pending(tmp_path):
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    idx.add_document("a", _onehot_matrix([0, 1]))
-    idx.search(_onehot_matrix([0]), k=1)  # build cache
-    idx.add_document("b", _onehot_matrix([5]))  # goes to pending
-    idx.add_document("a", _onehot_matrix([2]))  # replace -> tombstone + pending
-    cache = idx._resident_cache
-    idx._cache_compact(cache)  # idempotent if an auto-compaction already ran
-    assert cache["pending"] == [] and cache["removed"] == set()
-    assert cache["removed_patches"] == 0
-    assert set(cache["ids"]) == {"a", "b"}
-    # Results still correct after compaction: "a" now matches dim 2, not 0/1.
-    assert idx.search(_onehot_matrix([2]), k=1)[0].id == "a"
-    assert idx.search(_onehot_matrix([5]), k=1)[0].id == "b"
-    assert {h.id for h in idx.search(_onehot_matrix([0]), k=5)} == {"a", "b"}
-
-
-def test_replace_base_resident_doc_visible_before_compaction(tmp_path):
-    # Replacing (or remove-then-readd of) a document that is already in the
-    # resident BASE must keep the replacement visible immediately -- the tombstone
-    # masks only the base copy, not the pending replacement.
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    idx.add_document("a", _onehot_matrix([0]))
-    idx.add_document("b", _onehot_matrix([5]))
-    idx.search(_onehot_matrix([0]), k=2)  # build the resident base with a and b
-    idx.add_document("a", _onehot_matrix([2]))  # replace base doc a (-> tombstone + pending)
-    cache = idx._resident_cache
-    assert "a" in cache["removed"] and "a" in cache["pending_ids"]  # pre-compaction state
-
-    # a must now match dim 2 (its new content), via the pending replacement.
-    single = idx.search(_onehot_matrix([2]), k=2)
-    assert single[0].id == "a" and single[0].score == pytest.approx(1.0, abs=1e-3)
-    assert {h.id for h in idx.search(_onehot_matrix([2]), k=5)} == {"a", "b"}
-    batched = idx.search_many([_onehot_matrix([2])], k=5)[0]
-    assert {h.id for h in batched} == {"a", "b"}
-    assert next(h for h in batched if h.id == "a").score == pytest.approx(1.0, abs=1e-3)
-
-    # Remove-then-readd of a base doc is likewise immediately visible.
-    idx.remove("b")
-    idx.add_document("b", _onehot_matrix([7]))
-    assert idx.search(_onehot_matrix([7]), k=1)[0].id == "b"
-
-
-def test_deletes_compact_resident_base(tmp_path, monkeypatch):
-    # Pure deletes must reclaim tombstoned base rows (compaction), not score them
-    # forever. Lower the floor so the logic exercises at unit-test scale.
-    monkeypatch.setattr(li_module, "_COMPACT_MIN_STALE_PATCHES", 4)
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    for i in range(12):
-        idx.add_document(f"d{i:02d}", _onehot_matrix([i % DIM]))
-    idx.search(_onehot_matrix([0]), k=1)  # build base with 12 docs
-    assert len(idx._resident_cache["ids"]) == 12
-    for i in range(10):
-        idx.remove(f"d{i:02d}")
-    cache = idx._resident_cache
-    # Base was compacted: tombstones reclaimed, not left in the scored matrix.
-    assert len(cache["ids"]) < 12
-    assert {h.id for h in idx.search(_onehot_matrix([0]), k=12)} == {"d10", "d11"}
 
 
 def test_config_sidecar_durability(tmp_path, monkeypatch):
@@ -349,63 +272,6 @@ def test_concurrent_same_id_writers_keep_cache_consistent(tmp_path):
     assert live.patch_count == disk.patch_count
 
 
-def test_cold_ingest_does_not_decode_cache_matrices(tmp_path, monkeypatch):
-    # A cold bulk ingest (no resident cache yet) must not decode/retain cache
-    # matrices; the storage roundtrip is deferred until a cache actually exists.
-    calls = [0]
-    real_decode = li_module._decode_matrix
-
-    def counting_decode(*args, **kwargs):
-        calls[0] += 1
-        return real_decode(*args, **kwargs)
-
-    monkeypatch.setattr(li_module, "_decode_matrix", counting_decode)
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)  # no search -> cache not built
-    idx.add_documents(
-        [{"id": f"d{i:02d}", "patches": _onehot_matrix([i % DIM])} for i in range(20)]
-    )
-    assert calls[0] == 0  # cold ingest decoded nothing
-    idx.search(_onehot_matrix([0]), k=1)  # builds the cache (decodes the base once)
-    before = calls[0]
-    idx.add_document("new", _onehot_matrix([1]))  # now folds -> decodes this row
-    assert calls[0] > before
-    # and the post-cache add is live (findable without a rebuild/reopen)
-    assert "new" in {h.id for h in idx.search(_onehot_matrix([1]), k=25)}
-
-
-def test_over_budget_growth_evicts_without_compacting(tmp_path, monkeypatch):
-    # When live size cannot fit the budget, the cache evicts directly instead of
-    # paying a full base+pending vstack compaction first.
-    idx = LodeLateInteractionIndex(
-        tmp_path, dim=DIM, resident="auto", resident_max_bytes=DIM * 4 * 4
-    )
-    idx.add_document("a", _onehot_matrix([0]))
-    assert idx._resident_snapshot() is not None  # one patch fits
-    compacts = [0]
-    monkeypatch.setattr(
-        idx, "_cache_compact", lambda cache: compacts.__setitem__(0, compacts[0] + 1)
-    )
-    for i in range(20):  # grow well past the tiny budget
-        idx.add_document(f"x{i:02d}", _onehot_matrix([i % DIM]))
-    assert idx._resident_snapshot() is None  # evicted -> streaming
-    assert compacts[0] == 0  # never compacted on the way out
-    assert idx.search(_onehot_matrix([0]), k=1)[0].id == "a"  # streaming still exact
-
-
-def test_incremental_growth_evicts_over_budget(tmp_path):
-    # Start within budget so the cache builds, then grow past it incrementally:
-    # the cache evicts and queries fall back to the (exact) streaming path.
-    idx = LodeLateInteractionIndex(
-        tmp_path, dim=DIM, resident="auto", resident_max_bytes=DIM * 4 * 3
-    )
-    idx.add_document("a", _onehot_matrix([0]))
-    assert idx._resident_snapshot() is not None  # fits
-    for i in range(10):
-        idx.add_document(f"x{i}", _onehot_matrix([i % DIM]))
-    assert idx._resident_snapshot() is None  # evicted on growth -> streaming
-    assert idx.search(_onehot_matrix([0]), k=1)[0].id == "a"  # streaming still exact
-
-
 def test_add_documents_batch(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     ids = idx.add_documents(
@@ -436,54 +302,6 @@ def test_search_many_matches_single_search(tmp_path):
         assert [h.id for h in batch_hits] == [h.id for h in single]
         for a, b in zip(batch_hits, single, strict=True):
             assert a.score == pytest.approx(b.score, abs=1e-4)
-
-
-def test_search_many_multichunk_matches_single(tmp_path, monkeypatch):
-    # Force many small scoring chunks; the incremental per-query top-k merge must
-    # still equal looped single-query search (covers bounded-memory search_many).
-    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 4096)
-    rng = np.random.default_rng(21)
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    for i in range(60):
-        idx.add_document(f"d{i:02d}", _unit_rows(rng, 6), normalize=False)
-    queries = [_unit_rows(rng, 5) for _ in range(4)]
-    batched = idx.search_many(queries, k=7, normalize=False)
-    for q, batch_hits in zip(queries, batched, strict=True):
-        single = idx.search(q, k=7, normalize=False)
-        assert [h.id for h in batch_hits] == [h.id for h in single]
-        for a, b in zip(batch_hits, single, strict=True):
-            assert a.score == pytest.approx(b.score, abs=1e-4)
-
-
-def test_streaming_chunked_matches_resident(tmp_path, monkeypatch):
-    # A tiny chunk budget forces the streaming path to chunk during load; results
-    # must match the resident scan over the same documents.
-    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 8192)
-    rng = np.random.default_rng(22)
-    docs = [(f"d{i:02d}", _unit_rows(rng, 40)) for i in range(30)]
-    stream = LodeLateInteractionIndex(tmp_path / "s", dim=DIM, resident=False)
-    resident = LodeLateInteractionIndex(tmp_path / "r", dim=DIM, resident=True)
-    for doc_id, m in docs:
-        stream.add_document(doc_id, m, normalize=False)
-        resident.add_document(doc_id, m, normalize=False)
-    q = _unit_rows(rng, 8)
-    s_hits = stream.search(q, k=5, normalize=False)
-    r_hits = resident.search(q, k=5, normalize=False)
-    assert [h.id for h in s_hits] == [h.id for h in r_hits]
-    for a, b in zip(s_hits, r_hits, strict=True):
-        assert a.score == pytest.approx(b.score, abs=1e-4)
-
-
-def test_single_document_larger_than_chunk_budget(tmp_path, monkeypatch):
-    # A document with more patches than the chunk budget is scored as one unit.
-    monkeypatch.setattr(li_module, "_SCORE_CHUNK_BYTES", 2048)
-    rng = np.random.default_rng(23)
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM, resident=False)
-    big = _unit_rows(rng, 300)
-    idx.add_document("big", big, normalize=False)
-    idx.add_document("small", _onehot_matrix([0]))
-    hits = idx.search(big[:3], k=2, normalize=False)
-    assert hits[0].id == "big"
 
 
 def test_dim_must_be_multiple_of_8(tmp_path):
@@ -584,30 +402,6 @@ def test_empty_doc_rejected(tmp_path):
         idx.add_document("doc-a", np.zeros((0, DIM), dtype=np.float32))
 
 
-def test_engine_errors_propagate_not_swallowed(tmp_path):
-    # A real (non-404) engine failure must fail closed, not silently return no
-    # hits. LodeDB.list_documents already maps the empty-store 404 to []; anything
-    # else is a true error and should surface from search/search_many.
-    from lodedb.engine.index import EngineError
-
-    idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
-    idx.add_document("a", _onehot_matrix([0]))
-    idx.search(_onehot_matrix([0]), k=1)  # build cache (so resident path is live)
-    idx._resident_cache = None  # force a rebuild on next query
-
-    def boom(*args, **kwargs):
-        raise EngineError("boom", status_code=500, response={})
-
-    idx._db.list_documents = boom  # type: ignore[assignment]
-    with pytest.raises(EngineError):
-        idx.search(_onehot_matrix([0]), k=1)  # resident rebuild -> list_documents
-    with pytest.raises(EngineError):
-        idx.search(_onehot_matrix([0]), k=1, filter={"x": "y"})  # filtered path
-    idx.resident = False
-    with pytest.raises(EngineError):
-        idx.search(_onehot_matrix([0]), k=1)  # streaming path
-
-
 def test_search_empty_index_returns_nothing(tmp_path):
     idx = LodeLateInteractionIndex(tmp_path, dim=DIM)
     assert idx.search(_onehot_matrix([0]), k=5) == []
@@ -619,126 +413,6 @@ def test_hit_equality():
     assert hit == LodeLateInteractionHit(
         score=1.5, id="x", metadata={"a": "b"}, patch_count=3
     )
-
-
-def test_merge_topk_matches_full_sort_with_ties():
-    # The argpartition-based top-k must equal a full (-score, id) sort, including
-    # the id tie-break when many scores tie, with skip, and across incremental
-    # merges -- this is what keeps the fast path exact.
-    rng = np.random.default_rng(7)
-    n, k = 50, 10
-    scores = rng.integers(0, 5, size=n).astype(np.float32)  # many ties
-    ids = [f"d{i:03d}" for i in range(n)]
-    metas = [{} for _ in range(n)]
-    pcs = [1] * n
-
-    def ref(indices):
-        ordered = sorted(
-            ((float(scores[i]), ids[i]) for i in indices), key=lambda t: (-t[0], t[1])
-        )
-        return ordered[:k]
-
-    got = li_module._merge_topk([], scores, ids, metas, pcs, k, None)
-    assert [(g[0], g[1]) for g in got] == ref(range(n))
-
-    skip = frozenset(ids[:5])
-    got_skip = li_module._merge_topk([], scores, ids, metas, pcs, k, skip)
-    assert [(g[0], g[1]) for g in got_skip] == ref(i for i in range(n) if ids[i] not in skip)
-
-    # Incremental merge across two chunks equals the one-shot result.
-    first = li_module._merge_topk([], scores[:20], ids[:20], metas[:20], pcs[:20], k, None)
-    merged = li_module._merge_topk(
-        first, scores[20:], ids[20:], metas[20:], pcs[20:], k, None
-    )
-    assert [(g[0], g[1]) for g in merged] == ref(range(n))
-
-
-def test_maxsim_kernel_matches_reference():
-    rng = np.random.default_rng(0)
-    q = rng.standard_normal((4, DIM)).astype(np.float32)
-    d = rng.standard_normal((7, DIM)).astype(np.float32)
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    d /= np.linalg.norm(d, axis=1, keepdims=True)
-    expected = sum(max(float(qt @ dp) for dp in d) for qt in q)
-    assert _maxsim(q, d) == pytest.approx(expected, abs=1e-5)
-
-
-def test_native_kernel_concurrent_calls_are_consistent():
-    # The native binding holds the GIL while reading the borrowed buffers, so
-    # concurrent calls (on their own arrays) stay correct and never crash.
-    import threading
-
-    native = _resolve_native_maxsim()
-    if native is None:
-        pytest.skip("native maxsim_scores kernel not available")
-    rng = np.random.default_rng(2)
-    q = rng.standard_normal((6, DIM)).astype(np.float32)
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    docs = []
-    for n in (5, 8, 3):
-        d = rng.standard_normal((n, DIM)).astype(np.float32)
-        d /= np.linalg.norm(d, axis=1, keepdims=True)
-        docs.append(d)
-    flat = np.ascontiguousarray(np.vstack(docs), dtype=np.float32)
-    counts = np.array([d.shape[0] for d in docs], dtype=np.int64)
-    reference = np.array([(q @ d.T).max(axis=1).sum() for d in docs], dtype=np.float32)
-    errors: list[BaseException] = []
-
-    def worker() -> None:
-        try:
-            for _ in range(200):
-                scores = native(np.ascontiguousarray(q), flat, counts)
-                assert np.allclose(scores, reference, atol=1e-4)
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert not errors
-
-
-def test_native_kernel_is_available_and_matches_numpy():
-    # Stage 3: the bundled extension exposes the native MaxSim kernel. (If a build
-    # predates it, the SDK falls back to numpy; this asserts the bundled build.)
-    native = _resolve_native_maxsim()
-    assert native is not None, "native maxsim_scores kernel not found in lodedb._turbovec"
-    rng = np.random.default_rng(3)
-    q = rng.standard_normal((6, DIM)).astype(np.float32)
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    docs = []
-    for n in (5, 8, 3, 11):
-        d = rng.standard_normal((n, DIM)).astype(np.float32)
-        d /= np.linalg.norm(d, axis=1, keepdims=True)
-        docs.append(d)
-    reference = np.array([_maxsim(q, d) for d in docs], dtype=np.float32)
-    native_scores = _maxsim_batch(q, docs, prefer_native=True)
-    numpy_scores = _maxsim_batch(q, docs, prefer_native=False)
-    assert np.allclose(native_scores, reference, atol=1e-4)
-    assert np.allclose(native_scores, numpy_scores, atol=1e-4)
-
-
-def test_maxsim_batch_empty_returns_empty():
-    assert _maxsim_batch(np.zeros((2, DIM), dtype=np.float32), []).shape == (0,)
-
-
-def test_native_scoring_matches_numpy_end_to_end(tmp_path):
-    # The same corpus scored through the native kernel and the numpy path returns
-    # the same ranking and scores.
-    docs = [("a", [0, 1, 2]), ("b", [5, 6]), ("c", [2, 7, 9])]
-    np_idx = LodeLateInteractionIndex(tmp_path / "np", dim=DIM, scoring="numpy")
-    nat_idx = LodeLateInteractionIndex(tmp_path / "nat", dim=DIM, scoring="native")
-    for idx in (np_idx, nat_idx):
-        for doc_id, dims in docs:
-            idx.add_document(doc_id, _onehot_matrix(dims))
-    query = _onehot_matrix([0, 2])
-    np_hits = np_idx.search(query, k=3)
-    nat_hits = nat_idx.search(query, k=3)
-    assert [h.id for h in np_hits] == [h.id for h in nat_hits]
-    for a, b in zip(np_hits, nat_hits, strict=True):
-        assert a.score == pytest.approx(b.score, abs=1e-4)
 
 
 def test_invalid_scoring_rejected(tmp_path):

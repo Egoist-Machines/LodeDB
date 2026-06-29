@@ -19,8 +19,8 @@ The full upstream MIT license text is preserved at
 third_party/turbovec/LICENSE and must not be removed or altered.
 
 Local modifications by Egoist Machines — the encoded-row export/import,
-upsert_with_ids, and calibration_fitted lifecycle patches that the
-.tvim/.tvd/.jsd persistence path depends on, documented in
-third_party/turbovec/LOCAL_PATCHES.md — are contributed under the Apache
-License, Version 2.0. The MIT-origin upstream files retain their MIT notice;
-MIT is one-way compatible with Apache-2.0 and requires no upstream permission.
+upsert_with_ids, calibration_fitted lifecycle patches, reconstruction surface,
+and native-core packaging bridge documented in third_party/turbovec/LOCAL_PATCHES.md
+— are contributed under the Apache License, Version 2.0. The MIT-origin upstream
+files retain their MIT notice; MIT is one-way compatible with Apache-2.0 and
+requires no upstream permission.

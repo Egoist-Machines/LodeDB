@@ -1,17 +1,23 @@
-"""LodeDB direct TurboVec GPU batch sweep.
+"""LodeDB native GPU-resident batch sweep.
 
-Builds one local LodeDB index, then compares the compact CPU TurboVec scan
-against the optional CUDA GPU-resident fp16 reconstruction scan across query
-batch sizes. The output is raw-payload-free: only ids, counts, timings, backend
-labels, recall/overlap metrics, and byte accounting are written.
+Builds one local LodeDB index, then compares the native CPU TurboVec scan against
+the optional native CUDA GPU-resident scan across query batch sizes. The native
+core serves an unfiltered batch from the GPU once the batch and corpus clear the
+engine's thresholds and a CUDA driver loads; `LODEDB_GPU_DIRECT_TURBOVEC=off`
+forces the CPU scan, any other value (the default) leaves the GPU path eligible.
+Queries run through the public `LodeDB` API, so this drives exactly the path an
+application gets. The output is raw-payload-free: only ids, counts, timings,
+recall/overlap metrics, and a redacted audit status are written.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +25,39 @@ import numpy as np
 
 from lodedb.engine.core import audit_persisted_index_snapshots
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.engine.index import EngineError
-from lodedb.engine.runtime_policy import GpuDirectTurboVecPolicy
 from lodedb.engine.turbovec_index import turbovec_capability
 from lodedb.local import LodeDB
 from lodedb.local.presets import resolve_preset
+
+# The Rust core reads this per scan; "off" disables the GPU-resident scan, any
+# other value (or unset) leaves it eligible, still subject to the CUDA driver and
+# the batch/corpus gates in the engine.
+_GPU_SCAN_ENV = "LODEDB_GPU_DIRECT_TURBOVEC"
 
 DEFAULT_BATCH_SIZES = "1,2,4,8,16,32,64,128,256,512,1024"
 GOVREPORT_DATASET = "ccdv/govreport-summarization"
 GOVREPORT_CHUNK_CHARACTER_LIMIT = 480
 QREL_RECALL_PARITY_TOLERANCE = 0.002
+
+
+@contextmanager
+def _gpu_scan(enabled: bool):
+    """Toggles the native GPU-resident scan for the duration of the block.
+
+    Flips ``LODEDB_GPU_DIRECT_TURBOVEC`` (the Rust core reads it per scan), so the
+    CPU and GPU rows share one built index without a rebuild, and restores the
+    prior value on exit.
+    """
+
+    previous = os.environ.get(_GPU_SCAN_ENV)
+    os.environ[_GPU_SCAN_ENV] = "auto" if enabled else "off"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_GPU_SCAN_ENV, None)
+        else:
+            os.environ[_GPU_SCAN_ENV] = previous
 
 
 def run_direct_gpu_sweep(
@@ -41,15 +70,13 @@ def run_direct_gpu_sweep(
     top_k: int = 100,
     batch_sizes: str = DEFAULT_BATCH_SIZES,
     query_repeats: int = 5,
-    rejected_memory_budget_bytes: int = 1,
     device: str = "cuda",
     use_hash_backend: bool = False,
-    expect_gpu_rows: bool = True,
     persistence_root: str | Path | None = None,
     artifact_checkpoint: Callable[[], None] | None = None,
     dataset_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Runs the direct-route CPU/GPU batch sweep and writes a JSON summary."""
+    """Runs the native CPU/GPU batch sweep and writes a JSON summary."""
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -89,9 +116,7 @@ def run_direct_gpu_sweep(
             top_k=top_k,
             batch_size_values=batch_size_values,
             query_repeats=query_repeats,
-            rejected_memory_budget_bytes=rejected_memory_budget_bytes,
             use_hash_backend=use_hash_backend,
-            expect_gpu_rows=expect_gpu_rows,
             artifact_checkpoint=artifact_checkpoint,
         )
     finally:
@@ -112,20 +137,14 @@ def _run_sweep(
     top_k: int,
     batch_size_values: tuple[int, ...],
     query_repeats: int,
-    rejected_memory_budget_bytes: int,
     use_hash_backend: bool,
-    expect_gpu_rows: bool,
     artifact_checkpoint: Callable[[], None] | None,
 ) -> dict[str, Any]:
-    """Builds one LodeDB and executes all sweep rows."""
-
-    from lodedb.engine.gpu_turbovec import turbovec_reconstruction_api_available
+    """Builds one LodeDB and executes all sweep rows through the public API."""
 
     persistence_dir.mkdir(parents=True, exist_ok=True)
     preset = resolve_preset(model)
-    backend = (
-        HashEmbeddingBackend(native_dim=preset.native_dim) if use_hash_backend else None
-    )
+    backend = HashEmbeddingBackend(native_dim=preset.native_dim) if use_hash_backend else None
     db = LodeDB(
         path=persistence_dir,
         model=model,
@@ -138,13 +157,8 @@ def _run_sweep(
         db.add_many(documents)
         build_seconds = time.perf_counter() - started
         db.persist()
-        serving = db._engine._turbovec_index_for_state(next(iter(db._engine._indexes.values())))
-        reconstruction_available = turbovec_reconstruction_api_available(serving.index)
-        if expect_gpu_rows and not reconstruction_available:
-            raise RuntimeError(
-                "vendored TurboVec reconstruction APIs are unavailable; GPU rows would "
-                "fall back instead of proving the CUDA path"
-            )
+        stats = db.stats()
+        chunk_count = int(stats.get("chunk_count", 0) or 0)
 
         rows: list[dict[str, Any]] = []
         cpu_results_by_batch: dict[int, list[list[str]]] = {}
@@ -166,25 +180,20 @@ def _run_sweep(
                 batch_size=batch_size,
                 top_k=top_k,
                 repeats=query_repeats,
-                policy=GpuDirectTurboVecPolicy.OFF,
-                label=f"cpu_direct_batch_{batch_size}",
+                gpu=False,
+                label=f"cpu_batch_{batch_size}",
             )
             cpu_results_by_batch[batch_size] = cpu_row.pop("_served_document_ids")
             checkpoint(cpu_row)
 
-            gpu_policy = (
-                GpuDirectTurboVecPolicy.AUTO
-                if batch_size < 2
-                else GpuDirectTurboVecPolicy.REQUIRED
-            )
             gpu_row = _query_row(
                 db,
                 queries=queries,
                 batch_size=batch_size,
                 top_k=top_k,
                 repeats=query_repeats,
-                policy=gpu_policy,
-                label=f"gpu_direct_batch_{batch_size}",
+                gpu=True,
+                label=f"gpu_batch_{batch_size}",
             )
             gpu_served = gpu_row.pop("_served_document_ids")
             gpu_row["gpu_vs_cpu_top_k_overlap"] = _mean_overlap(
@@ -195,45 +204,14 @@ def _run_sweep(
                 - float(cpu_row["document_recall_at_top_k"])
             )
             gpu_row["document_recall_gap_vs_cpu"] = recall_gap
-            if batch_size >= 2 and recall_gap > QREL_RECALL_PARITY_TOLERANCE:
+            # The GPU scan must rank identically to the CPU scan (it reads back the
+            # same reconstructed rows); a divergence is a correctness bug, not noise.
+            if recall_gap > QREL_RECALL_PARITY_TOLERANCE:
                 raise RuntimeError(
                     f"GPU document recall diverged from CPU at batch {batch_size}: "
                     f"gap {recall_gap:.6f} exceeds {QREL_RECALL_PARITY_TOLERANCE}"
                 )
-            if (
-                expect_gpu_rows
-                and batch_size >= 2
-                and gpu_row["gpu_stage_one_status"] != "used"
-            ):
-                raise RuntimeError(
-                    f"GPU row for batch {batch_size} did not use GPU: {gpu_row}"
-                )
             checkpoint(gpu_row)
-
-        original_budget = db._engine.gpu_memory_budget_bytes
-        db._engine.gpu_memory_budget_bytes = int(rejected_memory_budget_bytes)
-        try:
-            auto_row = _query_row(
-                db,
-                queries=queries,
-                batch_size=min(2, len(queries)),
-                top_k=top_k,
-                repeats=1,
-                policy=GpuDirectTurboVecPolicy.AUTO,
-                label="gpu_direct_auto_memory_rejected",
-            )
-            auto_row.pop("_served_document_ids")
-            checkpoint(auto_row)
-            checkpoint(
-                _required_memory_failure_row(
-                    db,
-                    queries=queries,
-                    top_k=top_k,
-                )
-            )
-        finally:
-            db._engine.gpu_memory_budget_bytes = original_budget
-            db._engine.gpu_direct_turbovec_policy = GpuDirectTurboVecPolicy.OFF
 
         audit = audit_persisted_index_snapshots(persistence_dir)
         summary = {
@@ -241,13 +219,12 @@ def _run_sweep(
             "dataset_name": dataset_name,
             "model": model,
             "document_count": len(documents),
-            "chunk_count": len(serving.chunk_ids_by_stable_id),
+            "chunk_count": chunk_count,
             "query_count": len(queries),
             "top_k": int(top_k),
             "batch_sizes": list(batch_size_values),
             "build_seconds": float(build_seconds),
             "turbovec_capability": turbovec_capability().to_dict(),
-            "turbovec_reconstruction_api_available": bool(reconstruction_available),
             "row_count": len(rows),
             "rows": rows,
             "audit_status": audit["status"],
@@ -270,103 +247,45 @@ def _query_row(
     batch_size: int,
     top_k: int,
     repeats: int,
-    policy: GpuDirectTurboVecPolicy,
+    gpu: bool,
     label: str,
 ) -> dict[str, Any]:
-    """Measures one policy/batch-size cell over the evaluation query set."""
+    """Measures one CPU-or-GPU/batch-size cell over the evaluation query set."""
 
-    db._engine.gpu_direct_turbovec_policy = policy
     batches = [queries[start : start + batch_size] for start in range(0, len(queries), batch_size)]
-    warmup = _query_batch(db, batches[0], top_k=top_k)
-    if warmup.get("status") != "ok":
-        raise RuntimeError(f"warmup query batch failed for {label}: {warmup}")
-    search_ms: list[float] = []
     batch_ms: list[float] = []
     served: list[list[str]] = []
-    for repeat in range(max(1, repeats)):
-        repeat_served: list[list[str]] = []
-        for batch in batches:
-            started = time.perf_counter()
-            response = _query_batch(db, batch, top_k=top_k)
-            elapsed = (time.perf_counter() - started) * 1000.0
-            batch_ms.append(elapsed)
-            for item in response["queries"]:
-                search_ms.append(float(item["query_search_latency_ms"]))
+    with _gpu_scan(gpu):
+        _run_query_batch(db, batches[0], top_k=top_k)  # warm the layout / resident upload
+        for repeat in range(max(1, repeats)):
+            repeat_served: list[list[str]] = []
+            for batch in batches:
+                started = time.perf_counter()
+                results = _run_query_batch(db, batch, top_k=top_k)
+                batch_ms.append((time.perf_counter() - started) * 1000.0)
                 if repeat == 0:
-                    repeat_served.append(
-                        [str(row["document_id"]) for row in item["results"]]
-                    )
-        if repeat == 0:
-            served = repeat_served
-    event = _last_query_batch_event(db)
+                    repeat_served.extend([hit.id for hit in hits] for hits in results)
+            if repeat == 0:
+                served = repeat_served
     return {
         "row": label,
-        "policy": policy.value,
+        "gpu_enabled": bool(gpu),
         "batch_size": int(batch_size),
         "repeats": int(max(1, repeats)),
         "query_count": len(queries),
-        "search_p50_ms": float(np.percentile(search_ms, 50)),
-        "search_p95_ms": float(np.percentile(search_ms, 95)),
         "batch_p50_ms": float(np.percentile(batch_ms, 50)),
+        "batch_p95_ms": float(np.percentile(batch_ms, 95)),
         "document_recall_at_top_k": _document_recall(queries, served),
-        "gpu_stage_one_status": str(event.get("gpu_stage_one_status", "")),
-        "stage_one_backend": str(event.get("stage_one_backend", "")),
-        "gpu_fallback_reason": str(event.get("gpu_fallback_reason", "")),
-        "gpu_estimated_bytes": int(event.get("gpu_estimated_bytes", 0) or 0),
-        "gpu_budget_bytes": int(event.get("gpu_budget_bytes", 0) or 0),
-        "gpu_copy_back_bytes": int(event.get("gpu_copy_back_bytes", 0) or 0),
-        "gpu_resident_upload_build_ms": float(
-            event.get("gpu_resident_upload_build_ms", 0.0) or 0.0
-        ),
-        "gpu_stage_one_search_ms": float(event.get("gpu_stage_one_search_ms", 0.0) or 0.0),
-        "gpu_device_to_host_copy_ms": float(
-            event.get("gpu_device_to_host_copy_ms", 0.0) or 0.0
-        ),
         "_served_document_ids": served,
     }
 
 
-def _query_batch(db: LodeDB, queries: list[dict[str, str]], *, top_k: int) -> dict[str, Any]:
-    """Runs one redacted engine query batch."""
+def _run_query_batch(
+    db: LodeDB, queries: list[dict[str, str]], *, top_k: int
+) -> list[list[Any]]:
+    """Runs one batch of vector queries through the public batched search API."""
 
-    return db._index.query_batch(
-        [{"query": query["text"], "top_k": int(top_k)} for query in queries]
-    )
-
-
-def _required_memory_failure_row(
-    db: LodeDB,
-    *,
-    queries: list[dict[str, str]],
-    top_k: int,
-) -> dict[str, Any]:
-    """Verifies required GPU policy fails closed under a rejecting budget."""
-
-    db._engine.gpu_direct_turbovec_policy = GpuDirectTurboVecPolicy.REQUIRED
-    try:
-        _query_batch(db, queries[: min(2, len(queries))], top_k=top_k)
-    except EngineError as exc:
-        if exc.status_code != 503:
-            raise
-        error = str(exc.response.get("error", ""))
-        return {
-            "row": "gpu_direct_required_memory_rejected",
-            "policy": GpuDirectTurboVecPolicy.REQUIRED.value,
-            "batch_size": min(2, len(queries)),
-            "failed_closed": True,
-            "status_code": int(exc.status_code),
-            "error_contains_memory": "memory" in error.lower(),
-        }
-    raise RuntimeError("required policy did not fail closed under a rejecting memory budget")
-
-
-def _last_query_batch_event(db: LodeDB) -> dict[str, Any]:
-    """Returns the most recent redacted query_batch_completed audit event."""
-
-    for event in reversed(db._engine.audit_events):
-        if event.get("event") == "query_batch_completed":
-            return dict(event)
-    return {}
+    return db.search_many([query["text"] for query in queries], k=int(top_k), mode="vector")
 
 
 def _document_recall(queries: list[dict[str, str]], served: list[list[str]]) -> float:
@@ -478,7 +397,7 @@ def main() -> None:
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run LodeDB direct GPU sweep")
+    parser = argparse.ArgumentParser(description="Run LodeDB native GPU sweep")
     parser.add_argument("--out", default="benchmarks/direct_gpu_sweep/results/results.json")
     parser.add_argument("--dataset", default="GovReport5K")
     parser.add_argument("--model", default="minilm", choices=["minilm", "bge"])

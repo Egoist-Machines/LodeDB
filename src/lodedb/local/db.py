@@ -20,25 +20,39 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import json
 import math
 import secrets
+import sys
+import threading
 import time
+import weakref
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
+from lodedb.engine._commit_manifest import (
+    COMMIT_MANIFEST_SUFFIX,
+    base_json_path,
+    read_commit_manifest,
+)
+from lodedb.engine._filelock import ConcurrentWriterError
 from lodedb.engine._predicate import coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
-    EngineSecurityConfig,
     EngineVectorDocument,
-    LodeEngine,
+    _state_from_payload,
+    index_state_key_for_client_hash,
+    sha256_text,
 )
 from lodedb.engine.embedding_backends import EngineEmbeddingBackend
-from lodedb.engine.index import EngineError, LodeIndex
-from lodedb.engine.route_registry import default_route_registry, load_route_registry
-from lodedb.engine.runtime_policy import commit_mode_from_env, parse_commit_mode
+from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreEngineHandle
+from lodedb.engine.runtime_policy import (
+    commit_mode_from_env,
+    parse_commit_mode,
+)
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
@@ -53,6 +67,7 @@ from lodedb.local.presets import (
 # Fixed local identifier for the single-process client context. It never leaves
 # the process and has no security meaning — the local engine is auth-free.
 _LOCAL_CLIENT_ID = "lodedb-local"
+_LOCAL_CLIENT_ID_HASH = sha256_text(_LOCAL_CLIENT_ID)
 # The local DB is a single, stable index. Pinning it to the engine's
 # DEFAULT_INDEX_ID makes the persisted snapshot key the bare client hash (the
 # legacy default snapshot name), so reopening the same path binds to the same
@@ -129,6 +144,51 @@ class ImageEmbeddingUnsupportedError(RuntimeError):
     """
 
 
+class _ThreadConfinedNativeEngine:
+    """Routes every native call onto the engine's single home worker thread.
+
+    The native :class:`~lodedb.engine.native_adapter.NativeCoreEngineHandle` wraps
+    an ``unsendable`` PyO3 ``PyCoreEngine``: touching it from a thread other than
+    the one that created it raises a ``PanicException``. This proxy makes a shared
+    handle usable from any thread by submitting each call to the dedicated
+    single-worker executor that opened the engine; a call already on that worker
+    runs inline to avoid a self-deadlock. Only the engine object itself is
+    unsendable, and it is only ever touched inside :meth:`_run` on the worker, so
+    the numpy arrays and JSON-able arguments callers pass cross threads fine. The
+    engine is reached through a one-element ``holder`` list (shared with the GC
+    finalizer) so teardown can drop it on the worker, never on a collecting thread.
+    """
+
+    __slots__ = ("_executor", "_home_thread_id", "_holder")
+
+    def __init__(
+        self,
+        executor: ThreadPoolExecutor,
+        home_thread_id: int,
+        holder: list[NativeCoreEngineHandle],
+    ) -> None:
+        """Stores the worker executor, its thread id, and the engine holder list."""
+
+        self._executor = executor
+        self._home_thread_id = home_thread_id
+        self._holder = holder
+
+    def _run(self, fn):
+        """Runs ``fn`` on the home worker thread (inline if already on it)."""
+
+        if threading.get_ident() == self._home_thread_id:
+            return fn()
+        return self._executor.submit(fn).result()
+
+    def __getattr__(self, name: str):
+        """Proxies an attribute, wrapping callables to run on the worker thread."""
+
+        attr = getattr(self._holder[0], name)
+        if not callable(attr):
+            return attr
+        return lambda *args, **kwargs: self._run(lambda: attr(*args, **kwargs))
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -173,6 +233,7 @@ class LodeDB:
         chunk_character_limit: int = 900,
         store_text: bool = True,
         index_text: bool = False,
+        compression: bool = True,
         read_only: bool = False,
         durability: str | None = None,
         commit_mode: str | None = None,
@@ -234,13 +295,40 @@ class LodeDB:
         sidecar, never reaches telemetry, audit, or the redacted snapshot. The
         default leaves the on-disk layout byte-for-byte unchanged. Reopen the same
         path with the same ``index_text`` value you wrote with.
+        ``compression`` controls whether the retained raw-text store (the
+        ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
+        ``True``; it has no effect when ``store_text=False``. The setting is
+        persisted in the text-store manifest and the persisted value wins on
+        reopen, so a store keeps the compression it was created with and the
+        passed value only seeds a freshly created store. Reads are unaffected (the
+        reader detects compression on disk), so a store written either way always
+        reads back, and an existing store created before this option keeps loading.
         ``_embedding_backend`` is an internal hook for tests/fixtures.
         """
 
         self.path = Path(path)
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
+        self.compression = bool(compression)
         self.read_only = bool(read_only)
+        # The native core is the sole reader/writer for this handle. It is an
+        # unsendable PyO3 object, so it is opened on (and only ever touched from) a
+        # single dedicated worker thread; _ThreadConfinedNativeEngine routes every
+        # call there so a shared handle works from any caller thread. _op_lock
+        # serializes whole operations across concurrent callers so prepare/apply
+        # spans, lazy embedding-model init, and the columnar index a query reads
+        # never interleave.
+        self._native_executor: ThreadPoolExecutor | None = None
+        self._op_lock = threading.RLock()
+        self._native_vector_engine: _ThreadConfinedNativeEngine | None = None
+        self._native_engine_thread_id: int | None = None
+        self._native_vector_mutable = False
+        self._native_vector_covered = False
+        self._native_core_fallback_reason = ""
+        self._native_core_version = ""
+        self._native_core_abi_version = 0
+        self._native_write_through_enabled = False
+        self._chunk_character_limit = int(chunk_character_limit)
         # bit_width is only meaningful for vector-only / custom-embedder indexes (a
         # preset's width is fixed by its route). TurboVec stores 2- or 4-bit codes, so
         # reject any other width at the boundary; ``None`` means "use the index default".
@@ -360,37 +448,18 @@ class LodeDB:
                 )
         else:
             self.path.mkdir(parents=True, exist_ok=True)
-        security = EngineSecurityConfig(
-            bind_host=_LOCAL_BIND_HOST,
-            route_profile=route_profile,
-            telemetry_mode="metrics_only",
-            allow_raw_result_text=self.store_text,
-            persist_lexical_index=self.index_text,
-        )
-        self._engine = LodeEngine(
-            security=security,
-            route_registry=(
-                load_route_registry(str(route_registry_path))
-                if route_registry_path is not None
-                else default_route_registry()
-            ),
-            chunk_character_limit=int(chunk_character_limit),
-            persistence_dir=self.path,
-            read_only=self.read_only,
-            fsync_on_commit=fsync_on_commit,
-            commit_mode=resolved_commit_mode,
-            embedding_backend=backend,
-            route_policy=route_policy,
-        )
-        self._index = LodeIndex(
-            self._engine,
-            client_id=_LOCAL_CLIENT_ID,
-            index_id=_LOCAL_INDEX_ID,
-        )
-        # Ensure the (single) local index exists; load-on-open already restored
-        # any persisted state for this client hash via the engine constructor.
-        self._ensure_index()
         self._auto_id_counter = 0
+        native_durability = "fsync" if fsync_on_commit else "relaxed"
+        self._maybe_init_native_vector_engine(
+            resolved_bit_width,
+            durability=native_durability,
+            commit_mode=resolved_commit_mode.value,
+            route_profile=route_profile,
+            storage_profile=route_policy.index_backend,
+            model=route_policy.model,
+            provider=route_policy.provider,
+            task=route_policy.task,
+        )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
         # Split by phase: "ingest" (add_image/add_images) vs "query" (search_by_image).
@@ -467,7 +536,8 @@ class LodeDB:
             text=text,
             metadata=_coerce_metadata(metadata),
         )
-        self._index.upsert_batch((document,))
+        with self._op_lock:
+            self._native_upsert_text_documents((document,))
         return document_id
 
     def add_many(
@@ -497,7 +567,8 @@ class LodeDB:
                 )
             )
         if payload:
-            self._index.upsert_batch(tuple(payload))
+            with self._op_lock:
+                self._native_upsert_text_documents(tuple(payload))
         return ids
 
     def add_vectors(
@@ -537,16 +608,14 @@ class LodeDB:
         self._require_writable()
         document_id = str(id) if id is not None else self._next_auto_id()
         prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
-        self._index.upsert_vectors_batch(
-            (
-                EngineVectorDocument(
-                    document_id=document_id,
-                    vector=prepared,
-                    metadata=_coerce_metadata(metadata),
-                    text=_coerce_optional_text(text),
-                ),
-            )
+        document = EngineVectorDocument(
+            document_id=document_id,
+            vector=prepared,
+            metadata=_coerce_metadata(metadata),
+            text=_coerce_optional_text(text),
         )
+        with self._op_lock:
+            self._native_upsert_vectors((document,))
         return document_id
 
     def add_vectors_many(
@@ -580,7 +649,8 @@ class LodeDB:
                 )
             )
         if payload:
-            self._index.upsert_vectors_batch(tuple(payload))
+            with self._op_lock:
+                self._native_upsert_vectors(tuple(payload))
         return ids
 
     def search(
@@ -643,14 +713,14 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
-        response = self._index.query(
-            query,
-            top_k=int(k),
-            filter=_normalize_filter(filter),
-            mode=resolved_mode,
-            include=("metadata",),
-        )
-        return self._hits_from_result_rows(response.get("results", []))
+        normalized_filter = _normalize_filter(filter)
+        with self._op_lock:
+            return self._native_search_text(
+                query,
+                k=int(k),
+                filter=normalized_filter,
+                mode=resolved_mode,
+            )
 
     def search_many(
         self,
@@ -689,26 +759,10 @@ class LodeDB:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
-        batches = self._index.query_batch(
-            [
-                {
-                    "query": query,
-                    "top_k": int(k),
-                    "filter": normalized_filter,
-                    "mode": resolved_mode,
-                    "include": ("metadata",),
-                }
-                for query in queries
-            ]
-        ).get("queries", [])
-        if not isinstance(batches, list):
-            raise RuntimeError("invalid engine response: queries must be a list")
-        out: list[list[LodeSearchHit]] = []
-        for item in batches:
-            if not isinstance(item, Mapping):
-                raise RuntimeError("invalid engine response: query item must be an object")
-            out.append(self._hits_from_result_rows(item.get("results", [])))
-        return out
+        with self._op_lock:
+            return self._native_search_text_batch(
+                queries, k=int(k), filter=normalized_filter, mode=resolved_mode
+            )
 
     def search_by_vector(
         self,
@@ -731,13 +785,11 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
-        response = self._index.query_vector(
-            prepared,
-            top_k=int(k),
-            filter=_normalize_filter(filter),
-            include=("metadata",),
-        )
-        return self._hits_from_result_rows(response.get("results", []))
+        normalized_filter = _normalize_filter(filter)
+        with self._op_lock:
+            return self._native_search_by_vector(
+                prepared, k=int(k), filter=normalized_filter
+            )
 
     def search_many_by_vector(
         self,
@@ -758,24 +810,13 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         normalized_filter = _normalize_filter(filter)
-        items = [
-            {
-                "vector": _prepare_vector(vector, self._vector_dim, normalize=normalize),
-                "top_k": int(k),
-                "filter": normalized_filter,
-                "include": ("metadata",),
-            }
-            for vector in vectors
+        prepared_vectors = [
+            _prepare_vector(vector, self._vector_dim, normalize=normalize) for vector in vectors
         ]
-        batches = self._index.query_vectors_batch(items).get("queries", [])
-        if not isinstance(batches, list):
-            raise RuntimeError("invalid engine response: queries must be a list")
-        out: list[list[LodeSearchHit]] = []
-        for item in batches:
-            if not isinstance(item, Mapping):
-                raise RuntimeError("invalid engine response: query item must be an object")
-            out.append(self._hits_from_result_rows(item.get("results", [])))
-        return out
+        with self._op_lock:
+            return self._native_search_many_by_vector(
+                prepared_vectors, k=int(k), filter=normalized_filter
+            )
 
     def add_image(
         self,
@@ -882,7 +923,8 @@ class LodeDB:
             )
             for index in range(len(images))
         ]
-        self._index.upsert_vectors_batch(tuple(payload))
+        with self._op_lock:
+            self._native_upsert_vectors(tuple(payload))
         return ids
 
     def search_by_image(
@@ -915,11 +957,9 @@ class LodeDB:
         self._require_writable()
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
-        # `delete_documents` reports `document_count` as the number of unique
-        # ids *requested* (not necessarily existing); `deleted_chunks` counts
-        # chunks actually removed, so a positive value means the doc existed.
-        response = self._index.delete_batch((id,))
-        return int(response.get("deleted_chunks", 0) or 0) > 0
+        with self._op_lock:
+            native_response = self._native_delete_documents((id,))
+            return int(native_response.get("documents_deleted", 0) or 0) > 0
 
     def _update_document_payload(
         self,
@@ -934,12 +974,34 @@ class LodeDB:
         self._require_writable()
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
-        self._index.update_document_payload(
-            id,
-            metadata=_coerce_metadata(metadata) if metadata is not None else None,
-            text=text,
-            clear_text=clear_text,
-        )
+        with self._op_lock:
+            self._native_update_document_payload(
+                id, metadata=metadata, text=text, clear_text=clear_text
+            )
+
+    def _native_update_document_payload(
+        self,
+        document_id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
+        clear_text: bool = False,
+    ) -> None:
+        """Applies a metadata / raw-text update to the native core (fail closed)."""
+
+        try:
+            self._native_vector_engine.update_document_payload(
+                _LOCAL_INDEX_ID,
+                document_id,
+                metadata=_coerce_metadata(metadata) if metadata is not None else None,
+                text=text,
+                clear_text=clear_text,
+            )
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_payload_update_failed"
+            raise RuntimeError("native core payload update failed") from exc
 
     def get(self, id: str) -> str | None:
         """Returns the stored raw text for a document id, or ``None`` if absent.
@@ -969,12 +1031,8 @@ class LodeDB:
             raise ValueError("id must be a non-empty string")
         if not self.store_text:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
-        try:
-            return self._index.get_document_text(id)
-        except EngineError as exc:
-            if exc.status_code == 404:
-                return None
-            raise
+        with self._op_lock:
+            return self._native_get_text(id)
 
     def get_texts(self, ids: list[str]) -> dict[str, str]:
         """Returns a ``{id: text}`` map for the stored ids that have text.
@@ -993,7 +1051,8 @@ class LodeDB:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
         if not ids:
             return {}
-        return self._index.get_document_texts(ids)
+        with self._op_lock:
+            return self._native_get_texts(ids)
 
     def get_document(self, id: str) -> dict[str, Any] | None:
         """Returns one document's redacted record by id, or ``None`` if absent.
@@ -1007,62 +1066,56 @@ class LodeDB:
 
         if not isinstance(id, str) or not id.strip():
             raise ValueError("id must be a non-empty string")
-        try:
-            record = self._index.get_document(id)
-        except EngineError as exc:
-            if exc.status_code == 404:
-                return None
-            raise
-        return _public_document_record(record)
+        with self._op_lock:
+            native_record = self._native_get_document(id)
+        return None if native_record is None else _public_document_record(native_record)
 
     def list_documents(
         self,
         *,
         filter: Mapping[str, Any] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Returns the **complete** set of document records, optionally filtered.
+        """Returns document records, optionally filtered and paged by a keyset cursor.
 
-        Unlike :meth:`search`, this is enumeration, not ranking: it returns
-        *every* matching document — no ``k`` cap, no query vector, no scoring —
-        which is the primitive a graph / knowledge-graph layer needs for
-        deterministic traversal ("all edges whose ``src`` is X", "all nodes of
-        ``type`` Person"). Each record is the payload-free
-        ``{"id", "metadata", "chunk_count", "content_hash"}``.
+        Unlike :meth:`search`, this is enumeration, not ranking: it returns matching
+        documents with no query vector and no scoring — the primitive a graph /
+        knowledge-graph layer needs for deterministic traversal ("all edges whose
+        ``src`` is X", "all nodes of ``type`` Person"). Each record is the
+        payload-free ``{"id", "metadata", "chunk_count", "content_hash"}``.
 
-        ``filter`` takes the same exact-match-or-predicate grammar as
-        :meth:`search` (``$eq``/``$in``/``$gte``/``$and``/``$or``/… plus a
-        ``document_ids`` allowlist). It is resolved engine-side through the
-        per-field planner in O(matches), not by scanning the corpus, so this stays
-        flat as the corpus grows while the match set stays small.
+        ``filter`` takes the same exact-match-or-predicate grammar as :meth:`search`
+        (``$eq``/``$in``/``$gte``/``$and``/``$or``/… plus a ``document_ids``
+        allowlist) and is resolved engine-side through the per-field planner in
+        O(matches), not by scanning the corpus. ``after`` and ``limit`` page the
+        (stable id-ordered) result set: pass the last id of a page as ``after`` and a
+        page size as ``limit`` to stream large match sets without materializing them
+        all at once. With neither, the complete match set is returned (no ``k`` cap).
         """
 
-        try:
-            raw = self._index.list_documents(filter=_normalize_filter(filter))
-        except EngineError as exc:
-            # A read-only handle on a not-yet-written path has no index yet;
-            # that is an empty store, not an error.
-            if exc.status_code == 404:
-                return []
-            raise
-        return [_public_document_record(record) for record in raw]
+        normalized_filter = _normalize_filter(filter)
+        with self._op_lock:
+            records = self._native_list_documents(
+                normalized_filter, after=after, limit=limit
+            )
+        return [_public_document_record(record) for record in records]
 
     def persist(self) -> dict[str, Any]:
         """Flushes durable on-disk state and returns redacted storage stats.
 
-        The engine already persists on every mutation; this is an explicit
-        durability + stats checkpoint. In the default ``commit_mode="wal"`` it folds the
+        The native core commits each mutation; this is an explicit durability +
+        stats checkpoint. In the default ``commit_mode="wal"`` it folds the
         outstanding write-ahead log into a fresh committed generation (so the
         on-disk base is fully up to date and the WAL is empty); in
-        ``commit_mode="generation"`` there is nothing buffered, so it only reports stats.
-        State is reloaded automatically on the next ``LodeDB(path=...)`` open.
+        ``commit_mode="generation"`` there is nothing buffered, so it only reports
+        stats. State is reloaded automatically on the next ``LodeDB(path=...)`` open.
         """
 
-        if not self.read_only and self._engine is not None:
-            # Fold any WAL backlog into a generation; a no-op in generation mode.
-            self._engine.checkpoint()
-        # Surface the engine's current redacted stats, which include persisted
-        # byte accounting.
-        return self._index.stats()
+        with self._op_lock:
+            if not self.read_only:
+                self._native_persist()
+            return self._native_stats()
 
     def count(self, *, filter: Mapping[str, Any] | None = None) -> int:
         """Returns the number of documents stored, optionally matching a filter.
@@ -1072,9 +1125,11 @@ class LodeDB:
         per-field planner in O(matches) without materializing any record.
         """
 
-        if filter is None:
-            return int(self._index.stats().get("document_count", 0) or 0)
-        return self._index.count_documents(filter=_normalize_filter(filter))
+        with self._op_lock:
+            if filter is None:
+                return int(self._native_stats().get("document_count", 0) or 0)
+            normalized_filter = _normalize_filter(filter)
+            return len(self._native_list_documents(normalized_filter))
 
     def stats(self) -> dict[str, Any]:
         """Returns redacted engine stats (counts, storage bytes, telemetry).
@@ -1090,20 +1145,67 @@ class LodeDB:
         and aggregate in your own metrics pipeline.
         """
 
-        stats = self._index.stats()
-        if isinstance(stats, dict):
-            stats["image_embedding"] = {
-                phase: dict(counters) for phase, counters in self._image_metrics.items()
-            }
+        with self._op_lock:
+            stats = dict(self._native_stats())
+        stats["image_embedding"] = {
+            phase: dict(counters) for phase, counters in self._image_metrics.items()
+        }
+        stats["native_core"] = self._native_core_stats()
+        stats["document_count"] = int(stats.get("document_count", 0) or 0)
         return stats
 
     def close(self) -> None:
-        """Releases the single-writer lock and engine references; state stays on disk."""
+        """Closes the native core (folding writes durably); state stays on disk."""
 
-        if self._engine is not None:
-            self._engine.close()
-        self._index = None  # type: ignore[assignment]
-        self._engine = None  # type: ignore[assignment]
+        with self._op_lock:
+            executor = self._native_executor
+            if executor is None:
+                return
+            # The native engine is unsendable: it must be closed AND dropped (final
+            # decref) on its home worker thread. Detach the GC finalizer so it does
+            # not double-close, drop the proxy's reference, then drain the holder on
+            # the worker so the engine's last decref lands there. A close failure is
+            # surfaced (after the worker is stopped) since it can mean durable writes
+            # were not flushed.
+            finalizer = getattr(self, "_native_finalizer", None)
+            if finalizer is not None:
+                finalizer.detach()
+            holder = self._native_engine_holder
+            home_thread_id = self._native_engine_thread_id
+            self._native_vector_engine = None
+            self._native_engine_holder = []  # type: ignore[assignment]
+            self._native_executor = None
+            self._native_vector_mutable = False
+            self._native_vector_covered = False
+            self._native_write_through_enabled = False
+            on_worker = home_thread_id is not None and threading.get_ident() == home_thread_id
+
+            def _close_on_worker() -> None:
+                # Runs on the home worker: pop and close the engine so its final
+                # decref lands here, on the thread that created it.
+                if holder:
+                    engine = holder.pop()
+                    try:
+                        engine.close()
+                    finally:
+                        # Drop the unsendable native handle here on the home
+                        # worker even if close() raised: otherwise it stays
+                        # reachable through the raised exception's traceback and
+                        # is decref'd on the calling thread, which panics (the
+                        # handle is thread-confined).
+                        engine._engine = None
+
+            native_close_error: Exception | None = None
+            try:
+                if on_worker:
+                    _close_on_worker()
+                else:
+                    executor.submit(_close_on_worker).result()
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                native_close_error = exc
+            executor.shutdown(wait=not on_worker)
+        if native_close_error is not None:
+            raise RuntimeError("native core close failed") from native_close_error
 
     def __enter__(self) -> LodeDB:
         """Enters a context manager; state is already loaded on open."""
@@ -1116,6 +1218,540 @@ class LodeDB:
         self.close()
 
     # -- internals ----------------------------------------------------------
+
+    def _maybe_init_native_vector_engine(
+        self,
+        bit_width: int,
+        *,
+        durability: str,
+        commit_mode: str,
+        route_profile: str,
+        storage_profile: str,
+        model: str,
+        provider: str,
+        task: str,
+    ) -> None:
+        """Opens the native core engine on a dedicated worker thread.
+
+        The native engine is the sole reader/writer for this handle, so it is
+        always opened (the bundled extension is always present): a writable handle
+        opens a write-through mutable engine and creates the local index if it does
+        not already exist; a read-only handle opens a lock-free read-only engine.
+        It is unsendable, so it is created on a single-worker executor and wrapped
+        in :class:`_ThreadConfinedNativeEngine`, which routes every later call back
+        to that worker. A failure raises (there is no Python fallback).
+        """
+
+        adapter = NativeCoreAdapter()
+        if not adapter.available:
+            self._native_core_fallback_reason = "native_core_extension_unavailable"
+            raise RuntimeError("LodeDB requires the bundled native core (lodedb._native_core)")
+        self._native_core_version = adapter.version
+        self._native_core_abi_version = adapter.abi_version
+        index_options = _native_vector_index_options(
+            index_id=_LOCAL_INDEX_ID,
+            index_key=index_state_key_for_client_hash(_LOCAL_CLIENT_ID_HASH, _LOCAL_INDEX_ID),
+            client_id_hash=_LOCAL_CLIENT_ID_HASH,
+            name="lodedb-local",
+            model=model,
+            provider=provider,
+            task=task,
+            route_profile=route_profile,
+            storage_profile=storage_profile,
+            vector_dim=self._vector_dim,
+            bit_width=bit_width,
+        )
+        read_only = self.read_only
+
+        def _finalize_open(handle: NativeCoreEngineHandle) -> NativeCoreEngineHandle:
+            # Validates the persisted identity (and creates the index on a fresh
+            # writable store). On any failure here the engine is already open, so
+            # close + drop it on this worker thread before propagating: that
+            # releases the writer lock and keeps the unsendable object from being
+            # decref'd on the foreign thread that observes the error.
+            try:
+                if read_only:
+                    # A read-only handle never creates state; reject only when the
+                    # committed store on disk has an identity contradicting this
+                    # handle (a missing index is an empty store and serves nothing).
+                    _validate_native_index_identity(self.path, index_options)
+                    return handle
+                try:
+                    handle.stats(_LOCAL_INDEX_ID)
+                except Exception:
+                    # Fresh store: create the index and commit an initial generation
+                    # so a root manifest exists on disk. In WAL mode the native
+                    # recovery path only replays a `<key>.wal` that sits alongside a
+                    # committed `<key>.commit.json`; without this seed commit, a
+                    # crash before the first checkpoint would leave an orphan WAL the
+                    # next open could not discover.
+                    handle.create_index_with_options(index_options)
+                    handle.persist()
+                else:
+                    # The store already holds this index: enforce its full persisted
+                    # identity against this handle's route before serving or
+                    # mutating, so a reopen at a different model / dim / bit width
+                    # fails fast.
+                    _validate_native_index_identity(self.path, index_options)
+                return handle
+            except Exception:
+                # The engine is open on this worker. Close it (releasing the writer
+                # lock) and drop the unsendable PyCoreEngine HERE, on its home
+                # thread, before the error propagates: a later decref of an object
+                # captured by the exception traceback on the observing thread would
+                # panic. Nulling the wrapper's inner engine forces that final
+                # decref to happen now, on the worker.
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                handle._engine = None  # type: ignore[assignment]
+                del handle
+                raise
+
+        def _open() -> NativeCoreEngineHandle:
+            # Runs on the worker thread: records its id as the engine's home thread
+            # and opens (and, for a fresh writable store, creates the index in) the
+            # native engine here so the unsendable handle is only ever touched here.
+            self._native_engine_thread_id = threading.get_ident()
+            if read_only:
+                handle = adapter.open_readonly_engine(
+                    self.path,
+                    durability=durability,
+                    commit_mode=commit_mode,
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
+                    compression=self.compression,
+                )
+                return _finalize_open(handle)
+            if commit_mode != "wal" and _has_leftover_wal(self.path):
+                # A crash in WAL mode can leave a `<key>.wal` with no fresh
+                # checkpoint. The native recovery path only replays a WAL during a
+                # WAL-mode open, so a reopen in generation mode would otherwise drop
+                # those durably-logged writes. Fold the leftover WAL into a committed
+                # generation with a transient WAL-mode open (replay + persist on
+                # close) before opening in the requested mode.
+                recovery = adapter.open_engine(
+                    path=self.path,
+                    read_only=False,
+                    durability=durability,
+                    commit_mode="wal",
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
+                    compression=self.compression,
+                    acquire_writer_lock=True,
+                )
+                try:
+                    recovery.close()  # persists the replayed WAL into a generation
+                finally:
+                    recovery._engine = None  # type: ignore[assignment]
+                    del recovery
+            # The native engine is the sole writer for this handle, so it takes
+            # the shared <dir>/.lodedb.lock single-writer lock itself.
+            handle = adapter.open_engine(
+                path=self.path,
+                read_only=False,
+                durability=durability,
+                commit_mode=commit_mode,
+                store_text=self.store_text,
+                index_text=self.index_text,
+                chunk_character_limit=self._chunk_character_limit,
+                compression=self.compression,
+                acquire_writer_lock=True,
+            )
+            return _finalize_open(handle)
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lodedb-native")
+        try:
+            real_handle = executor.submit(_open).result()
+        except Exception as exc:
+            executor.shutdown(wait=True)
+            if _is_writer_lock_contention(exc):
+                # Another process holds the native single-writer lock. Surface the
+                # SDK's stable single-writer error (LodeDB is single-writer per
+                # path) rather than the generic init failure.
+                self._native_core_fallback_reason = "native_core_writer_lock_contended"
+                raise ConcurrentWriterError(
+                    f"LodeDB at {self.path} is already open by another process "
+                    "(LodeDB is single-writer per path); close the other handle, or "
+                    "raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
+                ) from exc
+            self._native_core_fallback_reason = "native_core_init_failed"
+            raise RuntimeError(f"failed to initialize native core: {exc!r}") from exc
+        self._native_executor = executor
+        # The unsendable engine must be closed AND dropped (final decref) on its
+        # home worker; a decref on any other thread panics. Both the proxy and the
+        # GC finalizer reach the engine only through this one-element holder, so the
+        # worker-side teardown can pop and drop it there, leaving the holder empty
+        # before any other reference (proxy slot, finalizer arg) is released on the
+        # collecting thread. _ThreadConfinedNativeEngine reads holder[0] per call.
+        self._native_engine_holder: list[NativeCoreEngineHandle] = [real_handle]
+        self._native_vector_engine = _ThreadConfinedNativeEngine(
+            executor, self._native_engine_thread_id, self._native_engine_holder
+        )
+        self._native_vector_mutable = not read_only
+        self._native_vector_covered = True
+        self._native_write_through_enabled = not read_only
+        # Drop the native engine on its home worker when this handle is garbage
+        # collected without close(); the unsendable engine must be dropped there.
+        self._native_finalizer = weakref.finalize(
+            self,
+            _shutdown_native_engine,
+            executor,
+            self._native_engine_holder,
+            self._native_engine_thread_id,
+        )
+
+    def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
+        """Upserts vector documents into the native core (fail closed)."""
+
+        if not documents:
+            return
+        try:
+            self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_upsert_failed"
+            raise RuntimeError("native core vector upsert failed") from exc
+
+    def _native_upsert_text_documents(self, documents: tuple[EngineDocument, ...]) -> None:
+        """Embeds and upserts text documents through the native core (fail closed).
+
+        The native core plans the chunking, Python embeds the chunks it asks for,
+        and the native core applies the embedded plan and (in generation mode)
+        publishes the durable generation.
+        """
+
+        if not documents:
+            return
+        if self._embedding_backend is None:
+            raise RuntimeError("native text upsert requires an embedding backend")
+        try:
+            plan = self._native_vector_engine.prepare_text_upsert(
+                _LOCAL_INDEX_ID,
+                documents,
+                store_text=self.store_text,
+                index_text=self.index_text,
+                chunk_character_limit=self._chunk_character_limit,
+            )
+            chunks_to_embed = tuple(
+                str(chunk.get("text", "")) for chunk in plan.get("chunks_to_embed", [])
+            )
+            started = time.perf_counter()
+            embeddings = (
+                self._embedding_backend.embed_documents(chunks_to_embed)
+                if chunks_to_embed
+                else ()
+            )
+            embedding_time_ms = (time.perf_counter() - started) * 1000.0
+            self._native_vector_engine.apply_text_upsert(
+                plan,
+                embeddings,
+                embedding_time_ms=embedding_time_ms,
+            )
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_text_upsert_failed"
+            raise RuntimeError("native core text upsert failed") from exc
+
+    def _native_delete_documents(self, document_ids: tuple[str, ...]) -> dict[str, Any]:
+        """Deletes documents in the native core and returns its response (fail closed)."""
+
+        if not document_ids:
+            return {"documents_deleted": 0}
+        try:
+            response = self._native_vector_engine.delete_documents(_LOCAL_INDEX_ID, document_ids)
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+            return response
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_delete_failed"
+            raise RuntimeError("native core vector delete failed") from exc
+
+    def _native_search_by_vector(
+        self,
+        vector: Sequence[float],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+    ) -> list[LodeSearchHit]:
+        """Returns native vector hits for a precomputed query vector (fail closed)."""
+
+        try:
+            payload = self._native_vector_engine.query_vector(
+                _LOCAL_INDEX_ID,
+                vector,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_query_failed"
+            raise RuntimeError("native core vector query failed") from exc
+        return self._hits_from_native_rows(payload.get("hits", []))
+
+    def _native_search_many_by_vector(
+        self,
+        vectors: list[Sequence[float]],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+    ) -> list[list[LodeSearchHit]]:
+        """Returns native vector batch hits for a query batch (fail closed)."""
+
+        try:
+            # Near-zero-copy path: flat query matrix in, arrays out (scores, ids,
+            # batched metadata) with no per-hit JSON. Optional on the engine, so it
+            # falls back to the JSON batch query for older extensions and minimal
+            # engine stubs that only implement query_vectors_batch.
+            arrays_query = getattr(
+                self._native_vector_engine, "query_vectors_batch_arrays", None
+            )
+            if callable(arrays_query):
+                arrays = arrays_query(_LOCAL_INDEX_ID, vectors, top_k=k, filter=filter)
+                if arrays is not None:
+                    return self._hits_from_native_arrays(*arrays, query_count=len(vectors))
+            batches = self._native_vector_engine.query_vectors_batch(
+                _LOCAL_INDEX_ID,
+                vectors,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_batch_query_failed"
+            raise RuntimeError("native core vector batch query failed") from exc
+        return [self._hits_from_native_rows(batch.get("hits", [])) for batch in batches]
+
+    def _native_search_text(
+        self,
+        query: str,
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+        mode: str,
+    ) -> list[LodeSearchHit]:
+        """Returns native hits for a text/hybrid/lexical query (fail closed)."""
+
+        try:
+            query_embedding = None
+            if mode in {"vector", "hybrid"}:
+                if self._embedding_backend is None:
+                    raise RuntimeError("native text query requires an embedding backend")
+                query_embedding = self._embedding_backend.embed_query(query)
+            if hasattr(self._native_vector_engine, "search_text"):
+                payload = self._native_vector_engine.search_text(
+                    _LOCAL_INDEX_ID,
+                    query,
+                    mode,
+                    query_embedding,
+                    top_k=k,
+                    filter=filter,
+                )
+            else:
+                query_plan = self._native_vector_engine.prepare_query_text(query, mode)
+                payload = self._native_vector_engine.search_embedded_text(
+                    _LOCAL_INDEX_ID,
+                    query_plan,
+                    query_embedding,
+                    top_k=k,
+                    filter=filter,
+                )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_text_query_failed"
+            raise RuntimeError("native core text query failed") from exc
+        return self._hits_from_native_rows(payload.get("hits", []))
+
+    def _native_search_text_batch(
+        self,
+        queries: list[str],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+        mode: str,
+    ) -> list[list[LodeSearchHit]]:
+        """Returns native hits for a batch of text queries (fail closed).
+
+        Mirrors :meth:`_native_search_text` but scores the whole batch through one
+        shared native scan (GPU-eligible), embedding each query in Python first.
+        Used by :meth:`search_many`.
+        """
+
+        try:
+            query_embeddings = None
+            if mode in {"vector", "hybrid"}:
+                if self._embedding_backend is None:
+                    raise RuntimeError("native text query requires an embedding backend")
+                query_embeddings = [
+                    self._embedding_backend.embed_query(query) for query in queries
+                ]
+            payloads = self._native_vector_engine.search_text_batch(
+                _LOCAL_INDEX_ID,
+                queries,
+                mode,
+                query_embeddings,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_text_batch_query_failed"
+            raise RuntimeError("native core text batch query failed") from exc
+        return [self._hits_from_native_rows(payload.get("hits", [])) for payload in payloads]
+
+    def _native_get_text(self, document_id: str) -> str | None:
+        """Returns one native raw-text value, or ``None`` if absent (fail closed)."""
+
+        try:
+            return self._native_vector_engine.get_document_text(_LOCAL_INDEX_ID, document_id)
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_get_text_failed"
+            raise RuntimeError("native core document read failed") from exc
+
+    def _native_get_texts(self, document_ids: list[str]) -> dict[str, str]:
+        """Returns a ``{id: text}`` map for the stored ids that have text (fail closed)."""
+
+        try:
+            return self._native_vector_engine.get_document_texts(_LOCAL_INDEX_ID, document_ids)
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_get_texts_failed"
+            raise RuntimeError("native core document read failed") from exc
+
+    def _native_get_document(self, document_id: str) -> dict[str, Any] | None:
+        """Returns one native payload-free document record, or ``None`` (fail closed)."""
+
+        try:
+            return self._native_vector_engine.get_document(_LOCAL_INDEX_ID, document_id)
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_get_document_failed"
+            raise RuntimeError("native core document read failed") from exc
+
+    def _native_list_documents(
+        self,
+        filter: Mapping[str, Any] | None,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Returns native payload-free document records, optionally paged (fail closed)."""
+
+        try:
+            return self._native_vector_engine.list_documents(
+                _LOCAL_INDEX_ID,
+                filter=filter,
+                after=after,
+                limit=limit,
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_list_documents_failed"
+            raise RuntimeError("native core document read failed") from exc
+
+    def _native_stats(self) -> dict[str, Any]:
+        """Returns native index stats (fail closed)."""
+
+        try:
+            return self._native_vector_engine.stats(_LOCAL_INDEX_ID)
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_stats_failed"
+            raise RuntimeError("native core stats failed") from exc
+
+    def _native_core_stats(self) -> dict[str, Any]:
+        """Returns redacted native-core status for this handle."""
+
+        try:
+            stats = self._native_stats()
+        except Exception:  # noqa: BLE001 - status report must never raise
+            stats = {}
+        return {
+            "mode": "on",
+            "write_mode": "on" if self._native_write_through_enabled else "off",
+            "version": self._native_core_version,
+            "abi_version": self._native_core_abi_version,
+            "enabled": self._native_vector_engine is not None,
+            "covered": self._native_vector_covered,
+            "fallback_reason": self._native_core_fallback_reason,
+            "document_count": int(stats.get("document_count", 0) or 0),
+            "write_through": self._native_write_through_enabled,
+        }
+
+    def _native_persist(self) -> None:
+        """Folds the native core's outstanding writes into a durable generation."""
+
+        if not self._native_vector_mutable:
+            return
+        try:
+            self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_write_persist_failed"
+            raise RuntimeError("native core persist failed") from exc
+
+    def _native_should_persist_after_mutation(self) -> bool:
+        """Whether native must publish a generation immediately after a mutation.
+
+        Generation mode only: there a per-add generation publish IS the durability.
+        In WAL mode the native upsert already appended a durable WAL record, so a
+        per-add ``persist()`` would only republish a full generation redundantly
+        (the real cost behind native's slow per-add WAL durability); the generation
+        publish is deferred to checkpoint/close instead.
+        """
+
+        return self._native_write_through_enabled and self.commit_mode.value == "generation"
+
+    @staticmethod
+    def _hits_from_native_rows(rows: Any) -> list[LodeSearchHit]:
+        """Hydrates native search rows into public payload-free hit objects."""
+
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid native response: hits must be a list")
+        hits: list[LodeSearchHit] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise RuntimeError("invalid native response: hit row must be an object")
+            hits.append(
+                LodeSearchHit(
+                    score=float(row["score"]),
+                    id=str(row["document_id"]),
+                    metadata=dict(row.get("metadata", {})),
+                )
+            )
+        return hits
+
+    @staticmethod
+    def _hits_from_native_arrays(
+        scores: Any,
+        document_ids: list[str],
+        metadata: list[Mapping[str, Any]],
+        k: int,
+        *,
+        query_count: int,
+    ) -> list[list[LodeSearchHit]]:
+        """Builds hit rows from flat ``[query_count * k]`` native arrays.
+
+        The near-zero-copy counterpart of :meth:`_hits_from_native_rows`: scores
+        arrive as a numpy array, ids as a string list, and metadata as a dict list,
+        all flat and row-major by query, so no per-hit JSON object is parsed.
+        """
+
+        if k == 0:
+            return [[] for _ in range(query_count)]
+        scores_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+        metadata_len = len(metadata)
+        rows: list[list[LodeSearchHit]] = []
+        for query_index in range(query_count):
+            base = query_index * k
+            row = [
+                LodeSearchHit(
+                    score=float(scores_list[base + offset]),
+                    id=str(document_ids[base + offset]),
+                    metadata=dict(metadata[base + offset])
+                    if base + offset < metadata_len
+                    else {},
+                )
+                for offset in range(k)
+            ]
+            rows.append(row)
+        return rows
 
     @property
     def _vector_dim(self) -> int:
@@ -1212,61 +1848,90 @@ class LodeDB:
         metrics["encode_seconds"] += time.perf_counter() - started
         return vectors
 
-    def _ensure_index(self) -> None:
-        """Binds the single local index, creating it unless this handle is read-only."""
-
-        try:
-            self._index.get_index()
-        except Exception:  # noqa: BLE001 - missing index
-            if self.read_only:
-                # A read-only handle never creates state: an absent index just
-                # means an empty or not-yet-written store, so reads return nothing.
-                return
-            self._index.create(name="lodedb-local")
-
     def _next_auto_id(self) -> str:
         """Returns a unique, collision-resistant auto id for an added document."""
 
         self._auto_id_counter += 1
         return f"doc-{secrets.token_hex(8)}-{self._auto_id_counter}"
 
-    def _metadata_for_document(self, document_id: str) -> dict[str, Any]:
-        """Returns redacted metadata for a document id (empty when unavailable)."""
 
+# The native writer-lock contention error, raised by the Rust core when another
+# process already holds <dir>/.lodedb.lock and the acquire timeout elapses. The
+# native binding surfaces it as a ValueError carrying this redacted message.
+_NATIVE_WRITER_LOCK_CONTENTION_MARKER = "another writer holds the lodedb lock"
+
+
+def _is_writer_lock_contention(error: BaseException) -> bool:
+    """Returns whether a native open failed because another writer holds the lock."""
+
+    return _NATIVE_WRITER_LOCK_CONTENTION_MARKER in str(error)
+
+
+# Engines we could not drop on their home worker (interpreter teardown, or a
+# worker that did not answer in time) are parked here so their final decref never
+# lands on a foreign thread (the unsendable PyCoreEngine panics if it does). The
+# OS reclaims them at process exit; this only prevents a spurious teardown panic.
+_LEAKED_NATIVE_ENGINES: list[NativeCoreEngineHandle] = []
+
+
+def _shutdown_native_engine(
+    executor: ThreadPoolExecutor,
+    holder: list[NativeCoreEngineHandle],
+    home_thread_id: int | None,
+) -> None:
+    """Drops the unsendable native engine on its home worker thread (GC fallback).
+
+    The GC finalizer for a handle the caller never closed. It drops the engine
+    without a clean ``close()`` (no WAL fold): each mutation is already durable on
+    its own (a generation publish in generation mode, a WAL record in WAL mode), so
+    a leftover WAL is simply replayed on the next open. The engine is reached
+    through ``holder`` (also captured by the finalizer): the worker task pops it out
+    and drops it there, so when this function returns the holder is empty and no
+    unsendable object remains for the collecting thread to drop.
+
+    During interpreter shutdown the executor's own atexit hook is joining the worker
+    threads, so submitting work can hang or has already been refused; we then park
+    the engine in :data:`_LEAKED_NATIVE_ENGINES` rather than risk a wrong-thread
+    drop (the process is exiting, so the OS reclaims it). A normal-GC worker drop
+    uses a bounded wait and falls back to the same park on timeout.
+    """
+
+    if not holder:
+        return
+    on_worker = home_thread_id is not None and threading.get_ident() == home_thread_id
+
+    def _drop_on_worker() -> None:
+        # Runs on the home worker: take the engine out of the shared holder so its
+        # final decref lands here, on the thread that created it.
+        if holder:
+            holder.pop()
+
+    if on_worker:
+        _drop_on_worker()
+        executor.shutdown(wait=False)
+        return
+    if home_thread_id is None:
+        _LEAKED_NATIVE_ENGINES.extend(holder)
+        holder.clear()
+        return
+    if sys.is_finalizing():
+        # Interpreter teardown: the executor's own atexit hook is joining the worker,
+        # so a blocking wait can hang. Hand the drop to the worker fire-and-forget
+        # (it usually drains before being joined, dropping on the right thread); if
+        # the worker is already gone, submit raises and we park the engine so it is
+        # never decref'd on this foreign thread.
         try:
-            record = self._index.get_document(document_id)
-        except Exception:  # noqa: BLE001 - tolerate races / missing metadata
-            return {}
-        metadata = record.get("metadata", {})
-        return dict(metadata) if isinstance(metadata, Mapping) else {}
-
-    def _hits_from_result_rows(self, rows: Any) -> list[LodeSearchHit]:
-        """Hydrates engine result rows into public payload-free hit objects."""
-
-        if not isinstance(rows, list):
-            raise RuntimeError("invalid engine response: results must be a list")
-        hits: list[LodeSearchHit] = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise RuntimeError("invalid engine response: result row must be an object")
-            document_id = str(row["document_id"])
-            # The engine inlines redacted metadata when the query opts in via
-            # include=("metadata",), which the search verbs now do. Fall back to a
-            # by-id read only when a row lacks it, so any other caller stays correct.
-            row_metadata = row.get("metadata")
-            metadata = (
-                dict(row_metadata)
-                if isinstance(row_metadata, Mapping)
-                else self._metadata_for_document(document_id)
-            )
-            hits.append(
-                LodeSearchHit(
-                    score=float(row["score"]),
-                    id=document_id,
-                    metadata=metadata,
-                )
-            )
-        return hits
+            executor.submit(_drop_on_worker)
+        except Exception:  # noqa: BLE001 - worker already shut down
+            _LEAKED_NATIVE_ENGINES.extend(holder)
+            holder.clear()
+        return
+    try:
+        executor.submit(_drop_on_worker).result(timeout=10.0)
+    except Exception:  # noqa: BLE001 - worker dead/stuck; park instead of dropping here
+        _LEAKED_NATIVE_ENGINES.extend(holder)
+        holder.clear()
+    executor.shutdown(wait=False)
 
 
 def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1337,6 +2002,105 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
                 f"metadata value for {key!r} must be a string, number, or bool"
             )
     return coerced
+
+
+def _native_vector_index_options(
+    *,
+    index_id: str,
+    index_key: str,
+    client_id_hash: str,
+    name: str,
+    model: str,
+    provider: str,
+    task: str,
+    route_profile: str,
+    storage_profile: str,
+    vector_dim: int,
+    bit_width: int,
+) -> dict[str, Any]:
+    """Builds the native-core index creation payload for the local vector store."""
+
+    return {
+        "index_id": str(index_id),
+        "index_key": str(index_key),
+        "client_id_hash": str(client_id_hash),
+        "name": str(name),
+        "model": str(model),
+        "provider": str(provider),
+        "task": str(task),
+        "route_profile": str(route_profile),
+        "storage_profile": str(storage_profile),
+        "vector_dim": int(vector_dim),
+        "bit_width": int(bit_width),
+    }
+
+
+def _has_leftover_wal(path: Path) -> bool:
+    """Returns whether a non-empty WAL log is present (a crash before checkpoint)."""
+
+    return any(p.is_file() and p.stat().st_size > 0 for p in Path(path).glob("*.wal"))
+
+
+def _persisted_index_identity(path: Path) -> dict[str, Any] | None:
+    """Reads the committed index identity (model/dim/etc.) for the local store.
+
+    Returns the persisted route identity from the consistent generation named by
+    the ``<key>.commit.json`` root manifest (the same on-disk source the snapshot
+    auditor reads), or ``None`` when the store has no committed index yet. Only the
+    redacted state header is read; journal deltas never change the identity.
+    """
+
+    commits = sorted(Path(path).glob(f"*{COMMIT_MANIFEST_SUFFIX}"))
+    for commit_path in commits:
+        manifest = read_commit_manifest(commit_path)
+        if manifest is None:
+            continue
+        key = commit_path.name[: -len(COMMIT_MANIFEST_SUFFIX)]
+        base = base_json_path(Path(path), key, int(manifest["base_epoch"]))
+        try:
+            payload = json.loads(base.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        state = _state_from_payload(payload)
+        return {
+            "native_dim": int(state.native_dim),
+            "model": str(state.model),
+            "provider": str(state.provider),
+            "task": str(state.task),
+            "storage_profile": str(state.storage_profile),
+            "turbovec_bit_width": int(state.turbovec_bit_width),
+        }
+    return None
+
+
+def _validate_native_index_identity(path: Path, options: Mapping[str, Any]) -> None:
+    """Rejects a reopen whose persisted index identity contradicts this handle.
+
+    Enforces the full persisted route identity (dimension, model, provider, task,
+    storage profile, and TurboVec bit width) against the identity this handle was
+    opened with. Checking only model/dim is not enough: a vector-only store and a
+    custom-embedder index can share model/provider/dim yet differ in task, and a
+    reopen at a different bit width must fail rather than silently keep the stored
+    width. A store with no committed generation yet has no identity to contradict.
+    """
+
+    persisted = _persisted_index_identity(path)
+    if persisted is None:
+        return
+    for label, persisted_value, expected_value in (
+        ("dimension", persisted["native_dim"], int(options["vector_dim"])),
+        ("model", persisted["model"], str(options["model"])),
+        ("provider", persisted["provider"], str(options["provider"])),
+        ("task", persisted["task"], str(options["task"])),
+        ("storage profile", persisted["storage_profile"], str(options["storage_profile"])),
+        ("bit_width", persisted["turbovec_bit_width"], int(options["bit_width"])),
+    ):
+        if persisted_value != expected_value:
+            raise RuntimeError(
+                f"persisted index {label} {persisted_value!r} does not match the opened "
+                f"index {label} {expected_value!r}; reopen with the same model / embedder "
+                "/ vector_dim / bit_width it was written with"
+            )
 
 
 def _coerce_optional_text(value: Any) -> str | None:

@@ -11,6 +11,8 @@ so the lexical index is the persisted-token path, not the raw-text one.
 
 from __future__ import annotations
 
+import gc
+
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend, hash_embedding
 
@@ -75,9 +77,10 @@ def test_vector_caption_lexical_recovers_from_wal(tmp_path):
     db.add_vectors(_vec(0), id="v", text="sensor fault code E1234 captured")
     assert [h.id for h in db.search("E1234", k=5, mode="lexical")] == ["v"]
 
-    # Crash: leave the uncheckpointed WAL on disk, release the lock to reopen.
-    db._engine._release_writer_lock()
+    # Crash: drop the handle, leaving the uncheckpointed WAL on disk; the native
+    # engine's writer lock is released on its worker so the test can reopen.
     del db
+    gc.collect()
 
     recovered = _open(tmp_path)
     try:

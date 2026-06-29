@@ -1,6 +1,14 @@
+use lodedb_core::{
+    engine::{CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
+    CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreIndexCreateOptions,
+    CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchResults,
+    CoreSecurityOptions, CoreStats, CoreVectorDocument,
+};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 fn not_contiguous_err(kind: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!(
@@ -59,7 +67,9 @@ impl TurboQuantIndex {
     fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> PyResult<()> {
         let arr = vectors.as_array();
         let dim = arr.ncols();
-        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("vectors"))?;
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         self.inner
@@ -82,7 +92,9 @@ impl TurboQuantIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         // Reject wrong-dim queries cleanly. Previously the inner
         // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
         // panic and surface to Python as a PanicException, not the
@@ -128,16 +140,15 @@ impl TurboQuantIndex {
     }
 
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::TurboQuantIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::TurboQuantIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -417,10 +428,7 @@ impl IdMapIndex {
     /// GEMM exactly.
     ///
     /// Local appliance extension on top of upstream v0.9.0.
-    fn rotation_matrix<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyArray2<f32>>>> {
+    fn rotation_matrix<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f32>>>> {
         match self.inner.rotation_matrix() {
             None => Ok(None),
             Some(rotation) => {
@@ -457,7 +465,9 @@ impl IdMapIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         if let Some(idx_dim) = self.inner.dim_opt() {
             if arr.ncols() != idx_dim {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -477,7 +487,9 @@ impl IdMapIndex {
                         "allowlist is empty",
                     ));
                 }
-                let slice = a_arr.as_slice().ok_or_else(|| not_contiguous_err("allowlist"))?;
+                let slice = a_arr
+                    .as_slice()
+                    .ok_or_else(|| not_contiguous_err("allowlist"))?;
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in slice {
                     if !self.inner.contains(id) {
@@ -542,18 +554,17 @@ impl IdMapIndex {
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::IdMapIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::IdMapIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -591,72 +602,735 @@ impl IdMapIndex {
     }
 }
 
-/// Exact late-interaction MaxSim scoring of one multi-vector query against a set
-/// of candidate documents.
-///
-/// `query` is a `(n_query, dim)` float32 matrix. `docs` is the candidate
-/// documents' patch vectors concatenated row-major into one `(total_patches,
-/// dim)` float32 matrix, partitioned by `doc_patch_counts` (patches per document,
-/// in order; must sum to `total_patches`). Returns one float32 score per
-/// document, in document order: the sum over query tokens of the maximum dot
-/// product against that document's patches. Vectors are assumed L2-normalized, so
-/// each dot is a cosine similarity. Documents are scored in parallel.
-#[pyfunction]
-fn maxsim_scores<'py>(
-    py: Python<'py>,
-    query: PyReadonlyArray2<f32>,
-    docs: PyReadonlyArray2<f32>,
-    doc_patch_counts: PyReadonlyArray1<i64>,
-) -> PyResult<Bound<'py, PyArray1<f32>>> {
-    let q_arr = query.as_array();
-    let n_query = q_arr.nrows();
-    let dim = q_arr.ncols();
-    let q_slice = q_arr.as_slice().ok_or_else(|| not_contiguous_err("query"))?;
+/// Private Python-owned LodeDB native engine handle.
+#[pyclass(name = "CoreEngine", unsendable)]
+struct PyCoreEngine {
+    inner: RustCoreEngine,
+}
 
-    let d_arr = docs.as_array();
-    let total_patches = d_arr.nrows();
-    if d_arr.ncols() != dim {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "query dim {} does not match docs dim {}",
-            dim,
-            d_arr.ncols(),
-        )));
+#[pymethods]
+impl PyCoreEngine {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: RustCoreEngine::new_in_memory(),
+        }
     }
-    let d_slice = d_arr.as_slice().ok_or_else(|| not_contiguous_err("docs"))?;
 
-    let counts_arr = doc_patch_counts.as_array();
-    let counts_slice = counts_arr
-        .as_slice()
-        .ok_or_else(|| not_contiguous_err("doc_patch_counts"))?;
-    let mut counts: Vec<usize> = Vec::with_capacity(counts_slice.len());
-    for &value in counts_slice {
-        if value < 0 {
+    #[staticmethod]
+    fn open(options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreEngine::open(options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    #[staticmethod]
+    fn open_readonly(path: String, options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreEngine::open_readonly(path, options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    fn create_index(
+        &mut self,
+        index_id: String,
+        vector_dim: usize,
+        bit_width: usize,
+    ) -> PyResult<()> {
+        self.inner
+            .create_index(index_id, vector_dim, bit_width)
+            .map_err(native_core_error_to_py)
+    }
+
+    fn create_index_with_options(&mut self, options_json: &str) -> PyResult<()> {
+        let options = native_from_json::<CoreIndexCreateOptions>(options_json)?;
+        self.inner
+            .create_index_with_options(options)
+            .map_err(native_core_error_to_py)
+    }
+
+    fn upsert_vectors(&mut self, index_id: &str, documents_json: &str) -> PyResult<String> {
+        let documents = native_from_json::<Vec<CoreVectorDocument>>(documents_json)?;
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Array-input fast path for vector upsert.
+    ///
+    /// `vectors` is a contiguous `(n, dim)` `f32` matrix; `sidecar_json` is a
+    /// parallel array of `{document_id, metadata, text}` objects (no vector
+    /// floats). This removes the per-document JSON-encode of the embedding (the
+    /// bulk of the durable-add payload) while keeping ids/metadata as a small
+    /// batched sidecar.
+    fn upsert_vectors_array(
+        &mut self,
+        index_id: &str,
+        vectors: PyReadonlyArray2<f32>,
+        sidecar_json: &str,
+    ) -> PyResult<String> {
+        #[derive(serde::Deserialize)]
+        struct VectorRowSidecar {
+            document_id: String,
+            #[serde(default)]
+            metadata: std::collections::BTreeMap<String, String>,
+            #[serde(default)]
+            text: Option<String>,
+        }
+        let arr = vectors.as_array();
+        let dim = arr.ncols();
+        let rows = arr.nrows();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("vectors"))?;
+        let sidecars = native_from_json::<Vec<VectorRowSidecar>>(sidecar_json)?;
+        if sidecars.len() != rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vector row count {} does not match sidecar length {}",
+                rows,
+                sidecars.len(),
+            )));
+        }
+        if rows > 0 && dim == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "doc_patch_counts must be non-negative",
+                "vectors must have a non-zero dimension",
             ));
         }
-        counts.push(value as usize);
-    }
-    let sum: usize = counts.iter().sum();
-    if sum != total_patches {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "doc_patch_counts sum {sum} does not match docs row count {total_patches}",
-        )));
+        let documents: Vec<CoreVectorDocument> = sidecars
+            .into_iter()
+            .zip(slice.chunks(dim.max(1)))
+            .map(|(sidecar, vector)| CoreVectorDocument {
+                document_id: sidecar.document_id,
+                vector: vector.to_vec(),
+                metadata: sidecar.metadata,
+                text: sidecar.text,
+                patch_matrix: None,
+            })
+            .collect();
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
     }
 
-    // The GIL is held while the kernel reads the borrowed NumPy buffers. A
-    // PyReadonlyArray keeps the arrays alive but does NOT stop other Python threads
-    // from mutating the same memory, so releasing the GIL here would let the kernel
-    // read moving buffers (unsound for a public binding). Holding it keeps the read
-    // of `q_slice` / `d_slice` consistent; the kernel is a bounded GEMM + reduction.
-    let scores = turbovec_core::maxsim_scores(q_slice, n_query, dim, d_slice, &counts);
-    Ok(scores.into_pyarray(py))
+    /// Array-input upsert for late-interaction documents. `vectors` is the pooled
+    /// `(n, dim)` f32 matrix (the indexed coarse rows); `patch_bytes` is every
+    /// document's encoded patch matrix concatenated into one `u8` buffer,
+    /// partitioned by the sidecar `nbytes`; `sidecar_json` is a parallel list of
+    /// `{document_id, metadata, dtype, patch_count, nbytes}`.
+    fn upsert_multivector(
+        &mut self,
+        index_id: &str,
+        vectors: PyReadonlyArray2<f32>,
+        patch_bytes: PyReadonlyArray1<u8>,
+        sidecar_json: &str,
+    ) -> PyResult<String> {
+        #[derive(serde::Deserialize)]
+        struct MultiVecSidecar {
+            document_id: String,
+            #[serde(default)]
+            metadata: std::collections::BTreeMap<String, String>,
+            dtype: String,
+            patch_count: usize,
+            nbytes: usize,
+        }
+        let arr = vectors.as_array();
+        let dim = arr.ncols();
+        let rows = arr.nrows();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let bytes_arr = patch_bytes.as_array();
+        let all_bytes = bytes_arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("patch_bytes"))?;
+        let sidecars = native_from_json::<Vec<MultiVecSidecar>>(sidecar_json)?;
+        if sidecars.len() != rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vector row count {} does not match sidecar length {}",
+                rows,
+                sidecars.len(),
+            )));
+        }
+        if rows > 0 && dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "vectors must have a non-zero dimension",
+            ));
+        }
+        let total: usize = sidecars.iter().map(|sidecar| sidecar.nbytes).sum();
+        if total != all_bytes.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "patch_bytes length {} does not match sidecar nbytes sum {total}",
+                all_bytes.len(),
+            )));
+        }
+        let mut offset = 0usize;
+        let mut documents: Vec<CoreVectorDocument> = Vec::with_capacity(rows);
+        for (sidecar, vector) in sidecars.into_iter().zip(slice.chunks(dim.max(1))) {
+            let stop = offset + sidecar.nbytes;
+            let patch_matrix = lodedb_core::storage::multivec_store::MultiVecRecord {
+                dtype: sidecar.dtype,
+                patch_count: sidecar.patch_count,
+                bytes: all_bytes[offset..stop].to_vec(),
+            };
+            offset = stop;
+            documents.push(CoreVectorDocument {
+                document_id: sidecar.document_id,
+                vector: vector.to_vec(),
+                metadata: sidecar.metadata,
+                text: None,
+                patch_matrix: Some(patch_matrix),
+            });
+        }
+        native_to_json(
+            &self
+                .inner
+                .upsert_vectors(index_id, &documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Late-interaction MaxSim query: `query` is the multi-vector query as a
+    /// contiguous `(n_query, dim)` f32 matrix; returns the top-k documents scored
+    /// by MaxSim against each candidate's stored patch matrix.
+    fn query_multivector(
+        &self,
+        index_id: &str,
+        query: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let arr = query.as_array();
+        let n_query = arr.nrows();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("query"))?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_multivector(index_id, slice, n_query, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn delete_documents(&mut self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
+        let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
+        native_to_json(
+            &self
+                .inner
+                .delete_documents(index_id, &document_ids)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn update_document_payload(
+        &mut self,
+        index_id: &str,
+        document_id: &str,
+        metadata_json: Option<&str>,
+        text_json: Option<&str>,
+    ) -> PyResult<String> {
+        let metadata: Option<std::collections::BTreeMap<String, String>> =
+            metadata_json.map(native_from_json).transpose()?;
+        let text: Option<Option<String>> = text_json.map(native_from_json).transpose()?;
+        native_to_json(
+            &self
+                .inner
+                .update_document_payload(index_id, document_id, metadata, text)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn query_vector(
+        &self,
+        index_id: &str,
+        query_vector_json: &str,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_vector = native_from_json::<Vec<f32>>(query_vector_json)?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vector(index_id, &query_vector, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn query_vectors_batch(
+        &self,
+        index_id: &str,
+        query_vectors_json: &str,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_vectors = native_from_json::<Vec<Vec<f32>>>(query_vectors_json)?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vectors_batch(index_id, &query_vectors, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Array-input fast path for a single vector query.
+    ///
+    /// Takes the query as a contiguous `f32` array instead of a JSON float list,
+    /// removing the per-query Python list-build + `json.dumps` + serde-parse cost
+    /// that dominates the single-query path. The top-k result stays JSON (it is
+    /// small) so the caller contract is identical to `query_vector`.
+    fn query_vector_array(
+        &self,
+        index_id: &str,
+        query_vector: PyReadonlyArray1<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        // Borrow the contiguous NumPy buffer directly rather than copying it into
+        // an owned Vec; the core query path takes a `&[f32]` slice, so a single
+        // query reaches the kernel with no boundary copy.
+        let array = query_vector.as_array();
+        let query = array
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_embedding"))?;
+        if !query.is_empty() {
+            validate_queries(query, query.len())?;
+        }
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vector(index_id, query, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Array-input fast path for a batch of vector queries.
+    ///
+    /// `query_vectors` is a contiguous `(n_query, dim)` `f32` matrix. Mirrors
+    /// `query_vectors_batch` but skips JSON-encoding the query matrix.
+    fn query_vectors_batch_array(
+        &self,
+        index_id: &str,
+        query_vectors: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let arr = query_vectors.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_vectors"))?;
+        if dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "query_vectors must have a non-zero dimension",
+            ));
+        }
+        validate_queries(slice, dim)?;
+        let queries: Vec<Vec<f32>> = slice.chunks(dim).map(|row| row.to_vec()).collect();
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .query_vectors_batch(index_id, &queries, top_k, filter.as_ref())
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Near-zero-copy batch query: flat query matrix in, arrays out.
+    ///
+    /// Borrows the contiguous query matrix straight through to the core (no
+    /// per-query `Vec`), and returns `(scores, document_ids, metadata_json, k)`:
+    /// `scores` is a flat `[nq*k]` f32 ndarray, `document_ids` a flat `[nq*k]`
+    /// string list, and only `metadata` crosses as a single JSON array — so a batch
+    /// no longer serializes and reparses one JSON object per hit. The caller
+    /// reshapes by `k`.
+    fn query_vectors_batch_array_out<'py>(
+        &self,
+        py: Python<'py>,
+        index_id: &str,
+        query_vectors: PyReadonlyArray2<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, Vec<String>, String, usize)> {
+        let arr = query_vectors.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("query_vectors"))?;
+        if dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "query_vectors must have a non-zero dimension",
+            ));
+        }
+        validate_queries(slice, dim)?;
+        let filter = native_optional_value(filter_json)?;
+        let arrays = self
+            .inner
+            .query_vectors_batch_arrays(index_id, slice, dim, top_k, filter.as_ref())
+            .map_err(native_core_error_to_py)?;
+        let metadata_json = serde_json::to_string(&arrays.metadata)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let scores = arrays.scores.into_pyarray(py);
+        Ok((scores, arrays.document_ids, metadata_json, arrays.k))
+    }
+
+    fn prepare_text_upsert(
+        &mut self,
+        index_id: &str,
+        documents_json: &str,
+        store_text: bool,
+        index_text: bool,
+        chunk_character_limit: usize,
+    ) -> PyResult<String> {
+        let documents = native_from_json::<Vec<CoreDocument>>(documents_json)?;
+        native_to_json(
+            &self
+                .inner
+                .prepare_text_upsert(
+                    index_id,
+                    &documents,
+                    store_text,
+                    index_text,
+                    chunk_character_limit,
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn apply_text_upsert(
+        &mut self,
+        plan_json: &str,
+        embeddings_json: &str,
+        embedding_time_ms: f64,
+    ) -> PyResult<String> {
+        let plan = native_from_json::<IngestPlan>(plan_json)?;
+        let embeddings = native_from_json::<Vec<Vec<f32>>>(embeddings_json)?;
+        native_to_json(
+            &self
+                .inner
+                .apply_text_upsert(&plan, &embeddings, embedding_time_ms)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn apply_text_upsert_array(
+        &mut self,
+        plan_json: &str,
+        embeddings: PyReadonlyArray2<f32>,
+        embedding_time_ms: f64,
+    ) -> PyResult<String> {
+        let plan = native_from_json::<IngestPlan>(plan_json)?;
+        let embeddings = embeddings_from_array(embeddings)?;
+        native_to_json(
+            &self
+                .inner
+                .apply_text_upsert(&plan, &embeddings, embedding_time_ms)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn prepare_query_text(&self, query: &str, mode: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .prepare_query_text(query, mode)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn search_embedded_text(
+        &self,
+        index_id: &str,
+        query_plan_json: &str,
+        query_embedding_json: Option<&str>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plan = native_from_json::<QueryPlan>(query_plan_json)?;
+        let query_embedding: Option<Vec<f32>> =
+            query_embedding_json.map(native_from_json).transpose()?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .search_embedded_text(
+                    index_id,
+                    &query_plan,
+                    query_embedding.as_deref(),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn search_embedded_text_array(
+        &self,
+        index_id: &str,
+        query_plan_json: &str,
+        query_embedding: PyReadonlyArray1<f32>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plan = native_from_json::<QueryPlan>(query_plan_json)?;
+        let query_embedding = query_embedding_from_array(query_embedding)?;
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .search_embedded_text(
+                    index_id,
+                    &query_plan,
+                    Some(&query_embedding),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn search_embedded_text_batch(
+        &self,
+        index_id: &str,
+        query_plans_json: &str,
+        query_embeddings: Option<PyReadonlyArray2<f32>>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plans = native_from_json::<Vec<QueryPlan>>(query_plans_json)?;
+        let embeddings: Option<Vec<Vec<f32>>> = query_embeddings.map(|array| {
+            array
+                .as_array()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect()
+        });
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .search_embedded_text_batch(
+                    index_id,
+                    &query_plans,
+                    embeddings.as_deref(),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn stats(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .stats(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn document_token_lists(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .document_token_lists(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn get_document_text(&self, index_id: &str, document_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .get_document_text(index_id, document_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn get_document_texts(&self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
+        let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
+        native_to_json(
+            &self
+                .inner
+                .get_document_texts(index_id, &document_ids)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn get_document(&self, index_id: &str, document_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .get_document(index_id, document_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn list_documents(
+        &self,
+        index_id: &str,
+        filter_json: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> PyResult<String> {
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .list_documents(index_id, filter.as_ref(), after, limit)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    fn persist(&mut self) -> PyResult<()> {
+        self.inner.persist().map_err(native_core_error_to_py)
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        self.inner.close().map_err(native_core_error_to_py)
+    }
+}
+
+#[pyfunction]
+fn native_core_version() -> &'static str {
+    lodedb_core::CORE_VERSION
+}
+
+#[pyfunction]
+fn native_core_abi_version() -> u32 {
+    lodedb_core::NATIVE_CORE_ABI_VERSION
+}
+
+#[pyfunction]
+fn storage_schema_version() -> u32 {
+    lodedb_core::STORAGE_SCHEMA_VERSION
+}
+
+#[pyfunction]
+fn cuda_runtime_available() -> bool {
+    lodedb_core::cuda_runtime_available()
+}
+
+#[pyfunction]
+fn core_document_to_json(
+    document_id: String,
+    text: String,
+    metadata: std::collections::BTreeMap<String, String>,
+) -> PyResult<String> {
+    native_to_json(&CoreDocument {
+        document_id,
+        text,
+        metadata,
+    })
+}
+
+#[pyfunction]
+fn round_trip_core_json(type_name: &str, json: &str) -> PyResult<String> {
+    match type_name {
+        "CoreDocument" => native_round_trip::<CoreDocument>(json),
+        "CoreIndexConfig" => native_round_trip::<CoreIndexConfig>(json),
+        "CoreMutationResult" => native_round_trip::<CoreMutationResult>(json),
+        "CoreOpenOptions" => native_round_trip::<CoreOpenOptions>(json),
+        "CoreQuery" => native_round_trip::<CoreQuery>(json),
+        "CoreRoutePolicy" => native_round_trip::<CoreRoutePolicy>(json),
+        "CoreSearchResults" => native_round_trip::<CoreSearchResults>(json),
+        "CoreSecurityOptions" => native_round_trip::<CoreSecurityOptions>(json),
+        "CoreStats" => native_round_trip::<CoreStats>(json),
+        "CoreVectorDocument" => native_round_trip::<CoreVectorDocument>(json),
+        _ => Err(native_core_error_to_py(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            "unknown core type",
+        ))),
+    }
+}
+
+fn native_round_trip<T>(json: &str) -> PyResult<String>
+where
+    T: serde::Serialize + DeserializeOwned,
+{
+    let value: T = native_from_json(json)?;
+    native_to_json(&value)
+}
+
+fn native_from_json<T>(json: &str) -> PyResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(json).map_err(|error| {
+        native_core_error_to_py(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            format!("invalid JSON payload: {error}"),
+        ))
+    })
+}
+
+fn native_to_json<T: serde::Serialize>(value: &T) -> PyResult<String> {
+    serde_json::to_string(value).map_err(|error| {
+        native_core_error_to_py(CoreError::new(
+            CoreErrorCode::Internal,
+            format!("failed to serialize core type: {error}"),
+        ))
+    })
+}
+
+fn native_optional_value(json: Option<&str>) -> PyResult<Option<Value>> {
+    json.map(native_from_json).transpose()
+}
+
+fn embeddings_from_array(embeddings: PyReadonlyArray2<f32>) -> PyResult<Vec<Vec<f32>>> {
+    let arr = embeddings.as_array();
+    // No rows (e.g. a re-add whose chunks all already exist, so nothing needs
+    // embedding) is valid and must not reach `chunks(ncols)`: an empty `(0, 0)`
+    // array has `ncols == 0`, and `slice.chunks(0)` panics.
+    if arr.nrows() == 0 {
+        return Ok(Vec::new());
+    }
+    let slice = arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("embeddings"))?;
+    Ok(slice
+        .chunks(arr.ncols())
+        .map(|row| row.to_vec())
+        .collect::<Vec<_>>())
+}
+
+fn query_embedding_from_array(embedding: PyReadonlyArray1<f32>) -> PyResult<Vec<f32>> {
+    let arr = embedding.as_array();
+    let slice = arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("query_embedding"))?;
+    Ok(slice.to_vec())
+}
+
+fn native_core_error_to_py(error: CoreError) -> PyErr {
+    match error.code() {
+        CoreErrorCode::InvalidArgument | CoreErrorCode::PlanStale => {
+            pyo3::exceptions::PyValueError::new_err(error.to_string())
+        }
+        CoreErrorCode::NotFound => pyo3::exceptions::PyKeyError::new_err(error.to_string()),
+        CoreErrorCode::CorruptStore | CoreErrorCode::Unsupported | CoreErrorCode::Internal => {
+            pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+        }
+    }
 }
 
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
-    m.add_function(wrap_pyfunction!(maxsim_scores, m)?)?;
+    m.add_class::<PyCoreEngine>()?;
+    m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
+    m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
+    m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_runtime_available, m)?)?;
+    m.add_function(wrap_pyfunction!(core_document_to_json, m)?)?;
+    m.add_function(wrap_pyfunction!(round_trip_core_json, m)?)?;
     Ok(())
 }

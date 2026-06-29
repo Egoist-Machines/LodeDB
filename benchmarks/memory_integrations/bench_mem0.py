@@ -128,6 +128,15 @@ class _LodeDBDriver(_Mem0Driver):
             collection_name="mem0", path=str(self.dir), embedding_model_dims=self.dim
         )
 
+    def persist(self) -> None:
+        # The base mem0 driver treats persist as a no-op (Qdrant/Chroma/FAISS
+        # persist on every write). LodeDB writes are durable on every add too, but
+        # WAL compaction is deferred: without an explicit checkpoint the on-disk
+        # store is the raw-vector WAL, not the compact 4-bit base, so footprint_bytes
+        # would over-report it ~10x. Checkpoint here so the measured footprint is the
+        # durable compact store, matching the LangChain/LlamaIndex LodeDB drivers.
+        self.store.client.persist()
+
     def _close_handle(self) -> None:
         try:
             self.store.close()

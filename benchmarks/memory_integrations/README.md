@@ -119,19 +119,20 @@ The single-query tables below are the **A10** run. `docs/s` is store-only ingest
 wall-clock budget, so a slow full-rewrite store is sampled fewer times), `footprint`
 is durable on-disk size, and `vs LodeDB` is the footprint ratio. CPU latencies vary
 run to run on Modal's shared hosts (see Caveats), so the **multipliers are the stable
-read** (ratios cancel host speed) and the absolute figures are one measured sample.
+read** (ratios cancel host speed); the absolute figures are the mean of 3 A10 runs of
+this branch's native Rust core (`CoreEngine`, default on).
 
 ### Headline: LodeDB vs each framework's default store
 
-At ~17.5k docs on an A10. Each cell is LodeDB's figure vs the default's, then the
-multiplier.
+At ~17.5k docs on an A10, mean of 3 runs. Each cell is LodeDB's figure vs the default's,
+then the multiplier.
 
 | Axis | LangChain (`InMemoryVectorStore`) | LlamaIndex (`SimpleVectorStore`) | mem0 (Qdrant) |
 |---|---|---|---|
 | **On-disk footprint** | 28 vs 199 MB = **7.2x smaller** | 28 vs 145 MB = **5.3x smaller** | 15 vs 70 MB = **4.6x smaller** |
-| **Single-query p50** (CPU) | 0.84 vs 345 ms = **~410x faster** | 0.85 vs 427 ms = **~500x faster** | 0.92 vs 23 ms = **~25x faster** |
-| **Batched retrieval, 64** (GPU) | 6,280 vs ~3 qps = **~2,000x** | 5,744 vs ~2 qps = **~2,800x** | 2,686 vs 43 qps = **~62x** |
-| **Durable single add** | 20 ms vs 11.5 s = **~570x faster** | 11 ms vs 23.4 s = **~2,200x faster** | 13 ms vs 0.7 ms (Qdrant faster) |
+| **Single-query p50** (CPU) | 0.68 vs 299 ms = **~440x faster** | 0.69 vs 346 ms = **~500x faster** | 0.74 vs 33 ms = **~44x faster** |
+| **Batched retrieval, 64** (GPU) | 5,447 vs ~3 qps = **~1,600x** | 5,105 vs ~3 qps = **~1,780x** | 3,779 vs 32 qps = **~117x** |
+| **Durable single add** | 1.1 ms vs 8.8 s = **~8,000x faster** | 1.2 ms vs 19.8 s = **~16,000x faster** | 0.8 ms vs 0.6 ms (Qdrant faster) |
 | **Recall@10** | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 (filtered 0.95 vs 1.00) |
 
 Every backend, LodeDB included, is fed the same precomputed vectors (LodeDB via its

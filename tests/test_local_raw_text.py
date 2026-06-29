@@ -21,23 +21,48 @@ from pathlib import Path
 import pytest
 
 from lodedb.engine.core import audit_persisted_index_snapshots
-from lodedb.engine.document_text_store import DocumentTextStore
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB
 
 _SECRET = "TOPSECRET document body that must only live in the text sidecar"
 
 
-def _open(tmp_path, *, store_text: bool, dim: int = 384, commit_mode: str | None = None) -> LodeDB:
-    """Opens a LodeDB with an injected deterministic hash backend."""
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
+
+def _open(
+    tmp_path,
+    *,
+    store_text: bool,
+    dim: int = 384,
+    commit_mode: str | None = None,
+    compression: bool | None = None,
+) -> LodeDB:
+    """Opens a LodeDB with an injected deterministic hash backend.
+
+    ``compression`` is omitted from the call when ``None`` so a reopen can rely on
+    the persisted value (the SDK default is ``True``).
+    """
+
+    kwargs: dict = {}
+    if compression is not None:
+        kwargs["compression"] = compression
     return LodeDB(
         path=tmp_path,
         model="minilm",
         store_text=store_text,
         commit_mode=commit_mode,
         _embedding_backend=HashEmbeddingBackend(native_dim=dim),
+        **kwargs,
     )
+
+
+def _text_base(tmp_path) -> Path:
+    """Returns the single retained-text base file (``g*.tvtext``)."""
+
+    bases = sorted(glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True))
+    assert bases, "expected a raw-text base"
+    return Path(bases[-1])
 
 
 def test_store_text_enabled_by_default(tmp_path):
@@ -244,19 +269,26 @@ def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
     for jsd in glob.glob(str(Path(tmp_path) / "**" / "*.jsd"), recursive=True):
         assert _SECRET not in Path(jsd).read_bytes().decode("utf-8", "replace")
 
-    # Telemetry and audit events carry no raw text.
-    engine = db._engine
-    assert _SECRET not in json.dumps([dict(m) for m in engine.metrics])
-    assert _SECRET not in json.dumps([dict(a) for a in engine.audit_events])
+    # The persisted redacted artifacts carry no raw text: the disk auditor scans
+    # the committed snapshot + journal deltas for forbidden raw-payload keys and
+    # never inspects the text sidecar.
+    report = audit_persisted_index_snapshots(tmp_path)
+    assert report["status"] == "passed"
+    assert report["raw_document_text_present"] is False
+    assert _SECRET not in json.dumps(report)
 
     # stats stays payload-free and still reports raw_payload_text_present False.
     stats = db.stats()
     assert stats["raw_payload_text_present"] is False
     assert _SECRET not in json.dumps(stats)
 
-    # The dedicated sidecar (and only it) holds the text.
-    tvtext = glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0]
-    assert _SECRET in Path(tvtext).read_text(encoding="utf-8")
+    # The text lives only in the dedicated sidecar. It is zstd-compressed, so the
+    # payload is not even plaintext on disk; round-tripping through the native
+    # reader proves it is durably stored and retrievable.
+    assert db.get("s") == _SECRET
+    tvtext = Path(glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0])
+    assert tvtext.stat().st_size > 0
+    assert _SECRET not in tvtext.read_bytes().decode("utf-8", "replace")
     db.close()
 
 
@@ -297,17 +329,103 @@ def test_text_store_checksum_mismatch_fails_closed(tmp_path):
     db.persist()
     db.close()
 
-    # The journaled raw-text base is a checksummed id->text map at g<epoch>.tvtext.
+    # The journaled raw-text base at g<epoch>.tvtext is a checksummed id->text map,
+    # now zstd-compressed. Overwrite it with an uncompressed base whose body no
+    # longer matches its recorded checksum: the native reader still accepts
+    # uncompressed bases (back-compat) and re-checks the body hash, so a tampered
+    # body fails closed regardless of on-disk compression.
     base = Path(sorted(glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True))[-1])
-    payload = json.loads(base.read_text(encoding="utf-8"))
-    # Mutate the body without updating the recorded checksum.
-    payload["body"]["documents"]["c"] = "tampered body"
-    base.write_text(json.dumps(payload), encoding="utf-8")
+    tampered = {
+        "schema_version": 2,
+        "body_sha256": "0" * 64,  # stale: does not match the body below
+        "body": {"schema_version": 2, "documents": {"c": "tampered body"}},
+    }
+    base.write_text(json.dumps(tampered), encoding="utf-8")
 
-    # Loading the tampered base through its store fails closed on the checksum.
-    with pytest.raises(RuntimeError, match="checksum"):
-        DocumentTextStore(base).load()
-
-    # And reopening the DB fails closed rather than serving the tampered text.
+    # Reopening the DB fails closed on the checksum rather than serving tampered text.
     with pytest.raises(RuntimeError, match="checksum"):
         _open(tmp_path, store_text=True)
+
+
+def test_compression_enabled_by_default_writes_zstd_base(tmp_path):
+    """The default (compression=True) writes a zstd-framed retained-text base."""
+
+    db = LodeDB(
+        path=tmp_path,
+        model="minilm",
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    assert db.compression is True
+    db.add("compressed default body", id="a")
+    db.persist()
+    base = _text_base(tmp_path)
+    assert base.read_bytes().startswith(_ZSTD_MAGIC), "default base must be zstd-compressed"
+    assert db.get("a") == "compressed default body"
+    db.close()
+
+
+def test_compression_false_writes_plain_json_base(tmp_path):
+    """compression=False writes a plain-JSON base (no zstd magic) that still reads."""
+
+    db = _open(tmp_path, store_text=True, compression=False)
+    assert db.compression is False
+    db.add("uncompressed body", id="a")
+    db.persist()
+    base = _text_base(tmp_path)
+    raw = base.read_bytes()
+    assert not raw.startswith(_ZSTD_MAGIC), "compression=False must not write a zstd frame"
+    # It is plain canonical JSON, so the wrapper parses and carries the document.
+    assert b'"documents"' in raw
+    assert db.get("a") == "uncompressed body"
+    db.close()
+
+
+def test_compression_setting_persists_and_reopen_wins(tmp_path):
+    """A store created uncompressed stays uncompressed on a default reopen.
+
+    The text-store manifest records ``compress``; the persisted value wins over
+    the passed default, so reopening WITHOUT compression=False (SDK default True)
+    keeps writing uncompressed bases, and all text still reads back.
+    """
+
+    # commit_mode="generation" so each add rewrites/extends the text store on disk
+    # under the engine's effective (persisted) compression flag.
+    db = _open(tmp_path, store_text=True, compression=False, commit_mode="generation")
+    db.add("seed body", id="seed")
+    db.persist()
+    db.close()
+    assert not _text_base(tmp_path).read_bytes().startswith(_ZSTD_MAGIC)
+
+    # Reopen WITHOUT passing compression: the SDK default is True, but the
+    # persisted False must win, so a fresh base written now stays uncompressed.
+    reopened = _open(tmp_path, store_text=True, commit_mode="generation")
+    assert reopened.compression is True  # the requested/seeded value
+    # Enough writes to force a fresh base rewrite (compaction), proving NEW writes
+    # honour the persisted flag rather than the requested default.
+    reopened.add_many([{"text": f"more body {i}", "id": f"m{i}"} for i in range(16)])
+    reopened.persist()
+    base = _text_base(tmp_path)
+    assert not base.read_bytes().startswith(
+        _ZSTD_MAGIC
+    ), "persisted compress=false must win on reopen (new base stays uncompressed)"
+    assert reopened.get("seed") == "seed body"
+    assert reopened.get("m5") == "more body 5"
+    reopened.close()
+
+
+def test_compression_true_persists_and_reopen_stays_compressed(tmp_path):
+    """A store created compressed stays compressed across a reopen, and reads back."""
+
+    db = _open(tmp_path, store_text=True, compression=True, commit_mode="generation")
+    db.add("compressed seed", id="seed")
+    db.persist()
+    db.close()
+    assert _text_base(tmp_path).read_bytes().startswith(_ZSTD_MAGIC)
+
+    reopened = _open(tmp_path, store_text=True, commit_mode="generation")
+    reopened.add_many([{"text": f"more body {i}", "id": f"m{i}"} for i in range(16)])
+    reopened.persist()
+    assert _text_base(tmp_path).read_bytes().startswith(_ZSTD_MAGIC)
+    assert reopened.get("seed") == "compressed seed"
+    assert reopened.get("m5") == "more body 5"
+    reopened.close()

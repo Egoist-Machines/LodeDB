@@ -90,6 +90,24 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+  # Runs the native Rust core's own test suites (the integration suites in
+  # crates/lodedb-core/tests plus the lodedb-ffi ABI smoke), which the Python
+  # pytest job above does not exercise. Linux only; the vendored TurboVec crate
+  # needs a CBLAS provider (OpenBLAS) to build here.
+  rust-tests:
+    name: native-core rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS (Linux CBLAS provider for the vendored TurboVec crate)
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the native-core Rust test suites
+        run: cargo test --workspace
+
   # Builds the package in a clean environment and asserts the *patched* TurboVec core is
   # what got built — not the stock PyPI `turbovec`, which lacks the delta-persistence and
   # reconstruction APIs. This is the guard for the vendored-dependency install story.
@@ -127,3 +145,43 @@ jobs:
                 {k: b.get(k) for k in ("version", "source_tag",
                                        "delta_persistence_available", "reconstruction_available")})
           PY
+
+  native-core-benchmark:
+    name: native-core benchmark artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS (Linux CBLAS provider for the vendored TurboVec crate)
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync (base runtime + dev)
+        run: uv sync --extra dev
+
+      - name: Build release native extension for benchmark
+        run: cargo build --release --manifest-path third_party/turbovec/turbovec-python/Cargo.toml
+
+      - name: Run Rust-vs-Python native-core benchmark
+        env:
+          LODEDB_NATIVE_CORE_EXTENSION_PATH: third_party/turbovec/target/release/lib_turbovec.so
+        run: |
+          uv run python -m benchmarks.native_migration.rust_vs_python \
+            --documents 2000 --queries 200 --dim 64 \
+            --output benchmarks/native_migration/results/rust_vs_python_ci.json
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("benchmarks/native_migration/results/rust_vs_python_ci.json").read_text())
+          summary = payload["pass_fail_summary"]
+          if not summary["passed"]:
+              raise SystemExit(f"native-core benchmark gates failed: {summary['failures']}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-core-rust-vs-python-benchmark
+          path: benchmarks/native_migration/results/rust_vs_python_ci.json

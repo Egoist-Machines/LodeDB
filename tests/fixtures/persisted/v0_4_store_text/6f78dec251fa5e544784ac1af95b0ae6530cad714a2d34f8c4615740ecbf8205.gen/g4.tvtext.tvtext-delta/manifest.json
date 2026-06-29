@@ -1,0 +1,11 @@
+{
+  "base": {
+    "document_count": 3,
+    "file_bytes": 289,
+    "file_name": "g4.tvtext",
+    "sha256": "759b3da02f4063cd65d1cd3d34ff392dec90ce10ef5e41d4e5a5cde5cc3e381b"
+  },
+  "deltas": [],
+  "next_seq": 1,
+  "schema_version": 2
+}

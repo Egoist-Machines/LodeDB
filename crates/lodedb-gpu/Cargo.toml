@@ -1,0 +1,35 @@
+[package]
+name = "lodedb-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional CUDA GPU-resident scan for the LodeDB native core"
+
+[lib]
+name = "lodedb_gpu"
+
+[dependencies]
+# Runtime-loaded CUDA: `dynamic-loading` links nothing at build time and dlopens
+# libcuda/libnvrtc/libcublas at runtime, so this crate compiles on CPU-only macOS,
+# Windows, and Linux and only engages a GPU where a driver is present. A concrete
+# `cuda-*` version must be selected; 12040 matches the benchmark image (CUDA 12.4)
+# and runs on any >= 12.4 driver.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "cublas",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-12040",
+] }
+
+# This crate is the single place `unsafe` is permitted: CUDA kernel launches and
+# the cuBLAS GEMM are inherently unsafe FFI. The rest of the workspace keeps
+# `unsafe_code = "forbid"`; lodedb-core consumes only this crate's safe API.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = "warn"

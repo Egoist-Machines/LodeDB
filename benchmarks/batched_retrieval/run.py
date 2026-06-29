@@ -5,13 +5,15 @@ This benchmarks the **public SDK path** ``LodeDB.search_many(queries, k=...)`` �
 batched entry point that lets CUDA hosts serve a query batch from the GPU-resident exact
 scan. Single-query ``search`` never takes that path, so batched ``search_many`` is the only
 way the GPU-batch story shows up through the supported API. It reports **queries/sec**
-across batch sizes for the CPU kernel and, when a CUDA GPU + the ``[gpu]`` extra are
-present, the GPU-resident path — so the batch crossover is visible end to end.
+across batch sizes for the native CPU kernel and, when a CUDA driver is present, the native
+GPU-resident path — so the batch crossover is visible end to end. The native scan reads
+``LODEDB_GPU_DIRECT_TURBOVEC`` per scan (``off`` forces the CPU baseline, any other value
+leaves the GPU path eligible), toggled here without rebuilding the index.
 
 Embedding is intentionally excluded: queries are embedded by a trivial local hash backend
 so the number isolates **retrieval** (the stage the GPU accelerates), the same property a
 batched-retrieval integration would lean on. Metrics only — counts, batch sizes, timings,
-throughput, and backend labels; never documents, queries, or embeddings.
+throughput, and a CPU-vs-GPU overlap; never documents, queries, or embeddings.
 
     uv run python benchmarks/batched_retrieval/run.py --docs 50000 --queries 1024
 
@@ -24,21 +26,27 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import platform
 import statistics
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.engine.gpu_turbovec import gpu_direct_turbovec_dependencies
-from lodedb.engine.runtime_policy import GpuDirectTurboVecPolicy
+from lodedb.engine.native_adapter import NativeCoreAdapter
 from lodedb.local.db import LodeDB
 from lodedb.local.presets import resolve_preset
 
 DEFAULT_BATCH_SIZES = "1,16,64,256,1024"
+
+# The Rust core reads this per scan; "off" disables the GPU-resident scan, any
+# other value (or unset) leaves it eligible, still subject to the CUDA driver and
+# the batch/corpus gates in the engine.
+_GPU_SCAN_ENV = "LODEDB_GPU_DIRECT_TURBOVEC"
 
 _TOPICS = (
     "machine learning models train on large corpora of text and images",
@@ -50,6 +58,26 @@ _TOPICS = (
     "tectonic plates shift slowly producing earthquakes over time",
     "the orchestra tuned before the conductor raised the baton",
 )
+
+
+@contextmanager
+def _gpu_scan(enabled: bool):
+    """Toggles the native GPU-resident scan for the duration of the block.
+
+    Flips ``LODEDB_GPU_DIRECT_TURBOVEC`` (the Rust core reads it per scan), so the
+    CPU and GPU rows share one built index without a rebuild, and restores the
+    prior value on exit.
+    """
+
+    previous = os.environ.get(_GPU_SCAN_ENV)
+    os.environ[_GPU_SCAN_ENV] = "auto" if enabled else "off"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_GPU_SCAN_ENV, None)
+        else:
+            os.environ[_GPU_SCAN_ENV] = previous
 
 
 def _synthetic_documents(count: int) -> list[dict[str, Any]]:
@@ -83,13 +111,16 @@ def _parse_batch_sizes(value: str) -> tuple[int, ...]:
     return sizes
 
 
-def _last_query_batch_event(db: LodeDB) -> dict[str, Any]:
-    """Returns the most recent redacted ``query_batch_completed`` audit event."""
+def _mean_overlap(left: list[list[str]], right: list[list[str]]) -> float:
+    """Returns mean top-k set overlap for paired result rows."""
 
-    for event in reversed(db._engine.audit_events):
-        if event.get("event") == "query_batch_completed":
-            return dict(event)
-    return {}
+    if not left:
+        return 1.0
+    scores: list[float] = []
+    for a, b in zip(left, right, strict=True):
+        denom = max(1, min(len(a), len(b)))
+        scores.append(len(set(a).intersection(b)) / denom)
+    return float(statistics.fmean(scores)) if scores else 1.0
 
 
 def _measure(
@@ -99,40 +130,40 @@ def _measure(
     batch_size: int,
     k: int,
     repeats: int,
-    policy: GpuDirectTurboVecPolicy,
+    gpu_enabled: bool,
     label: str,
 ) -> dict[str, Any]:
-    """Times ``repeats`` ``search_many`` calls at one batch size / GPU policy."""
+    """Times ``repeats`` ``search_many`` calls at one batch size / GPU setting."""
 
-    db._engine.gpu_direct_turbovec_policy = policy
     batch = [queries_pool[i % len(queries_pool)] for i in range(batch_size)]
 
-    db.search_many(batch, k=k)  # warm up (resident upload / kernel caches)
+    with _gpu_scan(gpu_enabled):
+        db.search_many(batch, k=k)  # warm up (resident upload / kernel caches)
 
-    per_call_ms: list[float] = []
-    elapsed = 0.0
-    for _ in range(max(1, repeats)):
-        started = time.perf_counter()
-        db.search_many(batch, k=k)
-        dt = time.perf_counter() - started
-        elapsed += dt
-        per_call_ms.append(dt * 1000.0)
+        per_call_ms: list[float] = []
+        elapsed = 0.0
+        served: list[list[str]] = []
+        for repeat in range(max(1, repeats)):
+            started = time.perf_counter()
+            results = db.search_many(batch, k=k)
+            dt = time.perf_counter() - started
+            elapsed += dt
+            per_call_ms.append(dt * 1000.0)
+            if repeat == 0:
+                served = [[hit.id for hit in hits] for hits in results]
 
     total_queries = batch_size * max(1, repeats)
     qps = total_queries / elapsed if elapsed > 0 else 0.0
-    event = _last_query_batch_event(db)
     return {
         "label": label,
-        "policy": policy.value,
+        "gpu_enabled": bool(gpu_enabled),
         "batch_size": int(batch_size),
         "repeats": int(max(1, repeats)),
         "k": int(k),
         "queries_per_second": round(qps, 1),
         "per_call_ms_p50": round(statistics.median(per_call_ms), 4),
         "per_query_ms": round((elapsed * 1000.0) / total_queries, 5),
-        "gpu_stage_one_status": str(event.get("gpu_stage_one_status", "")),
-        "stage_one_backend": str(event.get("stage_one_backend", "")),
-        "gpu_fallback_reason": str(event.get("gpu_fallback_reason", "")),
+        "_served": served,
     }
 
 
@@ -150,8 +181,7 @@ def run(
     preset = resolve_preset(model)
     backend = HashEmbeddingBackend(native_dim=preset.native_dim)
     pool_size = max(query_count, max(batch_sizes))
-    deps = gpu_direct_turbovec_dependencies()
-    gpu_available = bool(deps.available)
+    gpu_available = bool(NativeCoreAdapter().cuda_runtime_available())
 
     with contextlib.redirect_stdout(sys.stderr), tempfile.TemporaryDirectory() as tmp:
         db = LodeDB(path=tmp, model=model, _embedding_backend=backend)
@@ -174,9 +204,10 @@ def run(
                 batch_size=batch_size,
                 k=k,
                 repeats=repeats,
-                policy=GpuDirectTurboVecPolicy.OFF,
+                gpu_enabled=False,
                 label=f"cpu_batch_{batch_size}",
             )
+            cpu_served = cpu.pop("_served")
             rows.append(cpu)
             print(
                 f"[batched-retrieval] cpu  batch={batch_size:>4}  "
@@ -190,20 +221,24 @@ def run(
                     batch_size=batch_size,
                     k=k,
                     repeats=repeats,
-                    policy=GpuDirectTurboVecPolicy.AUTO,
+                    gpu_enabled=True,
                     label=f"gpu_batch_{batch_size}",
                 )
+                gpu_served = gpu.pop("_served")
                 cpu_qps = cpu["queries_per_second"]
                 gpu["speedup_vs_cpu"] = (
                     round(gpu["queries_per_second"] / cpu_qps, 2) if cpu_qps else None
                 )
+                gpu["gpu_vs_cpu_top_k_overlap"] = round(_mean_overlap(cpu_served, gpu_served), 4)
                 rows.append(gpu)
                 print(
                     f"[batched-retrieval] gpu  batch={batch_size:>4}  "
                     f"{gpu['queries_per_second']:>12,.1f} q/s  "
-                    f"({gpu.get('speedup_vs_cpu')}x, {gpu['gpu_stage_one_status']})",
+                    f"({gpu.get('speedup_vs_cpu')}x, overlap {gpu['gpu_vs_cpu_top_k_overlap']})",
                     file=sys.stderr,
                 )
+            else:
+                cpu.pop("_served", None)
 
         stats = db.stats()
         db.close()

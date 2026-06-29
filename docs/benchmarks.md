@@ -9,6 +9,81 @@ labels, never raw documents, queries, chunks, embeddings, or credentials.
 Provenance is tagged inline: `measured` = timed on the stated machine; `recorded` = read
 from the environment. No estimates.
 
+## Native-core migration baselines
+
+The native-core migration benchmark harness lives in
+[`benchmarks/native_migration/`](../benchmarks/native_migration). It records import/open,
+storage/WAL, lexical/hybrid, filter-planner, and TurboVec-adapter smoke measurements using
+deterministic fixture corpora. The committed smoke artifact is
+[`benchmarks/native_migration/results/baseline_smoke.json`](../benchmarks/native_migration/results/baseline_smoke.json).
+
+Run the baseline bundle from the repo root:
+
+```bash
+PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 \
+  uv run python -m benchmarks.native_migration.run
+```
+
+Current default-native verification is narrower than final runtime removal: fresh vector-only
+handles can execute through native core by default when the bundled extension is available, while
+Python remains the durable oracle and existing stores fall back to Python. Focused verification:
+
+```bash
+PYTHONPATH=.:src LODEDB_ALLOW_MOCK_TURBOVEC=1 uv run pytest -q \
+  tests/test_native_core_flags.py \
+  tests/test_native_core_shadow_vector_store.py \
+  tests/test_vector_only_index.py \
+  tests/test_local_vector_in.py \
+  tests/test_import_boundary.py
+```
+
+The side-by-side native-core closure benchmark compares the Python oracle against the Rust path
+on the same deterministic, metrics-only corpus:
+
+```bash
+cargo build --release --manifest-path third_party/turbovec/turbovec-python/Cargo.toml
+LODEDB_NATIVE_CORE_EXTENSION_PATH=third_party/turbovec/target/release/lib_turbovec.dylib \
+  uv run python -m benchmarks.native_migration.rust_vs_python \
+    --documents 2000 --queries 200 --dim 64 \
+    --output benchmarks/native_migration/results/rust_vs_python_local.json
+```
+
+Latest local artifact:
+[`benchmarks/native_migration/results/rust_vs_python_local.json`](../benchmarks/native_migration/results/rust_vs_python_local.json).
+It reports `pass_fail_summary.passed=true` on the migration gates. Rust/Python elapsed ratios
+from that run:
+
+| Row | Ratio |
+| --- | ---: |
+| Vector upsert | 0.242 |
+| Vector search, unfiltered | 0.920 |
+| Vector search, filtered | 0.652 |
+| Batch vector search | 0.303 |
+| Text prepare/apply with `HashEmbeddingBackend` | 0.529 |
+| Lexical search | 0.331 |
+| Hybrid search | 0.996 |
+| Persisted reopen/query | 0.598 |
+
+CI also runs this benchmark on Linux and uploads `rust_vs_python_ci.json` as the
+`native-core-rust-vs-python-benchmark` workflow artifact. The CI job fails if
+`pass_fail_summary.passed` is false.
+
+On those gates, the Rust core is comparable or faster for the covered native paths: it avoids
+per-query BM25 index rebuilds, uses maintained metadata indexes before falling back to scans for
+unsupported predicates, and serves native-covered vector queries through the Rust TurboVec
+adapter rather than the scalar Python path.
+
+Swift binding verification uses the same metrics-only native core fixtures and does not require
+Python at runtime. From the repo root:
+
+```bash
+cargo build -p lodedb-ffi
+LODEDB_FFI_DYLIB="$(pwd)/target/debug/liblodedb_ffi.dylib" \
+  swift test --package-path swift/LodeDBCore
+env -u LODEDB_FFI_DYLIB swift test --package-path swift/LodeDBCore
+swift/LodeDBCore/scripts/package_xcframework.sh
+```
+
 ## Launch benchmark: direct CUDA batch sweep
 
 The LodeDB-owned launch proof lives in

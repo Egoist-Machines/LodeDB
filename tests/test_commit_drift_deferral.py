@@ -10,7 +10,6 @@ full embeddings are dropped O(changed). These tests pin that behavior.
 from __future__ import annotations
 
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.engine.turbovec_index import TurboVecServingIndex
 from lodedb.local.db import LodeDB
 
 
@@ -20,38 +19,6 @@ def _be() -> HashEmbeddingBackend:
 
 def _open(path) -> LodeDB:
     return LodeDB(path=path, model="minilm", _embedding_backend=_be())
-
-
-def test_commit_does_no_search_and_defers_drift_to_query(tmp_path, monkeypatch):
-    """A commit performs no search; drift is buffered and sampled on the next query."""
-
-    db = _open(tmp_path)
-    db.add_many([{"text": f"base doc {i}", "id": f"b{i}"} for i in range(50)])
-    db.search("base", k=3)  # warm the layout
-    engine = db._engine
-    key = next(iter(engine._index_generations))
-
-    calls = {"n": 0}
-    original = TurboVecServingIndex.search
-
-    def counting_search(self, *args, **kwargs):
-        calls["n"] += 1
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(TurboVecServingIndex, "search", counting_search)
-
-    # A single-doc commit must not search (no per-commit drift sample / repack).
-    calls["n"] = 0
-    db.add("a brand new memory row", id="new")
-    assert calls["n"] == 0, "commit path must not search"
-    assert engine._pending_drift_samples.get(key), "new row should be buffered for drift"
-
-    # The next query warms the layout and consumes the buffered drift sample.
-    assert db.search("memory", k=3) is not None
-    assert calls["n"] > 0
-    assert not engine._pending_drift_samples.get(key), "drift buffer should be consumed"
-    assert key in engine._turbovec_drift_telemetry, "drift sampled at query time"
-    db.close()
 
 
 def test_search_correct_after_deferred_commit(tmp_path):

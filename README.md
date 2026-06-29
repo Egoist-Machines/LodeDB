@@ -7,29 +7,32 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0** across all metrics that matter: the most
-compact on disk, GPU-accelerated, and sub-millisecond on durable writes. Point any of them at
-LodeDB instead of its default store. Over 17.5k documents, per framework default:
+LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
+compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
+about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
+documents, per framework default:
 
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
-| On-disk footprint | **7.2× smaller** (28 vs 199 MB) | **5.3× smaller** (28 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~510× faster** (0.57 vs 294 ms) | **~610× faster** (0.57 vs 349 ms) | **~48× faster** (0.64 vs 31 ms) |
-| Batched retrieval, 64 (GPU) | **~1,900×** (6,602 vs ~4 qps) | **~2,200×** (6,414 vs ~3 qps) | **~160×** (4,649 vs 29 qps) |
-| Durable add of one memory | **~10,000× faster** (0.8 ms vs 8.6 s) | **~22,000× faster** (0.9 ms vs 19.3 s) | 0.6 vs 0.5 ms (both sub-ms) |
+| On-disk footprint | **13.6× smaller** (15 vs 199 MB) | **9.9× smaller** (15 vs 145 MB) | **5.7× smaller** (12 vs 70 MB) |
+| Single-query p50 (CPU) | **~600× faster** (0.45 vs 272 ms) | **~620× faster** (0.44 vs 272 ms) | **~46× faster** (0.59 vs 27 ms) |
+| Batched retrieval, 64 (GPU) | **~2,880×** (11,049 vs ~4 qps) | **~3,050×** (11,297 vs ~4 qps) | **~139×** (5,084 vs 36 qps) |
+| Durable add of one memory | **~26,000× faster** (0.26 ms vs 6.9 s) | **~57,000× faster** (0.26 ms vs 14.8 s) | **0.28** vs 0.44 ms (both sub-ms) |
 
-LodeDB matches sqlite-vec/qdrant's per-add latency with a significantly more compact footprint:
+Among embedded stores, LodeDB has the smallest footprint and the fastest single-query and batched
+search, and its durable add leads the fastest lazy-append stores
+(sqlite-vec, qdrant) too:
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
-| sqlite-vec | **0.4 ms** | 25.3 ms | 25.1 ms | 101 MB |
-| qdrant | **0.5 ms** | 27.3 ms | 27.0 ms | 85 MB |
-| **LodeDB** | **0.6 ms** | **0.49 ms** | **0.11 ms** | **29 MB** |
-| pgvector | 2.3 ms | 30.4 ms | 30.6 ms | 50 MB |
-| lancedb | 3.2 ms | 10.3 ms | 10.0 ms | 37 MB |
-| chroma | 6.5 ms | 3.0 ms | 3.1 ms | 151 MB |
+| **LodeDB** | **0.26 ms** | **0.45 ms** | **0.09 ms** | **15 MB** |
+| sqlite-vec | 0.42 ms | 26.8 ms | 24.7 ms | 96 MB |
+| qdrant | 0.48 ms | 13.9 ms | 14.2 ms | 81 MB |
+| pgvector | 2.29 ms | 35.1 ms | 37.0 ms | 48 MB |
+| lancedb | 3.36 ms | 10.6 ms | 10.3 ms | 35 MB |
+| chroma | 5.92 ms | 3.35 ms | 3.26 ms | 144 MB |
 
-[Full benchmark, all backends
+All numbers are reported as the mean of 3 independent runs on a L40S server. [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
 
 > **Like what you see?** Point the coding assistant in your project at
@@ -46,7 +49,8 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
 - **O(changed) persistence**: commits only the rows that changed, 173× to 1,308× faster
   than a full rewrite. [How it works](#delta-persistence).
 - **Compact storage**: the MIT [TurboVec](#turbovec) core packs vectors into 2/4-bit codes
-  and scans them with SIMD CPU kernels.
+  and scans them with SIMD CPU kernels; retained document text is stored zstd-compressed
+  (on by default, set at create time with `compression=`).
 - **In-process, on-disk** (`.tvim`/`.tvd`/`.jsd`): no daemon, no account, no API key.
 - **Safe concurrency**: one writer and many lock-free readers per path; every commit is
   crash-atomic and rolls back to the last committed state on failure, never a torn store.

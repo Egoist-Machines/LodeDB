@@ -1,12 +1,13 @@
 name: release
 
-# On a version tag (vX.Y.Z): build the sdist + native abi3 wheels (Linux / macOS / Windows),
-# publish them to PyPI via Trusted Publishing (OIDC, no stored token), and attach them to a
-# GitHub Release. The patched TurboVec Rust core is bundled into the lodedb wheel (see
-# pyproject [tool.maturin]), so `pip install lodedb` resolves the patched core with nothing
-# to compile and no extra dependency. Release wheels must also satisfy the base-runtime
-# contract: ONNX Runtime / transformers / sentence-transformers / PyYAML install from the
-# wheel metadata, while `import lodedb` keeps those embedding runtimes lazy.
+# On a version tag (vX.Y.Z): build the sdist + native abi3 wheels (Linux / macOS / Windows)
+# plus the Swift/iOS XCFramework, publish Python artifacts to PyPI via Trusted Publishing
+# (OIDC, no stored token), and attach all artifacts to a GitHub Release. The patched TurboVec
+# Rust core is bundled into the lodedb wheel (see pyproject [tool.maturin]), so `pip install
+# lodedb` resolves the patched core with nothing to compile and no extra dependency. Release
+# wheels must also satisfy the base-runtime contract: ONNX Runtime / transformers /
+# sentence-transformers / PyYAML install from the wheel metadata, while `import lodedb` keeps
+# those embedding runtimes lazy.
 #
 # One-time setup before the first publish: configure a PyPI Trusted Publisher for project
 # `lodedb` (owner: this repo, workflow: release.yml, environment: pypi). Until that exists the
@@ -135,10 +136,33 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  swift-xcframework:
+    needs: version-check
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build Swift/iOS XCFramework
+        env:
+          LODEDB_XCFRAMEWORK_TARGETS: aarch64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+          LODEDB_XCFRAMEWORK_REQUIRE_ALL: "1"
+        run: swift/LodeDBCore/scripts/package_xcframework.sh
+      - name: Archive Swift/iOS XCFramework
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent swift/LodeDBCore/.build/xcframework/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swift-xcframework
+          path: dist/LodeDBCoreFFI.xcframework.zip
+
   publish:
     # Only a real tag push publishes; workflow_dispatch stops after the build jobs above.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, swift-xcframework]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

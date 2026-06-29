@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-29
+
+### Changed
+
+- **The native Rust core (TurboVec) is now the sole engine.** The Python `LodeEngine` and
+  `LodeIndex` are removed; every read and write — text and vector ingest, search
+  (vector / hybrid / lexical), filters, batch, late-interaction, persistence, and the
+  WAL/generation commit — runs through the in-process Rust `CoreEngine`, with no Python
+  fallback. The public Python API is unchanged but for one additive change: `list_documents`
+  gains `after`/`limit` keyset paging. MPS vector scanning was dropped (MPS embedding via
+  PyTorch is unaffected).
+
+### Added
+
+- **Cross-platform single-writer lock.** The writer lock now holds on Windows (an exclusive
+  share-mode open of the `.lodedb.lock` sentinel) as well as via the Unix BSD advisory lock,
+  so concurrent processes serialize on every platform.
+- **Compressed retained text (`compression=`).** The opt-in document-text store is stored
+  zstd-compressed by default; pass `compression=False` at create time to keep it uncompressed.
+  The choice persists with the store and wins on reopen.
+
 ## [0.4.0] - 2026-06-25
 
 ### Added

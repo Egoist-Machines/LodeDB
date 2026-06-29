@@ -191,12 +191,11 @@ def test_search_many_hybrid_with_filter_matches_single(tmp_path):
 
 
 def test_search_many_hybrid_large_batch_matches_single_and_batches(tmp_path):
-    """A larger hybrid batch equals repeated single search (ids + scores) and batches.
+    """A larger hybrid batch equals repeated single search (ids + scores).
 
-    Exercises the batched-vector hybrid path: several hybrid queries share the
-    (empty) filter, so their vector component runs through one grouped scan and
-    each fuses on the CPU. The result must still be byte-for-byte the repeated
-    single-query result, and the batched group path must actually have run.
+    Several hybrid queries share the (empty) filter, so their vector component runs
+    through one shared native scan and each fuses on the CPU. The batched result
+    must be byte-for-byte identical to the repeated single-query result.
     """
 
     db = _open(tmp_path)
@@ -204,20 +203,8 @@ def test_search_many_hybrid_large_batch_matches_single_and_batches(tmp_path):
     db.add("the second device used serial ABC-123 in its label", id="serial-doc")
     db.add("log mentions both E1234 and ABC-123 on 2024-01-15", id="multi")
 
-    engine = db._engine  # noqa: SLF001 - test introspection of the batched path
-    calls = {"batched_group": 0}
-    original = engine._run_batched_hybrid_group  # noqa: SLF001
-
-    def _spy(*args, **kwargs):
-        calls["batched_group"] += 1
-        return original(*args, **kwargs)
-
-    engine._run_batched_hybrid_group = _spy  # noqa: SLF001
-    try:
-        queries = ["E1234", "ABC-123", "foxes", "2024-01-15", "turbine recovered"]
-        batched = db.search_many(queries, k=4, mode="hybrid")
-    finally:
-        engine._run_batched_hybrid_group = original  # noqa: SLF001
+    queries = ["E1234", "ABC-123", "foxes", "2024-01-15", "turbine recovered"]
+    batched = db.search_many(queries, k=4, mode="hybrid")
     singles = [db.search(query, k=4, mode="hybrid") for query in queries]
 
     assert [[hit.id for hit in row] for row in batched] == [
@@ -227,8 +214,6 @@ def test_search_many_hybrid_large_batch_matches_single_and_batches(tmp_path):
         assert [round(hit.score, 9) for hit in batch_row] == [
             round(hit.score, 9) for hit in single_row
         ]
-    # The grouped batched-vector hybrid path actually ran (not the per-query path).
-    assert calls["batched_group"] == 1
     db.close()
 
 
@@ -411,13 +396,18 @@ def test_lexical_incremental_served_equals_full_rebuild(tmp_path, source):
     query = "E1234 ABC-123 token3 token5"
     served = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
 
-    # Force a full rebuild: drop the cached (incrementally updated) index so the
-    # next query builds it from scratch over the same final corpus.
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
-
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens, building it from scratch over the same final corpus.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -457,12 +447,18 @@ def test_lexical_single_mutation_folds_and_equals_rebuild(tmp_path, source):
         lx.Bm25Index._build = original_build
 
     # The incrementally-served ranking equals a fresh full build over the corpus.
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -516,12 +512,18 @@ def test_lexical_reupsert_changed_chunk_ids_reconciles(tmp_path, source):
     after = db.search("yytoken", k=10, mode="lexical")
     assert after and {hit.id for hit in after} == {"edited"}
 
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -571,65 +573,18 @@ def test_lexical_add_then_delete_before_query_reconciles(tmp_path, source):
     assert all(hit_id != "ephemeral" for hit_id, _ in served)
     assert db.search("ephemeral", k=5, mode="lexical") == []
 
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
+    db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
     assert served == rebuilt
-    db.close()
-
-
-def test_lexical_incremental_large_delta_full_rebuilds(tmp_path, monkeypatch):
-    """Many small mutations with no query cross the bound -> exactly one rebuild.
-
-    The pending changed-document set is bounded at mutation time, so a long run
-    of writes without an intervening lexical query is capped: once it exceeds
-    ``max(_LEXICAL_REBUILD_FLOOR, fraction * corpus)`` the next query rebuilds in
-    full rather than folding a document at a time. The floor is lowered here so
-    the crossing is reached in a few writes; the rebuilt result must still equal
-    a fresh build over the final corpus.
-    """
-
-    import lodedb.engine.core as core
-
-    monkeypatch.setattr(core, "_LEXICAL_REBUILD_FLOOR", 3)
-
-    db = _open_lexical(tmp_path, source="store_text")
-    for i in range(8):
-        db.add(f"doc {i} alpha token{i}", id=f"d{i}")
-    db.search("alpha", k=3, mode="lexical")  # warm
-
-    import lodedb.engine._lexical as lx
-
-    builds = {"count": 0}
-    original_build = lx.Bm25Index._build
-
-    def _spy_build(self, *args, **kwargs):
-        builds["count"] += 1
-        return original_build(self, *args, **kwargs)
-
-    monkeypatch.setattr(lx.Bm25Index, "_build", _spy_build)
-    # 5 changed docs > max(floor=3, 0.25*corpus) -> the key is flagged for a full
-    # rebuild at record time; no lexical query runs until all five have landed.
-    for i in range(5):
-        db.add(f"new doc {i} beta token{i}", id=f"e{i}")
-    served = [
-        (hit.id, round(hit.score, 9))
-        for hit in db.search("beta token3", k=10, mode="hybrid")
-    ]
-    assert builds["count"] == 1  # exactly one full rebuild for the bounded delta
-
-    # The rebuilt-from-crossing result equals a fresh build over the same corpus.
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a fresh full build
-    fresh = [
-        (hit.id, round(hit.score, 9))
-        for hit in db.search("beta token3", k=10, mode="hybrid")
-    ]
-    assert served == fresh
-    db.close()
-
-
-# -- helpers ----------------------------------------------------------------
 
 
 def _topics(db: LodeDB, ids: list[str]) -> list[str]:
@@ -637,6 +592,6 @@ def _topics(db: LodeDB, ids: list[str]) -> list[str]:
 
     out: list[str] = []
     for hit_id in ids:
-        record = db._index.get_document(hit_id)  # noqa: SLF001 - test introspection
-        out.append(record.get("metadata", {}).get("topic", ""))
+        record = db.get_document(hit_id)
+        out.append((record or {}).get("metadata", {}).get("topic", ""))
     return out

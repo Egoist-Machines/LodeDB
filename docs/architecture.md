@@ -48,6 +48,39 @@ bring-your-own vectors, and `LodeCollection` groups several such indexes under o
 persists to generation-addressed artifacts (the redacted JSON state and compact vector base, plus
 the opt-in `.tvtext` raw-text and `.tvlex` lexical-postings sidecars).
 
+## Native-core rollout
+
+The Rust native core now ships inside the bundled wheel path and is the default rollout mode
+(`LODEDB_NATIVE_CORE=on`). The Python SDK keeps the same public API and still owns embedding,
+CLI/server/integration ergonomics, and durable persistence while the final storage cutover is in
+progress. For fresh vector-only stores, `LodeDB.open_vector_store(...)` mirrors vector mutations
+into a private native `CoreEngine` handle and serves vector queries from native core when the
+extension is available and the handle fully covers the current in-memory state. Python remains the
+durable oracle: every mutation still commits through the existing Python engine, and existing
+persisted stores fall back to Python until native storage can seed exact vectors from disk.
+
+Rollout flags:
+
+- `LODEDB_NATIVE_CORE=on` (default) uses native-covered paths and falls back safely for unsupported
+  or unseeded paths. If explicitly set to `on`, extension initialization failures fail closed.
+- `LODEDB_NATIVE_CORE=shadow` keeps Python authoritative and checks native parity for covered
+  vector-only handles.
+- `LODEDB_NATIVE_CORE=off` disables native execution for the deprecation cycle.
+- `LODEDB_NATIVE_CORE_STRICT_PARITY=1` raises on shadow mismatches instead of only recording the
+  fallback reason in `db.stats()["native_core"]`.
+
+The duplicate Python runtime paths have therefore not been removed yet; they are the compatibility
+and persistence fallback for this release window. See
+[`native_core_migration.md`](native_core_migration.md) for the current migration status and
+remaining removal gate.
+
+The Swift package binds to the same native core through `lodedb-ffi`. In local development,
+`LODEDB_FFI_DYLIB` points the Swift wrapper at a built Rust dylib; for distribution,
+`swift/LodeDBCore/scripts/package_xcframework.sh` builds installed Apple Rust targets into a
+native `LodeDBCoreFFI.xcframework`. Swift embedders still run outside the core, matching the
+Python prepare/apply split, and Swift text search uses the native query-plan/search protocol for
+vector, lexical, and hybrid modes while its native handle fully covers the current state.
+
 ## Package layout
 
 `pip install lodedb` installs one package, `lodedb`, imported as `import lodedb`. The CLI

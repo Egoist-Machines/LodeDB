@@ -48,29 +48,24 @@ def test_build_backend_rejects_unknown_device():
 
 
 def test_doctor_report_is_honest_about_gpu_scan():
-    """The doctor report never claims GPU vector search on Apple Silicon."""
+    """The doctor report never claims GPU vector search on Apple Silicon.
+
+    The GPU-resident scan runs in the native core (cudarc), so availability is
+    sourced from the native CUDA-driver probe, not a torch/CuPy proxy.
+    """
 
     report = local_capability_report(device="auto")
     assert "platform" in report and "compact_backend" in report
     gpu = report["gpu_vector_scan"]
+    assert "native_core_available" in gpu
+    assert "cupy_present" not in gpu
     if is_apple_silicon():
         assert gpu["gpu_vector_scan_available"] is False
         assert "CUDA" in gpu["reason"]
     # The formatted report renders without error and mentions the CPU kernel.
     text = format_capability_report(report)
     assert "TurboVec" in text
-    assert "CUDA/CuPy only" in text
-    # The opt-in MPS scan is reported honestly: present, opt-in, never the
-    # default, and always carrying a reason. Whether it is *available* depends on
-    # torch plus a usable Metal device — absent on headless/virtualized CI
-    # runners even on Apple Silicon — so availability is not asserted here; the
-    # _mps_only-gated dispatch tests cover the available path on real Metal.
-    mps_scan = report["mps_vector_scan"]
-    assert mps_scan["opt_in"] is True
-    assert mps_scan["default_enabled"] is False
-    assert isinstance(mps_scan["mps_exact_scan_available"], bool)
-    assert mps_scan["reason"]
-    assert "opt-in" in text
+    assert "GPU-resident vector scan (native core, CUDA driver only)" in text
 
 
 def test_torch_cuda_build_version_returns_none_or_str():

@@ -1,0 +1,21 @@
+{
+  "base": {
+    "chunk_count": 1,
+    "document_count": 1,
+    "file_bytes": 1219,
+    "file_name": "g2.json",
+    "sha256": "ceadb37ceb2a20497bdbf0fbc0cb32fba1c2c3042fb3023b03d4f2b2488849f8"
+  },
+  "deltas": [
+    {
+      "deleted_documents": 0,
+      "file_bytes": 1516,
+      "file_name": "delta-00000001.jsd",
+      "seq": 1,
+      "sha256": "0e504bf0ab38b63b0f4b0e2d85eeb50f9d294567a77693f912fc88c524784a23",
+      "upserted_documents": 1
+    }
+  ],
+  "next_seq": 2,
+  "schema_version": 1
+}

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from lodedb.engine.core import audit_persisted_index_snapshots
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local import LodeDB
 
@@ -307,10 +308,12 @@ def test_tokens_never_leak_into_redacted_artifacts(tmp_path):
     for jsd in glob.glob(str(Path(tmp_path) / "**" / "*.jsd"), recursive=True):
         assert secret not in Path(jsd).read_bytes().decode("utf-8", "replace")
 
-    # Telemetry, audit, and redacted stats carry no token.
-    engine = db._engine
-    assert secret not in json.dumps([dict(m) for m in engine.metrics])
-    assert secret not in json.dumps([dict(a) for a in engine.audit_events])
+    # The disk auditor scans the committed snapshot + journal deltas for forbidden
+    # raw-payload keys (it never reads the token sidecar) and redacted stats stay
+    # payload-free.
+    report = audit_persisted_index_snapshots(tmp_path)
+    assert report["status"] == "passed"
+    assert secret not in json.dumps(report)
     stats = db.stats()
     assert stats["raw_payload_text_present"] is False
     assert secret not in json.dumps(stats)

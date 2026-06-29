@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from lodedb.engine.core import LodeEngine
+from lodedb.engine._commit_manifest import (
+    COMMIT_MANIFEST_SUFFIX,
+    base_json_path,
+    read_commit_manifest,
+)
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB, ReadOnlyError
 
@@ -115,20 +119,28 @@ def test_read_only_missing_path_raises(tmp_path):
         )
 
 
-def test_read_only_load_surfaces_corruption(tmp_path, monkeypatch):
+def test_read_only_load_surfaces_corruption(tmp_path):
     """A read-only open fails closed on a corrupt load (no silent empty index).
 
-    Stage 2 reads the consistent generation named by the atomic commit manifest,
-    so there is no torn-read retry that could mask a genuine load failure.
+    The native core reads the consistent generation named by the atomic commit
+    manifest and validates its checksum, so corrupting the committed base
+    snapshot fails the open instead of masking a genuine load failure with an
+    empty index.
     """
 
     writer = _writer(tmp_path)
     writer.add("a", id="a")
     writer.close()
 
-    def always_fail(self):
-        raise RuntimeError("persistent corruption")
+    # Corrupt the committed base snapshot the root manifest points at. The native
+    # loader validates it against the manifest checksum, so the open must fail.
+    commits = list(tmp_path.glob(f"*{COMMIT_MANIFEST_SUFFIX}"))
+    assert commits, "expected a committed root manifest"
+    key = commits[0].name[: -len(COMMIT_MANIFEST_SUFFIX)]
+    manifest = read_commit_manifest(commits[0])
+    assert manifest is not None
+    base = base_json_path(tmp_path, key, int(manifest["base_epoch"]))
+    base.write_text("{ not the committed state", encoding="utf-8")
 
-    monkeypatch.setattr(LodeEngine, "_load_persisted_indexes", always_fail)
-    with pytest.raises(RuntimeError, match="persistent corruption"):
+    with pytest.raises(RuntimeError, match="CorruptStore"):
         LodeDB(path=tmp_path, model="minilm", read_only=True, _embedding_backend=_be())

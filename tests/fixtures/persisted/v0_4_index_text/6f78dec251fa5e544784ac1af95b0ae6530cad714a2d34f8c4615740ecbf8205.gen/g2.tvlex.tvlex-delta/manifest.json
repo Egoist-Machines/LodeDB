@@ -1,0 +1,20 @@
+{
+  "base": {
+    "document_count": 1,
+    "file_bytes": 263,
+    "file_name": "g2.tvlex",
+    "sha256": "e17c833c8451f76fef7d1b8b14780d19ca4764ebe333d200ff9486112b189e04"
+  },
+  "deltas": [
+    {
+      "deleted": 0,
+      "file_bytes": 293,
+      "file_name": "lexical-00000001.lxd",
+      "seq": 1,
+      "sha256": "acf451fdfb0662f2ffde760705df9a6eec23ba9f83e225d501e1b0c64b7e0474",
+      "upserted": 1
+    }
+  ],
+  "next_seq": 2,
+  "schema_version": 1
+}

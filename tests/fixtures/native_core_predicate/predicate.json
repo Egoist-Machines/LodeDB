@@ -1,0 +1,37 @@
+{
+  "cases": [
+    {"name":"bare_eq","filter":{"topic":"a"},"engine_validated":{"topic":"a"},"sdk_validated":{"topic":"a"},"engine_matches":["d0","d3"],"sdk_matches":["d0","d3"]},
+    {"name":"eq_number","filter":{"year":{"$eq":2020}},"engine_validated":{"year":{"$eq":"2020"}},"sdk_validated":{"year":{"$eq":"2020"}},"engine_matches":["d0"],"sdk_matches":["d0"]},
+    {"name":"ne_missing","filter":{"topic":{"$ne":"a"}},"engine_validated":{"topic":{"$ne":"a"}},"sdk_validated":{"topic":{"$ne":"a"}},"engine_matches":["d1","d2","d4","d5","d6","d7"],"sdk_matches":["d1","d2","d4","d5","d6","d7"]},
+    {"name":"in_values","filter":{"topic":{"$in":["a","c"]}},"engine_validated":{"topic":{"$in":["a","c"]}},"sdk_validated":{"topic":{"$in":["a","c"]}},"engine_matches":["d0","d2","d3"],"sdk_matches":["d0","d2","d3"]},
+    {"name":"nin_missing","filter":{"topic":{"$nin":["a"]}},"engine_validated":{"topic":{"$nin":["a"]}},"sdk_validated":{"topic":{"$nin":["a"]}},"engine_matches":["d1","d2","d4","d5","d6","d7"],"sdk_matches":["d1","d2","d4","d5","d6","d7"]},
+    {"name":"exists_true","filter":{"price":{"$exists":true}},"engine_validated":{"price":{"$exists":true}},"sdk_validated":{"price":{"$exists":true}},"engine_matches":["d0","d1","d2","d4","d6"],"sdk_matches":["d0","d1","d2","d4","d6"]},
+    {"name":"exists_false","filter":{"price":{"$exists":false}},"engine_validated":{"price":{"$exists":false}},"sdk_validated":{"price":{"$exists":false}},"engine_matches":["d3","d5","d7"],"sdk_matches":["d3","d5","d7"]},
+    {"name":"numeric_range","filter":{"year":{"$gte":2020,"$lt":2022}},"engine_validated":{"year":{"$gte":"2020","$lt":"2022"}},"sdk_validated":{"year":{"$gte":"2020","$lt":"2022"}},"engine_matches":["d0","d1"],"sdk_matches":["d0","d1"]},
+    {"name":"mixed_lexicographic","filter":{"price":{"$gt":8}},"engine_validated":{"price":{"$gt":"8"}},"sdk_validated":{"price":{"$gt":"8"}},"engine_matches":["d0","d1","d2","d4"],"sdk_matches":["d0","d1","d2","d4"]},
+    {"name":"nan_fallback","filter":{"year":{"$gt":"0"}},"engine_validated":{"year":{"$gt":"0"}},"sdk_validated":{"year":{"$gt":"0"}},"engine_matches":["d0","d1","d2","d3","d4","d6"],"sdk_matches":["d0","d1","d2","d3","d4","d6"]},
+    {"name":"inf_numeric","filter":{"year":{"$gte":"1e9"}},"engine_validated":{"year":{"$gte":"1e9"}},"sdk_validated":{"year":{"$gte":"1e9"}},"engine_matches":["d3","d4"],"sdk_matches":["d3","d4"]},
+    {"name":"and","filter":{"$and":[{"topic":"b"},{"price":{"$lt":8}}]},"engine_validated":{"$and":[{"topic":"b"},{"price":{"$lt":"8"}}]},"sdk_validated":{"$and":[{"topic":"b"},{"price":{"$lt":"8"}}]},"engine_matches":["d6"],"sdk_matches":["d6"]},
+    {"name":"or","filter":{"$or":[{"topic":"c"},{"year":{"$lt":2006}}]},"engine_validated":{"$or":[{"topic":"c"},{"year":{"$lt":"2006"}}]},"sdk_validated":{"$or":[{"topic":"c"},{"year":{"$lt":"2006"}}]},"engine_matches":["d2","d6"],"sdk_matches":["d2","d6"]},
+    {"name":"not","filter":{"$not":{"topic":"a"}},"engine_validated":{"$not":{"topic":"a"}},"sdk_validated":{"$not":{"topic":"a"}},"engine_matches":["d1","d2","d4","d5","d6","d7"],"sdk_matches":["d1","d2","d4","d5","d6","d7"]},
+    {"name":"mixed_node","filter":{"topic":"b","$or":[{"price":"7"},{"flag":false}]},"engine_validated":{"topic":"b","$or":[{"price":"7"},{"flag":"False"}]},"sdk_validated":{"topic":"b","$or":[{"price":"7"},{"flag":"false"}]},"engine_matches":["d6"],"sdk_matches":["d1","d6"]},
+    {"name":"sdk_bool","filter":{"flag":true},"engine_validated":{"flag":"True"},"sdk_validated":{"flag":"true"},"engine_matches":["d4"],"sdk_matches":["d0"]},
+    {"name":"engine_bool","filter":{"flag":{"$eq":true}},"engine_validated":{"flag":{"$eq":"True"}},"sdk_validated":{"flag":{"$eq":"true"}},"engine_matches":["d4"],"sdk_matches":["d0"]},
+    {"name":"null_empty","filter":{"empty":null},"engine_validated":{"empty":""},"sdk_validated":{"empty":""},"engine_matches":["d5"],"sdk_matches":["d5"]}
+  ],
+  "documents": [
+    {"id":"d0","metadata":{"flag":"true","price":"9.5","topic":"a","year":"2020"}},
+    {"id":"d1","metadata":{"flag":"false","price":"free","topic":"b","year":"2021"}},
+    {"id":"d2","metadata":{"price":"12.0","topic":"c","year":"2019"}},
+    {"id":"d3","metadata":{"topic":"a","year":"nan"}},
+    {"id":"d4","metadata":{"flag":"True","price":"1e9","year":"inf"}},
+    {"id":"d5","metadata":{"empty":"","topic":"z"}},
+    {"id":"d6","metadata":{"price":"7","topic":"b","year":"2005"}},
+    {"id":"d7","metadata":{}}
+  ],
+  "invalid_filters": [
+    {}, {"$foo":1}, {"a":{"$foo":1}}, {"a":{"$in":"x"}}, {"a":{"$in":[]}},
+    {"$and":[]}, {"$or":[]}, {"$not":[1]}, {"a":{"$exists":"yes"}}, {"a":{}},
+    {"a":{"$eq":{"x":1}}}, {"a":{"$eq":["x"]}}
+  ]
+}

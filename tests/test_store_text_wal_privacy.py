@@ -8,6 +8,8 @@ store_text=False, across the vector-in, image, and text-in paths.
 
 from __future__ import annotations
 
+import gc
+
 from lodedb import LodeDB
 from lodedb.engine.embedding_backends import HashEmbeddingBackend, hash_embedding
 
@@ -101,9 +103,10 @@ def test_store_text_false_text_recovers_from_wal_without_raw_text(tmp_path):
     assert db.get_document("long")["chunk_count"] >= 2  # exercises the multi-chunk delta
     assert _files_containing(tmp_path, SECRET) == []
 
-    # Crash: leave the WAL on disk, release the lock so the test can reopen.
-    db._engine._release_writer_lock()
+    # Crash: drop the handle, leaving the uncheckpointed WAL on disk; the native
+    # engine's writer lock is released on its worker so the test can reopen.
     del db
+    gc.collect()
 
     recovered = LodeDB(
         path=tmp_path,
@@ -140,9 +143,10 @@ def test_index_text_lexical_recovers_from_wal(tmp_path):
     db.add("a routine maintenance note", id="e")
     assert [h.id for h in db.search("E1234", k=5, mode="lexical")] == ["d"]
 
-    # Crash: leave the uncheckpointed WAL on disk, release the lock to reopen.
-    db._engine._release_writer_lock()
+    # Crash: drop the handle, leaving the uncheckpointed WAL on disk; the native
+    # engine's writer lock is released on its worker so the test can reopen.
     del db
+    gc.collect()
 
     recovered = _open()
     try:

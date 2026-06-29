@@ -7,9 +7,10 @@ rather than reimplementing any capability logic. Reports, honestly:
 - the embedding device that ``device="auto"`` resolves to, plus MPS/CUDA
   availability;
 - the compact (TurboVec) backend status and inferred native dispatch;
-- whether the GPU-resident vector-scan path exists — which is **CUDA/CuPy
-  only**; on Apple Silicon that CUDA path is unavailable, but an opt-in Metal
-  (MPS) exact scan is reported separately (off by default; NEON is the default).
+- whether the GPU-resident vector-scan path exists. That scan runs in the
+  bundled native core (cudarc), so the probe is the native CUDA-driver check,
+  not torch or CuPy; on Apple Silicon there is no CUDA driver and the NEON CPU
+  kernel is the accelerated path.
 """
 
 from __future__ import annotations
@@ -95,59 +96,34 @@ def _image_embedding_status() -> dict[str, Any]:
 
 
 def _gpu_vector_scan_status() -> dict[str, Any]:
-    """Returns honest GPU-resident vector-scan availability (CUDA/CuPy only)."""
+    """Returns honest GPU-resident vector-scan availability from the native probe.
 
-    cuda = torch_cuda_available()
-    cupy_present = False
-    try:
-        import importlib.util
-
-        cupy_present = importlib.util.find_spec("cupy") is not None
-    except Exception:  # noqa: BLE001 - absence is the common, fine case
-        cupy_present = False
-    available = bool(cuda and cupy_present)
-    if available:
-        reason = "CUDA + CuPy present"
-    elif is_apple_silicon():
-        reason = (
-            "Apple Silicon: the CUDA/CuPy GPU vector scan is unavailable here; an "
-            "opt-in Metal (MPS) exact scan is available instead (see mps_vector_scan). "
-            "NEON is the default and was faster on measured Apple hardware."
-        )
-    else:
-        missing = []
-        if not cuda:
-            missing.append("CUDA")
-        if not cupy_present:
-            missing.append("CuPy")
-        reason = f"GPU vector scan requires {' + '.join(missing) or 'CUDA + CuPy'}"
-    return {
-        "gpu_vector_scan_available": available,
-        "cuda_available": cuda,
-        "cupy_present": cupy_present,
-        "reason": reason,
-    }
-
-
-def _mps_vector_scan_status() -> dict[str, Any]:
-    """Returns honest opt-in Apple-GPU (MPS) exact-scan availability.
-
-    The MPS scan is opt-in and never the default: NEON is the default on Apple
-    Silicon and was faster across batch sizes on the hardware measured.
+    The GPU-resident scan runs in the bundled native core (cudarc), so this
+    reports the real CUDA-driver probe the native scan gates on rather than a
+    torch/CuPy proxy: it needs neither. ``native_core_available`` distinguishes
+    "no CUDA driver" from "the native extension did not load".
     """
 
-    from lodedb.engine.mps_turbovec import mps_exact_scan_available
+    from lodedb.engine.native_adapter import NativeCoreAdapter
 
-    available, reason = mps_exact_scan_available()
+    adapter = NativeCoreAdapter()
+    native_core_available = adapter.available
+    available = bool(adapter.cuda_runtime_available())
+    if available:
+        reason = "native core + CUDA driver present"
+    elif is_apple_silicon():
+        reason = (
+            "Apple Silicon: the CUDA GPU vector scan is unavailable here; the "
+            "NEON CPU kernel is the accelerated path."
+        )
+    elif not native_core_available:
+        reason = "GPU vector scan requires the bundled native core, which is not loaded"
+    else:
+        reason = "GPU vector scan requires a CUDA driver (none detected)"
     return {
-        "mps_exact_scan_available": available,
-        "opt_in": True,
-        "default_enabled": False,
-        "reason": (
-            reason
-            or "available; opt-in via LODEDB_MPS_DIRECT_TURBOVEC=auto|required "
-            "(NEON is the default and faster on measured Apple hardware)"
-        ),
+        "gpu_vector_scan_available": available,
+        "native_core_available": native_core_available,
+        "reason": reason,
     }
 
 
@@ -211,7 +187,6 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
             "inferred_native_dispatch": turbovec_native_backend_from_flags(cpu_flags),
         },
         "gpu_vector_scan": _gpu_vector_scan_status(),
-        "mps_vector_scan": _mps_vector_scan_status(),
         "windows_gpu_hint": _windows_gpu_embedding_hint(),
     }
 
@@ -224,7 +199,6 @@ def format_capability_report(report: dict[str, Any]) -> str:
     img = report["image_embedding"]
     backend = report["compact_backend"]
     gpu = report["gpu_vector_scan"]
-    mps_scan = report["mps_vector_scan"]
     lines = [
         "LodeDB doctor — local capability report",
         "=" * 42,
@@ -261,20 +235,15 @@ def format_capability_report(report: dict[str, Any]) -> str:
             f"    delta persistence    : {delta}"
             f" ({'incremental .tvd deltas' if delta else 'unavailable — full .tvim rewrites'})",
             f"    exact reconstruction : {recon}"
-            f" ({'MPS/CUDA exact serving' if recon else 'unavailable — CPU scan only'})",
+            f" ({'CUDA exact serving' if recon else 'unavailable, CPU scan only'})",
         ]
     else:
         lines.append(f"  unavailable reason     : {backend.get('unavailable_reason', '')}")
     lines += [
         "",
-        "GPU-resident vector scan (CUDA/CuPy only)",
+        "GPU-resident vector scan (native core, CUDA driver only)",
         f"  available              : {gpu['gpu_vector_scan_available']}",
         f"  reason                 : {gpu['reason']}",
-        "",
-        "Apple GPU exact scan (MPS, opt-in)",
-        f"  available              : {mps_scan['mps_exact_scan_available']}",
-        f"  default enabled        : {mps_scan['default_enabled']}",
-        f"  reason                 : {mps_scan['reason']}",
     ]
     hint = report.get("windows_gpu_hint")
     if hint:

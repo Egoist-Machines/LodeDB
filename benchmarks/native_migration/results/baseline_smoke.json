@@ -1,0 +1,165 @@
+{
+  "results": [
+    {
+      "measurements": [
+        {
+          "elapsed_ms": 0.003,
+          "name": "import_lodedb",
+          "result": "0.4.0"
+        },
+        {
+          "elapsed_ms": 70.692,
+          "name": "open_empty_db",
+          "result": 0
+        },
+        {
+          "elapsed_ms": 288.72,
+          "name": "seed_text_db",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 159.224,
+          "name": "reopen_persisted_db",
+          "result": 3
+        }
+      ],
+      "suite": "native_migration_engine"
+    },
+    {
+      "measurements": [
+        {
+          "elapsed_ms": 228.08,
+          "name": "wal_append_text_batch",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 250.347,
+          "name": "generation_commit_text_batch",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 167.598,
+          "name": "wal_reopen_replay_or_checkpoint",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 160.269,
+          "name": "generation_reopen",
+          "result": 3
+        }
+      ],
+      "suite": "native_migration_storage"
+    },
+    {
+      "measurements": [
+        {
+          "elapsed_ms": 0.198,
+          "name": "lexical_error E-1001",
+          "result": [
+            "doc-alpha"
+          ]
+        },
+        {
+          "elapsed_ms": 0.12,
+          "name": "lexical_offline vector recovery",
+          "result": [
+            "doc-gamma"
+          ]
+        },
+        {
+          "elapsed_ms": 0.102,
+          "name": "lexical_serial AX-42",
+          "result": [
+            "doc-beta"
+          ]
+        },
+        {
+          "elapsed_ms": 0.37,
+          "name": "hybrid_error E-1001",
+          "result": [
+            "doc-alpha",
+            "doc-gamma",
+            "doc-beta"
+          ]
+        },
+        {
+          "elapsed_ms": 0.147,
+          "name": "hybrid_offline vector recovery",
+          "result": [
+            "doc-gamma",
+            "doc-beta",
+            "doc-alpha"
+          ]
+        },
+        {
+          "elapsed_ms": 0.184,
+          "name": "hybrid_serial AX-42",
+          "result": [
+            "doc-beta",
+            "doc-alpha",
+            "doc-gamma"
+          ]
+        }
+      ],
+      "suite": "native_migration_hybrid"
+    },
+    {
+      "measurements": [
+        {
+          "elapsed_ms": 0.11,
+          "name": "filter_0",
+          "result": [
+            "vec-alpha",
+            "vec-beta",
+            "vec-gamma"
+          ]
+        },
+        {
+          "elapsed_ms": 0.113,
+          "name": "filter_1",
+          "result": [
+            "vec-alpha",
+            "vec-gamma"
+          ]
+        },
+        {
+          "elapsed_ms": 0.063,
+          "name": "filter_2",
+          "result": [
+            "vec-alpha"
+          ]
+        },
+        {
+          "elapsed_ms": 0.056,
+          "name": "filter_3",
+          "result": [
+            "vec-alpha",
+            "vec-gamma"
+          ]
+        }
+      ],
+      "suite": "native_migration_filters"
+    },
+    {
+      "measurements": [
+        {
+          "elapsed_ms": 182.448,
+          "name": "wal_append_no_fsync",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 205.633,
+          "name": "wal_reopen",
+          "result": 3
+        },
+        {
+          "elapsed_ms": 184.367,
+          "name": "wal_append_fsync",
+          "result": 3
+        }
+      ],
+      "suite": "native_migration_wal"
+    }
+  ],
+  "suite": "native_migration"
+}
