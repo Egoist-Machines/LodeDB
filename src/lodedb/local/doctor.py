@@ -7,8 +7,9 @@ rather than reimplementing any capability logic. Reports, honestly:
 - the embedding device that ``device="auto"`` resolves to, plus MPS/CUDA
   availability;
 - the compact (TurboVec) backend status and inferred native dispatch;
-- whether the GPU-resident vector-scan path exists, which is **CUDA/CuPy
-  only**; on Apple Silicon that CUDA path is unavailable and the NEON CPU
+- whether the GPU-resident vector-scan path exists. That scan runs in the
+  bundled native core (cudarc), so the probe is the native CUDA-driver check,
+  not torch or CuPy; on Apple Silicon there is no CUDA driver and the NEON CPU
   kernel is the accelerated path.
 """
 
@@ -95,35 +96,33 @@ def _image_embedding_status() -> dict[str, Any]:
 
 
 def _gpu_vector_scan_status() -> dict[str, Any]:
-    """Returns honest GPU-resident vector-scan availability (CUDA/CuPy only)."""
+    """Returns honest GPU-resident vector-scan availability from the native probe.
 
-    cuda = torch_cuda_available()
-    cupy_present = False
-    try:
-        import importlib.util
+    The GPU-resident scan runs in the bundled native core (cudarc), so this
+    reports the real CUDA-driver probe the native scan gates on rather than a
+    torch/CuPy proxy: it needs neither. ``native_core_available`` distinguishes
+    "no CUDA driver" from "the native extension did not load".
+    """
 
-        cupy_present = importlib.util.find_spec("cupy") is not None
-    except Exception:  # noqa: BLE001 - absence is the common, fine case
-        cupy_present = False
-    available = bool(cuda and cupy_present)
+    from lodedb.engine.native_adapter import NativeCoreAdapter
+
+    adapter = NativeCoreAdapter()
+    native_core_available = adapter.available
+    available = bool(adapter.cuda_runtime_available())
     if available:
-        reason = "CUDA + CuPy present"
+        reason = "native core + CUDA driver present"
     elif is_apple_silicon():
         reason = (
-            "Apple Silicon: the CUDA/CuPy GPU vector scan is unavailable here; the "
+            "Apple Silicon: the CUDA GPU vector scan is unavailable here; the "
             "NEON CPU kernel is the accelerated path."
         )
+    elif not native_core_available:
+        reason = "GPU vector scan requires the bundled native core, which is not loaded"
     else:
-        missing = []
-        if not cuda:
-            missing.append("CUDA")
-        if not cupy_present:
-            missing.append("CuPy")
-        reason = f"GPU vector scan requires {' + '.join(missing) or 'CUDA + CuPy'}"
+        reason = "GPU vector scan requires a CUDA driver (none detected)"
     return {
         "gpu_vector_scan_available": available,
-        "cuda_available": cuda,
-        "cupy_present": cupy_present,
+        "native_core_available": native_core_available,
         "reason": reason,
     }
 
@@ -242,7 +241,7 @@ def format_capability_report(report: dict[str, Any]) -> str:
         lines.append(f"  unavailable reason     : {backend.get('unavailable_reason', '')}")
     lines += [
         "",
-        "GPU-resident vector scan (CUDA/CuPy only)",
+        "GPU-resident vector scan (native core, CUDA driver only)",
         f"  available              : {gpu['gpu_vector_scan_available']}",
         f"  reason                 : {gpu['reason']}",
     ]

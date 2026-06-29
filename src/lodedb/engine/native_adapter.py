@@ -31,6 +31,7 @@ class NativeCoreModule(Protocol):
     """Subset of the hidden native module used by the adapter."""
 
     def CoreEngine(self) -> Any: ...
+    def cuda_runtime_available(self) -> bool: ...
     def native_core_abi_version(self) -> int: ...
     def native_core_version(self) -> str: ...
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str: ...
@@ -67,6 +68,18 @@ class NativeCoreAdapter:
         if module is None:
             return 0
         return int(module.native_core_abi_version())
+
+    def cuda_runtime_available(self) -> bool:
+        """Returns whether the bundled native core can run the GPU-resident scan.
+
+        Probes the real CUDA driver the cudarc scan gates on (not torch or CuPy);
+        returns False when the native extension is unavailable.
+        """
+
+        module = self._module_or_none()
+        if module is None:
+            return False
+        return bool(module.cuda_runtime_available())
 
     def document_json(self, document: EngineDocument) -> str:
         return json.dumps(self.document_payload(document), sort_keys=True, separators=(",", ":"))

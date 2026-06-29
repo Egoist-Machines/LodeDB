@@ -1278,6 +1278,11 @@ fn storage_schema_version() -> u32 {
 }
 
 #[pyfunction]
+fn cuda_runtime_available() -> bool {
+    lodedb_core::cuda_runtime_available()
+}
+
+#[pyfunction]
 fn core_document_to_json(
     document_id: String,
     text: String,
@@ -1389,6 +1394,7 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_runtime_available, m)?)?;
     m.add_function(wrap_pyfunction!(core_document_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(round_trip_core_json, m)?)?;
     Ok(())

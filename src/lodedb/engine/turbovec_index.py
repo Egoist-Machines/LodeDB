@@ -1,4 +1,10 @@
-"""TurboVec serving adapter for direct engine route profiles."""
+"""TurboVec capability + CPU-dispatch detection for the bundled compact backend.
+
+Reports whether the vendored TurboVec runtime can serve compact indexes and the
+native SIMD dispatch it is likely to use, without serving any index from
+Python: the native Rust core is the sole engine and owns the live scan. The
+remaining helpers back ``lodedb doctor`` and the benchmark provenance fields.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,6 @@ import importlib
 import logging
 import platform
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,157 +69,6 @@ class TurboVecCapability:
         }
 
 
-@dataclass(frozen=True)
-class TurboVecSearchResult:
-    """Stores compact stable-id search results and safe runtime telemetry."""
-
-    stable_ids: NDArray[np.uint64]
-    scores: NDArray[np.float32]
-    native_backend: str
-    native_used: bool
-
-
-@dataclass(frozen=True)
-class TurboVecServingIndex:
-    """Stores a TurboVec IdMapIndex plus engine stable-id lookup metadata."""
-
-    index: Any
-    chunk_ids_by_stable_id: dict[int, str]
-    document_ids_by_stable_id: dict[int, str]
-    dim: int
-    bit_width: int
-    generation: int
-    native_backend: str
-    native_used: bool
-    build_seconds: float
-
-    def __post_init__(self) -> None:
-        # Reverse map for O(matches) chunk-id -> stable-id allowlist resolution
-        # (the forward map alone forces an O(corpus) scan per filtered query).
-        object.__setattr__(
-            self,
-            "_stable_id_by_chunk_id",
-            {chunk_id: stable_id for stable_id, chunk_id in self.chunk_ids_by_stable_id.items()},
-        )
-
-    def stable_ids_for_chunks(self, chunk_ids: tuple[str, ...]) -> NDArray[np.uint64]:
-        """Returns the active stable ids for chunk ids, in O(len(chunk_ids))."""
-
-        reverse: dict[str, int] = self._stable_id_by_chunk_id  # type: ignore[attr-defined]
-        return np.ascontiguousarray(
-            [reverse[chunk_id] for chunk_id in chunk_ids if chunk_id in reverse],
-            dtype=np.uint64,
-        )
-
-    def search(
-        self,
-        query_embedding: tuple[float, ...],
-        *,
-        top_k: int,
-        allowlist_chunk_ids: tuple[str, ...] = (),
-    ) -> TurboVecSearchResult:
-        """Searches TurboVec by stable id and optionally restricts to chunk IDs."""
-
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
-        query = np.asarray(query_embedding, dtype=np.float32).reshape(1, -1)
-        if query.shape[1] != self.dim:
-            raise ValueError("query dimension does not match TurboVec index")
-        kwargs: dict[str, Any] = {}
-        if allowlist_chunk_ids:
-            allowed = self.stable_ids_for_chunks(allowlist_chunk_ids)
-            if allowed.size == 0:
-                return TurboVecSearchResult(
-                    stable_ids=np.empty((1, 0), dtype=np.uint64),
-                    scores=np.empty((1, 0), dtype=np.float32),
-                    native_backend=self.native_backend,
-                    native_used=self.native_used,
-                )
-            kwargs["allowlist"] = allowed
-        effective_top_k = min(int(top_k), int(len(self.index)))
-        if "allowlist" in kwargs:
-            effective_top_k = min(effective_top_k, int(kwargs["allowlist"].size))
-        if effective_top_k <= 0:
-            return TurboVecSearchResult(
-                stable_ids=np.empty((1, 0), dtype=np.uint64),
-                scores=np.empty((1, 0), dtype=np.float32),
-                native_backend=self.native_backend,
-                native_used=self.native_used,
-            )
-        scores, stable_ids = self.index.search(query, k=effective_top_k, **kwargs)
-        return TurboVecSearchResult(
-            stable_ids=np.asarray(stable_ids, dtype=np.uint64),
-            scores=np.asarray(scores, dtype=np.float32),
-            native_backend=self.native_backend,
-            native_used=self.native_used,
-        )
-
-    def search_batch(
-        self,
-        query_embeddings: NDArray[np.float32],
-        *,
-        top_k: int,
-        allowlist_chunk_ids: tuple[str, ...] = (),
-    ) -> TurboVecSearchResult:
-        """Searches a whole query batch in one native call, with one shared allowlist.
-
-        One call amortizes the per-query LUT/dispatch overhead the vendored
-        kernel pays on entry; the binding accepts a 2D query batch together with
-        a single ``allowlist`` applied to every row, so a filtered batch ranks
-        only eligible rows inside the SIMD scan instead of widening top_k to the
-        whole corpus and post-filtering. Result rows align with input query rows.
-        """
-
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
-        queries = np.ascontiguousarray(query_embeddings, dtype=np.float32)
-        if queries.ndim != 2 or queries.shape[1] != self.dim:
-            raise ValueError("query batch must be 2D and match the TurboVec dimension")
-        kwargs: dict[str, Any] = {}
-        if allowlist_chunk_ids:
-            allowed = self.stable_ids_for_chunks(allowlist_chunk_ids)
-            if allowed.size == 0:
-                return TurboVecSearchResult(
-                    stable_ids=np.empty((queries.shape[0], 0), dtype=np.uint64),
-                    scores=np.empty((queries.shape[0], 0), dtype=np.float32),
-                    native_backend=self.native_backend,
-                    native_used=self.native_used,
-                )
-            kwargs["allowlist"] = allowed
-        effective_top_k = min(int(top_k), int(len(self.index)))
-        if "allowlist" in kwargs:
-            effective_top_k = min(effective_top_k, int(kwargs["allowlist"].size))
-        if effective_top_k <= 0:
-            return TurboVecSearchResult(
-                stable_ids=np.empty((queries.shape[0], 0), dtype=np.uint64),
-                scores=np.empty((queries.shape[0], 0), dtype=np.float32),
-                native_backend=self.native_backend,
-                native_used=self.native_used,
-            )
-        scores, stable_ids = self.index.search(queries, k=effective_top_k, **kwargs)
-        return TurboVecSearchResult(
-            stable_ids=np.asarray(stable_ids, dtype=np.uint64),
-            scores=np.asarray(scores, dtype=np.float32),
-            native_backend=self.native_backend,
-            native_used=self.native_used,
-        )
-
-    def write(self, path: str | Path) -> dict[str, Any]:
-        """Persists the TurboVec index payload and returns safe write metrics."""
-
-        output = Path(path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        started = time.perf_counter()
-        self.index.write(str(output))
-        persist_ms = (time.perf_counter() - started) * 1000.0
-        return {
-            "compact_backend": "turbovec_idmap",
-            "snapshot_bytes": output.stat().st_size,
-            "persist_ms": persist_ms,
-            "raw_payload_text_present": False,
-        }
-
-
 def turbovec_capability(id_map_index_class: Any | None = None) -> TurboVecCapability:
     """Returns compact-backend availability and inferred CPU dispatch metadata."""
 
@@ -256,15 +110,6 @@ def turbovec_capability(id_map_index_class: Any | None = None) -> TurboVecCapabi
     )
 
 
-def require_turbovec_available(id_map_index_class: Any | None = None) -> TurboVecCapability:
-    """Raises a clear compact-backend error unless TurboVec validates at runtime."""
-
-    capability = turbovec_capability(id_map_index_class=id_map_index_class)
-    if not capability.available:
-        raise RuntimeError(f"TurboVec compact backend unavailable: {capability.unavailable_reason}")
-    return capability
-
-
 def load_turbovec_id_map_index_class() -> Any:
     """Imports TurboVec's ``IdMapIndex`` from the bundled compiled extension.
 
@@ -289,215 +134,6 @@ def load_turbovec_id_map_index_class() -> Any:
         "TurboVec compact backend is not installed; install lodedb (the compiled core "
         "is bundled) or build the vendored source at third_party/turbovec/turbovec-python."
     ) from last_exc
-
-
-def build_turbovec_serving_index(
-    chunks: tuple[Any, ...],
-    *,
-    native_dim: int,
-    bit_width: int,
-    generation: int,
-    id_map_index_class: Any | None = None,
-    progress_label: str | None = None,
-) -> TurboVecServingIndex:
-    """Builds an IdMapIndex from engine chunks and stable uint64 chunk IDs."""
-
-    if native_dim <= 0:
-        raise ValueError("native_dim must be positive")
-    if bit_width not in {2, 4}:
-        raise ValueError("TurboVec bit_width must be 2 or 4")
-    index_class = id_map_index_class or load_turbovec_id_map_index_class()
-    capability = require_turbovec_available(id_map_index_class=index_class)
-    _log_turbovec_build_progress(
-        progress_label,
-        phase="embedding_matrix",
-        event="start",
-        chunk_count=len(chunks),
-        native_dim=native_dim,
-        bit_width=bit_width,
-        generation=generation,
-        backend=capability.native_backend,
-    )
-    phase_started = time.perf_counter()
-    embeddings = _chunk_embedding_matrix(chunks, native_dim=native_dim)
-    _log_turbovec_build_progress(
-        progress_label,
-        phase="embedding_matrix",
-        event="end",
-        chunk_count=len(chunks),
-        native_dim=native_dim,
-        bit_width=bit_width,
-        generation=generation,
-        backend=capability.native_backend,
-        elapsed_ms=(time.perf_counter() - phase_started) * 1000.0,
-    )
-    _log_turbovec_build_progress(
-        progress_label,
-        phase="stable_ids",
-        event="start",
-        chunk_count=len(chunks),
-        native_dim=native_dim,
-        bit_width=bit_width,
-        generation=generation,
-        backend=capability.native_backend,
-    )
-    phase_started = time.perf_counter()
-    stable_ids = stable_uint64_ids_for_chunk_ids(tuple(str(chunk.chunk_id) for chunk in chunks))
-    _log_turbovec_build_progress(
-        progress_label,
-        phase="stable_ids",
-        event="end",
-        chunk_count=len(chunks),
-        native_dim=native_dim,
-        bit_width=bit_width,
-        generation=generation,
-        backend=capability.native_backend,
-        elapsed_ms=(time.perf_counter() - phase_started) * 1000.0,
-    )
-    started = time.perf_counter()
-    index = index_class(dim=native_dim, bit_width=int(bit_width))
-    if embeddings.shape[0]:
-        _log_turbovec_build_progress(
-            progress_label,
-            phase="add_with_ids",
-            event="start",
-            chunk_count=len(chunks),
-            native_dim=native_dim,
-            bit_width=bit_width,
-            generation=generation,
-            backend=capability.native_backend,
-        )
-        phase_started = time.perf_counter()
-        index.add_with_ids(embeddings, stable_ids)
-        _log_turbovec_build_progress(
-            progress_label,
-            phase="add_with_ids",
-            event="end",
-            chunk_count=len(chunks),
-            native_dim=native_dim,
-            bit_width=bit_width,
-            generation=generation,
-            backend=capability.native_backend,
-            elapsed_ms=(time.perf_counter() - phase_started) * 1000.0,
-        )
-    if hasattr(index, "prepare"):
-        _log_turbovec_build_progress(
-            progress_label,
-            phase="prepare",
-            event="start",
-            chunk_count=len(chunks),
-            native_dim=native_dim,
-            bit_width=bit_width,
-            generation=generation,
-            backend=capability.native_backend,
-        )
-        phase_started = time.perf_counter()
-        index.prepare()
-        _log_turbovec_build_progress(
-            progress_label,
-            phase="prepare",
-            event="end",
-            chunk_count=len(chunks),
-            native_dim=native_dim,
-            bit_width=bit_width,
-            generation=generation,
-            backend=capability.native_backend,
-            elapsed_ms=(time.perf_counter() - phase_started) * 1000.0,
-        )
-    build_seconds = time.perf_counter() - started
-    return TurboVecServingIndex(
-        index=index,
-        chunk_ids_by_stable_id={
-            int(stable_id): str(chunk.chunk_id)
-            for stable_id, chunk in zip(stable_ids, chunks, strict=True)
-        },
-        document_ids_by_stable_id={
-            int(stable_id): str(chunk.document_id)
-            for stable_id, chunk in zip(stable_ids, chunks, strict=True)
-        },
-        dim=native_dim,
-        bit_width=int(bit_width),
-        generation=int(generation),
-        native_backend=capability.native_backend,
-        native_used=capability.native_used,
-        build_seconds=build_seconds,
-    )
-
-
-def _log_turbovec_build_progress(
-    progress_label: str | None,
-    *,
-    phase: str,
-    event: str,
-    chunk_count: int,
-    native_dim: int,
-    bit_width: int,
-    generation: int,
-    backend: str,
-    elapsed_ms: float | None = None,
-) -> None:
-    """Emits raw-payload-free progress for direct TurboVec index construction."""
-
-    if progress_label is None:
-        return
-    logger.info(
-        "turbovec_build label=%s phase=%s event=%s chunks=%d native_dim=%d "
-        "bit_width=%d generation=%d backend=%s elapsed_ms=%s",
-        progress_label,
-        phase,
-        event,
-        chunk_count,
-        native_dim,
-        bit_width,
-        generation,
-        backend,
-        None if elapsed_ms is None else round(elapsed_ms, 3),
-    )
-
-
-def load_turbovec_serving_index(
-    path: str | Path,
-    chunks: tuple[Any, ...],
-    *,
-    generation: int,
-    id_map_index_class: Any | None = None,
-    post_load: Any | None = None,
-) -> TurboVecServingIndex:
-    """Loads a persisted TurboVec IdMapIndex and attaches redacted chunk metadata.
-
-    ``post_load``, when given, is called with the raw loaded ``IdMapIndex``
-    before `prepare()` and metadata attachment — the `.tvim-delta` replay
-    hook uses it to apply journaled mutations so the loaded index matches
-    the live pre-persist state.
-    """
-
-    index_class = id_map_index_class or load_turbovec_id_map_index_class()
-    capability = require_turbovec_available(id_map_index_class=index_class)
-    stable_ids = stable_uint64_ids_for_chunk_ids(tuple(str(chunk.chunk_id) for chunk in chunks))
-    started = time.perf_counter()
-    index = index_class.load(str(path))
-    if post_load is not None:
-        post_load(index)
-    if hasattr(index, "prepare"):
-        index.prepare()
-    build_seconds = time.perf_counter() - started
-    return TurboVecServingIndex(
-        index=index,
-        chunk_ids_by_stable_id={
-            int(stable_id): str(chunk.chunk_id)
-            for stable_id, chunk in zip(stable_ids, chunks, strict=True)
-        },
-        document_ids_by_stable_id={
-            int(stable_id): str(chunk.document_id)
-            for stable_id, chunk in zip(stable_ids, chunks, strict=True)
-        },
-        dim=int(index.dim),
-        bit_width=int(index.bit_width),
-        generation=int(generation),
-        native_backend=capability.native_backend,
-        native_used=capability.native_used,
-        build_seconds=build_seconds,
-    )
 
 
 def stable_uint64_ids_for_chunk_ids(chunk_ids: tuple[str, ...]) -> NDArray[np.uint64]:
@@ -565,17 +201,6 @@ def _validate_turbovec_runtime(index_class: Any) -> None:
             raise RuntimeError("TurboVec validation returned invalid scores")
     except Exception as exc:
         raise RuntimeError(f"TurboVec runtime validation failed: {exc}") from exc
-
-
-def _chunk_embedding_matrix(chunks: tuple[Any, ...], *, native_dim: int) -> NDArray[np.float32]:
-    """Returns a contiguous embedding matrix for engine chunk records."""
-
-    if not chunks:
-        return np.empty((0, native_dim), dtype=np.float32)
-    matrix = np.asarray([chunk.embedding for chunk in chunks], dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape[1] != native_dim:
-        raise ValueError("chunk embeddings do not match native_dim")
-    return np.ascontiguousarray(matrix, dtype=np.float32)
 
 
 def _stable_uint64_for_text(value: str) -> int:

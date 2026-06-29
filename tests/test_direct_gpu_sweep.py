@@ -14,19 +14,18 @@ from pathlib import Path
 
 import pytest
 
-from lodedb.engine.gpu_turbovec import gpu_direct_turbovec_dependencies
+from lodedb.engine.native_adapter import NativeCoreAdapter
 
 _BENCH_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "direct_gpu_sweep"
 sys.path.insert(0, str(_BENCH_DIR))
 
 from direct_gpu_sweep import run_direct_gpu_sweep  # noqa: E402
 
-# The native GPU scan needs a CUDA GPU; gate on the CuPy probe as a CUDA-presence
-# proxy and skip cleanly elsewhere rather than fabricating a device.
-_GPU = gpu_direct_turbovec_dependencies()
+# The native GPU scan runs in the Rust core (cudarc); gate on the native
+# CUDA-driver probe and skip cleanly elsewhere rather than fabricating a device.
 pytestmark = pytest.mark.skipif(
-    not _GPU.available,
-    reason=f"native GPU sweep needs a CUDA host: {_GPU.unavailable_reason or 'no CUDA GPU'}",
+    not NativeCoreAdapter().cuda_runtime_available(),
+    reason="native GPU scan needs a CUDA host",
 )
 
 

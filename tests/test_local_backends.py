@@ -48,18 +48,24 @@ def test_build_backend_rejects_unknown_device():
 
 
 def test_doctor_report_is_honest_about_gpu_scan():
-    """The doctor report never claims GPU vector search on Apple Silicon."""
+    """The doctor report never claims GPU vector search on Apple Silicon.
+
+    The GPU-resident scan runs in the native core (cudarc), so availability is
+    sourced from the native CUDA-driver probe, not a torch/CuPy proxy.
+    """
 
     report = local_capability_report(device="auto")
     assert "platform" in report and "compact_backend" in report
     gpu = report["gpu_vector_scan"]
+    assert "native_core_available" in gpu
+    assert "cupy_present" not in gpu
     if is_apple_silicon():
         assert gpu["gpu_vector_scan_available"] is False
         assert "CUDA" in gpu["reason"]
     # The formatted report renders without error and mentions the CPU kernel.
     text = format_capability_report(report)
     assert "TurboVec" in text
-    assert "CUDA/CuPy only" in text
+    assert "GPU-resident vector scan (native core, CUDA driver only)" in text
 
 
 def test_torch_cuda_build_version_returns_none_or_str():
