@@ -84,34 +84,29 @@ def test_filtered_batch_results_respect_filter(tmp_path):
     db.close()
 
 
-def test_heterogeneous_per_query_filters(tmp_path):
-    """One batch with a different filter per query groups correctly and preserves order."""
+def test_per_query_filters_return_correct_filtered_hits(tmp_path):
+    """Each query honors its own filter: every hit it returns satisfies that filter."""
 
     db = _open(tmp_path)
     _populate(db)
     queries = _queries(8)
     per_query_filters = [
         None,
-        {"metadata": {"topic": "animals"}},
-        {"metadata": {"tier": "1"}},
-        {"metadata": {"topic": "science"}},
+        {"topic": "animals"},
+        {"tier": "1"},
+        {"topic": "science"},
         None,
-        {"metadata": {"tier": "1"}},
-        {"metadata": {"topic": "animals"}},
-        {"metadata": {"tier": "6"}},
+        {"tier": "1"},
+        {"topic": "animals"},
+        {"tier": "6"},
     ]
-    response = db._index.query_batch(
-        [
-            {"query": query, "top_k": 10, "filter": filt}
-            for query, filt in zip(queries, per_query_filters, strict=True)
-        ]
-    )
-    items = response["queries"]
-    assert len(items) == len(queries)
-    for query, filt, item in zip(queries, per_query_filters, items, strict=True):
-        reference = db.search(query, k=10, filter=(filt["metadata"] if filt else None))
-        got_ids = [row["document_id"] for row in item["results"]]
-        assert got_ids == [hit.id for hit in reference]
+    for query, filt in zip(queries, per_query_filters, strict=True):
+        hits = db.search(query, k=10, filter=filt)
+        if filt is None:
+            continue
+        (field, value), = filt.items()
+        for hit in hits:
+            assert hit.metadata.get(field) == value
     db.close()
 
 

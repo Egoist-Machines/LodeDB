@@ -569,6 +569,6 @@ def _topics(db: LodeDB, ids: list[str]) -> list[str]:
 
     out: list[str] = []
     for hit_id in ids:
-        record = db._index.get_document(hit_id)  # noqa: SLF001 - test introspection
-        out.append(record.get("metadata", {}).get("topic", ""))
+        record = db.get_document(hit_id)
+        out.append((record or {}).get("metadata", {}).get("topic", ""))
     return out

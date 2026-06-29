@@ -490,7 +490,7 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     assert record["chunk_count"] == 1
     assert "text" not in record
     assert _loads(
-        engine.list_documents("text", json.dumps({"metadata": {"topic": "ops"}}))
+        engine.list_documents("text", json.dumps({"metadata": {"topic": "ops"}}), None, None)
     )[0]["document_id"] == "doc-alpha"
 
     query_plan = _loads(engine.prepare_query_text("E-1001", "vector"))
@@ -622,26 +622,6 @@ def test_native_core_extension_written_vector_store_opens_in_python(tmp_path) ->
     assert db.get("native-a") == "Native retained text."
 
 
-def test_native_core_write_shadow_verifies_counts(tmp_path, monkeypatch) -> None:
-    from lodedb import LodeDB
-
-    monkeypatch.setenv("LODEDB_NATIVE_CORE", "shadow")
-    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "shadow")
-    db = LodeDB.open_vector_store(tmp_path, vector_dim=8)
-    db.add_vectors(_onehot(0), id="shadow-a", metadata={"kind": "shadow"})
-    db.add_vectors(_onehot(1), id="shadow-b", metadata={"kind": "shadow"})
-
-    db.persist()
-    stats = db.stats()["native_core"]
-
-    assert stats["write_mode"] == "shadow"
-    assert stats["version"]
-    assert stats["abi_version"] == 1
-    assert stats["shadow_persist_count"] == 1
-    assert stats["shadow_persist_verified"] is True
-    assert db.search_by_vector(_onehot(1), k=1)[0].id == "shadow-b"
-
-
 def test_default_native_on_text_does_not_double_embed(tmp_path, monkeypatch) -> None:
     off_add, off_q, _ = _text_add_search_embed_counts("off", None, tmp_path / "off", monkeypatch)
     on_add, on_q, on_cov = _text_add_search_embed_counts("on", None, tmp_path / "on", monkeypatch)
@@ -652,19 +632,6 @@ def test_default_native_on_text_does_not_double_embed(tmp_path, monkeypatch) -> 
     assert on_cov is True
     assert on_add == off_add
     assert on_q == off_q
-
-
-def test_shadow_mode_runs_native_text_query_for_parity(tmp_path, monkeypatch) -> None:
-    off_add, off_q, _ = _text_add_search_embed_counts("off", None, tmp_path / "off", monkeypatch)
-    sh_add, sh_q, _ = _text_add_search_embed_counts(
-        "shadow", None, tmp_path / "shadow", monkeypatch
-    )
-
-    # Validation modes intentionally pay for the cross-check: the native text
-    # query runs (re-embedding the query) so parity can be verified, while the
-    # write mirror still shares the writer's document embeddings.
-    assert sh_add == off_add
-    assert sh_q > off_q
 
 
 def test_native_core_write_on_vector_store_persists_python_readable_store(
@@ -903,15 +870,13 @@ def test_native_write_through_generation_churn_round_trips(tmp_path, monkeypatch
         ro.close()
 
 
-def test_native_write_through_cross_thread_is_thread_confined(tmp_path, monkeypatch) -> None:
-    """Under native sole-writer write-through, a cross-thread write fails closed.
+def test_native_write_through_cross_thread_write_is_served(tmp_path, monkeypatch) -> None:
+    """A write from a non-owner thread is served on the native engine's worker.
 
-    Native is thread-confined and is the sole durable writer in generation
-    write-through (the Python engine's redundant upsert is skipped). A write from a
-    non-owner thread therefore cannot be served, and the Python fallback is disabled
-    in sole-writer mode, so it raises rather than silently dropping an acknowledged
-    write. The owner-thread write stays durable in the native store and is readable
-    on reopen.
+    The native engine is unsendable, but db.py routes every native call onto the
+    one worker thread that owns it, so a shared handle accepts writes from any
+    caller thread. Both the owner-thread and the cross-thread write land durably in
+    the native store and are readable on reopen.
     """
     import threading
 
@@ -933,15 +898,17 @@ def test_native_write_through_cross_thread_is_thread_confined(tmp_path, monkeypa
     worker = threading.Thread(target=add_from_other_thread)
     worker.start()
     worker.join()
-    # The cross-thread write fails closed rather than being silently dropped.
-    assert errors and isinstance(errors[0], RuntimeError)
+    # The cross-thread write is served (not rejected) and is visible immediately.
+    assert not errors, errors
+    assert db.count() == 2
     db.close()
 
-    # The owner-thread write is durable in the native store and reopens cleanly.
-    monkeypatch.setenv("LODEDB_NATIVE_CORE", "off")
+    # Both writes are durable in the native store and reopen cleanly.
     reopened = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="generation")
-    assert reopened.stats()["document_count"] == 1
+    assert reopened.stats()["document_count"] == 2
     assert reopened.search_by_vector(_onehot(0), k=1)[0].id == "main"
+    assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "thread"
+    reopened.close()
 
 
 def test_native_write_through_vector_content_hash_matches_python(tmp_path, monkeypatch) -> None:
@@ -1112,26 +1079,6 @@ def test_native_core_on_existing_raw_text_store_uses_readonly_seed(
 
     assert stats["enabled"] is True
     assert stats["covered"] is True
-    assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
-
-
-def test_native_core_on_text_store_uses_native_query_without_write_through(
-    tmp_path, monkeypatch
-) -> None:
-    from lodedb import LodeDB
-    from lodedb.engine.embedding_backends import HashEmbeddingBackend
-
-    monkeypatch.setenv("LODEDB_NATIVE_CORE", "on")
-    # The read-only-native path (no write-through) is now opt-in: write-through
-    # defaults on, so select the no-write-through behavior explicitly.
-    monkeypatch.setenv("LODEDB_NATIVE_CORE_WRITE", "off")
-    db = LodeDB(tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
-    db.add("Alpha launch notes mention error code E-1001.", id="doc-alpha")
-    stats = db.stats()["native_core"]
-
-    assert stats["enabled"] is True
-    assert stats["covered"] is True
-    assert stats["write_through"] is False
     assert db.search("Alpha", k=1, mode="lexical")[0].id == "doc-alpha"
 
 

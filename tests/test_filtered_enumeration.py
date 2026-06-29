@@ -65,12 +65,12 @@ def test_filtered_enumeration_is_complete(tmp_path):
 def test_keyset_cursor_pages(tmp_path):
     db = _db(tmp_path)
     _seed(db, 10)
-    # The engine cursor (via the index client) pages by stable id order.
-    page1 = db._index.list_documents(after=None, limit=4)
-    ids1 = [r["document_id"] for r in page1]
+    # The public cursor pages by stable id order.
+    page1 = db.list_documents(after=None, limit=4)
+    ids1 = [r["id"] for r in page1]
     assert ids1 == ["d000", "d001", "d002", "d003"]
-    page2 = db._index.list_documents(after=ids1[-1], limit=4)
-    ids2 = [r["document_id"] for r in page2]
+    page2 = db.list_documents(after=ids1[-1], limit=4)
+    ids2 = [r["id"] for r in page2]
     assert ids2 == ["d004", "d005", "d006", "d007"]
 
 
@@ -78,10 +78,8 @@ def test_cursor_with_filter(tmp_path):
     db = _db(tmp_path)
     _seed(db, 30)
     flt = {"topic": "a"}  # d000, d003, d006, ...
-    page = db._index.list_documents(
-        filter={"metadata": {"topic": "a"}}, after="d003", limit=2
-    )
-    assert [r["document_id"] for r in page] == ["d006", "d009"]
+    page = db.list_documents(filter=flt, after="d003", limit=2)
+    assert [r["id"] for r in page] == ["d006", "d009"]
     # cursor is consistent with the full filtered set
     assert db.count(filter=flt) == 10
 
