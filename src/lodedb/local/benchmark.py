@@ -97,18 +97,18 @@ def run_local_benchmark(
 
     db.persist()
 
-    # Query latency: each search embeds the query then scans on the CPU kernel.
-    # We report total query latency and isolate the search component using the
-    # engine's own per-query timing fields (query_search_latency_ms), which
-    # exclude embedding.
+    # Query latency: each search embeds the query then scans on the native kernel.
+    # We report the end-to-end query latency. The native core does not surface a
+    # separate embedding-excluded search component, so the search-only figure is
+    # reported as 0 (unavailable) rather than a misleading approximation.
     queries = [documents[i % doc_count]["text"] for i in range(query_count)]
     total_latencies: list[float] = []
     search_latencies: list[float] = []
     for text in queries:
         t0 = time.perf_counter()
-        response = db._index.query(text, top_k=top_k)  # engine path; timed fields below
+        db.search(text, k=top_k)
         total_latencies.append((time.perf_counter() - t0) * 1000.0)
-        search_latencies.append(float(response.get("query_search_latency_ms", 0.0)))
+        search_latencies.append(0.0)
 
     stats = db.stats()
     storage = stats.get("storage", {}) if isinstance(stats.get("storage"), dict) else {}

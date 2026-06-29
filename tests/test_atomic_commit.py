@@ -9,6 +9,8 @@ epochs.
 
 from __future__ import annotations
 
+import gc
+
 from lodedb.engine._commit_manifest import (
     COMMIT_MANIFEST_SUFFIX,
     DEFAULT_EPOCHS_RETAINED,
@@ -109,11 +111,13 @@ def test_generation_commits_survive_unclean_shutdown(tmp_path):
     writer.add_many([{"text": f"doc {i}", "id": f"d{i}"} for i in range(6)])
     writer.add("a late delta", id="late")
     assert writer.count() == 7
-    # Simulate a crash: release the writer lock (so the test can reopen) and drop
-    # the handle WITHOUT close(), leaving no checkpoint behind, as a real crash
-    # would. Each add already committed its own generation, so nothing is lost.
-    writer._engine._release_writer_lock()
+    # Simulate a crash: drop the handle WITHOUT close(), leaving no checkpoint
+    # behind as a real crash would. The native engine (and the single-writer lock
+    # it holds) is released when its weakref finalizer drops it on its worker, so
+    # the reopen below can reacquire the lock. Each add already committed its own
+    # generation, so nothing is lost.
     del writer
+    gc.collect()
 
     report = audit_persisted_index_snapshots(tmp_path)  # no corruption / orphan leak
     assert report["snapshot_count"] == 1

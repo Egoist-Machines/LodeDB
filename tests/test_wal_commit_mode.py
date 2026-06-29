@@ -10,6 +10,7 @@ and crash recovery — including a hard ``os._exit`` kill of a writer mid-run.
 
 from __future__ import annotations
 
+import gc
 import glob
 import multiprocessing as mp
 import os
@@ -202,17 +203,16 @@ def test_persist_checkpoints_wal(tmp_path):
         reader.close()
 
 
-def test_low_op_threshold_checkpoints_during_run(tmp_path):
-    """When the op threshold is small, a run auto-checkpoints into a generation."""
+def test_wal_run_folds_into_generation_on_close(tmp_path):
+    """A WAL-mode run folds its log into a committed generation on close."""
 
     db = _open(tmp_path, commit_mode="wal")
-    db._engine._wal_checkpoint_ops = 3  # fold every 3 logged mutations
     for i in range(7):
         db.add(f"doc number {i}", id=f"d{i}")
-    # 7 adds with a 3-op threshold -> at least two folds happened; the residual
-    # WAL holds fewer than 3 records (or none, on an exact multiple).
     assert db.count() == 7
     db.close()
+    # close() checkpoints the WAL into a committed generation, leaving no log.
+    assert _wal_files(tmp_path) == []
     reader = LodeDB.open_readonly(tmp_path, model="minilm", _embedding_backend=_be())
     try:
         assert reader.count() == 7
@@ -231,10 +231,11 @@ def test_recovery_after_unclean_shutdown(tmp_path):
     db.add("a lazy dog", id="b")
     db.add("the fox runs", id="c")
     live = [(h.id, round(h.score, 6)) for h in db.search("fox", k=3)]
-    # Simulate a crash: release the lock (so the test can reopen) WITHOUT
-    # checkpointing, leaving the WAL on disk as a real crash would.
-    db._engine._release_writer_lock()
+    # Simulate a crash: drop the handle WITHOUT checkpointing, leaving the WAL on
+    # disk as a real crash would. The native engine (and its writer lock) is
+    # released on its worker by the finalizer, so the reopen below can reacquire it.
     del db
+    gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
 
     recovered = _open(tmp_path, commit_mode="wal")
     try:
@@ -262,9 +263,10 @@ def test_recovery_when_reopened_in_generation_mode(tmp_path):
     db.add("a lazy dog", id="b")
     db.add("the fox runs", id="c")
     live = [(h.id, round(h.score, 6)) for h in db.search("fox", k=3)]
-    # Simulate a crash: leave the WAL on disk, release the lock so we can reopen.
-    db._engine._release_writer_lock()
+    # Simulate a crash: drop the handle, leaving the WAL on disk; the native
+    # engine's writer lock is released on its worker so we can reopen.
     del db
+    gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
     assert _wal_files(tmp_path), "the crashed WAL-mode writer should leave a WAL"
 
     # Reopen explicitly in generation mode (the opt-out path).
@@ -292,8 +294,8 @@ def test_open_normalizes_wal_into_generation(tmp_path):
     db = _open(tmp_path, commit_mode="wal")
     db.add("alpha one", id="a")
     db.add("beta two", id="b")
-    db._engine._release_writer_lock()  # crash: WAL left on disk
-    del db
+    del db  # crash: drop the handle without a clean close, leaving the WAL on disk
+    gc.collect()
     assert _wal_files(tmp_path)
 
     reopened = _open(tmp_path, commit_mode="wal")
@@ -316,8 +318,8 @@ def test_torn_wal_tail_recovers_prior_records(tmp_path):
     db = _open(tmp_path, commit_mode="wal")
     db.add("alpha one", id="a")
     db.add("beta two", id="b")
-    db._engine._release_writer_lock()
     del db
+    gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
     wal = wal_path(tmp_path, _only_wal_key(tmp_path))
     with wal.open("ab") as handle:
         handle.write(b"\x00\x00\x10\x00partial-frame-without-crc")
@@ -337,8 +339,8 @@ def test_interior_wal_corruption_fails_closed(tmp_path):
     db.add("alpha one", id="a")
     db.add("beta two", id="b")
     db.add("gamma three", id="c")
-    db._engine._release_writer_lock()
     del db
+    gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
     wal = wal_path(tmp_path, _only_wal_key(tmp_path))
     raw = bytearray(wal.read_bytes())
     raw[40] ^= 0xFF  # flip a byte inside an early (non-trailing) record
@@ -407,8 +409,8 @@ def test_wal_mode_vector_in_recovers(tmp_path):
     )
     db.add_vectors([1.0, 0, 0, 0, 0, 0, 0, 0], id="x", text="vec x")
     db.add_vectors([0, 1.0, 0, 0, 0, 0, 0, 0], id="y", text="vec y")
-    db._engine._release_writer_lock()
     del db
+    gc.collect()  # drop the native engine (releasing its writer lock) without a clean close
 
     recovered = LodeDB.open_vector_store(tmp_path, vector_dim=8, commit_mode="wal")
     try:

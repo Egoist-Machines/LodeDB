@@ -20,6 +20,7 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import json
 import math
 import secrets
 import sys
@@ -32,19 +33,22 @@ from pathlib import Path
 from typing import Any
 
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
+from lodedb.engine._commit_manifest import (
+    COMMIT_MANIFEST_SUFFIX,
+    base_json_path,
+    read_commit_manifest,
+)
+from lodedb.engine._filelock import ConcurrentWriterError
 from lodedb.engine._predicate import coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
-    EngineSecurityConfig,
     EngineVectorDocument,
-    LodeEngine,
+    _state_from_payload,
     index_state_key_for_client_hash,
     sha256_text,
 )
 from lodedb.engine.embedding_backends import EngineEmbeddingBackend
-from lodedb.engine.index import LodeIndex
 from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreEngineHandle
-from lodedb.engine.route_registry import default_route_registry, load_route_registry
 from lodedb.engine.runtime_policy import (
     commit_mode_from_env,
     parse_commit_mode,
@@ -301,9 +305,9 @@ class LodeDB:
         # unsendable PyO3 object, so it is opened on (and only ever touched from) a
         # single dedicated worker thread; _ThreadConfinedNativeEngine routes every
         # call there so a shared handle works from any caller thread. _op_lock
-        # serializes whole operations across concurrent callers (it previously
-        # lived in LodeEngine) so prepare/apply spans, lazy embedding-model init,
-        # and the columnar index a query reads never interleave.
+        # serializes whole operations across concurrent callers so prepare/apply
+        # spans, lazy embedding-model init, and the columnar index a query reads
+        # never interleave.
         self._native_executor: ThreadPoolExecutor | None = None
         self._op_lock = threading.RLock()
         self._native_vector_engine: _ThreadConfinedNativeEngine | None = None
@@ -434,36 +438,6 @@ class LodeDB:
                 )
         else:
             self.path.mkdir(parents=True, exist_ok=True)
-        security = EngineSecurityConfig(
-            bind_host=_LOCAL_BIND_HOST,
-            route_profile=route_profile,
-            telemetry_mode="metrics_only",
-            allow_raw_result_text=self.store_text,
-            persist_lexical_index=self.index_text,
-        )
-        self._engine = LodeEngine(
-            security=security,
-            route_registry=(
-                load_route_registry(str(route_registry_path))
-                if route_registry_path is not None
-                else default_route_registry()
-            ),
-            chunk_character_limit=self._chunk_character_limit,
-            persistence_dir=self.path,
-            read_only=self.read_only,
-            fsync_on_commit=fsync_on_commit,
-            commit_mode=resolved_commit_mode,
-            embedding_backend=backend,
-            route_policy=route_policy,
-        )
-        self._index = LodeIndex(
-            self._engine,
-            client_id=_LOCAL_CLIENT_ID,
-            index_id=_LOCAL_INDEX_ID,
-        )
-        # Ensure the (single) local index exists; load-on-open already restored
-        # any persisted state for this client hash via the engine constructor.
-        self._ensure_index()
         self._auto_id_counter = 0
         native_durability = "fsync" if fsync_on_commit else "relaxed"
         self._maybe_init_native_vector_engine(
@@ -1212,12 +1186,6 @@ class LodeDB:
             except Exception as exc:  # noqa: BLE001 - surfaced below
                 native_close_error = exc
             executor.shutdown(wait=not on_worker)
-            # The vestigial Python engine never published commits (native owned
-            # durability), so closing it only releases in-memory references.
-            if self._engine is not None:
-                self._engine.close()
-            self._index = None  # type: ignore[assignment]
-            self._engine = None  # type: ignore[assignment]
         if native_close_error is not None:
             raise RuntimeError("native core close failed") from native_close_error
 
@@ -1277,6 +1245,52 @@ class LodeDB:
         )
         read_only = self.read_only
 
+        def _finalize_open(handle: NativeCoreEngineHandle) -> NativeCoreEngineHandle:
+            # Validates the persisted identity (and creates the index on a fresh
+            # writable store). On any failure here the engine is already open, so
+            # close + drop it on this worker thread before propagating: that
+            # releases the writer lock and keeps the unsendable object from being
+            # decref'd on the foreign thread that observes the error.
+            try:
+                if read_only:
+                    # A read-only handle never creates state; reject only when the
+                    # committed store on disk has an identity contradicting this
+                    # handle (a missing index is an empty store and serves nothing).
+                    _validate_native_index_identity(self.path, index_options)
+                    return handle
+                try:
+                    handle.stats(_LOCAL_INDEX_ID)
+                except Exception:
+                    # Fresh store: create the index and commit an initial generation
+                    # so a root manifest exists on disk. In WAL mode the native
+                    # recovery path only replays a `<key>.wal` that sits alongside a
+                    # committed `<key>.commit.json`; without this seed commit, a
+                    # crash before the first checkpoint would leave an orphan WAL the
+                    # next open could not discover.
+                    handle.create_index_with_options(index_options)
+                    handle.persist()
+                else:
+                    # The store already holds this index: enforce its full persisted
+                    # identity against this handle's route before serving or
+                    # mutating, so a reopen at a different model / dim / bit width
+                    # fails fast.
+                    _validate_native_index_identity(self.path, index_options)
+                return handle
+            except Exception:
+                # The engine is open on this worker. Close it (releasing the writer
+                # lock) and drop the unsendable PyCoreEngine HERE, on its home
+                # thread, before the error propagates: a later decref of an object
+                # captured by the exception traceback on the observing thread would
+                # panic. Nulling the wrapper's inner engine forces that final
+                # decref to happen now, on the worker.
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                handle._engine = None  # type: ignore[assignment]
+                del handle
+                raise
+
         def _open() -> NativeCoreEngineHandle:
             # Runs on the worker thread: records its id as the engine's home thread
             # and opens (and, for a fresh writable store, creates the index in) the
@@ -1291,8 +1305,31 @@ class LodeDB:
                     index_text=self.index_text,
                     chunk_character_limit=self._chunk_character_limit,
                 )
-                handle.stats(_LOCAL_INDEX_ID)
-                return handle
+                return _finalize_open(handle)
+            if commit_mode != "wal" and _has_leftover_wal(self.path):
+                # A crash in WAL mode can leave a `<key>.wal` with no fresh
+                # checkpoint. The native recovery path only replays a WAL during a
+                # WAL-mode open, so a reopen in generation mode would otherwise drop
+                # those durably-logged writes. Fold the leftover WAL into a committed
+                # generation with a transient WAL-mode open (replay + persist on
+                # close) before opening in the requested mode.
+                recovery = adapter.open_engine(
+                    path=self.path,
+                    read_only=False,
+                    durability=durability,
+                    commit_mode="wal",
+                    store_text=self.store_text,
+                    index_text=self.index_text,
+                    chunk_character_limit=self._chunk_character_limit,
+                    acquire_writer_lock=True,
+                )
+                try:
+                    recovery.close()  # persists the replayed WAL into a generation
+                finally:
+                    recovery._engine = None  # type: ignore[assignment]
+                    del recovery
+            # The native engine is the sole writer for this handle, so it takes
+            # the shared <dir>/.lodedb.lock single-writer lock itself.
             handle = adapter.open_engine(
                 path=self.path,
                 read_only=False,
@@ -1301,18 +1338,25 @@ class LodeDB:
                 store_text=self.store_text,
                 index_text=self.index_text,
                 chunk_character_limit=self._chunk_character_limit,
+                acquire_writer_lock=True,
             )
-            try:
-                handle.stats(_LOCAL_INDEX_ID)
-            except Exception:
-                handle.create_index_with_options(index_options)
-            return handle
+            return _finalize_open(handle)
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lodedb-native")
         try:
             real_handle = executor.submit(_open).result()
         except Exception as exc:
             executor.shutdown(wait=True)
+            if _is_writer_lock_contention(exc):
+                # Another process holds the native single-writer lock. Surface the
+                # SDK's stable single-writer error (LodeDB is single-writer per
+                # path) rather than the generic init failure.
+                self._native_core_fallback_reason = "native_core_writer_lock_contended"
+                raise ConcurrentWriterError(
+                    f"LodeDB at {self.path} is already open by another process "
+                    "(LodeDB is single-writer per path); close the other handle, or "
+                    "raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
+                ) from exc
             self._native_core_fallback_reason = "native_core_init_failed"
             raise RuntimeError(f"failed to initialize native core: {exc!r}") from exc
         self._native_executor = executor
@@ -1338,11 +1382,6 @@ class LodeDB:
             self._native_engine_holder,
             self._native_engine_thread_id,
         )
-        if not read_only:
-            # Native owns durability now (it is the sole writer). The vestigial
-            # Python engine keeps no committed data and must never publish its own
-            # commit over the native store, so it defers commits for this handle.
-            self._engine.assign_native_durability_ownership()
 
     def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
         """Upserts vector documents into the native core (fail closed)."""
@@ -1788,23 +1827,23 @@ class LodeDB:
         metrics["encode_seconds"] += time.perf_counter() - started
         return vectors
 
-    def _ensure_index(self) -> None:
-        """Binds the single local index, creating it unless this handle is read-only."""
-
-        try:
-            self._index.get_index()
-        except Exception:  # noqa: BLE001 - missing index
-            if self.read_only:
-                # A read-only handle never creates state: an absent index just
-                # means an empty or not-yet-written store, so reads return nothing.
-                return
-            self._index.create(name="lodedb-local")
-
     def _next_auto_id(self) -> str:
         """Returns a unique, collision-resistant auto id for an added document."""
 
         self._auto_id_counter += 1
         return f"doc-{secrets.token_hex(8)}-{self._auto_id_counter}"
+
+
+# The native writer-lock contention error, raised by the Rust core when another
+# process already holds <dir>/.lodedb.lock and the acquire timeout elapses. The
+# native binding surfaces it as a ValueError carrying this redacted message.
+_NATIVE_WRITER_LOCK_CONTENTION_MARKER = "another writer holds the lodedb lock"
+
+
+def _is_writer_lock_contention(error: BaseException) -> bool:
+    """Returns whether a native open failed because another writer holds the lock."""
+
+    return _NATIVE_WRITER_LOCK_CONTENTION_MARKER in str(error)
 
 
 # Engines we could not drop on their home worker (interpreter teardown, or a
@@ -1973,6 +2012,74 @@ def _native_vector_index_options(
         "vector_dim": int(vector_dim),
         "bit_width": int(bit_width),
     }
+
+
+def _has_leftover_wal(path: Path) -> bool:
+    """Returns whether a non-empty WAL log is present (a crash before checkpoint)."""
+
+    return any(p.is_file() and p.stat().st_size > 0 for p in Path(path).glob("*.wal"))
+
+
+def _persisted_index_identity(path: Path) -> dict[str, Any] | None:
+    """Reads the committed index identity (model/dim/etc.) for the local store.
+
+    Returns the persisted route identity from the consistent generation named by
+    the ``<key>.commit.json`` root manifest (the same on-disk source the snapshot
+    auditor reads), or ``None`` when the store has no committed index yet. Only the
+    redacted state header is read; journal deltas never change the identity.
+    """
+
+    commits = sorted(Path(path).glob(f"*{COMMIT_MANIFEST_SUFFIX}"))
+    for commit_path in commits:
+        manifest = read_commit_manifest(commit_path)
+        if manifest is None:
+            continue
+        key = commit_path.name[: -len(COMMIT_MANIFEST_SUFFIX)]
+        base = base_json_path(Path(path), key, int(manifest["base_epoch"]))
+        try:
+            payload = json.loads(base.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        state = _state_from_payload(payload)
+        return {
+            "native_dim": int(state.native_dim),
+            "model": str(state.model),
+            "provider": str(state.provider),
+            "task": str(state.task),
+            "storage_profile": str(state.storage_profile),
+            "turbovec_bit_width": int(state.turbovec_bit_width),
+        }
+    return None
+
+
+def _validate_native_index_identity(path: Path, options: Mapping[str, Any]) -> None:
+    """Rejects a reopen whose persisted index identity contradicts this handle.
+
+    Enforces the full persisted route identity (dimension, model, provider, task,
+    storage profile, and TurboVec bit width) against the identity this handle was
+    opened with. Checking only model/dim is not enough: a vector-only store and a
+    custom-embedder index can share model/provider/dim yet differ in task, and a
+    reopen at a different bit width must fail rather than silently keep the stored
+    width. A store with no committed generation yet has no identity to contradict.
+    """
+
+    persisted = _persisted_index_identity(path)
+    if persisted is None:
+        return
+    for label, persisted_value, expected_value in (
+        ("dimension", persisted["native_dim"], int(options["vector_dim"])),
+        ("model", persisted["model"], str(options["model"])),
+        ("provider", persisted["provider"], str(options["provider"])),
+        ("task", persisted["task"], str(options["task"])),
+        ("storage profile", persisted["storage_profile"], str(options["storage_profile"])),
+        ("bit_width", persisted["turbovec_bit_width"], int(options["bit_width"])),
+    ):
+        if persisted_value != expected_value:
+            raise RuntimeError(
+                f"persisted index {label} {persisted_value!r} does not match the opened "
+                f"index {label} {expected_value!r}; reopen with the same model / embedder "
+                "/ vector_dim / bit_width it was written with"
+            )
 
 
 def _coerce_optional_text(value: Any) -> str | None:

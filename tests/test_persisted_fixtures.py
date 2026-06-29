@@ -3,6 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB
 
@@ -30,14 +32,19 @@ def test_v0_4_generation_fixture_opens(tmp_path: Path) -> None:
         db.close()
 
 
-def test_v0_4_wal_fixture_replays(tmp_path: Path) -> None:
+def test_v0_4_text_wal_fixture_fails_closed(tmp_path: Path) -> None:
+    """A leftover text-ingest WAL from a pre-native writer fails closed on open.
+
+    The fixture's WAL holds ``upsert_documents`` (raw text + metadata) records,
+    which only re-embedding could replay; the native-only core cannot re-embed
+    during recovery, so it leaves the WAL untouched and fails the open rather than
+    silently dropping the logged writes. A clean store (committed generation with
+    no leftover text WAL) opens normally; this is the pre-native crash boundary.
+    """
+
     path = _copy_fixture("v0_4_wal", tmp_path)
-    db = LodeDB(path, commit_mode="wal", _embedding_backend=HashEmbeddingBackend(native_dim=384))
-    try:
-        assert db.count() == 3
-        assert db.get("doc-beta") == "Beta incident report for serial AX-42 on 2024-06-13."
-    finally:
-        db.close()
+    with pytest.raises(RuntimeError, match="WAL containing non-native records"):
+        LodeDB(path, commit_mode="wal", _embedding_backend=HashEmbeddingBackend(native_dim=384))
 
 
 def test_v0_4_store_text_fixture_opens(tmp_path: Path) -> None:
@@ -79,11 +86,14 @@ def test_rust_generation_fixture_opens_in_python(tmp_path: Path) -> None:
         db.close()
 
 
-def test_rust_wal_fixture_replays_in_python(tmp_path: Path) -> None:
+def test_text_wal_fixture_fails_closed_in_python(tmp_path: Path) -> None:
+    """A leftover text-ingest WAL fails closed (no re-embed during native recovery).
+
+    The fixture's WAL holds an ``upsert_documents`` (raw text) record. Replaying it
+    would require re-embedding, which the native-only recovery path does not do, so
+    the open fails closed and leaves the WAL on disk instead of losing the write.
+    """
+
     path = _copy_fixture("rust_wal", tmp_path)
-    db = LodeDB(path, commit_mode="wal", _embedding_backend=HashEmbeddingBackend(native_dim=384))
-    try:
-        assert db.count() == 1
-        assert db.get("rust-wal-alpha") == "Rust authored WAL payload"
-    finally:
-        db.close()
+    with pytest.raises(RuntimeError, match="WAL containing non-native records"):
+        LodeDB(path, commit_mode="wal", _embedding_backend=HashEmbeddingBackend(native_dim=384))

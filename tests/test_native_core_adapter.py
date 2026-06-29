@@ -372,7 +372,9 @@ def test_adapter_wraps_persistent_native_engine_open(tmp_path) -> None:
         "store_text": False,
         "index_text": False,
         "chunk_character_limit": 512,
-        "acquire_writer_lock": False,
+        # The native engine is the sole writer, so a writable open takes the
+        # single-writer lock by default.
+        "acquire_writer_lock": True,
     }
 
 

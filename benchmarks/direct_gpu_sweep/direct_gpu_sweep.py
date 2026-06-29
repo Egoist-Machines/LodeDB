@@ -19,11 +19,24 @@ import numpy as np
 
 from lodedb.engine.core import audit_persisted_index_snapshots
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.engine.index import EngineError
 from lodedb.engine.runtime_policy import GpuDirectTurboVecPolicy
 from lodedb.engine.turbovec_index import turbovec_capability
 from lodedb.local import LodeDB
 from lodedb.local.presets import resolve_preset
+
+
+class EngineError(RuntimeError):
+    """Engine validation/response error with an HTTP-style status and body.
+
+    This harness drives Python-engine internals that the native-core-sole path no
+    longer exposes, so it is pending a native GPU-resident port (its test is
+    skipped). The error type is defined locally so the module still imports.
+    """
+
+    def __init__(self, message: str, *, status_code: int, response: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.response = dict(response)
 
 DEFAULT_BATCH_SIZES = "1,2,4,8,16,32,64,128,256,512,1024"
 GOVREPORT_DATASET = "ccdv/govreport-summarization"

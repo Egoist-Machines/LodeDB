@@ -244,10 +244,13 @@ def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
     for jsd in glob.glob(str(Path(tmp_path) / "**" / "*.jsd"), recursive=True):
         assert _SECRET not in Path(jsd).read_bytes().decode("utf-8", "replace")
 
-    # Telemetry and audit events carry no raw text.
-    engine = db._engine
-    assert _SECRET not in json.dumps([dict(m) for m in engine.metrics])
-    assert _SECRET not in json.dumps([dict(a) for a in engine.audit_events])
+    # The persisted redacted artifacts carry no raw text: the disk auditor scans
+    # the committed snapshot + journal deltas for forbidden raw-payload keys and
+    # never inspects the text sidecar.
+    report = audit_persisted_index_snapshots(tmp_path)
+    assert report["status"] == "passed"
+    assert report["raw_document_text_present"] is False
+    assert _SECRET not in json.dumps(report)
 
     # stats stays payload-free and still reports raw_payload_text_present False.
     stats = db.stats()

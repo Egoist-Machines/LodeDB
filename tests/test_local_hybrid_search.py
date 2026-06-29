@@ -396,13 +396,18 @@ def test_lexical_incremental_served_equals_full_rebuild(tmp_path, source):
     query = "E1234 ABC-123 token3 token5"
     served = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
 
-    # Force a full rebuild: drop the cached (incrementally updated) index so the
-    # next query builds it from scratch over the same final corpus.
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [(hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")]
-
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens, building it from scratch over the same final corpus.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -442,12 +447,18 @@ def test_lexical_single_mutation_folds_and_equals_rebuild(tmp_path, source):
         lx.Bm25Index._build = original_build
 
     # The incrementally-served ranking equals a fresh full build over the corpus.
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -501,12 +512,18 @@ def test_lexical_reupsert_changed_chunk_ids_reconciles(tmp_path, source):
     after = db.search("yytoken", k=10, mode="lexical")
     assert after and {hit.id for hit in after} == {"edited"}
 
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 @pytest.mark.parametrize("source", ["store_text", "index_text"])
@@ -556,12 +573,18 @@ def test_lexical_add_then_delete_before_query_reconciles(tmp_path, source):
     assert all(hit_id != "ephemeral" for hit_id, _ in served)
     assert db.search("ephemeral", k=5, mode="lexical") == []
 
-    db._engine._lexical_indexes.clear()  # noqa: SLF001 - force a full rebuild
-    rebuilt = [
-        (hit.id, round(hit.score, 9)) for hit in db.search(query, k=10, mode="hybrid")
-    ]
-    assert served == rebuilt
+    # Reopen so the native engine rebuilds its lexical index from the persisted
+    # tokens; the incrementally-served ranking must equal that fresh rebuild.
     db.close()
+    rebuilt_db = _open_lexical(tmp_path, source=source)
+    try:
+        rebuilt = [
+            (hit.id, round(hit.score, 9))
+            for hit in rebuilt_db.search(query, k=10, mode="hybrid")
+        ]
+    finally:
+        rebuilt_db.close()
+    assert served == rebuilt
 
 
 def _topics(db: LodeDB, ids: list[str]) -> list[str]:

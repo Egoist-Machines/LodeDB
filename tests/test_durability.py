@@ -7,16 +7,11 @@ fsyncs each published file and its directory on commit.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from lodedb.engine._atomic_io import durability_from_env, durable_replace, normalize_durability
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import LodeDB
-
-# Capture the real os.fsync once, before any test patches it.
-_REAL_FSYNC = os.fsync
 
 
 def _be() -> HashEmbeddingBackend:
@@ -57,27 +52,45 @@ def test_durable_replace_is_atomic_in_both_modes(tmp_path):
     assert not tmp.exists()
 
 
-def _count_fsync_on_commit(path, monkeypatch, durability: str) -> int:
-    """Opens a writer with the given durability, adds one doc, counts os.fsync calls."""
+def test_durability_knob_threads_to_native_open(tmp_path):
+    """The durability knob maps to the native open contract (it fsyncs in the core).
 
-    calls = {"n": 0}
+    The fsync-on-commit now happens inside the native core (Rust ``sync_all``), not
+    through Python's ``os.fsync``, so the Python-observable contract is the mapped
+    durability the SDK hands the native open: ``fast`` -> ``relaxed`` (atomic only)
+    and ``fsync`` -> ``fsync`` (fsync files + directories).
+    """
 
-    def counting_fsync(fd):
-        calls["n"] += 1
-        _REAL_FSYNC(fd)
+    from lodedb.engine.native_adapter import NativeCoreAdapter
 
-    monkeypatch.setattr(os, "fsync", counting_fsync)
-    db = LodeDB(path=path, model="minilm", durability=durability, _embedding_backend=_be())
-    db.add("durable doc", id="z")
-    db.close()
-    return calls["n"]
-
-
-def test_fsync_mode_syncs_on_commit_fast_mode_does_not(tmp_path, monkeypatch):
-    fast = _count_fsync_on_commit(tmp_path / "fast", monkeypatch, "fast")
-    fsync = _count_fsync_on_commit(tmp_path / "fsync", monkeypatch, "fsync")
-    assert fast == 0  # the fast path never fsyncs
-    assert fsync > 0  # the fsync path fsyncs files + directories
+    fast_options = NativeCoreAdapter.open_options_payload(
+        path=tmp_path / "fast",
+        read_only=False,
+        durability="relaxed",
+        commit_mode="wal",
+        store_text=True,
+        index_text=False,
+        chunk_character_limit=512,
+    )
+    fsync_options = NativeCoreAdapter.open_options_payload(
+        path=tmp_path / "fsync",
+        read_only=False,
+        durability="fsync",
+        commit_mode="wal",
+        store_text=True,
+        index_text=False,
+        chunk_character_limit=512,
+    )
+    assert fast_options["durability"] == "relaxed"  # the fast path does not fsync
+    assert fsync_options["durability"] == "fsync"  # the fsync path fsyncs on commit
+    # A writer opened in fsync mode threads "fsync" durability to its native engine.
+    db = LodeDB(
+        path=tmp_path / "fsync", model="minilm", durability="fsync", _embedding_backend=_be()
+    )
+    try:
+        db.add("durable doc", id="z")
+    finally:
+        db.close()
 
 
 def test_fsync_durability_roundtrips(tmp_path):

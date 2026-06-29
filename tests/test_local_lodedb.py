@@ -317,10 +317,10 @@ def test_reopen_uses_stable_index_id(tmp_path):
 
     db = _open(tmp_path)
     db.add("persisted document", id="p1")
-    first_id = db._index.index_id
+    first_id = db.stats()["index_id"]
     db.close()
     db2 = _open(tmp_path)
-    assert db2._index.index_id == first_id == "default"
+    assert db2.stats()["index_id"] == first_id == "default"
     assert db2.count() == 1
     db2.close()
 
@@ -357,13 +357,17 @@ def test_stats_is_metrics_only_no_raw_text(tmp_path):
 def test_no_auth_required_and_private_bind_policy(tmp_path):
     """Local mode requires no credentials and keeps a local/private bind policy."""
 
+    from lodedb.engine.core import is_private_bind_host
+    from lodedb.local.db import _LOCAL_BIND_HOST
+
+    # The SDK never asks the caller for a credential: the embedded handle opened
+    # with no auth arguments and carries no bearer/license/mTLS auth attributes.
     db = _open(tmp_path)
-    # The SDK never asks the caller for a credential — the engine carries no
-    # bearer/license/mTLS auth, only a local/private bind policy and metrics-only telemetry.
-    assert not hasattr(db._engine.security, "mtls_required")
-    assert not hasattr(db._engine.security, "bearer_token_sha256")
-    assert db._engine.security.bind_host in {"127.0.0.1", "localhost"}
-    assert db._engine.security.telemetry_mode == "metrics_only"
+    for auth_attr in ("security", "mtls_required", "bearer_token_sha256", "api_key"):
+        assert not hasattr(db, auth_attr)
+    # The embedded SDK pins a loopback/private bind policy and metrics-only stats.
+    assert is_private_bind_host(_LOCAL_BIND_HOST)
+    assert db.stats()["raw_payload_text_present"] is False
     db.close()
 
 
