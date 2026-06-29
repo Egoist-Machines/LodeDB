@@ -601,6 +601,9 @@ fn read_vector_documents(
                 } else {
                     Some(read_string(document.text)?)
                 },
+                // Plain vector documents carry no late-interaction multivector;
+                // the multivec record is populated only on the multivector path.
+                patch_matrix: None,
             })
         })
         .collect()

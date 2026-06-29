@@ -90,6 +90,24 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+  # Runs the native Rust core's own test suites (the integration suites in
+  # crates/lodedb-core/tests plus the lodedb-ffi ABI smoke), which the Python
+  # pytest job above does not exercise. Linux only; the vendored TurboVec crate
+  # needs a CBLAS provider (OpenBLAS) to build here.
+  rust-tests:
+    name: native-core rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS (Linux CBLAS provider for the vendored TurboVec crate)
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the native-core Rust test suites
+        run: cargo test --workspace
+
   # Builds the package in a clean environment and asserts the *patched* TurboVec core is
   # what got built — not the stock PyPI `turbovec`, which lacks the delta-persistence and
   # reconstruction APIs. This is the guard for the vendored-dependency install story.
