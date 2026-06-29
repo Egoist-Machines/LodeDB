@@ -257,9 +257,13 @@ def test_raw_text_never_leaks_into_redacted_artifacts(tmp_path):
     assert stats["raw_payload_text_present"] is False
     assert _SECRET not in json.dumps(stats)
 
-    # The dedicated sidecar (and only it) holds the text.
-    tvtext = glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0]
-    assert _SECRET in Path(tvtext).read_text(encoding="utf-8")
+    # The text lives only in the dedicated sidecar. It is zstd-compressed, so the
+    # payload is not even plaintext on disk; round-tripping through the native
+    # reader proves it is durably stored and retrievable.
+    assert db.get("s") == _SECRET
+    tvtext = Path(glob.glob(str(Path(tmp_path) / "**" / "*.tvtext"), recursive=True)[0])
+    assert tvtext.stat().st_size > 0
+    assert _SECRET not in tvtext.read_bytes().decode("utf-8", "replace")
     db.close()
 
 
@@ -300,12 +304,18 @@ def test_text_store_checksum_mismatch_fails_closed(tmp_path):
     db.persist()
     db.close()
 
-    # The journaled raw-text base is a checksummed id->text map at g<epoch>.tvtext.
+    # The journaled raw-text base at g<epoch>.tvtext is a checksummed id->text map,
+    # now zstd-compressed. Overwrite it with an uncompressed base whose body no
+    # longer matches its recorded checksum: the native reader still accepts
+    # uncompressed bases (back-compat) and re-checks the body hash, so a tampered
+    # body fails closed regardless of on-disk compression.
     base = Path(sorted(glob.glob(str(Path(tmp_path) / "**" / "g*.tvtext"), recursive=True))[-1])
-    payload = json.loads(base.read_text(encoding="utf-8"))
-    # Mutate the body without updating the recorded checksum.
-    payload["body"]["documents"]["c"] = "tampered body"
-    base.write_text(json.dumps(payload), encoding="utf-8")
+    tampered = {
+        "schema_version": 2,
+        "body_sha256": "0" * 64,  # stale: does not match the body below
+        "body": {"schema_version": 2, "documents": {"c": "tampered body"}},
+    }
+    base.write_text(json.dumps(tampered), encoding="utf-8")
 
     # Loading the tampered base through its store fails closed on the checksum.
     with pytest.raises(RuntimeError, match="checksum"):

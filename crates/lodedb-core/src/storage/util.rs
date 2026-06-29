@@ -212,6 +212,44 @@ pub(crate) fn write_py_json(path: &Path, value: &Value, fsync: bool) -> CoreResu
     write_text_atomic(path, &text, fsync)
 }
 
+/// The first bytes of a zstd frame (little-endian magic ``0xFD2FB528``). Read
+/// paths use it to tell a compressed payload from legacy plain JSON.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// Compression level for the document-text store. The base is rewritten only at
+/// checkpoint and the segments are off the per-add WAL hot path, so a high-ratio
+/// level is worth the CPU; retained payload text (e.g. mem0 memories) compresses
+/// several-fold.
+const TEXT_ZSTD_LEVEL: i32 = 19;
+
+/// Writes ``value`` as canonical (CPython-identical) JSON, zstd-compressed, via
+/// the same atomic temp-and-rename as [`write_py_json`]. The on-disk bytes are a
+/// zstd frame; callers checksum the file bytes for integrity, while the logical
+/// ``body_sha256`` is taken over the JSON value and is unaffected by compression.
+pub(crate) fn write_py_json_zstd(path: &Path, value: &Value, fsync: bool) -> CoreResult<usize> {
+    let text = py_canonical_json(value)?;
+    let compressed = zstd::encode_all(text.as_bytes(), TEXT_ZSTD_LEVEL).map_err(|error| {
+        corrupt(format!("could not compress {}: {error}", path.display()))
+    })?;
+    write_bytes_atomic(path, &compressed, fsync)
+}
+
+/// Reads a JSON value that may be zstd-compressed (written by
+/// [`write_py_json_zstd`]) or plain UTF-8 JSON (a legacy/uncompressed store). The
+/// zstd frame magic distinguishes the two, so existing uncompressed stores keep
+/// loading unchanged.
+pub(crate) fn read_maybe_zstd_json(path: &Path, context: &str) -> CoreResult<Value> {
+    let data =
+        fs::read(path).map_err(|error| corrupt(format!("{context} could not be read: {error}")))?;
+    let json = if data.starts_with(&ZSTD_MAGIC) {
+        zstd::decode_all(&data[..])
+            .map_err(|error| corrupt(format!("{context} could not be decompressed: {error}")))?
+    } else {
+        data
+    };
+    serde_json::from_slice(&json).map_err(|error| corrupt(format!("{context} is corrupt: {error}")))
+}
+
 pub(crate) fn write_text_atomic(path: &Path, text: &str, fsync: bool) -> CoreResult<usize> {
     write_bytes_atomic(path, text.as_bytes(), fsync)
 }

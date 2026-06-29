@@ -1,6 +1,6 @@
 use crate::storage::util::{
-    body_sha256, corrupt, get_i64, get_str, read_json, sha256_file_hex, value_object,
-    verify_file_sha256, write_pretty_json_atomic, write_py_json, CoreResult,
+    body_sha256, corrupt, get_i64, get_str, read_json, read_maybe_zstd_json, sha256_file_hex,
+    value_object, verify_file_sha256, write_pretty_json_atomic, write_py_json_zstd, CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -108,7 +108,7 @@ pub fn record_base(
         "body_sha256": body_sha256(&body)?,
         "body": body,
     });
-    write_py_json(base_path, &payload, fsync)?;
+    write_py_json_zstd(base_path, &payload, fsync)?;
     let manifest_path = manifest_path(base_path);
     let previous = if manifest_path.is_file() {
         Some(read_json(&manifest_path, "document text manifest")?)
@@ -179,7 +179,7 @@ pub fn append_delta(
         DOCUMENT_TEXT_DELTA_DIR_SUFFIX
     ));
     let segment_path = delta_dir.join(&segment_name);
-    write_py_json(&segment_path, &segment, fsync)?;
+    write_py_json_zstd(&segment_path, &segment, fsync)?;
     let deltas = manifest_object
         .entry("deltas")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -202,7 +202,7 @@ fn read_wrapped_document_map(
     path: &Path,
     schema_version: i64,
 ) -> CoreResult<BTreeMap<String, String>> {
-    let payload = read_json(path, "document text base")?;
+    let payload = read_maybe_zstd_json(path, "document text base")?;
     let payload = value_object(&payload, "document text base")?;
     if get_i64(payload, "schema_version", -1) != schema_version {
         return Err(corrupt("unsupported document text base schema version"));
@@ -225,7 +225,7 @@ fn read_wrapped_document_map(
 }
 
 fn read_segment_body(path: &Path, schema_version: i64, context: &str) -> CoreResult<Value> {
-    let segment = read_json(path, &format!("{context} segment"))?;
+    let segment = read_maybe_zstd_json(path, &format!("{context} segment"))?;
     let segment = value_object(&segment, &format!("{context} segment"))?;
     if get_i64(segment, "schema_version", -1) != schema_version {
         return Err(corrupt(format!(
