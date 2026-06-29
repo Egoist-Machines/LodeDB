@@ -6,12 +6,12 @@ This benchmark therefore reports two distinct numbers and makes no
 GPU-vector-search-on-Mac claim:
 
 1. **Embedding throughput** — docs/sec for the selected backend/device.
-2. **CPU vector-scan latency** — per-query p50/p95 *search* latency (the
-   TurboVec scan + materialization), measured with embedding excluded by
-   pre-embedding queries once and reusing the engine's query path.
+2. **CPU vector-scan latency** — per-query p50/p95 *search* latency (the native
+   TurboVec scan + result assembly), measured with embedding excluded by timing
+   the query embedding and the native vector scan separately.
 
-Reuses :class:`LodeDB` (hence the engine engine + TurboVec storage); it does
-not reimplement search.
+Reuses :class:`LodeDB` (hence the native core + TurboVec storage); it does not
+reimplement search.
 """
 
 from __future__ import annotations
@@ -97,18 +97,23 @@ def run_local_benchmark(
 
     db.persist()
 
-    # Query latency: each search embeds the query then scans on the native kernel.
-    # We report the end-to-end query latency. The native core does not surface a
-    # separate embedding-excluded search component, so the search-only figure is
-    # reported as 0 (unavailable) rather than a misleading approximation.
+    # Query latency: time the query embedding and the native vector scan separately
+    # so the search-only figure excludes embedding. Embedding the query and then
+    # calling search_by_vector is exactly what db.search does internally (embed, then
+    # scan), so the end-to-end figure is their sum and the search-only figure is the
+    # native scan + result assembly that an application pays beyond embedding.
     queries = [documents[i % doc_count]["text"] for i in range(query_count)]
+    backend = db._embedding_backend
     total_latencies: list[float] = []
     search_latencies: list[float] = []
     for text in queries:
-        t0 = time.perf_counter()
-        db.search(text, k=top_k)
-        total_latencies.append((time.perf_counter() - t0) * 1000.0)
-        search_latencies.append(0.0)
+        start = time.perf_counter()
+        vector = backend.embed_query(text)
+        embedded = time.perf_counter()
+        db.search_by_vector(vector, k=top_k)
+        finished = time.perf_counter()
+        total_latencies.append((finished - start) * 1000.0)
+        search_latencies.append((finished - embedded) * 1000.0)
 
     stats = db.stats()
     storage = stats.get("storage", {}) if isinstance(stats.get("storage"), dict) else {}
