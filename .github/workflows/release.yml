@@ -183,9 +183,22 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Stage Python distributions for PyPI
+        # PyPI only accepts Python distributions; keep the Swift xcframework (and any
+        # other non-Python release asset) out of the upload directory so twine does
+        # not try to validate them.
+        run: |
+          mkdir -p pypi-dist
+          mv dist/*.whl dist/*.tar.gz pypi-dist/
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi-dist
       - name: Create GitHub Release with artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        shell: bash
+        run: |
+          # Python distributions plus any extra assets (the Swift xcframework when built).
+          shopt -s nullglob
+          gh release create "$GITHUB_REF_NAME" pypi-dist/* dist/* --generate-notes --verify-tag
