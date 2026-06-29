@@ -738,11 +738,15 @@ class NativeCoreEngineHandle:
         index_id: str,
         *,
         filter: Mapping[str, Any] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         value = json.loads(
             self._engine.list_documents(
                 str(index_id),
                 None if filter is None else self._dumps(dict(filter)),
+                None if after is None else str(after),
+                None if limit is None else int(limit),
             )
         )
         if not isinstance(value, list):

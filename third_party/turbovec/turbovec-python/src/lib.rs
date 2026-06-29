@@ -1237,12 +1237,18 @@ impl PyCoreEngine {
         )
     }
 
-    fn list_documents(&self, index_id: &str, filter_json: Option<&str>) -> PyResult<String> {
+    fn list_documents(
+        &self,
+        index_id: &str,
+        filter_json: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> PyResult<String> {
         let filter = native_optional_value(filter_json)?;
         native_to_json(
             &self
                 .inner
-                .list_documents(index_id, filter.as_ref())
+                .list_documents(index_id, filter.as_ref(), after, limit)
                 .map_err(native_core_error_to_py)?,
         )
     }

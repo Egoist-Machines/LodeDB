@@ -74,6 +74,39 @@ fn seeded_engine() -> CoreEngine {
 }
 
 #[test]
+fn list_documents_keyset_cursor_pages_in_id_order() {
+    // The `after`/`limit` keyset cursor pages list_documents by stable-id order,
+    // composing with a metadata filter.
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    let docs: Vec<_> = (0..6)
+        .map(|i| {
+            let topic = if i % 2 == 0 { "a" } else { "b" };
+            doc(&format!("d{i:03}"), i % 8, metadata(&[("topic", topic)]))
+        })
+        .collect();
+    engine.upsert_vectors("default", &docs).unwrap();
+
+    let ids = |page: Vec<serde_json::Value>| -> Vec<String> {
+        page.iter()
+            .map(|record| record["document_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let page1 = engine.list_documents("default", None, None, Some(4)).unwrap();
+    assert_eq!(ids(page1), ["d000", "d001", "d002", "d003"]);
+    let page2 = engine.list_documents("default", None, Some("d003"), Some(4)).unwrap();
+    assert_eq!(ids(page2), ["d004", "d005"]);
+
+    // The cursor composes with a filter (topic=a is d000, d002, d004).
+    let filter = json!({"metadata": {"topic": "a"}});
+    let filtered = engine
+        .list_documents("default", Some(&filter), Some("d000"), Some(2))
+        .unwrap();
+    assert_eq!(ids(filtered), ["d002", "d004"]);
+}
+
+#[test]
 fn payload_update_respects_store_text_privacy() {
     // store_text=false must keep no raw text in memory or in the WAL, including
     // after a payload-only text update (index_text=false, so no tokens either).
@@ -410,7 +443,7 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
     assert!(!record["content_hash"].as_str().unwrap().is_empty());
     assert!(!record.as_object().unwrap().contains_key("text"));
     let listed = engine
-        .list_documents("text", Some(&json!({"metadata": {"topic": "ops"}})))
+        .list_documents("text", Some(&json!({"metadata": {"topic": "ops"}})), None, None)
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["document_id"], "doc-a");

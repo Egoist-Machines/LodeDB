@@ -1295,18 +1295,26 @@ impl CoreEngine {
         &self,
         index_id: &str,
         filter: Option<&Value>,
+        after: Option<&str>,
+        limit: Option<usize>,
     ) -> Result<Vec<Value>, CoreError> {
         let index = self.index(index_id)?;
+        // resolve_filter returns ids in BTreeSet (stable-id) order, so an `after`
+        // cursor is a forward scan past that id and `limit` caps the page.
         let document_ids = index.resolve_filter(filter)?;
-        Ok(document_ids
+        let page = document_ids
             .into_iter()
+            .filter(|document_id| after.map_or(true, |cursor| document_id.as_str() > cursor))
             .filter_map(|document_id| {
                 index
                     .documents
                     .get(&document_id)
                     .map(|record| document_resource_payload(&document_id, record))
-            })
-            .collect())
+            });
+        Ok(match limit {
+            Some(limit) => page.take(limit).collect(),
+            None => page.collect(),
+        })
     }
 
     /// Persists every open index through generation-mode storage.
