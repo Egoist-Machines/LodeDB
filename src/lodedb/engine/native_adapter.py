@@ -395,7 +395,7 @@ class NativeCoreEngineHandle:
                 "patch_count": int(document["patch_count"]),
                 "nbytes": len(blob),
             }
-            for document, blob in zip(documents, blobs)
+            for document, blob in zip(documents, blobs, strict=True)
         ]
         return self._loads(
             self._engine.upsert_multivector(
@@ -622,6 +622,51 @@ class NativeCoreEngineHandle:
             top_k=top_k,
             filter=filter,
         )
+
+    def search_text_batch(
+        self,
+        index_id: str,
+        queries: Iterable[str],
+        mode: str,
+        query_embeddings: Any | None,
+        *,
+        top_k: int,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Batched text/hybrid/lexical search sharing one native vector scan.
+
+        ``query_embeddings`` is an ``(nq, dim)`` float array for vector/hybrid (the
+        SDK embeds in Python) and ``None`` for lexical. Returns one result payload
+        per query, in input order.
+        """
+
+        requires_embedding = mode in {"vector", "hybrid"}
+        plans = [
+            {
+                "query": str(query),
+                "mode": str(mode),
+                "query_tokens": [],
+                "requires_embedding": requires_embedding,
+            }
+            for query in queries
+        ]
+        plans_json = self._dumps(plans)
+        filter_json = None if filter is None else self._dumps(dict(filter))
+        if query_embeddings is not None:
+            import numpy as np
+
+            matrix = np.ascontiguousarray(query_embeddings, dtype=np.float32)
+            payload = self._engine.search_embedded_text_batch(
+                index_id, plans_json, matrix, int(top_k), filter_json
+            )
+        else:
+            payload = self._engine.search_embedded_text_batch(
+                index_id, plans_json, None, int(top_k), filter_json
+            )
+        result = json.loads(payload)
+        if not isinstance(result, list):
+            raise RuntimeError("native core returned a non-list batch text payload")
+        return [dict(item) for item in result]
 
     def _search_embedded_text_json(
         self,

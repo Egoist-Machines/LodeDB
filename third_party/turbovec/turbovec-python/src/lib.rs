@@ -1160,6 +1160,37 @@ impl PyCoreEngine {
         )
     }
 
+    fn search_embedded_text_batch(
+        &self,
+        index_id: &str,
+        query_plans_json: &str,
+        query_embeddings: Option<PyReadonlyArray2<f32>>,
+        top_k: usize,
+        filter_json: Option<&str>,
+    ) -> PyResult<String> {
+        let query_plans = native_from_json::<Vec<QueryPlan>>(query_plans_json)?;
+        let embeddings: Option<Vec<Vec<f32>>> = query_embeddings.map(|array| {
+            array
+                .as_array()
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect()
+        });
+        let filter = native_optional_value(filter_json)?;
+        native_to_json(
+            &self
+                .inner
+                .search_embedded_text_batch(
+                    index_id,
+                    &query_plans,
+                    embeddings.as_deref(),
+                    top_k,
+                    filter.as_ref(),
+                )
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
     fn stats(&self, index_id: &str) -> PyResult<String> {
         native_to_json(
             &self

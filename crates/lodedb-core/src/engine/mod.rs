@@ -858,6 +858,68 @@ impl CoreEngine {
         }
     }
 
+    /// Batched [`Self::search_embedded_text`] that shares one vector scan across the
+    /// whole query batch.
+    ///
+    /// All plans must share a mode (the SDK's `search_many` applies one mode to the
+    /// batch). `query_embeddings` holds one embedding per plan for `vector`/`hybrid`
+    /// (the SDK embeds in Python) and is `None` for `lexical`. The vector half is
+    /// scored with the batched, GPU-eligible scan; BM25 is ranked and fused per
+    /// query, so the result is identical to looping [`Self::search_embedded_text`].
+    pub fn search_embedded_text_batch(
+        &self,
+        index_id: &str,
+        query_plans: &[QueryPlan],
+        query_embeddings: Option<&[Vec<f32>]>,
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        if query_plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mode = query_plans[0].mode.clone();
+        if query_plans.iter().any(|plan| plan.mode != mode) {
+            return invalid("batch text query plans must share a mode");
+        }
+        let require_embeddings = || -> Result<&[Vec<f32>], CoreError> {
+            let embeddings = query_embeddings
+                .ok_or_else(|| invalid_err("query embeddings are required for this mode"))?;
+            if embeddings.len() != query_plans.len() {
+                return Err(invalid_err("query embeddings count does not match query plans"));
+            }
+            Ok(embeddings)
+        };
+        match mode.as_str() {
+            "vector" => self.query_vectors_batch(index_id, require_embeddings()?, top_k, filter),
+            "lexical" => query_plans
+                .iter()
+                .map(|plan| self.query_lexical_text(index_id, plan, top_k, filter))
+                .collect(),
+            "hybrid" => {
+                let embeddings = require_embeddings()?;
+                let pool = lexical_pool_width(top_k);
+                // One batched (GPU-eligible) vector scan for the whole batch, then
+                // per-query BM25 + RRF fusion, mirroring the single-query hybrid path.
+                let vector_batch = self.query_vectors_batch(index_id, embeddings, pool, filter)?;
+                query_plans
+                    .iter()
+                    .zip(vector_batch)
+                    .map(|(plan, vector_results)| {
+                        let lexical_results =
+                            self.query_lexical_text(index_id, plan, pool, filter)?;
+                        let hits =
+                            fuse_hybrid_hits(vector_results.hits, lexical_results.hits, top_k);
+                        Ok(CoreSearchResults {
+                            hits,
+                            total_considered: vector_results.total_considered,
+                        })
+                    })
+                    .collect()
+            }
+            _ => invalid("unsupported query mode"),
+        }
+    }
+
     fn query_lexical_text(
         &self,
         index_id: &str,

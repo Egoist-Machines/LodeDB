@@ -469,6 +469,76 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
 }
 
 #[test]
+fn search_embedded_text_batch_matches_looped_single() {
+    // The batched text/hybrid/lexical search must rank identically to looping the
+    // single-query path, so search_many can share one vector scan across the batch.
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("text", 8, 4).unwrap();
+    let plan = engine
+        .prepare_text_upsert(
+            "text",
+            &[
+                text_doc("doc-a", "fault code E1234", metadata(&[("topic", "ops")])),
+                text_doc("doc-b", "quarterly revenue report", metadata(&[("topic", "finance")])),
+                text_doc("doc-c", "revenue forecast E1234", metadata(&[("topic", "ops")])),
+            ],
+            true,
+            true,
+            100,
+        )
+        .unwrap();
+    engine
+        .apply_text_upsert(
+            &plan,
+            &[
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            1.0,
+        )
+        .unwrap();
+
+    let queries = ["E1234", "revenue"];
+    let embeddings = [
+        vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ];
+    for mode in ["vector", "hybrid", "lexical"] {
+        let plans: Vec<_> = queries
+            .iter()
+            .map(|query| engine.prepare_query_text(query, mode).unwrap())
+            .collect();
+        let embeds: Option<Vec<Vec<f32>>> =
+            if mode == "lexical" { None } else { Some(embeddings.to_vec()) };
+        let batch = engine
+            .search_embedded_text_batch("text", &plans, embeds.as_deref(), 3, None)
+            .unwrap();
+        assert_eq!(batch.len(), queries.len());
+        for (i, query_plan) in plans.iter().enumerate() {
+            let single_embed: Option<&[f32]> =
+                if mode == "lexical" { None } else { Some(embeddings[i].as_slice()) };
+            let single = engine
+                .search_embedded_text("text", query_plan, single_embed, 3, None)
+                .unwrap();
+            let batch_ids: Vec<&String> =
+                batch[i].hits.iter().map(|hit| &hit.document_id).collect();
+            let single_ids: Vec<&String> =
+                single.hits.iter().map(|hit| &hit.document_id).collect();
+            assert_eq!(batch_ids, single_ids, "mode {mode} query {i}: batch != single");
+        }
+    }
+    // Mixed modes in one batch are rejected (search_many applies a single mode).
+    let mixed = vec![
+        engine.prepare_query_text("E1234", "lexical").unwrap(),
+        engine.prepare_query_text("revenue", "hybrid").unwrap(),
+    ];
+    assert!(engine
+        .search_embedded_text_batch("text", &mixed, None, 3, None)
+        .is_err());
+}
+
+#[test]
 fn stale_text_plan_is_rejected() {
     let mut engine = CoreEngine::new_in_memory();
     engine.create_index("text", 8, 4).unwrap();
