@@ -541,7 +541,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lodedb-core"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "lodedb-gpu",
  "rustix",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "lodedb-gpu"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "cudarc",
 ]

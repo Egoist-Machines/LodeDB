@@ -15,7 +15,7 @@ mod tests {
 
     #[test]
     fn exposes_version_constants() {
-        assert_eq!(CORE_VERSION, "0.4.0");
+        assert_eq!(CORE_VERSION, "1.0.0");
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
         assert_eq!(NATIVE_CORE_ABI_VERSION, 1);
     }
