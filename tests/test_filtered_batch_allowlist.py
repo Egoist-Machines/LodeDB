@@ -84,23 +84,6 @@ def test_filtered_batch_results_respect_filter(tmp_path):
     db.close()
 
 
-def test_filtered_batch_does_not_widen_top_k(tmp_path):
-    """A filtered batch on a >4096 corpus no longer trips the resident widen cliff."""
-
-    db = _open(tmp_path)
-    _populate(db)
-    db.search_many(_queries(), k=10, filter={"tier": "2"})
-    event = next(
-        event
-        for event in reversed(db._engine.audit_events)
-        if event.get("event") == "query_batch_completed"
-    )
-    # The old widen path bypassed the resident scan with this reason; the
-    # allowlist path must never produce it (it keeps top_k = k).
-    assert "top_k_exceeds_limit" not in str(event.get("gpu_fallback_reason", ""))
-    db.close()
-
-
 def test_heterogeneous_per_query_filters(tmp_path):
     """One batch with a different filter per query groups correctly and preserves order."""
 

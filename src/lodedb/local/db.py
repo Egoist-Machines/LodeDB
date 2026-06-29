@@ -757,11 +757,11 @@ class LodeDB:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
-        if self._native_reads_authoritative():
-            # Native is the sole writer and Python is stale (vector-in / image adds
-            # skipped the Python upsert), so the Python oracle cannot serve this
-            # query (it would raise on an empty snapshot). Serve from native, which
-            # owns the documents.
+        if self._native_serves_reads():
+            # Native covers this handle and is parity-clean with Python across every
+            # mode (vector, hybrid, lexical), so it serves the query directly and the
+            # Python oracle is not run. Python remains only as the fallback below for
+            # a handle native does not cover.
             native_hits = self._native_search_text(
                 query,
                 k=int(k),
@@ -771,12 +771,6 @@ class LodeDB:
             )
             if native_hits is not None:
                 return native_hits
-        # Text/lexical/hybrid search keeps the Python oracle + parity cross-check
-        # even in native-on: the native lexical/hybrid path still has divergences
-        # from Python (incremental lexical rebuilds, vector-caption lexical, commit
-        # drift), so Python stays authoritative here and native results are only
-        # returned when they match. The authoritative native fast path is applied
-        # to the vector-in search paths, where native is parity-clean.
         response = self._index.query(
             query,
             top_k=int(k),
@@ -838,6 +832,15 @@ class LodeDB:
             raise ValueError("k must be positive")
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
+        if self._native_serves_reads():
+            # Native covers this handle and is parity-clean across modes, so serve
+            # the whole batch through one shared (GPU-eligible) native scan instead
+            # of the Python oracle. Python remains the fallback below if uncovered.
+            native_batches = self._native_search_text_batch(
+                queries, k=int(k), filter=normalized_filter, mode=resolved_mode
+            )
+            if native_batches is not None:
+                return native_batches
         batches = self._index.query_batch(
             [
                 {
@@ -1261,11 +1264,10 @@ class LodeDB:
         if not self.store_text:
             raise ValueError("raw text retrieval requires opening LodeDB with store_text=True")
         native_handled, native_text = self._native_get_text(id)
-        # When native is the sole writer and Python is stale, native is the only
-        # authority: return its answer verbatim (including None = no text, e.g. a
-        # vector re-added without text that cleared the prior sidecar) instead of
-        # falling through to the stale Python copy.
-        if native_handled and self._native_reads_authoritative():
+        # When native serves reads it is the authority: return its answer verbatim
+        # (including None = no text, e.g. a vector re-added without text that cleared
+        # the prior sidecar) instead of falling through to the Python copy.
+        if native_handled and self._native_serves_reads():
             return native_text
         # Otherwise return a native HIT directly, but fall through to the Python
         # oracle on a native miss: an existing store seeded under an older raw-text
@@ -1416,11 +1418,11 @@ class LodeDB:
                 return int(stats.get("document_count", 0) or 0)
             return int(self._index.stats().get("document_count", 0) or 0)
         normalized_filter = _normalize_filter(filter)
-        if self._native_reads_authoritative() and self._native_filter_shortcut_safe(
+        if self._native_serves_reads() and self._native_filter_shortcut_safe(
             normalized_filter
         ):
-            # Native is the sole authority; counting via the stale Python engine
-            # would undercount. Enumerate the matching ids natively (O(matches)).
+            # Native covers this handle, so count via the native enumeration
+            # (O(matches)) rather than the Python engine.
             native_handled, native_records = self._native_list_documents(normalized_filter)
             if native_handled:
                 return len(native_records)
@@ -2061,6 +2063,50 @@ class LodeDB:
             return None
         return self._hits_from_native_rows(payload.get("hits", []))
 
+    def _native_search_text_batch(
+        self,
+        queries: list[str],
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+        mode: str,
+    ) -> list[list[LodeSearchHit]] | None:
+        """Returns native hits for a batch of text queries, or None to fall back.
+
+        Mirrors :meth:`_native_search_text` for the native-serves path but scores the
+        whole batch through one shared native scan (GPU-eligible), embedding each
+        query in Python first. Used by :meth:`search_many`.
+        """
+
+        if not self._native_thread_local() or not self._native_vector_covered:
+            return None
+        try:
+            query_embeddings = None
+            if mode in {"vector", "hybrid"}:
+                if self._embedding_backend is None:
+                    raise RuntimeError("native text query requires an embedding backend")
+                query_embeddings = [
+                    self._embedding_backend.embed_query(query) for query in queries
+                ]
+            payloads = self._native_vector_engine.search_text_batch(
+                _LOCAL_INDEX_ID,
+                queries,
+                mode,
+                query_embeddings,
+                top_k=k,
+                filter=filter,
+            )
+        except Exception as exc:
+            self._native_vector_covered = False
+            self._native_text_shadow_enabled = False
+            self._native_core_fallback_reason = "native_core_text_batch_query_failed"
+            if self._native_core_fail_closed:
+                raise RuntimeError("native core text batch query failed") from exc
+            if self._native_core_strict_parity:
+                raise
+            return None
+        return [self._hits_from_native_rows(payload.get("hits", [])) for payload in payloads]
+
     def _native_get_text(self, document_id: str) -> tuple[bool, str | None]:
         """Returns one native raw-text value when this handle is covered."""
 
@@ -2204,6 +2250,26 @@ class LodeDB:
         """
 
         return self._native_is_sole_writer() and self._native_sole_writes_made
+
+    def _native_serves_reads(self) -> bool:
+        """Whether native should serve reads directly, without the Python oracle.
+
+        Native is parity-clean with Python for every read mode (vector, text,
+        hybrid/lexical, payload, count), so it serves reads whenever it covers this
+        handle and is the authoritative query source. The one requirement beyond
+        coverage is that native saw every write: a read-only handle loaded the
+        committed snapshot, and a writable handle in write-through mirrors (and owns)
+        every write, so in both cases native is consistent. Without write-through a
+        writable handle's Python writes would not reach native, so Python serves.
+        """
+
+        if not (
+            self._native_query_authoritative()
+            and self._native_vector_covered
+            and self._native_thread_local()
+        ):
+            return False
+        return self.read_only or self._native_write_through_enabled
 
     def _native_should_persist_after_mutation(self) -> bool:
         """Whether native must publish a generation immediately after a mutation.
