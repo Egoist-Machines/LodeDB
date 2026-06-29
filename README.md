@@ -16,9 +16,9 @@ documents, per framework default:
 | vs the framework's default store | LangChain `InMemoryVectorStore` | LlamaIndex `SimpleVectorStore` | mem0 Qdrant |
 |---|---|---|---|
 | On-disk footprint | **7.4× smaller** (27 vs 199 MB) | **5.4× smaller** (27 vs 145 MB) | **4.6× smaller** (15 vs 70 MB) |
-| Single-query p50 (CPU) | **~660× faster** (0.36 vs 241 ms) | **~800× faster** (0.36 vs 288 ms) | **~44× faster** (0.74 vs 33 ms) |
-| Batched retrieval, 64 (GPU) | **~2,490×** (10,444 vs ~4 qps) | **~2,490×** (8,725 vs ~4 qps) | **~117×** (3,779 vs 32 qps) |
-| Durable add of one memory | **~29,000× faster** (0.24 ms vs 7.1 s) | **~69,000× faster** (0.22 ms vs 15.4 s) | 0.8 vs 0.6 ms (both sub-ms) |
+| Single-query p50 (CPU) | **~540× faster** (0.43 vs 234 ms) | **~570× faster** (0.43 vs 247 ms) | **~47× faster** (0.56 vs 27 ms) |
+| Batched retrieval, 64 (GPU) | **~2,630×** (11,650 vs ~4 qps) | **~2,810×** (11,326 vs ~4 qps) | **~139×** (5,052 vs 36 qps) |
+| Durable add of one memory | **~24,000× faster** (0.27 ms vs 6.5 s) | **~55,000× faster** (0.25 ms vs 13.9 s) | 0.27 vs 0.41 ms (both sub-ms) |
 
 Among embedded stores, LodeDB has the smallest footprint and the fastest single-query and batched
 search, and its durable add leads the fastest lazy-append stores
@@ -26,12 +26,12 @@ search, and its durable add leads the fastest lazy-append stores
 
 | **embedded stores** | **durable add p50** | **single-query p50** | **batch-64/query** | **memory footprint** |
 | --- | ---: | ---: | ---: | ---: |
-| **LodeDB** | **0.24 ms** | **0.36 ms** | **0.10 ms** | **27 MB** |
-| sqlite-vec | 0.47 ms | 24.8 ms | 23.7 ms | 96 MB |
-| qdrant | 0.52 ms | 25.1 ms | 26.7 ms | 81 MB |
-| pgvector | 2.07 ms | 49.5 ms | 41.7 ms | 48 MB |
-| lancedb | 3.42 ms | 11.2 ms | 10.7 ms | 35 MB |
-| chroma | 7.03 ms | 3.79 ms | 3.83 ms | 144 MB |
+| **LodeDB** | **0.27 ms** | **0.43 ms** | **0.09 ms** | **27 MB** |
+| sqlite-vec | 0.40 ms | 29.3 ms | 26.7 ms | 96 MB |
+| qdrant | 0.46 ms | 14.3 ms | 14.5 ms | 81 MB |
+| pgvector | 2.44 ms | 34.2 ms | 32.4 ms | 48 MB |
+| lancedb | 3.42 ms | 10.6 ms | 10.3 ms | 35 MB |
+| chroma | 5.96 ms | 3.11 ms | 3.12 ms | 144 MB |
 
 [Full benchmark, all backends
 (FAISS, Chroma, Qdrant, LanceDB, sqlite-vec, pgvector), and method.](benchmarks/memory_integrations)
