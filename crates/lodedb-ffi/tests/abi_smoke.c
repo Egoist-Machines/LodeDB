@@ -217,6 +217,35 @@ int main(void) {
   assert(gone != 0 && strcmp(gone->data, "null") == 0);
   lodedb_owned_string_free(gone);
 
+  // Batched vector search returns one CoreSearchResults per query.
+  LodeOwnedString *batch = 0;
+  assert(lodedb_engine_query_vectors_batch_json(
+             engine, sv("default"),
+             sv("[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0]]"), 1, sv(""),
+             0, &batch, &error) == LODE_OK);
+  assert(batch != 0);
+  lodedb_owned_string_free(batch);
+
+  // Late interaction: upsert a float32 multi-vector doc and MaxSim-query it.
+  float mv_vectors[8] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float mv_patches[16] = {1.0f, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f, 0, 0, 0, 0, 0, 0};
+  const char *mv_sidecar =
+      "[{\"document_id\":\"mv-doc\",\"metadata\":{\"kind\":\"li\"},\"dtype\":\"float32\","
+      "\"patch_count\":2,\"nbytes\":64}]";
+  LodeOwnedString *mv_upsert = 0;
+  assert(lodedb_engine_upsert_multivector_json(engine, sv("default"), mv_vectors, 1, 8,
+                                               (const uint8_t *)mv_patches, sizeof(mv_patches),
+                                               sv(mv_sidecar), &mv_upsert, &error) == LODE_OK);
+  assert(mv_upsert != 0);
+  lodedb_owned_string_free(mv_upsert);
+
+  float mv_query[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+  LodeOwnedString *mv_hits = 0;
+  assert(lodedb_engine_query_multivector_json(engine, sv("default"), mv_query, 8, 1, 1, sv(""), 0,
+                                              &mv_hits, &error) == LODE_OK);
+  assert(mv_hits != 0 && strstr(mv_hits->data, "\"document_id\":\"mv-doc\"") != 0);
+  lodedb_owned_string_free(mv_hits);
+
   // persist/close on an in-memory engine are no-ops that still return OK.
   assert(lodedb_engine_persist(engine, &error) == LODE_OK);
   assert(lodedb_engine_close(engine, &error) == LODE_OK);

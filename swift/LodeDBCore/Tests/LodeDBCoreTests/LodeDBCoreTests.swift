@@ -256,6 +256,67 @@ import Testing
     #expect(!stats.nativeCoreVersion.isEmpty)
 }
 
+@Test func mongoStyleFiltersResolveNatively() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector(unitVector(0), id: "a", metadata: ["topic": "ml", "year": "2020"])
+    try db.addVector(unitVector(1), id: "b", metadata: ["topic": "ops", "year": "2018"])
+    try db.addVector(unitVector(2), id: "c", metadata: ["topic": "ml", "year": "2022"])
+
+    func ids(_ predicate: FilterPredicate) throws -> Set<String> {
+        Set(try db.listDocuments(filter: MetadataFilter(predicate: predicate)).map(\.id))
+    }
+    #expect(try ids(.greaterThan("year", "2019")) == ["a", "c"])
+    #expect(try ids(.inSet("topic", ["ops"])) == ["b"])
+    #expect(try ids(.or([.equals("topic", "ops"), .greaterThanOrEqual("year", "2022")])) == ["b", "c"])
+    #expect(try ids(.not(.equals("topic", "ml"))) == ["b"])
+    #expect(try ids(.and([.equals("topic", "ml"), .lessThan("year", "2021")])) == ["a"])
+    #expect(try ids(.exists("year", true)) == ["a", "b", "c"])
+
+    let allowlisted = try db.listDocuments(
+        filter: MetadataFilter(documentIDs: ["a", "b"], predicate: .equals("topic", "ml")))
+    #expect(Set(allowlisted.map(\.id)) == ["a"])
+}
+
+@Test func searchManyReturnsPerQueryResults() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector(unitVector(0), id: "a")
+    try db.addVector(unitVector(1), id: "b")
+    let results = try db.searchMany(vectors: [unitVector(0), unitVector(1)], k: 1)
+    #expect(results.count == 2)
+    #expect(results[0].first?.id == "a")
+    #expect(results[1].first?.id == "b")
+}
+
+@Test func searchManyTextsRunLexicalPerQuery() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    let embedder = HashTestEmbedder(dimension: 8)
+    try db.addText("Beta incident report for serial AX-42.", id: "doc-beta", embedder: embedder)
+    try db.addText("Gamma handbook on local recovery.", id: "doc-gamma", embedder: embedder)
+    let results = try db.searchMany(texts: ["serial AX-42", "local recovery"], k: 1, mode: .lexical)
+    #expect(results.count == 2)
+    #expect(results[0].first?.id == "doc-beta")
+    #expect(results[1].first?.id == "doc-gamma")
+}
+
+@Test func lateInteractionMaxSimRanksByPatchSimilarity() throws {
+    let index = try LodeLateInteractionIndex(vectorDimension: 8)
+    try index.addDocument(id: "doc-x", patches: [unitVector(0), unitVector(1)], metadata: ["k": "x"])
+    try index.addDocument(id: "doc-y", patches: [unitVector(2), unitVector(3)])
+
+    let hits = try index.search(queryPatches: [unitVector(0), unitVector(1)], k: 2)
+    #expect(hits.first?.id == "doc-x")
+
+    let filtered = try index.search(
+        queryPatches: [unitVector(0)], k: 2, filter: MetadataFilter(documentIDs: ["doc-y"]))
+    #expect(filtered.map(\.id) == ["doc-y"])
+}
+
+private func unitVector(_ index: Int, dimension: Int = 8) -> [Float] {
+    var vector = Array(repeating: Float(0), count: dimension)
+    vector[index] = 1
+    return vector
+}
+
 @Test func concurrentSearchAndAddDoNotRaceTheNativeCore() throws {
     let db = try LodeDB(vectorDimension: 8)
     for index in 0..<8 {

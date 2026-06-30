@@ -224,6 +224,48 @@ uint32_t lodedb_engine_index_ids_json(
     const LodeEngine *engine,
     LodeOwnedString **out,
     LodeError **error);
+uint32_t lodedb_engine_query_vectors_batch_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView queries_json,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_search_embedded_text_batch_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView query_plans_json,
+    LodeStringView query_embeddings_json,
+    uint8_t has_query_embeddings,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_query_multivector_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    const float *query,
+    uintptr_t query_len,
+    uintptr_t n_query,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_upsert_multivector_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    const float *vectors,
+    uintptr_t rows,
+    uintptr_t dim,
+    const uint8_t *patch_bytes,
+    uintptr_t patch_bytes_len,
+    LodeStringView sidecar_json,
+    LodeOwnedString **out,
+    LodeError **error);
 
 #ifdef __cplusplus
 }

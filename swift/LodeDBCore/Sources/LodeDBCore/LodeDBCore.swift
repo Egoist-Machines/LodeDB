@@ -260,6 +260,65 @@ public final class LodeDB {
         }
     }
 
+    /// Batched vector search: one result list per query vector, in input order.
+    public func searchMany(vectors: [[Float]], k: Int, filter: MetadataFilter = MetadataFilter()) throws -> [[SearchHit]] {
+        try lockedOpen {
+            guard k > 0 else {
+                throw LodeDBError.invalidArgument("k must be positive")
+            }
+            guard vectors.allSatisfy({ $0.count == vectorDimension }) else {
+                throw LodeDBError.invalidArgument("query dimension does not match index")
+            }
+            let json = try engine.queryVectorsBatchJSON(
+                queriesJSON: try encodeJSON(vectors),
+                k: k,
+                filterJSON: filter.encodedJSON
+            )
+            return try decodeJSON([NativeSearchResultsJSON].self, from: json).map(\.searchHits)
+        }
+    }
+
+    /// Batched text search: one result list per query text, in input order.
+    public func searchMany(
+        texts: [String],
+        k: Int,
+        mode: RetrievalMode = .vector,
+        embedder: LodeEmbedder? = nil,
+        filter: MetadataFilter = MetadataFilter()
+    ) throws -> [[SearchHit]] {
+        try lockedOpen {
+            guard k > 0 else {
+                throw LodeDBError.invalidArgument("k must be positive")
+            }
+            let plans = try texts.map { try engine.prepareQueryTextJSON($0, mode: mode.rawValue) }
+            // Each plan is a JSON object; concatenating them is a valid JSON array.
+            let plansJSON = "[" + plans.joined(separator: ",") + "]"
+            let embeddingsJSON: String?
+            if mode == .vector || mode == .hybrid {
+                guard let embedder else {
+                    throw LodeDBError.invalidArgument("embedder is required for vector search")
+                }
+                guard embedder.dimension == vectorDimension else {
+                    throw LodeDBError.invalidArgument("embedder dimension does not match index")
+                }
+                let embeddings = try embedder.embed(texts: texts)
+                guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
+                    throw LodeDBError.invalidArgument("embedder returned an invalid query embedding")
+                }
+                embeddingsJSON = try encodeJSON(embeddings)
+            } else {
+                embeddingsJSON = nil
+            }
+            let json = try engine.searchEmbeddedTextBatchJSON(
+                queryPlansJSON: plansJSON,
+                queryEmbeddingsJSON: embeddingsJSON,
+                k: k,
+                filterJSON: filter.encodedJSON
+            )
+            return try decodeJSON([NativeSearchResultsJSON].self, from: json).map(\.searchHits)
+        }
+    }
+
     // MARK: - CRUD / retrieval
 
     /// Deletes a document by id. Returns true if a document was removed.
@@ -362,10 +421,7 @@ public final class LodeDB {
     }
 
     private func decodeSearchHits(_ resultsJSON: String) throws -> [SearchHit] {
-        let results = try decodeJSON(NativeSearchResultsJSON.self, from: resultsJSON)
-        return results.hits.map { hit in
-            SearchHit(id: hit.documentID, chunkID: hit.chunkID, score: hit.score, metadata: hit.metadata)
-        }
+        try decodeJSON(NativeSearchResultsJSON.self, from: resultsJSON).searchHits
     }
 }
 
@@ -452,11 +508,15 @@ private struct NativePlanEmbeddingChunkJSON: Decodable {
     let text: String
 }
 
-private struct NativeSearchResultsJSON: Decodable {
+struct NativeSearchResultsJSON: Decodable {
     let hits: [NativeSearchHitJSON]
+
+    var searchHits: [SearchHit] {
+        hits.map { SearchHit(id: $0.documentID, chunkID: $0.chunkID, score: $0.score, metadata: $0.metadata) }
+    }
 }
 
-private struct NativeSearchHitJSON: Decodable {
+struct NativeSearchHitJSON: Decodable {
     let documentID: String
     let chunkID: String
     let score: Float

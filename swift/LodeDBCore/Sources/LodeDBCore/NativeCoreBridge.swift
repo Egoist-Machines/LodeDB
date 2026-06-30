@@ -184,6 +184,78 @@ final class NativeEngine {
         }
     }
 
+    func queryVectorsBatchJSON(queriesJSON: String, k: Int, filterJSON: String?) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(queriesJSON) { queriesView in
+                    withStringView(filterJSON ?? "") { filterView in
+                        lodedb_engine_query_vectors_batch_json(
+                            handle, indexView, queriesView, UInt(k), filterView,
+                            filterJSON == nil ? 0 : 1, out, error)
+                    }
+                }
+            }
+        }
+    }
+
+    func searchEmbeddedTextBatchJSON(
+        queryPlansJSON: String,
+        queryEmbeddingsJSON: String?,
+        k: Int,
+        filterJSON: String?
+    ) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(queryPlansJSON) { plansView in
+                    withStringView(queryEmbeddingsJSON ?? "") { embeddingsView in
+                        withStringView(filterJSON ?? "") { filterView in
+                            lodedb_engine_search_embedded_text_batch_json(
+                                handle, indexView, plansView, embeddingsView,
+                                queryEmbeddingsJSON == nil ? 0 : 1, UInt(k), filterView,
+                                filterJSON == nil ? 0 : 1, out, error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func queryMultivectorJSON(query: [Float], nQuery: Int, k: Int, filterJSON: String?) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                query.withUnsafeBufferPointer { queryBuffer in
+                    withStringView(filterJSON ?? "") { filterView in
+                        lodedb_engine_query_multivector_json(
+                            handle, indexView, queryBuffer.baseAddress, UInt(query.count),
+                            UInt(nQuery), UInt(k), filterView, filterJSON == nil ? 0 : 1, out, error)
+                    }
+                }
+            }
+        }
+    }
+
+    func upsertMultivectorJSON(
+        vectors: [Float],
+        rows: Int,
+        dim: Int,
+        patchBytes: [UInt8],
+        sidecarJSON: String
+    ) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                vectors.withUnsafeBufferPointer { vectorBuffer in
+                    patchBytes.withUnsafeBufferPointer { patchBuffer in
+                        withStringView(sidecarJSON) { sidecarView in
+                            lodedb_engine_upsert_multivector_json(
+                                handle, indexView, vectorBuffer.baseAddress, UInt(rows), UInt(dim),
+                                patchBuffer.baseAddress, UInt(patchBytes.count), sidecarView, out, error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - CRUD / introspection
 
     func deleteDocumentsJSON(_ idsJSON: String) throws -> String {

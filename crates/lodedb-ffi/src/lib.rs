@@ -862,6 +862,187 @@ pub unsafe extern "C" fn lodedb_engine_index_ids_json(
     })
 }
 
+// ---- Batch search + late interaction (Phase 2) ----
+
+/// Batched vector search. `queries_json` is a JSON `[[f32]]`; returns a JSON array
+/// of `CoreSearchResults`, one per query, to release with `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `queries_json`, `out`, and any present filter must be valid
+/// for the duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_query_vectors_batch_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    queries_json: LodeStringView,
+    top_k: usize,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let queries = read_json_view::<Vec<Vec<f32>>>(queries_json)?;
+        let filter = optional_filter(filter_json, has_filter)?;
+        let results = engine.query_vectors_batch(&index_id, &queries, top_k, filter.as_ref())?;
+        write_owned_json(out, &results)
+    })
+}
+
+/// Batched text search. `query_plans_json` is a JSON `[QueryPlan]`; when
+/// `has_query_embeddings` is set, `query_embeddings_json` is a JSON `[[f32]]` aligned
+/// to the plans. Returns a JSON array of `CoreSearchResults`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `query_plans_json`, `out`, and any present optional views
+/// must be valid for the duration of the call. String views must contain valid UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_search_embedded_text_batch_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    query_plans_json: LodeStringView,
+    query_embeddings_json: LodeStringView,
+    has_query_embeddings: u8,
+    top_k: usize,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let query_plans = read_json_view::<Vec<QueryPlan>>(query_plans_json)?;
+        let query_embeddings = if has_query_embeddings == 0 {
+            None
+        } else {
+            Some(read_json_view::<Vec<Vec<f32>>>(query_embeddings_json)?)
+        };
+        let filter = optional_filter(filter_json, has_filter)?;
+        let results = engine.search_embedded_text_batch(
+            &index_id,
+            &query_plans,
+            query_embeddings.as_deref(),
+            top_k,
+            filter.as_ref(),
+        )?;
+        write_owned_json(out, &results)
+    })
+}
+
+/// Late-interaction MaxSim query. `query` is a contiguous `(n_query * dim)` f32
+/// matrix (row-major, L2-normalized). Returns `CoreSearchResults` JSON.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `out`, and any present filter must be valid for the call.
+/// `query` must point to `query_len` initialized f32 values (or be null with len 0).
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_query_multivector_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    query: *const c_float,
+    query_len: usize,
+    n_query: usize,
+    top_k: usize,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let query = read_f32_slice(query, query_len)?;
+        let filter = optional_filter(filter_json, has_filter)?;
+        let results = engine.query_multivector(&index_id, query, n_query, top_k, filter.as_ref())?;
+        write_owned_json(out, &results)
+    })
+}
+
+/// Sidecar describing one document's stored multi-vector patch matrix, matching the
+/// PyO3 multivector upsert contract.
+#[derive(serde::Deserialize)]
+struct MultiVecSidecar {
+    document_id: String,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+    dtype: String,
+    patch_count: usize,
+    nbytes: usize,
+}
+
+/// Upserts multi-vector (late-interaction) documents. `vectors` is a contiguous
+/// `(rows * dim)` f32 matrix of per-document anchor vectors; `patch_bytes` is the
+/// concatenation of each document's encoded patch matrix (split by the sidecar
+/// `nbytes`); `sidecar_json` is a JSON array of `{document_id, metadata?, dtype,
+/// patch_count, nbytes}`. Returns a `CoreMutationResult` JSON.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `sidecar_json`, and `out` must be valid for the call.
+/// `vectors` / `patch_bytes` must point to the stated number of elements (or be null
+/// with length 0). String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_upsert_multivector_json(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    vectors: *const c_float,
+    rows: usize,
+    dim: usize,
+    patch_bytes: *const u8,
+    patch_bytes_len: usize,
+    sidecar_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let vectors = read_f32_slice(vectors, rows.saturating_mul(dim))?;
+        let all_bytes = read_u8_slice(patch_bytes, patch_bytes_len)?;
+        let sidecars = read_json_view::<Vec<MultiVecSidecar>>(sidecar_json)?;
+        if sidecars.len() != rows {
+            return invalid("sidecar count does not match vector rows");
+        }
+        if rows > 0 && dim == 0 {
+            return invalid("vectors must have a non-zero dimension");
+        }
+        let total: usize = sidecars.iter().map(|sidecar| sidecar.nbytes).sum();
+        if total != all_bytes.len() {
+            return invalid("patch_bytes length does not match sidecar nbytes sum");
+        }
+        let mut offset = 0usize;
+        let mut documents: Vec<CoreVectorDocument> = Vec::with_capacity(rows);
+        for (sidecar, vector) in sidecars.into_iter().zip(vectors.chunks(dim.max(1))) {
+            let stop = offset + sidecar.nbytes;
+            let patch_matrix = lodedb_core::storage::multivec_store::MultiVecRecord {
+                dtype: sidecar.dtype,
+                patch_count: sidecar.patch_count,
+                bytes: all_bytes[offset..stop].to_vec(),
+            };
+            offset = stop;
+            documents.push(CoreVectorDocument {
+                document_id: sidecar.document_id,
+                vector: vector.to_vec(),
+                metadata: sidecar.metadata,
+                text: None,
+                patch_matrix: Some(patch_matrix),
+            });
+        }
+        let result = engine.upsert_vectors(&index_id, &documents)?;
+        write_owned_json(out, &result)
+    })
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -978,6 +1159,40 @@ fn read_f32_slice<'a>(data: *const c_float, len: usize) -> Result<&'a [f32], Cor
         return invalid("f32 data pointer is null");
     }
     Ok(unsafe { slice::from_raw_parts(data, len) })
+}
+
+fn read_u8_slice<'a>(data: *const u8, len: usize) -> Result<&'a [u8], CoreError> {
+    if data.is_null() && len > 0 {
+        return invalid("byte data pointer is null");
+    }
+    Ok(unsafe { slice::from_raw_parts(data, len) })
+}
+
+fn optional_filter(
+    filter_json: LodeStringView,
+    has_filter: u8,
+) -> Result<Option<serde_json::Value>, CoreError> {
+    if has_filter == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(read_json_view::<serde_json::Value>(filter_json)?))
+    }
+}
+
+/// Serializes `value` to JSON and writes it to the owned-string out-parameter.
+///
+/// # Safety
+///
+/// `out` must be a valid writable pointer (callers pass `require_out`-checked `out`s).
+fn write_owned_json<T: serde::Serialize>(
+    out: *mut *mut LodeOwnedString,
+    value: &T,
+) -> Result<(), CoreError> {
+    let result = owned_json(value)?;
+    unsafe {
+        *out = Box::into_raw(result);
+    }
+    Ok(())
 }
 
 fn read_vector_documents(
