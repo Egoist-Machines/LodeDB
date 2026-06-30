@@ -26,8 +26,14 @@ final class NativeEngine {
 
     // MARK: - Construction
 
-    /// Creates an empty in-memory engine and a vector index on it.
-    static func inMemory(vectorDimension: Int, bitWidth: Int = 4, indexID: String = "default") throws -> NativeEngine {
+    /// Creates an empty in-memory engine and a vector index on it (optionally bound
+    /// to a model identity).
+    static func inMemory(
+        vectorDimension: Int,
+        bitWidth: Int = 4,
+        indexID: String = "default",
+        model: String? = nil
+    ) throws -> NativeEngine {
         try requireABI()
         var engine: OpaquePointer?
         var error: UnsafeMutablePointer<LodeError>?
@@ -36,7 +42,7 @@ final class NativeEngine {
             throw LodeDBError.internalError("native core did not return an engine")
         }
         let native = NativeEngine(handle: engine, indexID: indexID)
-        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth)
+        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth, model: model)
         return native
     }
 
@@ -66,10 +72,22 @@ final class NativeEngine {
         return NativeEngine(handle: engine, indexID: indexID)
     }
 
-    func createIndex(vectorDimension: Int, bitWidth: Int = 4) throws {
+    /// Creates the index. When `model` is non-nil the index is bound to that model
+    /// identity (for the reopen-time embedder guard); otherwise native defaults apply.
+    func createIndex(vectorDimension: Int, bitWidth: Int = 4, model: String? = nil) throws {
         var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(indexID) {
-            lodedb_engine_create_index(handle, $0, UInt(vectorDimension), UInt(bitWidth), &error)
+        let status: UInt32
+        if let model {
+            status = withStringView(indexID) { indexView in
+                withStringView(model) { modelView in
+                    lodedb_engine_create_index_with_model(
+                        handle, indexView, UInt(vectorDimension), UInt(bitWidth), modelView, &error)
+                }
+            }
+        } else {
+            status = withStringView(indexID) { indexView in
+                lodedb_engine_create_index(handle, indexView, UInt(vectorDimension), UInt(bitWidth), &error)
+            }
         }
         try Self.check(status, error: error)
     }

@@ -256,6 +256,32 @@ import Testing
     #expect(!stats.nativeCoreVersion.isEmpty)
 }
 
+@Test func reopenWithDifferentModelIdentityIsRejected() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    do {
+        let db = try LodeDB(path: dir, vectorDimension: 8, modelIdentity: "model-a")
+        try db.addVector(unitVector(0), id: "x")
+        try db.persist()
+        try db.close()
+    }
+
+    // Same dimension but a different model identity must fail closed, writable or read-only.
+    #expect(throws: LodeDBError.self) {
+        _ = try LodeDB(path: dir, vectorDimension: 8, modelIdentity: "model-b")
+    }
+    #expect(throws: LodeDBError.self) {
+        _ = try LodeDB.openReadOnly(path: dir, modelIdentity: "model-b")
+    }
+
+    // The matching identity reopens and reports the persisted model.
+    let reopened = try LodeDB.openReadOnly(path: dir, modelIdentity: "model-a")
+    #expect(reopened.count == 1)
+    #expect(try reopened.stats().model == "model-a")
+}
+
 @Test func mongoStyleFiltersResolveNatively() throws {
     let db = try LodeDB(vectorDimension: 8)
     try db.addVector(unitVector(0), id: "a", metadata: ["topic": "ml", "year": "2020"])

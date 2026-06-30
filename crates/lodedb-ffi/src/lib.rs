@@ -2,7 +2,9 @@
 
 use lodedb_core::engine::CoreEngine;
 use lodedb_core::engine::{IngestPlan, QueryPlan};
-use lodedb_core::types::{CoreDocument, CoreMetadata, CoreOpenOptions, CoreVectorDocument};
+use lodedb_core::types::{
+    CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreOpenOptions, CoreVectorDocument,
+};
 use lodedb_core::{CoreError, CoreErrorCode};
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
@@ -213,6 +215,35 @@ pub unsafe extern "C" fn lodedb_engine_create_index(
     ffi_result(error, || {
         let engine = engine_mut(engine)?;
         engine.create_index(read_string(index_id)?, vector_dim, bit_width)
+    })
+}
+
+/// Creates a vector index bound to a model identity.
+///
+/// Like `lodedb_engine_create_index` but records `model` as the index's persisted
+/// model identity (the rest of the metadata uses the native defaults), so a binding
+/// can reject reopening a store with a different same-dimension embedding model.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, and `model` must be valid for the duration of the call.
+/// String views must contain valid UTF-8 bytes. `error` may be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_create_index_with_model(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    vector_dim: usize,
+    bit_width: usize,
+    model: LodeStringView,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let model = read_string(model)?;
+        let mut options = CoreIndexCreateOptions::native_default(index_id, vector_dim, bit_width);
+        options.model = model;
+        engine.create_index_with_options(options)
     })
 }
 

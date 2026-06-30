@@ -3,6 +3,16 @@ import Foundation
 public protocol LodeEmbedder {
     var dimension: Int { get }
     func embed(texts: [String]) throws -> [[Float]]
+    /// Embeds texts for a specific role. Embedders with asymmetric query/document
+    /// prefixes (e.g. BGE) must honor this; the default ignores the role. `LodeDB`
+    /// requests `.document` when ingesting and `.query` when searching.
+    func embed(texts: [String], role: EmbeddingRole) throws -> [[Float]]
+}
+
+public extension LodeEmbedder {
+    func embed(texts: [String], role: EmbeddingRole) throws -> [[Float]] {
+        try embed(texts: texts)
+    }
 }
 
 public enum RetrievalMode: String, Sendable {
@@ -28,17 +38,26 @@ public final class LodeDB {
     private var closed = false
 
     /// Creates an ephemeral in-memory store (nothing is read from or written to disk).
-    public init(vectorDimension: Int) throws {
+    ///
+    /// Pass `modelIdentity` (e.g. an embedder's `modelIdentity`) to bind the index to
+    /// a model so a later durable reopen can reject a different same-dimension model.
+    public init(vectorDimension: Int, modelIdentity: String? = nil) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
         self.vectorDimension = vectorDimension
-        self.engine = try NativeEngine.inMemory(vectorDimension: vectorDimension)
+        self.engine = try NativeEngine.inMemory(vectorDimension: vectorDimension, model: modelIdentity)
     }
 
     /// Opens (or creates) a durable, on-disk store at `path`. If the store already
-    /// holds an index, its vector dimension must match `vectorDimension`.
-    public init(path: URL, vectorDimension: Int, options: LodeStoreOptions = LodeStoreOptions()) throws {
+    /// holds an index, its vector dimension must match `vectorDimension`, and (when
+    /// `modelIdentity` is given) its persisted model identity must match too.
+    public init(
+        path: URL,
+        vectorDimension: Int,
+        options: LodeStoreOptions = LodeStoreOptions(),
+        modelIdentity: String? = nil
+    ) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
@@ -47,16 +66,13 @@ public final class LodeDB {
         }
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: false)
         let engine = try NativeEngine.open(optionsJSON: optionsJSON)
-        // Create the index on a fresh store, or verify the dimension of an existing one.
+        // Create the index on a fresh store, or verify the identity of an existing one.
         let existing = try decodeJSON([String].self, from: engine.indexIdsJSON())
         if existing.contains(engine.indexID) {
             let stats = CollectionStats(try decodeJSON(CoreEngineStatsJSON.self, from: engine.statsJSON()))
-            guard stats.vectorDimension == vectorDimension else {
-                throw LodeDBError.invalidArgument(
-                    "existing index dimension \(stats.vectorDimension) does not match requested \(vectorDimension)")
-            }
+            try LodeDB.validate(stats: stats, vectorDimension: vectorDimension, modelIdentity: modelIdentity)
         } else {
-            try engine.createIndex(vectorDimension: vectorDimension)
+            try engine.createIndex(vectorDimension: vectorDimension, model: modelIdentity)
         }
         self.vectorDimension = vectorDimension
         self.engine = engine
@@ -68,8 +84,13 @@ public final class LodeDB {
     }
 
     /// Opens a persisted store read-only (a lock-free generation snapshot). WAL tails
-    /// are ignored; the snapshot reflects the last committed generation.
-    public static func openReadOnly(path: URL, options: LodeStoreOptions = LodeStoreOptions()) throws -> LodeDB {
+    /// are ignored; the snapshot reflects the last committed generation. When
+    /// `modelIdentity` is given, the store's persisted model must match.
+    public static func openReadOnly(
+        path: URL,
+        options: LodeStoreOptions = LodeStoreOptions(),
+        modelIdentity: String? = nil
+    ) throws -> LodeDB {
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: true)
         let engine = try NativeEngine.openReadOnly(optionsJSON: optionsJSON)
         let ids = try decodeJSON([String].self, from: engine.indexIdsJSON())
@@ -78,7 +99,23 @@ public final class LodeDB {
         }
         engine.indexID = indexID
         let stats = CollectionStats(try decodeJSON(CoreEngineStatsJSON.self, from: engine.statsJSON()))
+        if let modelIdentity {
+            try validate(stats: stats, vectorDimension: stats.vectorDimension, modelIdentity: modelIdentity)
+        }
         return LodeDB(engine: engine, vectorDimension: stats.vectorDimension)
+    }
+
+    /// Validates a reopened index against the requested dimension and (optionally)
+    /// model identity, so a same-dimension different-model store fails closed.
+    private static func validate(stats: CollectionStats, vectorDimension: Int, modelIdentity: String?) throws {
+        guard stats.vectorDimension == vectorDimension else {
+            throw LodeDBError.invalidArgument(
+                "existing index dimension \(stats.vectorDimension) does not match requested \(vectorDimension)")
+        }
+        if let modelIdentity, stats.model != modelIdentity {
+            throw LodeDBError.invalidArgument(
+                "store model '\(stats.model)' does not match expected model '\(modelIdentity)'")
+        }
     }
 
     // MARK: - Stats / enumeration
@@ -138,7 +175,7 @@ public final class LodeDB {
                 chunkCharacterLimit: chunkCharacterLimit
             )
             let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
-            let embeddings = try embedder.embed(texts: plan.chunksToEmbed.map(\.text))
+            let embeddings = try embedder.embed(texts: plan.chunksToEmbed.map(\.text), role: .document)
             guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
                 throw LodeDBError.invalidArgument("embedding dimension does not match index")
             }
@@ -229,7 +266,7 @@ public final class LodeDB {
                 guard embedder.dimension == vectorDimension else {
                     throw LodeDBError.invalidArgument("embedder dimension does not match index")
                 }
-                let embeddings = try embedder.embed(texts: [text])
+                let embeddings = try embedder.embed(texts: [text], role: .query)
                 guard let query = embeddings.first, query.count == vectorDimension else {
                     throw LodeDBError.invalidArgument("embedder returned an invalid query embedding")
                 }
@@ -301,7 +338,7 @@ public final class LodeDB {
                 guard embedder.dimension == vectorDimension else {
                     throw LodeDBError.invalidArgument("embedder dimension does not match index")
                 }
-                let embeddings = try embedder.embed(texts: texts)
+                let embeddings = try embedder.embed(texts: texts, role: .query)
                 guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
                     throw LodeDBError.invalidArgument("embedder returned an invalid query embedding")
                 }

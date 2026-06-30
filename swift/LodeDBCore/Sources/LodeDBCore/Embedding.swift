@@ -59,10 +59,22 @@ public enum EmbeddingMath {
         guard let first = tokenEmbeddings.first else {
             throw LodeDBError.invalidArgument("token embeddings must not be empty")
         }
+        // A single row is either an already-pooled sentence vector (the Python path
+        // returns a 2D ONNX output as-is) or a one-token sequence; both pool to that
+        // row under mean and equal token 0 under CLS, so return it directly.
+        if tokenEmbeddings.count == 1 {
+            return first
+        }
         switch pooling {
         case .cls:
             return first
         case .mean:
+            // Fail loudly on a tokenizer/session shape mismatch rather than silently
+            // treating missing/extra mask entries as zero.
+            guard attentionMask.count == tokenEmbeddings.count else {
+                throw LodeDBError.invalidArgument(
+                    "attention mask length \(attentionMask.count) does not match token count \(tokenEmbeddings.count)")
+            }
             let dimension = first.count
             var sum = [Float](repeating: 0, count: dimension)
             var denominator: Float = 0
@@ -70,7 +82,7 @@ public enum EmbeddingMath {
                 guard token.count == dimension else {
                     throw LodeDBError.invalidArgument("ragged token embedding rows")
                 }
-                let weight = index < attentionMask.count ? Float(attentionMask[index]) : 0
+                let weight = Float(attentionMask[index])
                 if weight == 0 { continue }
                 for component in 0..<dimension {
                     sum[component] += token[component] * weight
@@ -128,10 +140,12 @@ public struct EmbeddingPreset: Sendable, Equatable {
         modelIdentity: "sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    /// BAAI/bge-base-en-v1.5: 768-dim, mean pooling, asymmetric query prefix.
+    /// BAAI/bge-base-en-v1.5: 768-dim, CLS pooling, asymmetric query prefix. (BGE is
+    /// trained for CLS pooling, matching the Python `bge` preset's `pooling="cls"`.)
     public static let bge = EmbeddingPreset(
         name: "bge",
         dimension: 768,
+        pooling: .cls,
         queryPrefix: "Represent this sentence for searching relevant passages: ",
         modelIdentity: "BAAI/bge-base-en-v1.5"
     )
@@ -145,7 +159,6 @@ public final class ONNXTextEmbedder: LodeEmbedder {
     public let preset: EmbeddingPreset
     private let tokenizer: TextTokenizer
     private let session: EmbeddingModelSession
-    private let role: EmbeddingRole
 
     public var dimension: Int { preset.dimension }
 
@@ -153,19 +166,19 @@ public final class ONNXTextEmbedder: LodeEmbedder {
     /// store records which model produced its vectors.
     public var modelIdentity: String { preset.modelIdentity }
 
-    public init(
-        preset: EmbeddingPreset,
-        tokenizer: TextTokenizer,
-        session: EmbeddingModelSession,
-        role: EmbeddingRole = .document
-    ) {
+    public init(preset: EmbeddingPreset, tokenizer: TextTokenizer, session: EmbeddingModelSession) {
         self.preset = preset
         self.tokenizer = tokenizer
         self.session = session
-        self.role = role
     }
 
     public func embed(texts: [String]) throws -> [[Float]] {
+        try embed(texts: texts, role: .document)
+    }
+
+    /// Embeds with the role-appropriate prefix (BGE applies its query prefix only to
+    /// queries). `LodeDB` calls this with `.document` for ingest and `.query` for search.
+    public func embed(texts: [String], role: EmbeddingRole) throws -> [[Float]] {
         let prefix = role == .query ? preset.queryPrefix : preset.documentPrefix
         return try texts.map { text in
             let tokenized = try tokenizer.encode(prefix + text, maxLength: preset.maxSequenceLength)

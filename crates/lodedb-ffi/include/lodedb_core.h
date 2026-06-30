@@ -100,6 +100,13 @@ uint32_t lodedb_engine_create_index(
     uintptr_t vector_dim,
     uintptr_t bit_width,
     LodeError **error);
+uint32_t lodedb_engine_create_index_with_model(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    uintptr_t vector_dim,
+    uintptr_t bit_width,
+    LodeStringView model,
+    LodeError **error);
 uint32_t lodedb_engine_upsert_vectors(
     LodeEngine *engine,
     LodeStringView index_id,

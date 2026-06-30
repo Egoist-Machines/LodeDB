@@ -1230,6 +1230,7 @@ impl CoreEngine {
         let index = self.index(index_id)?;
         Ok(CoreEngineStats {
             index_id: index.index_id.clone(),
+            model: index.model.clone(),
             document_count: index.documents.len(),
             chunk_count: index.chunk_count(),
             embedded_chunk_count: index.chunk_count(),
@@ -3487,6 +3488,9 @@ struct ChunkRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreEngineStats {
     pub index_id: String,
+    /// The persisted model identity the index was created with (bindings use this to
+    /// reject reopening a store with a different same-dimension embedding model).
+    pub model: String,
     pub document_count: usize,
     pub chunk_count: usize,
     pub embedded_chunk_count: usize,

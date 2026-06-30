@@ -71,6 +71,8 @@ public struct CollectionStats: Sendable, Equatable {
     public let nativeCoreVersion: String
     public let vectorDimension: Int
     public let bitWidth: Int
+    /// The persisted model identity the index was created with.
+    public let model: String
 
     init(_ json: CoreEngineStatsJSON) {
         self.documentCount = json.documentCount
@@ -80,6 +82,7 @@ public struct CollectionStats: Sendable, Equatable {
         self.nativeCoreVersion = json.nativeCoreVersion
         self.vectorDimension = json.vectorDim
         self.bitWidth = json.bitWidth
+        self.model = json.model
     }
 }
 
@@ -130,6 +133,7 @@ struct CoreEngineStatsJSON: Decodable {
     let nativeCoreVersion: String
     let vectorDim: Int
     let bitWidth: Int
+    let model: String
 
     enum CodingKeys: String, CodingKey {
         case documentCount = "document_count"
@@ -139,6 +143,7 @@ struct CoreEngineStatsJSON: Decodable {
         case nativeCoreVersion = "native_core_version"
         case vectorDim = "vector_dim"
         case bitWidth = "bit_width"
+        case model
     }
 }
 
