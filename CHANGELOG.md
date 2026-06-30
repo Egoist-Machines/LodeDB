@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-29
+
+### Changed
+
+- **Built-in text embedding is now opt-in.** The embedding runtimes (`onnxruntime` +
+  `transformers`, and `sentence-transformers`/PyTorch) are no longer base dependencies. The base
+  `pip install lodedb` is a dependency-light vector store: bring your own vectors
+  (`open_vector_store` / `add_vectors` / `search_by_vector`) or pass `embedder=`. Install the
+  built-in embedding stack with the new `lodedb[embeddings]` (ONNX, torch-free) and
+  `lodedb[torch]` (PyTorch fallback, CLIP, `device="mps"`) extras. Requesting a preset text model
+  without an embedding runtime now raises a clear install hint instead of a deep
+  `ModuleNotFoundError` at encode time. Existing installs that relied on `pip install lodedb`
+  embedding text out of the box should switch to `pip install lodedb[embeddings]`.
+
+### Added
+
+- `lodedb[embeddings]` and `lodedb[torch]` extras for the built-in embedding runtimes, plus a
+  `lodedb[all]` convenience extra (embeddings, torch, image, MCP, and the framework adapters).
+  The `lodedb[image]` extra now pulls the PyTorch tier itself.
+
 ## [1.0.0] - 2026-06-29
 
 ### Changed

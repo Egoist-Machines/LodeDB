@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "lodedb"
 # Static (maturin reads it here); keep in sync with src/lodedb/__init__.py __version__.
-version = "1.0.0"
+version = "1.1.0"
 description = "Local-first, privacy-by-default embedded vector database. Your data never leaves your machine."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,27 +30,36 @@ classifiers = [
   "Topic :: Database :: Database Engines/Servers",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Lean runtime set (see docs/architecture.md). The compact TurboVec CPU core +
-# .tvim/.tvd persistence is the bundled `lodedb._turbovec` extension (compiled
-# into the wheel, see [tool.maturin]), not a PyPI dependency. numpy = embedding/
-# scan I/O; typer = CLI; pyyaml = loads the bundled route registry.
-# Embedding runtime: onnxruntime is the default (faster feature extraction; the
-# preset models ship a prebuilt ONNX on the Hub, fetched on first use) with
-# transformers for tokenization; sentence-transformers (which pulls torch) is the
-# fallback when ONNX cannot be set up. Exporting ONNX for a model without a prebuilt
-# graph is the opt-in [onnx-export] extra (Optimum), not part of the base install.
-# Heavy research deps (faiss/modal/mteb/datasets/matplotlib/sklearn) are
-# deliberately NOT here and are guarded out by tests/test_import_boundary.py.
+# Base runtime set (see docs/architecture.md): everything needed to run LodeDB as a vector
+# store — bring-your-own-vectors (open_vector_store / add_vectors / search_by_vector) or a
+# caller-supplied embedder= — with no embedding runtime. The compact TurboVec CPU core +
+# .tvim/.tvd persistence is the bundled `lodedb._turbovec` extension (compiled into the wheel,
+# see [tool.maturin]), not a PyPI dependency. numpy = embedding/scan I/O; typer = CLI;
+# pyyaml = loads the bundled route registry.
+# Built-in text embedding is the opt-in [embeddings] extra: onnxruntime (the default runtime;
+# the preset models ship a prebuilt ONNX on the Hub, fetched on first use) + transformers (for
+# tokenization). The [torch] extra adds sentence-transformers (which pulls torch) for the
+# PyTorch fallback, the CLIP preset, and device="mps". All three are imported lazily (only when
+# a preset/CLIP backend is built), so a plain `import lodedb` pulls none of them — guarded by
+# tests/test_import_boundary.py, alongside the heavy research deps
+# (faiss/modal/mteb/datasets/matplotlib/sklearn) that are deliberately never declared.
 dependencies = [
   "numpy>=2.0.0",
   "typer>=0.12.0",
-  "onnxruntime>=1.20.0",
-  "transformers>=4.40.0",
-  "sentence-transformers>=3.0.0",
   "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
+# Built-in text embedding. onnxruntime is the default runtime (the minilm/bge presets ship a
+# prebuilt ONNX on the Hub, fetched on first use); transformers provides the tokenizer. This is
+# torch-free. Without it, LodeDB is a vector store: bring your own vectors (open_vector_store /
+# add_vectors / search_by_vector) or pass embedder=. The preset path raises a clear install
+# hint if a text model is requested without it.
+embeddings = ["onnxruntime>=1.20.0", "transformers>=4.40.0"]
+# PyTorch embedding tier: the sentence-transformers runtime used as the fallback when a model's
+# ONNX graph is unavailable, by the CLIP preset, and by device="mps". Pulls torch. Combine with
+# the ONNX default via lodedb[embeddings,torch].
+torch = ["sentence-transformers>=3.0.0"]
 # Opt-in GPU-resident exact scan on CUDA hosts (gpu_turbovec); absent CUDA, LodeDB uses
 # the CPU scan. cupy wheels are Linux/CUDA-only, so this resolves to nothing elsewhere.
 gpu = ["cupy-cuda12x>=13.0.0; platform_system == 'Linux'"]
@@ -66,11 +75,13 @@ langchain = ["langchain-core>=0.3.0"]
 llama-index = ["llama-index-core>=0.11.0"]
 # Optional mem0 vector-store adapter.
 mem0 = ["mem0ai>=2.0.0"]
-# Optional image + text (CLIP) embedding via the "clip" preset / add_image. The CLIP
-# model runs on the existing sentence-transformers + torch stack (already in the base
-# deps), so this adds only Pillow for decoding image files. Both are imported lazily,
-# so a plain `import lodedb` pulls neither (guarded by tests/test_import_boundary.py).
-image = ["pillow>=10.0.0"]
+# Optional image + text (CLIP) embedding via the "clip" preset / add_image. CLIP runs on the
+# sentence-transformers stack (the [torch] tier) and adds Pillow for decoding image files. Both
+# are imported lazily, so a plain `import lodedb` pulls neither (tests/test_import_boundary.py).
+image = ["pillow>=10.0.0", "lodedb[torch]"]
+# Everything a user would reach for: built-in embedding (ONNX + PyTorch), image search, the MCP
+# server, and the framework adapters. Excludes the niche [onnx-export]/[gpu] and the [dev] set.
+all = ["lodedb[embeddings,torch,image,mcp,langchain,llama-index,mem0]"]
 # ruff is pinned (not floored) so `ruff format`/`ruff check` are reproducible across
 # contributors and CI — the formatter's output can change between ruff releases.
 dev = ["pytest>=8.3.0", "ruff==0.15.17"]

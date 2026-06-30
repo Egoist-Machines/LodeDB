@@ -1334,27 +1334,39 @@ wheels = [
 
 [[package]]
 name = "lodedb"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
-    { name = "onnxruntime" },
     { name = "pyyaml" },
-    { name = "sentence-transformers" },
-    { name = "transformers" },
     { name = "typer" },
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "langchain-core" },
+    { name = "llama-index-core" },
+    { name = "mcp" },
+    { name = "mem0ai" },
+    { name = "onnxruntime" },
+    { name = "pillow" },
+    { name = "sentence-transformers" },
+    { name = "transformers" },
+]
 dev = [
     { name = "pytest" },
     { name = "ruff" },
+]
+embeddings = [
+    { name = "onnxruntime" },
+    { name = "transformers" },
 ]
 gpu = [
     { name = "cupy-cuda12x", marker = "sys_platform == 'linux'" },
 ]
 image = [
     { name = "pillow" },
+    { name = "sentence-transformers" },
 ]
 langchain = [
     { name = "langchain-core" },
@@ -1371,26 +1383,31 @@ mem0 = [
 onnx-export = [
     { name = "optimum", extra = ["exporters"] },
 ]
+torch = [
+    { name = "sentence-transformers" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "cupy-cuda12x", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=13.0.0" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=0.3.0" },
     { name = "llama-index-core", marker = "extra == 'llama-index'", specifier = ">=0.11.0" },
+    { name = "lodedb", extras = ["embeddings", "torch", "image", "mcp", "langchain", "llama-index", "mem0"], marker = "extra == 'all'" },
+    { name = "lodedb", extras = ["torch"], marker = "extra == 'image'" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0" },
     { name = "mem0ai", marker = "extra == 'mem0'", specifier = ">=2.0.0" },
     { name = "numpy", specifier = ">=2.0.0" },
-    { name = "onnxruntime", specifier = ">=1.20.0" },
+    { name = "onnxruntime", marker = "extra == 'embeddings'", specifier = ">=1.20.0" },
     { name = "optimum", extras = ["exporters"], marker = "extra == 'onnx-export'", specifier = ">=1.23.0,<2.0.0" },
     { name = "pillow", marker = "extra == 'image'", specifier = ">=10.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.17" },
-    { name = "sentence-transformers", specifier = ">=3.0.0" },
-    { name = "transformers", specifier = ">=4.40.0" },
+    { name = "sentence-transformers", marker = "extra == 'torch'", specifier = ">=3.0.0" },
+    { name = "transformers", marker = "extra == 'embeddings'", specifier = ">=4.40.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "image", "dev"]
+provides-extras = ["embeddings", "torch", "gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "image", "all", "dev"]
 
 [[package]]
 name = "markdown-it-py"

@@ -40,8 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (base runtime + dev/mcp/langchain/llama-index/mem0/image extras)
-        run: uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image
+      - name: Sync (base runtime + dev/embeddings/torch/mcp/langchain/llama-index/mem0/image extras)
+        run: uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image
 
       - name: Lint
         run: uv run ruff check .
@@ -72,12 +72,11 @@ jobs:
           if eager:
               raise SystemExit(f"import lodedb eagerly loaded heavy runtime modules: {eager}")
 
+          # Base = vector store only (numpy/typer/pyyaml); the embedding runtimes are the opt-in
+          # [embeddings]/[torch] extras, exercised by the test suite rather than asserted here.
           required = {
               "numpy": "numpy",
               "typer": "typer",
-              "onnxruntime": "onnxruntime",
-              "transformers": "transformers",
-              "sentence-transformers": "sentence_transformers",
               "pyyaml": "yaml",
           }
           missing = [name for name, module in required.items() if importlib.util.find_spec(module) is None]

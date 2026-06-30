@@ -102,12 +102,11 @@ jobs:
           if eager:
               raise SystemExit(f"wheel import eagerly loaded heavy runtime modules: {eager}")
 
+          # The bare wheel installs the slim base (vector store only); the embedding runtimes
+          # are the opt-in [embeddings]/[torch] extras, so they are not expected here.
           required = {
               "numpy": "numpy",
               "typer": "typer",
-              "onnxruntime": "onnxruntime",
-              "transformers": "transformers",
-              "sentence-transformers": "sentence_transformers",
               "pyyaml": "yaml",
           }
           missing = [name for name, module in required.items() if importlib.util.find_spec(module) is None]

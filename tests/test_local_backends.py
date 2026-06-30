@@ -47,6 +47,43 @@ def test_build_backend_rejects_unknown_device():
         build_local_embedding_backend(resolve_preset("minilm"), device="tpu")
 
 
+def test_preset_backend_errors_without_embedding_runtime(monkeypatch):
+    """A preset text model with no embedding runtime installed raises a clear install hint.
+
+    Built-in text embedding is opt-in (the [embeddings]/[torch] extras); requesting a preset
+    must point at the extra rather than surfacing a deep ModuleNotFoundError at encode time.
+    """
+
+    import lodedb.local.backends as backends
+
+    monkeypatch.setattr(backends, "onnxruntime_available", lambda: False)
+    monkeypatch.setattr(backends, "sentence_transformers_available", lambda: False)
+    with pytest.raises(ModuleNotFoundError, match=r"lodedb\[embeddings\]"):
+        build_local_embedding_backend(resolve_preset("minilm"), device="cpu")
+
+
+def test_forced_torch_runtime_errors_without_sentence_transformers(monkeypatch):
+    """embedding_runtime='torch' without the [torch] tier points at lodedb[embeddings,torch]."""
+
+    import lodedb.local.backends as backends
+
+    monkeypatch.setattr(backends, "sentence_transformers_available", lambda: False)
+    with pytest.raises(ModuleNotFoundError, match=r"lodedb\[embeddings,torch\]"):
+        build_local_embedding_backend(
+            resolve_preset("minilm"), device="cpu", embedding_runtime="torch"
+        )
+
+
+def test_clip_preset_errors_without_sentence_transformers(monkeypatch):
+    """The clip preset without sentence-transformers points at the [image] extra."""
+
+    import lodedb.local.backends as backends
+
+    monkeypatch.setattr(backends, "sentence_transformers_available", lambda: False)
+    with pytest.raises(ModuleNotFoundError, match=r"lodedb\[image\]"):
+        build_local_embedding_backend(resolve_preset("clip"), device="cpu")
+
+
 def test_doctor_report_is_honest_about_gpu_scan():
     """The doctor report never claims GPU vector search on Apple Silicon.
 

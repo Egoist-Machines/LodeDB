@@ -84,7 +84,8 @@ vector, lexical, and hybrid modes while its native handle fully covers the curre
 ## Package layout
 
 `pip install lodedb` installs one package, `lodedb`, imported as `import lodedb`. The CLI
-entry point is `lodedb`.
+entry point is `lodedb`. The base install is a vector store with no embedding runtime; built-in
+text embedding is the opt-in `[embeddings]` (ONNX) and `[torch]` (PyTorch) extras.
 
 ```
 src/lodedb/

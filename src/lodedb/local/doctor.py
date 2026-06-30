@@ -28,6 +28,7 @@ from lodedb.local.backends import (
     is_apple_silicon,
     onnxruntime_available,
     resolve_local_device,
+    sentence_transformers_available,
     torch_cuda_available,
     torch_cuda_build_version,
     torch_mps_available,
@@ -41,10 +42,10 @@ _PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
 def _windows_gpu_embedding_hint() -> dict[str, Any] | None:
     """On Windows with a CPU-only PyTorch, returns how to switch to a CUDA build.
 
-    PyPI serves the CPU-only torch wheel on Windows by default, so ``pip install lodedb``
-    leaves embeddings on the CPU even on an NVIDIA machine, and no package metadata can
-    redirect torch to the CUDA index. Returns ``None`` when it does not apply: off Windows,
-    when torch is absent, or when torch is already a CUDA build.
+    PyPI serves the CPU-only torch wheel on Windows by default, so installing the PyTorch tier
+    (``pip install 'lodedb[torch]'``) leaves embeddings on the CPU even on an NVIDIA machine, and
+    no package metadata can redirect torch to the CUDA index. Returns ``None`` when it does not
+    apply: off Windows, when torch is absent, or when torch is already a CUDA build.
     """
 
     if platform.system() != "Windows":
@@ -69,8 +70,9 @@ def _windows_gpu_embedding_hint() -> dict[str, Any] | None:
 def _image_embedding_status() -> dict[str, Any]:
     """Returns whether the optional image+text (CLIP) embedding path is installed.
 
-    The ``"clip"`` preset / ``add_image`` runs on the base sentence-transformers
-    stack and adds only Pillow (the ``[image]`` extra) for decoding image files.
+    The ``"clip"`` preset / ``add_image`` runs on the sentence-transformers stack (the
+    ``[torch]`` tier) and adds Pillow for decoding image files; the ``[image]`` extra pulls
+    both.
     """
 
     import importlib.util
@@ -130,14 +132,16 @@ def _gpu_vector_scan_status() -> dict[str, Any]:
 def _embedding_runtime_status() -> dict[str, Any]:
     """Reports the embedding runtime ``embedding_runtime="auto"`` prefers, plus ONNX details.
 
-    ``auto`` uses ONNX Runtime only when ``onnxruntime`` is installed *and* the model's
-    ONNX graph can be obtained (cached, a prebuilt Hub snapshot, or an Optimum export),
-    falling back to PyTorch sentence-transformers otherwise. This probe checks the former
-    (a usable onnxruntime) without forcing a per-model download, so it reports a
-    *preference*, not a guarantee; the ``note`` states the fallback condition.
+    ``auto`` uses ONNX Runtime when ``onnxruntime`` is installed *and* the model's ONNX graph
+    can be obtained (cached, a prebuilt Hub snapshot, or an Optimum export), falling back to
+    PyTorch sentence-transformers otherwise. Built-in text embedding is the optional
+    ``[embeddings]`` extra (ONNX) plus ``[torch]`` (the PyTorch tier); with neither installed
+    LodeDB is a vector store (bring your own vectors / ``embedder=``). This probe reports a
+    *preference*, not a guarantee, without forcing a per-model download.
     """
 
     onnx = onnxruntime_available()
+    torch_runtime = sentence_transformers_available()
     providers: list[str] = []
     if onnx:
         try:
@@ -146,14 +150,26 @@ def _embedding_runtime_status() -> dict[str, Any]:
             providers = list(ort.get_available_providers())
         except Exception:  # noqa: BLE001 - report none if probing fails
             providers = []
-    note = (
-        "auto prefers ONNX; falls back to PyTorch if a model's ONNX graph is unavailable"
-        if onnx
-        else "onnxruntime not installed; auto uses PyTorch"
-    )
+    if onnx:
+        preferred = "onnx"
+        note = (
+            "auto prefers ONNX; falls back to PyTorch if a model's ONNX graph is unavailable"
+            if torch_runtime
+            else "auto uses ONNX; install lodedb[torch] for the PyTorch fallback"
+        )
+    elif torch_runtime:
+        preferred = "torch"
+        note = "onnxruntime not installed; auto uses PyTorch (install lodedb[embeddings] for ONNX)"
+    else:
+        preferred = "none"
+        note = (
+            "no embedding runtime installed; text embedding is unavailable "
+            "(pip install 'lodedb[embeddings]', or bring your own vectors)"
+        )
     return {
-        "preferred": "onnx" if onnx else "torch",
+        "preferred": preferred,
         "onnxruntime_available": onnx,
+        "sentence_transformers_available": torch_runtime,
         "onnx_providers": providers,
         "note": note,
     }
@@ -212,6 +228,7 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  runtime (auto prefers) : {emb['runtime']['preferred']}",
         f"    fallback             : {emb['runtime']['note']}",
         f"  onnxruntime available  : {emb['runtime']['onnxruntime_available']}",
+        f"  sentence-transformers  : {emb['runtime']['sentence_transformers_available']}",
         f"  onnx providers         : {', '.join(emb['runtime']['onnx_providers']) or 'none'}",
         "",
         "Image + text embedding (CLIP, optional [image] extra)",

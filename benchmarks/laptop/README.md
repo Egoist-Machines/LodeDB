@@ -12,7 +12,7 @@ For the CUDA GPU scan, see [`../gpu_vanilla_vs_augmented/`](../gpu_vanilla_vs_au
 ## Run
 
 ```bash
-# from the repo root, with the venv synced (uv sync --extra dev)
+# from the repo root, with the venv synced (uv sync --extra dev --extra embeddings --extra torch)
 python benchmarks/laptop/run.py --docs 20000 --queries 200      # writes results/laptop_m1.json
 python benchmarks/laptop/diagrams.py                            # renders docs/*.png + *.svg
 ```

@@ -59,9 +59,12 @@ toolkit. A direct provider returns `"route": "provider"`. Ambiguity returns
 
 ## 3. Pick the LodeDB install command
 
-Install only what is needed:
+Install only what is needed. The base `lodedb` is a vector store with no embedding runtime; add
+the `[embeddings]` extra only when LodeDB itself embeds text:
 
-- Direct Python SDK or direct provider migration: `lodedb`.
+- Vector-preserve migration (the app owns embeddings; you insert precomputed vectors): `lodedb`.
+- Text-owned migration (LodeDB embeds text going forward, `model=...`): `lodedb[embeddings]`
+  (ONNX, torch-free), or `lodedb[embeddings,torch]` to add the PyTorch runtime.
 - LangChain code path: `lodedb[langchain]`, then follow the framework toolkit.
 - LlamaIndex code path: `lodedb[llama-index]`, then follow the framework toolkit.
 - mem0 code path: `lodedb[mem0]`, then follow the framework toolkit.
@@ -121,7 +124,7 @@ db = LodeDB.open_vector_store("./data/lodedb", vector_dim=1536)
 hits = db.search_by_vector(query_embedding, k=10, filter={"metadata": {"tenant_id": tenant_id}})
 ```
 
-Text-owned (LodeDB owns embeddings going forward):
+Text-owned (LodeDB owns embeddings going forward; needs `lodedb[embeddings]`):
 
 ```python
 from lodedb import LodeDB

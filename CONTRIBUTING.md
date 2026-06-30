@@ -10,7 +10,7 @@ source on first sync (maturin / pyo3), so you need a Rust toolchain and a CBLAS 
 the Accelerate framework on macOS, OpenBLAS on Linux (`sudo apt-get install libopenblas-dev`).
 
 ```bash
-uv sync --extra dev --extra mcp --extra langchain   # build the venv
+uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain   # build the venv
 uv run pytest -q                                                # run the test suite
 uv run ruff check .                                             # lint (line length 100)
 uv run ruff format .                                            # format
@@ -34,13 +34,13 @@ These are load-bearing — PRs that break them won't be merged:
   exception is the original document text, which is retained by default in a *separate*
   `.tvtext` sidecar so `db.get(id)` can return it; pass `store_text=False` to keep no text
   on disk. No telemetry/redacted path ever reads that sidecar.
-- **Lean dependencies.** The runtime PyPI set is `numpy`, `typer`, `onnxruntime`,
-  `transformers`, `sentence-transformers`, `pyyaml`; the patched TurboVec core is vendored
-  and bundled into the wheel as `lodedb._turbovec`, not a PyPI dependency. ONNX Runtime,
-  transformers, and sentence-transformers are base install dependencies but must still load
-  lazily; Optimum stays in the `[onnx-export]` extra. Heavier things go behind an extra and
-  must load lazily:
-  importing `lodedb` must not pull `faiss`, `modal`, `matplotlib`, and friends
+- **Lean dependencies.** The base runtime PyPI set is `numpy`, `typer`, `pyyaml` — a
+  dependency-light vector store; the patched TurboVec core is vendored and bundled into the
+  wheel as `lodedb._turbovec`, not a PyPI dependency. Built-in text embedding is opt-in:
+  `[embeddings]` (`onnxruntime` + `transformers`) and `[torch]` (`sentence-transformers`), with
+  Optimum in `[onnx-export]`. The embedding runtimes and every heavier dep load lazily:
+  importing `lodedb` must not pull `onnxruntime`, `transformers`, `sentence-transformers`,
+  `torch`, `faiss`, `modal`, `matplotlib`, and friends — even when installed
   (`tests/test_import_boundary.py` enforces this).
 - **Licensing.** LodeDB is Apache-2.0. The vendored TurboVec core under
   `third_party/turbovec/` is MIT — preserve its `LICENSE` and the top-level `NOTICE`. No
