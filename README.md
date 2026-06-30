@@ -510,6 +510,17 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   See the [payload boundary](docs/architecture.md#persistence--payload-boundary) docs.
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
+## Swift / iOS
+
+LodeDB has a native Swift binding for macOS and iOS over the same Rust core (no Python
+runtime, no network, on device). It exposes durable open/persist, vector/text/hybrid
+search, the full metadata-filter grammar, batched search, late-interaction (MaxSim),
+on-device embedders (Apple `NLEmbedding` out of the box, or an ONNX parity path), and a
+`LodeMemory` save/recall/forget facade for agent memory. The `.tvim` format is
+byte-compatible, so an index built here loads on a phone. See
+[swift/LodeDBCore/README.md](swift/LodeDBCore/README.md) and the agent contract in
+[docs/swift-agent-contract.md](docs/swift-agent-contract.md).
+
 ## Limitations
 
 - **Exact scan, no ANN.** Built for small-to-mid corpora where exact recall matters, not
