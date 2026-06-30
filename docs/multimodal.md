@@ -28,8 +28,8 @@ and (on CUDA hosts) the GPU-resident batch scan, with no embedding dependency.
 
 For the common image case, the `clip` preset embeds both images and text into one
 shared space, so a text query can retrieve images and an image query can retrieve
-images and text. It runs on the base sentence-transformers stack and needs only
-Pillow for decoding image files:
+images and text. It runs on the sentence-transformers stack plus Pillow for decoding
+image files; the `[image]` extra pulls both:
 
 ```
 uv pip install -e '.[image]'     # or: pip install 'lodedb[image]'

@@ -156,6 +156,37 @@ def onnxruntime_available() -> bool:
     return importlib.util.find_spec("onnxruntime") is not None
 
 
+def sentence_transformers_available() -> bool:
+    """Returns whether ``sentence-transformers`` is importable (without importing it)."""
+
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+def _missing_embedding_runtime_error(*, runtime: str, onnx_installed: bool) -> ModuleNotFoundError:
+    """Builds a clear error for a text model requested with no usable embedding runtime.
+
+    Built-in text embedding is opt-in (the ``[embeddings]`` / ``[torch]`` extras); without it
+    LodeDB is a vector store. This points at the right extra rather than letting a deep
+    ``ModuleNotFoundError`` surface later at encode time, and reminds the caller of the
+    bring-your-own-vectors path.
+    """
+
+    if runtime == "torch":
+        hint = "pip install 'lodedb[embeddings,torch]'"
+    elif onnx_installed:
+        # ONNX is installed but could not materialize this model's graph; torch is the fallback.
+        hint = (
+            "pip install 'lodedb[embeddings,torch]' (PyTorch fallback) or "
+            "'lodedb[onnx-export]' (export ONNX for this model)"
+        )
+    else:
+        hint = "pip install 'lodedb[embeddings]'"
+    return ModuleNotFoundError(
+        "text embedding needs an embedding runtime, which is not installed: "
+        f"{hint} (or bring your own vectors via LodeDB.open_vector_store(...) / pass embedder=)."
+    )
+
+
 def _coreml_opt_in() -> bool:
     """Returns whether the opt-in ONNX Core ML provider is enabled (``LODEDB_ONNX_COREML``)."""
 
@@ -255,6 +286,11 @@ def build_local_embedding_backend(
     # A multimodal preset ("clip") embeds text and images into one shared space via
     # sentence-transformers; it does not use the ONNX/torch text runtime selection.
     if preset.multimodal:
+        if not sentence_transformers_available():
+            raise ModuleNotFoundError(
+                "the 'clip' preset needs the sentence-transformers stack, which is not "
+                "installed: pip install 'lodedb[image]'"
+            )
         backend = ClipEmbeddingBackend(
             model_name=preset.model_name,
             native_dim=preset.native_dim,
@@ -271,6 +307,11 @@ def build_local_embedding_backend(
 
     fallback_reason = ""
     if runtime in {"auto", "onnx"}:
+        # Forcing ONNX without the runtime installed must raise the install hint up front,
+        # not enter _onnx_backend and fail deep at materialization/encode time. (The "auto"
+        # path instead falls through to the torch fallback below.)
+        if runtime == "onnx" and not onnxruntime_available():
+            raise _missing_embedding_runtime_error(runtime="onnx", onnx_installed=False)
         if runtime == "onnx" or onnxruntime_available():
             try:
                 backend = _onnx_backend(
@@ -290,6 +331,10 @@ def build_local_embedding_backend(
         else:
             fallback_reason = "onnxruntime not installed; using torch"
 
+    if not sentence_transformers_available():
+        raise _missing_embedding_runtime_error(
+            runtime=runtime, onnx_installed=onnxruntime_available()
+        )
     backend = _sentence_transformer_backend(
         preset, device=resolved, batch_size=batch_size, max_seq_length=max_seq_length
     )
