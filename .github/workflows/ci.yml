@@ -113,9 +113,18 @@ jobs:
   # binding on every PR; previously the XCFramework was only built on release.
   swift-binding:
     name: swift binding (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      # The Swift tests use the swift-testing framework (`import Testing`), which ships
+      # with the Swift 6 toolchain (Xcode 16+); pin the latest stable Xcode so the
+      # runner's default (which can be older) does not break `swift test`.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Toolchain
+        run: swift --version
 
       - uses: dtolnay/rust-toolchain@stable
 
