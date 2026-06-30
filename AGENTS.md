@@ -84,3 +84,28 @@ uv run ruff check .                                             # lint (line-len
 The vendored TurboVec crate is built from source by `uv sync` (maturin / pyo3). It links a
 CBLAS provider: the Accelerate framework on macOS, OpenBLAS on Linux (`apt-get install
 libopenblas-dev`).
+
+## Releasing
+
+Cut a release `vX.Y.Z` by setting the **same** version in every place below, then tagging.
+The `version-check` CI job asserts that pyproject, `__version__`, and the tag all agree,
+and the `smoke` job asserts `uv lock --check`, so a missed file or stale lockfile fails CI.
+
+1. `pyproject.toml` `version`.
+2. `src/lodedb/__init__.py` `__version__` (must equal the pyproject version and the tag).
+3. `Cargo.toml` `[workspace.package] version` (the `lodedb-core` / `lodedb-ffi` / `lodedb-gpu`
+   crates inherit it via `version.workspace = true`).
+4. Regenerate `uv.lock` with `uv lock`.
+5. Regenerate `Cargo.lock` with `cargo build` (or `cargo update -w`).
+6. Add a `CHANGELOG.md` entry.
+7. Commit `release: vX.Y.Z` on `main`, then `git tag -a vX.Y.Z && git push --tags`.
+
+The tag push triggers `release.yml`: it builds the wheels + sdist and the
+`LodeDBCoreFFI.xcframework`, publishes to PyPI (Trusted Publishing), creates the GitHub
+Release with the xcframework attached, and (via the `swift-package-publish` job) pushes the
+matching `vX.Y.Z` to the `Egoist-Machines/swift-lodedb` SwiftPM package. The Swift version is
+derived from the release tag, so there is no separate Swift version to bump.
+
+Do **not** bump on a routine release: `NATIVE_CORE_ABI_VERSION`
+(`crates/lodedb-core/src/version.rs`), which tracks the C ABI and changes only when the ABI
+does; and dependency version constraints (e.g. `mcp>=1.0.0`), which are not the package version.
