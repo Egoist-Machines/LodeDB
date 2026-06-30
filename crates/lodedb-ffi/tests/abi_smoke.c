@@ -146,6 +146,68 @@ int main(void) {
   lodedb_owned_string_free(hybrid_plan);
   lodedb_owned_string_free(plan);
 
+  // ---- Durable storage + CRUD (Phase 1) ----
+  // stats: metrics-only, reflects the documents added above.
+  LodeOwnedString *stats = 0;
+  assert(lodedb_engine_stats_json(engine, sv("default"), &stats, &error) == LODE_OK);
+  assert(stats != 0 && strstr(stats->data, "\"document_count\"") != 0);
+  lodedb_owned_string_free(stats);
+
+  // get_document: payload-free record for doc-a (added as a vector earlier).
+  LodeOwnedString *doc = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &doc, &error) == LODE_OK);
+  assert(doc != 0 && strstr(doc->data, "\"document_id\":\"doc-a\"") != 0);
+  assert(strstr(doc->data, "\"chunk_count\"") != 0);
+  lodedb_owned_string_free(doc);
+
+  // get_document_text / get_document_texts: ABI + valid JSON response.
+  LodeOwnedString *doc_text = 0;
+  assert(lodedb_engine_get_document_text_json(engine, sv("default"), sv("doc-text"), &doc_text,
+                                              &error) == LODE_OK);
+  assert(doc_text != 0);
+  lodedb_owned_string_free(doc_text);
+  LodeOwnedString *doc_texts = 0;
+  assert(lodedb_engine_get_document_texts_json(engine, sv("default"), sv("[\"doc-text\"]"),
+                                               &doc_texts, &error) == LODE_OK);
+  assert(doc_texts != 0);
+  lodedb_owned_string_free(doc_texts);
+
+  // list_documents: unfiltered, no cursor, no limit.
+  LodeOwnedString *list = 0;
+  assert(lodedb_engine_list_documents_json(engine, sv("default"), sv(""), 0, sv(""), 0, 0, 0, &list,
+                                           &error) == LODE_OK);
+  assert(list != 0 && strstr(list->data, "\"document_id\":\"doc-a\"") != 0);
+  lodedb_owned_string_free(list);
+
+  // update_document_payload: replace doc-a metadata, leave text untouched.
+  LodeOwnedString *updated = 0;
+  assert(lodedb_engine_update_document_payload_json(engine, sv("default"), sv("doc-a"),
+                                                    sv("{\"topic\":\"updated\"}"), 1, sv(""), 0,
+                                                    &updated, &error) == LODE_OK);
+  assert(updated != 0);
+  lodedb_owned_string_free(updated);
+  LodeOwnedString *doc_after = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &doc_after, &error) ==
+         LODE_OK);
+  assert(strstr(doc_after->data, "\"topic\":\"updated\"") != 0);
+  lodedb_owned_string_free(doc_after);
+
+  // delete_documents: remove doc-b, then confirm it is gone (get returns JSON null).
+  LodeOwnedString *deleted = 0;
+  assert(lodedb_engine_delete_documents_json(engine, sv("default"), sv("[\"doc-b\"]"), &deleted,
+                                             &error) == LODE_OK);
+  assert(deleted != 0 && strstr(deleted->data, "\"documents_deleted\":1") != 0);
+  lodedb_owned_string_free(deleted);
+  LodeOwnedString *gone = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-b"), &gone, &error) ==
+         LODE_OK);
+  assert(gone != 0 && strcmp(gone->data, "null") == 0);
+  lodedb_owned_string_free(gone);
+
+  // persist/close on an in-memory engine are no-ops that still return OK.
+  assert(lodedb_engine_persist(engine, &error) == LODE_OK);
+  assert(lodedb_engine_close(engine, &error) == LODE_OK);
+
   lodedb_engine_free(engine);
   lodedb_error_free(error);
   return 0;

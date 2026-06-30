@@ -160,6 +160,71 @@ uint32_t lodedb_engine_upsert_vectors_json(
     LodeStringView documents_json,
     LodeError **error);
 
+uint32_t lodedb_engine_open_json(
+    LodeStringView options_json,
+    LodeEngine **out,
+    LodeError **error);
+uint32_t lodedb_engine_open_readonly_json(
+    LodeStringView options_json,
+    LodeEngine **out,
+    LodeError **error);
+uint32_t lodedb_engine_persist(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_close(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_delete_documents_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_ids_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_update_document_payload_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeStringView metadata_json,
+    uint8_t has_metadata,
+    LodeStringView text_json,
+    uint8_t has_text,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_stats_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_text_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_texts_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_ids_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_list_documents_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeStringView after,
+    uint8_t has_after,
+    uintptr_t limit,
+    uint8_t has_limit,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_index_ids_json(
+    const LodeEngine *engine,
+    LodeOwnedString **out,
+    LodeError **error);
+
 #ifdef __cplusplus
 }
 #endif

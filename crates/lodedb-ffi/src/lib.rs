@@ -2,7 +2,7 @@
 
 use lodedb_core::engine::CoreEngine;
 use lodedb_core::engine::{IngestPlan, QueryPlan};
-use lodedb_core::types::{CoreDocument, CoreVectorDocument};
+use lodedb_core::types::{CoreDocument, CoreMetadata, CoreOpenOptions, CoreVectorDocument};
 use lodedb_core::{CoreError, CoreErrorCode};
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
@@ -519,6 +519,342 @@ pub unsafe extern "C" fn lodedb_engine_query_vector_json(
         };
         let results = engine.query_vector(&index_id, query, top_k, filter.as_ref())?;
         let result = owned_json(&results)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+// ---- Durable storage + CRUD (Phase 1) ----
+
+/// Opens a writable persistent engine from a JSON `CoreOpenOptions`.
+///
+/// The returned handle owns a durable engine (WAL/generation storage under
+/// `options.path`) and must be released with `lodedb_engine_free`.
+///
+/// # Safety
+///
+/// `options_json` and `out` must be valid for the duration of the call;
+/// `options_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_open_json(
+    options_json: LodeStringView,
+    out: *mut *mut LodeEngine,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let options = read_json_view::<CoreOpenOptions>(options_json)?;
+        let engine = CoreEngine::open(options)?;
+        let handle = Box::new(LodeEngine { engine });
+        unsafe {
+            *out = Box::into_raw(handle);
+        }
+        Ok(())
+    })
+}
+
+/// Opens a lock-free read-only generation snapshot from a JSON `CoreOpenOptions`.
+///
+/// WAL tails are ignored; the snapshot reflects the last committed generation. The
+/// returned handle must be released with `lodedb_engine_free`.
+///
+/// # Safety
+///
+/// `options_json` and `out` must be valid for the duration of the call;
+/// `options_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_open_readonly_json(
+    options_json: LodeStringView,
+    out: *mut *mut LodeEngine,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let options = read_json_view::<CoreOpenOptions>(options_json)?;
+        let path = options.path.clone();
+        let engine = CoreEngine::open_readonly(path, options)?;
+        let handle = Box::new(LodeEngine { engine });
+        unsafe {
+            *out = Box::into_raw(handle);
+        }
+        Ok(())
+    })
+}
+
+/// Flushes pending writes to durable storage (a generation commit / checkpoint).
+///
+/// # Safety
+///
+/// `engine` must be a valid writable engine pointer; `error` may be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_persist(
+    engine: *mut LodeEngine,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || engine_mut(engine)?.persist())
+}
+
+/// Closes the engine's writable generation (a final checkpoint). Idempotent.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer; `error` may be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_close(
+    engine: *mut LodeEngine,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || engine_mut(engine)?.close())
+}
+
+/// Deletes documents by id; returns a `CoreMutationResult` JSON to release with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `document_ids_json`, and `out` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_delete_documents_json(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    document_ids_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let ids = read_json_view::<Vec<String>>(document_ids_json)?;
+        let result = engine.delete_documents(&index_id, &ids)?;
+        let result = owned_json(&result)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Updates a document's metadata and/or retained text; returns a
+/// `CoreMutationResult` JSON.
+///
+/// `has_metadata`/`has_text` carry `Option` semantics: when `has_text` is non-zero,
+/// `text_json` is parsed as an `Option<String>` (JSON `null` clears the stored text,
+/// a string replaces it); when zero, the text is left unchanged. Same for metadata.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `document_id`, `out`, and any present optional JSON views
+/// must be valid for the duration of the call. String views must contain valid UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_update_document_payload_json(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    document_id: LodeStringView,
+    metadata_json: LodeStringView,
+    has_metadata: u8,
+    text_json: LodeStringView,
+    has_text: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let document_id = read_string(document_id)?;
+        let metadata = if has_metadata == 0 {
+            None
+        } else {
+            Some(read_json_view::<CoreMetadata>(metadata_json)?)
+        };
+        let text = if has_text == 0 {
+            None
+        } else {
+            Some(read_json_view::<Option<String>>(text_json)?)
+        };
+        let result = engine.update_document_payload(&index_id, &document_id, metadata, text)?;
+        let result = owned_json(&result)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Returns metrics-only `CoreEngineStats` JSON for an index.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, and `out` must be valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_stats_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let stats = engine.stats(&index_id)?;
+        let result = owned_json(&stats)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Returns a single document's payload-free record as JSON (`null` if absent).
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `document_id`, and `out` must be valid for the duration of
+/// the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_get_document_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    document_id: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let document_id = read_string(document_id)?;
+        let record = engine.get_document(&index_id, &document_id)?;
+        let result = owned_json(&record)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Returns a document's retained text as JSON `Option<String>` (`null` if none).
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `document_id`, and `out` must be valid for the duration of
+/// the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_get_document_text_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    document_id: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let document_id = read_string(document_id)?;
+        let text = engine.get_document_text(&index_id, &document_id)?;
+        let result = owned_json(&text)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Returns a JSON object mapping document id to retained text for the given ids.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `document_ids_json`, and `out` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_get_document_texts_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    document_ids_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let ids = read_json_view::<Vec<String>>(document_ids_json)?;
+        let texts = engine.get_document_texts(&index_id, &ids)?;
+        let result = owned_json(&texts)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Lists payload-free document records as a JSON array, with an optional metadata
+/// filter, an `after` id cursor, and a `limit` (each gated by its `has_*` flag).
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `out`, and any present optional views must be valid for the
+/// duration of the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_list_documents_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    after: LodeStringView,
+    has_after: u8,
+    limit: usize,
+    has_limit: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let filter = if has_filter == 0 {
+            None
+        } else {
+            Some(read_json_view::<serde_json::Value>(filter_json)?)
+        };
+        let after_str = if has_after == 0 {
+            None
+        } else {
+            Some(read_string(after)?)
+        };
+        let limit_opt = if has_limit == 0 { None } else { Some(limit) };
+        let documents =
+            engine.list_documents(&index_id, filter.as_ref(), after_str.as_deref(), limit_opt)?;
+        let result = owned_json(&documents)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Returns the engine's loaded index ids as a JSON array of strings.
+///
+/// # Safety
+///
+/// `engine` and `out` must be valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_index_ids_json(
+    engine: *const LodeEngine,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let ids = engine.index_ids();
+        let result = owned_json(&ids)?;
         unsafe {
             *out = Box::into_raw(result);
         }

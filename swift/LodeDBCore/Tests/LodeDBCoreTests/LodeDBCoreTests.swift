@@ -87,7 +87,7 @@ import Testing
 @Test func nativeEngineExposesABIVersionAndFFITextProtocol() throws {
     #expect(NativeEngine.abiVersion() == 1)
 
-    let engine = try NativeEngine(vectorDimension: 8)
+    let engine = try NativeEngine.inMemory(vectorDimension: 8)
     let documentsJSON = """
     [{"document_id":"doc-text","text":"Alpha launch notes mention error code E-1001.","metadata":{"topic":"ops"}}]
     """
@@ -139,6 +139,58 @@ import Testing
 
     let vector = try db.search(text: "anything", k: 1, mode: .vector, embedder: embedder)
     #expect(vector.first?.id == "doc-text")
+}
+
+@Test func durableStoreRoundTripsThroughNativeOpenPersistReopen() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let embedder = FixedTestEmbedder(vector: [0, 1, 0, 0, 0, 0, 0, 0])
+
+    do {
+        let db = try LodeDB(path: dir, vectorDimension: 8)
+        try db.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "vec-1", metadata: ["topic": "ops"])
+        try db.addText("durable notes about a blue widget", id: "txt-1", metadata: ["topic": "docs"], embedder: embedder)
+        #expect(db.count == 2)
+        try db.persist()
+        try db.close()
+    }
+
+    // Reopen the same on-disk store read-only and confirm it serves real native search.
+    let reopened = try LodeDB.openReadOnly(path: dir)
+    #expect(reopened.count == 2)
+    let hits = try reopened.search(vector: [0, 1, 0, 0, 0, 0, 0, 0], k: 2)
+    #expect(hits.contains { $0.id == "vec-1" })
+    #expect(try reopened.get("txt-1") == "durable notes about a blue widget")
+    #expect(try reopened.getDocument("vec-1")?.metadata["topic"] == "ops")
+}
+
+@Test func crudRemoveGetListUpdateRunNatively() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a", metadata: ["k": "1"])
+    try db.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "b", metadata: ["k": "2"])
+    #expect(db.count == 2)
+    #expect(try db.collections() == ["default"])
+
+    #expect(Set(try db.listDocuments().map(\.id)) == ["a", "b"])
+    #expect(try db.getDocument("a")?.metadata["k"] == "1")
+
+    try db.updateDocument(id: "a", metadata: ["k": "updated"])
+    #expect(try db.getDocument("a")?.metadata["k"] == "updated")
+
+    #expect(try db.remove("b") == true)
+    #expect(try db.remove("missing") == false)
+    #expect(db.count == 1)
+    #expect(try db.getDocument("b") == nil)
+}
+
+@Test func statsReportNativeMetrics() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")
+    let stats = try db.stats()
+    #expect(stats.documentCount == 1)
+    #expect(stats.vectorDimension == 8)
+    #expect(!stats.nativeCoreVersion.isEmpty)
 }
 
 @Test func concurrentSearchAndAddDoNotRaceTheNativeCore() throws {

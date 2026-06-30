@@ -1224,6 +1224,14 @@ impl CoreEngine {
         })
     }
 
+    /// Returns the ids of every index currently loaded in the engine, sorted.
+    ///
+    /// Bindings use this to enumerate collections and to discover the index id of a
+    /// store opened from disk without knowing it ahead of time.
+    pub fn index_ids(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
     /// Returns captured per-document, per-chunk lexical tokens.
     pub fn document_token_lists(
         &self,

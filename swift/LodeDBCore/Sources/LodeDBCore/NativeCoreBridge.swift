@@ -6,44 +6,75 @@ import LodeDBCoreFFI
 let lodeNativeExpectedABIVersion: UInt32 = 1
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
-/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe for concurrent
-/// writers; callers serialize access (see `LodeDB`).
+/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
+/// access (see `LodeDB`).
 final class NativeEngine {
     private let handle: OpaquePointer
-    let indexID: String
+    /// Mutable so a read-only open can rebind to the index id discovered on disk.
+    var indexID: String
 
     static func abiVersion() -> UInt32 { lodedb_abi_version() }
 
-    init(indexID: String = "default", vectorDimension: Int, bitWidth: Int = 4) throws {
-        let abi = lodedb_abi_version()
-        guard abi == lodeNativeExpectedABIVersion else {
-            throw LodeDBError.corruptStore(
-                "native core ABI \(abi) does not match expected \(lodeNativeExpectedABIVersion)")
-        }
-        var engine: OpaquePointer?
-        var error: UnsafeMutablePointer<LodeError>?
-        try NativeEngine.check(lodedb_engine_new_in_memory(&engine, &error), error: error)
-        guard let engine else {
-            throw LodeDBError.internalError("native core did not return an engine")
-        }
-        self.handle = engine
+    private init(handle: OpaquePointer, indexID: String) {
+        self.handle = handle
         self.indexID = indexID
-
-        var createError: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(indexID) { indexView in
-            lodedb_engine_create_index(handle, indexView, UInt(vectorDimension), UInt(bitWidth), &createError)
-        }
-        do {
-            try NativeEngine.check(status, error: createError)
-        } catch {
-            lodedb_engine_free(handle)
-            throw error
-        }
     }
 
     deinit {
         lodedb_engine_free(handle)
     }
+
+    // MARK: - Construction
+
+    /// Creates an empty in-memory engine and a vector index on it.
+    static func inMemory(vectorDimension: Int, bitWidth: Int = 4, indexID: String = "default") throws -> NativeEngine {
+        try requireABI()
+        var engine: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        try check(lodedb_engine_new_in_memory(&engine, &error), error: error)
+        guard let engine else {
+            throw LodeDBError.internalError("native core did not return an engine")
+        }
+        let native = NativeEngine(handle: engine, indexID: indexID)
+        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth)
+        return native
+    }
+
+    /// Opens a writable persistent engine from a `CoreOpenOptions` JSON document.
+    static func open(optionsJSON: String, indexID: String = "default") throws -> NativeEngine {
+        try requireABI()
+        var engine: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) { lodedb_engine_open_json($0, &engine, &error) }
+        try check(status, error: error)
+        guard let engine else {
+            throw LodeDBError.internalError("native core did not return an engine")
+        }
+        return NativeEngine(handle: engine, indexID: indexID)
+    }
+
+    /// Opens a lock-free read-only generation snapshot from a `CoreOpenOptions` JSON.
+    static func openReadOnly(optionsJSON: String, indexID: String = "default") throws -> NativeEngine {
+        try requireABI()
+        var engine: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) { lodedb_engine_open_readonly_json($0, &engine, &error) }
+        try check(status, error: error)
+        guard let engine else {
+            throw LodeDBError.internalError("native core did not return an engine")
+        }
+        return NativeEngine(handle: engine, indexID: indexID)
+    }
+
+    func createIndex(vectorDimension: Int, bitWidth: Int = 4) throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) {
+            lodedb_engine_create_index(handle, $0, UInt(vectorDimension), UInt(bitWidth), &error)
+        }
+        try Self.check(status, error: error)
+    }
+
+    // MARK: - Ingest
 
     func upsertVectorsJSON(_ documentsJSON: String) throws {
         var error: UnsafeMutablePointer<LodeError>?
@@ -52,31 +83,7 @@ final class NativeEngine {
                 lodedb_engine_upsert_vectors_json(handle, indexView, documentsView, &error)
             }
         }
-        try NativeEngine.check(status, error: error)
-    }
-
-    func queryVectorJSON(_ vector: [Float], k: Int, filterJSON: String?) throws -> String {
-        var out: UnsafeMutablePointer<LodeOwnedString>?
-        var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(indexID) { indexView in
-            vector.withUnsafeBufferPointer { queryBuffer in
-                withStringView(filterJSON ?? "") { filterView in
-                    lodedb_engine_query_vector_json(
-                        handle,
-                        indexView,
-                        queryBuffer.baseAddress,
-                        UInt(vector.count),
-                        UInt(k),
-                        filterView,
-                        filterJSON == nil ? 0 : 1,
-                        &out,
-                        &error
-                    )
-                }
-            }
-        }
-        try NativeEngine.check(status, error: error)
-        return try NativeEngine.copyOwnedString(out)
+        try Self.check(status, error: error)
     }
 
     func prepareTextUpsertJSON(
@@ -85,52 +92,66 @@ final class NativeEngine {
         indexText: Bool,
         chunkCharacterLimit: Int
     ) throws -> String {
-        var out: UnsafeMutablePointer<LodeOwnedString>?
-        var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(indexID) { indexView in
-            withStringView(documentsJSON) { documentsView in
-                lodedb_engine_prepare_text_upsert_json(
-                    handle,
-                    indexView,
-                    documentsView,
-                    storeText ? 1 : 0,
-                    indexText ? 1 : 0,
-                    UInt(chunkCharacterLimit),
-                    &out,
-                    &error
-                )
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(documentsJSON) { documentsView in
+                    lodedb_engine_prepare_text_upsert_json(
+                        handle,
+                        indexView,
+                        documentsView,
+                        storeText ? 1 : 0,
+                        indexText ? 1 : 0,
+                        UInt(chunkCharacterLimit),
+                        out,
+                        error
+                    )
+                }
             }
         }
-        try NativeEngine.check(status, error: error)
-        return try NativeEngine.copyOwnedString(out)
     }
 
-    func applyTextUpsertJSON(
-        planJSON: String,
-        embeddingsJSON: String,
-        embeddingTimeMS: Double
-    ) throws -> String {
-        var out: UnsafeMutablePointer<LodeOwnedString>?
-        var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(planJSON) { planView in
-            withStringView(embeddingsJSON) { embeddingsView in
-                lodedb_engine_apply_text_upsert_json(handle, planView, embeddingsView, embeddingTimeMS, &out, &error)
+    func applyTextUpsertJSON(planJSON: String, embeddingsJSON: String, embeddingTimeMS: Double) throws -> String {
+        try ownedCall { out, error in
+            withStringView(planJSON) { planView in
+                withStringView(embeddingsJSON) { embeddingsView in
+                    lodedb_engine_apply_text_upsert_json(handle, planView, embeddingsView, embeddingTimeMS, out, error)
+                }
             }
         }
-        try NativeEngine.check(status, error: error)
-        return try NativeEngine.copyOwnedString(out)
+    }
+
+    // MARK: - Query
+
+    func queryVectorJSON(_ vector: [Float], k: Int, filterJSON: String?) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                vector.withUnsafeBufferPointer { queryBuffer in
+                    withStringView(filterJSON ?? "") { filterView in
+                        lodedb_engine_query_vector_json(
+                            handle,
+                            indexView,
+                            queryBuffer.baseAddress,
+                            UInt(vector.count),
+                            UInt(k),
+                            filterView,
+                            filterJSON == nil ? 0 : 1,
+                            out,
+                            error
+                        )
+                    }
+                }
+            }
+        }
     }
 
     func prepareQueryTextJSON(_ query: String, mode: String) throws -> String {
-        var out: UnsafeMutablePointer<LodeOwnedString>?
-        var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(query) { queryView in
-            withStringView(mode) { modeView in
-                lodedb_engine_prepare_query_text_json(handle, queryView, modeView, &out, &error)
+        try ownedCall { out, error in
+            withStringView(query) { queryView in
+                withStringView(mode) { modeView in
+                    lodedb_engine_prepare_query_text_json(handle, queryView, modeView, out, error)
+                }
             }
         }
-        try NativeEngine.check(status, error: error)
-        return try NativeEngine.copyOwnedString(out)
     }
 
     func searchEmbeddedTextJSON(
@@ -139,30 +160,166 @@ final class NativeEngine {
         k: Int,
         filterJSON: String?
     ) throws -> String {
-        var out: UnsafeMutablePointer<LodeOwnedString>?
-        var error: UnsafeMutablePointer<LodeError>?
-        let status = withStringView(indexID) { indexView in
-            withStringView(queryPlanJSON) { queryPlanView in
-                withStringView(queryEmbeddingJSON ?? "") { embeddingView in
-                    withStringView(filterJSON ?? "") { filterView in
-                        lodedb_engine_search_embedded_text_json(
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(queryPlanJSON) { queryPlanView in
+                    withStringView(queryEmbeddingJSON ?? "") { embeddingView in
+                        withStringView(filterJSON ?? "") { filterView in
+                            lodedb_engine_search_embedded_text_json(
+                                handle,
+                                indexView,
+                                queryPlanView,
+                                embeddingView,
+                                queryEmbeddingJSON == nil ? 0 : 1,
+                                UInt(k),
+                                filterView,
+                                filterJSON == nil ? 0 : 1,
+                                out,
+                                error
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - CRUD / introspection
+
+    func deleteDocumentsJSON(_ idsJSON: String) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(idsJSON) { idsView in
+                    lodedb_engine_delete_documents_json(handle, indexView, idsView, out, error)
+                }
+            }
+        }
+    }
+
+    /// `metadataJSON == nil` leaves metadata unchanged; `textJSON == nil` leaves text
+    /// unchanged, otherwise `textJSON` is an `Option<String>` JSON (`null` clears it).
+    func updateDocumentPayloadJSON(documentID: String, metadataJSON: String?, textJSON: String?) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(documentID) { idView in
+                    withStringView(metadataJSON ?? "") { metadataView in
+                        withStringView(textJSON ?? "") { textView in
+                            lodedb_engine_update_document_payload_json(
+                                handle,
+                                indexView,
+                                idView,
+                                metadataView,
+                                metadataJSON == nil ? 0 : 1,
+                                textView,
+                                textJSON == nil ? 0 : 1,
+                                out,
+                                error
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func statsJSON() throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                lodedb_engine_stats_json(handle, indexView, out, error)
+            }
+        }
+    }
+
+    func getDocumentJSON(documentID: String) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(documentID) { idView in
+                    lodedb_engine_get_document_json(handle, indexView, idView, out, error)
+                }
+            }
+        }
+    }
+
+    func getDocumentTextJSON(documentID: String) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(documentID) { idView in
+                    lodedb_engine_get_document_text_json(handle, indexView, idView, out, error)
+                }
+            }
+        }
+    }
+
+    func getDocumentTextsJSON(_ idsJSON: String) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(idsJSON) { idsView in
+                    lodedb_engine_get_document_texts_json(handle, indexView, idsView, out, error)
+                }
+            }
+        }
+    }
+
+    func listDocumentsJSON(filterJSON: String?, after: String?, limit: Int?) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(filterJSON ?? "") { filterView in
+                    withStringView(after ?? "") { afterView in
+                        lodedb_engine_list_documents_json(
                             handle,
                             indexView,
-                            queryPlanView,
-                            embeddingView,
-                            queryEmbeddingJSON == nil ? 0 : 1,
-                            UInt(k),
                             filterView,
                             filterJSON == nil ? 0 : 1,
-                            &out,
-                            &error
+                            afterView,
+                            after == nil ? 0 : 1,
+                            UInt(limit ?? 0),
+                            limit == nil ? 0 : 1,
+                            out,
+                            error
                         )
                     }
                 }
             }
         }
-        try NativeEngine.check(status, error: error)
-        return try NativeEngine.copyOwnedString(out)
+    }
+
+    func indexIdsJSON() throws -> String {
+        try ownedCall { out, error in
+            lodedb_engine_index_ids_json(handle, out, error)
+        }
+    }
+
+    func persist() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try Self.check(lodedb_engine_persist(handle, &error), error: error)
+    }
+
+    func close() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try Self.check(lodedb_engine_close(handle, &error), error: error)
+    }
+
+    // MARK: - Helpers
+
+    private static func requireABI() throws {
+        let abi = lodedb_abi_version()
+        guard abi == lodeNativeExpectedABIVersion else {
+            throw LodeDBError.corruptStore(
+                "native core ABI \(abi) does not match expected \(lodeNativeExpectedABIVersion)")
+        }
+    }
+
+    /// Runs an FFI call that returns an owned JSON string out-parameter, checks the
+    /// status, and copies the result into a Swift `String` (freeing the native one).
+    private func ownedCall(
+        _ body: (UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>,
+                 UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>) -> UInt32
+    ) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = body(&out, &error)
+        try Self.check(status, error: error)
+        return try Self.copyOwnedString(out)
     }
 
     private static func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
