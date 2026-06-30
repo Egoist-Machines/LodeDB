@@ -184,6 +184,69 @@ import Testing
     #expect(try db.getDocument("b") == nil)
 }
 
+@Test func closedStoreRejectsFurtherOperations() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let db = try LodeDB(path: dir, vectorDimension: 8)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")
+    try db.close()
+    try db.close() // idempotent
+
+    // After close, writes must be rejected rather than silently lost to an in-memory copy.
+    #expect(throws: LodeDBError.self) {
+        try db.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "b")
+    }
+    #expect(throws: LodeDBError.self) {
+        _ = try db.search(vector: [1, 0, 0, 0, 0, 0, 0, 0], k: 1)
+    }
+    // The post-close write must not have reached disk.
+    let reopened = try LodeDB.openReadOnly(path: dir)
+    #expect(reopened.count == 1)
+}
+
+@Test func listDocumentsRejectsNegativeLimitWithoutCrashing() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")
+    #expect(throws: LodeDBError.self) {
+        _ = try db.listDocuments(limit: -1)
+    }
+}
+
+@Test func textUpdateClearAndSetRoundTrip() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    let embedder = FixedTestEmbedder(vector: [1, 0, 0, 0, 0, 0, 0, 0])
+    try db.addText("original retained text", id: "doc", embedder: embedder)
+    #expect(try db.get("doc") == "original retained text")
+
+    try db.updateDocument(id: "doc", text: .set("replacement text"))
+    #expect(try db.get("doc") == "replacement text")
+
+    try db.updateDocument(id: "doc", text: .clear)
+    #expect(try db.get("doc") == nil)
+}
+
+@Test func readOnlyOpenRejectsMutations() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    do {
+        let writable = try LodeDB(path: dir, vectorDimension: 8)
+        try writable.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")
+        try writable.persist()
+        try writable.close()
+    }
+
+    let readOnly = try LodeDB.openReadOnly(path: dir)
+    #expect(throws: LodeDBError.self) {
+        try readOnly.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "b")
+    }
+    #expect(throws: LodeDBError.self) {
+        _ = try readOnly.remove("a")
+    }
+}
+
 @Test func statsReportNativeMetrics() throws {
     let db = try LodeDB(vectorDimension: 8)
     try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")

@@ -192,6 +192,19 @@ int main(void) {
   assert(strstr(doc_after->data, "\"topic\":\"updated\"") != 0);
   lodedb_owned_string_free(doc_after);
 
+  // A batch delete with an empty id must fail atomically: doc-a stays present.
+  LodeOwnedString *bad_delete = 0;
+  assert(lodedb_engine_delete_documents_json(engine, sv("default"), sv("[\"doc-a\",\"\"]"),
+                                             &bad_delete, &error) == LODE_INVALID_ARGUMENT);
+  assert(bad_delete == 0);
+  lodedb_error_free(error);
+  error = 0;
+  LodeOwnedString *survivor = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &survivor, &error) ==
+         LODE_OK);
+  assert(survivor != 0 && strstr(survivor->data, "\"document_id\":\"doc-a\"") != 0);
+  lodedb_owned_string_free(survivor);
+
   // delete_documents: remove doc-b, then confirm it is gone (get returns JSON null).
   LodeOwnedString *deleted = 0;
   assert(lodedb_engine_delete_documents_json(engine, sv("default"), sv("[\"doc-b\"]"), &deleted,

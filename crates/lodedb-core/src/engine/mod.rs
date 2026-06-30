@@ -366,14 +366,20 @@ impl CoreEngine {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
+        // Validate the whole batch before mutating any state: a bad id late in the
+        // batch must not leave earlier documents already removed behind a failed
+        // request (and committable on the next persist). Mirrors the all-rows-first
+        // validation in `upsert_vectors`.
+        for document_id in document_ids {
+            if document_id.trim().is_empty() {
+                return invalid("document_id is required");
+            }
+        }
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
         let mut changed_filter_fields = BTreeSet::new();
         for document_id in document_ids {
-            if document_id.trim().is_empty() {
-                return invalid("document_id is required");
-            }
             if seen.insert(document_id.clone()) {
                 let Some(record) = index.documents.remove(document_id) else {
                     continue;

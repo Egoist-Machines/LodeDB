@@ -24,6 +24,8 @@ public final class LodeDB {
     public let vectorDimension: Int
     private let engine: NativeEngine
     private let lock = NSLock()
+    /// Set by `close()`; once true, every operation other than `close()` throws.
+    private var closed = false
 
     /// Creates an ephemeral in-memory store (nothing is read from or written to disk).
     public init(vectorDimension: Int) throws {
@@ -39,6 +41,9 @@ public final class LodeDB {
     public init(path: URL, vectorDimension: Int, options: LodeStoreOptions = LodeStoreOptions()) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
+        }
+        guard options.chunkCharacterLimit > 0 else {
+            throw LodeDBError.invalidArgument("chunkCharacterLimit must be positive")
         }
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: false)
         let engine = try NativeEngine.open(optionsJSON: optionsJSON)
@@ -84,20 +89,20 @@ public final class LodeDB {
     }
 
     public func stats() throws -> CollectionStats {
-        try locked {
+        try lockedOpen {
             CollectionStats(try decodeJSON(CoreEngineStatsJSON.self, from: engine.statsJSON()))
         }
     }
 
     /// The index ids loaded in the underlying engine (collection enumeration).
     public func collections() throws -> [String] {
-        try locked { try decodeJSON([String].self, from: engine.indexIdsJSON()) }
+        try lockedOpen { try decodeJSON([String].self, from: engine.indexIdsJSON()) }
     }
 
     // MARK: - Ingest
 
     public func addVector(_ vector: [Float], id: String, metadata: [String: String] = [:]) throws {
-        try locked {
+        try lockedOpen {
             guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw LodeDBError.invalidArgument("id is required")
             }
@@ -116,7 +121,7 @@ public final class LodeDB {
         embedder: LodeEmbedder,
         chunkCharacterLimit: Int = 8192
     ) throws {
-        try locked {
+        try lockedOpen {
             guard embedder.dimension == vectorDimension else {
                 throw LodeDBError.invalidArgument("embedder dimension does not match index")
             }
@@ -151,7 +156,7 @@ public final class LodeDB {
         metadata: [String: String] = [:],
         chunkCharacterLimit: Int = 8192
     ) throws -> TextIngestPlan {
-        try locked {
+        try lockedOpen {
             guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw LodeDBError.invalidArgument("id is required")
             }
@@ -185,7 +190,7 @@ public final class LodeDB {
     }
 
     public func applyTextUpsert(_ plan: TextIngestPlan, embeddings: [[Float]]) throws {
-        try locked {
+        try lockedOpen {
             guard embeddings.count == plan.chunks.count else {
                 throw LodeDBError.invalidArgument("embedding count does not match plan")
             }
@@ -211,7 +216,7 @@ public final class LodeDB {
         embedder: LodeEmbedder? = nil,
         filter: MetadataFilter = MetadataFilter()
     ) throws -> [SearchHit] {
-        try locked {
+        try lockedOpen {
             guard k > 0 else {
                 throw LodeDBError.invalidArgument("k must be positive")
             }
@@ -243,7 +248,7 @@ public final class LodeDB {
     }
 
     public func search(vector: [Float], k: Int, filter: MetadataFilter = MetadataFilter()) throws -> [SearchHit] {
-        try locked {
+        try lockedOpen {
             guard vector.count == vectorDimension else {
                 throw LodeDBError.invalidArgument("query dimension does not match index")
             }
@@ -260,7 +265,7 @@ public final class LodeDB {
     /// Deletes a document by id. Returns true if a document was removed.
     @discardableResult
     public func remove(_ id: String) throws -> Bool {
-        try locked {
+        try lockedOpen {
             let resultJSON = try engine.deleteDocumentsJSON(try encodeJSON([id]))
             let result = try decodeJSON(CoreMutationResultJSON.self, from: resultJSON)
             return result.documentsDeleted > 0
@@ -269,7 +274,7 @@ public final class LodeDB {
 
     /// Returns a document's retained text, or nil if absent or text was not stored.
     public func get(_ id: String) throws -> String? {
-        try locked {
+        try lockedOpen {
             let json = try engine.getDocumentTextJSON(documentID: id)
             if isJSONNull(json) { return nil }
             return try decodeJSON(String.self, from: json)
@@ -278,14 +283,14 @@ public final class LodeDB {
 
     /// Returns retained text for several documents (ids without stored text are omitted).
     public func getTexts(_ ids: [String]) throws -> [String: String] {
-        try locked {
+        try lockedOpen {
             try decodeJSON([String: String].self, from: engine.getDocumentTextsJSON(try encodeJSON(ids)))
         }
     }
 
     /// Returns a payload-free document record, or nil if the document does not exist.
     public func getDocument(_ id: String) throws -> DocumentRecord? {
-        try locked {
+        try lockedOpen {
             let json = try engine.getDocumentJSON(documentID: id)
             if isJSONNull(json) { return nil }
             return DocumentRecord(try decodeJSON(DocumentRecordJSON.self, from: json))
@@ -299,7 +304,10 @@ public final class LodeDB {
         after: String? = nil,
         limit: Int? = nil
     ) throws -> [DocumentRecord] {
-        try locked {
+        try lockedOpen {
+            if let limit, limit < 0 {
+                throw LodeDBError.invalidArgument("limit must be non-negative")
+            }
             let json = try engine.listDocumentsJSON(filterJSON: filter.encodedJSON, after: after, limit: limit)
             return try decodeJSON([DocumentRecordJSON].self, from: json).map(DocumentRecord.init)
         }
@@ -307,7 +315,10 @@ public final class LodeDB {
 
     /// Updates a document's metadata and/or retained text.
     public func updateDocument(id: String, metadata: [String: String]? = nil, text: TextUpdate = .unchanged) throws {
-        try locked {
+        try lockedOpen {
+            // Nothing to change: skip the FFI call so we do not bump the generation
+            // or append a WAL record for a no-op update.
+            if metadata == nil, case .unchanged = text { return }
             let metadataJSON = try metadata.map { try encodeJSON($0) }
             let textJSON: String?
             switch text {
@@ -323,19 +334,30 @@ public final class LodeDB {
 
     /// Flushes pending writes to durable storage. No-op for in-memory stores.
     public func persist() throws {
-        try locked { try engine.persist() }
+        try lockedOpen { try engine.persist() }
     }
 
-    /// Closes the writable generation (a final checkpoint). No-op for read-only / in-memory.
+    /// Closes the writable generation (a final checkpoint) and marks the handle
+    /// closed: every subsequent operation throws `.unsupported`. Idempotent.
+    ///
+    /// Native `close()` drops the engine's persistence and writer lock, so without
+    /// this guard the same instance would keep accepting writes into a detached
+    /// in-memory copy that is never persisted (and silently lost).
     public func close() throws {
-        try locked { try engine.close() }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        try engine.close()
+        closed = true
     }
 
     // MARK: - Helpers
 
-    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+    /// Locks, then runs `body` unless the store has been closed.
+    private func lockedOpen<T>(_ body: () throws -> T) throws -> T {
         lock.lock()
         defer { lock.unlock() }
+        guard !closed else { throw LodeDBError.unsupported("store is closed") }
         return try body()
     }
 
