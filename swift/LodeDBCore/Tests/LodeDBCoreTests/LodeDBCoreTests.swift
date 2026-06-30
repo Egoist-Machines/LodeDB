@@ -311,6 +311,21 @@ import Testing
     #expect(filtered.map(\.id) == ["doc-y"])
 }
 
+@Test func lateInteractionReplaceWithSameAnchorUpdatesPatches() throws {
+    let index = try LodeLateInteractionIndex(vectorDimension: 8)
+    try index.addDocument(id: "doc", patches: [unitVector(0), unitVector(1)])
+    let before = try index.search(queryPatches: [unitVector(0)], k: 1).first
+    #expect(before?.id == "doc")
+
+    // Same mean-pooled anchor (0.5, 0.5, 0, ...) but different patches: the engine
+    // must not treat this as a no-op and keep the stale MaxSim payload.
+    let half: [Float] = [0.5, 0.5, 0, 0, 0, 0, 0, 0]
+    try index.addDocument(id: "doc", patches: [half, half])
+    let after = try index.search(queryPatches: [unitVector(0)], k: 1).first
+    #expect(after?.id == "doc")
+    #expect((after?.score ?? 0) < (before?.score ?? 0))
+}
+
 private func unitVector(_ index: Int, dimension: Int = 8) -> [Float] {
     var vector = Array(repeating: Float(0), count: dimension)
     vector[index] = 1

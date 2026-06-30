@@ -1023,6 +1023,14 @@ pub unsafe extern "C" fn lodedb_engine_upsert_multivector_json(
         let mut offset = 0usize;
         let mut documents: Vec<CoreVectorDocument> = Vec::with_capacity(rows);
         for (sidecar, vector) in sidecars.into_iter().zip(vectors.chunks(dim.max(1))) {
+            // Fail closed on malformed patch layouts rather than persisting bytes the
+            // MaxSim decoder would later silently truncate or misread.
+            if sidecar.patch_count == 0 {
+                return invalid("patch_count must be positive");
+            }
+            if sidecar.nbytes != expected_patch_nbytes(&sidecar.dtype, sidecar.patch_count, dim)? {
+                return invalid("patch nbytes does not match dtype, patch_count, and dim");
+            }
             let stop = offset + sidecar.nbytes;
             let patch_matrix = lodedb_core::storage::multivec_store::MultiVecRecord {
                 dtype: sidecar.dtype,
@@ -1166,6 +1174,24 @@ fn read_u8_slice<'a>(data: *const u8, len: usize) -> Result<&'a [u8], CoreError>
         return invalid("byte data pointer is null");
     }
     Ok(unsafe { slice::from_raw_parts(data, len) })
+}
+
+/// Expected encoded byte length of one document's patch matrix, matching
+/// `MultiVecRecord::decode`: little-endian f4/f2 for float32/float16, or per-patch
+/// f32 scale (4 bytes) plus `dim` int8 codes for int8.
+fn expected_patch_nbytes(dtype: &str, patch_count: usize, dim: usize) -> Result<usize, CoreError> {
+    let size = match dtype {
+        "float32" => patch_count.checked_mul(dim).and_then(|n| n.checked_mul(4)),
+        "float16" => patch_count.checked_mul(dim).and_then(|n| n.checked_mul(2)),
+        "int8" => dim.checked_add(4).and_then(|per| patch_count.checked_mul(per)),
+        other => {
+            return Err(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                format!("unsupported patch dtype '{other}'"),
+            ))
+        }
+    };
+    size.ok_or_else(|| CoreError::new(CoreErrorCode::InvalidArgument, "patch matrix size overflow"))
 }
 
 fn optional_filter(

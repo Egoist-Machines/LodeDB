@@ -217,7 +217,11 @@ impl CoreEngine {
                         let fully_unchanged = vector_unchanged
                             && record.metadata == document.metadata
                             && record.text == retained_text
-                            && record.token_lists == token_lists;
+                            && record.token_lists == token_lists
+                            // A late-interaction replacement can keep the same anchor
+                            // vector and metadata but carry different patches; without
+                            // this the new MaxSim payload would be dropped as a no-op.
+                            && record.patch_matrix == document.patch_matrix;
                         (vector_unchanged, fully_unchanged)
                     }
                     None => (false, false),
@@ -298,12 +302,23 @@ impl CoreEngine {
                     (true, Some(text)) => serde_json::json!([tokenize(text)]),
                     _ => Value::Null,
                 };
+                // Carry the late-interaction patch matrix so a crash/replay before
+                // checkpoint does not lose the MaxSim payload while keeping the anchor.
+                let patch_matrix = match &document.patch_matrix {
+                    Some(matrix) => serde_json::json!({
+                        "dtype": matrix.dtype,
+                        "patch_count": matrix.patch_count,
+                        "bytes": matrix.bytes,
+                    }),
+                    None => Value::Null,
+                };
                 wal_vectors.push(serde_json::json!({
                     "document_id": document.document_id,
                     "vector": document.vector,
                     "metadata": document.metadata,
                     "text": text,
                     "tokens": tokens,
+                    "patch_matrix": patch_matrix,
                 }));
             }
             changed += 1;
@@ -2872,12 +2887,39 @@ fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreErr
         .get("text")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let patch_matrix = match value.get("patch_matrix") {
+        None | Some(Value::Null) => None,
+        Some(matrix) => {
+            let dtype = matrix
+                .get("dtype")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing dtype"))?
+                .to_string();
+            let patch_count = matrix
+                .get("patch_count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing patch_count"))?
+                as usize;
+            let bytes = matrix
+                .get("bytes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing bytes"))?
+                .iter()
+                .map(|value| value.as_u64().unwrap_or(0) as u8)
+                .collect::<Vec<u8>>();
+            Some(crate::storage::multivec_store::MultiVecRecord {
+                dtype,
+                patch_count,
+                bytes,
+            })
+        }
+    };
     Ok(CoreVectorDocument {
         document_id,
         vector,
         metadata,
         text,
-        patch_matrix: None,
+        patch_matrix,
     })
 }
 

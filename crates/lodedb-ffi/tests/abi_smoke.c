@@ -246,6 +246,27 @@ int main(void) {
   assert(mv_hits != 0 && strstr(mv_hits->data, "\"document_id\":\"mv-doc\"") != 0);
   lodedb_owned_string_free(mv_hits);
 
+  // Malformed multi-vector sidecars must fail closed: an unsupported dtype and a
+  // per-record nbytes that does not match dtype/patch_count/dim are both rejected.
+  LodeOwnedString *mv_bad = 0;
+  assert(lodedb_engine_upsert_multivector_json(
+             engine, sv("default"), mv_vectors, 1, 8, (const uint8_t *)mv_patches,
+             sizeof(mv_patches),
+             sv("[{\"document_id\":\"bad\",\"dtype\":\"bf16\",\"patch_count\":2,\"nbytes\":64}]"),
+             &mv_bad, &error) == LODE_INVALID_ARGUMENT);
+  assert(mv_bad == 0);
+  lodedb_error_free(error);
+  error = 0;
+  float mv_one_patch[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+  assert(lodedb_engine_upsert_multivector_json(
+             engine, sv("default"), mv_vectors, 1, 8, (const uint8_t *)mv_one_patch,
+             sizeof(mv_one_patch),
+             sv("[{\"document_id\":\"bad\",\"dtype\":\"float32\",\"patch_count\":2,\"nbytes\":32}]"),
+             &mv_bad, &error) == LODE_INVALID_ARGUMENT);
+  assert(mv_bad == 0);
+  lodedb_error_free(error);
+  error = 0;
+
   // persist/close on an in-memory engine are no-ops that still return OK.
   assert(lodedb_engine_persist(engine, &error) == LODE_OK);
   assert(lodedb_engine_close(engine, &error) == LODE_OK);
