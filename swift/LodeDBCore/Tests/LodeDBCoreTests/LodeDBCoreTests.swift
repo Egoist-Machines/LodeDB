@@ -256,6 +256,27 @@ import Testing
     #expect(!stats.nativeCoreVersion.isEmpty)
 }
 
+@Test func storeTextFalseDoesNotRetainText() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let embedder = HashTestEmbedder(dimension: 8)
+
+    do {
+        let db = try LodeDB(
+            path: dir, vectorDimension: 8,
+            options: LodeStoreOptions(storeText: false, indexText: false))
+        try db.addText("secret text that must not be retained", id: "doc", embedder: embedder)
+        #expect(try db.get("doc") == nil) // not retained even before reopen
+        #expect(try db.getDocument("doc") != nil) // the document itself still exists
+        try db.persist()
+        try db.close()
+    }
+
+    let reopened = try LodeDB.openReadOnly(path: dir)
+    #expect(try reopened.get("doc") == nil) // still not retained after reopen
+}
+
 @Test func reopenWithDifferentModelIdentityIsRejected() throws {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("lodedb-swift-\(UUID().uuidString)")

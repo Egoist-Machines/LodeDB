@@ -108,6 +108,20 @@ import Testing
     #expect(hits.first?.id == "cat")
 }
 
+@Test func embedderModelIdentityIsOptionalWithDefaultNil() throws {
+    let preset = EmbeddingPreset(name: "m", dimension: 4, modelIdentity: "vendor/model")
+    let onnx = ONNXTextEmbedder(
+        preset: preset, tokenizer: RecordingTokenizer(), session: FixedSession(tokenEmbeddings: [[1, 0, 0, 0]]))
+    #expect(onnx.modelIdentity == "vendor/model")
+    // An embedder that does not declare one gets the protocol default (nil).
+    #expect(NoIdentityEmbedder().modelIdentity == nil)
+}
+
+private struct NoIdentityEmbedder: LodeEmbedder {
+    var dimension: Int { 4 }
+    func embed(texts: [String]) throws -> [[Float]] { texts.map { _ in [1, 0, 0, 0] } }
+}
+
 private final class RecordingTokenizer: TextTokenizer, @unchecked Sendable {
     private(set) var lastText: String?
 

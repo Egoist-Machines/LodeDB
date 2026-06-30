@@ -32,6 +32,16 @@ import Testing
     #expect(hits.map(\.id) == ["a"])
 }
 
+@Test func recallDeduplicatesMultiChunkMemories() throws {
+    let memory = try LodeMemory(embedder: BucketEmbedder(dimension: 8))
+    // Longer than the default chunk limit (8192 chars), so it is stored as several chunks.
+    let longText = String(repeating: "alpha beta gamma delta epsilon ", count: 400)
+    let id = try memory.save(longText)
+    let hits = try memory.recall("alpha beta gamma", k: 5, mode: .lexical)
+    // One memory, not one result slot per chunk.
+    #expect(hits.map(\.id) == [id])
+}
+
 private struct BucketEmbedder: LodeEmbedder {
     let dimension: Int
 

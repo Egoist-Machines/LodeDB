@@ -2,6 +2,10 @@ import Foundation
 
 public protocol LodeEmbedder {
     var dimension: Int { get }
+    /// A stable, public model identity (e.g. `"BAAI/bge-base-en-v1.5"`). When non-nil,
+    /// `LodeMemory(embedder:)` binds the store to it so a later reopen with a different
+    /// same-dimension model is rejected. Defaults to nil (no identity binding).
+    var modelIdentity: String? { get }
     func embed(texts: [String]) throws -> [[Float]]
     /// Embeds texts for a specific role. Embedders with asymmetric query/document
     /// prefixes (e.g. BGE) must honor this; the default ignores the role. `LodeDB`
@@ -10,6 +14,8 @@ public protocol LodeEmbedder {
 }
 
 public extension LodeEmbedder {
+    var modelIdentity: String? { nil }
+
     func embed(texts: [String], role: EmbeddingRole) throws -> [[Float]] {
         try embed(texts: texts)
     }
@@ -36,6 +42,10 @@ public final class LodeDB {
     private let lock = NSLock()
     /// Set by `close()`; once true, every operation other than `close()` throws.
     private var closed = false
+    /// The store's text-retention policy, applied to `addText`/`prepareTextUpsert` so
+    /// a `storeText: false` / `indexText: false` store does not retain or index text.
+    private let storesText: Bool
+    private let indexesText: Bool
 
     /// Creates an ephemeral in-memory store (nothing is read from or written to disk).
     ///
@@ -47,6 +57,8 @@ public final class LodeDB {
         }
         self.vectorDimension = vectorDimension
         self.engine = try NativeEngine.inMemory(vectorDimension: vectorDimension, model: modelIdentity)
+        self.storesText = true
+        self.indexesText = true
     }
 
     /// Opens (or creates) a durable, on-disk store at `path`. If the store already
@@ -76,11 +88,16 @@ public final class LodeDB {
         }
         self.vectorDimension = vectorDimension
         self.engine = engine
+        self.storesText = options.storeText
+        self.indexesText = options.indexText
     }
 
     private init(engine: NativeEngine, vectorDimension: Int) {
         self.engine = engine
         self.vectorDimension = vectorDimension
+        // Read-only snapshots do not ingest, so the retention policy is unused.
+        self.storesText = true
+        self.indexesText = true
     }
 
     /// Opens a persisted store read-only (a lock-free generation snapshot). WAL tails
@@ -170,8 +187,8 @@ public final class LodeDB {
             ])
             let planJSON = try engine.prepareTextUpsertJSON(
                 documentsJSON,
-                storeText: true,
-                indexText: true,
+                storeText: storesText,
+                indexText: indexesText,
                 chunkCharacterLimit: chunkCharacterLimit
             )
             let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
@@ -205,8 +222,8 @@ public final class LodeDB {
             ])
             let planJSON = try engine.prepareTextUpsertJSON(
                 documentsJSON,
-                storeText: true,
-                indexText: true,
+                storeText: storesText,
+                indexText: indexesText,
                 chunkCharacterLimit: chunkCharacterLimit
             )
             let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)

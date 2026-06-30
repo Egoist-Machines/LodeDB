@@ -162,9 +162,9 @@ public final class ONNXTextEmbedder: LodeEmbedder {
 
     public var dimension: Int { preset.dimension }
 
-    /// The persisted model identity (`required_model_name`); pass to LodeDB so a
-    /// store records which model produced its vectors.
-    public var modelIdentity: String { preset.modelIdentity }
+    /// The persisted model identity (`required_model_name`); used by LodeDB so a store
+    /// records which model produced its vectors.
+    public var modelIdentity: String? { preset.modelIdentity }
 
     public init(preset: EmbeddingPreset, tokenizer: TextTokenizer, session: EmbeddingModelSession) {
         self.preset = preset

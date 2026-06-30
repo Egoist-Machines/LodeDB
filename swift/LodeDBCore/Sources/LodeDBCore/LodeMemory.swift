@@ -35,9 +35,12 @@ public final class LodeMemory {
         self.embedder = embedder
     }
 
-    /// An ephemeral in-memory memory store sized to `embedder`, bound to its identity.
+    /// An ephemeral in-memory memory store sized to `embedder`. Binds to the explicit
+    /// `modelIdentity` when given, otherwise the embedder's own `modelIdentity` (nil
+    /// for embedders that do not declare one, in which case no identity is recorded).
     public convenience init(embedder: LodeEmbedder, modelIdentity: String? = nil) throws {
-        let db = try LodeDB(vectorDimension: embedder.dimension, modelIdentity: modelIdentity)
+        let identity = modelIdentity ?? embedder.modelIdentity
+        let db = try LodeDB(vectorDimension: embedder.dimension, modelIdentity: identity)
         self.init(db: db, embedder: embedder)
     }
 
@@ -51,6 +54,9 @@ public final class LodeMemory {
 
     /// Recalls the most relevant memories for `query`. Hybrid (vector + lexical) by
     /// default; the stored text is attached to each hit.
+    ///
+    /// Returns up to `k` distinct memories: the underlying text search is chunk-level,
+    /// so a memory split into several chunks is deduplicated to its best-ranked hit.
     public func recall(
         _ query: String,
         k: Int = 5,
@@ -58,8 +64,11 @@ public final class LodeMemory {
         filter: MetadataFilter = MetadataFilter()
     ) throws -> [MemoryHit] {
         let hits = try db.search(text: query, k: k, mode: mode, embedder: embedder, filter: filter)
-        let texts = try db.getTexts(hits.map(\.id))
-        return hits.map { hit in
+        // Hits arrive best-first; keep the first (highest-scored) hit per document id.
+        var seen = Set<String>()
+        let unique = hits.filter { seen.insert($0.id).inserted }
+        let texts = try db.getTexts(unique.map(\.id))
+        return unique.map { hit in
             MemoryHit(id: hit.id, score: hit.score, text: texts[hit.id], metadata: hit.metadata)
         }
     }

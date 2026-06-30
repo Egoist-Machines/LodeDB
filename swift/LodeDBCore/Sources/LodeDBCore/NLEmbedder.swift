@@ -17,7 +17,7 @@ public final class NLEmbedder: LodeEmbedder {
     public let dimension: Int
 
     /// A stable identity for this embedder, suitable as the persisted model name.
-    public let modelIdentity: String
+    public let modelIdentity: String?
 
     /// Creates a sentence embedder for `language`. Throws `.unsupported` if the OS has
     /// no sentence-embedding model for that language available.
