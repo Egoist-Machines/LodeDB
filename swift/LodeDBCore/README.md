@@ -17,8 +17,21 @@ loads on a phone.
 
 ## Adding the package
 
-The native core ships as `LodeDBCoreFFI.xcframework`. `Package.swift` resolves it
-from a local `Artifacts/` directory by default, so a checkout must build it once:
+Released versions are published as a standalone SwiftPM package at
+[`Egoist-Machines/swift-lodedb`](https://github.com/Egoist-Machines/swift-lodedb), whose
+binary target is the matching `LodeDBCoreFFI.xcframework`:
+
+```swift
+.package(url: "https://github.com/Egoist-Machines/swift-lodedb", from: "1.1.0")
+```
+
+See [docs/swift-publishing.md](../../docs/swift-publishing.md) for how that package is
+produced on each release.
+
+### Building from this repo (development)
+
+The in-repo `Package.swift` resolves the XCFramework from a local `Artifacts/` directory,
+so a checkout must build it once:
 
 ```sh
 # from the repo root: builds the host slice and runs the package
@@ -28,10 +41,10 @@ LODEDB_XCFRAMEWORK_TARGETS="aarch64-apple-darwin aarch64-apple-ios aarch64-apple
   swift/LodeDBCore/scripts/package_xcframework.sh
 ```
 
-The `LodeDBCore` target links `Accelerate`. To consume a released build instead of a
-local one, set `LODEDB_FFI_BINARY_URL` and `LODEDB_FFI_BINARY_CHECKSUM` (the value
-`swift package compute-checksum` prints for the release zip); the manifest then
-resolves the remote `binaryTarget`.
+The `LodeDBCore` target links `Accelerate`. To resolve a hosted XCFramework instead of a
+local build, set `LODEDB_FFI_BINARY_URL` and `LODEDB_FFI_BINARY_CHECKSUM` (the value
+`swift package compute-checksum` prints for the zip); the manifest then uses the remote
+`binaryTarget`.
 
 ## Quick start
 
