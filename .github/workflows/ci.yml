@@ -108,6 +108,23 @@ jobs:
       - name: Run the native-core Rust test suites
         run: cargo test --workspace
 
+  # Builds the LodeDBCoreFFI XCFramework (host slice) and runs the Swift binding's
+  # build + test against the statically-linked native core. This gates the Swift/iOS
+  # binding on every PR; previously the XCFramework was only built on release.
+  swift-binding:
+    name: swift binding (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the LodeDBCoreFFI XCFramework (host slice)
+        run: bash swift/LodeDBCore/scripts/package_xcframework.sh
+
+      - name: Swift build + test against the native core
+        run: swift test --package-path swift/LodeDBCore
+
   # Builds the package in a clean environment and asserts the *patched* TurboVec core is
   # what got built — not the stock PyPI `turbovec`, which lacks the delta-persistence and
   # reconstruction APIs. This is the guard for the vendored-dependency install story.

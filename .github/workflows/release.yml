@@ -153,7 +153,7 @@ jobs:
       - name: Archive Swift/iOS XCFramework
         run: |
           mkdir -p dist
-          ditto -c -k --keepParent swift/LodeDBCore/.build/xcframework/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
+          ditto -c -k --keepParent swift/LodeDBCore/Artifacts/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
       - uses: actions/upload-artifact@v4
         with:
           name: swift-xcframework

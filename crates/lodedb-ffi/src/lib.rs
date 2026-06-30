@@ -456,6 +456,76 @@ pub unsafe extern "C" fn lodedb_engine_search_embedded_text_json(
     })
 }
 
+/// Upserts vector documents from a JSON array of `CoreVectorDocument` objects.
+///
+/// This is the JSON-shaped sibling of `lodedb_engine_upsert_vectors`; bindings
+/// that already marshal documents as JSON (and treat ingest as a cold path) use
+/// this to avoid hand-building the nested `LodeVectorDocument` C structs. Each
+/// object is `{ "document_id", "vector": [f32...], "metadata": {..}, "text"? }`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, and `documents_json` must be valid for the duration of
+/// the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_upsert_vectors_json(
+    engine: *mut LodeEngine,
+    index_id: LodeStringView,
+    documents_json: LodeStringView,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        let engine = engine_mut(engine)?;
+        let index_id = read_string(index_id)?;
+        let documents = read_json_view::<Vec<CoreVectorDocument>>(documents_json)?;
+        engine.upsert_vectors(&index_id, &documents).map(|_| ())
+    })
+}
+
+/// Searches one contiguous f32 query vector and returns `CoreSearchResults` JSON.
+///
+/// Unlike `lodedb_engine_query_vector`, this returns the full result set as JSON
+/// (including per-hit metadata) and accepts an optional metadata filter, matching
+/// the text-search path. The returned JSON must be released with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `out`, and (when `has_filter` is non-zero) `filter_json`
+/// must be valid for the duration of the call. `query` must either be null with
+/// `query_len` zero or point to `query_len` initialized f32 values. String views
+/// must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_query_vector_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    query: *const c_float,
+    query_len: usize,
+    top_k: usize,
+    filter_json: LodeStringView,
+    has_filter: u8,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let query = read_f32_slice(query, query_len)?;
+        let filter = if has_filter == 0 {
+            None
+        } else {
+            Some(read_json_view::<serde_json::Value>(filter_json)?)
+        };
+        let results = engine.query_vector(&index_id, query, top_k, filter.as_ref())?;
+        let result = owned_json(&results)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {

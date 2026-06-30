@@ -70,6 +70,30 @@ int main(void) {
   assert(strcmp(results->hits[0].document_id, "doc-a") == 0);
   lodedb_search_results_free(results);
 
+  // JSON vector query carries per-hit metadata and honors the metadata filter.
+  LodeOwnedString *vector_json = 0;
+  assert(lodedb_engine_query_vector_json(
+             engine, sv("default"), vector, 8, 1, sv("{\"metadata\":{\"topic\":\"ops\"}}"), 1,
+             &vector_json, &error) == LODE_OK);
+  assert(vector_json != 0);
+  assert(strstr(vector_json->data, "\"document_id\":\"doc-a\"") != 0);
+  assert(strstr(vector_json->data, "\"topic\":\"ops\"") != 0);
+  lodedb_owned_string_free(vector_json);
+
+  // JSON vector upsert ingests the same shape the Swift binding emits.
+  const char *vectors_json =
+      "[{\"document_id\":\"doc-b\",\"vector\":[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],"
+      "\"metadata\":{\"topic\":\"ml\"},\"text\":null}]";
+  assert(lodedb_engine_upsert_vectors_json(engine, sv("default"), sv(vectors_json), &error) ==
+         LODE_OK);
+  float query_b[8] = {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  LodeOwnedString *vector_b_json = 0;
+  assert(lodedb_engine_query_vector_json(engine, sv("default"), query_b, 8, 1, sv(""), 0,
+                                         &vector_b_json, &error) == LODE_OK);
+  assert(vector_b_json != 0);
+  assert(strstr(vector_b_json->data, "\"document_id\":\"doc-b\"") != 0);
+  lodedb_owned_string_free(vector_b_json);
+
   const char *documents_json =
       "[{\"document_id\":\"doc-text\",\"text\":\"Alpha launch notes mention error code E-1001.\","
       "\"metadata\":{\"topic\":\"ops\"}}]";

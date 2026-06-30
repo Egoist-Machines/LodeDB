@@ -7,15 +7,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "${ROOT}/../.." && pwd)"
-DERIVED="${ROOT}/.build/xcframework"
+# The XCFramework is emitted into a stable Artifacts/ directory (not .build/, which
+# `swift package clean` wipes) so Package.swift's binaryTarget path is durable.
+ARTIFACTS="${ROOT}/Artifacts"
 HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
 TARGETS="${LODEDB_XCFRAMEWORK_TARGETS:-${HOST_TARGET}}"
 REQUIRE_ALL="${LODEDB_XCFRAMEWORK_REQUIRE_ALL:-0}"
 HEADER_DIR="${REPO_ROOT}/crates/lodedb-ffi/include"
-OUTPUT="${DERIVED}/LodeDBCoreFFI.xcframework"
+OUTPUT="${ARTIFACTS}/LodeDBCoreFFI.xcframework"
 
-rm -rf "${DERIVED}"
-mkdir -p "${DERIVED}"
+# Pin the static slices' minimum OS to the Package.swift deployment floor so the
+# linker does not warn about (and App Store validation does not reject) a mismatch.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+
+rm -rf "${OUTPUT}"
+mkdir -p "${ARTIFACTS}"
 
 INSTALLED_TARGETS="$(rustup target list --installed)"
 xcframework_args=()

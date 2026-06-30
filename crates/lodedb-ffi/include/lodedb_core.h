@@ -144,6 +144,21 @@ uint32_t lodedb_engine_search_embedded_text_json(
     uint8_t has_filter,
     LodeOwnedString **out,
     LodeError **error);
+uint32_t lodedb_engine_query_vector_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    const float *query,
+    uintptr_t query_len,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_upsert_vectors_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView documents_json,
+    LodeError **error);
 
 #ifdef __cplusplus
 }

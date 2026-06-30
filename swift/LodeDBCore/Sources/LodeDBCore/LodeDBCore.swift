@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 public protocol LodeEmbedder {
     var dimension: Int { get }
@@ -12,53 +11,52 @@ public enum RetrievalMode: String, Sendable {
     case hybrid
 }
 
+/// A LodeDB store backed by the native Rust core (statically linked via the
+/// `LodeDBCoreFFI` XCFramework). All ranking, chunking, tokenization, and scoring
+/// run in the native engine; this type only marshals values across the C ABI.
 public final class LodeDB {
-    private let vectorDimension: Int
-    private let nativeTextCore: NativeTextCore?
-    private var nativeVectorSearchComplete: Bool
-    private var documents: [String: VectorDocument]
+    let vectorDimension: Int
+
+    /// The native engine. Present for writable in-memory stores. `nil` only for a
+    /// read-only snapshot opened with `openReadOnly`, which currently reports
+    /// `count` from the manifest; native read-only open lands in a later phase.
+    private let engine: NativeEngine?
+
+    /// Document ids known to this store, the source for `count` until the native
+    /// `stats()` call is exposed over the C ABI in the durable-storage phase.
+    private var documentIDs: Set<String>
 
     public init(vectorDimension: Int) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
         self.vectorDimension = vectorDimension
-        let nativeTextCore = try Self.nativeCoreFromEnvironment(vectorDimension: vectorDimension)
-        self.nativeTextCore = nativeTextCore
-        self.nativeVectorSearchComplete = nativeTextCore != nil
-        self.documents = [:]
+        self.engine = try NativeEngine(vectorDimension: vectorDimension)
+        self.documentIDs = []
     }
 
-    private init(vectorDimension: Int, documents: [String: VectorDocument]) {
-        self.vectorDimension = vectorDimension
-        self.nativeTextCore = nil
-        self.nativeVectorSearchComplete = false
-        self.documents = documents
-    }
-
-    var nativeCoreEnabled: Bool {
-        nativeTextCore != nil
-    }
-
-    var nativeVectorSearchReady: Bool {
-        nativeTextCore != nil && nativeVectorSearchComplete
+    /// Backing initializer for the read-only manifest snapshot (`openReadOnly`).
+    private init(snapshotVectorDimension: Int, documentIDs: Set<String>) {
+        self.vectorDimension = snapshotVectorDimension
+        self.engine = nil
+        self.documentIDs = documentIDs
     }
 
     public var count: Int {
-        documents.count
+        documentIDs.count
     }
 
     public func addVector(_ vector: [Float], id: String, metadata: [String: String] = [:]) throws {
+        let engine = try requireEngine()
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LodeDBError.invalidArgument("id is required")
         }
         guard vector.count == vectorDimension else {
             throw LodeDBError.invalidArgument("vector dimension does not match index")
         }
-        if nativeTextCore != nil {
-            nativeVectorSearchComplete = false
-        }
-        documents[id] = VectorDocument(vector: vector, metadata: metadata)
+        let document = NativeVectorDocumentJSON(documentID: id, vector: vector, metadata: metadata, text: nil)
+        try engine.upsertVectorsJSON(try encodeJSON([document]))
+        documentIDs.insert(id)
     }
 
     public func addText(
@@ -68,28 +66,33 @@ public final class LodeDB {
         embedder: LodeEmbedder,
         chunkCharacterLimit: Int = 8192
     ) throws {
+        let engine = try requireEngine()
         guard embedder.dimension == vectorDimension else {
             throw LodeDBError.invalidArgument("embedder dimension does not match index")
         }
-        if let nativeTextCore {
-            try addTextWithNativeCore(
-                nativeTextCore,
-                text: text,
-                id: id,
-                metadata: metadata,
-                embedder: embedder,
-                chunkCharacterLimit: chunkCharacterLimit
-            )
-            return
+        guard chunkCharacterLimit > 0 else {
+            throw LodeDBError.invalidArgument("chunkCharacterLimit must be positive")
         }
-        let plan = try prepareTextUpsert(
-            text,
-            id: id,
-            metadata: metadata,
+        let documentsJSON = try encodeJSON([
+            NativeCoreDocumentJSON(documentID: id, text: text, metadata: metadata)
+        ])
+        let planJSON = try engine.prepareTextUpsertJSON(
+            documentsJSON,
+            storeText: true,
+            indexText: true,
             chunkCharacterLimit: chunkCharacterLimit
         )
-        let embeddings = try embedder.embed(texts: plan.chunks.map(\.text))
-        try applyTextUpsert(plan, embeddings: embeddings)
+        let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
+        let embeddings = try embedder.embed(texts: plan.chunksToEmbed.map(\.text))
+        guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
+            throw LodeDBError.invalidArgument("embedding dimension does not match index")
+        }
+        _ = try engine.applyTextUpsertJSON(
+            planJSON: planJSON,
+            embeddingsJSON: try encodeJSON(embeddings),
+            embeddingTimeMS: 0
+        )
+        documentIDs.insert(id)
     }
 
     public func search(
@@ -99,18 +102,12 @@ public final class LodeDB {
         embedder: LodeEmbedder? = nil,
         filter: MetadataFilter = MetadataFilter()
     ) throws -> [SearchHit] {
-        if let nativeTextCore, nativeVectorSearchComplete {
-            return try searchTextWithNativeCore(
-                nativeTextCore,
-                text: text,
-                k: k,
-                mode: mode,
-                embedder: embedder,
-                filter: filter
-            )
+        let engine = try requireEngine()
+        guard k > 0 else {
+            throw LodeDBError.invalidArgument("k must be positive")
         }
-        let queryTokens = tokenize(text)
-        let vectorHits: [SearchHit]
+        let queryPlanJSON = try engine.prepareQueryTextJSON(text, mode: mode.rawValue)
+        let queryEmbeddingJSON: String?
         if mode == .vector || mode == .hybrid {
             guard let embedder else {
                 throw LodeDBError.invalidArgument("embedder is required for vector search")
@@ -119,58 +116,32 @@ public final class LodeDB {
                 throw LodeDBError.invalidArgument("embedder dimension does not match index")
             }
             let embeddings = try embedder.embed(texts: [text])
-            guard let query = embeddings.first else {
-                throw LodeDBError.invalidArgument("embedder returned no query embedding")
+            guard let query = embeddings.first, query.count == vectorDimension else {
+                throw LodeDBError.invalidArgument("embedder returned an invalid query embedding")
             }
-            vectorHits = try search(vector: query, k: k, filter: filter)
+            queryEmbeddingJSON = try encodeJSON(query)
         } else {
-            vectorHits = []
+            queryEmbeddingJSON = nil
         }
-        if mode == .vector {
-            return vectorHits
-        }
-        let lexicalHits = lexicalSearch(tokens: queryTokens, k: k, filter: filter)
-        if mode == .lexical {
-            return lexicalHits
-        }
-        return reciprocalRankFusion(vectorHits, lexicalHits, k: k)
+        let resultsJSON = try engine.searchEmbeddedTextJSON(
+            queryPlanJSON: queryPlanJSON,
+            queryEmbeddingJSON: queryEmbeddingJSON,
+            k: k,
+            filterJSON: filter.encodedJSON
+        )
+        return try decodeSearchHits(resultsJSON)
     }
 
     public func search(vector: [Float], k: Int, filter: MetadataFilter = MetadataFilter()) throws -> [SearchHit] {
+        let engine = try requireEngine()
         guard vector.count == vectorDimension else {
             throw LodeDBError.invalidArgument("query dimension does not match index")
         }
         guard k > 0 else {
             throw LodeDBError.invalidArgument("k must be positive")
         }
-        if let nativeTextCore, nativeVectorSearchComplete, filter.isEmpty {
-            return try nativeTextCore.queryVector(vector, k: k).map { hit in
-                SearchHit(
-                    id: hit.id,
-                    chunkID: hit.chunkID,
-                    score: hit.score,
-                    metadata: documents[hit.id]?.metadata ?? [:]
-                )
-            }
-        }
-        return documents
-            .filter { filter.matches($0.value.metadata) }
-            .map { id, document in
-                SearchHit(
-                    id: id,
-                    chunkID: document.chunkID.isEmpty ? nil : document.chunkID,
-                    score: dot(vector, document.vector),
-                    metadata: document.metadata
-                )
-            }
-            .sorted { left, right in
-                if left.score == right.score {
-                    return left.id < right.id
-                }
-                return left.score > right.score
-            }
-            .prefix(k)
-            .map { $0 }
+        let resultsJSON = try engine.queryVectorJSON(vector, k: k, filterJSON: filter.encodedJSON)
+        return try decodeSearchHits(resultsJSON)
     }
 
     public func prepareTextUpsert(
@@ -179,72 +150,61 @@ public final class LodeDB {
         metadata: [String: String] = [:],
         chunkCharacterLimit: Int = 8192
     ) throws -> TextIngestPlan {
+        let engine = try requireEngine()
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LodeDBError.invalidArgument("id is required")
         }
         guard chunkCharacterLimit > 0 else {
             throw LodeDBError.invalidArgument("chunkCharacterLimit must be positive")
         }
-        let chunks = chunkText(text, limit: chunkCharacterLimit).enumerated().map { offset, chunk in
-            let hash = normalizedSHA256(chunk)
-            return TextChunk(
-                documentID: id,
-                chunkID: "\(id):\(hash.prefix(12)):\(String(format: "%04d", offset))",
-                text: chunk,
-                tokens: tokenize(chunk)
-            )
+        let documentsJSON = try encodeJSON([
+            NativeCoreDocumentJSON(documentID: id, text: text, metadata: metadata)
+        ])
+        let planJSON = try engine.prepareTextUpsertJSON(
+            documentsJSON,
+            storeText: true,
+            indexText: true,
+            chunkCharacterLimit: chunkCharacterLimit
+        )
+        let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
+        guard let document = plan.documents.first(where: { $0.documentID == id }) else {
+            throw LodeDBError.internalError("native core returned no document plan")
         }
-        return TextIngestPlan(id: id, metadata: metadata, text: text, chunks: chunks)
-    }
-
-    public func applyTextUpsert(_ plan: TextIngestPlan, embeddings: [[Float]]) throws {
-        guard embeddings.count == plan.chunks.count else {
-            throw LodeDBError.invalidArgument("embedding count does not match plan")
+        let chunks = document.chunks.map { chunk in
+            TextChunk(documentID: id, chunkID: chunk.chunkID, text: chunk.text, tokens: chunk.tokens)
         }
-        guard let first = embeddings.first else {
-            throw LodeDBError.invalidArgument("text produced no chunks")
-        }
-        guard first.count == vectorDimension else {
-            throw LodeDBError.invalidArgument("embedding dimension does not match index")
-        }
-        if nativeTextCore != nil {
-            nativeVectorSearchComplete = false
-        }
-        documents[plan.id] = VectorDocument(
-            vector: first,
-            metadata: plan.metadata,
-            text: plan.text,
-            chunkID: plan.chunks.first?.chunkID ?? plan.id,
-            tokens: plan.chunks.flatMap(\.tokens)
+        return TextIngestPlan(
+            id: id,
+            metadata: document.metadata,
+            text: text,
+            chunks: chunks,
+            nativePlanJSON: planJSON
         )
     }
 
-    private func lexicalSearch(tokens: [String], k: Int, filter: MetadataFilter) -> [SearchHit] {
-        let query = Set(tokens)
-        return documents
-            .filter { filter.matches($0.value.metadata) }
-            .compactMap { id, document -> SearchHit? in
-                let overlap = document.tokens.filter { query.contains($0) }.count
-                guard overlap > 0 else {
-                    return nil
-                }
-                return SearchHit(
-                    id: id,
-                    chunkID: document.chunkID.isEmpty ? nil : document.chunkID,
-                    score: Float(overlap),
-                    metadata: document.metadata
-                )
+    public func applyTextUpsert(_ plan: TextIngestPlan, embeddings: [[Float]]) throws {
+        let engine = try requireEngine()
+        guard embeddings.count == plan.chunks.count else {
+            throw LodeDBError.invalidArgument("embedding count does not match plan")
+        }
+        if let first = embeddings.first {
+            guard first.count == vectorDimension else {
+                throw LodeDBError.invalidArgument("embedding dimension does not match index")
             }
-            .sorted { left, right in
-                if left.score == right.score {
-                    return left.id < right.id
-                }
-                return left.score > right.score
-            }
-            .prefix(k)
-            .map { $0 }
+        }
+        _ = try engine.applyTextUpsertJSON(
+            planJSON: plan.nativePlanJSON,
+            embeddingsJSON: try encodeJSON(embeddings),
+            embeddingTimeMS: 0
+        )
+        documentIDs.insert(plan.id)
     }
 
+    /// Opens a persisted store read-only by reading its commit manifest.
+    ///
+    /// This is an interim manifest reader that reports `count`; the durable-storage
+    /// phase replaces it with the native `open_readonly` path so snapshots can serve
+    /// real native search.
     public static func openReadOnly(path: URL) throws -> LodeDB {
         let fileManager = FileManager.default
         let entries = try fileManager.contentsOfDirectory(at: path, includingPropertiesForKeys: nil)
@@ -263,116 +223,24 @@ public final class LodeDB {
         let state = try readJSONObject(generationPath)
         let vectorDimension = state["native_dim"] as? Int ?? 1
         let hashes = state["document_hashes"] as? [String: Any] ?? [:]
-        let metadata = state["document_metadata"] as? [String: Any] ?? [:]
-        var documents: [String: VectorDocument] = [:]
-        for documentID in hashes.keys {
-            documents[documentID] = VectorDocument(
-                vector: Array(repeating: 0, count: vectorDimension),
-                metadata: normalizeMetadata(metadata[documentID])
-            )
-        }
-        return LodeDB(vectorDimension: vectorDimension, documents: documents)
-    }
-
-    private static func nativeCoreFromEnvironment(vectorDimension: Int) throws -> NativeTextCore? {
-        guard let dylib = ProcessInfo.processInfo.environment["LODEDB_FFI_DYLIB"] else {
-            return nil
-        }
-        let library = try NativeCoreLibrary(path: dylib)
-        return try NativeTextCore(library: library, vectorDimension: vectorDimension)
-    }
-
-    private func addTextWithNativeCore(
-        _ nativeTextCore: NativeTextCore,
-        text: String,
-        id: String,
-        metadata: [String: String],
-        embedder: LodeEmbedder,
-        chunkCharacterLimit: Int
-    ) throws {
-        guard chunkCharacterLimit > 0 else {
-            throw LodeDBError.invalidArgument("chunkCharacterLimit must be positive")
-        }
-        let documentsJSON = try encodeJSON([
-            NativeCoreDocumentJSON(documentID: id, text: text, metadata: metadata)
-        ])
-        let planJSON = try nativeTextCore.prepareTextUpsertJSON(
-            documentsJSON,
-            storeText: true,
-            indexText: true,
-            chunkCharacterLimit: chunkCharacterLimit
-        )
-        let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
-        let chunkTexts = plan.chunksToEmbed.map(\.text)
-        let embeddingStarted = Date()
-        let embeddings = try embedder.embed(texts: chunkTexts)
-        let embeddingTimeMS = Date().timeIntervalSince(embeddingStarted) * 1000
-        guard embeddings.allSatisfy({ $0.count == vectorDimension }) else {
-            throw LodeDBError.invalidArgument("embedding dimension does not match index")
-        }
-        _ = try nativeTextCore.applyTextUpsertJSON(
-            planJSON: planJSON,
-            embeddingsJSON: try encodeJSON(embeddings),
-            embeddingTimeMS: embeddingTimeMS
-        )
-        guard let document = plan.documents.first(where: { $0.documentID == id }) else {
-            throw LodeDBError.invalidArgument("native core returned no document plan")
-        }
-        guard let vector = embeddings.first ?? documents[id]?.vector else {
-            throw LodeDBError.invalidArgument("text produced no chunks")
-        }
-        documents[id] = VectorDocument(
-            vector: vector,
-            metadata: document.metadata,
-            text: document.text,
-            chunkID: document.chunks.first?.chunkID ?? id,
-            tokens: document.chunks.flatMap(\.tokens)
+        return LodeDB(
+            snapshotVectorDimension: vectorDimension,
+            documentIDs: Set(hashes.keys)
         )
     }
 
-    private func searchTextWithNativeCore(
-        _ nativeTextCore: NativeTextCore,
-        text: String,
-        k: Int,
-        mode: RetrievalMode,
-        embedder: LodeEmbedder?,
-        filter: MetadataFilter
-    ) throws -> [SearchHit] {
-        let queryPlanJSON = try nativeTextCore.prepareQueryTextJSON(text, mode: mode.rawValue)
-        let queryEmbeddingJSON: String?
-        if mode == .vector || mode == .hybrid {
-            guard let embedder else {
-                throw LodeDBError.invalidArgument("embedder is required for vector search")
-            }
-            guard embedder.dimension == vectorDimension else {
-                throw LodeDBError.invalidArgument("embedder dimension does not match index")
-            }
-            let embeddings = try embedder.embed(texts: [text])
-            guard let query = embeddings.first else {
-                throw LodeDBError.invalidArgument("embedder returned no query embedding")
-            }
-            guard query.count == vectorDimension else {
-                throw LodeDBError.invalidArgument("query dimension does not match index")
-            }
-            queryEmbeddingJSON = try encodeJSON(query)
-        } else {
-            queryEmbeddingJSON = nil
+    private func requireEngine() throws -> NativeEngine {
+        guard let engine else {
+            throw LodeDBError.unsupported(
+                "operation requires a writable store; read-only snapshots gain native search in a later phase")
         }
-        let filterJSON = filter.isEmpty ? nil : try encodeJSON(["metadata": filter.exactMatches])
-        let resultsJSON = try nativeTextCore.searchEmbeddedTextJSON(
-            queryPlanJSON: queryPlanJSON,
-            queryEmbeddingJSON: queryEmbeddingJSON,
-            k: k,
-            filterJSON: filterJSON
-        )
+        return engine
+    }
+
+    private func decodeSearchHits(_ resultsJSON: String) throws -> [SearchHit] {
         let results = try decodeJSON(NativeSearchResultsJSON.self, from: resultsJSON)
         return results.hits.map { hit in
-            SearchHit(
-                id: hit.documentID,
-                chunkID: hit.chunkID,
-                score: hit.score,
-                metadata: hit.metadata
-            )
+            SearchHit(id: hit.documentID, chunkID: hit.chunkID, score: hit.score, metadata: hit.metadata)
         }
     }
 }
@@ -382,6 +250,9 @@ public struct TextIngestPlan: Equatable, Sendable {
     public let metadata: [String: String]
     public let text: String
     public let chunks: [TextChunk]
+    /// The native `IngestPlan` JSON, carried so `applyTextUpsert` can hand the exact
+    /// plan back to the core (the source of truth for chunk ids and ordering).
+    let nativePlanJSON: String
 }
 
 public struct TextChunk: Equatable, Sendable {
@@ -389,6 +260,20 @@ public struct TextChunk: Equatable, Sendable {
     public let chunkID: String
     public let text: String
     public let tokens: [String]
+}
+
+private struct NativeVectorDocumentJSON: Encodable {
+    let documentID: String
+    let vector: [Float]
+    let metadata: [String: String]
+    let text: String?
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case vector
+        case metadata
+        case text
+    }
 }
 
 private struct NativeCoreDocumentJSON: Encodable {
@@ -461,28 +346,6 @@ private struct NativeSearchHitJSON: Decodable {
     }
 }
 
-private struct VectorDocument {
-    let vector: [Float]
-    let metadata: [String: String]
-    var text: String?
-    var chunkID: String
-    var tokens: [String]
-
-    init(
-        vector: [Float],
-        metadata: [String: String],
-        text: String? = nil,
-        chunkID: String? = nil,
-        tokens: [String] = []
-    ) {
-        self.vector = vector
-        self.metadata = metadata
-        self.text = text
-        self.chunkID = chunkID ?? ""
-        self.tokens = tokens
-    }
-}
-
 private func encodeJSON<T: Encodable>(_ value: T) throws -> String {
     let data = try JSONEncoder().encode(value)
     guard let text = String(data: data, encoding: .utf8) else {
@@ -493,13 +356,9 @@ private func encodeJSON<T: Encodable>(_ value: T) throws -> String {
 
 private func decodeJSON<T: Decodable>(_ type: T.Type, from text: String) throws -> T {
     guard let data = text.data(using: .utf8) else {
-        throw LodeDBError.invalidArgument("JSON is not valid UTF-8")
+        throw LodeDBError.internalError("native core returned JSON that is not valid UTF-8")
     }
     return try JSONDecoder().decode(type, from: data)
-}
-
-private func dot(_ left: [Float], _ right: [Float]) -> Float {
-    zip(left, right).map(*).reduce(0, +)
 }
 
 private func readJSONObject(_ url: URL) throws -> [String: Any] {
@@ -508,67 +367,4 @@ private func readJSONObject(_ url: URL) throws -> [String: Any] {
         throw LodeDBError.corruptStore("\(url.lastPathComponent) is not a JSON object")
     }
     return object
-}
-
-private func chunkText(_ text: String, limit: Int) -> [String] {
-    let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !stripped.isEmpty else {
-        return []
-    }
-    var result: [String] = []
-    var current = ""
-    for character in stripped {
-        current.append(character)
-        if current.count == limit {
-            result.append(current)
-            current = ""
-        }
-    }
-    if !current.isEmpty {
-        result.append(current)
-    }
-    return result
-}
-
-private func tokenize(_ text: String) -> [String] {
-    text.lowercased()
-        .split { !$0.isLetter && !$0.isNumber && $0 != "-" && $0 != "_" }
-        .map(String.init)
-}
-
-private func normalizedSHA256(_ text: String) -> String {
-    let normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-    let digest = SHA256.hash(data: Data(normalized.utf8))
-    return digest.map { String(format: "%02x", $0) }.joined()
-}
-
-private func reciprocalRankFusion(_ left: [SearchHit], _ right: [SearchHit], k: Int) -> [SearchHit] {
-    var scores: [String: (SearchHit, Float)] = [:]
-    for (offset, hit) in left.enumerated() {
-        scores[hit.id] = (hit, (scores[hit.id]?.1 ?? 0) + 1 / Float(60 + offset + 1))
-    }
-    for (offset, hit) in right.enumerated() {
-        scores[hit.id] = (hit, (scores[hit.id]?.1 ?? 0) + 1 / Float(60 + offset + 1))
-    }
-    return scores.values
-        .map { hit, score in SearchHit(id: hit.id, chunkID: hit.chunkID, score: score, metadata: hit.metadata) }
-        .sorted { left, right in
-            if left.score == right.score {
-                return left.id < right.id
-            }
-            return left.score > right.score
-        }
-        .prefix(k)
-        .map { $0 }
-}
-
-private func normalizeMetadata(_ value: Any?) -> [String: String] {
-    guard let object = value as? [String: Any] else {
-        return [:]
-    }
-    var result: [String: String] = [:]
-    for (key, value) in object {
-        result[key] = String(describing: value)
-    }
-    return result
 }

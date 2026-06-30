@@ -12,7 +12,10 @@
 fn main() {
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("linux") => println!("cargo:rustc-link-lib=openblas"),
-        Ok("macos") => println!("cargo:rustc-link-lib=framework=Accelerate"),
+        // iOS devices and the simulator both ship Accelerate, so the BLAS-backed
+        // rotation-matrix build links it just like macOS. (The hot NEON scan does
+        // not depend on BLAS; only the one-time rotation build does.)
+        Ok("macos") | Ok("ios") => println!("cargo:rustc-link-lib=framework=Accelerate"),
         _ => {}
     }
 }
