@@ -153,11 +153,20 @@ jobs:
       - name: Archive Swift/iOS XCFramework
         run: |
           mkdir -p dist
-          ditto -c -k --keepParent swift/LodeDBCore/.build/xcframework/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
+          ditto -c -k --keepParent swift/LodeDBCore/Artifacts/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
+      - name: Compute XCFramework checksum for SwiftPM remote binary target
+        run: |
+          # External SwiftPM consumers point .binaryTarget(url:checksum:) at the
+          # uploaded zip; this records the matching checksum alongside the asset.
+          CHECKSUM=$(swift package --package-path swift/LodeDBCore compute-checksum "$PWD/dist/LodeDBCoreFFI.xcframework.zip")
+          echo "$CHECKSUM" | tee dist/LodeDBCoreFFI.xcframework.zip.checksum
+          echo "LodeDBCoreFFI.xcframework.zip SwiftPM checksum: $CHECKSUM"
       - uses: actions/upload-artifact@v4
         with:
           name: swift-xcframework
-          path: dist/LodeDBCoreFFI.xcframework.zip
+          path: |
+            dist/LodeDBCoreFFI.xcframework.zip
+            dist/LodeDBCoreFFI.xcframework.zip.checksum
 
   publish:
     # Publish on a tag push once the Python artifacts (wheels + sdist) are built;
@@ -202,3 +211,75 @@ jobs:
           # Python distributions plus any extra assets (the Swift xcframework when built).
           shopt -s nullglob
           gh release create "$GITHUB_REF_NAME" pypi-dist/* dist/* --generate-notes --verify-tag
+
+  swift-package-publish:
+    # Publishes the standalone `swift-lodedb` SwiftPM package: the Swift sources plus a
+    # Package.swift whose binaryTarget is pinned to this release's xcframework asset and
+    # checksum, committed and tagged in the package repo. Consumers then depend on
+    # `.package(url: "https://github.com/Egoist-Machines/swift-lodedb", from: "x.y.z")`.
+    #
+    # Skips cleanly when SWIFT_PACKAGE_DEPLOY_TOKEN (a token with push access to the
+    # package repo) is not configured, so it never blocks a release.
+    needs: [publish, swift-xcframework]
+    if: >-
+      !cancelled()
+      && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && needs.publish.result == 'success'
+      && needs.swift-xcframework.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_TOKEN: ${{ secrets.SWIFT_PACKAGE_DEPLOY_TOKEN }}
+      PACKAGE_REPO: Egoist-Machines/swift-lodedb
+    steps:
+      - name: Skip when no deploy token is configured
+        if: env.DEPLOY_TOKEN == ''
+        run: echo "SWIFT_PACKAGE_DEPLOY_TOKEN is not set; skipping the swift-lodedb publish."
+
+      - uses: actions/checkout@v4
+        if: env.DEPLOY_TOKEN != ''
+
+      - name: Fetch the xcframework checksum
+        if: env.DEPLOY_TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-xcframework
+          path: dist
+
+      - name: Assemble and push the swift-lodedb package
+        if: env.DEPLOY_TOKEN != ''
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # SwiftPM resolves strict SemVer only, so publish X.Y.Z releases and skip
+          # non-SemVer tags (e.g. a PEP 440 pre-release like 1.1.0rc1).
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag ${GITHUB_REF_NAME} is not a strict vX.Y.Z release; skipping swift-lodedb publish."
+            exit 0
+          fi
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/LodeDBCoreFFI.xcframework.zip"
+          checksum="$(cat dist/LodeDBCoreFFI.xcframework.zip.checksum)"
+          git clone "https://x-access-token:${DEPLOY_TOKEN}@github.com/${PACKAGE_REPO}.git" pkg
+          # Reset the package repo's tracked content (keep .git) so removed source files
+          # do not linger; an empty repo has nothing to check out or remove.
+          ( cd pkg && { git checkout main 2>/dev/null || git checkout -b main; } && { git rm -rfq . 2>/dev/null || true; } )
+          bash swift/LodeDBCore/scripts/publish_swift_package.sh pkg "$version" "$url" "$checksum"
+          cd pkg
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          # Idempotent commit/tag so a rerun (including after a partial push) recovers:
+          # commit only when content changed, and create the tag only if missing, failing
+          # loudly if it already points at a different commit (never move a published tag).
+          if git diff --cached --quiet; then
+            echo "No package changes; reusing the current HEAD."
+          else
+            git commit -m "release: LodeDBCore ${version}"
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            test "$(git rev-list -n1 "v${version}")" = "$(git rev-parse HEAD)"
+          else
+            git tag -a "v${version}" -m "LodeDBCore ${version}"
+          fi
+          git push origin main
+          git push origin "v${version}"

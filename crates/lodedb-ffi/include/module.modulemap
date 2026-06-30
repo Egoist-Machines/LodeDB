@@ -1,0 +1,4 @@
+module LodeDBCoreFFI {
+    header "lodedb_core.h"
+    export *
+}

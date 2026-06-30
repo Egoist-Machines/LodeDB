@@ -217,7 +217,11 @@ impl CoreEngine {
                         let fully_unchanged = vector_unchanged
                             && record.metadata == document.metadata
                             && record.text == retained_text
-                            && record.token_lists == token_lists;
+                            && record.token_lists == token_lists
+                            // A late-interaction replacement can keep the same anchor
+                            // vector and metadata but carry different patches; without
+                            // this the new MaxSim payload would be dropped as a no-op.
+                            && record.patch_matrix == document.patch_matrix;
                         (vector_unchanged, fully_unchanged)
                     }
                     None => (false, false),
@@ -298,12 +302,23 @@ impl CoreEngine {
                     (true, Some(text)) => serde_json::json!([tokenize(text)]),
                     _ => Value::Null,
                 };
+                // Carry the late-interaction patch matrix so a crash/replay before
+                // checkpoint does not lose the MaxSim payload while keeping the anchor.
+                let patch_matrix = match &document.patch_matrix {
+                    Some(matrix) => serde_json::json!({
+                        "dtype": matrix.dtype,
+                        "patch_count": matrix.patch_count,
+                        "bytes": matrix.bytes,
+                    }),
+                    None => Value::Null,
+                };
                 wal_vectors.push(serde_json::json!({
                     "document_id": document.document_id,
                     "vector": document.vector,
                     "metadata": document.metadata,
                     "text": text,
                     "tokens": tokens,
+                    "patch_matrix": patch_matrix,
                 }));
             }
             changed += 1;
@@ -366,14 +381,20 @@ impl CoreEngine {
         self.require_writable()?;
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
+        // Validate the whole batch before mutating any state: a bad id late in the
+        // batch must not leave earlier documents already removed behind a failed
+        // request (and committable on the next persist). Mirrors the all-rows-first
+        // validation in `upsert_vectors`.
+        for document_id in document_ids {
+            if document_id.trim().is_empty() {
+                return invalid("document_id is required");
+            }
+        }
         let mut deleted = 0usize;
         let mut deleted_chunks = 0usize;
         let mut seen = BTreeSet::new();
         let mut changed_filter_fields = BTreeSet::new();
         for document_id in document_ids {
-            if document_id.trim().is_empty() {
-                return invalid("document_id is required");
-            }
             if seen.insert(document_id.clone()) {
                 let Some(record) = index.documents.remove(document_id) else {
                     continue;
@@ -1209,6 +1230,7 @@ impl CoreEngine {
         let index = self.index(index_id)?;
         Ok(CoreEngineStats {
             index_id: index.index_id.clone(),
+            model: index.model.clone(),
             document_count: index.documents.len(),
             chunk_count: index.chunk_count(),
             embedded_chunk_count: index.chunk_count(),
@@ -1222,6 +1244,14 @@ impl CoreEngine {
             bit_width: index.bit_width,
             raw_payload_text_present: false,
         })
+    }
+
+    /// Returns the ids of every index currently loaded in the engine, sorted.
+    ///
+    /// Bindings use this to enumerate collections and to discover the index id of a
+    /// store opened from disk without knowing it ahead of time.
+    pub fn index_ids(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
     }
 
     /// Returns captured per-document, per-chunk lexical tokens.
@@ -2858,12 +2888,39 @@ fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreErr
         .get("text")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let patch_matrix = match value.get("patch_matrix") {
+        None | Some(Value::Null) => None,
+        Some(matrix) => {
+            let dtype = matrix
+                .get("dtype")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing dtype"))?
+                .to_string();
+            let patch_count = matrix
+                .get("patch_count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing patch_count"))?
+                as usize;
+            let bytes = matrix
+                .get("bytes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_err("WAL patch_matrix missing bytes"))?
+                .iter()
+                .map(|value| value.as_u64().unwrap_or(0) as u8)
+                .collect::<Vec<u8>>();
+            Some(crate::storage::multivec_store::MultiVecRecord {
+                dtype,
+                patch_count,
+                bytes,
+            })
+        }
+    };
     Ok(CoreVectorDocument {
         document_id,
         vector,
         metadata,
         text,
-        patch_matrix: None,
+        patch_matrix,
     })
 }
 
@@ -3431,6 +3488,9 @@ struct ChunkRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreEngineStats {
     pub index_id: String,
+    /// The persisted model identity the index was created with (bindings use this to
+    /// reject reopening a store with a different same-dimension embedding model).
+    pub model: String,
     pub document_count: usize,
     pub chunk_count: usize,
     pub embedded_chunk_count: usize,

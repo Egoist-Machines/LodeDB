@@ -646,6 +646,48 @@ fn persistent_engine_opens_mutates_persists_and_reopens_readonly() {
 }
 
 #[test]
+fn wal_replay_preserves_multivector_patches() {
+    let path = unique_temp_dir("core_wal_multivector");
+    let patch = lodedb_core::storage::multivec_store::MultiVecRecord {
+        dtype: "float32".to_string(),
+        patch_count: 2,
+        bytes: [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect(),
+    };
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    // Checkpoint the (empty) index so a reopen finds it, then upsert the multi-vector
+    // document so it lives only in the WAL (not yet in a committed generation).
+    engine.persist().unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "mv".to_string(),
+                vector: vec![0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: BTreeMap::new(),
+                text: None,
+                patch_matrix: Some(patch),
+            }],
+        )
+        .unwrap();
+    // Reopen WITHOUT a checkpoint: the WAL replay must restore the patch matrix, not
+    // just the anchor vector, so the late-interaction document still scores via MaxSim.
+    drop(engine);
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let hits = reopened
+        .query_multivector("default", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, 1, None)
+        .unwrap();
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].document_id, "mv");
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn persistent_engine_writes_python_compatible_vector_metadata() {
     let path = unique_temp_dir("core_python_compatible");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();

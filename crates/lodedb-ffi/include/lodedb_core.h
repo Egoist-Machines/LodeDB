@@ -100,6 +100,13 @@ uint32_t lodedb_engine_create_index(
     uintptr_t vector_dim,
     uintptr_t bit_width,
     LodeError **error);
+uint32_t lodedb_engine_create_index_with_model(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    uintptr_t vector_dim,
+    uintptr_t bit_width,
+    LodeStringView model,
+    LodeError **error);
 uint32_t lodedb_engine_upsert_vectors(
     LodeEngine *engine,
     LodeStringView index_id,
@@ -142,6 +149,128 @@ uint32_t lodedb_engine_search_embedded_text_json(
     uintptr_t top_k,
     LodeStringView filter_json,
     uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_query_vector_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    const float *query,
+    uintptr_t query_len,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_upsert_vectors_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView documents_json,
+    LodeError **error);
+
+uint32_t lodedb_engine_open_json(
+    LodeStringView options_json,
+    LodeEngine **out,
+    LodeError **error);
+uint32_t lodedb_engine_open_readonly_json(
+    LodeStringView options_json,
+    LodeEngine **out,
+    LodeError **error);
+uint32_t lodedb_engine_persist(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_close(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_delete_documents_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_ids_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_update_document_payload_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeStringView metadata_json,
+    uint8_t has_metadata,
+    LodeStringView text_json,
+    uint8_t has_text,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_stats_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_text_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_id,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_document_texts_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView document_ids_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_list_documents_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeStringView after,
+    uint8_t has_after,
+    uintptr_t limit,
+    uint8_t has_limit,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_index_ids_json(
+    const LodeEngine *engine,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_query_vectors_batch_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView queries_json,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_search_embedded_text_batch_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView query_plans_json,
+    LodeStringView query_embeddings_json,
+    uint8_t has_query_embeddings,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_query_multivector_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    const float *query,
+    uintptr_t query_len,
+    uintptr_t n_query,
+    uintptr_t top_k,
+    LodeStringView filter_json,
+    uint8_t has_filter,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_upsert_multivector_json(
+    LodeEngine *engine,
+    LodeStringView index_id,
+    const float *vectors,
+    uintptr_t rows,
+    uintptr_t dim,
+    const uint8_t *patch_bytes,
+    uintptr_t patch_bytes_len,
+    LodeStringView sidecar_json,
     LodeOwnedString **out,
     LodeError **error);
 

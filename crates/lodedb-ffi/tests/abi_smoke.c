@@ -70,6 +70,30 @@ int main(void) {
   assert(strcmp(results->hits[0].document_id, "doc-a") == 0);
   lodedb_search_results_free(results);
 
+  // JSON vector query carries per-hit metadata and honors the metadata filter.
+  LodeOwnedString *vector_json = 0;
+  assert(lodedb_engine_query_vector_json(
+             engine, sv("default"), vector, 8, 1, sv("{\"metadata\":{\"topic\":\"ops\"}}"), 1,
+             &vector_json, &error) == LODE_OK);
+  assert(vector_json != 0);
+  assert(strstr(vector_json->data, "\"document_id\":\"doc-a\"") != 0);
+  assert(strstr(vector_json->data, "\"topic\":\"ops\"") != 0);
+  lodedb_owned_string_free(vector_json);
+
+  // JSON vector upsert ingests the same shape the Swift binding emits.
+  const char *vectors_json =
+      "[{\"document_id\":\"doc-b\",\"vector\":[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],"
+      "\"metadata\":{\"topic\":\"ml\"},\"text\":null}]";
+  assert(lodedb_engine_upsert_vectors_json(engine, sv("default"), sv(vectors_json), &error) ==
+         LODE_OK);
+  float query_b[8] = {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  LodeOwnedString *vector_b_json = 0;
+  assert(lodedb_engine_query_vector_json(engine, sv("default"), query_b, 8, 1, sv(""), 0,
+                                         &vector_b_json, &error) == LODE_OK);
+  assert(vector_b_json != 0);
+  assert(strstr(vector_b_json->data, "\"document_id\":\"doc-b\"") != 0);
+  lodedb_owned_string_free(vector_b_json);
+
   const char *documents_json =
       "[{\"document_id\":\"doc-text\",\"text\":\"Alpha launch notes mention error code E-1001.\","
       "\"metadata\":{\"topic\":\"ops\"}}]";
@@ -121,6 +145,131 @@ int main(void) {
   lodedb_owned_string_free(hybrid_search);
   lodedb_owned_string_free(hybrid_plan);
   lodedb_owned_string_free(plan);
+
+  // ---- Durable storage + CRUD (Phase 1) ----
+  // stats: metrics-only, reflects the documents added above.
+  LodeOwnedString *stats = 0;
+  assert(lodedb_engine_stats_json(engine, sv("default"), &stats, &error) == LODE_OK);
+  assert(stats != 0 && strstr(stats->data, "\"document_count\"") != 0);
+  lodedb_owned_string_free(stats);
+
+  // get_document: payload-free record for doc-a (added as a vector earlier).
+  LodeOwnedString *doc = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &doc, &error) == LODE_OK);
+  assert(doc != 0 && strstr(doc->data, "\"document_id\":\"doc-a\"") != 0);
+  assert(strstr(doc->data, "\"chunk_count\"") != 0);
+  lodedb_owned_string_free(doc);
+
+  // get_document_text / get_document_texts: ABI + valid JSON response.
+  LodeOwnedString *doc_text = 0;
+  assert(lodedb_engine_get_document_text_json(engine, sv("default"), sv("doc-text"), &doc_text,
+                                              &error) == LODE_OK);
+  assert(doc_text != 0);
+  lodedb_owned_string_free(doc_text);
+  LodeOwnedString *doc_texts = 0;
+  assert(lodedb_engine_get_document_texts_json(engine, sv("default"), sv("[\"doc-text\"]"),
+                                               &doc_texts, &error) == LODE_OK);
+  assert(doc_texts != 0);
+  lodedb_owned_string_free(doc_texts);
+
+  // list_documents: unfiltered, no cursor, no limit.
+  LodeOwnedString *list = 0;
+  assert(lodedb_engine_list_documents_json(engine, sv("default"), sv(""), 0, sv(""), 0, 0, 0, &list,
+                                           &error) == LODE_OK);
+  assert(list != 0 && strstr(list->data, "\"document_id\":\"doc-a\"") != 0);
+  lodedb_owned_string_free(list);
+
+  // update_document_payload: replace doc-a metadata, leave text untouched.
+  LodeOwnedString *updated = 0;
+  assert(lodedb_engine_update_document_payload_json(engine, sv("default"), sv("doc-a"),
+                                                    sv("{\"topic\":\"updated\"}"), 1, sv(""), 0,
+                                                    &updated, &error) == LODE_OK);
+  assert(updated != 0);
+  lodedb_owned_string_free(updated);
+  LodeOwnedString *doc_after = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &doc_after, &error) ==
+         LODE_OK);
+  assert(strstr(doc_after->data, "\"topic\":\"updated\"") != 0);
+  lodedb_owned_string_free(doc_after);
+
+  // A batch delete with an empty id must fail atomically: doc-a stays present.
+  LodeOwnedString *bad_delete = 0;
+  assert(lodedb_engine_delete_documents_json(engine, sv("default"), sv("[\"doc-a\",\"\"]"),
+                                             &bad_delete, &error) == LODE_INVALID_ARGUMENT);
+  assert(bad_delete == 0);
+  lodedb_error_free(error);
+  error = 0;
+  LodeOwnedString *survivor = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-a"), &survivor, &error) ==
+         LODE_OK);
+  assert(survivor != 0 && strstr(survivor->data, "\"document_id\":\"doc-a\"") != 0);
+  lodedb_owned_string_free(survivor);
+
+  // delete_documents: remove doc-b, then confirm it is gone (get returns JSON null).
+  LodeOwnedString *deleted = 0;
+  assert(lodedb_engine_delete_documents_json(engine, sv("default"), sv("[\"doc-b\"]"), &deleted,
+                                             &error) == LODE_OK);
+  assert(deleted != 0 && strstr(deleted->data, "\"documents_deleted\":1") != 0);
+  lodedb_owned_string_free(deleted);
+  LodeOwnedString *gone = 0;
+  assert(lodedb_engine_get_document_json(engine, sv("default"), sv("doc-b"), &gone, &error) ==
+         LODE_OK);
+  assert(gone != 0 && strcmp(gone->data, "null") == 0);
+  lodedb_owned_string_free(gone);
+
+  // Batched vector search returns one CoreSearchResults per query.
+  LodeOwnedString *batch = 0;
+  assert(lodedb_engine_query_vectors_batch_json(
+             engine, sv("default"),
+             sv("[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0]]"), 1, sv(""),
+             0, &batch, &error) == LODE_OK);
+  assert(batch != 0);
+  lodedb_owned_string_free(batch);
+
+  // Late interaction: upsert a float32 multi-vector doc and MaxSim-query it.
+  float mv_vectors[8] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float mv_patches[16] = {1.0f, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f, 0, 0, 0, 0, 0, 0};
+  const char *mv_sidecar =
+      "[{\"document_id\":\"mv-doc\",\"metadata\":{\"kind\":\"li\"},\"dtype\":\"float32\","
+      "\"patch_count\":2,\"nbytes\":64}]";
+  LodeOwnedString *mv_upsert = 0;
+  assert(lodedb_engine_upsert_multivector_json(engine, sv("default"), mv_vectors, 1, 8,
+                                               (const uint8_t *)mv_patches, sizeof(mv_patches),
+                                               sv(mv_sidecar), &mv_upsert, &error) == LODE_OK);
+  assert(mv_upsert != 0);
+  lodedb_owned_string_free(mv_upsert);
+
+  float mv_query[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+  LodeOwnedString *mv_hits = 0;
+  assert(lodedb_engine_query_multivector_json(engine, sv("default"), mv_query, 8, 1, 1, sv(""), 0,
+                                              &mv_hits, &error) == LODE_OK);
+  assert(mv_hits != 0 && strstr(mv_hits->data, "\"document_id\":\"mv-doc\"") != 0);
+  lodedb_owned_string_free(mv_hits);
+
+  // Malformed multi-vector sidecars must fail closed: an unsupported dtype and a
+  // per-record nbytes that does not match dtype/patch_count/dim are both rejected.
+  LodeOwnedString *mv_bad = 0;
+  assert(lodedb_engine_upsert_multivector_json(
+             engine, sv("default"), mv_vectors, 1, 8, (const uint8_t *)mv_patches,
+             sizeof(mv_patches),
+             sv("[{\"document_id\":\"bad\",\"dtype\":\"bf16\",\"patch_count\":2,\"nbytes\":64}]"),
+             &mv_bad, &error) == LODE_INVALID_ARGUMENT);
+  assert(mv_bad == 0);
+  lodedb_error_free(error);
+  error = 0;
+  float mv_one_patch[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+  assert(lodedb_engine_upsert_multivector_json(
+             engine, sv("default"), mv_vectors, 1, 8, (const uint8_t *)mv_one_patch,
+             sizeof(mv_one_patch),
+             sv("[{\"document_id\":\"bad\",\"dtype\":\"float32\",\"patch_count\":2,\"nbytes\":32}]"),
+             &mv_bad, &error) == LODE_INVALID_ARGUMENT);
+  assert(mv_bad == 0);
+  lodedb_error_free(error);
+  error = 0;
+
+  // persist/close on an in-memory engine are no-ops that still return OK.
+  assert(lodedb_engine_persist(engine, &error) == LODE_OK);
+  assert(lodedb_engine_close(engine, &error) == LODE_OK);
 
   lodedb_engine_free(engine);
   lodedb_error_free(error);

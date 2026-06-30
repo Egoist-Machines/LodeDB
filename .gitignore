@@ -26,6 +26,10 @@ htmlcov/
 target/
 third_party/turbovec/target/
 
+# Swift binding build output (the XCFramework is rebuilt by scripts/package_xcframework.sh)
+swift/LodeDBCore/.build/
+swift/LodeDBCore/Artifacts/
+
 # Local LodeDB data dirs created by examples/benchmarks
 *.tvim
 *.tvd
