@@ -251,6 +251,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          # SwiftPM resolves strict SemVer only, so publish X.Y.Z releases and skip
+          # non-SemVer tags (e.g. a PEP 440 pre-release like 1.1.0rc1).
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag ${GITHUB_REF_NAME} is not a strict vX.Y.Z release; skipping swift-lodedb publish."
+            exit 0
+          fi
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/LodeDBCoreFFI.xcframework.zip"
           checksum="$(cat dist/LodeDBCoreFFI.xcframework.zip.checksum)"
           git clone "https://x-access-token:${DEPLOY_TOKEN}@github.com/${PACKAGE_REPO}.git" pkg
@@ -262,7 +268,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "release: LodeDBCore ${version}"
-          git tag -a "v${version}" -m "LodeDBCore ${version}"
+          # Idempotent commit/tag so a rerun (including after a partial push) recovers:
+          # commit only when content changed, and create the tag only if missing, failing
+          # loudly if it already points at a different commit (never move a published tag).
+          if git diff --cached --quiet; then
+            echo "No package changes; reusing the current HEAD."
+          else
+            git commit -m "release: LodeDBCore ${version}"
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            test "$(git rev-list -n1 "v${version}")" = "$(git rev-parse HEAD)"
+          else
+            git tag -a "v${version}" -m "LodeDBCore ${version}"
+          fi
           git push origin main
           git push origin "v${version}"
