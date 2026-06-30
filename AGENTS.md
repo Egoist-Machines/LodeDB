@@ -26,12 +26,17 @@ tests/                   local SDK suite + import-boundary guard
   exception is original document text, retained by default in a *separate* raw-text store
   (`g<epoch>.tvtext` base + `.txd` delta journal) for `db.get(id)`; pass `store_text=False` to
   keep no text on disk. No telemetry/redacted path reads that store.
-- **Lean dependencies:** runtime PyPI deps are `numpy`, `typer`, `onnxruntime`,
-  `transformers`, `sentence-transformers`, `pyyaml` (+ extras `[onnx-export]`, `[mcp]`,
-  `[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`). The patched TurboVec core is vendored
-  under `third_party/turbovec/` and bundled into the wheel as `lodedb._turbovec` — not a PyPI
-  dependency. ONNX Runtime / transformers / sentence-transformers are base runtime deps but
-  must still load lazily; a plain `import lodedb` must not import them.
+- **Lean dependencies:** base runtime PyPI deps are `numpy`, `typer`, `pyyaml` — a
+  dependency-light vector store (bring your own vectors via `open_vector_store` / `add_vectors`,
+  or pass `embedder=`). Built-in text embedding is opt-in: `[embeddings]` (`onnxruntime` +
+  `transformers`, torch-free) and `[torch]` (`sentence-transformers` — the PyTorch fallback, the
+  `clip` preset, and `device="mps"`); other extras are `[image]`, `[onnx-export]`, `[mcp]`,
+  `[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`, and `[all]`. The patched TurboVec core is
+  vendored under `third_party/turbovec/` and bundled into the wheel as `lodedb._turbovec` — not a
+  PyPI dependency. The embedding runtimes load lazily (only when a preset/CLIP backend is built),
+  so a plain `import lodedb` must not import `onnxruntime` / `transformers` /
+  `sentence-transformers` / `torch` even when they are installed; the preset path raises a clear
+  `lodedb[embeddings]` install hint when none is.
   Importing LodeDB must **not** load `faiss` / `modal` / `mteb` / `datasets` / `matplotlib`
   / `sklearn` — `tests/test_import_boundary.py` fails closed (fresh subprocess) if it ever
   does. (`scikit-learn` may be *installed* transitively via `sentence-transformers`; the
@@ -76,7 +81,7 @@ tests/                   local SDK suite + import-boundary guard
 ## Develop
 
 ```bash
-uv sync --extra dev --extra mcp --extra langchain --extra llama-index --extra mem0  # build venv (compiles TurboVec)
+uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0  # build venv (compiles TurboVec)
 uv run pytest -q                                                # run the suite
 uv run ruff check .                                             # lint (line-length 100)
 ```

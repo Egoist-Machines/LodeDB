@@ -5,9 +5,9 @@ name: release
 # (OIDC, no stored token), and attach all artifacts to a GitHub Release. The patched TurboVec
 # Rust core is bundled into the lodedb wheel (see pyproject [tool.maturin]), so `pip install
 # lodedb` resolves the patched core with nothing to compile and no extra dependency. Release
-# wheels must also satisfy the base-runtime contract: ONNX Runtime / transformers /
-# sentence-transformers / PyYAML install from the wheel metadata, while `import lodedb` keeps
-# those embedding runtimes lazy.
+# wheels must also satisfy the base-runtime contract: only numpy / typer / PyYAML install from
+# the bare wheel metadata (the embedding runtimes are the opt-in [embeddings]/[torch] extras),
+# while `import lodedb` keeps any installed embedding runtime lazy.
 #
 # One-time setup before the first publish: configure a PyPI Trusted Publisher for project
 # `lodedb` (owner: this repo, workflow: release.yml, environment: pypi). Until that exists the
@@ -102,12 +102,11 @@ jobs:
           if eager:
               raise SystemExit(f"wheel import eagerly loaded heavy runtime modules: {eager}")
 
+          # The bare wheel installs the slim base (vector store only); the embedding runtimes
+          # are the opt-in [embeddings]/[torch] extras, so they are not expected here.
           required = {
               "numpy": "numpy",
               "typer": "typer",
-              "onnxruntime": "onnxruntime",
-              "transformers": "transformers",
-              "sentence-transformers": "sentence_transformers",
               "pyyaml": "yaml",
           }
           missing = [name for name, module in required.items() if importlib.util.find_spec(module) is None]

@@ -83,22 +83,34 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
 ## Install
 
 ```bash
+pip install "lodedb[embeddings]"   # vector store + built-in text embedding (ONNX, no PyTorch)
+```
+
+Prebuilt wheels cover Linux, macOS (Apple Silicon and Intel), and Windows on Python 3.11+, and
+bundle the TurboVec (Rust) core, so there's nothing to compile. Confirm the install with `lodedb
+doctor`.
+
+Bringing your own vectors or embedding model? The base install carries no embedding runtime —
+it's a dependency-light vector store (`open_vector_store` / `add_vectors` / `search_by_vector`,
+or pass your own `embedder=`):
+
+```bash
 pip install lodedb
 ```
 
-That's it. Prebuilt wheels cover Linux, macOS (Apple Silicon and Intel), and Windows on
-Python 3.11+, and bundle the TurboVec (Rust) core, so there's nothing to compile. Confirm
-the install with `lodedb doctor`. Optional extras:
+Optional extras:
 
 ```bash
+pip install "lodedb[embeddings,torch]"               # + PyTorch fallback, CLIP, Apple MPS
 pip install "lodedb[gpu]"                            # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[image]"                          # image + text (CLIP) embedding (model="clip")
 pip install "lodedb[mcp,langchain,llama-index,mem0]" # MCP server + LangChain/LlamaIndex/mem0 adapters
 pip install "lodedb[onnx-export]"                    # export ONNX for a custom model (Optimum); presets need no export
+pip install "lodedb[all]"                            # everything above
 ```
 
-Using LodeDB as memory for a coding assistant? After installing the `mcp` extra, register its
-server in one step (details under [Use as an MCP server](#use-as-an-mcp-server)):
+Using LodeDB as memory for a coding assistant? After installing the `mcp,embeddings` extras,
+register its server in one step (details under [Use as an MCP server](#use-as-an-mcp-server)):
 
 ```bash
 lodedb mcp install --client claude-code        # or: claude-desktop | cursor | lm-studio | codex | all
@@ -107,10 +119,10 @@ lodedb mcp install --client claude-code        # or: claude-desktop | cursor | l
 <details>
 <summary><b>Windows: NVIDIA GPU embeddings</b></summary>
 
-On Windows, PyPI serves the CPU-only PyTorch build by default, so `pip install lodedb` (and
-`uv`) leave embeddings on the CPU even on a CUDA machine, and no package metadata can override
-which torch wheel pip resolves. `lodedb doctor` detects this and prints the fix; `lodedb doctor
---fix` reinstalls the CUDA build for you:
+On Windows, PyPI serves the CPU-only PyTorch build by default, so installing the PyTorch tier
+(`pip install "lodedb[torch]"`, and `uv`) leaves embeddings on the CPU even on a CUDA machine,
+and no package metadata can override which torch wheel pip resolves. `lodedb doctor` detects this
+and prints the fix; `lodedb doctor --fix` reinstalls the CUDA build for you:
 
 ```bash
 lodedb doctor          # flags a CPU-only PyTorch on Windows and prints the command
@@ -139,6 +151,7 @@ Linux). [uv](https://docs.astral.sh/uv/) builds and bundles the core for you:
 ```bash
 git clone https://github.com/Egoist-Machines/LodeDB && cd LodeDB
 uv sync                                 # builds + bundles the TurboVec core via maturin
+uv sync --extra embeddings --extra torch                               # + built-in text embedding (ONNX + PyTorch)
 uv sync --extra mcp --extra langchain --extra llama-index --extra mem0  # + MCP server, adapters
 uv sync --extra gpu                                                     # + GPU-resident scan (Linux/CUDA)
 ```
@@ -273,8 +286,8 @@ db.search_by_vector(query_vector, k=10)
 ```
 
 Or use the built-in `clip` preset for image and text in one shared space, so a text
-query retrieves images and an image query retrieves images and text. It rides the base
-sentence-transformers stack and adds only Pillow (`pip install 'lodedb[image]'`):
+query retrieves images and an image query retrieves images and text. It runs on the
+sentence-transformers stack plus Pillow for decoding, both pulled by `pip install 'lodedb[image]'`:
 
 ```python
 db = LodeDB("./gallery", model="clip")            # downloads clip-ViT-B-32 on first use
@@ -405,11 +418,12 @@ lodedb benchmark   # local, metrics-only benchmark
 
 LodeDB ships a [Model Context Protocol](https://modelcontextprotocol.io) server, so an agent
 can use a local on-disk database as long-term memory or a RAG store. It runs over stdio, adds
-no storage logic of its own, and your data stays on the machine. Install the extra and point
-your host at `lodedb mcp`:
+no storage logic of its own, and your data stays on the machine. The server embeds text to add
+and search, so install the MCP and embedding extras together, then point your host at `lodedb
+mcp`:
 
 ```bash
-pip install "lodedb[mcp]"
+pip install "lodedb[mcp,embeddings]"
 
 # for coding assistant:
 lodedb mcp install --client claude-code  # or: claude-desktop | cursor | lm-studio | codex | all

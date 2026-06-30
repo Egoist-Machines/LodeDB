@@ -1,6 +1,6 @@
 """Import-boundary guards for the public LodeDB package.
 
-Two invariants, each checked in a **fresh subprocess** so the result is
+Three invariants, each checked in a **fresh subprocess** so the result is
 independent of whatever the parent pytest process has already imported
 (``sys.modules`` is process-global, so an in-process check could be polluted by
 an earlier test):
@@ -10,6 +10,10 @@ an earlier test):
 2. LodeDB's lean runtime set holds: importing the package must not pull any
    heavy dependency (faiss / modal / mteb / datasets / matplotlib / sklearn),
    which would otherwise have to be declared and shipped.
+3. Built-in text embedding is opt-in (the ``[embeddings]`` / ``[torch]`` extras),
+   so importing the package must not pull any embedding runtime
+   (onnxruntime / transformers / sentence-transformers / torch) — a base
+   ``pip install lodedb`` is a vector store and must import cleanly without them.
 """
 
 from __future__ import annotations
@@ -28,14 +32,13 @@ if "lodedb.engine.gpu_turbovec" in sys.modules:
     print("EAGER lodedb.engine.gpu_turbovec")
 """
 
-# LodeDB declares a lean runtime set (turbovec, numpy, typer, onnxruntime, transformers,
-# sentence-transformers, pyyaml; extras [onnx-export]/[mcp]/[langchain]/[mem0]/[gpu]). None of
-# the heavy deps below may load when the package is imported, and neither may the embedding
-# runtimes themselves (onnxruntime/transformers/sentence-transformers are imported lazily, only
-# when a backend is actually built). Top-level roots are checked (e.g. `sklearn`, not
-# `sklearn.x`) because importing any submodule pulls the heavy root. `scikit-learn`
-# may be *installed* (transitive via sentence-transformers); this asserts it is not
-# *imported* by simply importing LodeDB.
+# LodeDB declares a lean base runtime set (turbovec, numpy, typer, pyyaml; the embedding
+# runtimes are the opt-in [embeddings]/[torch] extras, and [onnx-export]/[mcp]/[langchain]/
+# [mem0]/[gpu] add the rest). None of the heavy deps below may load when the package is
+# imported. Top-level roots are checked (e.g. `sklearn`, not `sklearn.x`) because importing any
+# submodule pulls the heavy root. `scikit-learn` may be *installed* (transitive via
+# sentence-transformers when the [torch] extra is present); this asserts it is not *imported* by
+# simply importing LodeDB.
 _LEAN_BOUNDARY_PROBE = """
 import importlib, sys
 for _m in ("lodedb", "lodedb.local.db", "lodedb.local.backends", "lodedb.local.cli"):
@@ -83,6 +86,30 @@ if "PIL" in {_name.split(".", 1)[0] for _name in sys.modules}:
     print("EAGER PIL")
 """
 
+# Built-in text embedding is opt-in (the [embeddings]/[torch] extras): the embedding runtimes
+# must not load on a plain import, so a base `pip install lodedb` (a vector store with no
+# embedding deps) imports cleanly. onnxruntime/transformers/sentence-transformers/torch are
+# imported only inside the methods that build a preset/CLIP backend; the bring-your-own-vectors
+# and embedder= paths never build one. The modules below are where that wiring lives.
+_EMBEDDING_RUNTIME_LAZINESS_PROBE = """
+import importlib, sys
+for _m in (
+    "lodedb",
+    "lodedb.local.cli",
+    "lodedb.local.db",
+    "lodedb.local.backends",
+    "lodedb.local.onnx_artifacts",
+    "lodedb.local.presets",
+    "lodedb.engine.embedding_backends",
+):
+    importlib.import_module(_m)
+_FORBIDDEN = ("onnxruntime", "transformers", "sentence_transformers", "torch")
+_loaded = {_name.split(".", 1)[0] for _name in sys.modules}
+for _root in _FORBIDDEN:
+    if _root in _loaded:
+        print("LOADED " + _root)
+"""
+
 
 def _probe_lines(probe: str, marker: str) -> list[str]:
     """Runs a probe in a fresh interpreter and returns the names it flagged."""
@@ -125,3 +152,17 @@ def test_image_extra_stays_lazy_on_import():
     """Importing LodeDB must not eagerly load Pillow (the optional [image] extra)."""
 
     assert _probe_lines(_IMAGE_EXTRA_LAZINESS_PROBE, "EAGER") == []
+
+
+def test_import_does_not_load_embedding_runtime():
+    """Importing LodeDB must not pull any embedding runtime (opt-in [embeddings]/[torch] extras).
+
+    Guards the slim base install: a bring-your-own-vectors / ``embedder=`` user has none of
+    onnxruntime/transformers/sentence-transformers/torch installed, and ``import lodedb`` must
+    still succeed.
+    """
+
+    leaked = _probe_lines(_EMBEDDING_RUNTIME_LAZINESS_PROBE, "LOADED")
+    assert leaked == [], (
+        f"embedding runtimes loaded on import (must stay lazy / opt-in): {leaked}"
+    )
