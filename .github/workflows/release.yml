@@ -154,10 +154,19 @@ jobs:
         run: |
           mkdir -p dist
           ditto -c -k --keepParent swift/LodeDBCore/Artifacts/LodeDBCoreFFI.xcframework dist/LodeDBCoreFFI.xcframework.zip
+      - name: Compute XCFramework checksum for SwiftPM remote binary target
+        run: |
+          # External SwiftPM consumers point .binaryTarget(url:checksum:) at the
+          # uploaded zip; this records the matching checksum alongside the asset.
+          CHECKSUM=$(swift package --package-path swift/LodeDBCore compute-checksum "$PWD/dist/LodeDBCoreFFI.xcframework.zip")
+          echo "$CHECKSUM" | tee dist/LodeDBCoreFFI.xcframework.zip.checksum
+          echo "LodeDBCoreFFI.xcframework.zip SwiftPM checksum: $CHECKSUM"
       - uses: actions/upload-artifact@v4
         with:
           name: swift-xcframework
-          path: dist/LodeDBCoreFFI.xcframework.zip
+          path: |
+            dist/LodeDBCoreFFI.xcframework.zip
+            dist/LodeDBCoreFFI.xcframework.zip.checksum
 
   publish:
     # Publish on a tag push once the Python artifacts (wheels + sdist) are built;

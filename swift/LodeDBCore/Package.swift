@@ -4,16 +4,21 @@ import PackageDescription
 import Foundation
 
 // The native core ships as a prebuilt XCFramework (static `liblodedb_ffi` slices
-// for macOS, iOS device, and iOS simulator, plus the C header as a Clang module).
+// for macOS arm64, iOS device arm64, and iOS simulator arm64, plus the C header as a
+// Clang module). Apple platforms are arm64-only here; an Intel macOS host or x86_64
+// simulator would need extra slices added to scripts/package_xcframework.sh.
 //
-// By default the package links the framework from a local Artifacts/ directory,
-// produced by `scripts/package_xcframework.sh`. A fresh checkout must run that
-// script once before building (the script ends by invoking `swift build`).
-//
-// For tagged releases, set LODEDB_FFI_BINARY_URL + LODEDB_FFI_BINARY_CHECKSUM to
-// point at the hosted XCFramework zip (the value `swift package compute-checksum`
-// prints for the release asset); the manifest then resolves the remote artifact
-// instead of the local path. This is what consumers depending on a release tag get.
+// Resolution:
+//   - Default (no env vars): the local `Artifacts/LodeDBCoreFFI.xcframework`, built by
+//     `scripts/package_xcframework.sh`. This is the in-repo dev/CI path and the only
+//     supported way to build from a checkout; run that script once first (it ends by
+//     invoking `swift build`).
+//   - When LODEDB_FFI_BINARY_URL + LODEDB_FFI_BINARY_CHECKSUM are set, the manifest
+//     resolves that hosted XCFramework zip instead. The release workflow uploads the
+//     zip and records its `swift package compute-checksum` value, so consuming a
+//     released build via SwiftPM means setting those two vars (or pinning a manifest
+//     that hard-codes them). Turnkey tag consumption with no env vars is not wired
+//     yet — a fresh external checkout that sets neither will not find the local path.
 let nativeCore: Target = {
     let env = ProcessInfo.processInfo.environment
     if let urlString = env["LODEDB_FFI_BINARY_URL"],

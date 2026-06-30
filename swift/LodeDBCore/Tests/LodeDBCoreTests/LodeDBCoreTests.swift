@@ -141,6 +141,43 @@ import Testing
     #expect(vector.first?.id == "doc-text")
 }
 
+@Test func concurrentSearchAndAddDoNotRaceTheNativeCore() throws {
+    let db = try LodeDB(vectorDimension: 8)
+    for index in 0..<8 {
+        var vector = Array(repeating: Float(0), count: 8)
+        vector[index] = 1
+        try db.addVector(vector, id: "doc-\(index)", metadata: ["bucket": "\(index)"])
+    }
+    // Warm the lazily built native index before hammering it concurrently.
+    _ = try db.search(vector: [1, 0, 0, 0, 0, 0, 0, 0], k: 3)
+
+    let failures = Atomic(0)
+    DispatchQueue.concurrentPerform(iterations: 64) { iteration in
+        do {
+            if iteration % 4 == 0 {
+                var vector = Array(repeating: Float(0), count: 8)
+                vector[iteration % 8] = 1
+                try db.addVector(vector, id: "extra-\(iteration)", metadata: [:])
+            } else {
+                let hits = try db.search(vector: [0, 1, 0, 0, 0, 0, 0, 0], k: 2)
+                if hits.isEmpty { failures.mutate { $0 += 1 } }
+            }
+        } catch {
+            failures.mutate { $0 += 1 }
+        }
+    }
+    #expect(failures.value == 0)
+    #expect(db.count == 8 + 16) // 16 of the 64 iterations (every 4th) add a unique doc.
+}
+
+private final class Atomic<Value>: @unchecked Sendable {
+    private var value_: Value
+    private let lock = NSLock()
+    init(_ value: Value) { self.value_ = value }
+    var value: Value { lock.lock(); defer { lock.unlock() }; return value_ }
+    func mutate(_ body: (inout Value) -> Void) { lock.lock(); defer { lock.unlock() }; body(&value_) }
+}
+
 private struct HashTestEmbedder: LodeEmbedder {
     let dimension: Int
 
