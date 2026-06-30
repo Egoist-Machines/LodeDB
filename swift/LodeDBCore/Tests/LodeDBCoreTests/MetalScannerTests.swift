@@ -30,13 +30,34 @@ import Testing
     #expect(try scanner.topK(query: [1, 0, 0, 0], vectors: [], count: 0, dim: 4, k: 5).isEmpty)
 }
 
+@Test func topKBreaksTiesByLowerIndexAndHonorsSmallK() throws {
+    let scanner = MetalVectorScanner(preferMetal: false)
+    // Four identical vectors all tie at dot product 1.0; ties break by lower index.
+    let vectors: [Float] = [1, 0, 1, 0, 1, 0, 1, 0]
+    let hits = try scanner.topK(query: [1, 0], vectors: vectors, count: 4, dim: 2, k: 2)
+    #expect(hits.map(\.index) == [0, 1])
+}
+
+@Test func topKReturnsAllWhenKExceedsCount() throws {
+    let scanner = MetalVectorScanner(preferMetal: false)
+    let hits = try scanner.topK(query: [1, 0], vectors: [1, 0, 0, 1], count: 2, dim: 2, k: 10)
+    #expect(hits.count == 2)
+}
+
+@Test func topKThrowsOnOverflowingShapeRatherThanTrapping() throws {
+    let scanner = MetalVectorScanner(preferMetal: false)
+    #expect(throws: LodeDBError.self) {
+        _ = try scanner.topK(query: [0, 0], vectors: [], count: Int.max, dim: 2, k: 1)
+    }
+}
+
 @Test func metalScannerScoresMatchCPUReference() throws {
     // Skip where no Metal device is present (e.g. some headless CI).
     guard MetalVectorScanner.isMetalAvailable else { return }
     let scanner = MetalVectorScanner(preferMetal: true)
     #expect(scanner.backend == .metal)
 
-    let count = 256
+    let count = 257 // non-round, to exercise GPU dispatch with a partial threadgroup
     let dimension = 16
     var vectors = [Float](repeating: 0, count: count * dimension)
     for i in 0..<vectors.count {
