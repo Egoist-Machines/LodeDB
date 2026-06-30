@@ -67,6 +67,10 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
   LlamaIndex adapter.
+- **Swift / iOS bindings**: a native Swift package for macOS and iOS over the same Rust
+  core, with on-device vector, text, and hybrid search, durable storage, metadata filters,
+  late-interaction (MaxSim), and an agent-memory facade. [Swift guide](swift/LodeDBCore/README.md),
+  published as the [`swift-lodedb`](https://github.com/Egoist-Machines/swift-lodedb) SwiftPM package.
 - **Migrate onto LodeDB**: `lodedb migrate` moves an existing LangChain, LlamaIndex, or mem0
   store, or a direct provider such as pgvector, onto a local LodeDB path along a
   plan-first, non-destructive inspect/plan/dry-run/run/validate path.

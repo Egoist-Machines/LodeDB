@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-30
+
+### Added
+
+- **Swift / iOS bindings.** A native Swift package (`LodeDBCore`) for macOS and iOS over the
+  same Rust core, distributed as the
+  [`swift-lodedb`](https://github.com/Egoist-Machines/swift-lodedb) SwiftPM package (a
+  `LodeDBCoreFFI.xcframework` binary target). It covers durable open/persist, vector / text /
+  hybrid search, the full metadata-filter grammar, batched search, late-interaction (MaxSim),
+  on-device embedders (Apple `NLEmbedding` out of the box, or an ONNX parity path with a
+  persisted model-identity guard), and a `LodeMemory` save/recall/forget agent-memory facade.
+  The `.tvim` format is byte-compatible across platforms, so an index built on a server loads
+  on a phone. See [swift/LodeDBCore/README.md](swift/LodeDBCore/README.md) and
+  [docs/swift-agent-contract.md](docs/swift-agent-contract.md).
+
+### Fixed
+
+- **Atomic batch delete.** `delete_documents` now validates every id before mutating, so a
+  blank id later in a batch no longer leaves earlier deletions applied behind a failed request.
+- **WAL replay preserves multi-vector patches.** A crash and reopen before a checkpoint now
+  restores the late-interaction patch matrix, not just the anchor vector.
+
 ## [1.0.0] - 2026-06-29
 
 ### Changed
