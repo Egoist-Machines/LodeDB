@@ -15,7 +15,9 @@ mod tests {
 
     #[test]
     fn exposes_version_constants() {
-        assert_eq!(CORE_VERSION, "1.0.0");
+        // CORE_VERSION tracks the crate version, so check it is populated rather
+        // than pinning a literal that goes stale on every release bump.
+        assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
         assert_eq!(NATIVE_CORE_ABI_VERSION, 1);
     }
