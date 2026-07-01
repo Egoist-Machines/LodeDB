@@ -1,0 +1,133 @@
+{
+  "axis_a": {
+    "axis": "A",
+    "batched_throughput": [
+      {
+        "batch_size": 1,
+        "per_query_ms": 6.8073,
+        "qps": 146.9,
+        "repeats": 20
+      },
+      {
+        "batch_size": 16,
+        "per_query_ms": 0.7082,
+        "qps": 1412.0,
+        "repeats": 20
+      },
+      {
+        "batch_size": 64,
+        "per_query_ms": 0.2377,
+        "qps": 4206.4,
+        "repeats": 15
+      },
+      {
+        "batch_size": 256,
+        "per_query_ms": 0.1429,
+        "qps": 6998.9,
+        "repeats": 3
+      }
+    ],
+    "chunk_character_limit": 360,
+    "corpus_count": 200000,
+    "count_after_ingest": 200000,
+    "dataset": "ccdv/govreport-summarization",
+    "dim": 384,
+    "embed_seconds": 43.17,
+    "footprint": {
+      "by_extension_bytes": {
+        ".json": 49937190,
+        ".lock": 0,
+        ".tvim": 40803090,
+        ".tvtext": 15507880
+      },
+      "file_count": 10,
+      "total_bytes": 106248160
+    },
+    "index_recall_at_k": {
+      "k": 10,
+      "note": "index fidelity vs fp32 brute-force top-k over the same vectors",
+      "query_sample": 1000,
+      "recall": 0.9583
+    },
+    "ingest_seconds": 39.977,
+    "ingest_throughput_per_s": 5002.9,
+    "k": 10,
+    "peak_rss_bytes": 7883120640,
+    "persist_seconds": 47.61,
+    "single_query_latency_ms": {
+      "count": 1000,
+      "mean_ms": 6.466223179999644,
+      "p50_ms": 6.277471999993622,
+      "p95_ms": 7.340571000014506
+    }
+  },
+  "axis_b": {
+    "axis": "B",
+    "chunk_character_limit": 360,
+    "corpus_chunk_count": 151299,
+    "corpus_doc_count": 1500,
+    "count_after_ingest": 151299,
+    "dataset": "Shitao/MLDR/en",
+    "embed_seconds": 41.25,
+    "footprint": {
+      "by_extension_bytes": {
+        ".json": 50175513,
+        ".lock": 0,
+        ".tvim": 30868086,
+        ".tvlex": 82058933,
+        ".tvtext": 15923204
+      },
+      "file_count": 12,
+      "total_bytes": 179025736
+    },
+    "hybrid": {
+      "metrics": {
+        "ndcg@10": 0.9182,
+        "recall@10": 0.965,
+        "recall@100": 0.9875
+      },
+      "mode": "hybrid",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 109.98712057125054,
+        "p50_ms": 113.51498999999876,
+        "p95_ms": 137.78109600002608
+      }
+    },
+    "ingest_seconds": 47.875,
+    "k": 100,
+    "lexical": {
+      "metrics": {
+        "ndcg@10": 0.9115,
+        "recall@10": 0.9513,
+        "recall@100": 0.9775
+      },
+      "mode": "lexical",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 88.19687470250037,
+        "p50_ms": 91.31671400001551,
+        "p95_ms": 110.85016399999859
+      }
+    },
+    "query_count": 800,
+    "vector": {
+      "metrics": {
+        "ndcg@10": 0.8624,
+        "recall@10": 0.9163,
+        "recall@100": 0.965
+      },
+      "mode": "vector",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 5.726954099999445,
+        "p50_ms": 5.6949560000134625,
+        "p95_ms": 6.124193000005107
+      }
+    }
+  },
+  "smoke": false
+}
