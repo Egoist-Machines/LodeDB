@@ -2136,10 +2136,14 @@ def _prepare_vector(
     if not all(math.isfinite(component) for component in values):
         raise ValueError("vector must contain only finite values")
     if normalize:
-        norm = math.sqrt(sum(component * component for component in values))
+        # math.hypot scales internally, so a large-but-finite component (whose square
+        # would overflow float64) does not push the norm to inf and zero the vector.
+        norm = math.hypot(*values)
         if norm == 0.0:
             raise ValueError(
                 "cannot normalize a zero vector; pass a non-zero vector or normalize=False"
             )
+        if not math.isfinite(norm):
+            raise ValueError("vector norm overflows; scale the vector down before adding")
         values = [component / norm for component in values]
     return tuple(values)
