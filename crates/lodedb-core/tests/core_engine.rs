@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::CoreEngine;
 use lodedb_core::types::{
-    CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreVectorDocument,
+    CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
+    CoreVectorDocument,
 };
 use lodedb_core::vector::index::CoreVectorChunk;
 use lodedb_core::vector::turbovec::TurboVecNativeIndex;
@@ -704,6 +705,7 @@ fn persistent_engine_writes_python_compatible_vector_metadata() {
             storage_profile: "turbovec_direct".to_string(),
             vector_dim: 8,
             bit_width: 4,
+            ann: None,
         })
         .unwrap();
     engine
@@ -942,6 +944,7 @@ fn native_wal_vector_records_replay_and_checkpoint() {
             storage_profile: "turbovec_direct".to_string(),
             vector_dim: 8,
             bit_width: 4,
+            ann: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1001,6 +1004,7 @@ fn native_wal_text_apply_records_replay_and_checkpoint() {
             storage_profile: "turbovec_direct".to_string(),
             vector_dim: 8,
             bit_width: 4,
+            ann: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1154,4 +1158,311 @@ fn query_multivector_ranks_documents_by_maxsim() {
     // doc-a: max(axis1)=0 + max(axis2)=1 = 1; doc-b: max(axis1)=1 + max(axis2)=0 = 1.
     assert_eq!(results.hits.len(), 2);
     assert!((results.hits[0].score - 1.0).abs() < 1e-6);
+}
+
+// --- Opt-in ANN (cluster-prune) query path ---
+//
+// ANN generates candidates; the exact TurboVec scan re-scores them and stays the
+// authority. These tests assert the invariants that make the feature safe: exact
+// default unchanged, probe-all reproduces exact, hit scores are the exact scores,
+// well-separated recall matches exact, new vectors stay findable, tiny corpora
+// fall back, and the opt-in config round-trips through persistence.
+
+fn ann_options(clusters: usize, nprobe: usize) -> CoreIndexCreateOptions {
+    let mut options = CoreIndexCreateOptions::native_default("default", 8, 4);
+    options.ann = Some(CoreAnnOptions {
+        algorithm: CoreAnnOptions::CLUSTER.to_string(),
+        clusters: Some(clusters),
+        nprobe: Some(nprobe),
+    });
+    options
+}
+
+fn vector_doc(id: &str, vector: Vec<f32>) -> CoreVectorDocument {
+    CoreVectorDocument {
+        document_id: id.to_string(),
+        vector,
+        metadata: BTreeMap::new(),
+        text: None,
+        patch_matrix: None,
+    }
+}
+
+/// Four well-separated blobs on orthogonal axes, five docs each. Each doc leans a
+/// little further off its blob's axis (a distinct perpendicular component), so
+/// within a blob the cosine to the axis is distinct and there are no score ties.
+fn blob_docs() -> Vec<CoreVectorDocument> {
+    let axes = [0usize, 2, 4, 6];
+    let mut docs = Vec::new();
+    for (blob, &axis) in axes.iter().enumerate() {
+        for i in 0..5 {
+            let mut vector = vec![0.0f32; 8];
+            vector[axis] = 1.0;
+            vector[axis + 1] = 0.02 * (i as f32 + 1.0);
+            docs.push(vector_doc(&format!("b{blob}c{i}"), vector));
+        }
+    }
+    docs
+}
+
+fn hit_keys(results: &CoreSearchResults) -> Vec<(String, u32)> {
+    results
+        .hits
+        .iter()
+        .map(|hit| (hit.chunk_id.clone(), hit.score.to_bits()))
+        .collect()
+}
+
+fn axis_query(axis: usize) -> Vec<f32> {
+    let mut query = vec![0.0f32; 8];
+    query[axis] = 1.0;
+    query
+}
+
+fn exact_engine(docs: &[CoreVectorDocument]) -> CoreEngine {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", docs).unwrap();
+    engine
+}
+
+fn ann_engine(docs: &[CoreVectorDocument], clusters: usize, nprobe: usize) -> CoreEngine {
+    let mut engine = CoreEngine::new_in_memory();
+    engine
+        .create_index_with_options(ann_options(clusters, nprobe))
+        .unwrap();
+    engine.upsert_vectors("default", docs).unwrap();
+    engine
+}
+
+#[test]
+fn ann_probe_all_matches_exact() {
+    // nprobe == clusters probes the whole corpus, so ANN must reproduce the exact
+    // top-k bit for bit (ids, order, and scores).
+    let docs = blob_docs();
+    let exact = exact_engine(&docs);
+    let ann = ann_engine(&docs, 4, 4);
+    for axis in [0usize, 2, 4, 6] {
+        let query = axis_query(axis);
+        let exact_hits = exact.query_vector("default", &query, 5, None).unwrap();
+        let ann_hits = ann.query_vector("default", &query, 5, None).unwrap();
+        assert_eq!(
+            hit_keys(&exact_hits),
+            hit_keys(&ann_hits),
+            "probe-all must equal exact for axis {axis}"
+        );
+    }
+}
+
+#[test]
+fn ann_recovers_exact_top_k_on_separated_clusters() {
+    // With one probe over four well-separated blobs, the query's blob is fully
+    // recovered, so ANN returns exactly the exact top-k.
+    let docs = blob_docs();
+    let exact = exact_engine(&docs);
+    let ann = ann_engine(&docs, 4, 1);
+    let query = axis_query(0);
+    let exact_hits = exact.query_vector("default", &query, 5, None).unwrap();
+    let ann_hits = ann.query_vector("default", &query, 5, None).unwrap();
+    assert_eq!(hit_keys(&exact_hits), hit_keys(&ann_hits));
+    assert!(ann_hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+}
+
+#[test]
+fn ann_hit_scores_match_exact_rescore() {
+    // Every ANN hit carries the exact re-score for its id, proving ANN only picks
+    // candidates and never surfaces an approximate centroid score.
+    let docs = blob_docs();
+    let exact = exact_engine(&docs);
+    let ann = ann_engine(&docs, 4, 1);
+    let query = axis_query(0);
+    let exact_hits = exact.query_vector("default", &query, 5, None).unwrap();
+    let exact_scores: BTreeMap<String, u32> = exact_hits
+        .hits
+        .iter()
+        .map(|hit| (hit.chunk_id.clone(), hit.score.to_bits()))
+        .collect();
+    let ann_hits = ann.query_vector("default", &query, 5, None).unwrap();
+    assert!(!ann_hits.hits.is_empty());
+    for hit in &ann_hits.hits {
+        assert_eq!(
+            exact_scores.get(&hit.chunk_id),
+            Some(&hit.score.to_bits()),
+            "ANN hit {} must have the exact re-score",
+            hit.chunk_id
+        );
+    }
+}
+
+#[test]
+fn ann_finds_newly_upserted_vector() {
+    // A mutation invalidates the cluster cache; the next query rebuilds over the
+    // current documents, so a newly-upserted vector is clustered and findable. A
+    // stale cache (still holding only the original 20 docs) would leave the new
+    // vector out of every posting, so finding it proves the rebuild happened.
+    let mut ann = ann_engine(&blob_docs(), 4, 1);
+    let query = axis_query(0);
+    // First query builds the cluster cache over the original corpus.
+    let _ = ann.query_vector("default", &query, 6, None).unwrap();
+    // A vector aligned with blob 0; it joins blob 0's cluster on rebuild.
+    ann.upsert_vectors("default", &[vector_doc("newtop", axis_query(0))])
+        .unwrap();
+    let hits = ann.query_vector("default", &query, 6, None).unwrap();
+    assert!(
+        hits.hits.iter().any(|hit| hit.document_id == "newtop"),
+        "a newly-upserted vector must be findable after cache invalidation"
+    );
+    // And removal drops it again (cache invalidated, and the scan drops absent ids).
+    ann.delete_documents("default", &["newtop".to_string()])
+        .unwrap();
+    let after = ann.query_vector("default", &query, 6, None).unwrap();
+    assert!(after.hits.iter().all(|hit| hit.document_id != "newtop"));
+}
+
+#[test]
+fn ann_returns_full_top_k_when_nearest_cluster_is_small() {
+    // Eight orthogonal blobs of five. A single probe reaches only five docs, but
+    // top_k=8 must still return eight: the probe set expands to the next cluster
+    // rather than clamping to the nearest cluster's size.
+    let mut docs = Vec::new();
+    for axis in 0..8usize {
+        for i in 0..5 {
+            let mut vector = vec![0.0f32; 8];
+            vector[axis] = 1.0 + 0.01 * i as f32;
+            docs.push(vector_doc(&format!("a{axis}c{i}"), vector));
+        }
+    }
+    let ann = ann_engine(&docs, 8, 1);
+    let hits = ann.query_vector("default", &axis_query(0), 8, None).unwrap();
+    assert_eq!(hits.hits.len(), 8);
+}
+
+#[test]
+fn ann_batch_queries_match_looping_singles() {
+    // With ANN enabled, a batch query must return the same hits as looping the
+    // single-query API, for both the struct and the flat-arrays batch paths.
+    let docs = blob_docs();
+    let ann = ann_engine(&docs, 4, 1);
+    let queries: Vec<Vec<f32>> = [0usize, 2, 4, 6].iter().map(|&a| axis_query(a)).collect();
+
+    let batch = ann.query_vectors_batch("default", &queries, 5, None).unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let single = ann.query_vector("default", query, 5, None).unwrap();
+        assert_eq!(hit_keys(&batch[i]), hit_keys(&single), "batch != single at {i}");
+    }
+
+    let flat: Vec<f32> = queries.iter().flatten().copied().collect();
+    let arrays = ann
+        .query_vectors_batch_arrays("default", &flat, 8, 5, None)
+        .unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let single = ann.query_vector("default", query, 5, None).unwrap();
+        let start = i * arrays.k;
+        let ids: Vec<&str> = arrays.document_ids[start..start + single.hits.len()]
+            .iter()
+            .map(|id| id.as_str())
+            .collect();
+        let single_ids: Vec<&str> = single
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect();
+        assert_eq!(ids, single_ids, "arrays batch != single at {i}");
+    }
+}
+
+#[test]
+fn ann_tiny_corpus_falls_back_to_exact() {
+    // Fewer vectors than can form a cluster: ANN must fall back to the exact scan,
+    // not panic or drop the single result.
+    let mut ann = CoreEngine::new_in_memory();
+    ann.create_index_with_options(ann_options(4, 1)).unwrap();
+    ann.upsert_vectors("default", &[vector_doc("only", axis_query(0))])
+        .unwrap();
+    let hits = ann.query_vector("default", &axis_query(0), 3, None).unwrap();
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].document_id, "only");
+}
+
+#[test]
+fn rejects_invalid_ann_options() {
+    let cases = [
+        ("hnsw", None, None),
+        (CoreAnnOptions::CLUSTER, Some(0), None),
+        (CoreAnnOptions::CLUSTER, None, Some(0)),
+    ];
+    for (index, (algorithm, clusters, nprobe)) in cases.into_iter().enumerate() {
+        let mut engine = CoreEngine::new_in_memory();
+        let mut options =
+            CoreIndexCreateOptions::native_default(format!("idx{index}"), 8, 4);
+        options.ann = Some(CoreAnnOptions {
+            algorithm: algorithm.to_string(),
+            clusters,
+            nprobe,
+        });
+        assert!(
+            engine.create_index_with_options(options).is_err(),
+            "case {index} must be rejected"
+        );
+    }
+}
+
+/// Recursively concatenates every persisted `.json` payload under `dir`.
+fn read_persisted_json(dir: &Path) -> String {
+    let mut out = String::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push_str(&read_persisted_json(&path));
+        } else if path.extension().is_some_and(|ext| ext == "json") {
+            if let Ok(text) = fs::read_to_string(&path) {
+                out.push_str(&text);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn ann_config_persists_and_survives_reopen() {
+    let path = unique_temp_dir("core_ann_reopen");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let mut options = ann_options(4, 1);
+    options.index_key = INDEX_KEY.to_string();
+    options.client_id_hash = INDEX_KEY.to_string();
+    engine.create_index_with_options(options).unwrap();
+    engine.upsert_vectors("default", &blob_docs()).unwrap();
+    engine.persist().unwrap();
+    // The opt-in config is written to the persisted state header.
+    assert!(read_persisted_json(&path).contains("\"ann\""));
+    drop(engine);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    // The load path parsed the persisted ann config and the cluster index
+    // rebuilds lazily from the reconstructed rows; the query still recovers the
+    // exact blob-0 top-k over this well-separated corpus.
+    let hits = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert_eq!(hits.hits.len(), 5);
+    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn exact_index_state_header_omits_ann() {
+    // An exact-only index must not write the ann key, keeping its state header
+    // byte-identical to before the feature.
+    let path = unique_temp_dir("core_ann_absent");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", &blob_docs()).unwrap();
+    engine.persist().unwrap();
+    assert!(!read_persisted_json(&path).contains("\"ann\""));
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
 }

@@ -144,6 +144,35 @@ pub struct CoreIndexCreateOptions {
     pub storage_profile: String,
     pub vector_dim: usize,
     pub bit_width: usize,
+    /// Opt-in approximate-nearest-neighbor acceleration. `None` (the default)
+    /// leaves the index exact-scan only, byte-for-byte as before. When set, the
+    /// query path generates candidates from an in-memory cluster index and the
+    /// exact TurboVec scan re-scores them as the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ann: Option<CoreAnnOptions>,
+}
+
+/// Approximate-nearest-neighbor tuning for an index.
+///
+/// Only `algorithm = "cluster"` (IVF-style cluster pruning) is supported today.
+/// The tuning knobs are optional; unset fields fall back to corpus-derived
+/// defaults. The struct is additive so new algorithms and knobs can be added
+/// without breaking persisted options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreAnnOptions {
+    /// ANN algorithm; the only supported value is `"cluster"`.
+    pub algorithm: String,
+    /// Number of clusters to build. Defaults to a `sqrt(corpus)` heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clusters: Option<usize>,
+    /// Clusters probed per query. Defaults to `ceil(sqrt(clusters))`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nprobe: Option<usize>,
+}
+
+impl CoreAnnOptions {
+    /// ANN algorithm value for IVF-style cluster pruning.
+    pub const CLUSTER: &'static str = "cluster";
 }
 
 impl CoreIndexCreateOptions {
@@ -166,6 +195,7 @@ impl CoreIndexCreateOptions {
             storage_profile: "native-core".to_string(),
             vector_dim,
             bit_width,
+            ann: None,
         }
     }
 }
