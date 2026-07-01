@@ -146,6 +146,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
     let wal_path = wal::wal_path(&temp, INDEX_KEY);
     wal::append_record(
         &wal_path,
+        2,
         "upsert_documents",
         &json!({
             "client_id": "lodedb-local",

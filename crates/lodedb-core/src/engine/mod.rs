@@ -359,6 +359,7 @@ impl CoreEngine {
         if !wal_vectors.is_empty() {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "upsert_vectors",
                 serde_json::json!({ "vectors": wal_vectors }),
             )?;
@@ -427,6 +428,7 @@ impl CoreEngine {
         if deleted > 0 {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "delete_documents",
                 serde_json::json!({
                     "document_ids": document_ids,
@@ -548,6 +550,7 @@ impl CoreEngine {
         }
         self.append_wal_record(
             &index_key,
+            generation,
             "update_document_payload",
             Value::Object(payload),
         )?;
@@ -810,6 +813,7 @@ impl CoreEngine {
         if append_wal && !plan.documents.is_empty() {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "apply_embedded_documents",
                 serde_json::json!({
                     "documents": wal_documents,
@@ -1437,6 +1441,7 @@ impl CoreEngine {
     fn append_wal_record(
         &self,
         index_key: &str,
+        lsn: u64,
         op: &str,
         payload: Value,
     ) -> Result<(), CoreError> {
@@ -1448,6 +1453,7 @@ impl CoreEngine {
         }
         crate::storage::wal::append_record(
             &crate::storage::wal::wal_path(&persistence.path, index_key),
+            lsn,
             op,
             &payload,
             persistence.fsync,
@@ -1809,6 +1815,25 @@ impl CoreEngine {
                 ))?;
                 if !records.is_empty() {
                     if records.iter().all(is_native_replayable_wal_record) {
+                        // Replay only records the loaded generation has not already
+                        // folded in. A record whose LSN is below the base was durably
+                        // checkpointed, so it is skipped; one at or above the base is
+                        // replayed. The boundary is inclusive because an empty store
+                        // checkpoints at generation 1 (via `generation.max(1)`) while
+                        // its first mutation is also LSN 1, so `> base` would drop that
+                        // first write; re-applying an already-folded record at or above
+                        // the base is idempotent anyway. Pre-LSN records carry no
+                        // watermark and are always replayed.
+                        //
+                        // The post-replay generation is left to the per-record advance
+                        // and is deliberately NOT pinned back to the WAL watermark: the
+                        // counter doubles as the immutable generation epoch, so a replay
+                        // that applies any record must checkpoint onto a fresh epoch
+                        // (the advance guarantees that), while a replay that applies
+                        // nothing leaves the base untouched and `persist()` no-ops on it
+                        // (nothing pending). Either way no committed epoch is rewritten
+                        // in place.
+                        let base_generation = loaded.generation;
                         let index =
                             index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
                         let index_id = index.index_id.clone();
@@ -1816,6 +1841,10 @@ impl CoreEngine {
                         self.replaying_wal = true;
                         let replay_result = records
                             .iter()
+                            .filter(|record| match record.lsn {
+                                Some(lsn) => lsn >= base_generation,
+                                None => true,
+                            })
                             .try_for_each(|record| self.apply_native_wal_record(&index_id, record));
                         self.replaying_wal = false;
                         replay_result?;

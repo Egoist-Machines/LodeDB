@@ -15,6 +15,10 @@ pub const WAL_SCHEMA_VERSION: u32 = 1;
 pub struct WalRecord {
     pub op: String,
     pub payload: Value,
+    /// Log sequence number: the writer's generation counter at the mutation
+    /// that produced this record. `None` for pre-LSN WALs read back from older
+    /// stores, which carry no watermark and are always replayed in full.
+    pub lsn: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +36,14 @@ pub fn wal_path(persistence_dir: &Path, index_key: &str) -> PathBuf {
     persistence_dir.join(format!("{index_key}{WAL_SUFFIX}"))
 }
 
-pub fn append_record(path: &Path, op: &str, payload: &Value, fsync: bool) -> CoreResult<WalAppend> {
-    let body = encode_body(op, payload)?;
+pub fn append_record(
+    path: &Path,
+    lsn: u64,
+    op: &str,
+    payload: &Value,
+    fsync: bool,
+) -> CoreResult<WalAppend> {
+    let body = encode_body(op, payload, lsn)?;
     let mut frame = Vec::with_capacity(4 + body.len() + 4);
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
@@ -94,7 +104,7 @@ pub fn scan_stats(path: &Path) -> CoreResult<WalStats> {
     let records = read_records(path)?;
     let mut byte_count = 0;
     for record in &records {
-        let body = encode_body(&record.op, &record.payload)?;
+        let body = encode_body(&record.op, &record.payload, record.lsn.unwrap_or(0))?;
         byte_count += 4 + body.len() + 4;
     }
     Ok(WalStats {
@@ -216,25 +226,36 @@ fn decode_body(body: &[u8]) -> CoreResult<WalRecord> {
     let op = std::str::from_utf8(&body[..newline])
         .map_err(|error| corrupt(format!("WAL record op is not UTF-8: {error}")))?
         .to_string();
-    let payload: Value = serde_json::from_slice(&body[newline + 1..])
+    let mut payload: Value = serde_json::from_slice(&body[newline + 1..])
         .map_err(|error| corrupt(format!("WAL record payload is not valid JSON: {error}")))?;
     if !payload.is_object() {
         return Err(corrupt("WAL record payload must be a JSON object"));
     }
-    Ok(WalRecord { op, payload })
+    // Lift the framing sequence number out of the body so replay sees only the
+    // op payload; a record from a pre-LSN WAL simply has no `lsn` key.
+    let lsn = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("lsn"))
+        .and_then(|value| value.as_u64());
+    Ok(WalRecord { op, payload, lsn })
 }
 
-fn encode_body(op: &str, payload: &Value) -> CoreResult<Vec<u8>> {
+fn encode_body(op: &str, payload: &Value, lsn: u64) -> CoreResult<Vec<u8>> {
     if op.is_empty() || op.contains('\n') {
         return Err(corrupt("WAL record op must be non-empty and newline-free"));
     }
-    if !payload.is_object() {
+    let Some(object) = payload.as_object() else {
         return Err(corrupt("WAL record payload must be a JSON object"));
-    }
+    };
+    // Stamp the log sequence number into the JSON body rather than the binary
+    // frame, so the frame layout (and the committed cross-version WAL fixtures)
+    // stays byte-compatible. `decode_body` lifts it back out on read.
+    let mut object = object.clone();
+    object.insert("lsn".to_string(), Value::from(lsn));
     let mut body = Vec::new();
     body.extend_from_slice(op.as_bytes());
     body.push(b'\n');
-    let payload = serde_json::to_vec(payload)
+    let payload = serde_json::to_vec(&Value::Object(object))
         .map_err(|error| corrupt(format!("WAL payload could not be encoded: {error}")))?;
     body.extend_from_slice(&payload);
     Ok(body)
@@ -647,10 +668,11 @@ mod tests {
     fn appends_and_reads_framed_records() {
         let dir = temp_dir("append-read");
         let path = dir.join("default.wal");
-        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
             .expect("append first");
         let append = append_record(
             &path,
+            2,
             "delete_documents",
             &json!({"document_ids": ["alpha"]}),
             false,
@@ -661,6 +683,10 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].op, "upsert_documents");
         assert_eq!(records[1].payload["document_ids"], json!(["alpha"]));
+        // The sequence number round-trips and is lifted back out of the payload.
+        assert_eq!(records[0].lsn, Some(1));
+        assert_eq!(records[1].lsn, Some(2));
+        assert!(records[1].payload.get("lsn").is_none());
         // op_count/byte_count come from an explicit scan, not the append hot path.
         let stats = scan_stats(&path).expect("scan stats");
         assert_eq!(stats.op_count, 2);
@@ -671,10 +697,11 @@ mod tests {
     fn drops_torn_trailing_frame() {
         let dir = temp_dir("torn-tail");
         let path = dir.join("default.wal");
-        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
+            2,
             "delete_documents",
             &json!({"document_ids": ["alpha"]}),
             false,
@@ -694,10 +721,11 @@ mod tests {
     fn corrupt_interior_frame_fails_closed() {
         let dir = temp_dir("interior-corrupt");
         let path = dir.join("default.wal");
-        append_record(&path, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
+            2,
             "delete_documents",
             &json!({"document_ids": ["alpha"]}),
             false,
@@ -725,6 +753,7 @@ mod tests {
                         "metadata": {"kind": "text"}
                     }]
                 }),
+                lsn: Some(1),
             },
             WalRecord {
                 op: "apply_embedded_documents".to_string(),
@@ -744,6 +773,7 @@ mod tests {
                     }],
                     "removed_chunk_ids": []
                 }),
+                lsn: Some(2),
             },
             WalRecord {
                 op: "apply_embedded_documents".to_string(),
@@ -763,6 +793,7 @@ mod tests {
                     }],
                     "removed_chunk_ids": []
                 }),
+                lsn: Some(3),
             },
         ];
         let mut store = LoadedStore {
@@ -798,6 +829,7 @@ mod tests {
         let wal = wal_path(&dir, index_key);
         append_record(
             &wal,
+            1,
             "upsert_documents",
             &json!({
                 "documents": [{

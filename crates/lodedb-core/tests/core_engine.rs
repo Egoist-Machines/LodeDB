@@ -985,6 +985,94 @@ fn native_wal_vector_records_replay_and_checkpoint() {
 }
 
 #[test]
+fn native_wal_replay_advances_to_a_fresh_generation() {
+    // A crash after mutating but before checkpointing leaves the writes only in
+    // the WAL. Recovery must fold them into a FRESH generation epoch: the counter
+    // doubles as the immutable epoch id, so re-checkpointing must never rewrite
+    // the committed base epoch in place (that would break crash-atomicity).
+    let path = unique_temp_dir("core_wal_generation");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+        })
+        .unwrap();
+    engine.persist().unwrap();
+    let first = engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-a".to_string(),
+                vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    let second = engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-b".to_string(),
+                vector: vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(second.generation, 2);
+    // Drop without persisting: the WAL holds LSN 1 and 2 while the manifest is
+    // still the empty checkpoint at generation 1.
+    drop(engine);
+
+    let mut reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    // No loss and no duplication after replay.
+    assert_eq!(reopened.stats("default").unwrap().document_count, 2);
+    // Recovery advanced the generation past the recovered base rather than pinning
+    // it back onto the committed epoch, so the next write's generation is strictly
+    // greater than the last pre-crash write's.
+    let third = reopened
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-c".to_string(),
+                vector: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    assert!(
+        third.generation > second.generation,
+        "generation must advance past the pre-crash base, got {}",
+        third.generation
+    );
+    assert_eq!(reopened.stats("default").unwrap().document_count, 3);
+    drop(reopened);
+
+    // The recovery checkpoint is a valid committed generation: a clean reopen
+    // still sees all three documents.
+    let final_open = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert_eq!(final_open.stats("default").unwrap().document_count, 3);
+    drop(final_open);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn native_wal_text_apply_records_replay_and_checkpoint() {
     let path = unique_temp_dir("core_text_wal");
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
