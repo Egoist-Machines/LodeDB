@@ -311,7 +311,6 @@ pub fn write_generation_commit(
         document_count,
         chunk_count,
         json_manifest: Some(json_manifest),
-        tvim_present: tvim_manifest.is_some(),
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
@@ -462,11 +461,6 @@ pub fn write_generation_delta(
         }
         _ => previous.store_manifest("tvim").cloned(),
     };
-    let tvim_present = previous
-        .body
-        .get("tvim_present")
-        .and_then(Value::as_bool)
-        .unwrap_or(tvim_manifest.is_some());
 
     let text_manifest = match input.raw_text_upserts {
         Some(upserts) if !upserts.is_empty() || !input.document_deletes.is_empty() => {
@@ -521,7 +515,6 @@ pub fn write_generation_delta(
         document_count: input.document_count_after,
         chunk_count: input.chunk_count_after,
         json_manifest: Some(json_manifest),
-        tvim_present,
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,

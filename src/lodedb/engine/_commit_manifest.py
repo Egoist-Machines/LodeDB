@@ -179,7 +179,6 @@ def build_commit_body(
     chunk_count: int,
     json_manifest: dict[str, Any] | None,
     tvim_manifest: dict[str, Any] | None,
-    tvim_present: bool,
     tvtext_manifest: dict[str, Any] | None,
     tvlex_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -204,7 +203,6 @@ def build_commit_body(
         "chunk_count": int(chunk_count),
         "json": json_manifest,
         "tvim": tvim_manifest,
-        "tvim_present": bool(tvim_present),
         "tvtext": tvtext_manifest,
         "tvlex": tvlex_manifest,
     }
