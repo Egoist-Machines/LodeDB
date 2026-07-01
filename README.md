@@ -7,7 +7,7 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
+LodeDB is great for local RAG; it's _extremely fast_, exact by default, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
 compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
 about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
 documents, per framework default:
