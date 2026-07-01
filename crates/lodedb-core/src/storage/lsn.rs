@@ -44,22 +44,62 @@ pub fn reserve(
     floor: u64,
     fsync: bool,
 ) -> CoreResult<u64> {
+    with_reserved(persistence_dir, index_key, count, floor, fsync, Ok)
+}
+
+/// Reserves `count` LSNs and runs `body` with the first of the range while the
+/// counter lock is still held, returning whatever `body` returns.
+///
+/// The counter is advanced and persisted before `body` runs, so the LSNs are
+/// spent even if `body` fails (an un-written tail simply becomes an LSN gap,
+/// never a reuse). Holding the lock across `body` is what lets a concurrent WAL
+/// append keep file order aligned with LSN order: an appender reserves and
+/// writes its frames as one critical section, so a second appender cannot slot
+/// a lower-numbered frame in between. `body` must therefore be short (a WAL
+/// append), never a checkpoint or other long operation. See [`reserve`] for the
+/// argument contract.
+pub fn with_reserved<T>(
+    persistence_dir: &Path,
+    index_key: &str,
+    count: u64,
+    floor: u64,
+    fsync: bool,
+    body: impl FnOnce(u64) -> CoreResult<T>,
+) -> CoreResult<T> {
     if count == 0 {
         return Err(corrupt("LSN reservation count must be non-zero"));
     }
+    with_lock(persistence_dir, index_key, |file| {
+        let current = read_value(file)?.unwrap_or(0).max(floor);
+        let next = current
+            .checked_add(count)
+            .ok_or_else(|| corrupt("LSN counter would overflow u64"))?;
+        write_value(file, next, fsync)?;
+        body(current + 1)
+    })
+}
+
+/// Runs `body` while holding the counter's exclusive lock, handing it the open
+/// counter file. This is the append serialization point: [`with_reserved`] takes
+/// it to reserve LSNs and write WAL frames, and an appender's open takes it to
+/// inspect and repair the WAL without racing a concurrent append. `body` must be
+/// short (a counter update or a WAL append/repair), never a checkpoint.
+pub fn with_lock<T>(
+    persistence_dir: &Path,
+    index_key: &str,
+    body: impl FnOnce(&mut File) -> CoreResult<T>,
+) -> CoreResult<T> {
     let path = lsn_path(persistence_dir, index_key);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| corrupt(format!("LSN counter directory could not be created: {error}")))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            corrupt(format!("LSN counter directory could not be created: {error}"))
+        })?;
     }
     let mut file = open_exclusive(&path)?;
-    let current = read_value(&mut file)?.unwrap_or(0).max(floor);
-    let next = current
-        .checked_add(count)
-        .ok_or_else(|| corrupt("LSN counter would overflow u64"))?;
-    write_value(&mut file, next, fsync)?;
-    // Dropping `file` releases the OS lock and closes the handle.
-    Ok(current + 1)
+    let result = body(&mut file);
+    // Hold the lock until `body` returns, then release it by dropping the handle.
+    drop(file);
+    result
 }
 
 /// Reads the highest LSN the counter has handed out, or `None` when the counter

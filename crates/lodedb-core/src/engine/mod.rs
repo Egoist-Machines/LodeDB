@@ -1909,10 +1909,30 @@ struct PersistentLock {
 
 /// Outcome of one non-blocking attempt to take the writer lock.
 enum TryLock {
-    /// Another writer holds the sentinel; retry until the timeout elapses.
+    /// Another holder blocks this mode; retry until the timeout elapses.
     Contended,
     /// A failure that retrying will not resolve.
     Fatal(CoreError),
+}
+
+/// Whether a lock hold is exclusive (a single writer) or shared (concurrent
+/// appenders). Many shared holds coexist, but a shared hold and an exclusive
+/// hold always exclude each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Exclusive,
+    Shared,
+}
+
+impl LockMode {
+    fn contention_message(self) -> &'static str {
+        match self {
+            // Kept verbatim: the Python engine matches this substring to detect
+            // writer-lock contention and fall back to its own writer.
+            LockMode::Exclusive => "another writer holds the lodedb lock",
+            LockMode::Shared => "an exclusive writer holds the lodedb lock",
+        }
+    }
 }
 
 /// Opens (creating if needed) the lock sentinel without taking the lock. Used by
@@ -1943,16 +1963,33 @@ impl PersistentLock {
     /// releases when the handle is dropped and the sentinel file is left in place,
     /// matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
     fn acquire(path: &Path) -> Result<Self, CoreError> {
+        Self::acquire_with_timeout(path, LockMode::Exclusive, lock_timeout_seconds())
+    }
+
+    /// Takes a shared hold: many shared holders coexist, but a shared hold still
+    /// excludes (and is excluded by) an exclusive writer. Concurrent WAL
+    /// appenders take this so they run together yet never overlap the exclusive
+    /// checkpointing writer, which is what keeps their appends from racing a WAL
+    /// truncation.
+    fn acquire_shared(path: &Path) -> Result<Self, CoreError> {
+        Self::acquire_with_timeout(path, LockMode::Shared, lock_timeout_seconds())
+    }
+
+    fn acquire_with_timeout(
+        path: &Path,
+        mode: LockMode,
+        timeout_secs: f64,
+    ) -> Result<Self, CoreError> {
         let lock_path = path.join(".lodedb.lock");
-        let deadline = Instant::now() + Duration::from_secs_f64(lock_timeout_seconds());
+        let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
-            match Self::try_lock(&lock_path) {
+            match Self::try_lock(&lock_path, mode) {
                 Ok(file) => return Ok(Self { _file: file }),
                 Err(TryLock::Contended) => {
                     if Instant::now() >= deadline {
                         return Err(CoreError::new(
                             CoreErrorCode::InvalidArgument,
-                            "another writer holds the lodedb lock".to_string(),
+                            mode.contention_message().to_string(),
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(25));
@@ -1964,10 +2001,14 @@ impl PersistentLock {
 
     /// One non-blocking attempt to open and exclusively lock the sentinel.
     #[cfg(unix)]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
         use rustix::fs::{flock, FlockOperation};
         let file = open_sentinel(lock_path).map_err(TryLock::Fatal)?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        let operation = match mode {
+            LockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+            LockMode::Shared => FlockOperation::NonBlockingLockShared,
+        };
+        match flock(&file, operation) {
             Ok(()) => Ok(file),
             Err(err)
                 if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
@@ -1985,16 +2026,24 @@ impl PersistentLock {
     /// the equivalent. A second writer's open fails with ``ERROR_SHARING_VIOLATION``
     /// until the holding handle drops on close or process exit.
     #[cfg(windows)]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
         use std::os::windows::fs::OpenOptionsExt;
         const ERROR_SHARING_VIOLATION: i32 = 32;
         const ERROR_LOCK_VIOLATION: i32 = 33;
+        // A true shared hold would need CreateFile share modes, but those do not
+        // interoperate with the Python writer lock, which takes an `msvcrt` byte
+        // lock the share mode cannot see (and `msvcrt` has no shared byte lock to
+        // match). So on Windows a shared hold degrades to exclusive (share_mode 0):
+        // appenders serialize here, but they still correctly exclude both native
+        // and Python exclusive writers. Unix keeps a true shared `flock`.
+        let _ = mode;
+        let share_mode: u32 = 0;
         match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .share_mode(0)
+            .share_mode(share_mode)
             .open(lock_path)
         {
             Ok(file) => Ok(file),
@@ -2017,7 +2066,7 @@ impl PersistentLock {
     // sentinel keeps behaviour uniform (no cross-process exclusion, but these are
     // not a multi-writer target).
     #[cfg(not(any(unix, windows)))]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, _mode: LockMode) -> Result<File, TryLock> {
         open_sentinel(lock_path).map_err(TryLock::Fatal)
     }
 }
@@ -2031,6 +2080,224 @@ fn lock_timeout_seconds() -> f64 {
             .filter(|v| *v >= 0.0)
             .unwrap_or(30.0),
         Err(_) => 30.0,
+    }
+}
+
+/// A shared-lock appender for concurrent multi-writer ingest.
+///
+/// It durably logs self-contained vector-in records to a store's WAL for a later
+/// exclusive writer to fold in on its next open, without holding the exclusive
+/// writer lock. Many appenders run at once (they take the shared lock, which
+/// excludes only the checkpointing writer, so an append can never race a WAL
+/// truncation), and each append reserves a log sequence number and writes its
+/// frame under one hold of the counter lock, so LSN order matches WAL file order.
+///
+/// The appender never reconstructs the vector index, mutates in memory, or
+/// checkpoints. It validates each vector against the persisted index shape so a
+/// malformed record cannot poison a later replay. It is vector-in only (vector
+/// plus metadata); raw document text is not logged.
+pub struct CoreAppender {
+    path: PathBuf,
+    index_key: String,
+    vector_dim: usize,
+    // The highest LSN already durable in the store when this appender opened. The
+    // allocator clamps every reservation up to it, so appended LSNs never collide
+    // with an exclusive writer's generation-based LSNs from a prior session.
+    floor: u64,
+    fsync: bool,
+    // Held for the appender's lifetime; dropping it releases the shared lock.
+    // `None` when the caller opts out of the shared lock (`acquire_writer_lock`
+    // false) because an outer coordinator owns exclusion, matching CoreEngine.
+    _lock: Option<PersistentLock>,
+}
+
+impl CoreAppender {
+    /// Opens the single index at `options.path` for shared appending. Fails if
+    /// the path holds no index or more than one, or if an exclusive writer
+    /// currently holds the lock.
+    pub fn open(options: CoreOpenOptions) -> Result<Self, CoreError> {
+        let path = PathBuf::from(&options.path);
+        if !path.is_dir() {
+            return Err(invalid_err("append path does not exist"));
+        }
+        // Appends reach the index only through the WAL, which a generation-mode
+        // writer never replays, so appending is meaningful in WAL mode only.
+        if options.commit_mode != "wal" {
+            return Err(invalid_err(
+                "append requires wal commit mode; generation mode does not replay the WAL",
+            ));
+        }
+        // Take the shared lock first: once it is held no exclusive writer is
+        // active, so the shape and LSN floor read below cannot change under us. A
+        // caller that manages exclusion itself opts out with acquire_writer_lock.
+        let lock = if options.acquire_writer_lock {
+            Some(PersistentLock::acquire_shared(&path)?)
+        } else {
+            None
+        };
+        let mut index_keys = Vec::new();
+        for entry in fs::read_dir(&path).map_err(core_io_error)? {
+            let entry = entry.map_err(core_io_error)?;
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(index_key) = name.strip_suffix(".commit.json") {
+                    index_keys.push(index_key.to_string());
+                }
+            }
+        }
+        let index_key = match index_keys.as_slice() {
+            [key] => key.clone(),
+            [] => return Err(invalid_err("no index to append to at this path")),
+            _ => return Err(invalid_err("append requires exactly one index at the path")),
+        };
+        let loaded = crate::storage::load_store(
+            &path,
+            &index_key,
+            crate::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )?;
+        let vector_dim = loaded
+            .state
+            .get("native_dim")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        if vector_dim == 0 {
+            return Err(invalid_err("index has no vector dimension to append against"));
+        }
+        // Under the counter lock (so no concurrent appender is mid-write), scan the
+        // WAL to seed the LSN floor and repair any torn tail a crash left behind.
+        // Without the repair this appender's frames would land after the torn bytes
+        // and be silently dropped by the next writer's replay. The floor is the max
+        // of the committed generation and the WAL's highest LSN, so a reserved LSN
+        // is always above every LSN already on disk.
+        let wal_path = crate::storage::wal::wal_path(&path, &index_key);
+        let base_generation = loaded.generation;
+        let floor = crate::storage::lsn::with_lock(&path, &index_key, |_| {
+            let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
+            Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
+            // Refuse if the WAL already holds records only the Python engine can
+            // replay (e.g. a text `upsert_documents` tail): a native writer fails on
+            // that prefix in `load_persisted_indexes` before it reaches anything we
+            // append, which would strand acknowledged records behind it. A writer
+            // must recover such a store first.
+            if !scan.records.iter().all(is_native_replayable_wal_record) {
+                return Err(invalid_err(
+                    "the store's WAL has records only the Python engine can replay; \
+                     open it with a writer to recover before appending",
+                ));
+            }
+            let wal_max_lsn = scan
+                .records
+                .iter()
+                .filter_map(|record| record.lsn)
+                .max()
+                .unwrap_or(0);
+            Ok(base_generation.max(wal_max_lsn))
+        })?;
+        Ok(Self {
+            path,
+            index_key,
+            vector_dim,
+            floor,
+            fsync: options.durability == "fsync",
+            _lock: lock,
+        })
+    }
+
+    /// Durably appends one `upsert_vectors` record for `documents`, returning the
+    /// LSN assigned to it.
+    pub fn append_vectors(&self, documents: &[CoreVectorDocument]) -> Result<u64, CoreError> {
+        if documents.is_empty() {
+            return Err(invalid_err("append_vectors requires at least one document"));
+        }
+        let mut vectors = Vec::with_capacity(documents.len());
+        for document in documents {
+            if document.document_id.trim().is_empty() {
+                return Err(invalid_err("document_id is required"));
+            }
+            if document.vector.len() != self.vector_dim {
+                return Err(invalid_err("vector dimension does not match index"));
+            }
+            // Same finiteness guard the writer's upsert_vectors applies, so a
+            // NaN/Inf vector cannot enter the log and fail a later replay.
+            if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
+                return Err(invalid_err("vector contains a non-finite or out-of-range value"));
+            }
+            let patch_matrix = match &document.patch_matrix {
+                Some(matrix) => serde_json::json!({
+                    "dtype": matrix.dtype,
+                    "patch_count": matrix.patch_count,
+                    "bytes": matrix.bytes,
+                }),
+                None => Value::Null,
+            };
+            vectors.push(serde_json::json!({
+                "document_id": document.document_id,
+                "vector": document.vector,
+                "metadata": document.metadata,
+                "text": Value::Null,
+                "tokens": Value::Null,
+                "patch_matrix": patch_matrix,
+            }));
+        }
+        self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
+    }
+
+    /// Durably appends one `delete_documents` record, returning its LSN.
+    pub fn append_deletes(&self, document_ids: &[String]) -> Result<u64, CoreError> {
+        if document_ids.is_empty() {
+            return Err(invalid_err("append_deletes requires at least one document id"));
+        }
+        if document_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(invalid_err("document_id is required"));
+        }
+        self.append_one(
+            "delete_documents",
+            serde_json::json!({ "document_ids": document_ids }),
+        )
+    }
+
+    fn append_one(&self, op: &str, payload: Value) -> Result<u64, CoreError> {
+        let wal = crate::storage::wal::wal_path(&self.path, &self.index_key);
+        crate::storage::lsn::with_reserved(
+            &self.path,
+            &self.index_key,
+            1,
+            self.floor,
+            self.fsync,
+            |lsn| {
+                // A peer appender may have crashed mid-frame since we opened,
+                // leaving a torn tail. Repair it under the counter lock so this
+                // frame lands after complete records, not behind torn bytes that
+                // the next writer's replay would stop at (losing this record).
+                // This is O(WAL) per append; appenders are meant to run in short
+                // sessions where the WAL stays small before a writer checkpoints.
+                let scan = crate::storage::wal::read_records_with_valid_len(&wal)?;
+                Self::repair_torn_tail(&wal, scan.valid_len, scan.total_len)?;
+                crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
+                Ok(lsn)
+            },
+        )
+    }
+
+    /// Drops a torn or headerless WAL tail so the next append lands after complete
+    /// records. The caller must hold the counter lock (via `with_lock` or
+    /// `with_reserved`) so no concurrent append is mid-write.
+    fn repair_torn_tail(wal: &Path, valid_len: u64, total_len: u64) -> Result<(), CoreError> {
+        if !wal.is_file() {
+            return Ok(());
+        }
+        if valid_len == 0 {
+            // No valid header at all (a zero-byte file, a sub-header fragment, or a
+            // torn header): drop it so the next append writes a fresh header rather
+            // than a headerless bad-magic frame the next writer cannot replay.
+            std::fs::remove_file(wal).map_err(core_io_error)?;
+        } else if total_len > valid_len {
+            // A torn trailing frame from a crash mid-append: drop it.
+            crate::storage::wal::truncate_to(wal, valid_len)?;
+        }
+        Ok(())
     }
 }
 
@@ -3703,4 +3970,54 @@ fn invalid_err(message: impl Into<String>) -> CoreError {
 
 fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::new(CoreErrorCode::Internal, error.to_string())
+}
+
+// Unix-only: it asserts that two shared holds coexist, which is the true `flock`
+// behavior. On Windows a shared hold degrades to exclusive (see `try_lock`), so
+// coexistence does not hold there.
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::{LockMode, PersistentLock};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "lodedb-lock-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn shared_holds_coexist_but_exclude_exclusive() {
+        let dir = temp_dir();
+        // Two shared holders coexist (flock across separate descriptions, or the
+        // Windows read/write share mode).
+        let first = PersistentLock::acquire_shared(&dir).expect("first shared hold");
+        let second = PersistentLock::acquire_shared(&dir).expect("second shared hold coexists");
+        // An exclusive writer cannot acquire while shared holders are alive; use a
+        // short explicit timeout so the assertion does not wait the full default.
+        assert!(
+            PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05).is_err(),
+            "exclusive must be blocked while shared holds exist"
+        );
+        drop(first);
+        drop(second);
+        // With the shared holds gone, the exclusive writer acquires...
+        let writer = PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05)
+            .expect("exclusive after shared released");
+        // ...and now a shared hold is blocked while the writer is alive.
+        assert!(
+            PersistentLock::acquire_with_timeout(&dir, LockMode::Shared, 0.05).is_err(),
+            "shared must be blocked while an exclusive writer exists"
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

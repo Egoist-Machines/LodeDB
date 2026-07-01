@@ -118,13 +118,36 @@ pub fn should_checkpoint(stats: WalStats, checkpoint_ops: usize, checkpoint_byte
 }
 
 pub fn read_records(path: &Path) -> CoreResult<Vec<WalRecord>> {
+    Ok(read_records_with_valid_len(path)?.records)
+}
+
+/// The outcome of scanning a WAL: the replayable records plus the byte length of
+/// the valid frame prefix and the file's total length. `total_len > valid_len`
+/// means a crash left a torn trailing frame (which readers drop); `valid_len`
+/// is where a repair should truncate so the next append lands after complete
+/// records.
+pub struct WalScan {
+    pub records: Vec<WalRecord>,
+    pub valid_len: u64,
+    pub total_len: u64,
+}
+
+pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok(WalScan {
+            records: Vec::new(),
+            valid_len: 0,
+            total_len: 0,
+        });
     }
     let data =
         std::fs::read(path).map_err(|error| corrupt(format!("WAL could not be read: {error}")))?;
     if data.len() < 12 {
-        return Ok(Vec::new());
+        return Ok(WalScan {
+            records: Vec::new(),
+            valid_len: 0,
+            total_len: data.len() as u64,
+        });
     }
     if &data[..WAL_MAGIC.len()] != WAL_MAGIC {
         return Err(corrupt("not a LodeDB WAL file (bad magic)"));
@@ -165,7 +188,23 @@ pub fn read_records(path: &Path) -> CoreResult<Vec<WalRecord>> {
         records.push(decode_body(&frame[4..])?);
         offset = crc_end;
     }
-    Ok(records)
+    Ok(WalScan {
+        records,
+        valid_len: offset as u64,
+        total_len: total as u64,
+    })
+}
+
+/// Truncates the WAL to `valid_len`, dropping a torn trailing frame left by a
+/// crash mid-append so the next append lands after the last complete record.
+pub fn truncate_to(path: &Path, valid_len: u64) -> CoreResult<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| corrupt(format!("WAL could not be opened to repair: {error}")))?;
+    file.set_len(valid_len)
+        .map_err(|error| corrupt(format!("WAL torn tail could not be repaired: {error}")))?;
+    Ok(())
 }
 
 pub fn replay_records_onto_store(

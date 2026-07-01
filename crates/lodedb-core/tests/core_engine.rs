@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lodedb_core::engine::CoreEngine;
+use lodedb_core::engine::{CoreAppender, CoreEngine};
 use lodedb_core::types::{
     CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreVectorDocument,
 };
@@ -1242,4 +1242,234 @@ fn query_multivector_ranks_documents_by_maxsim() {
     // doc-a: max(axis1)=0 + max(axis2)=1 = 1; doc-b: max(axis1)=1 + max(axis2)=0 = 1.
     assert_eq!(results.hits.len(), 2);
     assert!((results.hits[0].score - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn concurrent_appenders_are_folded_by_the_next_writer() {
+    let path = unique_temp_dir("core_appender");
+    // Real coordination: writer takes the exclusive lock, appenders the shared one.
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+
+    // A writer creates the index and checkpoints an empty base, then closes so the
+    // shared appenders can take the lock.
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        engine
+            .create_index_with_options(CoreIndexCreateOptions {
+                index_id: "default".to_string(),
+                index_key: INDEX_KEY.to_string(),
+                client_id_hash: INDEX_KEY.to_string(),
+                name: "lodedb-local".to_string(),
+                model: "external".to_string(),
+                provider: "external".to_string(),
+                task: "vector-only".to_string(),
+                route_profile: "vector-only".to_string(),
+                storage_profile: "turbovec_direct".to_string(),
+                vector_dim: 8,
+                bit_width: 4,
+            })
+            .unwrap();
+        engine.persist().unwrap();
+    }
+
+    // Many concurrent appenders take the shared lock and log vector-in records.
+    let threads = 5_usize;
+    let per_thread = 8_usize;
+    let handles: Vec<_> = (0..threads)
+        .map(|thread| {
+            let options = base.clone();
+            std::thread::spawn(move || {
+                let appender = CoreAppender::open(options).expect("open appender");
+                for i in 0..per_thread {
+                    let id = format!("doc-{thread}-{i}");
+                    appender
+                        .append_vectors(&[doc(&id, i % 8, metadata(&[("kind", "appended")]))])
+                        .expect("append vectors");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // The next exclusive writer folds every appended record into the index: no
+    // loss, no duplication, no LSN collision across the concurrent appenders.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        writer.stats("default").unwrap().document_count,
+        threads * per_thread
+    );
+    // An appended vector is queryable, proving the vector and metadata survived the
+    // WAL round-trip.
+    let mut probe = vec![0.0_f32; 8];
+    probe[3] = 1.0;
+    let hits = writer.query_vector("default", &probe, 1, None).unwrap().hits;
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].document_id.starts_with("doc-"));
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn create_vector_only_index(engine: &mut CoreEngine) {
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+        })
+        .unwrap();
+}
+
+#[test]
+fn appender_rejects_generation_mode() {
+    let path = unique_temp_dir("core_appender_gen");
+    let mut wal_opts = open_options(&path, false, "wal");
+    wal_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(wal_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Generation mode never replays the WAL, so appended records would be
+    // acknowledged yet invisible; the appender must refuse to open.
+    let mut gen_opts = open_options(&path, false, "generation");
+    gen_opts.acquire_writer_lock = true;
+    assert!(CoreAppender::open(gen_opts).is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_a_torn_wal_tail() {
+    let path = unique_temp_dir("core_appender_torn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // One good appended record.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("before-crash", 0, metadata(&[("kind", "a")]))])
+            .expect("append good record");
+    }
+    // Simulate a crash mid-append: a frame that claims a 5-byte body but carries
+    // only two, leaving a torn trailing frame after the good record.
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    {
+        use std::io::Write;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .expect("open wal for torn write");
+        handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+    }
+    // The next appender repairs the torn tail, so its record lands after the good
+    // one rather than after the torn bytes.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender after torn tail");
+        appender
+            .append_vectors(&[doc("after-repair", 1, metadata(&[("kind", "b")]))])
+            .expect("append after repair");
+    }
+    // The writer replays both durable records; the torn frame is gone.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_a_zero_byte_wal() {
+    let path = unique_temp_dir("core_appender_zero");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // A crash can leave a zero-byte `<key>.wal` created before its header was
+    // written. The appender must drop it rather than append a headerless frame
+    // that the next writer would reject as bad magic.
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    std::fs::File::create(&wal).expect("create zero-byte wal");
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender over zero-byte wal");
+        appender
+            .append_vectors(&[doc("after-zero", 2, metadata(&[("kind", "z")]))])
+            .expect("append after zero-byte repair");
+    }
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 1);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_rejects_non_native_wal() {
+    let path = unique_temp_dir("core_appender_nonnative");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // A prior Python text ingest can leave an `upsert_documents` record the native
+    // writer cannot replay. Appending native records behind it would strand them,
+    // so the appender must refuse to open until a writer recovers the store.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", &json!({ "documents": [] }), false)
+        .expect("write non-native record");
+    assert!(CoreAppender::open(base).is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_torn_tail_between_appends() {
+    let path = unique_temp_dir("core_appender_between");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    {
+        // The appender stays open across a peer's crash: a torn frame injected
+        // mid-session must be repaired by the next append, not left to strand it.
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("first", 0, metadata(&[("n", "1")]))])
+            .expect("append first");
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal)
+                .expect("open wal for torn write");
+            handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+        }
+        appender
+            .append_vectors(&[doc("second", 1, metadata(&[("n", "2")]))])
+            .expect("append second after torn tail");
+    }
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
 }
