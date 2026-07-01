@@ -1,16 +1,19 @@
 import Foundation
 
-/// One pre-embedded document to append (vector-in). The appender logs the vector
-/// and metadata only; raw text is never written to the WAL.
+/// One pre-embedded document to append (vector-in). `text` is an optional caption
+/// (e.g. for an image), retained only when the appender was opened with
+/// `storeText`; it is never embedded or chunked.
 public struct LodeAppendDocument: Sendable, Equatable {
     public let id: String
     public let vector: [Float]
     public let metadata: [String: String]
+    public let text: String?
 
-    public init(id: String, vector: [Float], metadata: [String: String] = [:]) {
+    public init(id: String, vector: [Float], metadata: [String: String] = [:], text: String? = nil) {
         self.id = id
         self.vector = vector
         self.metadata = metadata
+        self.text = text
     }
 }
 
@@ -31,32 +34,56 @@ public final class LodeAppender {
         self.native = native
     }
 
-    /// Opens an appender over the store at `path` with `options`.
+    /// Opens an appender over the store at `path`.
     ///
-    /// `options.commitMode` must be `.wal` (the default); generation mode is
-    /// rejected because it never replays the WAL, so appended records would be
-    /// acknowledged yet never folded in. `options.durability` controls whether each
-    /// append fsyncs before returning, and `options.acquireWriterLock` takes the
-    /// shared `<dir>/.lodedb.lock` so appenders exclude an exclusive writer (pass a
-    /// value with it `false` only when an outer caller owns exclusion). The
-    /// retained-text options are inert here — the appender logs vector plus metadata
-    /// only, never raw text.
+    /// `commitMode` must be `.wal` (the default); generation mode is rejected because
+    /// it never replays the WAL, so appended records would be acknowledged yet never
+    /// folded in. `durability` defaults to `.fsync` (each append is fsynced before
+    /// returning, matching `LodeDB`); pass `.buffered` to trade power-loss durability
+    /// for ingest throughput. `acquireWriterLock` takes the shared
+    /// `<dir>/.lodedb.lock` so appenders exclude an exclusive writer (pass `false`
+    /// only when an outer caller owns exclusion).
+    ///
+    /// `storeText`/`indexText` default to `false` (privacy: no raw text reaches the
+    /// WAL). These are appender-specific defaults, so customizing another argument
+    /// never turns retention on by accident. To retain appended captions, pass
+    /// `storeText: true`, and only for a store whose writer also retains text, or the
+    /// writer drops the caption at checkpoint.
     public static func open(
         at path: URL,
-        options: LodeStoreOptions = LodeStoreOptions()
+        commitMode: CommitMode = .wal,
+        durability: Durability = .fsync,
+        storeText: Bool = false,
+        indexText: Bool = false,
+        acquireWriterLock: Bool = true
     ) throws -> LodeAppender {
-        guard options.commitMode == .wal else {
+        guard commitMode == .wal else {
             throw LodeDBError.unsupported(
                 "the appender requires WAL commit mode; generation mode does not replay the WAL")
         }
+        let options = LodeStoreOptions(
+            durability: durability,
+            commitMode: .wal,
+            storeText: storeText,
+            indexText: indexText,
+            acquireWriterLock: acquireWriterLock
+        )
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: false)
         return LodeAppender(native: try NativeAppender.open(optionsJSON: optionsJSON))
     }
 
     /// Durably logs one vector-in record and returns its log sequence number.
+    ///
+    /// `text` is an optional caption retained only when the appender was opened with
+    /// `storeText` (see `open`); it is never embedded or chunked.
     @discardableResult
-    public func append(id: String, vector: [Float], metadata: [String: String] = [:]) throws -> UInt64 {
-        try append([LodeAppendDocument(id: id, vector: vector, metadata: metadata)])
+    public func append(
+        id: String,
+        vector: [Float],
+        metadata: [String: String] = [:],
+        text: String? = nil
+    ) throws -> UInt64 {
+        try append([LodeAppendDocument(id: id, vector: vector, metadata: metadata, text: text)])
     }
 
     /// Durably logs one record covering `documents` and returns its log sequence
@@ -64,7 +91,8 @@ public final class LodeAppender {
     @discardableResult
     public func append(_ documents: [LodeAppendDocument]) throws -> UInt64 {
         let payload = documents.map {
-            AppenderVectorDocumentJSON(documentID: $0.id, vector: $0.vector, metadata: $0.metadata)
+            AppenderVectorDocumentJSON(
+                documentID: $0.id, vector: $0.vector, metadata: $0.metadata, text: $0.text)
         }
         return try native.appendVectorsJSON(try encodeJSON(payload))
     }
@@ -80,8 +108,9 @@ private struct AppenderVectorDocumentJSON: Encodable {
     let documentID: String
     let vector: [Float]
     let metadata: [String: String]
-    // Always null: the appender logs vector plus metadata only, never raw text.
-    let text: String? = nil
+    // The optional caption. The native appender retains it only under storeText;
+    // otherwise it is dropped, so no raw text reaches the WAL.
+    let text: String?
 
     enum CodingKeys: String, CodingKey {
         case documentID = "document_id"
