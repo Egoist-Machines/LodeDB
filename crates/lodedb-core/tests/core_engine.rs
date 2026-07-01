@@ -1466,3 +1466,103 @@ fn exact_index_state_header_omits_ann() {
     drop(engine);
     fs::remove_dir_all(path).unwrap();
 }
+
+/// Whether any file with `ext` exists anywhere under `dir`.
+fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            has_file_with_ext(&path, ext)
+        } else {
+            path.extension().is_some_and(|found| found == ext)
+        }
+    })
+}
+
+fn ann_durable(path: &Path) -> CoreEngine {
+    let mut engine = CoreEngine::open(open_options(path, false, "wal")).unwrap();
+    let mut options = ann_options(4, 1);
+    options.index_key = INDEX_KEY.to_string();
+    options.client_id_hash = INDEX_KEY.to_string();
+    engine.create_index_with_options(options).unwrap();
+    engine
+}
+
+#[test]
+fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
+    let path = unique_temp_dir("core_ann_sidecar");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        // Query to build the cluster index, then checkpoint it to a `.tvann` base.
+        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"), "persist must write a .tvann base");
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    // The persisted assignment is adopted on open, before any query rebuilds it.
+    assert!(
+        reopened.ann_cluster_resident("default").unwrap(),
+        "a valid .tvann must be adopted on reopen, skipping the rebuild"
+    );
+    // And it still serves the correct ANN top-k.
+    let hits = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert_eq!(hits.hits.len(), 5);
+    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn ann_reopen_reflects_reembedded_vector() {
+    // Regression for stale-clustering adoption: re-embedding a doc under the same
+    // chunk id and reopening must serve it at its NEW location. A vector-changing
+    // delta invalidates the persisted assignment, so the reopened clustering is
+    // rebuilt rather than adopting the stale one.
+    let path = unique_temp_dir("core_ann_reembed");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        // Move b0c0 from blob 0 (axis 0) to blob 2 (axis 4), same chunk id.
+        engine
+            .upsert_vectors("default", &[vector_doc("b0c0", axis_query(4))])
+            .unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let hits = reopened.query_vector("default", &axis_query(4), 6, None).unwrap();
+    assert!(
+        hits.hits.iter().any(|hit| hit.document_id == "b0c0"),
+        "a re-embedded vector must be served at its new location after reopen"
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn exact_store_writes_no_tvann_sidecar() {
+    let path = unique_temp_dir("core_no_tvann");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", &blob_docs()).unwrap();
+    let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+    engine.persist().unwrap();
+    assert!(!has_file_with_ext(&path, "tvann"), "an exact store must not write a .tvann");
+    drop(engine);
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(!reopened.ann_cluster_resident("default").unwrap());
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}

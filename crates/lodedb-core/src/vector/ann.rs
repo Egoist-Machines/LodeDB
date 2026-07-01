@@ -170,6 +170,92 @@ impl ClusterIndex {
         self.num_vectors
     }
 
+    /// Centroid space dimension.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Sorted chunk ids per cluster, for persistence (centroids are not persisted;
+    /// they are recomputed from these plus the reconstructed vectors on load).
+    pub fn postings(&self) -> &[Vec<String>] {
+        &self.postings
+    }
+
+    /// Reassembles a cluster index from a persisted assignment, skipping k-means.
+    ///
+    /// `postings` is the persisted per-cluster chunk-id membership; `entries` is
+    /// the live `(chunk_id, vector)` set (rotated space), sorted by chunk id as
+    /// [`build`](Self::build) requires. Centroids are recomputed as the per-cluster
+    /// means in entry order, so the result is bit-identical to a fresh `build`
+    /// (k-means' final centroids are exactly the means of the final assignment).
+    /// `rotation` is the live TurboVec rotation, re-derived on load rather than
+    /// persisted. Returns `None` when the persisted assignment does not exactly
+    /// cover the live entries (stale sidecar) or is malformed, so the caller
+    /// rebuilds instead.
+    pub fn from_assignment(
+        entries: &[(&str, &[f32])],
+        dim: usize,
+        postings: Vec<Vec<String>>,
+        rotation: Option<Vec<f32>>,
+    ) -> Option<Self> {
+        if dim == 0 || postings.is_empty() {
+            return None;
+        }
+        if rotation.as_ref().is_some_and(|matrix| matrix.len() != dim * dim) {
+            return None;
+        }
+        let posting_total: usize = postings.iter().map(Vec::len).sum();
+        // Exact coverage: the persisted assignment must name every live entry and
+        // nothing else, so the reloaded clustering equals a fresh build.
+        if posting_total != entries.len() {
+            return None;
+        }
+        let centroids = {
+            let cluster_count = postings.len();
+            let mut cluster_of: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::with_capacity(posting_total);
+            for (cluster, ids) in postings.iter().enumerate() {
+                for id in ids {
+                    if cluster_of.insert(id.as_str(), cluster).is_some() {
+                        return None; // a chunk id in two clusters: corrupt
+                    }
+                }
+            }
+            let mut sums = vec![0.0f64; cluster_count * dim];
+            let mut counts = vec![0usize; cluster_count];
+            for entry in entries {
+                if entry.1.len() != dim {
+                    return None;
+                }
+                let cluster = *cluster_of.get(entry.0)?; // an unmapped live entry: stale
+                counts[cluster] += 1;
+                let base = cluster * dim;
+                for (offset, &value) in entry.1.iter().enumerate() {
+                    sums[base + offset] += value as f64;
+                }
+            }
+            let mut centroids = vec![0.0f32; cluster_count * dim];
+            for (cluster, &count) in counts.iter().enumerate() {
+                if count == 0 {
+                    return None; // a persisted cluster with no live members
+                }
+                let base = cluster * dim;
+                let divisor = count as f64;
+                for offset in 0..dim {
+                    centroids[base + offset] = (sums[base + offset] / divisor) as f32;
+                }
+            }
+            centroids
+        };
+        Some(Self {
+            dim,
+            centroids,
+            postings,
+            num_vectors: posting_total,
+            rotation,
+        })
+    }
+
     /// Returns candidate chunk ids for a raw query.
     ///
     /// `raw_query` is in the pre-rotation space; this rotates it into the
@@ -377,6 +463,34 @@ mod tests {
         let refs = entries(&rows);
         let index = ClusterIndex::build(&refs, 2, 2, None);
         assert_eq!(index.num_clusters(), 2);
+    }
+
+    #[test]
+    fn from_assignment_reproduces_build_and_rejects_stale() {
+        // Build, then reassemble from the built postings + the same entries: the
+        // reloaded index must yield identical candidates (centroids recomputed
+        // from the assignment equal the k-means centroids).
+        let rows: Vec<(String, Vec<f32>)> = (0..24)
+            .map(|i| {
+                let a = (i * 3 % 7) as f32;
+                let b = (i * 5 % 11) as f32;
+                (format!("c{i:02}"), vec![a, b, 1.0])
+            })
+            .collect();
+        let refs = entries(&rows);
+        let built = ClusterIndex::build(&refs, 3, 4, None);
+        let postings: Vec<Vec<String>> = built.postings().to_vec();
+        let reloaded = ClusterIndex::from_assignment(&refs, 3, postings.clone(), None).unwrap();
+        let query = [2.0, 3.0, 1.0];
+        assert_eq!(
+            built.candidate_chunk_ids(&query, 2, 1),
+            reloaded.candidate_chunk_ids(&query, 2, 1)
+        );
+        // A live entry missing from the persisted assignment (a vector added since
+        // the sidecar was written) is rejected so the caller rebuilds.
+        let mut extra = rows.clone();
+        extra.push(("c99".to_string(), vec![1.0, 1.0, 1.0]));
+        assert!(ClusterIndex::from_assignment(&entries(&extra), 3, postings, None).is_none());
     }
 
     #[test]

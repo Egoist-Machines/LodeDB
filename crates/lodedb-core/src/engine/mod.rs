@@ -1027,6 +1027,15 @@ impl CoreEngine {
         }
     }
 
+    /// Whether the ANN cluster index is currently resident in memory for an index
+    /// (adopted from a persisted `.tvann` sidecar on open, or built by a prior
+    /// query). Returns `false` when it is not resident — a later ANN query builds
+    /// it — or when the index is exact. Observability; does not trigger a build.
+    pub fn ann_cluster_resident(&self, index_id: &str) -> Result<bool, CoreError> {
+        let index = self.index(index_id)?;
+        Ok(index.cluster_index.borrow().is_some())
+    }
+
     fn query_vector_scalar(
         &self,
         index_id: &str,
@@ -2131,7 +2140,7 @@ fn index_from_loaded_store(
         .as_ref()
         .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
     let base_epoch = loaded.base_epoch;
-    Ok(VectorOnlyIndex {
+    let index = VectorOnlyIndex {
         index_id,
         index_key,
         client_id_hash,
@@ -2197,7 +2206,12 @@ fn index_from_loaded_store(
         pending_upserts: BTreeSet::new(),
         pending_deletes: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
-    })
+    };
+    // Adopt a persisted cluster assignment when it is still valid; otherwise the
+    // first ANN query rebuilds it. This skips the k-means rebuild after a clean
+    // reopen without ever trusting a stale sidecar.
+    index.install_persisted_ann(loaded.ann.as_ref(), base_calibration_fingerprint);
+    Ok(index)
 }
 
 fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Vec<String>> {
@@ -2712,6 +2726,33 @@ fn write_index_base(
     // Late-interaction patch matrices for every document (empty for non-LI stores,
     // where the multi-vector base is skipped).
     let multivec = multivec_for_documents(index, index.documents.keys().map(String::as_str));
+    // Persist the ANN cluster assignment only when ANN would actually be used
+    // (opt-in, would prune) and a vector base is being written. Build it first,
+    // then hold the borrow across the commit so its postings are written without
+    // a copy. A probe-all or too-small configuration writes no `.tvann`.
+    let persist_ann = index.ann_prunes() && tvim_base.is_some();
+    if persist_ann {
+        index.ensure_cluster_index()?;
+    }
+    let ann_guard = index.cluster_index.borrow();
+    let ann = if persist_ann {
+        ann_guard
+            .as_ref()
+            .filter(|cluster| cluster.num_clusters() > 1)
+            .map(|cluster| crate::storage::tvann_store::AnnBaseInput {
+                algorithm: index
+                    .ann_options
+                    .as_ref()
+                    .map_or("cluster", |options| options.algorithm.as_str()),
+                dim: cluster.dim(),
+                calibration_fingerprint: tvim_base
+                    .as_ref()
+                    .map_or(0, |tvim| tvim.calibration_fingerprint),
+                postings: cluster.postings(),
+            })
+    } else {
+        None
+    };
     crate::storage::write_generation_commit(
         dir,
         crate::storage::GenerationCommitInput {
@@ -2729,6 +2770,7 @@ fn write_index_base(
             raw_text: Some(&raw_text),
             lexical_tokens: Some(&lexical_tokens),
             multivec: Some(&multivec),
+            ann,
             compress_text,
         },
         crate::storage::GenerationWriteOptions {
@@ -3413,6 +3455,43 @@ impl VectorOnlyIndex {
         let built = ClusterIndex::build(&entries, dim, clusters, rotation);
         *self.cluster_index.borrow_mut() = Some(built);
         Ok(())
+    }
+
+    /// Adopts a persisted cluster assignment into the cache when it is still valid:
+    /// ANN enabled, matching dimension and calibration fingerprint, and exact
+    /// coverage of the live chunk set (enforced by [`ClusterIndex::from_assignment`],
+    /// which recomputes centroids from the live vectors so the adopted index equals
+    /// a fresh build). Any mismatch (disabled, recalibrated, or a stale set after
+    /// deltas) leaves the cache empty so the first ANN query rebuilds.
+    fn install_persisted_ann(
+        &self,
+        loaded: Option<&crate::storage::tvann_store::LoadedAnn>,
+        base_fingerprint: u64,
+    ) {
+        let Some(loaded) = loaded else {
+            return;
+        };
+        if self.ann_options.is_none()
+            || loaded.dim != self.vector_dim
+            || loaded.calibration_fingerprint != base_fingerprint
+        {
+            return;
+        }
+        let mut entries: Vec<(&str, &[f32])> = Vec::new();
+        for record in self.documents.values() {
+            for chunk in &record.chunks {
+                entries.push((chunk.chunk_id.as_str(), chunk.vector.as_slice()));
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        if let Some(cluster) = ClusterIndex::from_assignment(
+            &entries,
+            loaded.dim,
+            loaded.postings.clone(),
+            self.query_rotation.clone(),
+        ) {
+            *self.cluster_index.borrow_mut() = Some(cluster);
+        }
     }
 
     /// Number of clusters to build: the configured override, else a `sqrt(n)`

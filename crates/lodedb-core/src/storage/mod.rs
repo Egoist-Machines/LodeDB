@@ -4,19 +4,21 @@ pub mod lexical_store;
 pub mod multivec_store;
 pub mod state_journal;
 pub mod text_store;
+pub mod tvann_store;
 pub mod tvim_delta;
 mod util;
 pub mod wal;
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{
-    base_json_path, base_tvim_path, base_tvlex_path, base_tvmv_path, base_tvtext_path,
-    build_commit_body, commit_manifest_path, generation_dir, list_base_epochs,
+    base_json_path, base_tvann_path, base_tvim_path, base_tvlex_path, base_tvmv_path,
+    base_tvtext_path, build_commit_body, commit_manifest_path, generation_dir, list_base_epochs,
     read_commit_manifest, write_commit_manifest, CommitBodyInput, CommitManifest,
 };
 use crate::storage::lexical_store::TokenLists;
 use crate::storage::multivec_store::MultiVecMap;
 use crate::storage::state_journal::StateJournalDeltaInput;
+use crate::storage::tvann_store::{AnnBaseInput, LoadedAnn};
 use crate::storage::tvim_delta::{TvimDeltaAppendInput, TvimDeltaArray};
 use crate::storage::util::{corrupt, get_str, invalid, value_object, CoreResult};
 use crate::storage::wal::WalRecord;
@@ -43,6 +45,10 @@ pub struct LoadedStore {
     pub raw_text: BTreeMap<String, String>,
     pub lexical_tokens: BTreeMap<String, TokenLists>,
     pub multivec: MultiVecMap,
+    /// The persisted ANN cluster partition, if a valid `.tvann` sidecar was
+    /// found. The engine still validates it against the live calibration
+    /// fingerprint and chunk set before use, rebuilding on any mismatch.
+    pub ann: Option<LoadedAnn>,
     pub wal_records: Vec<WalRecord>,
 }
 
@@ -102,6 +108,7 @@ pub fn load_store(
             raw_text: legacy.raw_text,
             lexical_tokens: BTreeMap::new(),
             multivec: MultiVecMap::new(),
+            ann: None,
             wal_records: Vec::new(),
         });
     }
@@ -172,6 +179,19 @@ pub fn load_generation_store(
         )?,
         None => MultiVecMap::new(),
     };
+    let ann = match manifest.store_manifest("tvann") {
+        Some(tvann_manifest) => {
+            // The `.tvann` is an optional acceleration cache, rebuildable from
+            // `.tvim`. A missing, truncated, or checksum-failing sidecar is a cache
+            // miss (the engine rebuilds), never a reason to fail opening an
+            // otherwise-intact store, so swallow any error to `None`.
+            let tvann_base_path = base_tvann_path(persistence_dir, &index_key, base_epoch);
+            tvann_store::validate(&tvann_base_path, Some(tvann_manifest))
+                .and_then(|()| tvann_store::load(&tvann_base_path, Some(tvann_manifest)))
+                .unwrap_or(None)
+        }
+        None => None,
+    };
     let wal_records = if options.read_wal && !options.read_only {
         wal::read_records(&wal::wal_path(persistence_dir, &index_key))?
     } else {
@@ -188,6 +208,7 @@ pub fn load_generation_store(
         raw_text,
         lexical_tokens,
         multivec,
+        ann,
         wal_records,
     })
 }
@@ -235,6 +256,9 @@ pub struct GenerationCommitInput<'a> {
     pub raw_text: Option<&'a BTreeMap<String, String>>,
     pub lexical_tokens: Option<&'a BTreeMap<String, TokenLists>>,
     pub multivec: Option<&'a MultiVecMap>,
+    /// The ANN cluster partition to persist, when the index opts into ANN and the
+    /// clustering would actually be used. `None` writes no `.tvann` base.
+    pub ann: Option<AnnBaseInput<'a>>,
     /// Whether the retained document-text base is zstd-compressed. Threaded from
     /// the engine's effective (persisted-or-seeded) flag down to
     /// [`text_store::record_base`].
@@ -304,6 +328,14 @@ pub fn write_generation_commit(
         )?),
         _ => None,
     };
+    let tvann_manifest = match input.ann {
+        Some(ann) => Some(tvann_store::record_base(
+            &base_tvann_path(persistence_dir, input.index_key, input.base_epoch),
+            ann,
+            options.fsync,
+        )?),
+        None => None,
+    };
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
@@ -316,6 +348,7 @@ pub fn write_generation_commit(
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
         tvmv_manifest: multivec_manifest,
+        tvann_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),
@@ -405,6 +438,9 @@ pub fn write_generation_delta(
         },
     )?;
 
+    // Whether this delta changes the vector set (an upsert or a removal). Used to
+    // decide the ANN sidecar: a vector change invalidates the base clustering.
+    let tvim_changed = input.tvim.as_ref().is_some_and(|tvim| !tvim.is_empty());
     // tvim: append a delta when vectors changed, else carry the base manifest.
     let tvim_manifest = match input.tvim {
         Some(tvim) if !tvim.is_empty() => {
@@ -514,6 +550,21 @@ pub fn write_generation_delta(
         _ => previous.store_manifest("tvmv").cloned(),
     };
 
+    // ANN has no delta journal yet, so any delta that emits a tvim change drops
+    // the tvann manifest and forces a rebuild on reopen. This is required for
+    // correctness: a re-upsert under the same chunk id moves a vector without
+    // changing the id set or (necessarily) the calibration fingerprint, so the
+    // load-time coverage check alone would wrongly adopt the stale assignment.
+    // It is deliberately conservative — a metadata-only update re-emits its
+    // (unchanged) vector in the tvim delta, so it drops the sidecar too. The
+    // storage layer cannot cheaply tell an unchanged re-emit from a real move;
+    // preserving the sidecar across metadata-only updates needs an engine-level
+    // vector-change signal and is a follow-up alongside the delta journal.
+    let tvann_manifest = if tvim_changed {
+        None
+    } else {
+        previous.store_manifest("tvann").cloned()
+    };
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
@@ -526,6 +577,7 @@ pub fn write_generation_delta(
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
         tvmv_manifest: multivec_manifest,
+        tvann_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),
@@ -613,6 +665,7 @@ pub fn gc_after_base_rewrite(
             base_tvim_path(persistence_dir, index_key, epoch),
             base_tvtext_path(persistence_dir, index_key, epoch),
             base_tvlex_path(persistence_dir, index_key, epoch),
+            base_tvann_path(persistence_dir, index_key, epoch),
         ] {
             let _ = fs::remove_file(&path);
             for suffix in [

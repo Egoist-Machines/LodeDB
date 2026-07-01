@@ -76,6 +76,10 @@ pub fn base_tvmv_path(persistence_dir: &Path, index_key: &str, epoch: u64) -> Pa
     generation_dir(persistence_dir, index_key).join(format!("g{epoch}.tvmv"))
 }
 
+pub fn base_tvann_path(persistence_dir: &Path, index_key: &str, epoch: u64) -> PathBuf {
+    generation_dir(persistence_dir, index_key).join(format!("g{epoch}.tvann"))
+}
+
 pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
     if !path.is_file() {
         return Ok(None);
@@ -109,6 +113,7 @@ pub struct CommitBodyInput<'a> {
     pub tvtext_manifest: Option<Value>,
     pub tvlex_manifest: Option<Value>,
     pub tvmv_manifest: Option<Value>,
+    pub tvann_manifest: Option<Value>,
 }
 
 pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
@@ -124,6 +129,7 @@ pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
         "tvtext": input.tvtext_manifest,
         "tvlex": input.tvlex_manifest,
         "tvmv": input.tvmv_manifest,
+        "tvann": input.tvann_manifest,
     })
 }
 
