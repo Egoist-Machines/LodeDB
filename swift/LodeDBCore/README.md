@@ -189,6 +189,20 @@ A `LodeDB` instance is safe to share across threads; access is serialized intern
 C ABI status codes (`invalidArgument`, `notFound`, `corruptStore`, `planStale`,
 `unsupported`, `internalError`).
 
+For concurrent ingest, `LodeAppender` lets many processes durably log vector-in
+records to one store's WAL at once (a shared lock, distinct from the exclusive
+writer's), folded into the index by the next *writable* `LodeDB` open. A read-only
+snapshot (`openReadOnly`) ignores the WAL tail, so appended records are queryable
+only after a writable open replays and checkpoints them. It requires WAL commit
+mode and logs vector plus metadata only:
+
+```swift
+let appender = try LodeAppender.open(at: url)
+let lsn = try appender.append(id: "doc-1", vector: embedding, metadata: ["topic": "ops"])
+_ = try appender.append([LodeAppendDocument(id: "doc-2", vector: other)]) // batch
+_ = try appender.delete(ids: ["doc-1"])
+```
+
 ## Out of scope
 
 The CLI, dev server, MCP server, model-download flow, framework adapters
