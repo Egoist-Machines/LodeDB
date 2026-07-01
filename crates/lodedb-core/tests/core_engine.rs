@@ -1647,3 +1647,123 @@ fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
     drop(writer);
     fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn appender_retains_text_only_under_store_text() {
+    let path = unique_temp_dir("core_appender_text");
+
+    // store_text on: the appended caption is logged and the next writer retains it.
+    let mut with_text = open_options(&path, false, "wal"); // open_options sets store_text = true
+    with_text.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(with_text.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(with_text.clone()).expect("open appender (store_text)");
+        let mut document = doc("with-text", 0, metadata(&[("kind", "image")]));
+        document.text = Some("a red bicycle by the canal".to_string());
+        appender.append_vectors(&[document]).expect("append with text");
+    }
+    {
+        let writer = CoreEngine::open(with_text).unwrap();
+        assert_eq!(
+            writer
+                .get_document_text("default", "with-text")
+                .unwrap()
+                .as_deref(),
+            Some("a red bicycle by the canal")
+        );
+    }
+
+    // store_text off, index_text on (the privacy mode): no raw text reaches the WAL,
+    // but the derived caption tokens do, so replay can rebuild lexical postings
+    // without retaining raw text (parity with the engine's upsert_vectors record).
+    let mut private_mode = open_options(&path, false, "wal"); // open_options sets index_text = true
+    private_mode.acquire_writer_lock = true;
+    private_mode.store_text = false;
+    {
+        let appender =
+            CoreAppender::open(private_mode.clone()).expect("open appender (private mode)");
+        let mut document = doc("captioned", 1, metadata(&[]));
+        document.text = Some("turquoise dragon".to_string());
+        appender.append_vectors(&[document]).expect("append captioned");
+    }
+    // Inspect the appended record before a writer folds and truncates the WAL: it
+    // carries derived tokens but no raw text.
+    {
+        let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+        let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
+        let appended = records.last().expect("an appended record");
+        assert_eq!(appended.op, "upsert_vectors");
+        let vector = &appended.payload["vectors"][0];
+        assert!(vector["text"].is_null(), "no raw text in privacy mode");
+        assert!(
+            vector["tokens"].is_array(),
+            "derived caption tokens must be logged for lexical replay"
+        );
+    }
+    {
+        let writer = CoreEngine::open(private_mode).unwrap();
+        assert_eq!(
+            writer.get_document_text("default", "captioned").unwrap(),
+            None
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_privacy_mode_tokens_persist_across_reopen() {
+    // Privacy mode (store_text=false, index_text=true): a caption appended onto an
+    // existing vector-identical document must survive a checkpoint and reopen. The
+    // replay's upsert is a no-op (vector and metadata unchanged, no raw text), so
+    // the restored caption tokens have to mark the document pending, or the
+    // checkpoint truncates the WAL and drops them.
+    let path = unique_temp_dir("core_appender_privacy_tokens");
+    let mut base = open_options(&path, false, "wal"); // index_text = true
+    base.store_text = false;
+    base.acquire_writer_lock = true;
+    let generation_before;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        // A pre-existing document with a vector but no caption tokens.
+        engine
+            .upsert_vectors("default", &[doc("d1", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+        generation_before = engine.stats("default").unwrap().generation;
+    }
+    // The appender adds a caption to the same vector: tokens, no raw text.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        let mut document = doc("d1", 0, metadata(&[]));
+        document.text = Some("turquoise dragon".to_string());
+        appender.append_vectors(&[document]).expect("append caption");
+    }
+    // A writer replays (upsert no-op + token restore) and checkpoints, truncating
+    // the WAL. Applying the token restore must advance the generation epoch so
+    // generation-based observers see the lexical update.
+    {
+        let writer = CoreEngine::open(base.clone()).unwrap();
+        assert!(
+            writer.stats("default").unwrap().generation > generation_before,
+            "token restore must advance the generation"
+        );
+    }
+    // After reopen the caption must still be lexically searchable: the tokens were
+    // persisted, not dropped with the truncated WAL.
+    {
+        let writer = CoreEngine::open(base).unwrap();
+        let plan = writer.prepare_query_text("dragon", "lexical").unwrap();
+        let hits = writer
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1, "restored caption tokens were dropped at checkpoint");
+        assert_eq!(hits.hits[0].document_id, "d1");
+    }
+    fs::remove_dir_all(path).unwrap();
+}

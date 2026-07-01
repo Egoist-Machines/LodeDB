@@ -1570,16 +1570,30 @@ impl CoreEngine {
                     .collect(),
                 None => continue,
             };
-            if let Some(record) = index.documents.get_mut(document_id) {
-                record.token_lists = token_lists.clone();
-            } else {
-                continue;
+            match index.documents.get_mut(document_id) {
+                // Skip when the tokens are already current: for a retained caption
+                // (store_text on) upsert_vectors above derived the same tokens, so it
+                // already advanced the generation and marked the row pending. Only a
+                // genuine change falls through to the persistence bookkeeping below,
+                // so the common path is not double-counted.
+                Some(record) if record.token_lists != token_lists => {
+                    record.token_lists = token_lists.clone();
+                }
+                _ => continue,
             }
             let units = vec![(
                 document_id.to_string(),
                 token_lists.into_iter().next().unwrap_or_default(),
             )];
             index.lexical_index.replace_group(document_id, &units);
+            // A token-only restore (store_text=false, index_text=true) onto an
+            // otherwise-unchanged row leaves upsert_vectors a no-op, so account for
+            // the mutation here: mark the row pending AND advance the generation.
+            // Without the pending marker the checkpoint truncates the WAL and drops
+            // these tokens; without the generation bump the lexical delta commits
+            // under an already-published epoch and generation-based readers miss it.
+            index.pending_upserts.insert(document_id.to_string());
+            index.generation += 1;
         }
         Ok(())
     }
@@ -2105,6 +2119,15 @@ pub struct CoreAppender {
     // with an exclusive writer's generation-based LSNs from a prior session.
     floor: u64,
     fsync: bool,
+    // The raw-text/lexical retention policy for appended captions, mirroring the
+    // engine's vector-in text policy exactly so an appended `upsert_vectors` record
+    // is byte-identical to a writer-authored one. store_text logs the raw text
+    // (privacy: never written to `<key>.wal` otherwise); index_text logs derived
+    // caption tokens so lexical/BM25 search survives replay even in the
+    // store_text=false privacy mode. The caller must open with the same policy as
+    // the store's writer, or the writer drops the payload at checkpoint.
+    store_text: bool,
+    index_text: bool,
     // Held for the appender's lifetime; dropping it releases the shared lock.
     // `None` when the caller opts out of the shared lock (`acquire_writer_lock`
     // false) because an outer coordinator owns exclusion, matching CoreEngine.
@@ -2222,12 +2245,17 @@ impl CoreAppender {
             vector_dim,
             floor,
             fsync,
+            store_text: options.store_text,
+            index_text: options.index_text,
             _lock: lock,
         })
     }
 
     /// Durably appends one `upsert_vectors` record for `documents`, returning the
-    /// LSN assigned to it.
+    /// LSN assigned to it. Each document's optional `text` is retained (in the WAL
+    /// record, for the next writer to persist) only when the appender was opened
+    /// with `store_text`; otherwise it is dropped, matching the engine's vector-in
+    /// text policy.
     pub fn append_vectors(&self, documents: &[CoreVectorDocument]) -> Result<u64, CoreError> {
         if documents.is_empty() {
             return Err(invalid_err("append_vectors requires at least one document"));
@@ -2253,12 +2281,26 @@ impl CoreAppender {
                 }),
                 None => Value::Null,
             };
+            // Mirror the engine's upsert_vectors WAL record exactly: retain raw text
+            // only under store_text (privacy), and when index_text is on write the
+            // derived caption tokens so replay rebuilds BM25 postings even in the
+            // store_text=false privacy mode (a captioned vector is one chunk keyed by
+            // its document id, so its caption is one token list).
+            let text = if self.store_text {
+                serde_json::json!(document.text)
+            } else {
+                Value::Null
+            };
+            let tokens = match (self.index_text, document.text.as_deref()) {
+                (true, Some(text)) => serde_json::json!([tokenize(text)]),
+                _ => Value::Null,
+            };
             vectors.push(serde_json::json!({
                 "document_id": document.document_id,
                 "vector": document.vector,
                 "metadata": document.metadata,
-                "text": Value::Null,
-                "tokens": Value::Null,
+                "text": text,
+                "tokens": tokens,
                 "patch_matrix": patch_matrix,
             }));
         }
