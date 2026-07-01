@@ -1,5 +1,5 @@
 use lodedb_core::{
-    engine::{CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
+    engine::{CoreAppender as RustCoreAppender, CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
     CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreIndexCreateOptions,
     CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchResults,
     CoreSecurityOptions, CoreStats, CoreVectorDocument,
@@ -1321,11 +1321,52 @@ fn native_core_error_to_py(error: CoreError) -> PyErr {
     }
 }
 
+/// Private Python-owned shared-lock WAL appender.
+///
+/// Wraps `lodedb_core::engine::CoreAppender`: many processes can each hold one and
+/// durably log vector-in records to a store's WAL concurrently, for the next
+/// exclusive writer to fold in on open. The store must be in WAL commit mode and
+/// hold exactly one index.
+#[pyclass(name = "CoreAppender", unsendable)]
+struct PyCoreAppender {
+    inner: RustCoreAppender,
+}
+
+#[pymethods]
+impl PyCoreAppender {
+    #[staticmethod]
+    fn open(options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreAppender::open(options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    /// Durably appends one `upsert_vectors` record from a JSON `CoreVectorDocument`
+    /// array (vector plus metadata; raw text is not logged) and returns its LSN.
+    fn append_vectors(&self, documents_json: &str) -> PyResult<u64> {
+        let documents = native_from_json::<Vec<CoreVectorDocument>>(documents_json)?;
+        self.inner
+            .append_vectors(&documents)
+            .map_err(native_core_error_to_py)
+    }
+
+    /// Durably appends one `delete_documents` record from a JSON array of document
+    /// ids and returns its LSN.
+    fn append_deletes(&self, document_ids_json: &str) -> PyResult<u64> {
+        let ids = native_from_json::<Vec<String>>(document_ids_json)?;
+        self.inner
+            .append_deletes(&ids)
+            .map_err(native_core_error_to_py)
+    }
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
     m.add_class::<PyCoreEngine>()?;
+    m.add_class::<PyCoreAppender>()?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;

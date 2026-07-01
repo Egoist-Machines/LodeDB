@@ -1146,3 +1146,104 @@ def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) 
     from lodedb.engine.native_adapter import NativeCoreAdapter
 
     assert NativeCoreAdapter().available is True
+
+
+def _wal_store_options(store: Path) -> str:
+    return json.dumps(
+        {
+            "path": str(store),
+            "read_only": False,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": False,
+            "index_text": False,
+            "chunk_character_limit": 900,
+            "acquire_writer_lock": True,
+        }
+    )
+
+
+def test_native_core_appender_folds_into_next_writer(tmp_path) -> None:
+    """A shared-lock appender logs vectors the next exclusive writer folds in."""
+
+    store = tmp_path / "store"
+    store.mkdir()
+    options = _wal_store_options(store)
+    # A writer creates the index and checkpoints an empty base, then closes so the
+    # shared appender can take the lock.
+    engine = native_core.CoreEngine.open(options)
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    # The appender durably logs a vector-in record, then a delete, each returning a
+    # monotonic LSN.
+    appender = native_core.CoreAppender.open(options)
+    documents = json.dumps(
+        [{"document_id": "doc-a", "vector": _onehot(0), "metadata": {"topic": "ops"}, "text": None}]
+    )
+    lsn = appender.append_vectors(documents)
+    assert lsn > 0
+    delete_lsn = appender.append_deletes(json.dumps(["doc-a"]))
+    assert delete_lsn > lsn
+    del appender
+
+    # The next writer folds the appended-then-deleted record in: doc-a is gone.
+    writer = native_core.CoreEngine.open(options)
+    stats = _loads(writer.stats("default"))
+    assert stats["document_count"] == 0
+    del writer
+
+
+def test_native_core_appender_rejects_generation_mode(tmp_path) -> None:
+    """Generation mode never replays the WAL, so opening an appender must fail."""
+
+    store = tmp_path / "store"
+    store.mkdir()
+    engine = native_core.CoreEngine.open(_wal_store_options(store))
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    generation_options = json.dumps(
+        {
+            "path": str(store),
+            "read_only": False,
+            "durability": "buffered",
+            "commit_mode": "generation",
+            "store_text": False,
+            "index_text": False,
+            "chunk_character_limit": 900,
+            "acquire_writer_lock": True,
+        }
+    )
+    # The InvalidArgument CoreError maps to ValueError at the binding boundary.
+    with pytest.raises(ValueError):
+        native_core.CoreAppender.open(generation_options)
+
+
+def test_native_core_appender_through_adapter(tmp_path) -> None:
+    """The `NativeCoreAdapter.open_appender` wrapper drives the real extension."""
+
+    from lodedb.engine.core import EngineVectorDocument
+    from lodedb.engine.native_adapter import NativeCoreAdapter
+
+    store = tmp_path / "store"
+    store.mkdir()
+    engine = native_core.CoreEngine.open(_wal_store_options(store))
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    adapter = NativeCoreAdapter()
+    appender = adapter.open_appender(path=store)
+    lsn = appender.append_vectors(
+        [EngineVectorDocument("doc-a", _onehot(0), metadata={"topic": "ops"}, text=None)]
+    )
+    assert lsn > 0
+    del appender
+
+    writer = native_core.CoreEngine.open(_wal_store_options(store))
+    stats = _loads(writer.stats("default"))
+    assert stats["document_count"] == 1
+    del writer
