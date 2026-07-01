@@ -32,7 +32,8 @@ final class NativeEngine {
         vectorDimension: Int,
         bitWidth: Int = 4,
         indexID: String = "default",
-        model: String? = nil
+        model: String? = nil,
+        ann: LodeAnnOptions? = nil
     ) throws -> NativeEngine {
         try requireABI()
         var engine: OpaquePointer?
@@ -42,7 +43,7 @@ final class NativeEngine {
             throw LodeDBError.internalError("native core did not return an engine")
         }
         let native = NativeEngine(handle: engine, indexID: indexID)
-        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth, model: model)
+        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth, model: model, ann: ann)
         return native
     }
 
@@ -74,7 +75,40 @@ final class NativeEngine {
 
     /// Creates the index. When `model` is non-nil the index is bound to that model
     /// identity (for the reopen-time embedder guard); otherwise native defaults apply.
-    func createIndex(vectorDimension: Int, bitWidth: Int = 4, model: String? = nil) throws {
+    /// When `ann` is set the index opts into approximate-nearest-neighbor scanning.
+    func createIndex(
+        vectorDimension: Int,
+        bitWidth: Int = 4,
+        model: String? = nil,
+        ann: LodeAnnOptions? = nil
+    ) throws {
+        // ANN needs the full CoreIndexCreateOptions, which the positional create
+        // functions do not carry, so route it through the JSON create ABI. The
+        // non-ann fields mirror CoreIndexCreateOptions::native_default so an ANN
+        // index shares the exact identity and route of a positionally-created one.
+        if let ann {
+            let options = CoreIndexCreateOptionsJSON(
+                index_id: indexID,
+                index_key: indexID,
+                client_id_hash: indexID,
+                name: "lodedb-local",
+                model: model ?? "native-core",
+                provider: "native",
+                task: "native-core",
+                route_profile: "native-core",
+                storage_profile: "native-core",
+                vector_dim: vectorDimension,
+                bit_width: bitWidth,
+                ann: CoreAnnOptionsJSON(
+                    algorithm: ann.algorithm, clusters: ann.clusters, nprobe: ann.nprobe))
+            let optionsJSON = try encodeJSON(options)
+            var error: UnsafeMutablePointer<LodeError>?
+            let status = withStringView(optionsJSON) {
+                lodedb_engine_create_index_json(handle, $0, &error)
+            }
+            try Self.check(status, error: error)
+            return
+        }
         var error: UnsafeMutablePointer<LodeError>?
         let status: UInt32
         if let model {
@@ -444,6 +478,32 @@ final class NativeEngine {
         }
         return text
     }
+}
+
+/// Serde-shaped payload for `lodedb_engine_create_index_json`. Field names match
+/// `CoreIndexCreateOptions`; `nil` optionals (including `ann`) are omitted by the
+/// encoder, so an exact index sends no `ann` key.
+private struct CoreIndexCreateOptionsJSON: Encodable {
+    let index_id: String
+    let index_key: String
+    let client_id_hash: String
+    let name: String
+    let model: String
+    let provider: String
+    let task: String
+    let route_profile: String
+    let storage_profile: String
+    let vector_dim: Int
+    let bit_width: Int
+    let ann: CoreAnnOptionsJSON?
+}
+
+/// Serde-shaped payload for `CoreAnnOptions`; unset tuning is omitted so the core
+/// applies its corpus-derived defaults.
+private struct CoreAnnOptionsJSON: Encodable {
+    let algorithm: String
+    let clusters: Int?
+    let nprobe: Int?
 }
 
 func withStringView<T>(_ string: String, _ body: (LodeStringView) throws -> T) rethrows -> T {

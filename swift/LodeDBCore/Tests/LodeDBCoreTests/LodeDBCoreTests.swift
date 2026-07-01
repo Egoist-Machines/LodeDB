@@ -21,6 +21,29 @@ import Testing
     #expect(filtered.map(\.id) == ["a"])
 }
 
+@Test func annEnabledStoreCreatesAndServes() throws {
+    // The ann option opts into cluster pruning at create; the store still serves
+    // and, on well-separated vectors, returns the exact nearest first. This
+    // exercises the JSON create ABI carrying the ann config end to end.
+    let db = try LodeDB(vectorDimension: 8, ann: .cluster)
+    try db.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "a")
+    try db.addVector([0, 1, 0, 0, 0, 0, 0, 0], id: "b")
+    try db.addVector([0, 0, 1, 0, 0, 0, 0, 0], id: "c")
+    let hits = try db.search(vector: [0, 1, 0, 0, 0, 0, 0, 0], k: 1)
+    #expect(hits.map(\.id) == ["b"])
+
+    // Tuning knobs are accepted too.
+    let tuned = try LodeDB(vectorDimension: 8, ann: LodeAnnOptions(clusters: 2, nprobe: 2))
+    try tuned.addVector([1, 0, 0, 0, 0, 0, 0, 0], id: "x")
+    #expect(try tuned.search(vector: [1, 0, 0, 0, 0, 0, 0, 0], k: 1).map(\.id) == ["x"])
+}
+
+@Test func annRejectsUnknownAlgorithm() throws {
+    #expect(throws: (any Error).self) {
+        _ = try LodeDB(vectorDimension: 8, ann: LodeAnnOptions(algorithm: "hnsw"))
+    }
+}
+
 @Test func opensPythonGenerationFixtureReadOnly() throws {
     let package = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()

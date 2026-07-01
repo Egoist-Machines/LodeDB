@@ -234,6 +234,9 @@ class LodeDB:
         chunk_character_limit: int = 900,
         store_text: bool = True,
         index_text: bool = False,
+        ann: str | None = None,
+        ann_clusters: int | None = None,
+        ann_nprobe: int | None = None,
         compression: bool = True,
         read_only: bool = False,
         durability: str | None = None,
@@ -296,6 +299,18 @@ class LodeDB:
         sidecar, never reaches telemetry, audit, or the redacted snapshot. The
         default leaves the on-disk layout byte-for-byte unchanged. Reopen the same
         path with the same ``index_text`` value you wrote with.
+        ``ann`` opts into approximate nearest-neighbor acceleration for the vector
+        scan and defaults to ``None`` (exact scan, full recall). Pass
+        ``ann="cluster"`` to enable IVF-style cluster pruning: the query scores
+        cluster centroids, scans only the nearest clusters, and the exact TurboVec
+        scan re-scores those candidates, so returned scores are exact but the result
+        set is approximate (a true neighbor in an unprobed cluster can be missed, so
+        recall is below 100%). Exact scan stays the default and the authority. Tune
+        with ``ann_clusters`` (partition count, defaults to about ``sqrt(n)``) and
+        ``ann_nprobe`` (clusters probed per query, defaults to about
+        ``sqrt(clusters)``); probing every cluster reproduces the exact result. ANN
+        is worthwhile for large corpora where the full scan is the bottleneck; small
+        and mid-size corpora should keep the exact default.
         ``compression`` controls whether the retained raw-text store (the
         ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
         ``True``; it has no effect when ``store_text=False``. The setting is
@@ -310,6 +325,9 @@ class LodeDB:
         self.path = Path(path)
         self.store_text = bool(store_text)
         self.index_text = bool(index_text)
+        # Opt-in ANN config (None => exact scan). Validated here for a friendly
+        # error; the native core is the authority and re-validates the algorithm.
+        self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)
         self.compression = bool(compression)
         self.read_only = bool(read_only)
         # The native core is the sole reader/writer for this handle. It is an
@@ -460,6 +478,7 @@ class LodeDB:
             model=route_policy.model,
             provider=route_policy.provider,
             task=route_policy.task,
+            ann=self.ann,
         )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
@@ -1231,6 +1250,7 @@ class LodeDB:
         model: str,
         provider: str,
         task: str,
+        ann: dict[str, Any] | None = None,
     ) -> None:
         """Opens the native core engine on a dedicated worker thread.
 
@@ -1261,6 +1281,7 @@ class LodeDB:
             storage_profile=storage_profile,
             vector_dim=self._vector_dim,
             bit_width=bit_width,
+            ann=ann,
         )
         read_only = self.read_only
 
@@ -2063,6 +2084,35 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
     return coerced
 
 
+def _resolve_ann_options(
+    algorithm: str | None,
+    clusters: int | None,
+    nprobe: int | None,
+) -> dict[str, Any] | None:
+    """Builds the native-core ``ann`` option dict, or ``None`` for exact scan.
+
+    ``algorithm`` opts into ANN (``"cluster"`` today); ``clusters``/``nprobe`` are
+    optional tuning. The native core is the authority on which algorithms exist, so
+    the algorithm string is passed through as-is; only the local shape (tuning
+    without ``ann=``, non-positive counts) is checked here for a friendly error.
+    """
+
+    if algorithm is None:
+        if clusters is not None or nprobe is not None:
+            raise ValueError("ann_clusters/ann_nprobe require ann= to be set")
+        return None
+    options: dict[str, Any] = {"algorithm": str(algorithm)}
+    if clusters is not None:
+        if int(clusters) < 1:
+            raise ValueError("ann_clusters must be a positive integer")
+        options["clusters"] = int(clusters)
+    if nprobe is not None:
+        if int(nprobe) < 1:
+            raise ValueError("ann_nprobe must be a positive integer")
+        options["nprobe"] = int(nprobe)
+    return options
+
+
 def _native_vector_index_options(
     *,
     index_id: str,
@@ -2076,10 +2126,11 @@ def _native_vector_index_options(
     storage_profile: str,
     vector_dim: int,
     bit_width: int,
+    ann: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Builds the native-core index creation payload for the local vector store."""
 
-    return {
+    options: dict[str, Any] = {
         "index_id": str(index_id),
         "index_key": str(index_key),
         "client_id_hash": str(client_id_hash),
@@ -2092,6 +2143,11 @@ def _native_vector_index_options(
         "vector_dim": int(vector_dim),
         "bit_width": int(bit_width),
     }
+    # Omit the key entirely when exact, so the create payload (and the persisted
+    # state header) stays byte-for-byte unchanged for non-ANN indexes.
+    if ann is not None:
+        options["ann"] = ann
+    return options
 
 
 def _has_leftover_wal(path: Path) -> bool:

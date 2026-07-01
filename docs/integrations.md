@@ -8,8 +8,10 @@ LodeDB is a strong fit wherever a project already treats vector storage as a plu
 backend, or where its current local default makes LodeDB's strengths easy to show:
 
 - **Local-first, no server.** In-process, on-disk, no daemon, no account, no API key.
-- **Exact recall.** A brute-force exact scan rather than ANN, so results don't drift with
-  index size.
+- **Exact recall by default.** A brute-force exact scan is the default and the authority, so
+  results don't drift with index size. An opt-in IVF-style ANN (`ann="cluster"`) is available for
+  large corpora; it re-scores its candidates exactly (exact scores) but is approximate (a neighbor
+  in an unprobed cluster can be missed), so exact scan stays the default.
 - **Hybrid retrieval.** `search` / `search_many` take a `mode` of `"vector"`, `"hybrid"`, or
   `"lexical"`. Hybrid fuses an Okapi BM25 lexical ranker with the vector scan via Reciprocal
   Rank Fusion, so exact tokens an embedding misses (error codes, serials, dates) are recovered

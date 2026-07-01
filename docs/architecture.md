@@ -192,6 +192,14 @@ batched `search_many` via `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`, but it sta
 on the measured M1 it was slower than NEON at every batch size, and newer Apple GPUs should be
 re-measured before any default change.
 
+An opt-in ANN layer (`ann="cluster"`) sits *in front of* whichever exact scan runs. When enabled
+for an index, an unfiltered query scores an in-memory IVF cluster index, unions the nearest
+`nprobe` clusters into a candidate set, and hands that set to the exact scan above as an
+allowlist; the exact scan re-scores the candidates. Scores are therefore exact but the result is
+approximate (a true neighbor in an unprobed cluster can be missed). It is off by default, the
+exact scan remains the authority, and probing every cluster reproduces the exact top-k. The
+cluster index is in-memory and rebuilt on open; only the opt-in config is persisted.
+
 Vector-scan routing (what the launch sweep in `benchmarks/direct_gpu_sweep/` asserts):
 
 ```mermaid
