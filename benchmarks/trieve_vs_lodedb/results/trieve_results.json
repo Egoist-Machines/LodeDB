@@ -1,0 +1,174 @@
+{
+  "axis_a": {
+    "axis": "A",
+    "batched_throughput": [
+      {
+        "concurrency": 1,
+        "per_query_ms": 49.0253,
+        "qps": 20.4
+      },
+      {
+        "concurrency": 16,
+        "per_query_ms": 52.2914,
+        "qps": 19.1
+      },
+      {
+        "concurrency": 64,
+        "per_query_ms": 44.2683,
+        "qps": 22.6
+      },
+      {
+        "concurrency": 256,
+        "per_query_ms": 39.6197,
+        "qps": 25.2
+      }
+    ],
+    "chunk_character_limit": 360,
+    "corpus_count": 200000,
+    "count_after_ingest": 200000,
+    "dataset": "ccdv/govreport-summarization",
+    "enqueue": {
+      "batch_count": 1667,
+      "enqueue_seconds": 3.197,
+      "enqueue_throughput_per_s": 62555.5,
+      "non_200_batches": 0
+    },
+    "index_wait": {
+      "expected_count": 200000,
+      "final_chunk_count": 200000,
+      "index_wait_seconds": 2335.05
+    },
+    "ingest_seconds": 2338.247,
+    "ingest_throughput_per_s": 85.5,
+    "k": 10,
+    "server_timing": {
+      "embed_ms": {
+        "count": 1000,
+        "mean_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "note": "per-phase from Trieve Server-Timing; qdrant_ms is the vector-store phase",
+      "phases_sample": {},
+      "qdrant_ms": {
+        "count": 1000,
+        "mean_ms": 0.0,
+        "p50_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "raw_header_sample": ""
+    },
+    "single_query_latency_ms": {
+      "count": 1000,
+      "mean_ms": 50.84741762399699,
+      "p50_ms": 49.3668690000959,
+      "p95_ms": 58.50003000023207
+    },
+    "system": "trieve"
+  },
+  "axis_b": {
+    "axis": "B",
+    "chunk_character_limit": 360,
+    "corpus_chunk_count": 151299,
+    "corpus_doc_count": 1500,
+    "count_after_ingest": 151299,
+    "dataset": "Shitao/MLDR/en",
+    "enqueue": {
+      "batch_count": 1261,
+      "enqueue_seconds": 2.23,
+      "enqueue_throughput_per_s": 67834.1,
+      "non_200_batches": 0
+    },
+    "hybrid": {
+      "metrics": {
+        "ndcg@10": 0.8608,
+        "recall@10": 0.955,
+        "recall@100": 0.9812
+      },
+      "mode": "hybrid",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 649.9324976424873,
+        "p50_ms": 648.0490089998057,
+        "p95_ms": 760.0057899999229
+      },
+      "server_timing": {
+        "embed_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        },
+        "qdrant_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        },
+        "rerank_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        }
+      }
+    },
+    "index_wait": {
+      "expected_count": 151299,
+      "final_chunk_count": 151299,
+      "index_wait_seconds": 2175.5
+    },
+    "ingest_seconds": 2177.73,
+    "k": 100,
+    "query_count": 800,
+    "system": "trieve",
+    "vector": {
+      "metrics": {
+        "ndcg@10": 0.8657,
+        "recall@10": 0.9187,
+        "recall@100": 0.9625
+      },
+      "mode": "semantic",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 59.18482151999797,
+        "p50_ms": 59.10315700020874,
+        "p95_ms": 64.65897799989762
+      },
+      "server_timing": {
+        "embed_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        },
+        "qdrant_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        },
+        "rerank_ms": {
+          "count": 800,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        }
+      }
+    }
+  },
+  "handle": {
+    "base_url": "http://localhost:8090",
+    "dataset_id": "7041d3cd-4fbf-437a-bced-3998125e6af0",
+    "org_id": "33d25bc5-20fd-432d-baef-38bef038cf51"
+  },
+  "handle_axis_b": {
+    "base_url": "http://localhost:8090",
+    "dataset_id": "57363a8d-2bc0-48f3-99ed-0149588dd912",
+    "org_id": "2be38ef8-f744-45c6-b8ac-12eabcf8960f"
+  },
+  "smoke": false,
+  "trieve_sha": "a99b21e23f21025757b44efb594676c4a7b7495f"
+}
