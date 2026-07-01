@@ -1473,3 +1473,177 @@ fn appender_repairs_torn_tail_between_appends() {
     drop(writer);
     fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn appender_preserves_a_writers_wal_growth_across_sessions() {
+    // A stale cross-session watermark must never make an append truncate records
+    // a writer committed to the WAL after the last appender session closed. The
+    // O(1) repair trusts the watermark only within a session; `open` re-scans and
+    // re-seeds it, so a writer's intervening frames survive.
+    let path = unique_temp_dir("core_appender_writer_growth");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Appender session 1 records a watermark at the end of its frame, then closes.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender 1");
+        appender
+            .append_vectors(&[doc("appended-1", 0, metadata(&[("s", "1")]))])
+            .expect("append 1");
+    }
+    // A writer grows the WAL without touching the LSN counter (the single-writer
+    // WAL path uses its in-memory generation, not the shared allocator), so the
+    // counter's watermark now sits behind the file. Its LSN stays above the base
+    // generation, so replay keeps it.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        3,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "writer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("writer grows the wal");
+    // Appender session 2 opens (full-scanning and re-seeding the watermark to
+    // include the writer's frame), then appends. The writer's frame must not be
+    // truncated back to session 1's stale watermark.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender 2");
+        appender
+            .append_vectors(&[doc("appended-2", 4, metadata(&[("s", "2")]))])
+            .expect("append 2");
+    }
+    // The next writer replays all three durable records: both appends and the
+    // writer's own growth.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 3);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_does_not_reuse_an_lsn_after_a_torn_counter() {
+    // A long-lived appender opened at floor F=1 (empty WAL). A peer commits a valid
+    // frame at LSN 2 and then crashes while rewriting the counter, leaving it torn
+    // (valid magic and length, bad CRC -> reads as absent). The appender's next
+    // append must scan the WAL and clamp above 2, not reuse 2 from its stale
+    // open-time floor, or the WAL would hold two frames at the same LSN.
+    let path = unique_temp_dir("core_appender_torn_counter_lsn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Open the appender first, so its floor is captured before the peer's frame.
+    let appender = CoreAppender::open(base.clone()).expect("open appender");
+    // A peer commits a valid native frame at LSN 2 (the LSN it would have reserved
+    // from the empty counter), then its counter rewrite is torn by a crash.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    let peer_lsn = 2_u64;
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        peer_lsn,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "peer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("peer commits a frame");
+    let lsn_file = path.join(format!("{INDEX_KEY}.lsn"));
+    let mut counter_bytes = std::fs::read(&lsn_file).expect("read counter");
+    counter_bytes[10] ^= 0xFF; // corrupt the payload so the CRC fails
+    std::fs::write(&lsn_file, counter_bytes).expect("torn counter");
+    // The appender's next append must land above the peer's LSN, not reuse it.
+    let lsn = appender
+        .append_vectors(&[doc("appended", 4, metadata(&[("s", "a")]))])
+        .expect("append after torn counter");
+    assert!(
+        lsn > peer_lsn,
+        "expected an LSN above the peer's {peer_lsn}, got {lsn}"
+    );
+    // Both frames replay with distinct LSNs: the peer's is kept, ours is above it.
+    drop(appender);
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
+    // When one appender's open heals a torn counter, it must publish a truthful
+    // LSN. Otherwise a second, still-open appender reads the healed (crc-valid)
+    // counter via the O(1) fast path, trusts its stale LSN, and reuses an LSN a
+    // peer already committed to the WAL.
+    let path = unique_temp_dir("core_appender_reseed_lsn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Long-lived appender X opens first, capturing a floor of 1 (empty WAL).
+    let x = CoreAppender::open(base.clone()).expect("open X");
+    // A peer commits a valid frame at LSN 2, then its counter rewrite is torn.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        2,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "peer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("peer commits a frame");
+    let lsn_file = path.join(format!("{INDEX_KEY}.lsn"));
+    let mut counter_bytes = std::fs::read(&lsn_file).expect("read counter");
+    counter_bytes[10] ^= 0xFF;
+    std::fs::write(&lsn_file, counter_bytes).expect("torn counter");
+    // A second appender Y opens, healing the torn counter from its WAL scan. The
+    // healed counter must carry an LSN of at least 2, not 0.
+    let y = CoreAppender::open(base.clone()).expect("open Y");
+    // X, still holding its stale open-time floor, reads the healed counter on the
+    // fast path and must still land above the peer's LSN.
+    let lsn = x
+        .append_vectors(&[doc("x-doc", 4, metadata(&[("s", "x")]))])
+        .expect("append X");
+    assert!(lsn > 2, "X reused an LSN through the healed counter: got {lsn}");
+    drop(x);
+    drop(y);
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}

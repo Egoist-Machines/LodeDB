@@ -632,7 +632,7 @@ fn set_document_metadata(
     Ok(())
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFF_u32;
     for byte in bytes {
         crc ^= u32::from(*byte);

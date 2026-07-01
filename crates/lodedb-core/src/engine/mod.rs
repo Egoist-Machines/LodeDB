@@ -2173,7 +2173,8 @@ impl CoreAppender {
         // is always above every LSN already on disk.
         let wal_path = crate::storage::wal::wal_path(&path, &index_key);
         let base_generation = loaded.generation;
-        let floor = crate::storage::lsn::with_lock(&path, &index_key, |_| {
+        let fsync = options.durability == "fsync";
+        let floor = crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
             Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
             // Refuse if the WAL already holds records only the Python engine can
@@ -2193,14 +2194,34 @@ impl CoreAppender {
                 .filter_map(|record| record.lsn)
                 .max()
                 .unwrap_or(0);
-            Ok(base_generation.max(wal_max_lsn))
+            let floor = base_generation.max(wal_max_lsn);
+            // Re-seed the shared counter to the just-repaired valid length. This is
+            // the correctness anchor for the O(1) per-append repair: a stale
+            // cross-session watermark (e.g. one left behind after a writer
+            // checkpoint truncated and regrew the WAL, or after a writer appended
+            // its own records in WAL mode) must never reach the append path, or an
+            // append could truncate committed frames as if they were an
+            // unacknowledged tail. A full scan happens once here per session; every
+            // append after it repairs in O(1).
+            //
+            // Seed the LSN to the floor (the WAL max and the generation), never
+            // below the value already there. This publishes a crc-valid counter, so
+            // its LSN must be truthful: leaving it at a torn counter's `0` would let
+            // another long-lived appender take the fast path, trust the stale LSN,
+            // and reserve one already committed to the WAL.
+            let existing_lsn = crate::storage::lsn::read_counter(file)?
+                .map(|counter| counter.lsn)
+                .unwrap_or(0);
+            let seeded_lsn = existing_lsn.max(floor);
+            crate::storage::lsn::write_counter(file, seeded_lsn, Some(scan.valid_len), fsync)?;
+            Ok(floor)
         })?;
         Ok(Self {
             path,
             index_key,
             vector_dim,
             floor,
-            fsync: options.durability == "fsync",
+            fsync,
             _lock: lock,
         })
     }
@@ -2260,25 +2281,79 @@ impl CoreAppender {
 
     fn append_one(&self, op: &str, payload: Value) -> Result<u64, CoreError> {
         let wal = crate::storage::wal::wal_path(&self.path, &self.index_key);
-        crate::storage::lsn::with_reserved(
-            &self.path,
-            &self.index_key,
-            1,
-            self.floor,
-            self.fsync,
-            |lsn| {
-                // A peer appender may have crashed mid-frame since we opened,
-                // leaving a torn tail. Repair it under the counter lock so this
-                // frame lands after complete records, not behind torn bytes that
-                // the next writer's replay would stop at (losing this record).
-                // This is O(WAL) per append; appenders are meant to run in short
-                // sessions where the WAL stays small before a writer checkpoints.
-                let scan = crate::storage::wal::read_records_with_valid_len(&wal)?;
-                Self::repair_torn_tail(&wal, scan.valid_len, scan.total_len)?;
-                crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
-                Ok(lsn)
-            },
-        )
+        crate::storage::lsn::with_lock(&self.path, &self.index_key, |file| {
+            let counter = crate::storage::lsn::read_counter(file)?;
+            // Repair a crashed peer's torn tail and establish the floor the next LSN
+            // must clear, both under the counter lock. This lands the frame after
+            // complete records (not behind torn bytes the next writer's replay would
+            // stop at) and reserves an LSN that collides with neither a writer's
+            // generation LSNs nor a frame a crashed peer already committed.
+            let floor = self.repair_and_lsn_floor(&wal, counter)?;
+            let lsn = floor
+                .checked_add(1)
+                .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
+            crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
+            // Record the new valid length as the next appender's watermark, after
+            // the frame is durable (see `lsn::write_counter`): a crash between the
+            // two leaves the watermark behind the frame, so the next appender drops
+            // the frame as an unacknowledged tail rather than trusting a phantom.
+            let new_len = std::fs::metadata(&wal)
+                .map(|meta| meta.len())
+                .map_err(core_io_error)?;
+            crate::storage::lsn::write_counter(file, lsn, Some(new_len), self.fsync)?;
+            Ok(lsn)
+        })
+    }
+
+    /// Repairs the WAL tail and returns the floor the next LSN must exceed (the
+    /// reservation is `floor + 1`). The caller must hold the counter lock.
+    ///
+    /// With a trusted watermark (the common case) this is O(1): stat the file and,
+    /// if it grew past the watermark, drop the crashed peer's unacknowledged tail;
+    /// the counter's own LSN then covers every surviving frame. No writer can have
+    /// appended those bytes, since a writer needs the exclusive lock this
+    /// appender's shared lock excludes, and every peer append advances the
+    /// watermark under this same counter lock.
+    ///
+    /// Without a watermark (a v1 or torn counter) or with one that sits past the
+    /// file (a stale pre-checkpoint value), it falls back to a full scan. That scan
+    /// both repairs the tail AND yields the WAL's true max LSN, which clamps the
+    /// floor: a torn counter's LSN cannot be trusted, and the appender's open-time
+    /// floor may be stale relative to a frame a peer committed after this appender
+    /// opened, so without the clamp a reused LSN could reach the WAL.
+    fn repair_and_lsn_floor(
+        &self,
+        wal: &Path,
+        counter: Option<crate::storage::lsn::Counter>,
+    ) -> Result<u64, CoreError> {
+        let counter_lsn = counter.map(|counter| counter.lsn).unwrap_or(0);
+        let physical = match std::fs::metadata(wal) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(core_io_error(error)),
+        };
+        match counter.and_then(|counter| counter.wal_len) {
+            // Intact tail: nothing sits past the last recorded frame, and the
+            // counter's LSN is the last frame's LSN. The hot path.
+            Some(mark) if physical == mark && mark > 0 => Ok(counter_lsn.max(self.floor)),
+            // Bytes past the watermark are a crashed peer's unacknowledged tail (or
+            // a zero-length WAL that needs its header rewritten): drop them back to
+            // the boundary. `repair_torn_tail` removes the file when the boundary is
+            // zero so the next append writes a fresh header, not a headerless frame.
+            Some(mark) if physical >= mark => {
+                Self::repair_torn_tail(wal, mark, physical)?;
+                Ok(counter_lsn.max(self.floor))
+            }
+            // No usable watermark, or one past the file: scan to repair the tail and
+            // clamp the LSN above the WAL's true max so a torn counter or stale floor
+            // cannot reuse an LSN a peer already wrote.
+            _ => {
+                let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
+                Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
+                let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
+                Ok(counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)))
+            }
+        }
     }
 
     /// Drops a torn or headerless WAL tail so the next append lands after complete
