@@ -18,7 +18,7 @@ from typing import Any
 from lodedb.engine._atomic_io import normalize_durability
 from lodedb.engine.core import EngineVectorDocument
 from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreAppenderHandle
-from lodedb.local.db import _coerce_metadata
+from lodedb.local.db import _coerce_metadata, _coerce_optional_text
 
 __all__ = ["Appender"]
 
@@ -44,16 +44,23 @@ class Appender:
         path: str | PathLike[str],
         *,
         durability: str = "fast",
+        store_text: bool = False,
+        index_text: bool = False,
         acquire_writer_lock: bool = True,
     ) -> Appender:
         """Opens an appender over the store at ``path``.
 
         ``durability`` is ``"fast"`` (default, atomic but not fsynced per append) or
         ``"fsync"`` (each append fsynced before returning); any other value raises,
-        matching :class:`LodeDB`. ``acquire_writer_lock`` takes the shared
-        ``<dir>/.lodedb.lock`` so appenders exclude an exclusive writer; pass
-        ``False`` only when an outer caller owns exclusion for the process. The store
-        must hold exactly one index and be in WAL commit mode.
+        matching :class:`LodeDB`. ``store_text``/``index_text`` control whether an
+        appended document's ``text`` is retained and its lexical tokens logged. Both
+        default **off** for privacy: no raw text reaches ``<key>.wal`` unless you opt
+        in. Enable ``store_text`` only for a store whose writer also retains text
+        (i.e. was opened ``store_text=True``), or the writer drops the caption at
+        checkpoint. ``acquire_writer_lock`` takes the shared ``<dir>/.lodedb.lock`` so
+        appenders exclude an exclusive writer; pass ``False`` only when an outer
+        caller owns exclusion. The store must hold exactly one index and be in WAL
+        commit mode.
         """
 
         # Validate/normalize up front (raises on an unknown mode) so a typo cannot
@@ -65,6 +72,8 @@ class Appender:
         handle = adapter.open_appender(
             path=path,
             durability=native_durability,
+            store_text=store_text,
+            index_text=index_text,
             acquire_writer_lock=acquire_writer_lock,
         )
         return cls(handle)
@@ -75,6 +84,7 @@ class Appender:
         *,
         id: str,
         metadata: Mapping[str, Any] | None = None,
+        text: str | None = None,
         normalize: bool = True,
     ) -> int:
         """Logs one vector-in record and returns its LSN.
@@ -82,10 +92,13 @@ class Appender:
         The vector is L2-normalized by default (matching :meth:`LodeDB.add_vectors`,
         so cosine scores stay comparable); pass ``normalize=False`` for a unit-norm
         vector. ``id`` is required: auto-ids would collide across concurrent writers.
+        ``text`` is the optional caption (e.g. for an image), retained only when the
+        appender was opened with ``store_text``; it is never embedded or chunked.
         """
 
         return self.append_many(
-            [{"vector": vector, "id": id, "metadata": metadata}], normalize=normalize
+            [{"vector": vector, "id": id, "metadata": metadata, "text": text}],
+            normalize=normalize,
         )
 
     def append_many(
@@ -94,8 +107,8 @@ class Appender:
         *,
         normalize: bool = True,
     ) -> int:
-        """Logs a batch of ``{"vector", "id", "metadata"?}`` records as one WAL record
-        and returns its LSN. Each ``id`` must be present and non-empty."""
+        """Logs a batch of ``{"vector", "id", "metadata"?, "text"?}`` records as one
+        WAL record and returns its LSN. Each ``id`` must be present and non-empty."""
 
         prepared: list[EngineVectorDocument] = []
         for item in documents:
@@ -110,7 +123,7 @@ class Appender:
                     document_id=str(document_id),
                     vector=_normalize_vector(vector, normalize=normalize),
                     metadata=_coerce_metadata(item.get("metadata")),
-                    text=None,
+                    text=_coerce_optional_text(item.get("text")),
                 )
             )
         if not prepared:

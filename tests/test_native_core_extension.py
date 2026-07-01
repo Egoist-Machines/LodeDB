@@ -1326,3 +1326,34 @@ def test_public_appender_normalizes_large_vectors(tmp_path) -> None:
         assert hits[0].score > 0.5
     finally:
         reopened.close()
+
+
+def test_public_appender_retains_caption_text(tmp_path) -> None:
+    """With store_text on, a caption appended via lodedb.Appender is retained and
+    reconstructable after the next writable open. This is also the image path: a
+    captioned CLIP vector is a vector plus caption text. store_text is off by
+    default (privacy), so a caption is not retained unless opted in."""
+
+    import lodedb
+
+    store = lodedb.LodeDB.open_vector_store(tmp_path / "store", vector_dim=8)
+    store.close()
+    path = tmp_path / "store"
+
+    with lodedb.Appender.open(path, store_text=True) as appender:
+        appender.append(_onehot(0), id="img-1", metadata={"kind": "image"}, text="a red bicycle")
+
+    reopened = lodedb.LodeDB.open_vector_store(path, vector_dim=8)
+    try:
+        assert reopened.get_text("img-1") == "a red bicycle"
+    finally:
+        reopened.close()
+
+    # Default (store_text off): the appender logs no raw text, so none is retained.
+    with lodedb.Appender.open(path) as appender:
+        appender.append(_onehot(1), id="vec-2", text="dropped caption")
+    reopened = lodedb.LodeDB.open_vector_store(path, vector_dim=8)
+    try:
+        assert reopened.get_text("vec-2") is None
+    finally:
+        reopened.close()

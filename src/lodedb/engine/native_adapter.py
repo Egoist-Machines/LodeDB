@@ -172,6 +172,8 @@ class NativeCoreAdapter:
         *,
         path: str | PathLike[str],
         durability: str = "buffered",
+        store_text: bool = False,
+        index_text: bool = False,
         acquire_writer_lock: bool = True,
     ) -> NativeCoreAppenderHandle:
         """Opens a shared-lock appender over the single index at ``path``.
@@ -179,7 +181,12 @@ class NativeCoreAdapter:
         Many processes can each hold an appender and durably log vector-in records
         to the store's WAL concurrently; the next exclusive writer folds them into
         the index on open. The store must be in WAL commit mode and hold exactly
-        one index. Appenders take the shared ``<dir>/.lodedb.lock`` lock by default
+        one index. ``store_text``/``index_text`` mirror the store's writer: a
+        document's caption is retained only under ``store_text`` and its lexical
+        tokens are logged only under ``index_text``. Both default off (privacy: no
+        raw text reaches ``<key>.wal``); enable them only for a store whose writer
+        also does, or the writer drops the payload at checkpoint.
+        Appenders take the shared ``<dir>/.lodedb.lock`` lock by default
         (``acquire_writer_lock=True``); pass ``False`` only when an outer caller
         already owns exclusion for the process.
         """
@@ -192,10 +199,8 @@ class NativeCoreAdapter:
             # Appends reach the index only through the WAL, which a generation-mode
             # writer never replays, so the appender requires WAL commit mode.
             commit_mode="wal",
-            # Vector-in only: no retained text or lexical tokens, so text options
-            # are inert here and the chunk limit is unused.
-            store_text=False,
-            index_text=False,
+            store_text=store_text,
+            index_text=index_text,
             chunk_character_limit=8192,
             acquire_writer_lock=acquire_writer_lock,
         )
