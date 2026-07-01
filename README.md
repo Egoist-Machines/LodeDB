@@ -165,26 +165,27 @@ Run with `uv run` (e.g. `uv run lodedb doctor`).
 ```python
 from lodedb import LodeDB
 
-db = LodeDB(path="./data", model="minilm")   # "minilm" (fast) | "bge" (quality) | "clip" (image+text)
+with LodeDB(path="./data", model="minilm") as db:   # "minilm" (fast) | "bge" (quality) | "clip" (image+text)
+    fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})
+    db.add("a lazy dog sleeps all day", metadata={"topic": "animals"})
 
-fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})
-db.add("a lazy dog sleeps all day", metadata={"topic": "animals"})
+    for score, doc_id, meta in db.search("fox", k=5):
+        print(score, doc_id, meta)
 
-for score, doc_id, meta in db.search("fox", k=5):
-    print(score, doc_id, meta)
+    for hits in db.search_many(["fox", "dog"], k=5):   # batched; the GPU can serve this
+        print([(h.score, h.id, h.metadata) for h in hits])
 
-for hits in db.search_many(["fox", "dog"], k=5):   # batched; the GPU can serve this
-    print([(h.score, h.id, h.metadata) for h in hits])
+    # filter by metadata: exact match, plus $gt/$gte/$lt/$lte/$in/$nin/$exists and $and/$or/$not
+    db.search("fox", k=5, filter={"topic": "animals"})                      # bare scalar = exact
+    db.search("fox", k=5, filter={"$or": [{"topic": "animals"}, {"year": {"$gte": 2020}}]})
 
-# filter by metadata: exact match, plus $gt/$gte/$lt/$lte/$in/$nin/$exists and $and/$or/$not
-db.search("fox", k=5, filter={"topic": "animals"})                      # bare scalar = exact
-db.search("fox", k=5, filter={"$or": [{"topic": "animals"}, {"year": {"$gte": 2020}}]})
+    # hybrid search: vector recall plus exact lexical matches the embedding misses
+    db.add("turbine tripped, fault code E1234 overnight", metadata={"topic": "ops"})
+    for score, doc_id, meta in db.search("E1234", k=5, mode="hybrid"):  # exact code the vector misses
+        print(score, doc_id, meta)
 
-# hybrid search: vector recall plus exact lexical matches the embedding misses
-db.search("E1234", k=5, mode="hybrid")     # surfaces error codes, serials, dates in the body
-
-db.get(fox)     # -> "the quick brown fox jumps"  (text retained by default)
-db.persist()    # durable .tvim/.tvd/.jsd snapshot; replays on reopen
+    print(db.get(fox))   # "the quick brown fox jumps"  (text retained by default)
+# leaving the block persists a durable .tvim/.tvd/.jsd snapshot and releases the store
 ```
 
 Reopen with `LodeDB(path="./data")`; no migration step. Original text is kept in a
