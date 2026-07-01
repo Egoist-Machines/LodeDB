@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -908,6 +909,53 @@ def test_native_write_through_cross_thread_write_is_served(tmp_path, monkeypatch
     assert reopened.stats()["document_count"] == 2
     assert reopened.search_by_vector(_onehot(0), k=1)[0].id == "main"
     assert reopened.search_by_vector(_onehot(1), k=1)[0].id == "thread"
+    reopened.close()
+
+
+def test_unclosed_native_engine_exits_without_teardown_warning(tmp_path) -> None:
+    """A store left un-closed must exit cleanly, with no wrong-thread drop warning.
+
+    The native engine is unsendable and lives on a single worker thread, so its
+    final decref must land on that worker. When the caller never calls close(), the
+    drop falls to interpreter teardown; if it happens on the finalizing thread PyO3
+    writes ``... is unsendable, but is being dropped on another thread`` to stderr
+    (and skips the drop). db.py closes still-open native engines on their worker just
+    before the worker threads are joined, so a fresh interpreter that opens a store
+    and exits without close() prints no such warning. Runs in a subprocess because
+    the drop only happens at real interpreter shutdown.
+    """
+
+    from lodedb import LodeDB
+
+    store = tmp_path / "unclosed"
+    probe = (
+        "import importlib.machinery, importlib.util, os, sys\n"
+        "_ext = os.environ.get('LODEDB_NATIVE_CORE_EXTENSION_PATH')\n"
+        "if _ext:\n"
+        "    import lodedb\n"
+        "    _loader = importlib.machinery.ExtensionFileLoader('lodedb._turbovec', _ext)\n"
+        "    _spec = importlib.util.spec_from_file_location(\n"
+        "        'lodedb._turbovec', _ext, loader=_loader)\n"
+        "    _mod = importlib.util.module_from_spec(_spec)\n"
+        "    sys.modules['lodedb._turbovec'] = _mod\n"
+        "    _spec.loader.exec_module(_mod)\n"
+        "from lodedb import LodeDB\n"
+        f"db = LodeDB.open_vector_store({str(store)!r}, vector_dim=8, commit_mode='generation')\n"
+        "db.add_vectors([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], id='main', normalize=False)\n"
+        "print('NATIVE_ACTIVE', db._native_vector_engine is not None)\n"
+        "# Intentionally no db.close(): exercise the interpreter-teardown drop path.\n"
+    )
+    env = {**os.environ, "LODEDB_NATIVE_CORE": "on", "LODEDB_NATIVE_CORE_WRITE": "on"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env
+    )
+
+    # The engine really existed (otherwise the assertion below would be vacuous).
+    assert "NATIVE_ACTIVE True" in result.stdout, result.stdout
+    assert "is being dropped on another thread" not in result.stderr, result.stderr
+    # The write is durable even without an explicit close() (the exit hook folds it).
+    reopened = LodeDB.open_vector_store(store, vector_dim=8, commit_mode="generation")
+    assert reopened.stats()["document_count"] == 1
     reopened.close()
 
 

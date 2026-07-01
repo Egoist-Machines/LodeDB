@@ -20,6 +20,7 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import secrets
@@ -1403,6 +1404,12 @@ class LodeDB:
             self._native_engine_holder,
             self._native_engine_thread_id,
         )
+        # Also close on its home worker at interpreter exit if the caller never
+        # does: the GC finalizer above runs too late (after the worker is joined),
+        # so without this an un-closed handle drops on the finalizing thread and
+        # PyO3 writes a spurious "dropped on another thread" unraisable.
+        _OPEN_NATIVE_DBS.add(self)
+        _register_early_native_atexit()
 
     def _native_upsert_vectors(self, documents: tuple[EngineVectorDocument, ...]) -> None:
         """Upserts vector documents into the native core (fail closed)."""
@@ -1872,6 +1879,58 @@ def _is_writer_lock_contention(error: BaseException) -> bool:
 # lands on a foreign thread (the unsendable PyCoreEngine panics if it does). The
 # OS reclaims them at process exit; this only prevents a spurious teardown panic.
 _LEAKED_NATIVE_ENGINES: list[NativeCoreEngineHandle] = []
+
+
+# Open handles whose unsendable native engine still needs dropping on its home
+# worker. The per-handle GC finalizer (_shutdown_native_engine) runs from weakref's
+# atexit callback, which fires *after* concurrent.futures has already joined the
+# worker threads; by then the worker is gone and the engine's final decref lands on
+# the finalizing thread, which makes PyO3 write an "is being dropped on another
+# thread" unraisable (and skip the drop). Closing them from a hook that runs *before*
+# that worker join gives each engine a clean worker-side drop and no teardown noise.
+_OPEN_NATIVE_DBS: weakref.WeakSet[LodeDB] = weakref.WeakSet()
+_EARLY_ATEXIT_REGISTERED = False
+
+
+def _close_open_native_dbs_at_exit() -> None:
+    """Closes every still-open native engine on its home worker before teardown.
+
+    Runs before ``concurrent.futures`` joins its worker threads, so each engine's
+    final decref lands on the worker that created it. ``close()`` is idempotent and
+    detaches the GC finalizer, so a handle the caller already closed is a no-op.
+    """
+
+    for db in list(_OPEN_NATIVE_DBS):
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001 - teardown is best effort; never raise at exit
+            pass
+
+
+def _register_early_native_atexit() -> None:
+    """Arms the pre-worker-join teardown hook once, on the first native open.
+
+    Registered lazily (after the ``concurrent.futures`` import that arms its own
+    worker-join hook) so the LIFO atexit order runs ours first. Prefers
+    ``threading._register_atexit`` (runs before the worker join, where a clean drop
+    is still possible); falls back to ``atexit.register`` on the rare interpreter
+    without it (there the worker is already gone by teardown, so the per-handle
+    finalizer's park is the safety net instead).
+    """
+
+    global _EARLY_ATEXIT_REGISTERED
+    if _EARLY_ATEXIT_REGISTERED:
+        return
+    _EARLY_ATEXIT_REGISTERED = True
+    register = getattr(threading, "_register_atexit", None)
+    if register is not None:
+        try:
+            register(_close_open_native_dbs_at_exit)
+            return
+        except RuntimeError:
+            # Interpreter already finalizing; fall through to a best-effort atexit.
+            pass
+    atexit.register(_close_open_native_dbs_at_exit)
 
 
 def _shutdown_native_engine(
