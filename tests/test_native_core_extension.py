@@ -1247,3 +1247,82 @@ def test_native_core_appender_through_adapter(tmp_path) -> None:
     stats = _loads(writer.stats("default"))
     assert stats["document_count"] == 1
     del writer
+
+
+def test_public_appender_api_round_trip(tmp_path) -> None:
+    """The public `lodedb.Appender` logs vector-in records and a delete that the next
+    writable `LodeDB` open folds in, leaving the survivor queryable."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    db.close()  # release the writer lock so the shared-lock appender can open
+
+    with lodedb.Appender.open(store) as appender:
+        first = appender.append(_onehot(0), id="doc-a", metadata={"topic": "ops"})
+        assert first > 0
+        batch = appender.append_many([{"vector": _onehot(1), "id": "doc-b"}])
+        assert batch > first
+        # A bare string is one id, not iterated into characters.
+        removed = appender.delete("doc-b")
+        assert removed > batch
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        # doc-a folded in; doc-b was appended then deleted.
+        assert reopened.count() == 1
+        hits = reopened.search_by_vector(_onehot(0), k=2)
+        assert [hit.id for hit in hits] == ["doc-a"]
+        assert hits[0].metadata.get("topic") == "ops"
+    finally:
+        reopened.close()
+
+
+def test_public_appender_rejects_zero_vector_when_normalizing(tmp_path) -> None:
+    """A zero vector cannot be L2-normalized, so the default path rejects it (matching
+    LodeDB.add_vectors) rather than committing a meaningless record."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    with lodedb.Appender.open(store) as appender:
+        with pytest.raises(ValueError):
+            appender.append([0.0] * 8, id="zero")
+
+
+def test_public_appender_rejects_unknown_durability(tmp_path) -> None:
+    """An unknown durability mode raises rather than silently degrading to buffered."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+    with pytest.raises(ValueError):
+        lodedb.Appender.open(store, durability="turbo")
+
+
+def test_public_appender_normalizes_large_vectors(tmp_path) -> None:
+    """A large but finite vector normalizes along its direction (float64 norm), not to
+    an all-zero record from a float32 norm overflow."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+    with lodedb.Appender.open(store) as appender:
+        # 1e155 squared overflows float64, so a naive sum-of-squares norm would zero
+        # the vector; math.hypot keeps it along axis 0.
+        appender.append([1e155, 0, 0, 0, 0, 0, 0, 0], id="big")
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        hits = reopened.search_by_vector(_onehot(0), k=1)
+        assert hits[0].id == "big"
+        # A zeroed (overflowed) vector would score ~0; a correctly normalized one
+        # scores near 1 along its own axis.
+        assert hits[0].score > 0.5
+    finally:
+        reopened.close()
