@@ -527,6 +527,19 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   deltas plus, with `index_text=True`, lexical tokens), so treat it as sensitively as the data it
   indexes; `persist()`/`close()` checkpoint and truncate it, and `generation` mode keeps no WAL.
   See the [payload boundary](docs/architecture.md#persistence--payload-boundary) docs.
+- **Concurrent multi-writer append (WAL mode).** Beyond the single exclusive writer, many
+  processes can *append* to one path at once through a shared-lock appender. Each takes a shared
+  lock (the exclusive writer's lock still excludes them), logs self-contained vector-in records to
+  `<key>.wal` ordered by a durable, process-shared sequence allocator, and the next *writable* open
+  folds them into a clean generation. Appends are durable once acknowledged under
+  `durability="fsync"` (the default `fast` is atomic but not fsynced, like the writer's own adds)
+  and become queryable only after that fold-in (a read-only handle still loads the last
+  checkpointed generation, not the appended tail). On Windows the shared lock degrades to an
+  exclusive hold, so appenders serialize there rather than coexisting. Each record is a precomputed
+  vector plus metadata, and an optional caption (e.g. for an image) retained only when the appender
+  opts into `store_text` (off by default, so no raw text reaches the WAL); it requires WAL commit
+  mode. Exposed as the native `CoreAppender`, over the C ABI, in Python (`lodedb.Appender`), and in
+  Swift (`LodeAppender`).
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Swift / iOS
@@ -534,6 +547,7 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
 LodeDB has a native Swift binding for macOS and iOS over the same Rust core (no Python
 runtime, no network, on device). It exposes durable open/persist, vector/text/hybrid
 search, the full metadata-filter grammar, batched search, late-interaction (MaxSim),
+a concurrent WAL appender (`LodeAppender`) for multi-process ingest,
 on-device embedders (Apple `NLEmbedding` out of the box, or an ONNX parity path), and a
 `LodeMemory` save/recall/forget facade for agent memory. The `.tvim` format is
 byte-compatible, so an index built here loads on a phone. See
@@ -553,9 +567,10 @@ byte-compatible, so an index built here loads on a phone. See
   need either `store_text=True` (the index built from raw text) or `index_text=True` (a durable
   `.tvlex` postings store that survives reopens without raw text). The serving index is held in
   memory and maintained incrementally across mutations.
-- **Single writer per path.** One writer at a time (many concurrent readers), with no live
-  cross-process refresh, on local filesystems only. See
-  [Concurrency & durability](#concurrency--durability).
+- **Single exclusive writer per path.** One full writer at a time (many concurrent readers), with
+  no live cross-process refresh, on local filesystems only. Concurrent *append* is the exception:
+  in WAL mode many processes can log vector-in records at once via a shared-lock appender, folded
+  in by the next writer. See [Concurrency & durability](#concurrency--durability).
 - **Model weights download from Hugging Face** on first use, then cache locally.
 
 ## TurboVec

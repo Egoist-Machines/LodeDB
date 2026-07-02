@@ -8,6 +8,7 @@ extension module, ``lodedb._turbovec``.
 from __future__ import annotations
 
 from lodedb._turbovec import (  # type: ignore[attr-defined]
+    CoreAppender,
     CoreEngine,
     core_document_to_json,
     cuda_runtime_available,
@@ -20,6 +21,7 @@ from lodedb._turbovec import (  # type: ignore[attr-defined]
 __version__ = native_core_version()
 
 __all__ = [
+    "CoreAppender",
     "CoreEngine",
     "__version__",
     "core_document_to_json",

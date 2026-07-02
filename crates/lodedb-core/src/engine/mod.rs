@@ -233,6 +233,7 @@ impl CoreEngine {
                 chunk_id: document.document_id.clone(),
                 vector: document.vector.clone(),
             }];
+            let retains_text = retained_text.is_some();
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
@@ -249,6 +250,24 @@ impl CoreEngine {
                     patch_matrix: document.patch_matrix.clone(),
                 },
             );
+            let old_had_tokens = old_record
+                .as_ref()
+                .is_some_and(|record| !record.token_lists.is_empty());
+            let old_had_text = old_record
+                .as_ref()
+                .is_some_and(|record| record.text.is_some());
+            if retains_text {
+                index
+                    .pending_raw_text_clears
+                    .remove(&document.document_id);
+            } else if old_had_text {
+                // A re-add without a retained caption clears the raw text; the
+                // clear must reach the text delta as a delete, or the base's old
+                // text resurrects on reload.
+                index
+                    .pending_raw_text_clears
+                    .insert(document.document_id.clone());
+            }
             if let Some(old_record) = old_record {
                 index.remove_document_indexes(
                     &document.document_id,
@@ -272,11 +291,17 @@ impl CoreEngine {
             );
             if caption_tokens.is_empty() {
                 index.lexical_index.remove_group(&document.document_id);
+                if old_had_tokens {
+                    index
+                        .pending_lexical_clears
+                        .insert(document.document_id.clone());
+                }
             } else {
                 index.lexical_index.replace_group(
                     &document.document_id,
                     &[(document.document_id.clone(), caption_tokens)],
                 );
+                index.pending_lexical_clears.remove(&document.document_id);
             }
             // Only re-sync the vector when it actually changed; a same-vector
             // metadata refresh keeps its existing live-index row.
@@ -359,6 +384,7 @@ impl CoreEngine {
         if !wal_vectors.is_empty() {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "upsert_vectors",
                 serde_json::json!({ "vectors": wal_vectors }),
             )?;
@@ -427,6 +453,7 @@ impl CoreEngine {
         if deleted > 0 {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "delete_documents",
                 serde_json::json!({
                     "document_ids": document_ids,
@@ -487,9 +514,17 @@ impl CoreEngine {
                 .as_ref()
                 .map(|text| crate::text::hash::sha256_text(text))
                 .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
+            let had_text = record.text.is_some();
             // Retain raw text only when store_text is on (privacy); otherwise the
             // updated caption must not be kept in memory or written to disk.
             record.text = if store_text { text.clone() } else { None };
+            if record.text.is_some() {
+                index.pending_raw_text_clears.remove(document_id);
+            } else if had_text {
+                // A cleared raw caption must reach the text delta as a delete, or
+                // the base's old text resurrects on reload.
+                index.pending_raw_text_clears.insert(document_id.to_string());
+            }
             // The caption changed, so refresh its lexical postings: tokenize the
             // new caption when index_text is on, otherwise clear stale postings.
             let caption_tokens: Vec<String> = if index_text {
@@ -497,6 +532,7 @@ impl CoreEngine {
             } else {
                 Vec::new()
             };
+            let had_tokens = !record.token_lists.is_empty();
             record.token_lists = if caption_tokens.is_empty() {
                 Vec::new()
             } else {
@@ -504,16 +540,26 @@ impl CoreEngine {
             };
             if caption_tokens.is_empty() {
                 index.lexical_index.remove_group(document_id);
+                if had_tokens {
+                    index.pending_lexical_clears.insert(document_id.to_string());
+                }
             } else {
                 index
                     .lexical_index
                     .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+                index.pending_lexical_clears.remove(document_id);
             }
         }
         if metadata_changed {
             let metadata = record.metadata.clone();
             index.add_document_indexes(document_id, &metadata, &chunks, &mut changed_filter_fields);
             index.finalize_filter_fields(&changed_filter_fields);
+        } else if text_for_wal.is_some() {
+            // A text-only update must still mark the document pending, or
+            // persist() no-ops and the checkpoint truncates the WAL record
+            // carrying the only durable copy of the change.
+            index.pending_deletes.remove(document_id);
+            index.pending_upserts.insert(document_id.to_string());
         }
         index.generation += 1;
         let generation = index.generation;
@@ -548,6 +594,7 @@ impl CoreEngine {
         }
         self.append_wal_record(
             &index_key,
+            generation,
             "update_document_payload",
             Value::Object(payload),
         )?;
@@ -810,6 +857,7 @@ impl CoreEngine {
         if append_wal && !plan.documents.is_empty() {
             self.append_wal_record(
                 &index_key,
+                generation,
                 "apply_embedded_documents",
                 serde_json::json!({
                     "documents": wal_documents,
@@ -1437,6 +1485,7 @@ impl CoreEngine {
     fn append_wal_record(
         &self,
         index_key: &str,
+        lsn: u64,
         op: &str,
         payload: Value,
     ) -> Result<(), CoreError> {
@@ -1448,6 +1497,7 @@ impl CoreEngine {
         }
         crate::storage::wal::append_record(
             &crate::storage::wal::wal_path(&persistence.path, index_key),
+            lsn,
             op,
             &payload,
             persistence.fsync,
@@ -1561,19 +1611,48 @@ impl CoreEngine {
                             .map(ToString::to_string)
                             .collect()
                     })
+                    // A caption that tokenizes to nothing is logged as `[[]]` but
+                    // stored by the live path as no list at all; collapse empty
+                    // lists so the equality guard below compares like shapes and a
+                    // replayed store stays byte-identical to a live-written one.
+                    .filter(|tokens: &Vec<String>| !tokens.is_empty())
                     .collect(),
                 None => continue,
             };
-            if let Some(record) = index.documents.get_mut(document_id) {
-                record.token_lists = token_lists.clone();
-            } else {
-                continue;
+            match index.documents.get_mut(document_id) {
+                // Skip when the tokens are already current: for a retained caption
+                // (store_text on) upsert_vectors above derived the same tokens, so it
+                // already advanced the generation and marked the row pending. Only a
+                // genuine change falls through to the persistence bookkeeping below,
+                // so the common path is not double-counted.
+                Some(record) if record.token_lists != token_lists => {
+                    record.token_lists = token_lists.clone();
+                }
+                _ => continue,
             }
-            let units = vec![(
-                document_id.to_string(),
-                token_lists.into_iter().next().unwrap_or_default(),
-            )];
-            index.lexical_index.replace_group(document_id, &units);
+            if token_lists.is_empty() {
+                // Mirror the live path for a cleared caption: the document leaves
+                // the lexical index instead of lingering as a zero-token unit that
+                // would inflate the BM25 doc count, and the clear is marked for the
+                // delta (the guard above proves the old tokens were non-empty).
+                index.lexical_index.remove_group(document_id);
+                index.pending_lexical_clears.insert(document_id.to_string());
+            } else {
+                let units = vec![(
+                    document_id.to_string(),
+                    token_lists.into_iter().next().unwrap_or_default(),
+                )];
+                index.lexical_index.replace_group(document_id, &units);
+                index.pending_lexical_clears.remove(document_id);
+            }
+            // A token-only restore (store_text=false, index_text=true) onto an
+            // otherwise-unchanged row leaves upsert_vectors a no-op, so account for
+            // the mutation here: mark the row pending AND advance the generation.
+            // Without the pending marker the checkpoint truncates the WAL and drops
+            // these tokens; without the generation bump the lexical delta commits
+            // under an already-published epoch and generation-based readers miss it.
+            index.pending_upserts.insert(document_id.to_string());
+            index.generation += 1;
         }
         Ok(())
     }
@@ -1802,6 +1881,20 @@ impl CoreEngine {
                     persistence.compress_text = persisted;
                 }
             }
+            if !replay_wal && !persistence_read_only {
+                // A writable generation-mode open must not proceed over unfolded
+                // WAL records: its commits advance the committed generation past
+                // their LSNs, so the next WAL-mode open would skip them as already
+                // folded and truncate the log, silently destroying acknowledged
+                // appends. Refuse instead and point at the fold path.
+                let wal = crate::storage::wal::wal_path(&persistence_path, &index_key);
+                if !crate::storage::wal::read_records(&wal)?.is_empty() {
+                    return invalid(
+                        "store has unfolded WAL records; open it with commit_mode=\"wal\" \
+                         to fold them before a generation-mode writable open",
+                    );
+                }
+            }
             if replay_wal && !persistence_read_only {
                 let records = crate::storage::wal::read_records(&crate::storage::wal::wal_path(
                     &persistence_path,
@@ -1809,6 +1902,25 @@ impl CoreEngine {
                 ))?;
                 if !records.is_empty() {
                     if records.iter().all(is_native_replayable_wal_record) {
+                        // Replay only records the loaded generation has not already
+                        // folded in. A record whose LSN is below the base was durably
+                        // checkpointed, so it is skipped; one at or above the base is
+                        // replayed. The boundary is inclusive because an empty store
+                        // checkpoints at generation 1 (via `generation.max(1)`) while
+                        // its first mutation is also LSN 1, so `> base` would drop that
+                        // first write; re-applying an already-folded record at or above
+                        // the base is idempotent anyway. Pre-LSN records carry no
+                        // watermark and are always replayed.
+                        //
+                        // The post-replay generation is left to the per-record advance
+                        // and is deliberately NOT pinned back to the WAL watermark: the
+                        // counter doubles as the immutable generation epoch, so a replay
+                        // that applies any record must checkpoint onto a fresh epoch
+                        // (the advance guarantees that), while a replay that applies
+                        // nothing leaves the base untouched and `persist()` no-ops on it
+                        // (nothing pending). Either way no committed epoch is rewritten
+                        // in place.
+                        let base_generation = loaded.generation;
                         let index =
                             index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
                         let index_id = index.index_id.clone();
@@ -1816,6 +1928,10 @@ impl CoreEngine {
                         self.replaying_wal = true;
                         let replay_result = records
                             .iter()
+                            .filter(|record| match record.lsn {
+                                Some(lsn) => lsn >= base_generation,
+                                None => true,
+                            })
                             .try_for_each(|record| self.apply_native_wal_record(&index_id, record));
                         self.replaying_wal = false;
                         replay_result?;
@@ -1880,10 +1996,30 @@ struct PersistentLock {
 
 /// Outcome of one non-blocking attempt to take the writer lock.
 enum TryLock {
-    /// Another writer holds the sentinel; retry until the timeout elapses.
+    /// Another holder blocks this mode; retry until the timeout elapses.
     Contended,
     /// A failure that retrying will not resolve.
     Fatal(CoreError),
+}
+
+/// Whether a lock hold is exclusive (a single writer) or shared (concurrent
+/// appenders). Many shared holds coexist, but a shared hold and an exclusive
+/// hold always exclude each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Exclusive,
+    Shared,
+}
+
+impl LockMode {
+    fn contention_message(self) -> &'static str {
+        match self {
+            // Kept verbatim: the Python engine matches this substring to detect
+            // writer-lock contention and fall back to its own writer.
+            LockMode::Exclusive => "another writer holds the lodedb lock",
+            LockMode::Shared => "an exclusive writer holds the lodedb lock",
+        }
+    }
 }
 
 /// Opens (creating if needed) the lock sentinel without taking the lock. Used by
@@ -1914,16 +2050,33 @@ impl PersistentLock {
     /// releases when the handle is dropped and the sentinel file is left in place,
     /// matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
     fn acquire(path: &Path) -> Result<Self, CoreError> {
+        Self::acquire_with_timeout(path, LockMode::Exclusive, lock_timeout_seconds())
+    }
+
+    /// Takes a shared hold: many shared holders coexist, but a shared hold still
+    /// excludes (and is excluded by) an exclusive writer. Concurrent WAL
+    /// appenders take this so they run together yet never overlap the exclusive
+    /// checkpointing writer, which is what keeps their appends from racing a WAL
+    /// truncation.
+    fn acquire_shared(path: &Path) -> Result<Self, CoreError> {
+        Self::acquire_with_timeout(path, LockMode::Shared, lock_timeout_seconds())
+    }
+
+    fn acquire_with_timeout(
+        path: &Path,
+        mode: LockMode,
+        timeout_secs: f64,
+    ) -> Result<Self, CoreError> {
         let lock_path = path.join(".lodedb.lock");
-        let deadline = Instant::now() + Duration::from_secs_f64(lock_timeout_seconds());
+        let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
-            match Self::try_lock(&lock_path) {
+            match Self::try_lock(&lock_path, mode) {
                 Ok(file) => return Ok(Self { _file: file }),
                 Err(TryLock::Contended) => {
                     if Instant::now() >= deadline {
                         return Err(CoreError::new(
                             CoreErrorCode::InvalidArgument,
-                            "another writer holds the lodedb lock".to_string(),
+                            mode.contention_message().to_string(),
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(25));
@@ -1935,10 +2088,14 @@ impl PersistentLock {
 
     /// One non-blocking attempt to open and exclusively lock the sentinel.
     #[cfg(unix)]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
         use rustix::fs::{flock, FlockOperation};
         let file = open_sentinel(lock_path).map_err(TryLock::Fatal)?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        let operation = match mode {
+            LockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+            LockMode::Shared => FlockOperation::NonBlockingLockShared,
+        };
+        match flock(&file, operation) {
             Ok(()) => Ok(file),
             Err(err)
                 if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
@@ -1956,16 +2113,24 @@ impl PersistentLock {
     /// the equivalent. A second writer's open fails with ``ERROR_SHARING_VIOLATION``
     /// until the holding handle drops on close or process exit.
     #[cfg(windows)]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
         use std::os::windows::fs::OpenOptionsExt;
         const ERROR_SHARING_VIOLATION: i32 = 32;
         const ERROR_LOCK_VIOLATION: i32 = 33;
+        // A true shared hold would need CreateFile share modes, but those do not
+        // interoperate with the Python writer lock, which takes an `msvcrt` byte
+        // lock the share mode cannot see (and `msvcrt` has no shared byte lock to
+        // match). So on Windows a shared hold degrades to exclusive (share_mode 0):
+        // appenders serialize here, but they still correctly exclude both native
+        // and Python exclusive writers. Unix keeps a true shared `flock`.
+        let _ = mode;
+        let share_mode: u32 = 0;
         match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .share_mode(0)
+            .share_mode(share_mode)
             .open(lock_path)
         {
             Ok(file) => Ok(file),
@@ -1988,7 +2153,7 @@ impl PersistentLock {
     // sentinel keeps behaviour uniform (no cross-process exclusion, but these are
     // not a multi-writer target).
     #[cfg(not(any(unix, windows)))]
-    fn try_lock(lock_path: &Path) -> Result<File, TryLock> {
+    fn try_lock(lock_path: &Path, _mode: LockMode) -> Result<File, TryLock> {
         open_sentinel(lock_path).map_err(TryLock::Fatal)
     }
 }
@@ -2002,6 +2167,327 @@ fn lock_timeout_seconds() -> f64 {
             .filter(|v| *v >= 0.0)
             .unwrap_or(30.0),
         Err(_) => 30.0,
+    }
+}
+
+/// A shared-lock appender for concurrent multi-writer ingest.
+///
+/// It durably logs self-contained vector-in records to a store's WAL for a later
+/// exclusive writer to fold in on its next open, without holding the exclusive
+/// writer lock. Many appenders run at once (they take the shared lock, which
+/// excludes only the checkpointing writer, so an append can never race a WAL
+/// truncation), and each append reserves a log sequence number and writes its
+/// frame under one hold of the counter lock, so LSN order matches WAL file order.
+///
+/// The appender never reconstructs the vector index, mutates in memory, or
+/// checkpoints. It validates each vector against the persisted index shape so a
+/// malformed record cannot poison a later replay. It is vector-in only (vector
+/// plus metadata); raw document text is not logged.
+pub struct CoreAppender {
+    path: PathBuf,
+    index_key: String,
+    vector_dim: usize,
+    // The highest LSN already durable in the store when this appender opened. The
+    // allocator clamps every reservation up to it, so appended LSNs never collide
+    // with an exclusive writer's generation-based LSNs from a prior session.
+    floor: u64,
+    fsync: bool,
+    // The raw-text/lexical retention policy for appended captions, mirroring the
+    // engine's vector-in text policy exactly so an appended `upsert_vectors` record
+    // is byte-identical to a writer-authored one. store_text logs the raw text
+    // (privacy: never written to `<key>.wal` otherwise); index_text logs derived
+    // caption tokens so lexical/BM25 search survives replay even in the
+    // store_text=false privacy mode. The caller must open with the same policy as
+    // the store's writer, or the writer drops the payload at checkpoint.
+    store_text: bool,
+    index_text: bool,
+    // Held for the appender's lifetime; dropping it releases the shared lock.
+    // `None` when the caller opts out of the shared lock (`acquire_writer_lock`
+    // false) because an outer coordinator owns exclusion, matching CoreEngine.
+    _lock: Option<PersistentLock>,
+}
+
+impl CoreAppender {
+    /// Opens the single index at `options.path` for shared appending. Fails if
+    /// the path holds no index or more than one, or if an exclusive writer
+    /// currently holds the lock.
+    pub fn open(options: CoreOpenOptions) -> Result<Self, CoreError> {
+        let path = PathBuf::from(&options.path);
+        if !path.is_dir() {
+            return Err(invalid_err("append path does not exist"));
+        }
+        // Appends reach the index only through the WAL, which a generation-mode
+        // writer never replays, so appending is meaningful in WAL mode only.
+        if options.commit_mode != "wal" {
+            return Err(invalid_err(
+                "append requires wal commit mode; generation mode does not replay the WAL",
+            ));
+        }
+        // Take the shared lock first: once it is held no exclusive writer is
+        // active, so the shape and LSN floor read below cannot change under us. A
+        // caller that manages exclusion itself opts out with acquire_writer_lock.
+        let lock = if options.acquire_writer_lock {
+            Some(PersistentLock::acquire_shared(&path)?)
+        } else {
+            None
+        };
+        let mut index_keys = Vec::new();
+        for entry in fs::read_dir(&path).map_err(core_io_error)? {
+            let entry = entry.map_err(core_io_error)?;
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(index_key) = name.strip_suffix(".commit.json") {
+                    index_keys.push(index_key.to_string());
+                }
+            }
+        }
+        let index_key = match index_keys.as_slice() {
+            [key] => key.clone(),
+            [] => return Err(invalid_err("no index to append to at this path")),
+            _ => return Err(invalid_err("append requires exactly one index at the path")),
+        };
+        let loaded = crate::storage::load_store(
+            &path,
+            &index_key,
+            crate::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )?;
+        let vector_dim = loaded
+            .state
+            .get("native_dim")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        if vector_dim == 0 {
+            return Err(invalid_err("index has no vector dimension to append against"));
+        }
+        // Under the counter lock (so no concurrent appender is mid-write), scan the
+        // WAL to seed the LSN floor and repair any torn tail a crash left behind.
+        // Without the repair this appender's frames would land after the torn bytes
+        // and be silently dropped by the next writer's replay. The floor is the max
+        // of the committed generation and the WAL's highest LSN, so a reserved LSN
+        // is always above every LSN already on disk.
+        let wal_path = crate::storage::wal::wal_path(&path, &index_key);
+        let base_generation = loaded.generation;
+        let fsync = options.durability == "fsync";
+        let floor = crate::storage::lsn::with_lock(&path, &index_key, |file| {
+            let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
+            Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
+            // Refuse if the WAL already holds records only the Python engine can
+            // replay (e.g. a text `upsert_documents` tail): a native writer fails on
+            // that prefix in `load_persisted_indexes` before it reaches anything we
+            // append, which would strand acknowledged records behind it. A writer
+            // must recover such a store first.
+            if !scan.records.iter().all(is_native_replayable_wal_record) {
+                return Err(invalid_err(
+                    "the store's WAL has records only the Python engine can replay; \
+                     open it with a writer to recover before appending",
+                ));
+            }
+            let wal_max_lsn = scan
+                .records
+                .iter()
+                .filter_map(|record| record.lsn)
+                .max()
+                .unwrap_or(0);
+            let floor = base_generation.max(wal_max_lsn);
+            // Re-seed the shared counter to the just-repaired valid length. This is
+            // the correctness anchor for the O(1) per-append repair: a stale
+            // cross-session watermark (e.g. one left behind after a writer
+            // checkpoint truncated and regrew the WAL, or after a writer appended
+            // its own records in WAL mode) must never reach the append path, or an
+            // append could truncate committed frames as if they were an
+            // unacknowledged tail. A full scan happens once here per session; every
+            // append after it repairs in O(1).
+            //
+            // Seed the LSN to the floor (the WAL max and the generation), never
+            // below the value already there. This publishes a crc-valid counter, so
+            // its LSN must be truthful: leaving it at a torn counter's `0` would let
+            // another long-lived appender take the fast path, trust the stale LSN,
+            // and reserve one already committed to the WAL.
+            let existing_lsn = crate::storage::lsn::read_counter(file)?
+                .map(|counter| counter.lsn)
+                .unwrap_or(0);
+            let seeded_lsn = existing_lsn.max(floor);
+            crate::storage::lsn::write_counter(file, seeded_lsn, Some(scan.valid_len), fsync)?;
+            Ok(floor)
+        })?;
+        Ok(Self {
+            path,
+            index_key,
+            vector_dim,
+            floor,
+            fsync,
+            store_text: options.store_text,
+            index_text: options.index_text,
+            _lock: lock,
+        })
+    }
+
+    /// Durably appends one `upsert_vectors` record for `documents`, returning the
+    /// LSN assigned to it. Each document's optional `text` is retained (in the WAL
+    /// record, for the next writer to persist) only when the appender was opened
+    /// with `store_text`; otherwise it is dropped, matching the engine's vector-in
+    /// text policy.
+    pub fn append_vectors(&self, documents: &[CoreVectorDocument]) -> Result<u64, CoreError> {
+        if documents.is_empty() {
+            return Err(invalid_err("append_vectors requires at least one document"));
+        }
+        let mut vectors = Vec::with_capacity(documents.len());
+        for document in documents {
+            if document.document_id.trim().is_empty() {
+                return Err(invalid_err("document_id is required"));
+            }
+            if document.vector.len() != self.vector_dim {
+                return Err(invalid_err("vector dimension does not match index"));
+            }
+            // Same finiteness guard the writer's upsert_vectors applies, so a
+            // NaN/Inf vector cannot enter the log and fail a later replay.
+            if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
+                return Err(invalid_err("vector contains a non-finite or out-of-range value"));
+            }
+            let patch_matrix = match &document.patch_matrix {
+                Some(matrix) => serde_json::json!({
+                    "dtype": matrix.dtype,
+                    "patch_count": matrix.patch_count,
+                    "bytes": matrix.bytes,
+                }),
+                None => Value::Null,
+            };
+            // Mirror the engine's upsert_vectors WAL record exactly: retain raw text
+            // only under store_text (privacy), and when index_text is on write the
+            // derived caption tokens so replay rebuilds BM25 postings even in the
+            // store_text=false privacy mode (a captioned vector is one chunk keyed by
+            // its document id, so its caption is one token list).
+            let text = if self.store_text {
+                serde_json::json!(document.text)
+            } else {
+                Value::Null
+            };
+            let tokens = match (self.index_text, document.text.as_deref()) {
+                (true, Some(text)) => serde_json::json!([tokenize(text)]),
+                _ => Value::Null,
+            };
+            vectors.push(serde_json::json!({
+                "document_id": document.document_id,
+                "vector": document.vector,
+                "metadata": document.metadata,
+                "text": text,
+                "tokens": tokens,
+                "patch_matrix": patch_matrix,
+            }));
+        }
+        self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
+    }
+
+    /// Durably appends one `delete_documents` record, returning its LSN.
+    pub fn append_deletes(&self, document_ids: &[String]) -> Result<u64, CoreError> {
+        if document_ids.is_empty() {
+            return Err(invalid_err("append_deletes requires at least one document id"));
+        }
+        if document_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(invalid_err("document_id is required"));
+        }
+        self.append_one(
+            "delete_documents",
+            serde_json::json!({ "document_ids": document_ids }),
+        )
+    }
+
+    fn append_one(&self, op: &str, payload: Value) -> Result<u64, CoreError> {
+        let wal = crate::storage::wal::wal_path(&self.path, &self.index_key);
+        crate::storage::lsn::with_lock(&self.path, &self.index_key, |file| {
+            let counter = crate::storage::lsn::read_counter(file)?;
+            // Repair a crashed peer's torn tail and establish the floor the next LSN
+            // must clear, both under the counter lock. This lands the frame after
+            // complete records (not behind torn bytes the next writer's replay would
+            // stop at) and reserves an LSN that collides with neither a writer's
+            // generation LSNs nor a frame a crashed peer already committed.
+            let floor = self.repair_and_lsn_floor(&wal, counter)?;
+            let lsn = floor
+                .checked_add(1)
+                .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
+            crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
+            // Record the new valid length as the next appender's watermark, after
+            // the frame is durable (see `lsn::write_counter`): a crash between the
+            // two leaves the watermark behind the frame, so the next appender drops
+            // the frame as an unacknowledged tail rather than trusting a phantom.
+            let new_len = std::fs::metadata(&wal)
+                .map(|meta| meta.len())
+                .map_err(core_io_error)?;
+            crate::storage::lsn::write_counter(file, lsn, Some(new_len), self.fsync)?;
+            Ok(lsn)
+        })
+    }
+
+    /// Repairs the WAL tail and returns the floor the next LSN must exceed (the
+    /// reservation is `floor + 1`). The caller must hold the counter lock.
+    ///
+    /// With a trusted watermark (the common case) this is O(1): stat the file and,
+    /// if it grew past the watermark, drop the crashed peer's unacknowledged tail;
+    /// the counter's own LSN then covers every surviving frame. No writer can have
+    /// appended those bytes, since a writer needs the exclusive lock this
+    /// appender's shared lock excludes, and every peer append advances the
+    /// watermark under this same counter lock.
+    ///
+    /// Without a watermark (a v1 or torn counter) or with one that sits past the
+    /// file (a stale pre-checkpoint value), it falls back to a full scan. That scan
+    /// both repairs the tail AND yields the WAL's true max LSN, which clamps the
+    /// floor: a torn counter's LSN cannot be trusted, and the appender's open-time
+    /// floor may be stale relative to a frame a peer committed after this appender
+    /// opened, so without the clamp a reused LSN could reach the WAL.
+    fn repair_and_lsn_floor(
+        &self,
+        wal: &Path,
+        counter: Option<crate::storage::lsn::Counter>,
+    ) -> Result<u64, CoreError> {
+        let counter_lsn = counter.map(|counter| counter.lsn).unwrap_or(0);
+        let physical = match std::fs::metadata(wal) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(core_io_error(error)),
+        };
+        match counter.and_then(|counter| counter.wal_len) {
+            // Intact tail: nothing sits past the last recorded frame, and the
+            // counter's LSN is the last frame's LSN. The hot path.
+            Some(mark) if physical == mark && mark > 0 => Ok(counter_lsn.max(self.floor)),
+            // Bytes past the watermark are a crashed peer's unacknowledged tail (or
+            // a zero-length WAL that needs its header rewritten): drop them back to
+            // the boundary. `repair_torn_tail` removes the file when the boundary is
+            // zero so the next append writes a fresh header, not a headerless frame.
+            Some(mark) if physical >= mark => {
+                Self::repair_torn_tail(wal, mark, physical)?;
+                Ok(counter_lsn.max(self.floor))
+            }
+            // No usable watermark, or one past the file: scan to repair the tail and
+            // clamp the LSN above the WAL's true max so a torn counter or stale floor
+            // cannot reuse an LSN a peer already wrote.
+            _ => {
+                let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
+                Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
+                let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
+                Ok(counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)))
+            }
+        }
+    }
+
+    /// Drops a torn or headerless WAL tail so the next append lands after complete
+    /// records. The caller must hold the counter lock (via `with_lock` or
+    /// `with_reserved`) so no concurrent append is mid-write.
+    fn repair_torn_tail(wal: &Path, valid_len: u64, total_len: u64) -> Result<(), CoreError> {
+        if !wal.is_file() {
+            return Ok(());
+        }
+        if valid_len == 0 {
+            // No valid header at all (a zero-byte file, a sub-header fragment, or a
+            // torn header): drop it so the next append writes a fresh header rather
+            // than a headerless bad-magic frame the next writer cannot replay.
+            std::fs::remove_file(wal).map_err(core_io_error)?;
+        } else if total_len > valid_len {
+            // A torn trailing frame from a crash mid-append: drop it.
+            crate::storage::wal::truncate_to(wal, valid_len)?;
+        }
+        Ok(())
     }
 }
 
@@ -2187,6 +2673,8 @@ fn index_from_loaded_store(
         base_calibration_fingerprint,
         pending_upserts: BTreeSet::new(),
         pending_deletes: BTreeSet::new(),
+        pending_lexical_clears: BTreeSet::new(),
+        pending_raw_text_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
     })
 }
@@ -2544,6 +3032,8 @@ fn persist_index_generation(
 ) -> Result<(), CoreError> {
     let nothing_pending = index.pending_upserts.is_empty()
         && index.pending_deletes.is_empty()
+        && index.pending_lexical_clears.is_empty()
+        && index.pending_raw_text_clears.is_empty()
         && index.pending_removed_stable_ids.is_empty();
     // A committed base with nothing pending is already durable on disk.
     if index.base_epoch != 0 && nothing_pending {
@@ -2561,12 +3051,14 @@ fn persist_index_generation(
     // text-free has no `.tvtext` base, and must still be delta-appendable.)
     let pending_text = store_text
         && (!index.pending_deletes.is_empty()
+            || !index.pending_raw_text_clears.is_empty()
             || index
                 .pending_upserts
                 .iter()
                 .any(|id| index.documents.get(id).is_some_and(|r| r.text.is_some())));
     let pending_lexical = index_text
         && (!index.pending_deletes.is_empty()
+            || !index.pending_lexical_clears.is_empty()
             || index.pending_upserts.iter().any(|id| {
                 index
                     .documents
@@ -2615,6 +3107,8 @@ fn persist_index_generation(
     }
     index.pending_upserts.clear();
     index.pending_deletes.clear();
+    index.pending_lexical_clears.clear();
+    index.pending_raw_text_clears.clear();
     index.pending_removed_stable_ids.clear();
     Ok(())
 }
@@ -2761,7 +3255,9 @@ fn write_index_delta(
             chunk_count_after: index.chunk_count(),
             tvim: build_tvim_delta(index)?,
             raw_text_upserts,
+            raw_text_clears: index.pending_raw_text_clears.iter().cloned().collect(),
             lexical_upserts,
+            lexical_clears: index.pending_lexical_clears.iter().cloned().collect(),
             multivec_upserts: Some(multivec_for_documents(
                 index,
                 index.pending_upserts.iter().map(String::as_str),
@@ -2981,6 +3477,17 @@ struct VectorOnlyIndex {
     pending_upserts: BTreeSet<String>,
     /// Document ids deleted since the current base.
     pending_deletes: BTreeSet<String>,
+    /// Live documents whose caption tokens went non-empty to empty since the
+    /// current base. A lexical delta cannot express the clear by omission (absence
+    /// means "unchanged", so the base's old tokens would resurrect on reload);
+    /// these ids are written to the delta as explicit lexical deletes. Dropped
+    /// when a caption returns; may overlap `pending_deletes` (the duplicate entry
+    /// in the delta's deleted list is a no-op).
+    pending_lexical_clears: BTreeSet<String>,
+    /// Live documents whose retained raw text went present to absent since the
+    /// current base; written to the text delta as explicit deletes, like
+    /// `pending_lexical_clears`.
+    pending_raw_text_clears: BTreeSet<String>,
     /// TurboVec stable ids dropped from the live index since the current base and
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
@@ -3016,6 +3523,8 @@ impl VectorOnlyIndex {
             base_calibration_fingerprint: 0,
             pending_upserts: BTreeSet::new(),
             pending_deletes: BTreeSet::new(),
+            pending_lexical_clears: BTreeSet::new(),
+            pending_raw_text_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
         }
     }
@@ -3126,7 +3635,11 @@ impl VectorOnlyIndex {
             }
         }
         // Track the document-level removal for the next generation delta; the tvim
-        // row removals are tracked at the vector-sync choke points.
+        // row removals are tracked at the vector-sync choke points. Pending caption
+        // clears are deliberately NOT dropped here: replacement upserts also run
+        // this helper, and an earlier clear must still reach the delta when the
+        // replacement stays caption-free. A true delete leaves the id in the clear
+        // sets too; the delta's deleted list tolerates the duplicate.
         self.pending_upserts.remove(document_id);
         self.pending_deletes.insert(document_id.to_string());
         for chunk in chunks {
@@ -3674,4 +4187,54 @@ fn invalid_err(message: impl Into<String>) -> CoreError {
 
 fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::new(CoreErrorCode::Internal, error.to_string())
+}
+
+// Unix-only: it asserts that two shared holds coexist, which is the true `flock`
+// behavior. On Windows a shared hold degrades to exclusive (see `try_lock`), so
+// coexistence does not hold there.
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::{LockMode, PersistentLock};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "lodedb-lock-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn shared_holds_coexist_but_exclude_exclusive() {
+        let dir = temp_dir();
+        // Two shared holders coexist (flock across separate descriptions, or the
+        // Windows read/write share mode).
+        let first = PersistentLock::acquire_shared(&dir).expect("first shared hold");
+        let second = PersistentLock::acquire_shared(&dir).expect("second shared hold coexists");
+        // An exclusive writer cannot acquire while shared holders are alive; use a
+        // short explicit timeout so the assertion does not wait the full default.
+        assert!(
+            PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05).is_err(),
+            "exclusive must be blocked while shared holds exist"
+        );
+        drop(first);
+        drop(second);
+        // With the shared holds gone, the exclusive writer acquires...
+        let writer = PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05)
+            .expect("exclusive after shared released");
+        // ...and now a shared hold is blocked while the writer is alive.
+        assert!(
+            PersistentLock::acquire_with_timeout(&dir, LockMode::Shared, 0.05).is_err(),
+            "shared must be blocked while an exclusive writer exists"
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

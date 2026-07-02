@@ -31,6 +31,7 @@ class NativeCoreModule(Protocol):
     """Subset of the hidden native module used by the adapter."""
 
     def CoreEngine(self) -> Any: ...
+    def CoreAppender(self) -> Any: ...
     def cuda_runtime_available(self) -> bool: ...
     def native_core_abi_version(self) -> int: ...
     def native_core_version(self) -> str: ...
@@ -165,6 +166,45 @@ class NativeCoreAdapter:
         return NativeCoreEngineHandle(
             module.CoreEngine.open_readonly(str(path), self._dumps(options))
         )
+
+    def open_appender(
+        self,
+        *,
+        path: str | PathLike[str],
+        durability: str = "buffered",
+        store_text: bool = False,
+        index_text: bool = False,
+        acquire_writer_lock: bool = True,
+    ) -> NativeCoreAppenderHandle:
+        """Opens a shared-lock appender over the single index at ``path``.
+
+        Many processes can each hold an appender and durably log vector-in records
+        to the store's WAL concurrently; the next exclusive writer folds them into
+        the index on open. The store must be in WAL commit mode and hold exactly
+        one index. ``store_text``/``index_text`` mirror the store's writer: a
+        document's caption is retained only under ``store_text`` and its lexical
+        tokens are logged only under ``index_text``. Both default off (privacy: no
+        raw text reaches ``<key>.wal``); enable them only for a store whose writer
+        also does, or the writer drops the payload at checkpoint.
+        Appenders take the shared ``<dir>/.lodedb.lock`` lock by default
+        (``acquire_writer_lock=True``); pass ``False`` only when an outer caller
+        already owns exclusion for the process.
+        """
+
+        module = self._require_module()
+        options = self.open_options_payload(
+            path=path,
+            read_only=False,
+            durability=durability,
+            # Appends reach the index only through the WAL, which a generation-mode
+            # writer never replays, so the appender requires WAL commit mode.
+            commit_mode="wal",
+            store_text=store_text,
+            index_text=index_text,
+            chunk_character_limit=8192,
+            acquire_writer_lock=acquire_writer_lock,
+        )
+        return NativeCoreAppenderHandle(module.CoreAppender.open(self._dumps(options)))
 
     @staticmethod
     def document_payload(document: EngineDocument) -> dict[str, Any]:
@@ -807,3 +847,29 @@ class NativeCoreEngineHandle:
         if not isinstance(value, dict):
             raise RuntimeError("native core returned a non-object JSON payload")
         return NativeCorePayload(value, native_json=payload)
+
+
+class NativeCoreAppenderHandle:
+    """Small JSON-backed wrapper over ``lodedb._native_core.CoreAppender``.
+
+    Each ``append_*`` durably logs one WAL record under the shared lock and
+    returns the log sequence number (LSN) assigned to it.
+    """
+
+    def __init__(self, appender: Any) -> None:
+        self._appender = appender
+
+    def append_vectors(self, documents: Iterable[EngineVectorDocument]) -> int:
+        payload = [NativeCoreAdapter.vector_document_payload(document) for document in documents]
+        return int(self._appender.append_vectors(self._dumps(payload)))
+
+    def append_deletes(self, document_ids: Iterable[str]) -> int:
+        return int(
+            self._appender.append_deletes(
+                self._dumps([str(document_id) for document_id in document_ids])
+            )
+        )
+
+    @staticmethod
+    def _dumps(payload: Any) -> str:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))

@@ -11,6 +11,7 @@ Public surface:
 """
 
 from lodedb.engine._filelock import ConcurrentWriterError
+from lodedb.local.appender import Appender
 from lodedb.local.backends import (
     LocalEmbeddingResolution,
     build_local_embedding_backend,
@@ -32,6 +33,7 @@ from lodedb.local.presets import LOCAL_MODEL_PRESETS, LocalModelPreset, resolve_
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
+    "Appender",
     "ConcurrentWriterError",
     "ImageEmbeddingUnsupportedError",
     "LodeCollection",

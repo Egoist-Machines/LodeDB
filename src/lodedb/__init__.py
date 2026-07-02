@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from lodedb.local import (
     LOCAL_MODEL_PRESETS,
+    Appender,
     ConcurrentWriterError,
     ImageEmbeddingUnsupportedError,
     LodeCollection,
@@ -27,6 +28,7 @@ __version__ = "1.2.0"
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
+    "Appender",
     "ConcurrentWriterError",
     "ImageEmbeddingUnsupportedError",
     "LodeCollection",
