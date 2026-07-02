@@ -1,6 +1,6 @@
 //! C ABI for the native LodeDB core.
 
-use lodedb_core::engine::CoreEngine;
+use lodedb_core::engine::{CoreAppender, CoreEngine};
 use lodedb_core::engine::{IngestPlan, QueryPlan};
 use lodedb_core::types::{
     CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreOpenOptions, CoreVectorDocument,
@@ -26,6 +26,11 @@ pub struct LodeError {
 #[repr(C)]
 pub struct LodeEngine {
     engine: CoreEngine,
+}
+
+#[repr(C)]
+pub struct LodeAppender {
+    appender: CoreAppender,
 }
 
 #[repr(C)]
@@ -1107,6 +1112,103 @@ pub unsafe extern "C" fn lodedb_engine_upsert_multivector_json(
     })
 }
 
+// ---- Concurrent multi-writer append ----
+
+/// Opens a shared-lock appender over the single index at `options.path`.
+///
+/// Many processes can hold an appender at once and durably log vector-in records
+/// to the store's WAL concurrently; the next exclusive writer folds them into the
+/// index on open. The store must be in WAL commit mode and hold exactly one
+/// index. The returned handle must be released with `lodedb_appender_free`.
+///
+/// # Safety
+///
+/// `options_json` and `out` must be valid for the duration of the call;
+/// `options_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_open_json(
+    options_json: LodeStringView,
+    out: *mut *mut LodeAppender,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let options = read_json_view::<CoreOpenOptions>(options_json)?;
+        let appender = CoreAppender::open(options)?;
+        let handle = Box::new(LodeAppender { appender });
+        unsafe {
+            *out = Box::into_raw(handle);
+        }
+        Ok(())
+    })
+}
+
+/// Frees an appender handle allocated by this library.
+///
+/// # Safety
+///
+/// `appender` must be null or a pointer returned by `lodedb_appender_open_json`.
+/// It must not be used after this call and must not be freed more than once.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_free(appender: *mut LodeAppender) {
+    if !appender.is_null() {
+        let _ = Box::from_raw(appender);
+    }
+}
+
+/// Durably appends one `upsert_vectors` record from a JSON `CoreVectorDocument`
+/// array (vector plus metadata; raw text is not logged) and writes the assigned
+/// LSN to `out_lsn`.
+///
+/// # Safety
+///
+/// `appender`, `documents_json`, and `out_lsn` must be valid for the duration of
+/// the call. `documents_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_append_vectors_json(
+    appender: *const LodeAppender,
+    documents_json: LodeStringView,
+    out_lsn: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_lsn)?;
+        let appender = appender_ref(appender)?;
+        let documents = read_json_view::<Vec<CoreVectorDocument>>(documents_json)?;
+        let lsn = appender.append_vectors(&documents)?;
+        unsafe {
+            *out_lsn = lsn;
+        }
+        Ok(())
+    })
+}
+
+/// Durably appends one `delete_documents` record from a JSON array of document
+/// ids and writes the assigned LSN to `out_lsn`.
+///
+/// # Safety
+///
+/// `appender`, `document_ids_json`, and `out_lsn` must be valid for the duration
+/// of the call. `document_ids_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_append_deletes_json(
+    appender: *const LodeAppender,
+    document_ids_json: LodeStringView,
+    out_lsn: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_lsn)?;
+        let appender = appender_ref(appender)?;
+        let ids = read_json_view::<Vec<String>>(document_ids_json)?;
+        let lsn = appender.append_deletes(&ids)?;
+        unsafe {
+            *out_lsn = lsn;
+        }
+        Ok(())
+    })
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -1155,6 +1257,13 @@ fn require_out<T>(out: *mut *mut T) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn require_out_value(out: *mut u64) -> Result<(), CoreError> {
+    if out.is_null() {
+        return invalid("output pointer is null");
+    }
+    Ok(())
+}
+
 fn engine_mut<'a>(engine: *mut LodeEngine) -> Result<&'a mut CoreEngine, CoreError> {
     if engine.is_null() {
         return invalid("engine pointer is null");
@@ -1167,6 +1276,13 @@ fn engine_ref<'a>(engine: *const LodeEngine) -> Result<&'a CoreEngine, CoreError
         return invalid("engine pointer is null");
     }
     Ok(unsafe { &(*engine).engine })
+}
+
+fn appender_ref<'a>(appender: *const LodeAppender) -> Result<&'a CoreAppender, CoreError> {
+    if appender.is_null() {
+        return invalid("appender pointer is null");
+    }
+    Ok(unsafe { &(*appender).appender })
 }
 
 fn read_string(view: LodeStringView) -> Result<String, CoreError> {
@@ -1461,5 +1577,150 @@ mod tests {
             data: text.as_ptr().cast::<c_char>(),
             len: text.len(),
         }
+    }
+
+    static NEXT_APPENDER_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn appender_temp_dir() -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "lodedb-ffi-appender-{}-{}",
+            std::process::id(),
+            NEXT_APPENDER_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn wal_options_json(dir: &std::path::Path) -> String {
+        serde_json::json!({
+            "path": dir.to_str().expect("utf-8 temp path"),
+            "read_only": false,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": false,
+            "index_text": false,
+            "acquire_writer_lock": true,
+        })
+        .to_string()
+    }
+
+    /// A `LodeStringView` over a non-static string. The caller must keep `text`
+    /// alive for as long as the view is used (the view borrows its bytes).
+    fn borrowed_view(text: &str) -> LodeStringView {
+        LodeStringView {
+            size: std::mem::size_of::<LodeStringView>() as u32,
+            version: ABI_VERSION,
+            data: text.as_ptr().cast::<c_char>(),
+            len: text.len(),
+        }
+    }
+
+    unsafe fn owned_to_string(owned: *mut LodeOwnedString) -> String {
+        let owned = &*owned;
+        let bytes = slice::from_raw_parts(owned.data.cast::<u8>(), owned.len);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn appender_ffi_round_trips_through_a_durable_store() {
+        let dir = appender_temp_dir();
+        let options = wal_options_json(&dir);
+        let options_view = borrowed_view(&options); // `options` outlives every use below
+
+        // A writer creates the index and checkpoints an empty base, then closes so
+        // the shared appender can take the lock.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            assert!(!engine.is_null());
+            assert_eq!(
+                lodedb_engine_create_index(engine, string_view("default"), 8, 4, &mut error),
+                0
+            );
+            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            lodedb_engine_free(engine);
+        }
+
+        // The appender logs a vector-in record, then a delete, each handing back an
+        // LSN; the delete's LSN is above the append's.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut appender: *mut LodeAppender = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_open_json(options_view, &mut appender, &mut error),
+                0
+            );
+            assert!(!appender.is_null());
+            let documents = r#"[{"document_id":"doc-a","vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"metadata":{"topic":"ops"},"text":null}]"#;
+            let mut lsn: u64 = 0;
+            assert_eq!(
+                lodedb_appender_append_vectors_json(
+                    appender,
+                    string_view(documents),
+                    &mut lsn,
+                    &mut error
+                ),
+                0
+            );
+            assert!(lsn > 0, "expected a positive LSN, got {lsn}");
+            let mut delete_lsn: u64 = 0;
+            assert_eq!(
+                lodedb_appender_append_deletes_json(
+                    appender,
+                    string_view(r#"["doc-a"]"#),
+                    &mut delete_lsn,
+                    &mut error
+                ),
+                0
+            );
+            assert!(
+                delete_lsn > lsn,
+                "delete LSN {delete_lsn} not above append {lsn}"
+            );
+            lodedb_appender_free(appender);
+        }
+
+        // A null appender is rejected as an invalid argument, not a crash.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut lsn: u64 = 0;
+            let status = lodedb_appender_append_vectors_json(
+                ptr::null(),
+                string_view("[]"),
+                &mut lsn,
+                &mut error,
+            );
+            assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
+            lodedb_error_free(error);
+        }
+
+        // The next writer folds the appended-then-deleted record in: doc-a is gone.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            let mut stats: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
+                0
+            );
+            let stats_json = owned_to_string(stats);
+            assert!(
+                stats_json.contains("\"document_count\":0"),
+                "expected doc-a folded in then deleted: {stats_json}"
+            );
+            lodedb_owned_string_free(stats);
+            lodedb_engine_free(engine);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

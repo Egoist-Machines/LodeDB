@@ -29,6 +29,8 @@ typedef struct LodeError {
 
 typedef struct LodeEngine LodeEngine;
 
+typedef struct LodeAppender LodeAppender;
+
 typedef struct LodeStringView {
   uint32_t size;
   uint32_t version;
@@ -276,6 +278,22 @@ uint32_t lodedb_engine_upsert_multivector_json(
     uintptr_t patch_bytes_len,
     LodeStringView sidecar_json,
     LodeOwnedString **out,
+    LodeError **error);
+
+uint32_t lodedb_appender_open_json(
+    LodeStringView options_json,
+    LodeAppender **out,
+    LodeError **error);
+void lodedb_appender_free(LodeAppender *appender);
+uint32_t lodedb_appender_append_vectors_json(
+    const LodeAppender *appender,
+    LodeStringView documents_json,
+    uint64_t *out_lsn,
+    LodeError **error);
+uint32_t lodedb_appender_append_deletes_json(
+    const LodeAppender *appender,
+    LodeStringView document_ids_json,
+    uint64_t *out_lsn,
     LodeError **error);
 
 #ifdef __cplusplus

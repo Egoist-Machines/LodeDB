@@ -277,3 +277,21 @@ every write and keeps no WAL, so it retains no between-write payload in a log at
 per-write cost). For backups, support bundles, and incident response, classify `<key>.wal` as
 carrying the same data class as the `.tvtext`/`.tvlex` sidecars under the active
 `store_text`/`index_text` settings.
+
+**Concurrent multi-writer append.** The single exclusive writer is not the only way to add records
+in WAL mode. A shared-lock *appender* (`CoreAppender`, exposed over the C ABI, in Python as
+`lodedb.Appender`, and in Swift as `LodeAppender`) lets many processes durably log vector-in
+records to one `<key>.wal` at once. Appenders take a shared lock while a checkpointing
+writer takes the exclusive lock, so an append never races a truncation; each record's log sequence
+number (LSN) comes from a durable, process-shared allocator (`<key>.lsn`) whose floor is the
+store's committed max LSN, so appended LSNs never collide with a writer's generation LSNs. The next
+writable open replays the WAL (skipping records already folded in, by LSN) and checkpoints onto a
+fresh generation. A record is durable once acknowledged under `durability="fsync"` (the default
+`fast` mode is atomic but not fsynced) and becomes queryable only after that fold-in; a read-only
+handle still loads the last checkpointed generation, not the appended tail. On Windows a shared
+hold degrades to an exclusive one, so appenders serialize there rather than coexisting. A writable
+generation-mode open refuses a store with unfolded WAL records rather than committing past them.
+Each record carries a precomputed vector plus metadata, and (only when the appender opts into
+`store_text`, off by default) a caption. So the appender honors the same `store_text` payload
+boundary as the single-writer paths above: it writes raw text to `<key>.wal` only when text
+retention is on, never otherwise.

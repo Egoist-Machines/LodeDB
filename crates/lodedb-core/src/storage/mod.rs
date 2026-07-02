@@ -1,6 +1,7 @@
 pub mod commit_manifest;
 pub mod legacy;
 pub mod lexical_store;
+pub mod lsn;
 pub mod multivec_store;
 pub mod state_journal;
 pub mod text_store;
@@ -343,7 +344,6 @@ pub fn write_generation_commit(
         document_count,
         chunk_count,
         json_manifest: Some(json_manifest),
-        tvim_present: tvim_manifest.is_some(),
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,
@@ -396,8 +396,16 @@ pub struct GenerationDeltaInput<'a> {
     pub tvim: Option<TvimDeltaWrite>,
     /// `Some` only when `store_text` is on; carries the changed documents' text.
     pub raw_text_upserts: Option<BTreeMap<String, String>>,
+    /// Live documents whose retained raw text was cleared since the base. A delta
+    /// cannot express the clear by omission (absence means "unchanged", so the
+    /// base's old text would resurrect on reload); these are written to the text
+    /// delta as explicit deletes.
+    pub raw_text_clears: Vec<String>,
     /// `Some` only when `index_text` is on; carries the changed documents' tokens.
     pub lexical_upserts: Option<BTreeMap<String, TokenLists>>,
+    /// Live documents whose lexical tokens were cleared since the base; written to
+    /// the lexical delta as explicit deletes, like `raw_text_clears`.
+    pub lexical_clears: Vec<String>,
     /// `Some` only for late-interaction stores; the changed documents' matrices.
     pub multivec_upserts: Option<MultiVecMap>,
     pub document_deletes: Vec<String>,
@@ -498,18 +506,19 @@ pub fn write_generation_delta(
         }
         _ => previous.store_manifest("tvim").cloned(),
     };
-    let tvim_present = previous
-        .body
-        .get("tvim_present")
-        .and_then(Value::as_bool)
-        .unwrap_or(tvim_manifest.is_some());
 
     let text_manifest = match input.raw_text_upserts {
-        Some(upserts) if !upserts.is_empty() || !input.document_deletes.is_empty() => {
+        Some(upserts)
+            if !upserts.is_empty()
+                || !input.document_deletes.is_empty()
+                || !input.raw_text_clears.is_empty() =>
+        {
+            let mut deleted = input.document_deletes.clone();
+            deleted.extend(input.raw_text_clears.iter().cloned());
             Some(text_store::append_delta(
                 &base_tvtext_path(persistence_dir, input.index_key, input.base_epoch),
                 &upserts,
-                &input.document_deletes,
+                &deleted,
                 input.document_count_after,
                 fsync,
                 input.compress_text,
@@ -518,11 +527,17 @@ pub fn write_generation_delta(
         _ => previous.store_manifest("tvtext").cloned(),
     };
     let lexical_manifest = match input.lexical_upserts {
-        Some(upserts) if !upserts.is_empty() || !input.document_deletes.is_empty() => {
+        Some(upserts)
+            if !upserts.is_empty()
+                || !input.document_deletes.is_empty()
+                || !input.lexical_clears.is_empty() =>
+        {
+            let mut deleted = input.document_deletes.clone();
+            deleted.extend(input.lexical_clears.iter().cloned());
             Some(lexical_store::append_delta(
                 &base_tvlex_path(persistence_dir, input.index_key, input.base_epoch),
                 &upserts,
-                &input.document_deletes,
+                &deleted,
                 input.document_count_after,
                 fsync,
             )?)
@@ -572,7 +587,6 @@ pub fn write_generation_delta(
         document_count: input.document_count_after,
         chunk_count: input.chunk_count_after,
         json_manifest: Some(json_manifest),
-        tvim_present,
         tvim_manifest,
         tvtext_manifest: text_manifest,
         tvlex_manifest: lexical_manifest,

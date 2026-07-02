@@ -64,6 +64,7 @@ fn main() {
     .expect("write base fixture");
     wal::append_record(
         &wal::wal_path(&target, INDEX_KEY),
+        2,
         "upsert_documents",
         &json!({
             "client_id": "lodedb-local",

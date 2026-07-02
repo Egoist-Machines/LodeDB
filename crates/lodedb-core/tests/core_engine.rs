@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lodedb_core::engine::CoreEngine;
+use lodedb_core::engine::{CoreAppender, CoreEngine};
 use lodedb_core::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
     CoreVectorDocument,
@@ -988,6 +988,95 @@ fn native_wal_vector_records_replay_and_checkpoint() {
 }
 
 #[test]
+fn native_wal_replay_advances_to_a_fresh_generation() {
+    // A crash after mutating but before checkpointing leaves the writes only in
+    // the WAL. Recovery must fold them into a FRESH generation epoch: the counter
+    // doubles as the immutable epoch id, so re-checkpointing must never rewrite
+    // the committed base epoch in place (that would break crash-atomicity).
+    let path = unique_temp_dir("core_wal_generation");
+    let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+            ann: None,
+        })
+        .unwrap();
+    engine.persist().unwrap();
+    let first = engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-a".to_string(),
+                vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    let second = engine
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-b".to_string(),
+                vector: vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(second.generation, 2);
+    // Drop without persisting: the WAL holds LSN 1 and 2 while the manifest is
+    // still the empty checkpoint at generation 1.
+    drop(engine);
+
+    let mut reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    // No loss and no duplication after replay.
+    assert_eq!(reopened.stats("default").unwrap().document_count, 2);
+    // Recovery advanced the generation past the recovered base rather than pinning
+    // it back onto the committed epoch, so the next write's generation is strictly
+    // greater than the last pre-crash write's.
+    let third = reopened
+        .upsert_vectors(
+            "default",
+            &[CoreVectorDocument {
+                document_id: "vec-c".to_string(),
+                vector: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: metadata(&[("kind", "wal")]),
+                text: None,
+                patch_matrix: None,
+            }],
+        )
+        .unwrap();
+    assert!(
+        third.generation > second.generation,
+        "generation must advance past the pre-crash base, got {}",
+        third.generation
+    );
+    assert_eq!(reopened.stats("default").unwrap().document_count, 3);
+    drop(reopened);
+
+    // The recovery checkpoint is a valid committed generation: a clean reopen
+    // still sees all three documents.
+    let final_open = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert_eq!(final_open.stats("default").unwrap().document_count, 3);
+    drop(final_open);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn native_wal_text_apply_records_replay_and_checkpoint() {
     let path = unique_temp_dir("core_text_wal");
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
@@ -1158,6 +1247,791 @@ fn query_multivector_ranks_documents_by_maxsim() {
     // doc-a: max(axis1)=0 + max(axis2)=1 = 1; doc-b: max(axis1)=1 + max(axis2)=0 = 1.
     assert_eq!(results.hits.len(), 2);
     assert!((results.hits[0].score - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn concurrent_appenders_are_folded_by_the_next_writer() {
+    let path = unique_temp_dir("core_appender");
+    // Real coordination: writer takes the exclusive lock, appenders the shared one.
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+
+    // A writer creates the index and checkpoints an empty base, then closes so the
+    // shared appenders can take the lock.
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        engine
+            .create_index_with_options(CoreIndexCreateOptions {
+                index_id: "default".to_string(),
+                index_key: INDEX_KEY.to_string(),
+                client_id_hash: INDEX_KEY.to_string(),
+                name: "lodedb-local".to_string(),
+                model: "external".to_string(),
+                provider: "external".to_string(),
+                task: "vector-only".to_string(),
+                route_profile: "vector-only".to_string(),
+                storage_profile: "turbovec_direct".to_string(),
+                vector_dim: 8,
+                bit_width: 4,
+                ann: None,
+            })
+            .unwrap();
+        engine.persist().unwrap();
+    }
+
+    // Many concurrent appenders take the shared lock and log vector-in records.
+    let threads = 5_usize;
+    let per_thread = 8_usize;
+    let handles: Vec<_> = (0..threads)
+        .map(|thread| {
+            let options = base.clone();
+            std::thread::spawn(move || {
+                let appender = CoreAppender::open(options).expect("open appender");
+                for i in 0..per_thread {
+                    let id = format!("doc-{thread}-{i}");
+                    appender
+                        .append_vectors(&[doc(&id, i % 8, metadata(&[("kind", "appended")]))])
+                        .expect("append vectors");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // The next exclusive writer folds every appended record into the index: no
+    // loss, no duplication, no LSN collision across the concurrent appenders.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        writer.stats("default").unwrap().document_count,
+        threads * per_thread
+    );
+    // An appended vector is queryable, proving the vector and metadata survived the
+    // WAL round-trip.
+    let mut probe = vec![0.0_f32; 8];
+    probe[3] = 1.0;
+    let hits = writer.query_vector("default", &probe, 1, None).unwrap().hits;
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].document_id.starts_with("doc-"));
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn create_vector_only_index(engine: &mut CoreEngine) {
+    engine
+        .create_index_with_options(CoreIndexCreateOptions {
+            index_id: "default".to_string(),
+            index_key: INDEX_KEY.to_string(),
+            client_id_hash: INDEX_KEY.to_string(),
+            name: "lodedb-local".to_string(),
+            model: "external".to_string(),
+            provider: "external".to_string(),
+            task: "vector-only".to_string(),
+            route_profile: "vector-only".to_string(),
+            storage_profile: "turbovec_direct".to_string(),
+            vector_dim: 8,
+            bit_width: 4,
+            ann: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn appender_rejects_generation_mode() {
+    let path = unique_temp_dir("core_appender_gen");
+    let mut wal_opts = open_options(&path, false, "wal");
+    wal_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(wal_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Generation mode never replays the WAL, so appended records would be
+    // acknowledged yet invisible; the appender must refuse to open.
+    let mut gen_opts = open_options(&path, false, "generation");
+    gen_opts.acquire_writer_lock = true;
+    assert!(CoreAppender::open(gen_opts).is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_a_torn_wal_tail() {
+    let path = unique_temp_dir("core_appender_torn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // One good appended record.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("before-crash", 0, metadata(&[("kind", "a")]))])
+            .expect("append good record");
+    }
+    // Simulate a crash mid-append: a frame that claims a 5-byte body but carries
+    // only two, leaving a torn trailing frame after the good record.
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    {
+        use std::io::Write;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .expect("open wal for torn write");
+        handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+    }
+    // The next appender repairs the torn tail, so its record lands after the good
+    // one rather than after the torn bytes.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender after torn tail");
+        appender
+            .append_vectors(&[doc("after-repair", 1, metadata(&[("kind", "b")]))])
+            .expect("append after repair");
+    }
+    // The writer replays both durable records; the torn frame is gone.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_a_zero_byte_wal() {
+    let path = unique_temp_dir("core_appender_zero");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // A crash can leave a zero-byte `<key>.wal` created before its header was
+    // written. The appender must drop it rather than append a headerless frame
+    // that the next writer would reject as bad magic.
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    std::fs::File::create(&wal).expect("create zero-byte wal");
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender over zero-byte wal");
+        appender
+            .append_vectors(&[doc("after-zero", 2, metadata(&[("kind", "z")]))])
+            .expect("append after zero-byte repair");
+    }
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 1);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_rejects_non_native_wal() {
+    let path = unique_temp_dir("core_appender_nonnative");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // A prior Python text ingest can leave an `upsert_documents` record the native
+    // writer cannot replay. Appending native records behind it would strand them,
+    // so the appender must refuse to open until a writer recovers the store.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", &json!({ "documents": [] }), false)
+        .expect("write non-native record");
+    assert!(CoreAppender::open(base).is_err());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_repairs_torn_tail_between_appends() {
+    let path = unique_temp_dir("core_appender_between");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    {
+        // The appender stays open across a peer's crash: a torn frame injected
+        // mid-session must be repaired by the next append, not left to strand it.
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("first", 0, metadata(&[("n", "1")]))])
+            .expect("append first");
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal)
+                .expect("open wal for torn write");
+            handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+        }
+        appender
+            .append_vectors(&[doc("second", 1, metadata(&[("n", "2")]))])
+            .expect("append second after torn tail");
+    }
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_preserves_a_writers_wal_growth_across_sessions() {
+    // A stale cross-session watermark must never make an append truncate records
+    // a writer committed to the WAL after the last appender session closed. The
+    // O(1) repair trusts the watermark only within a session; `open` re-scans and
+    // re-seeds it, so a writer's intervening frames survive.
+    let path = unique_temp_dir("core_appender_writer_growth");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Appender session 1 records a watermark at the end of its frame, then closes.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender 1");
+        appender
+            .append_vectors(&[doc("appended-1", 0, metadata(&[("s", "1")]))])
+            .expect("append 1");
+    }
+    // A writer grows the WAL without touching the LSN counter (the single-writer
+    // WAL path uses its in-memory generation, not the shared allocator), so the
+    // counter's watermark now sits behind the file. Its LSN stays above the base
+    // generation, so replay keeps it.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        3,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "writer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("writer grows the wal");
+    // Appender session 2 opens (full-scanning and re-seeding the watermark to
+    // include the writer's frame), then appends. The writer's frame must not be
+    // truncated back to session 1's stale watermark.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender 2");
+        appender
+            .append_vectors(&[doc("appended-2", 4, metadata(&[("s", "2")]))])
+            .expect("append 2");
+    }
+    // The next writer replays all three durable records: both appends and the
+    // writer's own growth.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 3);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_does_not_reuse_an_lsn_after_a_torn_counter() {
+    // A long-lived appender opened at floor F=1 (empty WAL). A peer commits a valid
+    // frame at LSN 2 and then crashes while rewriting the counter, leaving it torn
+    // (valid magic and length, bad CRC -> reads as absent). The appender's next
+    // append must scan the WAL and clamp above 2, not reuse 2 from its stale
+    // open-time floor, or the WAL would hold two frames at the same LSN.
+    let path = unique_temp_dir("core_appender_torn_counter_lsn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Open the appender first, so its floor is captured before the peer's frame.
+    let appender = CoreAppender::open(base.clone()).expect("open appender");
+    // A peer commits a valid native frame at LSN 2 (the LSN it would have reserved
+    // from the empty counter), then its counter rewrite is torn by a crash.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    let peer_lsn = 2_u64;
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        peer_lsn,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "peer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("peer commits a frame");
+    let lsn_file = path.join(format!("{INDEX_KEY}.lsn"));
+    let mut counter_bytes = std::fs::read(&lsn_file).expect("read counter");
+    counter_bytes[10] ^= 0xFF; // corrupt the payload so the CRC fails
+    std::fs::write(&lsn_file, counter_bytes).expect("torn counter");
+    // The appender's next append must land above the peer's LSN, not reuse it.
+    let lsn = appender
+        .append_vectors(&[doc("appended", 4, metadata(&[("s", "a")]))])
+        .expect("append after torn counter");
+    assert!(
+        lsn > peer_lsn,
+        "expected an LSN above the peer's {peer_lsn}, got {lsn}"
+    );
+    // Both frames replay with distinct LSNs: the peer's is kept, ours is above it.
+    drop(appender);
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
+    // When one appender's open heals a torn counter, it must publish a truthful
+    // LSN. Otherwise a second, still-open appender reads the healed (crc-valid)
+    // counter via the O(1) fast path, trusts its stale LSN, and reuses an LSN a
+    // peer already committed to the WAL.
+    let path = unique_temp_dir("core_appender_reseed_lsn");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Long-lived appender X opens first, capturing a floor of 1 (empty WAL).
+    let x = CoreAppender::open(base.clone()).expect("open X");
+    // A peer commits a valid frame at LSN 2, then its counter rewrite is torn.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        2,
+        "upsert_vectors",
+        &json!({
+            "vectors": [{
+                "document_id": "peer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("peer commits a frame");
+    let lsn_file = path.join(format!("{INDEX_KEY}.lsn"));
+    let mut counter_bytes = std::fs::read(&lsn_file).expect("read counter");
+    counter_bytes[10] ^= 0xFF;
+    std::fs::write(&lsn_file, counter_bytes).expect("torn counter");
+    // A second appender Y opens, healing the torn counter from its WAL scan. The
+    // healed counter must carry an LSN of at least 2, not 0.
+    let y = CoreAppender::open(base.clone()).expect("open Y");
+    // X, still holding its stale open-time floor, reads the healed counter on the
+    // fast path and must still land above the peer's LSN.
+    let lsn = x
+        .append_vectors(&[doc("x-doc", 4, metadata(&[("s", "x")]))])
+        .expect("append X");
+    assert!(lsn > 2, "X reused an LSN through the healed counter: got {lsn}");
+    drop(x);
+    drop(y);
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_retains_text_only_under_store_text() {
+    let path = unique_temp_dir("core_appender_text");
+
+    // store_text on: the appended caption is logged and the next writer retains it.
+    let mut with_text = open_options(&path, false, "wal"); // open_options sets store_text = true
+    with_text.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(with_text.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(with_text.clone()).expect("open appender (store_text)");
+        let mut document = doc("with-text", 0, metadata(&[("kind", "image")]));
+        document.text = Some("a red bicycle by the canal".to_string());
+        appender.append_vectors(&[document]).expect("append with text");
+    }
+    {
+        let writer = CoreEngine::open(with_text).unwrap();
+        assert_eq!(
+            writer
+                .get_document_text("default", "with-text")
+                .unwrap()
+                .as_deref(),
+            Some("a red bicycle by the canal")
+        );
+    }
+
+    // store_text off, index_text on (the privacy mode): no raw text reaches the WAL,
+    // but the derived caption tokens do, so replay can rebuild lexical postings
+    // without retaining raw text (parity with the engine's upsert_vectors record).
+    let mut private_mode = open_options(&path, false, "wal"); // open_options sets index_text = true
+    private_mode.acquire_writer_lock = true;
+    private_mode.store_text = false;
+    {
+        let appender =
+            CoreAppender::open(private_mode.clone()).expect("open appender (private mode)");
+        let mut document = doc("captioned", 1, metadata(&[]));
+        document.text = Some("turquoise dragon".to_string());
+        appender.append_vectors(&[document]).expect("append captioned");
+    }
+    // Inspect the appended record before a writer folds and truncates the WAL: it
+    // carries derived tokens but no raw text.
+    {
+        let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+        let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
+        let appended = records.last().expect("an appended record");
+        assert_eq!(appended.op, "upsert_vectors");
+        let vector = &appended.payload["vectors"][0];
+        assert!(vector["text"].is_null(), "no raw text in privacy mode");
+        assert!(
+            vector["tokens"].is_array(),
+            "derived caption tokens must be logged for lexical replay"
+        );
+    }
+    {
+        let writer = CoreEngine::open(private_mode).unwrap();
+        assert_eq!(
+            writer.get_document_text("default", "captioned").unwrap(),
+            None
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_privacy_mode_tokens_persist_across_reopen() {
+    // Privacy mode (store_text=false, index_text=true): a caption appended onto an
+    // existing vector-identical document must survive a checkpoint and reopen. The
+    // replay's upsert is a no-op (vector and metadata unchanged, no raw text), so
+    // the restored caption tokens have to mark the document pending, or the
+    // checkpoint truncates the WAL and drops them.
+    let path = unique_temp_dir("core_appender_privacy_tokens");
+    let mut base = open_options(&path, false, "wal"); // index_text = true
+    base.store_text = false;
+    base.acquire_writer_lock = true;
+    let generation_before;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        // A pre-existing document with a vector but no caption tokens.
+        engine
+            .upsert_vectors("default", &[doc("d1", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+        generation_before = engine.stats("default").unwrap().generation;
+    }
+    // The appender adds a caption to the same vector: tokens, no raw text.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        let mut document = doc("d1", 0, metadata(&[]));
+        document.text = Some("turquoise dragon".to_string());
+        appender.append_vectors(&[document]).expect("append caption");
+    }
+    // A writer replays (upsert no-op + token restore) and checkpoints, truncating
+    // the WAL. Applying the token restore must advance the generation epoch so
+    // generation-based observers see the lexical update.
+    {
+        let writer = CoreEngine::open(base.clone()).unwrap();
+        assert!(
+            writer.stats("default").unwrap().generation > generation_before,
+            "token restore must advance the generation"
+        );
+    }
+    // After reopen the caption must still be lexically searchable: the tokens were
+    // persisted, not dropped with the truncated WAL.
+    {
+        let writer = CoreEngine::open(base).unwrap();
+        let plan = writer.prepare_query_text("dragon", "lexical").unwrap();
+        let hits = writer
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1, "restored caption tokens were dropped at checkpoint");
+        assert_eq!(hits.hits[0].document_id, "d1");
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn generation_mode_writable_open_refuses_unfolded_wal_records() {
+    // A writable generation-mode open over acknowledged-but-unfolded appends must
+    // refuse: its commits would advance the committed generation past the appended
+    // LSNs, and the next WAL-mode open would then skip them as already folded and
+    // truncate the log, silently destroying the acknowledged records.
+    let path = unique_temp_dir("core_appender_generation_guard");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("d1", 0, metadata(&[]))])
+            .expect("append vectors");
+    }
+    let mut generation = base.clone();
+    generation.commit_mode = "generation".to_string();
+    let error = match CoreEngine::open(generation.clone()) {
+        Ok(_) => panic!("generation-mode open must refuse unfolded WAL records"),
+        Err(error) => error,
+    };
+    assert!(
+        error.message().contains("unfolded WAL records"),
+        "unexpected error: {}",
+        error.message()
+    );
+    // A WAL-mode open folds the record; generation mode is accepted again after.
+    {
+        let writer = CoreEngine::open(base).unwrap();
+        assert_eq!(writer.stats("default").unwrap().document_count, 1);
+    }
+    let reopened = CoreEngine::open(generation).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn replayed_empty_caption_matches_a_live_written_store() {
+    // A caption that tokenizes to nothing ("///") is logged as an empty token list;
+    // its replay must leave the lexical index exactly as a live write does (no
+    // zero-token BM25 unit inflating n/avgdl), so scores match a never-crashed
+    // store bit-for-bit.
+    let live = unique_temp_dir("core_appender_empty_caption_live");
+    let replayed = unique_temp_dir("core_appender_empty_caption_replayed");
+    let documents = || {
+        let mut worded = doc("d1", 0, metadata(&[]));
+        worded.text = Some("alpha beta".to_string());
+        let mut empty = doc("d2", 1, metadata(&[]));
+        empty.text = Some("///".to_string());
+        vec![worded, empty]
+    };
+
+    // Live store: the writer ingests both captions directly. Keep the session
+    // open: the comparison is against the live writer's own lexical state (the
+    // reopen rebuild has its own captionless-document shape on both sides).
+    let mut base_live = open_options(&live, false, "wal");
+    base_live.store_text = false;
+    base_live.acquire_writer_lock = true;
+    let mut live_engine = CoreEngine::open(base_live.clone()).unwrap();
+    create_vector_only_index(&mut live_engine);
+    live_engine.upsert_vectors("default", &documents()).unwrap();
+    live_engine.persist().unwrap();
+
+    // Replayed store: the same records arrive through an appender and are folded
+    // by the next writable open.
+    let mut base_replayed = open_options(&replayed, false, "wal");
+    base_replayed.store_text = false;
+    base_replayed.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base_replayed.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(base_replayed.clone()).expect("open appender");
+        appender.append_vectors(&documents()).expect("append vectors");
+    }
+
+    let folded = CoreEngine::open(base_replayed).unwrap();
+    let live_plan = live_engine.prepare_query_text("alpha", "lexical").unwrap();
+    let live_hits = live_engine
+        .search_embedded_text("default", &live_plan, None, 2, None)
+        .unwrap();
+    let folded_plan = folded.prepare_query_text("alpha", "lexical").unwrap();
+    let folded_hits = folded
+        .search_embedded_text("default", &folded_plan, None, 2, None)
+        .unwrap();
+    assert_eq!(live_hits.hits.len(), 1);
+    assert_eq!(folded_hits.hits.len(), 1);
+    assert_eq!(folded_hits.hits[0].document_id, "d1");
+    assert_eq!(
+        folded_hits.hits[0].score.to_bits(),
+        live_hits.hits[0].score.to_bits(),
+        "a replayed empty caption must not inflate the BM25 statistics"
+    );
+    drop(live_engine);
+    drop(folded);
+    fs::remove_dir_all(live).unwrap();
+    fs::remove_dir_all(replayed).unwrap();
+}
+
+#[test]
+fn cleared_caption_does_not_resurrect_after_reopen() {
+    // Clearing a caption must reach the lexical delta as an explicit delete:
+    // absence means "unchanged", so the base's old tokens would resurrect on
+    // reload. Cover both clear paths: a live payload update and an appender
+    // re-caption folded by WAL replay.
+    let path = unique_temp_dir("core_caption_clear");
+    let mut base = open_options(&path, false, "wal");
+    base.store_text = false;
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut first = doc("d1", 0, metadata(&[]));
+        first.text = Some("turquoise dragon".to_string());
+        let mut second = doc("d2", 1, metadata(&[]));
+        second.text = Some("crimson kraken".to_string());
+        engine.upsert_vectors("default", &[first, second]).unwrap();
+        engine.persist().unwrap(); // the tvlex base holds both captions
+        // Live clear: replace d1's caption with one that tokenizes to nothing.
+        engine
+            .update_document_payload("default", "d1", None, Some(Some("///".to_string())))
+            .unwrap();
+        engine.persist().unwrap(); // this delta commit must carry the clear
+    }
+    // Appender clear: d2 re-captioned to nothing, folded by the next writer.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        let mut cleared = doc("d2", 1, metadata(&[]));
+        cleared.text = Some("///".to_string());
+        appender.append_vectors(&[cleared]).expect("append vectors");
+    }
+    {
+        let writer = CoreEngine::open(base.clone()).unwrap();
+        drop(writer); // fold + checkpoint truncates the WAL
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    for term in ["dragon", "kraken"] {
+        let plan = reopened.prepare_query_text(term, "lexical").unwrap();
+        let hits = reopened
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert!(
+            hits.hits.is_empty(),
+            "cleared caption resurrected for {term}"
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_only_payload_update_survives_the_checkpoint() {
+    // A text-only update (no metadata) must mark the document pending: persist()
+    // otherwise no-ops and the checkpoint truncates the WAL record carrying the
+    // only durable copy. Cover set, replace, and clear against reopens.
+    let path = unique_temp_dir("core_text_only_update");
+    let mut base = open_options(&path, false, "wal"); // store_text = true
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut captioned = doc("d1", 0, metadata(&[]));
+        captioned.text = Some("old caption".to_string());
+        engine.upsert_vectors("default", &[captioned]).unwrap();
+        engine.persist().unwrap();
+        // Replace the caption with a text-only update, then checkpoint.
+        engine
+            .update_document_payload("default", "d1", None, Some(Some("new caption".to_string())))
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    {
+        let engine = CoreEngine::open(base.clone()).unwrap();
+        assert_eq!(
+            engine.get_document_text("default", "d1").unwrap().as_deref(),
+            Some("new caption"),
+            "a text-only update was truncated away with the WAL"
+        );
+        let plan = engine.prepare_query_text("caption", "lexical").unwrap();
+        let hits = engine
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+    }
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        // Clear the caption entirely; the delta must carry the clear for both the
+        // raw-text and lexical sidecars.
+        engine
+            .update_document_payload("default", "d1", None, Some(None))
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        reopened.get_document_text("default", "d1").unwrap(),
+        None,
+        "a cleared raw caption resurrected from the base"
+    );
+    let plan = reopened.prepare_query_text("caption", "lexical").unwrap();
+    let hits = reopened
+        .search_embedded_text("default", &plan, None, 1, None)
+        .unwrap();
+    assert!(hits.hits.is_empty(), "cleared caption tokens resurrected");
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn clear_then_reupsert_still_persists_the_clear() {
+    // A replacement upsert runs the same index-removal helper as a delete; an
+    // earlier caption clear must survive it, or the delta drops the sidecar
+    // delete and the base's old text/tokens resurrect after reopen.
+    let path = unique_temp_dir("core_caption_clear_reupsert");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut captioned = doc("d1", 0, metadata(&[]));
+        captioned.text = Some("turquoise dragon".to_string());
+        engine.upsert_vectors("default", &[captioned]).unwrap();
+        engine.persist().unwrap();
+        // Clear the caption, then replace the document (still caption-free)
+        // before the checkpoint.
+        engine
+            .update_document_payload("default", "d1", None, Some(None))
+            .unwrap();
+        engine
+            .upsert_vectors("default", &[doc("d1", 2, metadata(&[("kind", "moved")]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        reopened.get_document_text("default", "d1").unwrap(),
+        None,
+        "cleared raw caption resurrected past a replacement upsert"
+    );
+    let plan = reopened.prepare_query_text("dragon", "lexical").unwrap();
+    let hits = reopened
+        .search_embedded_text("default", &plan, None, 1, None)
+        .unwrap();
+    assert!(
+        hits.hits.is_empty(),
+        "cleared caption tokens resurrected past a replacement upsert"
+    );
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
 }
 
 // --- Opt-in ANN (cluster-prune) query path ---

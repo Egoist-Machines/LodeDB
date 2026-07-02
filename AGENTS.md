@@ -57,7 +57,10 @@ tests/                   local SDK suite + import-boundary guard
   must never persist (`_persist_state` enforces this). Public `LodeEngine` operations run
   under one reentrant in-process lock (`@_synchronized`) so the threaded `serve` can share a
   handle. Persist every file via `durable_replace` (temp + `os.replace`, with the fsync gated
-  on `durability="fsync"`) — never write a persisted artifact in place.
+  on `durability="fsync"`) — never write a persisted artifact in place. Two carve-outs hold the
+  lock on the file they rewrite, so a rename would drop it: journal appends (`.txd`, `<key>.wal`)
+  and the fixed-width `<key>.lsn` counter, which is CRC-guarded and reseeds itself from the store
+  when torn.
 - **Atomic commits (`engine/_commit_manifest.py`):** an index commits by writing
   generation-addressed artifacts under `<key>.gen/` and then atomically swapping the
   `<key>.commit.json` root pointer — that swap is the *only* commit point, so never overwrite a

@@ -13,6 +13,10 @@ class FakeNativeModule:
     def CoreEngine(self) -> type[FakeCoreEngine]:
         return FakeCoreEngine
 
+    @property
+    def CoreAppender(self) -> type[FakeCoreAppender]:
+        return FakeCoreAppender
+
     def round_trip_core_json(self, type_name: str, json_payload: str) -> str:
         assert type_name in {"CoreDocument", "CoreVectorDocument", "CoreQuery"}
         return json_payload
@@ -251,6 +255,30 @@ class FakeCoreEngine:
         return json.dumps({"document_count": len(self.documents), "native_core_enabled": True})
 
 
+class FakeCoreAppender:
+    def __init__(self) -> None:
+        self.open_options: dict | None = None
+        self.appended: list[list[dict]] = []
+        self.deleted: list[list[str]] = []
+        self._lsn = 0
+
+    @staticmethod
+    def open(options_json: str) -> FakeCoreAppender:
+        appender = FakeCoreAppender()
+        appender.open_options = json.loads(options_json)
+        return appender
+
+    def append_vectors(self, documents_json: str) -> int:
+        self.appended.append(json.loads(documents_json))
+        self._lsn += 1
+        return self._lsn
+
+    def append_deletes(self, document_ids_json: str) -> int:
+        self.deleted.append(json.loads(document_ids_json))
+        self._lsn += 1
+        return self._lsn
+
+
 def test_adapter_maps_engine_document_to_native_payload() -> None:
     adapter = NativeCoreAdapter(FakeNativeModule())
     assert adapter.version == "test-native-core"
@@ -437,3 +465,29 @@ def test_adapter_lazily_reports_missing_native_module(monkeypatch) -> None:
     assert adapter.available is False
     with pytest.raises(RuntimeError, match="native core extension"):
         adapter.round_trip("CoreDocument", {})
+
+
+def test_adapter_open_appender_forces_wal_and_passes_payloads() -> None:
+    adapter = NativeCoreAdapter(FakeNativeModule())
+    handle = adapter.open_appender(path="/tmp/store", acquire_writer_lock=False)
+
+    # The appender always opens in WAL commit mode (generation mode never replays
+    # the WAL), writable, and honours the caller's lock choice.
+    options = handle._appender.open_options
+    assert options["path"] == "/tmp/store"
+    assert options["commit_mode"] == "wal"
+    assert options["read_only"] is False
+    assert options["acquire_writer_lock"] is False
+
+    lsn = handle.append_vectors(
+        [EngineVectorDocument("doc-a", (1.0, 0.0), metadata={"topic": "ops"}, text=None)]
+    )
+    assert lsn == 1
+    appended = handle._appender.appended[0]
+    assert appended[0]["document_id"] == "doc-a"
+    assert appended[0]["vector"] == [1.0, 0.0]
+    assert appended[0]["metadata"] == {"topic": "ops"}
+
+    delete_lsn = handle.append_deletes(["doc-a"])
+    assert delete_lsn == 2
+    assert handle._appender.deleted[0] == ["doc-a"]

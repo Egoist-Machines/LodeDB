@@ -425,7 +425,7 @@ final class NativeEngine {
 
     // MARK: - Helpers
 
-    private static func requireABI() throws {
+    fileprivate static func requireABI() throws {
         let abi = lodedb_abi_version()
         guard abi == lodeNativeExpectedABIVersion else {
             throw LodeDBError.corruptStore(
@@ -446,7 +446,7 @@ final class NativeEngine {
         return try Self.copyOwnedString(out)
     }
 
-    private static func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
+    fileprivate static func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
         guard status != 0 else { return }
         defer { lodedb_error_free(error) }
         let message = error?.pointee.message.map { String(cString: $0) } ?? "native core call failed"
@@ -477,6 +477,57 @@ final class NativeEngine {
             throw LodeDBError.internalError("native core returned invalid UTF-8")
         }
         return text
+    }
+}
+
+/// Owning wrapper around a native `LodeAppender *`, statically linked from the
+/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
+/// access (see `LodeAppender`).
+final class NativeAppender {
+    private let handle: OpaquePointer
+
+    private init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        lodedb_appender_free(handle)
+    }
+
+    /// Opens a shared-lock appender over the single index at the store described by
+    /// a `CoreOpenOptions` JSON document (WAL commit mode).
+    static func open(optionsJSON: String) throws -> NativeAppender {
+        try NativeEngine.requireABI()
+        var appender: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) { lodedb_appender_open_json($0, &appender, &error) }
+        try NativeEngine.check(status, error: error)
+        guard let appender else {
+            throw LodeDBError.internalError("native core did not return an appender")
+        }
+        return NativeAppender(handle: appender)
+    }
+
+    /// Durably logs one `upsert_vectors` record and returns its assigned LSN.
+    func appendVectorsJSON(_ documentsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentsJSON) {
+            lodedb_appender_append_vectors_json(handle, $0, &lsn, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
+    }
+
+    /// Durably logs one `delete_documents` record and returns its assigned LSN.
+    func appendDeletesJSON(_ documentIDsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentIDsJSON) {
+            lodedb_appender_append_deletes_json(handle, $0, &lsn, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
     }
 }
 

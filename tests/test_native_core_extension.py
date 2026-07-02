@@ -1196,6 +1196,239 @@ def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) 
     assert NativeCoreAdapter().available is True
 
 
+def _wal_store_options(store: Path) -> str:
+    return json.dumps(
+        {
+            "path": str(store),
+            "read_only": False,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": False,
+            "index_text": False,
+            "chunk_character_limit": 900,
+            "acquire_writer_lock": True,
+        }
+    )
+
+
+def test_native_core_appender_folds_into_next_writer(tmp_path) -> None:
+    """A shared-lock appender logs vectors the next exclusive writer folds in."""
+
+    store = tmp_path / "store"
+    store.mkdir()
+    options = _wal_store_options(store)
+    # A writer creates the index and checkpoints an empty base, then closes so the
+    # shared appender can take the lock.
+    engine = native_core.CoreEngine.open(options)
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    # The appender durably logs a vector-in record, then a delete, each returning a
+    # monotonic LSN.
+    appender = native_core.CoreAppender.open(options)
+    documents = json.dumps(
+        [{"document_id": "doc-a", "vector": _onehot(0), "metadata": {"topic": "ops"}, "text": None}]
+    )
+    lsn = appender.append_vectors(documents)
+    assert lsn > 0
+    delete_lsn = appender.append_deletes(json.dumps(["doc-a"]))
+    assert delete_lsn > lsn
+    del appender
+
+    # The next writer folds the appended-then-deleted record in: doc-a is gone.
+    writer = native_core.CoreEngine.open(options)
+    stats = _loads(writer.stats("default"))
+    assert stats["document_count"] == 0
+    del writer
+
+
+def test_native_core_appender_rejects_generation_mode(tmp_path) -> None:
+    """Generation mode never replays the WAL, so opening an appender must fail."""
+
+    store = tmp_path / "store"
+    store.mkdir()
+    engine = native_core.CoreEngine.open(_wal_store_options(store))
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    generation_options = json.dumps(
+        {
+            "path": str(store),
+            "read_only": False,
+            "durability": "buffered",
+            "commit_mode": "generation",
+            "store_text": False,
+            "index_text": False,
+            "chunk_character_limit": 900,
+            "acquire_writer_lock": True,
+        }
+    )
+    # The InvalidArgument CoreError maps to ValueError at the binding boundary.
+    with pytest.raises(ValueError):
+        native_core.CoreAppender.open(generation_options)
+
+
+def test_native_core_appender_through_adapter(tmp_path) -> None:
+    """The `NativeCoreAdapter.open_appender` wrapper drives the real extension."""
+
+    from lodedb.engine.core import EngineVectorDocument
+    from lodedb.engine.native_adapter import NativeCoreAdapter
+
+    store = tmp_path / "store"
+    store.mkdir()
+    engine = native_core.CoreEngine.open(_wal_store_options(store))
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    adapter = NativeCoreAdapter()
+    appender = adapter.open_appender(path=store)
+    lsn = appender.append_vectors(
+        [EngineVectorDocument("doc-a", _onehot(0), metadata={"topic": "ops"}, text=None)]
+    )
+    assert lsn > 0
+    del appender
+
+    writer = native_core.CoreEngine.open(_wal_store_options(store))
+    stats = _loads(writer.stats("default"))
+    assert stats["document_count"] == 1
+    del writer
+
+
+def test_public_appender_api_round_trip(tmp_path) -> None:
+    """The public `lodedb.Appender` logs vector-in records and a delete that the next
+    writable `LodeDB` open folds in, leaving the survivor queryable."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    db.close()  # release the writer lock so the shared-lock appender can open
+
+    with lodedb.Appender.open(store) as appender:
+        first = appender.append(_onehot(0), id="doc-a", metadata={"topic": "ops"})
+        assert first > 0
+        batch = appender.append_many([{"vector": _onehot(1), "id": "doc-b"}])
+        assert batch > first
+        # A bare string is one id, not iterated into characters.
+        removed = appender.delete("doc-b")
+        assert removed > batch
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        # doc-a folded in; doc-b was appended then deleted.
+        assert reopened.count() == 1
+        hits = reopened.search_by_vector(_onehot(0), k=2)
+        assert [hit.id for hit in hits] == ["doc-a"]
+        assert hits[0].metadata.get("topic") == "ops"
+    finally:
+        reopened.close()
+
+
+def test_public_appender_rejects_zero_vector_when_normalizing(tmp_path) -> None:
+    """A zero vector cannot be L2-normalized, so the default path rejects it (matching
+    LodeDB.add_vectors) rather than committing a meaningless record."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    with lodedb.Appender.open(store) as appender:
+        with pytest.raises(ValueError):
+            appender.append([0.0] * 8, id="zero")
+
+
+def test_public_appender_rejects_unknown_durability(tmp_path) -> None:
+    """An unknown durability mode raises rather than silently degrading to buffered."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+    with pytest.raises(ValueError):
+        lodedb.Appender.open(store, durability="turbo")
+
+
+def test_public_appender_contention_raises_concurrent_writer_error(tmp_path) -> None:
+    """Appender lock contention surfaces the SDK's stable ConcurrentWriterError (as a
+    writable LodeDB open does for the same lock), not a bare ValueError."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    previous = os.environ.get("LODEDB_PERSIST_LOCK_TIMEOUT")
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        # The writable handle holds the exclusive lock, so the shared acquire fails.
+        with pytest.raises(lodedb.ConcurrentWriterError):
+            lodedb.Appender.open(store)
+    finally:
+        if previous is None:
+            os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+        else:
+            os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = previous
+        db.close()
+
+
+def test_public_appender_normalizes_large_vectors(tmp_path) -> None:
+    """A large but finite vector normalizes along its direction (float64 norm), not to
+    an all-zero record from a float32 norm overflow."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+    with lodedb.Appender.open(store) as appender:
+        # 1e155 squared overflows float64, so a naive sum-of-squares norm would zero
+        # the vector; math.hypot keeps it along axis 0.
+        appender.append([1e155, 0, 0, 0, 0, 0, 0, 0], id="big")
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        hits = reopened.search_by_vector(_onehot(0), k=1)
+        assert hits[0].id == "big"
+        # A zeroed (overflowed) vector would score ~0; a correctly normalized one
+        # scores near 1 along its own axis.
+        assert hits[0].score > 0.5
+    finally:
+        reopened.close()
+
+
+def test_public_appender_retains_caption_text(tmp_path) -> None:
+    """With store_text on, a caption appended via lodedb.Appender is retained and
+    reconstructable after the next writable open. This is also the image path: a
+    captioned CLIP vector is a vector plus caption text. store_text is off by
+    default (privacy), so a caption is not retained unless opted in."""
+
+    import lodedb
+
+    store = lodedb.LodeDB.open_vector_store(tmp_path / "store", vector_dim=8)
+    store.close()
+    path = tmp_path / "store"
+
+    with lodedb.Appender.open(path, store_text=True) as appender:
+        appender.append(_onehot(0), id="img-1", metadata={"kind": "image"}, text="a red bicycle")
+
+    reopened = lodedb.LodeDB.open_vector_store(path, vector_dim=8)
+    try:
+        assert reopened.get_text("img-1") == "a red bicycle"
+    finally:
+        reopened.close()
+
+    # Default (store_text off): the appender logs no raw text, so none is retained.
+    with lodedb.Appender.open(path) as appender:
+        appender.append(_onehot(1), id="vec-2", text="dropped caption")
+    reopened = lodedb.LodeDB.open_vector_store(path, vector_dim=8)
+    try:
+        assert reopened.get_text("vec-2") is None
+    finally:
+        reopened.close()
+
+
 def test_public_ann_option_creates_and_serves_a_cluster_store(tmp_path) -> None:
     """The ann= kwargs flow dict -> JSON -> native create options: the store serves
     ANN-pruned queries with exact re-scored hits, and a default reopen keeps the

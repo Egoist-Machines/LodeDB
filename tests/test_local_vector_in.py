@@ -89,6 +89,16 @@ def test_normalize_dedup_is_noop(tmp_path):
     assert db.count() == 1
 
 
+def test_large_finite_vector_normalizes_without_overflow(tmp_path):
+    db = _db(tmp_path)
+    # A component whose square overflows float64 (>~1e154) must still normalize along
+    # its direction via a scaled (hypot) norm, not collapse to an all-zero record.
+    db.add_vectors(_onehot(0, scale=1e155), id="big")
+    hits = db.search_by_vector(_onehot(0), k=1)
+    assert hits[0].id == "big"
+    assert hits[0].score > 0.9
+
+
 def test_dim_mismatch_raises(tmp_path):
     db = _db(tmp_path)
     with pytest.raises(ValueError, match="dimension"):
