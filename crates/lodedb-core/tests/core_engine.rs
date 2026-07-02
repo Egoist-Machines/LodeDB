@@ -1520,6 +1520,35 @@ fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
 }
 
 #[test]
+fn ingest_only_commit_skips_the_cold_sidecar_build() {
+    // A base commit must not force a cold k-means build: an ingest-only session
+    // (no ANN query warmed the cache) writes no `.tvann`, and the next reader
+    // lazy-builds at its first query instead.
+    let path = unique_temp_dir("core_ann_cold_commit");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        engine.persist().unwrap();
+        assert!(
+            !has_file_with_ext(&path, "tvann"),
+            "an ingest-only commit must not build the cluster index"
+        );
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(!reopened.ann_cluster_resident("default").unwrap());
+    // The first ANN query lazy-builds and still serves the correct top-k.
+    let hits = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert_eq!(hits.hits.len(), 5);
+    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    assert!(reopened.ann_cluster_resident("default").unwrap());
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn ann_reopen_reflects_reembedded_vector() {
     // Regression for stale-clustering adoption: re-embedding a doc under the same
     // chunk id and reopening must serve it at its NEW location. A vector-changing

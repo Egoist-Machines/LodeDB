@@ -2727,13 +2727,14 @@ fn write_index_base(
     // where the multi-vector base is skipped).
     let multivec = multivec_for_documents(index, index.documents.keys().map(String::as_str));
     // Persist the ANN cluster assignment only when ANN would actually be used
-    // (opt-in, would prune) and a vector base is being written. Build it first,
-    // then hold the borrow across the commit so its postings are written without
-    // a copy. A probe-all or too-small configuration writes no `.tvann`.
+    // (opt-in, would prune), a vector base is being written, and a query already
+    // built the index this session. A cold cache is deliberately not built here:
+    // forcing the full k-means inside every base commit would stall ingest-only
+    // workloads (each mutation empties the cache), and a missing sidecar is just
+    // the documented lazy first-query build after reopen. The borrow is held
+    // across the commit so the postings are written without a copy. A probe-all
+    // or too-small configuration writes no `.tvann`.
     let persist_ann = index.ann_prunes() && tvim_base.is_some();
-    if persist_ann {
-        index.ensure_cluster_index()?;
-    }
     let ann_guard = index.cluster_index.borrow();
     let ann = if persist_ann {
         ann_guard
@@ -3458,11 +3459,12 @@ impl VectorOnlyIndex {
     }
 
     /// Adopts a persisted cluster assignment into the cache when it is still valid:
-    /// ANN enabled, matching dimension and calibration fingerprint, and exact
-    /// coverage of the live chunk set (enforced by [`ClusterIndex::from_assignment`],
-    /// which recomputes centroids from the live vectors so the adopted index equals
-    /// a fresh build). Any mismatch (disabled, recalibrated, or a stale set after
-    /// deltas) leaves the cache empty so the first ANN query rebuilds.
+    /// ANN enabled, matching algorithm, dimension and calibration fingerprint, and
+    /// exact coverage of the live chunk set (enforced by
+    /// [`ClusterIndex::from_assignment`], which recomputes centroids from the live
+    /// vectors so the adopted index equals a fresh build). Any mismatch (disabled,
+    /// recalibrated, or a stale set after deltas) leaves the cache empty so the
+    /// first ANN query rebuilds.
     fn install_persisted_ann(
         &self,
         loaded: Option<&crate::storage::tvann_store::LoadedAnn>,
@@ -3471,7 +3473,13 @@ impl VectorOnlyIndex {
         let Some(loaded) = loaded else {
             return;
         };
-        if self.ann_options.is_none()
+        let Some(options) = &self.ann_options else {
+            return;
+        };
+        // The sidecar names the algorithm that produced its postings; adopt it
+        // only for the same algorithm, so a future format never reads another's
+        // assignment as cluster postings.
+        if loaded.algorithm != options.algorithm
             || loaded.dim != self.vector_dim
             || loaded.calibration_fingerprint != base_fingerprint
         {
