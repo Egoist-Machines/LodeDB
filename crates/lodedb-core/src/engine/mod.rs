@@ -2,7 +2,7 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2005,25 +2005,6 @@ impl LockMode {
     }
 }
 
-/// Opens (creating if needed) the lock sentinel without taking the lock. Used by
-/// platforms that lock in a separate step after the open; Windows instead opens
-/// with an exclusive share mode, so it does not use this.
-#[cfg(not(windows))]
-fn open_sentinel(lock_path: &Path) -> Result<File, CoreError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(|error| {
-            CoreError::new(
-                CoreErrorCode::InvalidArgument,
-                format!("could not open writer lock {}: {error}", lock_path.display()),
-            )
-        })
-}
-
 impl PersistentLock {
     /// Takes the single-writer lock on ``<dir>/.lodedb.lock`` — the same sentinel
     /// the Python writer uses, so a native/FFI/Swift writer contends with a Python
@@ -2069,75 +2050,22 @@ impl PersistentLock {
         }
     }
 
-    /// One non-blocking attempt to open and exclusively lock the sentinel.
-    #[cfg(unix)]
+    /// One non-blocking attempt to open and lock the sentinel in `mode`. Delegates
+    /// to the shared `storage::util::try_lock_file` primitive (a non-blocking
+    /// advisory `flock` on unix, an exclusive share-mode open on windows): its
+    /// `None` is contention, its `Err` a fatal open/lock failure. Windows has no
+    /// shared advisory lock the Python `msvcrt` byte lock can see, so a shared hold
+    /// degrades to exclusive there (appenders serialize) while still excluding both
+    /// native and Python exclusive writers; unix keeps a true shared `flock`.
     fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
-        use rustix::fs::{flock, FlockOperation};
-        let file = open_sentinel(lock_path).map_err(TryLock::Fatal)?;
-        let operation = match mode {
-            LockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
-            LockMode::Shared => FlockOperation::NonBlockingLockShared,
-        };
-        match flock(&file, operation) {
-            Ok(()) => Ok(file),
-            Err(err)
-                if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
-            {
-                Err(TryLock::Contended)
-            }
-            Err(err) => Err(TryLock::Fatal(CoreError::new(
+        match crate::storage::util::try_lock_file(lock_path, mode == LockMode::Exclusive) {
+            Ok(Some(file)) => Ok(file),
+            Ok(None) => Err(TryLock::Contended),
+            Err(error) => Err(TryLock::Fatal(CoreError::new(
                 CoreErrorCode::InvalidArgument,
-                format!("could not acquire writer lock: {err}"),
+                format!("could not acquire writer lock {}: {error}", lock_path.display()),
             ))),
         }
-    }
-
-    /// Windows has no BSD flock; an exclusive (no-sharing) open of the sentinel is
-    /// the equivalent. A second writer's open fails with ``ERROR_SHARING_VIOLATION``
-    /// until the holding handle drops on close or process exit.
-    #[cfg(windows)]
-    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
-        use std::os::windows::fs::OpenOptionsExt;
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        const ERROR_LOCK_VIOLATION: i32 = 33;
-        // A true shared hold would need CreateFile share modes, but those do not
-        // interoperate with the Python writer lock, which takes an `msvcrt` byte
-        // lock the share mode cannot see (and `msvcrt` has no shared byte lock to
-        // match). So on Windows a shared hold degrades to exclusive (share_mode 0):
-        // appenders serialize here, but they still correctly exclude both native
-        // and Python exclusive writers. Unix keeps a true shared `flock`.
-        let _ = mode;
-        let share_mode: u32 = 0;
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(share_mode)
-            .open(lock_path)
-        {
-            Ok(file) => Ok(file),
-            Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-                ) =>
-            {
-                Err(TryLock::Contended)
-            }
-            Err(err) => Err(TryLock::Fatal(CoreError::new(
-                CoreErrorCode::InvalidArgument,
-                format!("could not open writer lock {}: {err}", lock_path.display()),
-            ))),
-        }
-    }
-
-    // Other platforms have neither flock nor Windows share modes; opening the
-    // sentinel keeps behaviour uniform (no cross-process exclusion, but these are
-    // not a multi-writer target).
-    #[cfg(not(any(unix, windows)))]
-    fn try_lock(lock_path: &Path, _mode: LockMode) -> Result<File, TryLock> {
-        open_sentinel(lock_path).map_err(TryLock::Fatal)
     }
 }
 

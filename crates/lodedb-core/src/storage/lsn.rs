@@ -22,7 +22,7 @@
 //! crash mid-reservation never wedges the counter.
 
 use crate::storage::util::{corrupt, CoreResult};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -180,69 +180,23 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 /// Opens the counter file with an exclusive hold for the read-modify-write.
 ///
-/// Unix takes a non-blocking BSD advisory lock and retries until a deadline;
-/// Windows opens with an exclusive share mode and retries the same way. Both
-/// release when the returned handle drops (or the process exits). The deadline
-/// keeps a wedged peer (frozen process, hung disk) from stalling every other
-/// appender forever, matching the writer lock's bounded wait.
-#[cfg(unix)]
+/// Retries the shared non-blocking exclusive open (`util::try_lock_file`) until a
+/// deadline. The hold releases when the returned handle drops (or the process
+/// exits). The deadline keeps a wedged peer (frozen process, hung disk) from
+/// stalling every other appender forever, matching the writer lock's bounded wait.
 fn open_exclusive(path: &Path) -> CoreResult<File> {
-    use rustix::fs::{flock, FlockOperation};
     use std::time::{Duration, Instant};
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|error| corrupt(format!("LSN counter could not be opened: {error}")))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(file),
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                if Instant::now() >= deadline {
-                    return Err(corrupt("LSN counter is locked by another reserver"));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => {
-                return Err(corrupt(format!("LSN counter could not be locked: {error}")))
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn open_exclusive(path: &Path) -> CoreResult<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::time::{Duration, Instant};
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_LOCK_VIOLATION: i32 = 33;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(0)
-            .open(path)
+        match crate::storage::util::try_lock_file(path, true)
+            .map_err(|error| corrupt(format!("LSN counter could not be locked: {error}")))?
         {
-            Ok(file) => return Ok(file),
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-                ) =>
-            {
+            Some(file) => return Ok(file),
+            None => {
                 if Instant::now() >= deadline {
                     return Err(corrupt("LSN counter is locked by another reserver"));
                 }
                 std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => {
-                return Err(corrupt(format!("LSN counter could not be opened: {error}")))
             }
         }
     }

@@ -7,7 +7,7 @@ pub mod state_journal;
 pub mod text_store;
 pub mod tvann_store;
 pub mod tvim_delta;
-mod util;
+pub(crate) mod util;
 pub mod wal;
 
 use crate::error::CoreError;
