@@ -2156,19 +2156,14 @@ impl CoreAppender {
             [] => return Err(invalid_err("no index to append to at this path")),
             _ => return Err(invalid_err("append requires exactly one index at the path")),
         };
-        let loaded = crate::storage::load_store(
-            &path,
-            &index_key,
-            crate::storage::LoadOptions {
-                read_only: true,
-                read_wal: false,
-            },
-        )?;
-        let vector_dim = loaded
-            .state
-            .get("native_dim")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        // The appender needs only the committed generation (the LSN floor) and the
+        // index's vector dimension (to validate appended vectors). Read just those
+        // from the commit manifest and the state base rather than the whole store:
+        // an append never reconstructs vectors, so SHA-256-ing the entire `.tvim`
+        // and every sidecar on open was O(store) waste. A corrupt vector image is
+        // the folding writer's problem, not the appender's.
+        let metadata = crate::storage::load_store_metadata(&path, &index_key)?;
+        let vector_dim = metadata.native_dim;
         if vector_dim == 0 {
             return Err(invalid_err("index has no vector dimension to append against"));
         }
@@ -2179,7 +2174,7 @@ impl CoreAppender {
         // of the committed generation and the WAL's highest LSN, so a reserved LSN
         // is always above every LSN already on disk.
         let wal_path = crate::storage::wal::wal_path(&path, &index_key);
-        let base_generation = loaded.generation;
+        let base_generation = metadata.generation;
         let fsync = options.durability == "fsync";
         let floor = crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;

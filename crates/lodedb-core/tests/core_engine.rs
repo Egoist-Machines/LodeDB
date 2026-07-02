@@ -1785,6 +1785,46 @@ fn appender_and_writer_log_byte_identical_upsert_vectors() {
 }
 
 #[test]
+fn appender_open_reads_metadata_not_the_vector_image() {
+    // The appender opens O(metadata): it reads the committed generation and the
+    // vector dimension from the commit manifest + state base only, never the
+    // `.tvim` vectors or the sidecars (an append does not reconstruct them, and a
+    // corrupt vector image is the folding writer's problem). So corrupting the
+    // committed `.tvim` must not stop an appender from opening and logging.
+    let path = unique_temp_dir("core_appender_open_metadata");
+    let mut options = open_options(&path, false, "wal");
+    options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("seed", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    // Overwrite every committed `.tvim` base with garbage. A full store load would
+    // now fail its checksum; the appender's metadata-only open must not.
+    let gen_dir = path.join(format!("{INDEX_KEY}.gen"));
+    let mut corrupted = 0;
+    for entry in fs::read_dir(&gen_dir).unwrap() {
+        let entry_path = entry.unwrap().path();
+        if entry_path.extension().and_then(|ext| ext.to_str()) == Some("tvim") {
+            fs::write(&entry_path, b"corrupt-tvim-bytes").unwrap();
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted > 0, "expected a committed .tvim base to corrupt");
+
+    let appender = CoreAppender::open(options).expect("appender opens over a corrupt vector image");
+    let lsn = appender
+        .append_vectors(&[doc("appended", 1, metadata(&[]))])
+        .expect("append after corrupt-tvim open");
+    assert!(lsn >= 1);
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn appender_privacy_mode_tokens_persist_across_reopen() {
     // Privacy mode (store_text=false, index_text=true): a caption appended onto an
     // existing vector-identical document must survive a checkpoint and reopen. The

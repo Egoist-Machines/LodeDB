@@ -214,6 +214,38 @@ pub fn load_generation_store(
     })
 }
 
+/// Cheap store metadata for the append path: the committed generation and the
+/// index's vector dimension. Read from the commit manifest and the state base
+/// payload only — unlike [`load_store`] it does not read or checksum the `.tvim`
+/// vectors or the text/lexical/multivec/ann sidecars, so a `CoreAppender` open is
+/// O(state metadata) rather than O(store).
+#[derive(Debug, Clone, Copy)]
+pub struct StoreMetadata {
+    pub generation: u64,
+    pub native_dim: usize,
+}
+
+/// Reads [`StoreMetadata`] for a generation store, or an error when no committed
+/// generation exists for `index_key`.
+pub fn load_store_metadata(persistence_dir: &Path, index_key: &str) -> CoreResult<StoreMetadata> {
+    let manifest = read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
+        .ok_or_else(|| invalid(format!("no committed generation for index key {index_key}")))?;
+    let base_epoch = manifest.base_epoch();
+    // native_dim is fixed at index creation and rewritten into every state base, so
+    // the base payload carries it; state deltas only journal document/chunk
+    // mutations. Read (and checksum) just the base — not the deltas, the vectors,
+    // or any sidecar — so this stays O(state metadata), not O(store).
+    let state = state_journal::read_base_payload(
+        &base_json_path(persistence_dir, index_key, base_epoch),
+        manifest.store_manifest("json"),
+    )?;
+    let native_dim = state.get("native_dim").and_then(Value::as_u64).unwrap_or(0) as usize;
+    Ok(StoreMetadata {
+        generation: manifest.generation(),
+        native_dim,
+    })
+}
+
 fn legacy_tvim_path(persistence_dir: &Path, index_key: &str) -> Option<PathBuf> {
     let path = persistence_dir.join(format!("{index_key}.tvim"));
     path.is_file().then_some(path)
