@@ -40,9 +40,9 @@ const LSN_RECORD_LEN_V1: usize = LSN_MAGIC_V1.len() + 8;
 // magic + lsn + wal_len + crc32.
 const LSN_PAYLOAD_LEN: usize = 16;
 const LSN_RECORD_LEN_V2: usize = LSN_MAGIC_V2.len() + LSN_PAYLOAD_LEN + 4;
-// Stored in the watermark slot when the writer does not track the WAL length
-// (the standalone `reserve` path). A real WAL can never be u64::MAX bytes, so it
-// is an unambiguous "no watermark recorded" and reads back as `None`.
+// Stored in the watermark slot when the writer does not track the WAL length. A
+// real WAL can never be u64::MAX bytes, so it is an unambiguous "no watermark
+// recorded" and reads back as `None`.
 const WAL_LEN_UNKNOWN: u64 = u64::MAX;
 
 /// Returns the counter-file path for an index.
@@ -50,68 +50,13 @@ pub fn lsn_path(persistence_dir: &Path, index_key: &str) -> PathBuf {
     persistence_dir.join(format!("{index_key}{LSN_SUFFIX}"))
 }
 
-/// Reserves `count` contiguous LSNs and returns the first of the range
-/// (`start ..= start + count - 1`).
-///
-/// `floor` is the highest LSN already durable in the store (the maximum of the
-/// committed watermark and any WAL tail) and is authoritative: the counter is a
-/// rebuildable optimization over it. The reservation never hands out an LSN at
-/// or below `floor`, so a fresh, missing, or crash-torn counter seeds safely and
-/// never reuses a sequence number. `count` must be non-zero. The read-modify-
-/// write runs under a short exclusive lock on the counter file, so concurrent
-/// reservers cannot collide or observe a partial write.
-pub fn reserve(
-    persistence_dir: &Path,
-    index_key: &str,
-    count: u64,
-    floor: u64,
-    fsync: bool,
-) -> CoreResult<u64> {
-    with_reserved(persistence_dir, index_key, count, floor, fsync, Ok)
-}
-
-/// Reserves `count` LSNs and runs `body` with the first of the range while the
-/// counter lock is still held, returning whatever `body` returns.
-///
-/// The counter is advanced and persisted before `body` runs, so the LSNs are
-/// spent even if `body` fails (an un-written tail simply becomes an LSN gap,
-/// never a reuse). Holding the lock across `body` is what lets a concurrent WAL
-/// append keep file order aligned with LSN order: an appender reserves and
-/// writes its frames as one critical section, so a second appender cannot slot
-/// a lower-numbered frame in between. `body` must therefore be short (a WAL
-/// append), never a checkpoint or other long operation. See [`reserve`] for the
-/// argument contract.
-pub fn with_reserved<T>(
-    persistence_dir: &Path,
-    index_key: &str,
-    count: u64,
-    floor: u64,
-    fsync: bool,
-    body: impl FnOnce(u64) -> CoreResult<T>,
-) -> CoreResult<T> {
-    if count == 0 {
-        return Err(corrupt("LSN reservation count must be non-zero"));
-    }
-    with_lock(persistence_dir, index_key, |file| {
-        let current = read_counter(file)?
-            .map(|counter| counter.lsn)
-            .unwrap_or(0)
-            .max(floor);
-        let next = current
-            .checked_add(count)
-            .ok_or_else(|| corrupt("LSN counter would overflow u64"))?;
-        // The standalone reserve path does not track the WAL, so it records no
-        // watermark; the appender path uses `write_counter` directly to store one.
-        write_counter(file, next, None, fsync)?;
-        body(current + 1)
-    })
-}
-
 /// Runs `body` while holding the counter's exclusive lock, handing it the open
-/// counter file. This is the append serialization point: [`with_reserved`] takes
-/// it to reserve LSNs and write WAL frames, and an appender's open takes it to
-/// inspect and repair the WAL without racing a concurrent append. `body` must be
-/// short (a counter update or a WAL append/repair), never a checkpoint.
+/// counter file. This is the append serialization point: `CoreAppender` takes it
+/// to reserve an LSN and write its WAL frame as one critical section (so a second
+/// appender cannot slot a lower-numbered frame in between), and an appender's open
+/// takes it to inspect and repair the WAL without racing a concurrent append.
+/// `body` must be short (a counter update or a WAL append/repair), never a
+/// checkpoint or other long operation.
 pub fn with_lock<T>(
     persistence_dir: &Path,
     index_key: &str,
@@ -128,22 +73,6 @@ pub fn with_lock<T>(
     // Hold the lock until `body` returns, then release it by dropping the handle.
     drop(file);
     result
-}
-
-/// Reads the highest LSN the counter has handed out, or `None` when the counter
-/// does not exist yet. Does not take the exclusive lock, so callers that need a
-/// consistent value against concurrent reservers must serialize themselves; it
-/// exists for read-only inspection and recovery seeding.
-pub fn peek(persistence_dir: &Path, index_key: &str) -> CoreResult<Option<u64>> {
-    let path = lsn_path(persistence_dir, index_key);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .map_err(|error| corrupt(format!("LSN counter could not be opened: {error}")))?;
-    Ok(read_counter(&mut file)?.map(|counter| counter.lsn))
 }
 
 /// A decoded counter record.
@@ -165,9 +94,10 @@ pub struct Counter {
 /// (just created) or one left torn by a crash mid-write (short, or wrong magic)
 /// reads as `None`, and callers reseed the LSN from the floor and the watermark
 /// from a full scan instead of wedging. A structurally intact but partially
-/// rewritten value is still clamped up to the floor by `reserve`, so it can never
-/// fall below the store's durable maximum. A genuine read (I/O) error still
-/// propagates. Both the v1 (LSN-only) and v2 (LSN + watermark) layouts are read.
+/// rewritten value is still clamped up to the floor by the appender's reservation,
+/// so it can never fall below the store's durable maximum. A genuine read (I/O)
+/// error still propagates. Both the v1 (LSN-only) and v2 (LSN + watermark) layouts
+/// are read.
 pub fn read_counter(file: &mut File) -> CoreResult<Option<Counter>> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| corrupt(format!("LSN counter could not be read: {error}")))?;
@@ -321,7 +251,7 @@ fn open_exclusive(path: &Path) -> CoreResult<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -337,23 +267,36 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn reserves_sequentially_from_one() {
-        let dir = temp_dir("sequential");
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 1);
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 2);
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 3);
-        assert_eq!(peek(&dir, "k").unwrap(), Some(3));
-        std::fs::remove_dir_all(dir).unwrap();
+    /// Mirrors how `CoreAppender` reserves one LSN under the counter lock: clamp
+    /// the persisted counter up to `floor`, hand out the next value, and persist it
+    /// with the given watermark. The standalone reserve convenience API is gone, so
+    /// the appender's `with_lock` + `read_counter` + `write_counter` is the
+    /// reservation exercised here.
+    fn reserve_one(dir: &Path, key: &str, floor: u64, wal_len: Option<u64>) -> u64 {
+        with_lock(dir, key, |file| {
+            let current = read_counter(file)?.map(|counter| counter.lsn).unwrap_or(0).max(floor);
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| corrupt("LSN counter would overflow u64"))?;
+            write_counter(file, next, wal_len, false)?;
+            Ok(next)
+        })
+        .unwrap()
+    }
+
+    /// Reads the persisted LSN under the lock, or `None` when the counter file does
+    /// not exist yet or reads as torn/absent.
+    fn peek_lsn(dir: &Path, key: &str) -> Option<u64> {
+        with_lock(dir, key, |file| Ok(read_counter(file)?.map(|counter| counter.lsn))).unwrap()
     }
 
     #[test]
-    fn reserves_contiguous_ranges() {
-        let dir = temp_dir("ranges");
-        assert_eq!(reserve(&dir, "k", 5, 0, false).unwrap(), 1);
-        // The five-LSN reservation consumed 1..=5, so the next starts at 6.
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 6);
-        assert_eq!(peek(&dir, "k").unwrap(), Some(6));
+    fn reserves_sequentially_from_one() {
+        let dir = temp_dir("sequential");
+        assert_eq!(reserve_one(&dir, "k", 0, None), 1);
+        assert_eq!(reserve_one(&dir, "k", 0, None), 2);
+        assert_eq!(reserve_one(&dir, "k", 0, None), 3);
+        assert_eq!(peek_lsn(&dir, "k"), Some(3));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -361,39 +304,32 @@ mod tests {
     fn floor_seeds_a_fresh_counter_without_reuse() {
         let dir = temp_dir("floor");
         // A store already durable up to LSN 10 must never hand out <= 10.
-        assert_eq!(reserve(&dir, "k", 1, 10, false).unwrap(), 11);
-        assert_eq!(reserve(&dir, "k", 1, 10, false).unwrap(), 12);
+        assert_eq!(reserve_one(&dir, "k", 10, None), 11);
+        assert_eq!(reserve_one(&dir, "k", 10, None), 12);
         // A stale (lower) floor cannot pull the counter backwards.
-        assert_eq!(reserve(&dir, "k", 1, 3, false).unwrap(), 13);
+        assert_eq!(reserve_one(&dir, "k", 3, None), 13);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn peek_is_none_before_first_reservation() {
+    fn counter_is_none_before_first_reservation() {
         let dir = temp_dir("peek-none");
-        assert_eq!(peek(&dir, "k").unwrap(), None);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn rejects_zero_count() {
-        let dir = temp_dir("zero");
-        assert!(reserve(&dir, "k", 0, 0, false).is_err());
+        assert_eq!(peek_lsn(&dir, "k"), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn corrupt_counter_reseeds_from_floor() {
         let dir = temp_dir("corrupt");
-        reserve(&dir, "k", 1, 0, false).unwrap();
+        reserve_one(&dir, "k", 0, None);
         // A crash mid-write can leave the counter torn. Because the floor (the
         // store's durable max LSN) is authoritative, a garbage counter must not
         // wedge reservation: it reads as absent and the next reservation seeds
         // from the floor, then heals the file for later reservations.
         std::fs::write(lsn_path(&dir, "k"), b"not-a-counter").unwrap();
-        assert_eq!(peek(&dir, "k").unwrap(), None);
-        assert_eq!(reserve(&dir, "k", 1, 10, false).unwrap(), 11);
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 12);
+        assert_eq!(peek_lsn(&dir, "k"), None);
+        assert_eq!(reserve_one(&dir, "k", 10, None), 11);
+        assert_eq!(reserve_one(&dir, "k", 0, None), 12);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -407,7 +343,7 @@ mod tests {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     (0..per_thread)
-                        .map(|_| reserve(&dir, "k", 1, 0, false).unwrap())
+                        .map(|_| reserve_one(&dir, "k", 0, None))
                         .collect::<Vec<u64>>()
                 })
             })
@@ -482,8 +418,8 @@ mod tests {
             );
         }
         // The next reservation preserves the LSN and rewrites the file as v2.
-        assert_eq!(reserve(&dir, "k", 1, 0, false).unwrap(), 6);
-        assert_eq!(peek(&dir, "k").unwrap(), Some(6));
+        assert_eq!(reserve_one(&dir, "k", 0, None), 6);
+        assert_eq!(peek_lsn(&dir, "k"), Some(6));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -508,8 +444,8 @@ mod tests {
             assert_eq!(read_counter(&mut file).unwrap(), None);
         }
         // Reservation reseeds from the floor and heals the file back to a valid v2.
-        assert_eq!(reserve(&dir, "k", 1, 10, false).unwrap(), 11);
-        assert_eq!(peek(&dir, "k").unwrap(), Some(11));
+        assert_eq!(reserve_one(&dir, "k", 10, None), 11);
+        assert_eq!(peek_lsn(&dir, "k"), Some(11));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
