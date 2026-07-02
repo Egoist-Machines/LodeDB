@@ -1855,14 +1855,16 @@ class LodeDB:
         return f"doc-{secrets.token_hex(8)}-{self._auto_id_counter}"
 
 
-# The native writer-lock contention error, raised by the Rust core when another
-# process already holds <dir>/.lodedb.lock and the acquire timeout elapses. The
-# native binding surfaces it as a ValueError carrying this redacted message.
-_NATIVE_WRITER_LOCK_CONTENTION_MARKER = "another writer holds the lodedb lock"
+# The native lock contention errors, raised by the Rust core when a hold on
+# <dir>/.lodedb.lock cannot be acquired before the timeout elapses: an exclusive
+# acquire reports "another writer holds the lodedb lock", a shared (appender)
+# acquire reports "an exclusive writer holds the lodedb lock". The native binding
+# surfaces both as ValueError; the shared suffix matches either.
+_NATIVE_WRITER_LOCK_CONTENTION_MARKER = "holds the lodedb lock"
 
 
 def _is_writer_lock_contention(error: BaseException) -> bool:
-    """Returns whether a native open failed because another writer holds the lock."""
+    """Returns whether a native open failed because another holder has the lock."""
 
     return _NATIVE_WRITER_LOCK_CONTENTION_MARKER in str(error)
 

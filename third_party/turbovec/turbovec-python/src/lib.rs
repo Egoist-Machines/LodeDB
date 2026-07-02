@@ -1327,7 +1327,12 @@ fn native_core_error_to_py(error: CoreError) -> PyErr {
 /// durably log vector-in records to a store's WAL concurrently, for the next
 /// exclusive writer to fold in on open. The store must be in WAL commit mode and
 /// hold exactly one index.
-#[pyclass(name = "CoreAppender", unsendable)]
+///
+/// Sendable, unlike `PyCoreEngine`: `CoreAppender` is `Send + Sync` (immutable
+/// fields plus on-disk locking), so a cross-thread call or final decref runs
+/// normally and always releases the shared lock, with no thread-confined
+/// executor needed.
+#[pyclass(name = "CoreAppender")]
 struct PyCoreAppender {
     inner: RustCoreAppender,
 }

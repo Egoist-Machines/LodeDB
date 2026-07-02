@@ -1304,6 +1304,28 @@ def test_public_appender_rejects_unknown_durability(tmp_path) -> None:
         lodedb.Appender.open(store, durability="turbo")
 
 
+def test_public_appender_contention_raises_concurrent_writer_error(tmp_path) -> None:
+    """Appender lock contention surfaces the SDK's stable ConcurrentWriterError (as a
+    writable LodeDB open does for the same lock), not a bare ValueError."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    previous = os.environ.get("LODEDB_PERSIST_LOCK_TIMEOUT")
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        # The writable handle holds the exclusive lock, so the shared acquire fails.
+        with pytest.raises(lodedb.ConcurrentWriterError):
+            lodedb.Appender.open(store)
+    finally:
+        if previous is None:
+            os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+        else:
+            os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = previous
+        db.close()
+
+
 def test_public_appender_normalizes_large_vectors(tmp_path) -> None:
     """A large but finite vector normalizes along its direction (float64 norm), not to
     an all-zero record from a float32 norm overflow."""

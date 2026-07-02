@@ -16,9 +16,10 @@ from os import PathLike
 from typing import Any
 
 from lodedb.engine._atomic_io import normalize_durability
+from lodedb.engine._filelock import ConcurrentWriterError
 from lodedb.engine.core import EngineVectorDocument
 from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreAppenderHandle
-from lodedb.local.db import _coerce_metadata, _coerce_optional_text
+from lodedb.local.db import _coerce_metadata, _coerce_optional_text, _is_writer_lock_contention
 
 __all__ = ["Appender"]
 
@@ -33,6 +34,11 @@ class Appender:
     checkpointed generation). A single instance is not thread-safe; serialize calls
     to it. Use it as a context manager, or call :meth:`close`, to release the shared
     lock promptly.
+
+    On Windows the shared lock degrades to an exclusive hold, so appenders exclude
+    each other there: a second concurrent :meth:`open` waits for the first appender
+    to close (up to ``LODEDB_PERSIST_LOCK_TIMEOUT``), then raises
+    :class:`ConcurrentWriterError`. On Unix appenders coexist freely.
     """
 
     def __init__(self, handle: NativeCoreAppenderHandle) -> None:
@@ -69,13 +75,24 @@ class Appender:
         adapter = NativeCoreAdapter()
         if not adapter.available:
             raise RuntimeError("native core extension is not available")
-        handle = adapter.open_appender(
-            path=path,
-            durability=native_durability,
-            store_text=store_text,
-            index_text=index_text,
-            acquire_writer_lock=acquire_writer_lock,
-        )
+        try:
+            handle = adapter.open_appender(
+                path=path,
+                durability=native_durability,
+                store_text=store_text,
+                index_text=index_text,
+                acquire_writer_lock=acquire_writer_lock,
+            )
+        except ValueError as exc:
+            if _is_writer_lock_contention(exc):
+                # Same lock and timeout as a writable LodeDB open; surface the
+                # SDK's stable contention error so one retry loop covers both.
+                raise ConcurrentWriterError(
+                    f"appender at {path} could not take the lodedb lock (held by an "
+                    "exclusive writer, or by another appender on Windows); close the "
+                    "other handle, or raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
+                ) from exc
+            raise
         return cls(handle)
 
     def append(
