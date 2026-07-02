@@ -3502,6 +3502,36 @@ fn document_resource_payload(document_id: &str, record: &DocumentRecord) -> Valu
     })
 }
 
+/// Packs per-query search results into the flat `[nq * k]` arrays the arrays batch
+/// path returns. `k` is the largest per-query hit count; shorter rows are padded
+/// with empty slots to keep the `[nq, k]` shape, matching how the exact arrays
+/// scan pads absent documents.
+fn pack_results_to_arrays(results: &[CoreSearchResults], nq: usize) -> VectorBatchArrays {
+    let k = results.iter().map(|result| result.hits.len()).max().unwrap_or(0);
+    let mut scores = Vec::with_capacity(nq * k);
+    let mut document_ids = Vec::with_capacity(nq * k);
+    let mut metadata = Vec::with_capacity(nq * k);
+    for result in results {
+        for hit in &result.hits {
+            scores.push(hit.score);
+            document_ids.push(hit.document_id.clone());
+            metadata.push(hit.metadata.clone());
+        }
+        for _ in result.hits.len()..k {
+            scores.push(0.0);
+            document_ids.push(String::new());
+            metadata.push(CoreMetadata::default());
+        }
+    }
+    VectorBatchArrays {
+        nq,
+        k,
+        scores,
+        document_ids,
+        metadata,
+    }
+}
+
 /// Live rows reconstructed for clustering: chunk ids, aligned stable ids, and
 /// row-major vectors in the scan's rotated space, ordered by chunk id, plus the
 /// TurboVec rotation. Owns its buffers so [`ClusterSource::entries`] can hand out
@@ -4165,15 +4195,37 @@ impl VectorOnlyIndex {
         filter: Option<&Value>,
     ) -> Result<Vec<CoreSearchResults>, CoreError> {
         // ANN candidate selection is per-query (each query probes different
-        // clusters), so a batch cannot share one candidate allowlist. To keep the
-        // invariant that a batch equals looping single queries, route each query
-        // through the single-query ANN path when ANN would prune and the query is
-        // unfiltered. A non-pruning config keeps the optimized shared/GPU batch.
+        // clusters), so a batch cannot share one candidate allowlist. When ANN
+        // would prune, resolve each query's candidates first: if at least one
+        // query prunes, run the per-query allowlisted scans (a batch equals
+        // looping single queries); if every query declines (e.g. the half-corpus
+        // rule), fall through to the batched shared/GPU exact scan rather than
+        // running N serial single scans. A non-pruning config skips this entirely.
         if self.ann_should_prune(filter) {
-            return query_vectors
+            let allowlists = query_vectors
                 .iter()
-                .map(|query| self.query_vector_turbovec(query, top_k, None))
-                .collect();
+                .map(|query| self.ann_candidate_stable_ids(query, top_k))
+                .collect::<Result<Vec<_>, _>>()?;
+            if allowlists.iter().any(Option::is_some) {
+                let total_considered = self.all_docs.len();
+                let index = self.turbovec_index()?;
+                return query_vectors
+                    .iter()
+                    .zip(&allowlists)
+                    .map(|(query, allowlist)| {
+                        let raw_hits = match allowlist {
+                            Some(stable_ids) => {
+                                index.search_with_stable_allowlist(query, top_k, stable_ids)?
+                            }
+                            None => index.search(query, top_k, &[])?,
+                        };
+                        Ok(CoreSearchResults {
+                            hits: self.assemble_vector_hits(raw_hits),
+                            total_considered,
+                        })
+                    })
+                    .collect();
+            }
         }
         let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
         if empty_filter {
@@ -4186,29 +4238,14 @@ impl VectorOnlyIndex {
                 .collect());
         }
         let index = self.turbovec_index()?;
-        index
+        Ok(index
             .search_batch(query_vectors, top_k, &allowlist)?
             .into_iter()
-            .map(|row| {
-                let hits = row
-                    .into_iter()
-                    .filter_map(|hit| {
-                        self.documents
-                            .get(&hit.document_id)
-                            .map(|record| CoreSearchHit {
-                                document_id: hit.document_id,
-                                chunk_id: hit.chunk_id,
-                                score: hit.score,
-                                metadata: record.metadata.clone(),
-                            })
-                    })
-                    .collect();
-                Ok(CoreSearchResults {
-                    hits,
-                    total_considered,
-                })
+            .map(|row| CoreSearchResults {
+                hits: self.assemble_vector_hits(row),
+                total_considered,
             })
-            .collect()
+            .collect())
     }
 
     /// Arrays-output counterpart of [`Self::query_vectors_batch_turbovec`]: runs the
@@ -4223,12 +4260,18 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<VectorBatchArrays, CoreError> {
-        // As in `query_vectors_batch_turbovec`, ANN is per-query, so preserve the
-        // batch-equals-singles invariant by looping the single-query path and
-        // packing the flat arrays from its results. A non-pruning config keeps the
-        // optimized shared/GPU batch scan.
+        // ANN is per-query, so route through the struct batch path (which itself
+        // falls back to the batched scan when every query declines) and pack its
+        // results into the flat arrays, rather than duplicating the routing
+        // decision and a bespoke packer. A non-pruning config keeps the optimized
+        // flat shared/GPU batch scan below.
         if self.ann_should_prune(filter) {
-            return self.ann_batch_arrays(queries, nq, top_k);
+            let dim = self.vector_dim;
+            let query_vectors: Vec<Vec<f32>> = (0..nq)
+                .map(|i| queries[i * dim..(i + 1) * dim].to_vec())
+                .collect();
+            let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, None)?;
+            return Ok(pack_results_to_arrays(&results, nq));
         }
         let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
         if empty_filter {
@@ -4252,51 +4295,6 @@ impl VectorOnlyIndex {
                     .unwrap_or_default()
             })
             .collect();
-        Ok(VectorBatchArrays {
-            nq,
-            k,
-            scores,
-            document_ids,
-            metadata,
-        })
-    }
-
-    /// Packs per-query ANN results into flat `[nq * k]` arrays.
-    ///
-    /// Loops the single-query ANN path so a batch is identical to looping single
-    /// queries, then flattens the per-query hits. `k` is the largest per-query hit
-    /// count; shorter rows are padded with empty slots to keep the `[nq, k]`
-    /// shape, exactly as the exact arrays path pads absent documents.
-    fn ann_batch_arrays(
-        &self,
-        queries: &[f32],
-        nq: usize,
-        top_k: usize,
-    ) -> Result<VectorBatchArrays, CoreError> {
-        let dim = self.vector_dim;
-        let mut rows = Vec::with_capacity(nq);
-        let mut k = 0usize;
-        for query_index in 0..nq {
-            let query = &queries[query_index * dim..(query_index + 1) * dim];
-            let result = self.query_vector_turbovec(query, top_k, None)?;
-            k = k.max(result.hits.len());
-            rows.push(result);
-        }
-        let mut scores = Vec::with_capacity(nq * k);
-        let mut document_ids = Vec::with_capacity(nq * k);
-        let mut metadata = Vec::with_capacity(nq * k);
-        for result in &rows {
-            for hit in &result.hits {
-                scores.push(hit.score);
-                document_ids.push(hit.document_id.clone());
-                metadata.push(hit.metadata.clone());
-            }
-            for _ in result.hits.len()..k {
-                scores.push(0.0);
-                document_ids.push(String::new());
-                metadata.push(CoreMetadata::default());
-            }
-        }
         Ok(VectorBatchArrays {
             nq,
             k,

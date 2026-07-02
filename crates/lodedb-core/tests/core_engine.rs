@@ -2246,6 +2246,66 @@ fn ann_batch_queries_match_looping_singles() {
 }
 
 #[test]
+fn ann_batch_all_decline_falls_back_to_batched_scan() {
+    // Two equal-size, well-separated blobs with one probe: each query's nearest
+    // cluster already holds exactly half the corpus, so every query declines the
+    // ANN prune (the half-corpus rule). The batch must then fall back to the
+    // batched exact scan and still equal both the exact scan and looping singles,
+    // for the struct and the flat-arrays paths.
+    let mut docs = Vec::new();
+    for i in 0..5 {
+        let mut a = vec![0.0f32; 8];
+        a[0] = 1.0;
+        a[1] = 0.02 * (i as f32 + 1.0);
+        docs.push(vector_doc(&format!("b0c{i}"), a));
+        let mut b = vec![0.0f32; 8];
+        b[2] = 1.0;
+        b[3] = 0.02 * (i as f32 + 1.0);
+        docs.push(vector_doc(&format!("b1c{i}"), b));
+    }
+    let exact = exact_engine(&docs);
+    let ann = ann_engine(&docs, 2, 1);
+    let queries = vec![axis_query(0), axis_query(2)];
+
+    let batch = ann
+        .query_vectors_batch("default", &queries, 3, None)
+        .unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let exact_hits = exact.query_vector("default", query, 3, None).unwrap();
+        let single = ann.query_vector("default", query, 3, None).unwrap();
+        assert_eq!(
+            hit_keys(&batch[i]),
+            hit_keys(&exact_hits),
+            "batch != exact at {i}"
+        );
+        assert_eq!(
+            hit_keys(&batch[i]),
+            hit_keys(&single),
+            "batch != single at {i}"
+        );
+    }
+
+    let flat: Vec<f32> = queries.iter().flatten().copied().collect();
+    let arrays = ann
+        .query_vectors_batch_arrays("default", &flat, 8, 3, None)
+        .unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let single = ann.query_vector("default", query, 3, None).unwrap();
+        let start = i * arrays.k;
+        let ids: Vec<&str> = arrays.document_ids[start..start + single.hits.len()]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let single_ids: Vec<&str> = single
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect();
+        assert_eq!(ids, single_ids, "arrays batch != single at {i}");
+    }
+}
+
+#[test]
 fn ann_tiny_corpus_falls_back_to_exact() {
     // Fewer vectors than can form a cluster: ANN must fall back to the exact scan,
     // not panic or drop the single result.
