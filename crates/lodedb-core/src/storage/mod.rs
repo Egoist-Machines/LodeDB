@@ -180,18 +180,22 @@ pub fn load_generation_store(
         )?,
         None => MultiVecMap::new(),
     };
+    // Load the `.tvann` cache only when the store opts into ANN (its state carries
+    // an `ann` config). The sidecar is a pure acceleration cache the engine
+    // rebuilds on demand, so verifying its checksum and parsing its corpus-sized
+    // postings for a store that will serve exact only is wasted work; gate it on
+    // the config rather than eagerly loading and discarding it.
     let ann = match manifest.store_manifest("tvann") {
-        Some(tvann_manifest) => {
-            // The `.tvann` is an optional acceleration cache, rebuildable from
-            // `.tvim`. A missing, truncated, or checksum-failing sidecar is a cache
-            // miss (the engine rebuilds), never a reason to fail opening an
-            // otherwise-intact store, so swallow any error to `None`.
+        Some(tvann_manifest) if state.get("ann").is_some() => {
+            // A missing, truncated, or checksum-failing sidecar is a cache miss
+            // (the engine rebuilds), never a reason to fail opening an otherwise-
+            // intact store, so swallow any error to `None`.
             let tvann_base_path = base_tvann_path(persistence_dir, &index_key, base_epoch);
             tvann_store::validate(&tvann_base_path, Some(tvann_manifest))
                 .and_then(|()| tvann_store::load(&tvann_base_path, Some(tvann_manifest)))
                 .unwrap_or(None)
         }
-        None => None,
+        _ => None,
     };
     let wal_records = if options.read_wal && !options.read_only {
         wal::read_records(&wal::wal_path(persistence_dir, &index_key))?
