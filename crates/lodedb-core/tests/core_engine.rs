@@ -1825,6 +1825,43 @@ fn appender_open_reads_metadata_not_the_vector_image() {
 }
 
 #[test]
+fn appended_lsn_exceeds_committed_generation() {
+    // The exclusive writer uses the generation as its own WAL LSN and can advance
+    // it faster than one-per-LSN, so the committed generation can exceed every WAL
+    // LSN. An appended LSN must still clear the committed generation, or a later
+    // writer's replay would treat the append as already folded and drop it.
+    let path = unique_temp_dir("core_appender_gen_clamp");
+    let mut options = open_options(&path, false, "wal");
+    options.acquire_writer_lock = true;
+    let committed_generation;
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        // Several upserts advance the generation; the checkpoint truncates the WAL,
+        // so at append time the WAL max LSN is 0 while the generation is high.
+        for i in 0..5 {
+            engine
+                .upsert_vectors("default", &[doc(&format!("d{i}"), i % 8, metadata(&[]))])
+                .unwrap();
+        }
+        engine.persist().unwrap();
+        committed_generation = engine.stats("default").unwrap().generation;
+    }
+    assert!(committed_generation >= 1);
+
+    let appender = CoreAppender::open(options).expect("open appender");
+    let lsn = appender
+        .append_vectors(&[doc("appended", 0, metadata(&[]))])
+        .expect("append");
+    assert!(
+        lsn > committed_generation,
+        "appended LSN {lsn} must exceed the committed generation {committed_generation}"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn appender_privacy_mode_tokens_persist_across_reopen() {
     // Privacy mode (store_text=false, index_text=true): a caption appended onto an
     // existing vector-identical document must survive a checkpoint and reopen. The

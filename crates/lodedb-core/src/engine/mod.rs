@@ -2098,10 +2098,19 @@ pub struct CoreAppender {
     path: PathBuf,
     index_key: String,
     vector_dim: usize,
-    // The highest LSN already durable in the store when this appender opened. The
-    // allocator clamps every reservation up to it, so appended LSNs never collide
-    // with an exclusive writer's generation-based LSNs from a prior session.
+    // The highest WAL LSN already durable when this appender opened (e.g. a peer's
+    // unfolded appends). Every reservation clamps up to it so an appended LSN never
+    // reuses one already on disk.
     floor: u64,
+    // The committed generation at open. The exclusive writer uses the generation
+    // as its own WAL LSN and can advance it faster than one-per-LSN (a captioned
+    // fold bumps it as upsert + token restore), so the counter can lag it. Clamping
+    // every reservation up to this makes the "an appended LSN always exceeds the
+    // committed generation" invariant local to the reservation, rather than resting
+    // on the shared/exclusive lock keeping an appender from spanning a fold. The
+    // generation is frozen for the appender's lifetime (a fold needs the exclusive
+    // lock this appender's shared lock excludes), so the open-time value stays valid.
+    committed_generation: u64,
     fsync: bool,
     // The raw-text/lexical retention policy for appended captions, mirroring the
     // engine's vector-in text policy exactly so an appended `upsert_vectors` record
@@ -2176,7 +2185,7 @@ impl CoreAppender {
         let wal_path = crate::storage::wal::wal_path(&path, &index_key);
         let base_generation = metadata.generation;
         let fsync = options.durability == "fsync";
-        let floor = crate::storage::lsn::with_lock(&path, &index_key, |file| {
+        let wal_max_lsn = crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
             Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
             // Refuse if the WAL already holds records only the Python engine can
@@ -2196,6 +2205,9 @@ impl CoreAppender {
                 .filter_map(|record| record.lsn)
                 .max()
                 .unwrap_or(0);
+            // The reservation floor is the max of the WAL's durable LSNs and the
+            // committed generation; keep them separate on the appender so the
+            // generation clamp stays explicit at each reservation.
             let floor = base_generation.max(wal_max_lsn);
             // Re-seed the shared counter to the just-repaired valid length. This is
             // the correctness anchor for the O(1) per-append repair: a stale
@@ -2216,13 +2228,14 @@ impl CoreAppender {
                 .unwrap_or(0);
             let seeded_lsn = existing_lsn.max(floor);
             crate::storage::lsn::write_counter(file, seeded_lsn, Some(scan.valid_len), fsync)?;
-            Ok(floor)
+            Ok(wal_max_lsn)
         })?;
         Ok(Self {
             path,
             index_key,
             vector_dim,
-            floor,
+            floor: wal_max_lsn,
+            committed_generation: base_generation,
             fsync,
             store_text: options.store_text,
             index_text: options.index_text,
@@ -2339,17 +2352,23 @@ impl CoreAppender {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(core_io_error(error)),
         };
+        // Every reservation clamps up to the committed generation as well as the
+        // counter and WAL floors, so an appended LSN always exceeds the generation
+        // even though the writer can advance the generation faster than the counter.
+        let generation = self.committed_generation;
         match counter.and_then(|counter| counter.wal_len) {
             // Intact tail: nothing sits past the last recorded frame, and the
             // counter's LSN is the last frame's LSN. The hot path.
-            Some(mark) if physical == mark && mark > 0 => Ok((counter_lsn.max(self.floor), mark)),
+            Some(mark) if physical == mark && mark > 0 => {
+                Ok((counter_lsn.max(self.floor).max(generation), mark))
+            }
             // Bytes past the watermark are a crashed peer's unacknowledged tail (or
             // a zero-length WAL that needs its header rewritten): drop them back to
             // the boundary. `repair_torn_tail` removes the file when the boundary is
             // zero so the next append writes a fresh header, not a headerless frame.
             Some(mark) if physical >= mark => {
                 Self::repair_torn_tail(wal, mark, physical)?;
-                Ok((counter_lsn.max(self.floor), mark))
+                Ok((counter_lsn.max(self.floor).max(generation), mark))
             }
             // No usable watermark, or one past the file: scan to repair the tail and
             // clamp the LSN above the WAL's true max so a torn counter or stale floor
@@ -2359,7 +2378,10 @@ impl CoreAppender {
                 Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
                 let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
                 Ok((
-                    counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)),
+                    counter_lsn
+                        .max(self.floor)
+                        .max(generation)
+                        .max(wal_max.unwrap_or(0)),
                     scan.valid_len,
                 ))
             }
