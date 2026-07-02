@@ -37,6 +37,13 @@ pub struct CoreEngine {
     next_plan_id: u64,
     persistence: Option<PersistenceState>,
     replaying_wal: bool,
+    /// Per-index `(commit-manifest token, WAL byte length, appender counter LSN)`
+    /// from the last successful [`refresh`](Self::refresh) reload. When a later
+    /// refresh sees the identical signature, neither the committed base nor any WAL
+    /// tail changed, so the overlaid view is already current and the reload is
+    /// skipped. See [`refresh_signature`](Self::refresh_signature) for why all three
+    /// components are needed.
+    refresh_cache: BTreeMap<String, (String, u64, u64)>,
 }
 
 impl CoreEngine {
@@ -69,6 +76,7 @@ impl CoreEngine {
                 _lock: lock,
             }),
             replaying_wal: false,
+            refresh_cache: BTreeMap::new(),
         };
         engine.load_persisted_indexes(options.commit_mode == "wal")?;
         Ok(engine)
@@ -96,6 +104,7 @@ impl CoreEngine {
                 _lock: None,
             }),
             replaying_wal: false,
+            refresh_cache: BTreeMap::new(),
         };
         engine.load_persisted_indexes(false)?;
         Ok(engine)
@@ -814,6 +823,15 @@ impl CoreEngine {
                 },
             );
             if let Some(old_record) = old_record {
+                // A text re-add carries no patch matrix; if it replaces a
+                // late-interaction document, record a multi-vector clear so the
+                // base's matrix does not resurrect on reload (mirrors the
+                // upsert_vectors and delete paths).
+                if old_record.patch_matrix.is_some() {
+                    index
+                        .pending_multivec_clears
+                        .insert(document.document_id.clone());
+                }
                 for chunk in &old_record.chunks {
                     removed_chunk_ids.insert(chunk.chunk_id.clone());
                 }
@@ -1800,6 +1818,12 @@ impl CoreEngine {
                 },
             );
             if let Some(old_record) = old_record {
+                // A replayed embedded-text upsert carries no patch matrix; clear a
+                // replaced late-interaction document's matrix so it does not
+                // resurrect from the base on reload (mirrors apply_text_upsert).
+                if old_record.patch_matrix.is_some() {
+                    index.pending_multivec_clears.insert(document_id.clone());
+                }
                 index.remove_document_indexes(
                     &document_id,
                     &old_record.metadata,
@@ -1969,6 +1993,15 @@ impl CoreEngine {
                             });
                         self.replaying_wal = false;
                         replay_result?;
+                        // A no-op fold advances applied_lsn without bumping
+                        // generation, and the writer mints its own WAL LSNs from
+                        // generation; clamp generation up to the watermark so a
+                        // later mutation never mints an LSN at or below one already
+                        // applied (which a read-only refresh would then skip and an
+                        // appender could reuse).
+                        if let Some(index) = self.indexes.get_mut(&index_id) {
+                            index.generation = index.generation.max(index.applied_lsn);
+                        }
                         self.persist()?;
                         continue;
                     } else {
@@ -2017,6 +2050,16 @@ impl CoreEngine {
             Some(persistence) if persistence.read_only => {}
             _ => return Ok(()),
         }
+        // Fast path: if no committed manifest and no WAL tail changed since the last
+        // successful refresh, the overlaid view is already current -- skip the whole
+        // reload + re-tail. The signature is cheap (small manifest reads plus a WAL
+        // stat per index) against a full-store reload.
+        let signature = self.refresh_signature()?;
+        if let Some(signature) = &signature {
+            if !signature.is_empty() && *signature == self.refresh_cache {
+                return Ok(());
+            }
+        }
         // Seqlock over the crash-atomic root manifest: reload the base and overlay
         // the WAL tail, then confirm no checkpoint swapped a root manifest meanwhile.
         // A racing checkpoint folds records into a new base and truncates the WAL, so
@@ -2027,16 +2070,125 @@ impl CoreEngine {
         // both commit at generation 1). Bounded so a writer churning cannot wedge us
         // (the last attempt's view still self-consistent, at worst one commit stale,
         // which the next refresh resolves).
+        // Build the refreshed view while keeping the pre-refresh one in hand for the
+        // whole seqlock loop: a mid-refresh error (a transient read, or a WAL that
+        // needs a writer to recover, which `overlay_wal_tails` reports) must leave the
+        // reader's last-good view intact rather than an empty or half-overlaid one.
+        // `saved` is captured once, and each attempt rebuilds from an empty map, so a
+        // checkpoint-raced attempt is discarded rather than promoted to the fallback:
+        // an error always restores the last-good view, never a half-built or
+        // seqlock-rejected one.
+        let saved = std::mem::take(&mut self.indexes);
+        let mut outcome = Ok(());
         for _ in 0..8 {
-            let before = self.committed_root_tokens()?;
             self.indexes.clear();
-            self.load_persisted_indexes(false)?;
-            self.overlay_wal_tails()?;
-            if self.committed_root_tokens()? == before {
+            let before = match self.committed_root_tokens() {
+                Ok(before) => before,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            };
+            if let Err(error) = self
+                .load_persisted_indexes(false)
+                .and_then(|()| self.overlay_wal_tails())
+            {
+                outcome = Err(error);
                 break;
             }
+            match self.committed_root_tokens() {
+                Ok(after) if after == before => break,
+                Ok(_) => continue,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
         }
+        if let Err(error) = outcome {
+            self.indexes = saved;
+            return Err(error);
+        }
+        // Cache the pre-reload signature: a change that raced this reload leaves the
+        // live signature ahead of it, so the next refresh reloads again instead of
+        // skipping (never the reverse -- the signature only moves forward). An
+        // indeterminate signature (a locked counter) clears the cache so the next
+        // refresh re-evaluates cleanly.
+        self.refresh_cache = signature.unwrap_or_default();
         Ok(())
+    }
+
+    /// The [`refresh`](Self::refresh) fast-path signature: per index, three cheap
+    /// change signals whose conjunction covers everything the overlay depends on.
+    ///
+    /// - The commit-manifest token changes on every base swap (a checkpoint).
+    /// - The WAL byte length changes on every append or truncation, including the
+    ///   exclusive writer's own WAL-mode appends, which do not touch the counter.
+    /// - The appender counter's LSN changes on every acknowledged append even when
+    ///   the byte length coincides: a crashed peer's unacknowledged tail can be
+    ///   repaired away and replaced by a different record of the same length, and
+    ///   because a reservation always clears the WAL's true max LSN (see
+    ///   `repair_and_lsn_floor`) the counter's LSN strictly advances. Length alone
+    ///   would miss that swap and keep the phantom record while never observing the
+    ///   acknowledged replacement.
+    ///
+    /// Equal signatures across two refreshes mean nothing the overlay folds moved.
+    /// Cheap: a small manifest read, one stat, and one fixed-size counter read per
+    /// index, no store load. The counter read is lock-free; a torn read reads as
+    /// absent (a conservative "changed" that forces a reload, never a missed one),
+    /// and an append is not acknowledged to its caller until the counter is written,
+    /// so a not-yet-published append cannot be a read-your-writes miss. Returns `None`
+    /// when a counter cannot be read this pass -- a concurrent appender holds it with
+    /// an exclusive share mode on Windows -- so the caller skips the fast path and
+    /// does a normal reload rather than surfacing a spurious error.
+    fn refresh_signature(
+        &self,
+    ) -> Result<Option<BTreeMap<String, (String, u64, u64)>>, CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(Some(BTreeMap::new()));
+        };
+        let mut signature = BTreeMap::new();
+        if !persistence.path.is_dir() {
+            return Ok(Some(signature));
+        }
+        for entry in fs::read_dir(&persistence.path).map_err(core_io_error)? {
+            let entry = entry.map_err(core_io_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(index_key) = name.strip_suffix(".commit.json") {
+                let manifest = crate::storage::commit_manifest::read_commit_manifest(
+                    &crate::storage::commit_manifest::commit_manifest_path(
+                        &persistence.path,
+                        index_key,
+                    ),
+                )?;
+                let token = manifest.map(|manifest| manifest.body_sha256).unwrap_or_default();
+                let wal = crate::storage::wal::wal_path(&persistence.path, index_key);
+                let wal_len = match fs::metadata(&wal) {
+                    Ok(meta) => meta.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(core_io_error(error)),
+                };
+                let lsn_file = crate::storage::lsn::lsn_path(&persistence.path, index_key);
+                let counter_lsn = match std::fs::File::open(&lsn_file) {
+                    Ok(mut file) => match crate::storage::lsn::read_counter(&mut file) {
+                        Ok(counter) => counter.map_or(0, |counter| counter.lsn),
+                        // Only a fast-path hint: an unreadable counter is
+                        // indeterminate, not a refresh failure.
+                        Err(_) => return Ok(None),
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    // A concurrent appender can hold the counter with an exclusive
+                    // share mode (Windows), failing the open; treat that as
+                    // indeterminate so the caller reloads rather than erroring.
+                    Err(_) => return Ok(None),
+                };
+                signature.insert(index_key.to_string(), (token, wal_len, counter_lsn));
+            }
+        }
+        Ok(Some(signature))
     }
 
     /// Reads each committed index's manifest body checksum, the [`refresh`](Self::refresh)
@@ -2064,7 +2216,7 @@ impl CoreEngine {
                     ),
                 )?;
                 let token = match manifest {
-                    Some(manifest) => crate::storage::util::body_sha256(&manifest.body)?,
+                    Some(manifest) => manifest.body_sha256,
                     None => String::new(),
                 };
                 tokens.insert(index_key.to_string(), token);
@@ -2073,13 +2225,20 @@ impl CoreEngine {
         Ok(tokens)
     }
 
-    /// Highest LSN reflected in `index_id`'s in-memory view: the committed base
-    /// generation, this handle's own writer mutations (which use `generation` as
-    /// their WAL LSN), and any WAL records a [`refresh`](Self::refresh) overlay
-    /// folded. Compare it to an appender's returned LSN for read-your-writes.
+    /// Highest LSN reflected in `index_id`'s in-memory view: the durable applied
+    /// watermark (the committed base plus its folded appends), advanced by any WAL
+    /// records a [`refresh`](Self::refresh) overlay folds in. Compare it to an
+    /// appender's returned LSN for read-your-writes (the append is visible once
+    /// `applied_lsn >= that_lsn`).
+    ///
+    /// This is `applied_lsn`, not `max(applied_lsn, generation)`: `generation` is a
+    /// mutation counter that can advance faster than one-per-LSN (a captioned fold
+    /// bumps it as upsert + token restore), so folding a record with LSN `n` could
+    /// leave `generation == n + 1` and make the watermark falsely cover LSN `n + 1`
+    /// -- exactly the LSN an appender hands out next -- a false-positive
+    /// read-your-writes. The watermark tracks LSNs the store has actually applied.
     pub fn applied_lsn(&self, index_id: &str) -> Result<u64, CoreError> {
-        let index = self.index(index_id)?;
-        Ok(index.applied_lsn.max(index.generation))
+        Ok(self.index(index_id)?.applied_lsn)
     }
 
     /// Folds every index's current WAL tail into its in-memory view (read-only
@@ -2099,15 +2258,6 @@ impl CoreEngine {
             .collect();
         for (index_id, index_key, base_generation) in targets {
             let wal = crate::storage::wal::wal_path(&path, &index_key);
-            // Fold only frames the appender has acknowledged (published the counter
-            // for). When there is no usable watermark, distinguish two cases: a
-            // present-but-unreadable counter (an appender mid-write torn the CRC
-            // catches, or a legacy watermark-less counter) may hide an unacknowledged
-            // tail, so skip this index's overlay this pass rather than risk exposing
-            // a frame the appender never returned -- a later refresh (once the
-            // counter is clean) folds it. An absent counter means the WAL was written
-            // only by the exclusive writer, whose frames are all acknowledged, so
-            // fold all of it.
             // Fold every CRC-valid frame. This covers all committed records -- the
             // exclusive writer's own appends and appenders' acknowledged frames -- so
             // read-your-writes holds: a returned append's frame is CRC-valid and thus
@@ -2565,13 +2715,30 @@ impl CoreAppender {
             Some(mark) if physical == mark && mark > 0 => {
                 Ok((counter_lsn.max(self.floor).max(generation), mark))
             }
-            // Bytes past the watermark are a crashed peer's unacknowledged tail (or
-            // a zero-length WAL that needs its header rewritten): drop them back to
-            // the boundary. `repair_torn_tail` removes the file when the boundary is
-            // zero so the next append writes a fresh header, not a headerless frame.
+            // Bytes at or past the watermark: a crashed peer's unacknowledged tail,
+            // or a zero-length WAL that needs its header rewritten. Scan for the
+            // WAL's true max LSN and clamp the floor above it BEFORE dropping the
+            // tail: `refresh` overlays every CRC-valid frame, so a reader may have
+            // transiently observed an unacknowledged past-watermark frame at some
+            // LSN; re-minting that LSN for a different record would leave that
+            // reader's `applied_lsn` pointing at the wrong record. The tail is still
+            // dropped back to the boundary (an unacknowledged frame is not
+            // committed), and `repair_torn_tail` removes the file when the boundary
+            // is zero so the next append writes a fresh header, not a headerless
+            // frame. This scan is off the steady-state hot path: once this appender
+            // acks its frame the watermark equals the file length and the intact-tail
+            // arm above handles every later append in O(1).
             Some(mark) if physical >= mark => {
+                let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
+                let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
                 Self::repair_torn_tail(wal, mark, physical)?;
-                Ok((counter_lsn.max(self.floor).max(generation), mark))
+                Ok((
+                    counter_lsn
+                        .max(self.floor)
+                        .max(generation)
+                        .max(wal_max.unwrap_or(0)),
+                    mark,
+                ))
             }
             // No usable watermark, or one past the file: scan to repair the tail and
             // clamp the LSN above the WAL's true max so a torn counter or stale floor
@@ -3258,6 +3425,12 @@ fn persist_index_generation(
         )?;
         index.base_epoch = generation;
         index.base_calibration_fingerprint = live_fingerprint;
+    } else if watermark_only {
+        // No document state changed -- only the applied-LSN watermark advanced. Carry
+        // the committed base and all its store manifests forward and re-seal just the
+        // commit manifest, rather than appending an empty state-journal delta that
+        // would push the base toward premature compaction.
+        write_index_watermark(index, dir, fsync, generation)?;
     } else {
         write_index_delta(
             index,
@@ -3276,9 +3449,15 @@ fn persist_index_generation(
     index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
-    // `build_commit_body`); record that as the durable watermark so `persist` knows
-    // the on-disk manifest now covers the WAL and may truncate it.
-    index.persisted_applied_lsn = index.applied_lsn.max(generation);
+    // `build_commit_body`). Advance the in-memory watermark to match so this live
+    // writable handle's `applied_lsn()` reports the committed generation (the
+    // writer's own LSN) rather than a stale value -- a reopen would read exactly this
+    // from the manifest -- and record it as the persisted watermark so `persist`
+    // knows the on-disk manifest now covers the WAL and may truncate it. Only the
+    // writable persist path runs here; a read-only overlay still tracks `applied_lsn`
+    // as the max folded WAL LSN, never the faster-moving mutation generation.
+    index.applied_lsn = index.applied_lsn.max(generation);
+    index.persisted_applied_lsn = index.applied_lsn;
     Ok(())
 }
 
@@ -3415,6 +3594,26 @@ fn write_index_base(
 }
 
 /// Appends an O(changed) generation delta for one index onto the live base.
+/// Re-seals the commit manifest at `generation` and the current applied-LSN
+/// watermark without writing any base or delta segment. Used when a fold advanced
+/// only the durable watermark (an idempotent re-add or a missing-id delete) and no
+/// document state changed, so the previous commit's stores all carry forward.
+fn write_index_watermark(
+    index: &VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    generation: u64,
+) -> Result<(), CoreError> {
+    crate::storage::write_generation_watermark(
+        dir,
+        &index.index_key,
+        generation,
+        index.applied_lsn.max(generation),
+        fsync,
+    )?;
+    Ok(())
+}
+
 fn write_index_delta(
     index: &VectorOnlyIndex,
     dir: &Path,

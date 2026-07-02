@@ -240,16 +240,22 @@ pub struct StoreMetadata {
 pub fn load_store_metadata(persistence_dir: &Path, index_key: &str) -> CoreResult<StoreMetadata> {
     let manifest = read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
         .ok_or_else(|| invalid(format!("no committed generation for index key {index_key}")))?;
-    let base_epoch = manifest.base_epoch();
-    // native_dim is fixed at index creation and rewritten into every state base, so
-    // the base payload carries it; state deltas only journal document/chunk
-    // mutations. Read (and checksum) just the base — not the deltas, the vectors,
-    // or any sidecar — so this stays O(state metadata), not O(store).
-    let state = state_journal::read_base_payload(
-        &base_json_path(persistence_dir, index_key, base_epoch),
-        manifest.store_manifest("json"),
-    )?;
-    let native_dim = state.get("native_dim").and_then(Value::as_u64).unwrap_or(0) as usize;
+    // native_dim is fixed at index creation. Recent manifests record it directly, so
+    // the whole read is O(manifest). Fall back to the state base only for a manifest
+    // written before the field existed: it always carries native_dim (state deltas
+    // journal only document/chunk mutations), and reading just the base -- not the
+    // deltas, the vectors, or any sidecar -- keeps that fallback O(state metadata).
+    let native_dim = match manifest.native_dim() {
+        Some(dim) => dim as usize,
+        None => {
+            let base_epoch = manifest.base_epoch();
+            let state = state_journal::read_base_payload(
+                &base_json_path(persistence_dir, index_key, base_epoch),
+                manifest.store_manifest("json"),
+            )?;
+            state.get("native_dim").and_then(Value::as_u64).unwrap_or(0) as usize
+        }
+    };
     Ok(StoreMetadata {
         generation: manifest.generation(),
         applied_lsn: manifest.applied_lsn(),
@@ -388,6 +394,9 @@ pub fn write_generation_commit(
         generation: input.generation,
         applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
+        // The full state base carries native_dim; record it so a metadata read need
+        // not reload the base to recover it.
+        native_dim: input.state.get("native_dim").and_then(Value::as_u64),
         document_count,
         chunk_count,
         json_manifest: Some(json_manifest),
@@ -644,6 +653,9 @@ pub fn write_generation_delta(
         generation: input.generation,
         applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
+        // native_dim is fixed at index creation; carry the previous manifest's value
+        // forward (absent only when the prior commit predates the field).
+        native_dim: previous.native_dim(),
         document_count: input.document_count_after,
         chunk_count: input.chunk_count_after,
         json_manifest: Some(json_manifest),
@@ -658,6 +670,50 @@ pub fn write_generation_delta(
         &body,
         fsync,
     )?;
+    Ok(body)
+}
+
+/// Re-seals the commit manifest at a new generation and applied-LSN watermark
+/// without writing any base or delta segment. A no-op fold (an idempotent re-add or
+/// a missing-id delete) advances the durable watermark without changing document
+/// state, so every store manifest, base epoch, and count carries forward unchanged
+/// from the previous commit; only the generation and `applied_lsn` move. This keeps
+/// a watermark flush O(manifest) instead of appending an empty state-journal segment
+/// that would otherwise bloat the journal toward compaction.
+pub fn write_generation_watermark(
+    persistence_dir: impl AsRef<Path>,
+    index_key: &str,
+    generation: u64,
+    applied_lsn: u64,
+    fsync: bool,
+) -> CoreResult<Value> {
+    let persistence_dir = persistence_dir.as_ref();
+    let previous = read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
+        .ok_or_else(|| corrupt("watermark commit requires an existing commit manifest"))?;
+    let carried_count = |key: &str| {
+        previous
+            .body
+            .as_object()
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+    let body = build_commit_body(CommitBodyInput {
+        index_key,
+        generation,
+        applied_lsn,
+        base_epoch: previous.base_epoch(),
+        native_dim: previous.native_dim(),
+        document_count: carried_count("document_count"),
+        chunk_count: carried_count("chunk_count"),
+        json_manifest: previous.store_manifest("json").cloned(),
+        tvim_manifest: previous.store_manifest("tvim").cloned(),
+        tvtext_manifest: previous.store_manifest("tvtext").cloned(),
+        tvlex_manifest: previous.store_manifest("tvlex").cloned(),
+        tvmv_manifest: previous.store_manifest("tvmv").cloned(),
+        tvann_manifest: previous.store_manifest("tvann").cloned(),
+    });
+    write_commit_manifest(&commit_manifest_path(persistence_dir, index_key), &body, fsync)?;
     Ok(body)
 }
 

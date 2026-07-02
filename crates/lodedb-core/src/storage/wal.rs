@@ -255,10 +255,11 @@ pub fn checkpoint_store(
     let input = crate::storage::GenerationCommitInput {
         index_key: &store.index_key,
         generation: next_generation,
-        // This in-crate checkpoint helper does not track a folded-append watermark
-        // separately; the generation is the best available (its callers append no
-        // higher-LSN records than the generation they check point at).
-        applied_lsn: next_generation,
+        // Carry the loaded store's applied-LSN watermark forward, never below it: a
+        // store folded past its committed generation reports `applied_lsn >
+        // generation`, and dropping back to `next_generation` here would regress the
+        // durable watermark a lock-free reader trusts for read-your-writes.
+        applied_lsn: store.applied_lsn.max(next_generation),
         base_epoch: next_generation,
         state: &store.state,
         tvim: None,
