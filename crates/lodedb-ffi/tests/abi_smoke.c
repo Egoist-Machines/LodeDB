@@ -33,8 +33,11 @@ int main(void) {
   assert(lodedb_engine_new_in_memory(&engine, &error) == LODE_OK);
   assert(engine != 0);
 
-  // TurboVec requires a positive-multiple-of-8 dimension; use 8 here.
-  assert(lodedb_engine_create_index(engine, sv("default"), 8, 4, &error) == LODE_OK);
+  // TurboVec requires a positive-multiple-of-8 dimension; use 8 here. The single
+  // create entry point takes a minimal JSON request; the core supplies defaults.
+  assert(lodedb_engine_create_index_json(
+             engine, sv("{\"index_id\":\"default\",\"vector_dim\":8,\"bit_width\":4}"),
+             &error) == LODE_OK);
 
   float vector[8] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   LodeMetadataPair metadata[1];
@@ -267,13 +270,10 @@ int main(void) {
   lodedb_error_free(error);
   error = 0;
 
-  // create_index_json: build an ANN-enabled index from a full options blob and
-  // confirm the ann config deserializes, is accepted, and the index serves.
+  // create_index_json: build an ANN-enabled index from the minimal request blob
+  // and confirm the ann config deserializes, is accepted, and the index serves.
   const char *ann_options_json =
-      "{\"index_id\":\"ann-idx\",\"index_key\":\"ann-idx\",\"client_id_hash\":\"ann-idx\","
-      "\"name\":\"lodedb-local\",\"model\":\"external\",\"provider\":\"external\","
-      "\"task\":\"vector-only\",\"route_profile\":\"vector-only\","
-      "\"storage_profile\":\"turbovec_direct\",\"vector_dim\":8,\"bit_width\":4,"
+      "{\"index_id\":\"ann-idx\",\"vector_dim\":8,\"bit_width\":4,\"model\":\"external\","
       "\"ann\":{\"algorithm\":\"cluster\",\"nprobe\":1}}";
   assert(lodedb_engine_create_index_json(engine, sv(ann_options_json), &error) == LODE_OK);
   assert(lodedb_engine_upsert_vectors(engine, sv("ann-idx"), &document, 1, &error) == LODE_OK);
@@ -291,10 +291,8 @@ int main(void) {
 
   // An unknown ann algorithm fails closed through the JSON create path.
   const char *ann_bad_json =
-      "{\"index_id\":\"ann-bad\",\"index_key\":\"ann-bad\",\"client_id_hash\":\"ann-bad\","
-      "\"name\":\"n\",\"model\":\"external\",\"provider\":\"external\",\"task\":\"vector-only\","
-      "\"route_profile\":\"vector-only\",\"storage_profile\":\"turbovec_direct\","
-      "\"vector_dim\":8,\"bit_width\":4,\"ann\":{\"algorithm\":\"hnsw\"}}";
+      "{\"index_id\":\"ann-bad\",\"vector_dim\":8,\"bit_width\":4,"
+      "\"ann\":{\"algorithm\":\"hnsw\"}}";
   assert(lodedb_engine_create_index_json(engine, sv(ann_bad_json), &error) ==
          LODE_INVALID_ARGUMENT);
   lodedb_error_free(error);
