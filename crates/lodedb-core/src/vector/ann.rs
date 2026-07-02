@@ -2,9 +2,14 @@
 //!
 //! This is the candidate-generation half of the opt-in ANN path. It partitions
 //! the corpus into clusters with a deterministic k-means and, at query time,
-//! returns the chunk ids in the `nprobe` nearest clusters. The exact TurboVec
+//! returns the stable ids in the `nprobe` nearest clusters. The exact TurboVec
 //! scan re-scores those candidates and remains the authority, so this layer only
 //! affects *which* rows are scored (recall/latency), never the scores themselves.
+//!
+//! Postings are the TurboVec stable u64 ids, resolved once at build/adoption, so
+//! the query path hands them straight to the exact scan's allowlist with no
+//! per-candidate string clone, sort, or corpus-map lookup. The chunk-id strings
+//! live only in the `.tvann` sidecar, mapped back from stable ids at persist time.
 //!
 //! Everything here is deterministic: no clocks, no RNG (`unsafe_code = forbid`
 //! and no `rand` dependency), fixed iteration counts, and stable-order tie
@@ -21,15 +26,19 @@ use std::cmp::Ordering;
 /// unchanged-assignment early exit) is plenty and keeps the build deterministic.
 const MAX_ITERS: usize = 10;
 
+/// One clustering entry: the chunk id (for deterministic ordering and to map the
+/// persisted string postings), its stable TurboVec id (what the postings store),
+/// and its vector in centroid (rotated) space.
+pub type ClusterEntry<'a> = (&'a str, u64, &'a [f32]);
+
 /// A deterministic cluster partition of the corpus for candidate generation.
 #[derive(Debug)]
 pub struct ClusterIndex {
     dim: usize,
     /// Row-major `num_clusters * dim` centroids, aligned with `postings`.
     centroids: Vec<f32>,
-    /// Sorted chunk ids per cluster; every chunk id appears in exactly one.
-    postings: Vec<Vec<String>>,
-    num_vectors: usize,
+    /// Stable ids per cluster, chunk-id ordered; every id appears in exactly one.
+    postings: Vec<Vec<u64>>,
     /// Row-major `dim * dim` rotation matching the centroid space, or `None`
     /// when the rows are already in raw space. A raw query is rotated by this
     /// before scoring centroids so it shares the centroids' coordinate space.
@@ -37,15 +46,16 @@ pub struct ClusterIndex {
 }
 
 impl ClusterIndex {
-    /// Builds a cluster index from `(chunk_id, vector)` entries.
+    /// Builds a cluster index from `(chunk_id, stable_id, vector)` entries.
     ///
     /// `entries` must be in a deterministic order (the caller sorts by chunk id)
     /// and every vector must have length `dim`, in the same (rotated) space as
     /// `rotation` maps a query into. `requested_k` is the desired cluster count,
     /// clamped to `[1, entries.len()]`. Empty clusters are dropped, so
-    /// `num_clusters()` counts only clusters that own at least one chunk.
+    /// `num_clusters()` counts only clusters that own at least one chunk. Postings
+    /// hold the entries' stable ids, chunk-id ordered within each cluster.
     pub fn build(
-        entries: &[(&str, &[f32])],
+        entries: &[ClusterEntry<'_>],
         dim: usize,
         requested_k: usize,
         rotation: Option<Vec<f32>>,
@@ -64,7 +74,7 @@ impl ClusterIndex {
         seeds.push(0);
         seeded[0] = true;
         let mut nearest = vec![f32::NEG_INFINITY; n];
-        update_nearest(&mut nearest, entries, entries[0].1);
+        update_nearest(&mut nearest, entries, entries[0].2);
         while seeds.len() < k {
             let mut pick: Option<usize> = None;
             let mut pick_similarity = f32::INFINITY;
@@ -83,13 +93,13 @@ impl ClusterIndex {
             };
             seeds.push(pick);
             seeded[pick] = true;
-            update_nearest(&mut nearest, entries, entries[pick].1);
+            update_nearest(&mut nearest, entries, entries[pick].2);
         }
 
         let cluster_count = seeds.len();
         let mut centroids = vec![0.0f32; cluster_count * dim];
         for (cluster, &row) in seeds.iter().enumerate() {
-            centroids[cluster * dim..(cluster + 1) * dim].copy_from_slice(entries[row].1);
+            centroids[cluster * dim..(cluster + 1) * dim].copy_from_slice(entries[row].2);
         }
 
         // Lloyd iterations: assign by max dot product, update centroids to the
@@ -99,7 +109,7 @@ impl ClusterIndex {
         for _ in 0..MAX_ITERS {
             let mut changed = false;
             for (i, entry) in entries.iter().enumerate() {
-                let cluster = nearest_centroid(entry.1, &centroids, cluster_count, dim);
+                let cluster = nearest_centroid(entry.2, &centroids, cluster_count, dim);
                 if cluster != assignment[i] {
                     assignment[i] = cluster;
                     changed = true;
@@ -108,45 +118,24 @@ impl ClusterIndex {
             if !changed {
                 break;
             }
-            let mut sums = vec![0.0f64; cluster_count * dim];
-            let mut counts = vec![0usize; cluster_count];
-            for (i, entry) in entries.iter().enumerate() {
-                let cluster = assignment[i];
-                counts[cluster] += 1;
-                let base = cluster * dim;
-                for (offset, &value) in entry.1.iter().enumerate() {
-                    sums[base + offset] += value as f64;
-                }
-            }
-            for (cluster, &count) in counts.iter().enumerate() {
-                if count == 0 {
-                    // Keep the prior centroid; the cluster may simply be empty
-                    // this round and is dropped below if it stays empty.
-                    continue;
-                }
-                let base = cluster * dim;
-                let divisor = count as f64;
-                for offset in 0..dim {
-                    centroids[base + offset] = (sums[base + offset] / divisor) as f32;
-                }
-            }
+            recompute_centroids(&mut centroids, entries, &assignment, cluster_count, dim);
         }
 
         // Materialize postings and drop empty clusters. An empty cluster owns no
         // chunks, so probing it can only waste a probe slot; dropping it keeps
-        // `centroids`/`postings` aligned and every probe productive.
-        let mut members: Vec<Vec<String>> = vec![Vec::new(); cluster_count];
+        // `centroids`/`postings` aligned and every probe productive. Entries are
+        // already chunk-id ordered, so appending in entry order keeps each cluster
+        // chunk-id ordered without a re-sort.
+        let mut members: Vec<Vec<u64>> = vec![Vec::new(); cluster_count];
         for (i, entry) in entries.iter().enumerate() {
-            members[assignment[i]].push(entry.0.to_string());
+            members[assignment[i]].push(entry.1);
         }
         let mut kept_centroids = Vec::new();
         let mut postings = Vec::new();
-        for cluster in 0..cluster_count {
-            if members[cluster].is_empty() {
+        for (cluster, ids) in members.into_iter().enumerate() {
+            if ids.is_empty() {
                 continue;
             }
-            let mut ids = std::mem::take(&mut members[cluster]);
-            ids.sort();
             kept_centroids.extend_from_slice(&centroids[cluster * dim..(cluster + 1) * dim]);
             postings.push(ids);
         }
@@ -155,7 +144,6 @@ impl ClusterIndex {
             dim,
             centroids: kept_centroids,
             postings,
-            num_vectors: n,
             rotation,
         }
     }
@@ -165,9 +153,10 @@ impl ClusterIndex {
         self.postings.len()
     }
 
-    /// Number of chunks the index was built over.
+    /// Number of chunks the index was built over, derived from the postings
+    /// (disjoint by invariant, so the sum of their lengths is the corpus size).
     pub fn num_vectors(&self) -> usize {
-        self.num_vectors
+        self.postings.iter().map(Vec::len).sum()
     }
 
     /// Centroid space dimension.
@@ -175,25 +164,27 @@ impl ClusterIndex {
         self.dim
     }
 
-    /// Sorted chunk ids per cluster, for persistence (centroids are not persisted;
-    /// they are recomputed from these plus the reconstructed vectors on load).
-    pub fn postings(&self) -> &[Vec<String>] {
+    /// Stable ids per cluster, for persistence. The caller maps these back to
+    /// chunk-id strings for the `.tvann` sidecar; centroids are not persisted,
+    /// they are recomputed from these plus the reconstructed vectors on load.
+    pub fn postings(&self) -> &[Vec<u64>] {
         &self.postings
     }
 
     /// Reassembles a cluster index from a persisted assignment, skipping k-means.
     ///
     /// `postings` is the persisted per-cluster chunk-id membership; `entries` is
-    /// the live `(chunk_id, vector)` set (rotated space), sorted by chunk id as
-    /// [`build`](Self::build) requires. Centroids are recomputed as the per-cluster
-    /// means in entry order, so the result is bit-identical to a fresh `build`
-    /// (k-means' final centroids are exactly the means of the final assignment).
-    /// `rotation` is the live TurboVec rotation, re-derived on load rather than
-    /// persisted. Returns `None` when the persisted assignment does not exactly
-    /// cover the live entries (stale sidecar) or is malformed, so the caller
+    /// the live `(chunk_id, stable_id, vector)` set (rotated space), sorted by
+    /// chunk id as [`build`](Self::build) requires. Centroids are recomputed as the
+    /// per-cluster means in entry order, so the result is bit-identical to a fresh
+    /// `build` (k-means' final centroids are exactly the means of the final
+    /// assignment), and the stable-id postings are grouped from the live entries by
+    /// that assignment. `rotation` is the live TurboVec rotation, re-derived on load
+    /// rather than persisted. Returns `None` when the persisted assignment does not
+    /// exactly cover the live entries (stale sidecar) or is malformed, so the caller
     /// rebuilds instead.
     pub fn from_assignment(
-        entries: &[(&str, &[f32])],
+        entries: &[ClusterEntry<'_>],
         dim: usize,
         postings: Vec<Vec<String>>,
         rotation: Option<Vec<f32>>,
@@ -201,7 +192,10 @@ impl ClusterIndex {
         if dim == 0 || postings.is_empty() {
             return None;
         }
-        if rotation.as_ref().is_some_and(|matrix| matrix.len() != dim * dim) {
+        if rotation
+            .as_ref()
+            .is_some_and(|matrix| matrix.len() != dim * dim)
+        {
             return None;
         }
         let posting_total: usize = postings.iter().map(Vec::len).sum();
@@ -210,68 +204,68 @@ impl ClusterIndex {
         if posting_total != entries.len() {
             return None;
         }
-        let centroids = {
-            let cluster_count = postings.len();
-            let mut cluster_of: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::with_capacity(posting_total);
-            for (cluster, ids) in postings.iter().enumerate() {
-                for id in ids {
-                    if cluster_of.insert(id.as_str(), cluster).is_some() {
-                        return None; // a chunk id in two clusters: corrupt
-                    }
+        let cluster_count = postings.len();
+        let mut cluster_of: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(posting_total);
+        for (cluster, ids) in postings.iter().enumerate() {
+            for id in ids {
+                if cluster_of.insert(id.as_str(), cluster).is_some() {
+                    return None; // a chunk id in two clusters: corrupt
                 }
             }
-            let mut sums = vec![0.0f64; cluster_count * dim];
-            let mut counts = vec![0usize; cluster_count];
-            for entry in entries {
-                if entry.1.len() != dim {
-                    return None;
-                }
-                let cluster = *cluster_of.get(entry.0)?; // an unmapped live entry: stale
-                counts[cluster] += 1;
-                let base = cluster * dim;
-                for (offset, &value) in entry.1.iter().enumerate() {
-                    sums[base + offset] += value as f64;
-                }
+        }
+        // Group the live stable ids by the persisted assignment and accumulate the
+        // centroid means in one pass. Entries are chunk-id ordered, so each cluster
+        // posting comes out chunk-id ordered, matching a fresh build.
+        let mut sums = vec![0.0f64; cluster_count * dim];
+        let mut stable_postings: Vec<Vec<u64>> = vec![Vec::new(); cluster_count];
+        for entry in entries {
+            if entry.2.len() != dim {
+                return None;
             }
-            let mut centroids = vec![0.0f32; cluster_count * dim];
-            for (cluster, &count) in counts.iter().enumerate() {
-                if count == 0 {
-                    return None; // a persisted cluster with no live members
-                }
-                let base = cluster * dim;
-                let divisor = count as f64;
-                for offset in 0..dim {
-                    centroids[base + offset] = (sums[base + offset] / divisor) as f32;
-                }
+            let cluster = *cluster_of.get(entry.0)?; // an unmapped live entry: stale
+            stable_postings[cluster].push(entry.1);
+            let base = cluster * dim;
+            for (offset, &value) in entry.2.iter().enumerate() {
+                sums[base + offset] += value as f64;
             }
-            centroids
-        };
+        }
+        let mut centroids = vec![0.0f32; cluster_count * dim];
+        for (cluster, ids) in stable_postings.iter().enumerate() {
+            if ids.is_empty() {
+                return None; // a persisted cluster with no live members
+            }
+            let base = cluster * dim;
+            let divisor = ids.len() as f64;
+            for offset in 0..dim {
+                centroids[base + offset] = (sums[base + offset] / divisor) as f32;
+            }
+        }
         Some(Self {
             dim,
             centroids,
-            postings,
-            num_vectors: posting_total,
+            postings: stable_postings,
             rotation,
         })
     }
 
-    /// Returns candidate chunk ids for a raw query.
+    /// Returns candidate stable ids for a raw query.
     ///
-    /// `raw_query` is in the pre-rotation space; this rotates it into the
-    /// centroid space itself. It probes the `nprobe` nearest clusters (ranked by
-    /// dot product to their centroid, ties broken by cluster index) and then
-    /// keeps taking the next-nearest cluster until the candidate set holds at
-    /// least `min_candidates` chunks or every cluster has been probed. Expanding
-    /// to `min_candidates` (the caller passes `top_k`) prevents returning fewer
-    /// than the requested results when the nearest clusters are small. The result
-    /// is sorted and deduplicated (each chunk lives in exactly one cluster).
-    pub fn candidate_chunk_ids(
+    /// `raw_query` is in the pre-rotation space; this rotates it into the centroid
+    /// space itself. It probes the `nprobe` nearest clusters (ranked by dot product
+    /// to their centroid, ties broken by cluster index) and then keeps taking the
+    /// next-nearest cluster until the candidate set holds at least `min_candidates`
+    /// ids or every cluster has been probed. Expanding to `min_candidates` (the
+    /// caller passes `top_k`) prevents returning fewer than the requested results
+    /// when the nearest clusters are small. The result needs no sort or dedup: the
+    /// exact scan's allowlist is an order-insensitive set mask and every stable id
+    /// lives in exactly one cluster.
+    pub fn candidate_stable_ids(
         &self,
         raw_query: &[f32],
         nprobe: usize,
         min_candidates: usize,
-    ) -> Vec<String> {
+    ) -> Vec<u64> {
         let cluster_count = self.num_clusters();
         if cluster_count == 0 {
             return Vec::new();
@@ -301,10 +295,41 @@ impl ClusterIndex {
             if rank >= nprobe && candidates.len() >= min_candidates {
                 break;
             }
-            candidates.extend(self.postings[cluster].iter().cloned());
+            candidates.extend_from_slice(&self.postings[cluster]);
         }
-        candidates.sort();
         candidates
+    }
+}
+
+/// Recomputes every centroid as the f64 mean of its assigned members, in entry
+/// order so the build stays bit-reproducible. Empty clusters keep their prior
+/// centroid (they are dropped later if they stay empty).
+fn recompute_centroids(
+    centroids: &mut [f32],
+    entries: &[ClusterEntry<'_>],
+    assignment: &[usize],
+    cluster_count: usize,
+    dim: usize,
+) {
+    let mut sums = vec![0.0f64; cluster_count * dim];
+    let mut counts = vec![0usize; cluster_count];
+    for (i, entry) in entries.iter().enumerate() {
+        let cluster = assignment[i];
+        counts[cluster] += 1;
+        let base = cluster * dim;
+        for (offset, &value) in entry.2.iter().enumerate() {
+            sums[base + offset] += value as f64;
+        }
+    }
+    for (cluster, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let base = cluster * dim;
+        let divisor = count as f64;
+        for offset in 0..dim {
+            centroids[base + offset] = (sums[base + offset] / divisor) as f32;
+        }
     }
 }
 
@@ -344,9 +369,9 @@ fn nearest_centroid(vector: &[f32], centroids: &[f32], cluster_count: usize, dim
     best
 }
 
-fn update_nearest(nearest: &mut [f32], entries: &[(&str, &[f32])], centroid: &[f32]) {
+fn update_nearest(nearest: &mut [f32], entries: &[ClusterEntry<'_>], centroid: &[f32]) {
     for (slot, entry) in nearest.iter_mut().zip(entries) {
-        let similarity = dot(entry.1, centroid);
+        let similarity = dot(entry.2, centroid);
         if similarity > *slot {
             *slot = similarity;
         }
@@ -355,16 +380,41 @@ fn update_nearest(nearest: &mut [f32], entries: &[(&str, &[f32])], centroid: &[f
 
 #[cfg(test)]
 mod tests {
-    use super::ClusterIndex;
+    use super::{ClusterEntry, ClusterIndex};
+    use std::collections::HashMap;
 
-    /// Builds entries from owned rows for a test corpus.
-    fn entries(rows: &[(String, Vec<f32>)]) -> Vec<(&str, &[f32])> {
-        let mut refs: Vec<(&str, &[f32])> = rows
-            .iter()
-            .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+    /// Assigns each row a stable id (its 1-based position in the sorted set) and
+    /// returns chunk-id-sorted entries plus the id->chunk-id reverse map so tests
+    /// can assert on chunk ids while the index works in stable-id space.
+    fn entries(
+        rows: &[(String, Vec<f32>)],
+    ) -> (Vec<(String, u64, Vec<f32>)>, HashMap<u64, String>) {
+        let mut sorted: Vec<(String, Vec<f32>)> = rows.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut reverse = HashMap::new();
+        let owned: Vec<(String, u64, Vec<f32>)> = sorted
+            .into_iter()
+            .enumerate()
+            .map(|(position, (id, vector))| {
+                let stable_id = position as u64 + 1;
+                reverse.insert(stable_id, id.clone());
+                (id, stable_id, vector)
+            })
             .collect();
-        refs.sort_by(|a, b| a.0.cmp(b.0));
-        refs
+        (owned, reverse)
+    }
+
+    fn refs<'a>(owned: &'a [(String, u64, Vec<f32>)]) -> Vec<ClusterEntry<'a>> {
+        owned
+            .iter()
+            .map(|(id, stable_id, vector)| (id.as_str(), *stable_id, vector.as_slice()))
+            .collect()
+    }
+
+    fn chunk_ids(ids: &[u64], reverse: &HashMap<u64, String>) -> Vec<String> {
+        let mut resolved: Vec<String> = ids.iter().map(|id| reverse[id].clone()).collect();
+        resolved.sort();
+        resolved
     }
 
     #[test]
@@ -376,10 +426,10 @@ mod tests {
             rows.push((format!("a{i}"), vec![1.0, 0.02 * i as f32]));
             rows.push((format!("b{i}"), vec![-1.0, 0.02 * i as f32]));
         }
-        let refs = entries(&rows);
-        let index = ClusterIndex::build(&refs, 2, 2, None);
+        let (owned, reverse) = entries(&rows);
+        let index = ClusterIndex::build(&refs(&owned), 2, 2, None);
         assert_eq!(index.num_clusters(), 2);
-        let hits = index.candidate_chunk_ids(&[1.0, 0.0], 1, 1);
+        let hits = chunk_ids(&index.candidate_stable_ids(&[1.0, 0.0], 1, 1), &reverse);
         assert!(hits.iter().all(|id| id.starts_with('a')));
         assert_eq!(hits.len(), 6);
     }
@@ -389,10 +439,12 @@ mod tests {
         let rows: Vec<(String, Vec<f32>)> = (0..20)
             .map(|i| (format!("c{i:02}"), vec![(i as f32).cos(), (i as f32).sin()]))
             .collect();
-        let refs = entries(&rows);
-        let index = ClusterIndex::build(&refs, 2, 4, None);
-        let mut all = index.candidate_chunk_ids(&[1.0, 0.0], index.num_clusters(), 0);
-        all.sort();
+        let (owned, reverse) = entries(&rows);
+        let index = ClusterIndex::build(&refs(&owned), 2, 4, None);
+        let all = chunk_ids(
+            &index.candidate_stable_ids(&[1.0, 0.0], index.num_clusters(), 0),
+            &reverse,
+        );
         let mut expected: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
         expected.sort();
         assert_eq!(all, expected);
@@ -407,10 +459,10 @@ mod tests {
             rows.push((format!("a{i}"), vec![1.0, 0.01 * i as f32]));
             rows.push((format!("b{i}"), vec![-1.0, 0.01 * i as f32]));
         }
-        let refs = entries(&rows);
-        let index = ClusterIndex::build(&refs, 2, 2, None);
-        assert_eq!(index.candidate_chunk_ids(&[1.0, 0.0], 1, 1).len(), 6);
-        assert_eq!(index.candidate_chunk_ids(&[1.0, 0.0], 1, 10).len(), 12);
+        let (owned, _reverse) = entries(&rows);
+        let index = ClusterIndex::build(&refs(&owned), 2, 2, None);
+        assert_eq!(index.candidate_stable_ids(&[1.0, 0.0], 1, 1).len(), 6);
+        assert_eq!(index.candidate_stable_ids(&[1.0, 0.0], 1, 10).len(), 12);
     }
 
     #[test]
@@ -422,12 +474,13 @@ mod tests {
                 (format!("c{i:02}"), vec![a, b, 1.0])
             })
             .collect();
-        let first = ClusterIndex::build(&entries(&rows), 3, 5, None);
-        let second = ClusterIndex::build(&entries(&rows), 3, 5, None);
+        let (owned, _reverse) = entries(&rows);
+        let first = ClusterIndex::build(&refs(&owned), 3, 5, None);
+        let second = ClusterIndex::build(&refs(&owned), 3, 5, None);
         let query = [2.0, 3.0, 1.0];
         assert_eq!(
-            first.candidate_chunk_ids(&query, 2, 1),
-            second.candidate_chunk_ids(&query, 2, 1)
+            first.candidate_stable_ids(&query, 2, 1),
+            second.candidate_stable_ids(&query, 2, 1)
         );
     }
 
@@ -439,12 +492,12 @@ mod tests {
             ("hi".to_string(), vec![0.0f32, 1.0]),
             ("lo".to_string(), vec![0.0f32, -1.0]),
         ];
-        let refs = entries(&rows);
+        let (owned, reverse) = entries(&rows);
         // Swap matrix: out[0]=in[1], out[1]=in[0].
         let swap = vec![0.0f32, 1.0, 1.0, 0.0];
-        let index = ClusterIndex::build(&refs, 2, 2, Some(swap));
+        let index = ClusterIndex::build(&refs(&owned), 2, 2, Some(swap));
         // Raw query [1,0] rotates to [0,1], which matches the "hi" row.
-        let hits = index.candidate_chunk_ids(&[1.0, 0.0], 1, 1);
+        let hits = chunk_ids(&index.candidate_stable_ids(&[1.0, 0.0], 1, 1), &reverse);
         assert_eq!(hits, vec!["hi"]);
     }
 
@@ -460,8 +513,8 @@ mod tests {
             ("d".to_string(), vec![-1.0, 0.0]),
             ("e".to_string(), vec![-1.0, 0.1]),
         ];
-        let refs = entries(&rows);
-        let index = ClusterIndex::build(&refs, 2, 2, None);
+        let (owned, _reverse) = entries(&rows);
+        let index = ClusterIndex::build(&refs(&owned), 2, 2, None);
         assert_eq!(index.num_clusters(), 2);
     }
 
@@ -469,7 +522,8 @@ mod tests {
     fn from_assignment_reproduces_build_and_rejects_stale() {
         // Build, then reassemble from the built postings + the same entries: the
         // reloaded index must yield identical candidates (centroids recomputed
-        // from the assignment equal the k-means centroids).
+        // from the assignment equal the k-means centroids). The persisted form is
+        // chunk-id strings, so map the built stable-id postings back first.
         let rows: Vec<(String, Vec<f32>)> = (0..24)
             .map(|i| {
                 let a = (i * 3 % 7) as f32;
@@ -477,20 +531,28 @@ mod tests {
                 (format!("c{i:02}"), vec![a, b, 1.0])
             })
             .collect();
-        let refs = entries(&rows);
-        let built = ClusterIndex::build(&refs, 3, 4, None);
-        let postings: Vec<Vec<String>> = built.postings().to_vec();
-        let reloaded = ClusterIndex::from_assignment(&refs, 3, postings.clone(), None).unwrap();
+        let (owned, reverse) = entries(&rows);
+        let built = ClusterIndex::build(&refs(&owned), 3, 4, None);
+        let string_postings: Vec<Vec<String>> = built
+            .postings()
+            .iter()
+            .map(|cluster| cluster.iter().map(|id| reverse[id].clone()).collect())
+            .collect();
+        let reloaded =
+            ClusterIndex::from_assignment(&refs(&owned), 3, string_postings.clone(), None).unwrap();
         let query = [2.0, 3.0, 1.0];
         assert_eq!(
-            built.candidate_chunk_ids(&query, 2, 1),
-            reloaded.candidate_chunk_ids(&query, 2, 1)
+            built.candidate_stable_ids(&query, 2, 1),
+            reloaded.candidate_stable_ids(&query, 2, 1)
         );
         // A live entry missing from the persisted assignment (a vector added since
         // the sidecar was written) is rejected so the caller rebuilds.
         let mut extra = rows.clone();
         extra.push(("c99".to_string(), vec![1.0, 1.0, 1.0]));
-        assert!(ClusterIndex::from_assignment(&entries(&extra), 3, postings, None).is_none());
+        let (extra_owned, _extra_reverse) = entries(&extra);
+        assert!(
+            ClusterIndex::from_assignment(&refs(&extra_owned), 3, string_postings, None).is_none()
+        );
     }
 
     #[test]
@@ -498,12 +560,14 @@ mod tests {
         let rows: Vec<(String, Vec<f32>)> = (0..3)
             .map(|i| (format!("same{i}"), vec![0.5, 0.5]))
             .collect();
-        let refs = entries(&rows);
+        let (owned, reverse) = entries(&rows);
         // Request more clusters than rows, with all-identical vectors.
-        let index = ClusterIndex::build(&refs, 2, 8, None);
+        let index = ClusterIndex::build(&refs(&owned), 2, 8, None);
         assert!(index.num_clusters() >= 1 && index.num_clusters() <= 3);
-        let mut hits = index.candidate_chunk_ids(&[0.5, 0.5], index.num_clusters(), 0);
-        hits.sort();
+        let hits = chunk_ids(
+            &index.candidate_stable_ids(&[0.5, 0.5], index.num_clusters(), 0),
+            &reverse,
+        );
         assert_eq!(hits, vec!["same0", "same1", "same2"]);
     }
 }

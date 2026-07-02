@@ -22,7 +22,7 @@ use crate::types::{
     CoreOpenOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument, VectorBatchArrays,
 };
 use crate::vector::ann::ClusterIndex;
-use crate::vector::index::CoreVectorChunk;
+use crate::vector::index::{CoreVectorChunk, VectorSearchHit};
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 use crate::vector::turbovec::TurboVecNativeIndex;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
@@ -1932,7 +1932,7 @@ impl CoreEngine {
                         // in place.
                         let base_generation = loaded.generation;
                         let index =
-                            index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
+                            index_from_loaded_store(loaded, persistence_chunk_character_limit)?;
                         let index_id = index.index_id.clone();
                         self.indexes.insert(index_id.clone(), index);
                         self.replaying_wal = true;
@@ -1972,7 +1972,7 @@ impl CoreEngine {
                     }
                 }
             }
-            let index = index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
+            let index = index_from_loaded_store(loaded, persistence_chunk_character_limit)?;
             self.indexes.insert(index.index_id.clone(), index);
         }
         Ok(())
@@ -2502,7 +2502,7 @@ impl CoreAppender {
 }
 
 fn index_from_loaded_store(
-    loaded: &crate::storage::LoadedStore,
+    loaded: crate::storage::LoadedStore,
     chunk_character_limit: usize,
 ) -> Result<VectorOnlyIndex, CoreError> {
     let state = loaded
@@ -2541,7 +2541,7 @@ fn index_from_loaded_store(
         .cloned()
         .unwrap_or_default();
     let mut documents = BTreeMap::new();
-    let chunk_vectors = reconstruct_tvim_vectors(loaded, vector_dim)?;
+    let chunk_vectors = reconstruct_tvim_vectors(&loaded, vector_dim)?;
     let vectors_seeded = loaded.chunk_count() == 0 || chunk_vectors.is_some();
     let (chunk_vectors, query_rotation) = chunk_vectors
         .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
@@ -2698,7 +2698,7 @@ fn index_from_loaded_store(
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
     // first ANN query rebuilds it. This skips the k-means rebuild after a clean
     // reopen without ever trusting a stale sidecar.
-    index.install_persisted_ann(loaded.ann.as_ref(), base_calibration_fingerprint);
+    index.install_persisted_ann(loaded.ann, base_calibration_fingerprint);
     Ok(index)
 }
 
@@ -3225,29 +3225,29 @@ fn write_index_base(
     // built the index this session. A cold cache is deliberately not built here:
     // forcing the full k-means inside every base commit would stall ingest-only
     // workloads (each mutation empties the cache), and a missing sidecar is just
-    // the documented lazy first-query build after reopen. The borrow is held
-    // across the commit so the postings are written without a copy. A probe-all
-    // or too-small configuration writes no `.tvann`.
+    // the documented lazy first-query build after reopen. The resident postings
+    // are stable ids; they are mapped back to chunk-id strings for the sidecar
+    // (the payload boundary the other sidecars hold to). A probe-all or too-small
+    // configuration writes no `.tvann`.
     let persist_ann = index.ann_prunes() && tvim_base.is_some();
-    let ann_guard = index.cluster_index.borrow();
-    let ann = if persist_ann {
-        ann_guard
-            .as_ref()
-            .filter(|cluster| cluster.num_clusters() > 1)
-            .map(|cluster| crate::storage::tvann_store::AnnBaseInput {
-                algorithm: index
-                    .ann_options
-                    .as_ref()
-                    .map_or("cluster", |options| options.algorithm.as_str()),
-                dim: cluster.dim(),
-                calibration_fingerprint: tvim_base
-                    .as_ref()
-                    .map_or(0, |tvim| tvim.calibration_fingerprint),
-                postings: cluster.postings(),
-            })
+    let ann_postings = if persist_ann {
+        index.ann_persisted_postings()?
     } else {
         None
     };
+    let ann = ann_postings
+        .as_ref()
+        .map(|postings| crate::storage::tvann_store::AnnBaseInput {
+            algorithm: index
+                .ann_options
+                .as_ref()
+                .map_or("cluster", |options| options.algorithm.as_str()),
+            dim: index.vector_dim,
+            calibration_fingerprint: tvim_base
+                .as_ref()
+                .map_or(0, |tvim| tvim.calibration_fingerprint),
+            postings,
+        });
     crate::storage::write_generation_commit(
         dir,
         crate::storage::GenerationCommitInput {
@@ -3500,6 +3500,37 @@ fn document_resource_payload(document_id: &str, record: &DocumentRecord) -> Valu
         "chunk_count": record.chunks.len(),
         "content_hash": record.content_hash.clone(),
     })
+}
+
+/// Live rows reconstructed for clustering: chunk ids, aligned stable ids, and
+/// row-major vectors in the scan's rotated space, ordered by chunk id, plus the
+/// TurboVec rotation. Owns its buffers so [`ClusterSource::entries`] can hand out
+/// borrowed slices for either a fresh build or a persisted adoption.
+struct ClusterSource {
+    chunk_ids: Vec<String>,
+    stable_ids: Vec<u64>,
+    rows: Vec<f32>,
+    dim: usize,
+    rotation: Option<Vec<f32>>,
+}
+
+impl ClusterSource {
+    fn len(&self) -> usize {
+        self.chunk_ids.len()
+    }
+
+    /// Borrowed `(chunk_id, stable_id, vector)` entries in chunk-id order.
+    fn entries(&self) -> Vec<crate::vector::ann::ClusterEntry<'_>> {
+        (0..self.chunk_ids.len())
+            .map(|i| {
+                (
+                    self.chunk_ids[i].as_str(),
+                    self.stable_ids[i],
+                    &self.rows[i * self.dim..(i + 1) * self.dim],
+                )
+            })
+            .collect()
+    }
 }
 
 struct VectorOnlyIndex {
@@ -3856,19 +3887,31 @@ impl VectorOnlyIndex {
         // filtered query is already bounded by its allowlist and takes the exact
         // path. The `ann_prunes` gate is config-only (no cluster build), so a
         // probe-all or too-small configuration stays exact without paying to
-        // build a cluster index. When ANN produces candidates they replace the
-        // (empty) unfiltered allowlist; the exact scan re-scores them and stays
-        // the authority, so a fall-back to `None` simply runs the full exact scan.
-        let ann_allowlist = if filter.is_none() && self.ann_prunes() {
-            self.ann_candidate_chunk_ids(query_vector, top_k)?
+        // build a cluster index. When ANN produces candidates they are stable ids
+        // fed straight to the allowlisted scan; the exact scan re-scores them and
+        // stays the authority, so a fall-back to `None` runs the full exact scan.
+        let ann_allowlist = if self.ann_should_prune(filter) {
+            self.ann_candidate_stable_ids(query_vector, top_k)?
         } else {
             None
         };
-        let effective_allowlist = ann_allowlist.as_deref().unwrap_or(allowlist.as_slice());
         let index = self.turbovec_index()?;
-        let hits = index
-            .search(query_vector, top_k, effective_allowlist)?
-            .into_iter()
+        let raw_hits = match &ann_allowlist {
+            Some(stable_ids) => {
+                index.search_with_stable_allowlist(query_vector, top_k, stable_ids)?
+            }
+            None => index.search(query_vector, top_k, &allowlist)?,
+        };
+        Ok(CoreSearchResults {
+            hits: self.assemble_vector_hits(raw_hits),
+            total_considered,
+        })
+    }
+
+    /// Maps raw TurboVec hits to search hits, attaching each document's metadata
+    /// and dropping any hit whose document is no longer resident.
+    fn assemble_vector_hits(&self, hits: Vec<VectorSearchHit>) -> Vec<CoreSearchHit> {
+        hits.into_iter()
             .filter_map(|hit| {
                 self.documents
                     .get(&hit.document_id)
@@ -3879,28 +3922,25 @@ impl VectorOnlyIndex {
                         metadata: record.metadata.clone(),
                     })
             })
-            .collect();
-        Ok(CoreSearchResults {
-            hits,
-            total_considered,
-        })
+            .collect()
     }
 
-    /// ANN candidate chunk ids for an unfiltered query, or `None` to fall back to
+    /// ANN candidate stable ids for an unfiltered query, or `None` to fall back to
     /// the exact full scan.
     ///
     /// Returns `None` (exact scan) when ANN is disabled, the corpus is too small
     /// to cluster, the configuration probes every cluster (which would reproduce
     /// the exact result anyway), or the candidate set covers at least half the
-    /// corpus (pruning would buy little). Otherwise returns the chunk ids in the
-    /// probed clusters, expanded until they can satisfy `top_k`. The candidates
-    /// are re-scored exactly by the caller, so this only affects which rows are
-    /// scored, never the scores.
-    fn ann_candidate_chunk_ids(
+    /// corpus (pruning would buy little). Otherwise returns the TurboVec stable ids
+    /// in the probed clusters, expanded until they can satisfy `top_k`. The stable
+    /// ids feed the exact scan's allowlist directly (no chunk-id resolution), and
+    /// the candidates are re-scored exactly by the caller, so this only affects
+    /// which rows are scored, never the scores.
+    fn ann_candidate_stable_ids(
         &self,
         query_vector: &[f32],
         top_k: usize,
-    ) -> Result<Option<Vec<String>>, CoreError> {
+    ) -> Result<Option<Vec<u64>>, CoreError> {
         if self.ann_options.is_none() {
             return Ok(None);
         }
@@ -3924,7 +3964,7 @@ impl VectorOnlyIndex {
         // expands the probe set until it holds at least `top_k` chunks, so a
         // query never returns fewer hits than requested when the corpus has them.
         // The raw query is also what reaches `search`, which rotates internally.
-        let candidates = cluster.candidate_chunk_ids(query_vector, nprobe, top_k);
+        let candidates = cluster.candidate_stable_ids(query_vector, nprobe, top_k);
         // An empty or corpus-spanning candidate set is not worth pruning, so fall
         // back to the exact scan (which also satisfies `top_k`).
         if candidates.is_empty() || candidates.len() * 2 >= cluster.num_vectors() {
@@ -3945,30 +3985,57 @@ impl VectorOnlyIndex {
         if self.ann_options.is_none() || self.cluster_index.borrow().is_some() {
             return Ok(());
         }
-        // Reconstruct the canonical rows (and their rotation) from the live index,
-        // dropping the borrow before building so it never overlaps the
-        // cluster-index borrow.
-        let (chunk_ids, rows, rotation) = {
+        let Some(source) = self.cluster_source_rows()? else {
+            return Ok(());
+        };
+        let clusters = self.ann_cluster_count(source.len());
+        let built = ClusterIndex::build(
+            &source.entries(),
+            self.vector_dim,
+            clusters,
+            source.rotation.clone(),
+        );
+        *self.cluster_index.borrow_mut() = Some(built);
+        Ok(())
+    }
+
+    /// Reconstructs the live rows for clustering: chunk ids, aligned stable ids,
+    /// and row-major vectors in the scan's rotated space, all ordered by chunk id,
+    /// plus the TurboVec rotation. `None` when fewer than two rows exist (too small
+    /// to form more than one cluster). Shared by the lazy build and the persisted
+    /// adoption so both cluster over the same rows in the same space.
+    fn cluster_source_rows(&self) -> Result<Option<ClusterSource>, CoreError> {
+        // Reconstruct from the live index (dropping its borrow before returning so
+        // it never overlaps the cluster-index borrow the caller takes).
+        let (chunk_ids, stable_ids, rows, rotation) = {
             let index = self.turbovec_index()?;
-            let (chunk_ids, rows) = index.reconstruct_all_chunks();
-            (chunk_ids, rows, index.rotation_matrix())
+            let (chunk_ids, stable_ids, rows) = index.reconstruct_all_chunks();
+            (chunk_ids, stable_ids, rows, index.rotation_matrix())
         };
         let count = chunk_ids.len();
         if count < 2 {
-            return Ok(());
+            return Ok(None);
         }
         let dim = self.vector_dim;
-        // Order entries by chunk id for a deterministic clustering.
+        // Order by chunk id for a deterministic clustering, materializing the rows
+        // in that order so an entry can borrow a contiguous slice.
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by(|&left, &right| chunk_ids[left].cmp(&chunk_ids[right]));
-        let entries: Vec<(&str, &[f32])> = order
-            .iter()
-            .map(|&i| (chunk_ids[i].as_str(), &rows[i * dim..(i + 1) * dim]))
-            .collect();
-        let clusters = self.ann_cluster_count(count);
-        let built = ClusterIndex::build(&entries, dim, clusters, rotation);
-        *self.cluster_index.borrow_mut() = Some(built);
-        Ok(())
+        let mut sorted_chunk_ids = Vec::with_capacity(count);
+        let mut sorted_stable_ids = Vec::with_capacity(count);
+        let mut sorted_rows = Vec::with_capacity(rows.len());
+        for &i in &order {
+            sorted_chunk_ids.push(chunk_ids[i].clone());
+            sorted_stable_ids.push(stable_ids[i]);
+            sorted_rows.extend_from_slice(&rows[i * dim..(i + 1) * dim]);
+        }
+        Ok(Some(ClusterSource {
+            chunk_ids: sorted_chunk_ids,
+            stable_ids: sorted_stable_ids,
+            rows: sorted_rows,
+            dim,
+            rotation,
+        }))
     }
 
     /// Adopts a persisted cluster assignment into the cache when it is still valid:
@@ -3980,7 +4047,7 @@ impl VectorOnlyIndex {
     /// first ANN query rebuilds.
     fn install_persisted_ann(
         &self,
-        loaded: Option<&crate::storage::tvann_store::LoadedAnn>,
+        loaded: Option<crate::storage::tvann_store::LoadedAnn>,
         base_fingerprint: u64,
     ) {
         let Some(loaded) = loaded else {
@@ -3998,21 +4065,49 @@ impl VectorOnlyIndex {
         {
             return;
         }
-        let mut entries: Vec<(&str, &[f32])> = Vec::new();
-        for record in self.documents.values() {
-            for chunk in &record.chunks {
-                entries.push((chunk.chunk_id.as_str(), chunk.vector.as_slice()));
-            }
-        }
-        entries.sort_by(|left, right| left.0.cmp(right.0));
+        // Cluster over the same reconstructed rows (and rotation) a fresh build
+        // uses, so an adopted assignment recomputes bit-identical centroids and its
+        // stable-id postings are grouped from the live rows. The caller owns the
+        // `LoadedAnn`, so the string postings move straight into `from_assignment`.
+        let Ok(Some(source)) = self.cluster_source_rows() else {
+            return;
+        };
         if let Some(cluster) = ClusterIndex::from_assignment(
-            &entries,
+            &source.entries(),
             loaded.dim,
-            loaded.postings.clone(),
-            self.query_rotation.clone(),
+            loaded.postings,
+            source.rotation.clone(),
         ) {
             *self.cluster_index.borrow_mut() = Some(cluster);
         }
+    }
+
+    /// Maps the resident cluster postings (stable ids) back to chunk-id strings
+    /// for the `.tvann` sidecar. `None` when no cluster index is resident or it
+    /// holds a single cluster (nothing to prune, so nothing worth persisting).
+    /// Errors if a posting names a stable id no longer live, which would mean the
+    /// cache outlived a mutation without being invalidated.
+    fn ann_persisted_postings(&self) -> Result<Option<Vec<Vec<String>>>, CoreError> {
+        let guard = self.cluster_index.borrow();
+        let Some(cluster) = guard.as_ref().filter(|cluster| cluster.num_clusters() > 1) else {
+            return Ok(None);
+        };
+        let index = self.turbovec_index()?;
+        let mut clusters = Vec::with_capacity(cluster.num_clusters());
+        for posting in cluster.postings() {
+            let mut chunk_ids = Vec::with_capacity(posting.len());
+            for &stable_id in posting {
+                let chunk_id = index.chunk_id_for_stable_id(stable_id).ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorCode::CorruptStore,
+                        "ANN cluster posting references a stable id absent from the live index",
+                    )
+                })?;
+                chunk_ids.push(chunk_id.to_string());
+            }
+            clusters.push(chunk_ids);
+        }
+        Ok(Some(clusters))
     }
 
     /// Number of clusters to build: the configured override, else a `sqrt(n)`
@@ -4030,6 +4125,14 @@ impl VectorOnlyIndex {
         nprobe.clamp(1, num_clusters)
     }
 
+    /// Whether a query with this `filter` should take the ANN candidate path: ANN
+    /// candidate generation applies to unfiltered queries only (a filtered query
+    /// is already bounded by its allowlist), and only when the config would prune.
+    /// Centralized so lifting the unfiltered-only restriction is a one-site change.
+    fn ann_should_prune(&self, filter: Option<&Value>) -> bool {
+        filter.is_none() && self.ann_prunes()
+    }
+
     /// Whether ANN is enabled and would actually prune for the current corpus:
     /// more than one cluster and fewer probes than clusters. This is derived from
     /// config and corpus size with no cluster build, so the query and batch paths
@@ -4039,12 +4142,20 @@ impl VectorOnlyIndex {
         if self.ann_options.is_none() {
             return false;
         }
-        let n = self.chunk_count();
+        let n = self.live_chunk_count();
         if n < 2 {
             return false;
         }
         let clusters = self.ann_cluster_count(n);
         clusters > 1 && self.ann_nprobe(clusters) < clusters
+    }
+
+    /// Live chunk (vector row) count in O(1): the chunk-owner map holds exactly one
+    /// entry per live chunk and is maintained at every mutation, so it avoids the
+    /// O(#documents) walk `chunk_count` pays. The batch paths gate on ANN once per
+    /// query, so a corpus-sized walk there was O(#documents) per batch element.
+    fn live_chunk_count(&self) -> usize {
+        self.chunk_owner_by_id.len()
     }
 
     fn query_vectors_batch_turbovec(
@@ -4058,7 +4169,7 @@ impl VectorOnlyIndex {
         // invariant that a batch equals looping single queries, route each query
         // through the single-query ANN path when ANN would prune and the query is
         // unfiltered. A non-pruning config keeps the optimized shared/GPU batch.
-        if filter.is_none() && self.ann_prunes() {
+        if self.ann_should_prune(filter) {
             return query_vectors
                 .iter()
                 .map(|query| self.query_vector_turbovec(query, top_k, None))
@@ -4116,7 +4227,7 @@ impl VectorOnlyIndex {
         // batch-equals-singles invariant by looping the single-query path and
         // packing the flat arrays from its results. A non-pruning config keeps the
         // optimized shared/GPU batch scan.
-        if filter.is_none() && self.ann_prunes() {
+        if self.ann_should_prune(filter) {
             return self.ann_batch_arrays(queries, nq, top_k);
         }
         let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
