@@ -2,7 +2,7 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -257,6 +257,9 @@ impl CoreEngine {
             let old_had_text = old_record
                 .as_ref()
                 .is_some_and(|record| record.text.is_some());
+            let old_had_matrix = old_record
+                .as_ref()
+                .is_some_and(|record| record.patch_matrix.is_some());
             if retains_text {
                 index
                     .pending_raw_text_clears
@@ -267,6 +270,17 @@ impl CoreEngine {
                 // text resurrects on reload.
                 index
                     .pending_raw_text_clears
+                    .insert(document.document_id.clone());
+            }
+            if document.patch_matrix.is_some() {
+                index.pending_multivec_clears.remove(&document.document_id);
+            } else if old_had_matrix {
+                // A re-add that drops the late-interaction matrix on a live document
+                // clears it; like a text/lexical clear, the delta expresses
+                // "unchanged" by omission, so without an explicit multi-vector delete
+                // the base's old matrix would resurrect on reload.
+                index
+                    .pending_multivec_clears
                     .insert(document.document_id.clone());
             }
             if let Some(old_record) = old_record {
@@ -315,37 +329,10 @@ impl CoreEngine {
                 chunks_upserted += 1;
             }
             if append_wal {
-                // Collect only changed rows for the WAL: never write raw text when
-                // store_text is off (privacy); when index_text is on, write derived
-                // caption tokens so replay rebuilds lexical postings without
-                // retaining raw text on disk.
-                let text = if store_text {
-                    serde_json::json!(document.text)
-                } else {
-                    Value::Null
-                };
-                let tokens = match (index_text, document.text.as_deref()) {
-                    (true, Some(text)) => serde_json::json!([tokenize(text)]),
-                    _ => Value::Null,
-                };
-                // Carry the late-interaction patch matrix so a crash/replay before
-                // checkpoint does not lose the MaxSim payload while keeping the anchor.
-                let patch_matrix = match &document.patch_matrix {
-                    Some(matrix) => serde_json::json!({
-                        "dtype": matrix.dtype,
-                        "patch_count": matrix.patch_count,
-                        "bytes": matrix.bytes,
-                    }),
-                    None => Value::Null,
-                };
-                wal_vectors.push(serde_json::json!({
-                    "document_id": document.document_id,
-                    "vector": document.vector,
-                    "metadata": document.metadata,
-                    "text": text,
-                    "tokens": tokens,
-                    "patch_matrix": patch_matrix,
-                }));
+                // Only rows that actually changed are logged (unchanged rows took
+                // the `continue` above). The record shape is the single shared
+                // builder, so an appender-authored record is byte-identical.
+                wal_vectors.push(wal_vector_document(document, store_text, index_text));
             }
             changed += 1;
         }
@@ -432,6 +419,21 @@ impl CoreEngine {
                     &record.chunks,
                     &mut changed_filter_fields,
                 );
+                // Record the deleted document's sidecar payloads as pending clears.
+                // A re-add before persist cancels the pending delete
+                // (`add_document_indexes` clears it), so without these a delete +
+                // re-add-without-payload would carry neither a delete nor a clear and
+                // resurrect the base's text/tokens/matrix on reload. The re-add's own
+                // upsert logic drops the clear again when the payload returns.
+                if record.text.is_some() {
+                    index.pending_raw_text_clears.insert(document_id.clone());
+                }
+                if !record.token_lists.is_empty() {
+                    index.pending_lexical_clears.insert(document_id.clone());
+                }
+                if record.patch_matrix.is_some() {
+                    index.pending_multivec_clears.insert(document_id.clone());
+                }
                 index.lexical_index.remove_group(document_id);
                 let chunk_ids = record
                     .chunks
@@ -1423,6 +1425,9 @@ impl CoreEngine {
         let commit_mode = persistence.commit_mode.clone();
         for index in self.indexes.values_mut() {
             persist_index_generation(index, &dir, fsync, store_text, index_text, compress_text)?;
+            // Safe to truncate: `persist_index_generation` forces a watermark-only
+            // commit whenever a no-op fold advanced `applied_lsn`, so the manifest
+            // now records every LSN the WAL held.
             if commit_mode == "wal" {
                 crate::storage::wal::truncate(
                     &crate::storage::wal::wal_path(&dir, &index.index_key),
@@ -1458,6 +1463,13 @@ impl CoreEngine {
     }
 
     fn require_writable(&self) -> Result<(), CoreError> {
+        // WAL replay folds records into the in-memory view through the same mutation
+        // methods; on a read-only `refresh` overlay that fold is in-memory only (no
+        // durable write, no WAL append -- `should_append_wal` stays false while
+        // replaying), so allow it even though the handle is read-only.
+        if self.replaying_wal {
+            return Ok(());
+        }
         if matches!(
             self.persistence.as_ref(),
             Some(persistence) if persistence.read_only
@@ -1509,7 +1521,7 @@ impl CoreEngine {
             &crate::storage::wal::wal_path(&persistence.path, index_key),
             lsn,
             op,
-            &payload,
+            payload,
             persistence.fsync,
         )?;
         Ok(())
@@ -1942,7 +1954,19 @@ impl CoreEngine {
                                 Some(lsn) => lsn >= base_generation,
                                 None => true,
                             })
-                            .try_for_each(|record| self.apply_native_wal_record(&index_id, record));
+                            .try_for_each(|record| {
+                                self.apply_native_wal_record(&index_id, record)?;
+                                // Advance the durable watermark to the folded LSN so the
+                                // checkpoint below persists it (a folded record may not
+                                // advance `generation` one-for-one -- e.g. an idempotent
+                                // re-add or a no-op delete -- so the generation alone
+                                // could trail an acknowledged appender LSN).
+                                if let Some(index) = self.indexes.get_mut(&index_id) {
+                                    index.applied_lsn =
+                                        index.applied_lsn.max(record.lsn.unwrap_or(0));
+                                }
+                                Ok(())
+                            });
                         self.replaying_wal = false;
                         replay_result?;
                         self.persist()?;
@@ -1974,6 +1998,154 @@ impl CoreEngine {
             }
             let index = index_from_loaded_store(&loaded, persistence_chunk_character_limit)?;
             self.indexes.insert(index.index_id.clone(), index);
+        }
+        Ok(())
+    }
+
+    /// Re-loads the committed base and overlays the current WAL tail into the
+    /// in-memory view without checkpointing, giving a read-only handle freshness
+    /// and read-your-writes. After it returns, [`applied_lsn`](Self::applied_lsn)
+    /// reflects the durable base plus every WAL record currently on disk, so an
+    /// appender's record is visible once `applied_lsn >= its returned LSN`.
+    ///
+    /// A no-op for a writable handle (which folds and truncates the WAL on open)
+    /// and for an in-memory engine. Reloading the base rather than folding
+    /// incrementally keeps the overlay correct across a concurrent checkpoint that
+    /// advanced the base and truncated the WAL.
+    pub fn refresh(&mut self) -> Result<(), CoreError> {
+        match &self.persistence {
+            Some(persistence) if persistence.read_only => {}
+            _ => return Ok(()),
+        }
+        // Seqlock over the crash-atomic root manifest: reload the base and overlay
+        // the WAL tail, then confirm no checkpoint swapped a root manifest meanwhile.
+        // A racing checkpoint folds records into a new base and truncates the WAL, so
+        // a base read before it plus a WAL read after it would miss those records;
+        // retry on a mismatch. The token is each manifest's body checksum, which
+        // changes on every commit -- keying on `generation` alone would miss two
+        // commits that share a generation (the empty-store seed and the first upsert
+        // both commit at generation 1). Bounded so a writer churning cannot wedge us
+        // (the last attempt's view still self-consistent, at worst one commit stale,
+        // which the next refresh resolves).
+        for _ in 0..8 {
+            let before = self.committed_root_tokens()?;
+            self.indexes.clear();
+            self.load_persisted_indexes(false)?;
+            self.overlay_wal_tails()?;
+            if self.committed_root_tokens()? == before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads each committed index's manifest body checksum, the [`refresh`](Self::refresh)
+    /// seqlock token: it changes on every root-manifest swap. Cheap: only the small
+    /// manifest files.
+    fn committed_root_tokens(&self) -> Result<BTreeMap<String, String>, CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(BTreeMap::new());
+        };
+        let mut tokens = BTreeMap::new();
+        if !persistence.path.is_dir() {
+            return Ok(tokens);
+        }
+        for entry in fs::read_dir(&persistence.path).map_err(core_io_error)? {
+            let entry = entry.map_err(core_io_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(index_key) = name.strip_suffix(".commit.json") {
+                let manifest = crate::storage::commit_manifest::read_commit_manifest(
+                    &crate::storage::commit_manifest::commit_manifest_path(
+                        &persistence.path,
+                        index_key,
+                    ),
+                )?;
+                let token = match manifest {
+                    Some(manifest) => crate::storage::util::body_sha256(&manifest.body)?,
+                    None => String::new(),
+                };
+                tokens.insert(index_key.to_string(), token);
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// Highest LSN reflected in `index_id`'s in-memory view: the committed base
+    /// generation, this handle's own writer mutations (which use `generation` as
+    /// their WAL LSN), and any WAL records a [`refresh`](Self::refresh) overlay
+    /// folded. Compare it to an appender's returned LSN for read-your-writes.
+    pub fn applied_lsn(&self, index_id: &str) -> Result<u64, CoreError> {
+        let index = self.index(index_id)?;
+        Ok(index.applied_lsn.max(index.generation))
+    }
+
+    /// Folds every index's current WAL tail into its in-memory view (read-only
+    /// overlay: no persist, no truncate) and advances each index's `applied_lsn` to
+    /// the max folded LSN. Requires read-only persistence and that the base has
+    /// already been loaded.
+    fn overlay_wal_tails(&mut self) -> Result<(), CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let path = persistence.path.clone();
+        // Snapshot (index_id, index_key, base generation) before mutating self.
+        let targets: Vec<(String, String, u64)> = self
+            .indexes
+            .values()
+            .map(|index| (index.index_id.clone(), index.index_key.clone(), index.generation))
+            .collect();
+        for (index_id, index_key, base_generation) in targets {
+            let wal = crate::storage::wal::wal_path(&path, &index_key);
+            // Fold only frames the appender has acknowledged (published the counter
+            // for). When there is no usable watermark, distinguish two cases: a
+            // present-but-unreadable counter (an appender mid-write torn the CRC
+            // catches, or a legacy watermark-less counter) may hide an unacknowledged
+            // tail, so skip this index's overlay this pass rather than risk exposing
+            // a frame the appender never returned -- a later refresh (once the
+            // counter is clean) folds it. An absent counter means the WAL was written
+            // only by the exclusive writer, whose frames are all acknowledged, so
+            // fold all of it.
+            // Fold every CRC-valid frame. This covers all committed records -- the
+            // exclusive writer's own appends and appenders' acknowledged frames -- so
+            // read-your-writes holds: a returned append's frame is CRC-valid and thus
+            // folded. Capping at the `.lsn` counter's watermark is deliberately NOT
+            // done: that watermark tracks only appender acks, so it goes stale after a
+            // writer-mode WAL append or a checkpoint and would drop committed writer
+            // records. The only imperfection is that a frame from an in-flight append
+            // (written but not yet acknowledged, and dropped if that append never
+            // completes) can appear transiently; that never violates read-your-writes
+            // (an append that has returned is already acknowledged) and self-heals on
+            // the next refresh after the tail is repaired.
+            let records = crate::storage::wal::read_records(&wal)?;
+            if records.is_empty() {
+                continue;
+            }
+            // The overlay can only fold records native replays; a Python-only WAL
+            // prefix means the store needs a writer to recover, so surface it rather
+            // than present a silently-incomplete view (matches the writable open).
+            if !records.iter().all(is_native_replayable_wal_record) {
+                return Err(CoreError::new(
+                    CoreErrorCode::Unsupported,
+                    "the store's WAL has records only the Python engine can replay; \
+                     open it with a writer to fold them before a read-only refresh",
+                ));
+            }
+            self.replaying_wal = true;
+            let result = records
+                .iter()
+                .filter(|record| record.lsn.map_or(true, |lsn| lsn >= base_generation))
+                .try_for_each(|record| {
+                    self.apply_native_wal_record(&index_id, record)?;
+                    if let Some(index) = self.indexes.get_mut(&index_id) {
+                        index.applied_lsn = index.applied_lsn.max(record.lsn.unwrap_or(0));
+                    }
+                    Ok(())
+                });
+            self.replaying_wal = false;
+            result?;
         }
         Ok(())
     }
@@ -2032,25 +2204,6 @@ impl LockMode {
     }
 }
 
-/// Opens (creating if needed) the lock sentinel without taking the lock. Used by
-/// platforms that lock in a separate step after the open; Windows instead opens
-/// with an exclusive share mode, so it does not use this.
-#[cfg(not(windows))]
-fn open_sentinel(lock_path: &Path) -> Result<File, CoreError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(|error| {
-            CoreError::new(
-                CoreErrorCode::InvalidArgument,
-                format!("could not open writer lock {}: {error}", lock_path.display()),
-            )
-        })
-}
-
 impl PersistentLock {
     /// Takes the single-writer lock on ``<dir>/.lodedb.lock`` — the same sentinel
     /// the Python writer uses, so a native/FFI/Swift writer contends with a Python
@@ -2096,75 +2249,22 @@ impl PersistentLock {
         }
     }
 
-    /// One non-blocking attempt to open and exclusively lock the sentinel.
-    #[cfg(unix)]
+    /// One non-blocking attempt to open and lock the sentinel in `mode`. Delegates
+    /// to the shared `storage::util::try_lock_file` primitive (a non-blocking
+    /// advisory `flock` on unix, an exclusive share-mode open on windows): its
+    /// `None` is contention, its `Err` a fatal open/lock failure. Windows has no
+    /// shared advisory lock the Python `msvcrt` byte lock can see, so a shared hold
+    /// degrades to exclusive there (appenders serialize) while still excluding both
+    /// native and Python exclusive writers; unix keeps a true shared `flock`.
     fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
-        use rustix::fs::{flock, FlockOperation};
-        let file = open_sentinel(lock_path).map_err(TryLock::Fatal)?;
-        let operation = match mode {
-            LockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
-            LockMode::Shared => FlockOperation::NonBlockingLockShared,
-        };
-        match flock(&file, operation) {
-            Ok(()) => Ok(file),
-            Err(err)
-                if err == rustix::io::Errno::WOULDBLOCK || err == rustix::io::Errno::AGAIN =>
-            {
-                Err(TryLock::Contended)
-            }
-            Err(err) => Err(TryLock::Fatal(CoreError::new(
+        match crate::storage::util::try_lock_file(lock_path, mode == LockMode::Exclusive) {
+            Ok(Some(file)) => Ok(file),
+            Ok(None) => Err(TryLock::Contended),
+            Err(error) => Err(TryLock::Fatal(CoreError::new(
                 CoreErrorCode::InvalidArgument,
-                format!("could not acquire writer lock: {err}"),
+                format!("could not acquire writer lock {}: {error}", lock_path.display()),
             ))),
         }
-    }
-
-    /// Windows has no BSD flock; an exclusive (no-sharing) open of the sentinel is
-    /// the equivalent. A second writer's open fails with ``ERROR_SHARING_VIOLATION``
-    /// until the holding handle drops on close or process exit.
-    #[cfg(windows)]
-    fn try_lock(lock_path: &Path, mode: LockMode) -> Result<File, TryLock> {
-        use std::os::windows::fs::OpenOptionsExt;
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        const ERROR_LOCK_VIOLATION: i32 = 33;
-        // A true shared hold would need CreateFile share modes, but those do not
-        // interoperate with the Python writer lock, which takes an `msvcrt` byte
-        // lock the share mode cannot see (and `msvcrt` has no shared byte lock to
-        // match). So on Windows a shared hold degrades to exclusive (share_mode 0):
-        // appenders serialize here, but they still correctly exclude both native
-        // and Python exclusive writers. Unix keeps a true shared `flock`.
-        let _ = mode;
-        let share_mode: u32 = 0;
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(share_mode)
-            .open(lock_path)
-        {
-            Ok(file) => Ok(file),
-            Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-                ) =>
-            {
-                Err(TryLock::Contended)
-            }
-            Err(err) => Err(TryLock::Fatal(CoreError::new(
-                CoreErrorCode::InvalidArgument,
-                format!("could not open writer lock {}: {err}", lock_path.display()),
-            ))),
-        }
-    }
-
-    // Other platforms have neither flock nor Windows share modes; opening the
-    // sentinel keeps behaviour uniform (no cross-process exclusion, but these are
-    // not a multi-writer target).
-    #[cfg(not(any(unix, windows)))]
-    fn try_lock(lock_path: &Path, _mode: LockMode) -> Result<File, TryLock> {
-        open_sentinel(lock_path).map_err(TryLock::Fatal)
     }
 }
 
@@ -2197,10 +2297,19 @@ pub struct CoreAppender {
     path: PathBuf,
     index_key: String,
     vector_dim: usize,
-    // The highest LSN already durable in the store when this appender opened. The
-    // allocator clamps every reservation up to it, so appended LSNs never collide
-    // with an exclusive writer's generation-based LSNs from a prior session.
+    // The highest WAL LSN already durable when this appender opened (e.g. a peer's
+    // unfolded appends). Every reservation clamps up to it so an appended LSN never
+    // reuses one already on disk.
     floor: u64,
+    // The committed generation at open. The exclusive writer uses the generation
+    // as its own WAL LSN and can advance it faster than one-per-LSN (a captioned
+    // fold bumps it as upsert + token restore), so the counter can lag it. Clamping
+    // every reservation up to this makes the "an appended LSN always exceeds the
+    // committed generation" invariant local to the reservation, rather than resting
+    // on the shared/exclusive lock keeping an appender from spanning a fold. The
+    // generation is frozen for the appender's lifetime (a fold needs the exclusive
+    // lock this appender's shared lock excludes), so the open-time value stays valid.
+    committed_generation: u64,
     fsync: bool,
     // The raw-text/lexical retention policy for appended captions, mirroring the
     // engine's vector-in text policy exactly so an appended `upsert_vectors` record
@@ -2255,19 +2364,14 @@ impl CoreAppender {
             [] => return Err(invalid_err("no index to append to at this path")),
             _ => return Err(invalid_err("append requires exactly one index at the path")),
         };
-        let loaded = crate::storage::load_store(
-            &path,
-            &index_key,
-            crate::storage::LoadOptions {
-                read_only: true,
-                read_wal: false,
-            },
-        )?;
-        let vector_dim = loaded
-            .state
-            .get("native_dim")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        // The appender needs only the committed generation (the LSN floor) and the
+        // index's vector dimension (to validate appended vectors). Read just those
+        // from the commit manifest and the state base rather than the whole store:
+        // an append never reconstructs vectors, so SHA-256-ing the entire `.tvim`
+        // and every sidecar on open was O(store) waste. A corrupt vector image is
+        // the folding writer's problem, not the appender's.
+        let metadata = crate::storage::load_store_metadata(&path, &index_key)?;
+        let vector_dim = metadata.native_dim;
         if vector_dim == 0 {
             return Err(invalid_err("index has no vector dimension to append against"));
         }
@@ -2278,9 +2382,13 @@ impl CoreAppender {
         // of the committed generation and the WAL's highest LSN, so a reserved LSN
         // is always above every LSN already on disk.
         let wal_path = crate::storage::wal::wal_path(&path, &index_key);
-        let base_generation = loaded.generation;
+        // Clamp reservations above the durable applied-LSN watermark, not just the
+        // committed generation: a no-op-folded append can leave `applied_lsn` above
+        // `generation`, and if the `.lsn` counter is missing/torn a fresh append
+        // must still land above every LSN the store already reports applied.
+        let base_generation = metadata.applied_lsn.max(metadata.generation);
         let fsync = options.durability == "fsync";
-        let floor = crate::storage::lsn::with_lock(&path, &index_key, |file| {
+        let wal_max_lsn = crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
             Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
             // Refuse if the WAL already holds records only the Python engine can
@@ -2300,6 +2408,9 @@ impl CoreAppender {
                 .filter_map(|record| record.lsn)
                 .max()
                 .unwrap_or(0);
+            // The reservation floor is the max of the WAL's durable LSNs and the
+            // committed generation; keep them separate on the appender so the
+            // generation clamp stays explicit at each reservation.
             let floor = base_generation.max(wal_max_lsn);
             // Re-seed the shared counter to the just-repaired valid length. This is
             // the correctness anchor for the O(1) per-append repair: a stale
@@ -2320,13 +2431,14 @@ impl CoreAppender {
                 .unwrap_or(0);
             let seeded_lsn = existing_lsn.max(floor);
             crate::storage::lsn::write_counter(file, seeded_lsn, Some(scan.valid_len), fsync)?;
-            Ok(floor)
+            Ok(wal_max_lsn)
         })?;
         Ok(Self {
             path,
             index_key,
             vector_dim,
-            floor,
+            floor: wal_max_lsn,
+            committed_generation: base_generation,
             fsync,
             store_text: options.store_text,
             index_text: options.index_text,
@@ -2356,36 +2468,10 @@ impl CoreAppender {
             if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
                 return Err(invalid_err("vector contains a non-finite or out-of-range value"));
             }
-            let patch_matrix = match &document.patch_matrix {
-                Some(matrix) => serde_json::json!({
-                    "dtype": matrix.dtype,
-                    "patch_count": matrix.patch_count,
-                    "bytes": matrix.bytes,
-                }),
-                None => Value::Null,
-            };
-            // Mirror the engine's upsert_vectors WAL record exactly: retain raw text
-            // only under store_text (privacy), and when index_text is on write the
-            // derived caption tokens so replay rebuilds BM25 postings even in the
-            // store_text=false privacy mode (a captioned vector is one chunk keyed by
-            // its document id, so its caption is one token list).
-            let text = if self.store_text {
-                serde_json::json!(document.text)
-            } else {
-                Value::Null
-            };
-            let tokens = match (self.index_text, document.text.as_deref()) {
-                (true, Some(text)) => serde_json::json!([tokenize(text)]),
-                _ => Value::Null,
-            };
-            vectors.push(serde_json::json!({
-                "document_id": document.document_id,
-                "vector": document.vector,
-                "metadata": document.metadata,
-                "text": text,
-                "tokens": tokens,
-                "patch_matrix": patch_matrix,
-            }));
+            // Byte-identical to the engine's writer-authored record via the shared
+            // builder: raw text only under store_text (privacy), caption tokens
+            // under index_text, and the late-interaction patch matrix carried along.
+            vectors.push(wal_vector_document(document, self.store_text, self.index_text));
         }
         self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
     }
@@ -2413,25 +2499,37 @@ impl CoreAppender {
             // complete records (not behind torn bytes the next writer's replay would
             // stop at) and reserves an LSN that collides with neither a writer's
             // generation LSNs nor a frame a crashed peer already committed.
-            let floor = self.repair_and_lsn_floor(&wal, counter)?;
+            let (floor, valid_len) = self.repair_and_lsn_floor(&wal, counter)?;
             let lsn = floor
                 .checked_add(1)
                 .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
-            crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
+            let append = crate::storage::wal::append_record(&wal, lsn, op, payload, self.fsync)?;
             // Record the new valid length as the next appender's watermark, after
             // the frame is durable (see `lsn::write_counter`): a crash between the
             // two leaves the watermark behind the frame, so the next appender drops
             // the frame as an unacknowledged tail rather than trusting a phantom.
-            let new_len = std::fs::metadata(&wal)
-                .map(|meta| meta.len())
-                .map_err(core_io_error)?;
+            //
+            // Derive the new length from the repaired pre-append length plus the
+            // bytes just written, so the hot path takes no post-append stat.
+            // `append_record` writes the fixed header only when the file did not
+            // exist, which is exactly when the repaired valid length is 0 (repair
+            // removes a headerless WAL); otherwise the frame lands at `valid_len`.
+            let new_len = if valid_len == 0 {
+                crate::storage::wal::WAL_HEADER_LEN as u64 + append.record_bytes as u64
+            } else {
+                valid_len + append.record_bytes as u64
+            };
             crate::storage::lsn::write_counter(file, lsn, Some(new_len), self.fsync)?;
             Ok(lsn)
         })
     }
 
-    /// Repairs the WAL tail and returns the floor the next LSN must exceed (the
-    /// reservation is `floor + 1`). The caller must hold the counter lock.
+    /// Repairs the WAL tail and returns `(floor, valid_len)`: the floor the next
+    /// LSN must exceed (the reservation is `floor + 1`) and the WAL's valid byte
+    /// length after the repair (where the next frame will land, `0` when the file
+    /// is absent and a header must be written). The caller must hold the counter
+    /// lock, and derives the next watermark as `valid_len + bytes_written` without
+    /// a post-append stat.
     ///
     /// With a trusted watermark (the common case) this is O(1): stat the file and,
     /// if it grew past the watermark, drop the crashed peer's unacknowledged tail;
@@ -2450,24 +2548,30 @@ impl CoreAppender {
         &self,
         wal: &Path,
         counter: Option<crate::storage::lsn::Counter>,
-    ) -> Result<u64, CoreError> {
+    ) -> Result<(u64, u64), CoreError> {
         let counter_lsn = counter.map(|counter| counter.lsn).unwrap_or(0);
         let physical = match std::fs::metadata(wal) {
             Ok(meta) => meta.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(core_io_error(error)),
         };
+        // Every reservation clamps up to the committed generation as well as the
+        // counter and WAL floors, so an appended LSN always exceeds the generation
+        // even though the writer can advance the generation faster than the counter.
+        let generation = self.committed_generation;
         match counter.and_then(|counter| counter.wal_len) {
             // Intact tail: nothing sits past the last recorded frame, and the
             // counter's LSN is the last frame's LSN. The hot path.
-            Some(mark) if physical == mark && mark > 0 => Ok(counter_lsn.max(self.floor)),
+            Some(mark) if physical == mark && mark > 0 => {
+                Ok((counter_lsn.max(self.floor).max(generation), mark))
+            }
             // Bytes past the watermark are a crashed peer's unacknowledged tail (or
             // a zero-length WAL that needs its header rewritten): drop them back to
             // the boundary. `repair_torn_tail` removes the file when the boundary is
             // zero so the next append writes a fresh header, not a headerless frame.
             Some(mark) if physical >= mark => {
                 Self::repair_torn_tail(wal, mark, physical)?;
-                Ok(counter_lsn.max(self.floor))
+                Ok((counter_lsn.max(self.floor).max(generation), mark))
             }
             // No usable watermark, or one past the file: scan to repair the tail and
             // clamp the LSN above the WAL's true max so a torn counter or stale floor
@@ -2476,14 +2580,20 @@ impl CoreAppender {
                 let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
                 Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
                 let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
-                Ok(counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)))
+                Ok((
+                    counter_lsn
+                        .max(self.floor)
+                        .max(generation)
+                        .max(wal_max.unwrap_or(0)),
+                    scan.valid_len,
+                ))
             }
         }
     }
 
     /// Drops a torn or headerless WAL tail so the next append lands after complete
-    /// records. The caller must hold the counter lock (via `with_lock` or
-    /// `with_reserved`) so no concurrent append is mid-write.
+    /// records. The caller must hold the counter lock (via `with_lock`) so no
+    /// concurrent append is mid-write.
     fn repair_torn_tail(wal: &Path, valid_len: u64, total_len: u64) -> Result<(), CoreError> {
         if !wal.is_file() {
             return Ok(());
@@ -2663,7 +2773,17 @@ fn index_from_loaded_store(
         vector_dim,
         bit_width,
         documents,
-        generation: loaded.generation,
+        // Clamp the generation up to the applied-LSN watermark. A watermark-only
+        // commit can leave the committed generation below `applied_lsn`, and the
+        // writer uses the generation as its own WAL LSN: without this a new mutation
+        // could reuse an LSN readers already report applied, violating LSN order.
+        // (`applied_lsn >= generation` by the manifest invariant, so this only ever
+        // raises the generation.)
+        generation: loaded.generation.max(loaded.applied_lsn),
+        // The durable read-your-writes watermark from the commit manifest (>=
+        // generation); a WAL replay/overlay bumps it further as it folds records.
+        applied_lsn: loaded.applied_lsn,
+        persisted_applied_lsn: loaded.applied_lsn,
         vectors_seeded,
         query_rotation,
         delete_count: state
@@ -2693,6 +2813,7 @@ fn index_from_loaded_store(
         pending_deletes: BTreeSet::new(),
         pending_lexical_clears: BTreeSet::new(),
         pending_raw_text_clears: BTreeSet::new(),
+        pending_multivec_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
     };
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
@@ -3066,10 +3187,21 @@ fn persist_index_generation(
         && index.pending_deletes.is_empty()
         && index.pending_lexical_clears.is_empty()
         && index.pending_raw_text_clears.is_empty()
+        && index.pending_multivec_clears.is_empty()
         && index.pending_removed_stable_ids.is_empty();
-    // A committed base with nothing pending is already durable on disk.
-    if index.base_epoch != 0 && nothing_pending {
+    // A fold can advance the durable applied-LSN watermark without changing any
+    // document (an idempotent re-add / missing-id delete). That still must be
+    // committed, or truncating the WAL would strand the acknowledged LSN and a
+    // reader waiting on it could never catch up.
+    let watermark_only = nothing_pending && index.applied_lsn > index.persisted_applied_lsn;
+    // A committed base with nothing pending and no watermark to flush is durable.
+    if index.base_epoch != 0 && nothing_pending && !watermark_only {
         return Ok(());
+    }
+    // A watermark-only commit did not advance the mutation counter, so bump the
+    // generation to a fresh epoch or the delta would target the committed base.
+    if watermark_only && index.generation <= index.base_epoch {
+        index.generation = index.base_epoch + 1;
     }
     let generation = index.generation.max(1);
     let live_fingerprint = index
@@ -3141,7 +3273,12 @@ fn persist_index_generation(
     index.pending_deletes.clear();
     index.pending_lexical_clears.clear();
     index.pending_raw_text_clears.clear();
+    index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
+    // The commit manifest just recorded `applied_lsn.max(generation)` (see
+    // `build_commit_body`); record that as the durable watermark so `persist` knows
+    // the on-disk manifest now covers the WAL and may truncate it.
+    index.persisted_applied_lsn = index.applied_lsn.max(generation);
     Ok(())
 }
 
@@ -3253,6 +3390,7 @@ fn write_index_base(
         crate::storage::GenerationCommitInput {
             index_key: &index.index_key,
             generation,
+            applied_lsn: index.applied_lsn.max(generation),
             base_epoch: generation,
             state: &state,
             tvim: tvim_base
@@ -3308,6 +3446,7 @@ fn write_index_delta(
         crate::storage::GenerationDeltaInput {
             index_key: &index.index_key,
             generation,
+            applied_lsn: index.applied_lsn.max(generation),
             base_epoch: index.base_epoch,
             state_header: &state_header,
             upserted_documents,
@@ -3323,6 +3462,7 @@ fn write_index_delta(
                 index,
                 index.pending_upserts.iter().map(String::as_str),
             )),
+            multivec_clears: index.pending_multivec_clears.iter().cloned().collect(),
             document_deletes: deleted_document_ids,
             compress_text,
         },
@@ -3427,6 +3567,46 @@ fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> b
     )
 }
 
+/// Builds the per-document JSON object for an `upsert_vectors` WAL record.
+///
+/// The single source of truth for that record's shape: both the exclusive writer
+/// (`CoreEngine::upsert_vectors`) and the concurrent `CoreAppender::append_vectors`
+/// log through it, so an appended record is byte-identical to a writer-authored
+/// one and replays the same way (`vector_document_from_wal` is the inverse). Raw
+/// `text` is retained only under `store_text` (privacy: it is never written to the
+/// WAL otherwise); derived caption `tokens` are written under `index_text` so
+/// lexical/BM25 search survives replay even when raw text is not stored (a
+/// captioned vector is one chunk keyed by its document id, so its caption is one
+/// token list); the late-interaction `patch_matrix` is carried so a crash/replay
+/// before checkpoint keeps the MaxSim payload alongside the anchor vector.
+fn wal_vector_document(document: &CoreVectorDocument, store_text: bool, index_text: bool) -> Value {
+    let text = if store_text {
+        serde_json::json!(document.text)
+    } else {
+        Value::Null
+    };
+    let tokens = match (index_text, document.text.as_deref()) {
+        (true, Some(text)) => serde_json::json!([tokenize(text)]),
+        _ => Value::Null,
+    };
+    let patch_matrix = match &document.patch_matrix {
+        Some(matrix) => serde_json::json!({
+            "dtype": matrix.dtype,
+            "patch_count": matrix.patch_count,
+            "bytes": matrix.bytes,
+        }),
+        None => Value::Null,
+    };
+    serde_json::json!({
+        "document_id": document.document_id,
+        "vector": document.vector,
+        "metadata": document.metadata,
+        "text": text,
+        "tokens": tokens,
+        "patch_matrix": patch_matrix,
+    })
+}
+
 fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreError> {
     let document_id = value
         .get("document_id")
@@ -3516,6 +3696,17 @@ struct VectorOnlyIndex {
     bit_width: usize,
     documents: BTreeMap<String, DocumentRecord>,
     generation: u64,
+    /// Highest LSN reflected in this in-memory view: the committed base generation,
+    /// then the max WAL LSN folded by a read-only `refresh` overlay. A reader
+    /// compares it to an appender's returned LSN for read-your-writes (the append is
+    /// visible once `applied_lsn >= that_lsn`), and it advances monotonically.
+    applied_lsn: u64,
+    /// The `applied_lsn` most recently written to the commit manifest (the durable
+    /// watermark on disk). When a fold advances `applied_lsn` past this without any
+    /// document change (a no-op re-add / missing-id delete), `persist` writes
+    /// nothing, so the WAL must NOT be truncated or the watermark would be lost;
+    /// truncation is gated on `persisted_applied_lsn >= applied_lsn`.
+    persisted_applied_lsn: u64,
     vectors_seeded: bool,
     query_rotation: Option<Vec<f32>>,
     delete_count: usize,
@@ -3555,6 +3746,12 @@ struct VectorOnlyIndex {
     /// current base; written to the text delta as explicit deletes, like
     /// `pending_lexical_clears`.
     pending_raw_text_clears: BTreeSet<String>,
+    /// Live documents whose late-interaction patch matrix went present to absent
+    /// since the current base; written to the multi-vector delta as explicit
+    /// deletes, like `pending_lexical_clears`. Without this a re-add that drops the
+    /// matrix would leave the base's old matrix to resurrect on reload (the delta
+    /// expresses "unchanged" by omission).
+    pending_multivec_clears: BTreeSet<String>,
     /// TurboVec stable ids dropped from the live index since the current base and
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
@@ -3577,6 +3774,8 @@ impl VectorOnlyIndex {
             bit_width: options.bit_width,
             documents: BTreeMap::new(),
             generation: 0,
+            applied_lsn: 0,
+            persisted_applied_lsn: 0,
             vectors_seeded: true,
             query_rotation: None,
             delete_count: 0,
@@ -3594,6 +3793,7 @@ impl VectorOnlyIndex {
             pending_deletes: BTreeSet::new(),
             pending_lexical_clears: BTreeSet::new(),
             pending_raw_text_clears: BTreeSet::new(),
+            pending_multivec_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
         }
     }

@@ -1250,6 +1250,311 @@ fn query_multivector_ranks_documents_by_maxsim() {
 }
 
 #[test]
+fn cleared_patch_matrix_does_not_resurrect_on_reload() {
+    use lodedb_core::storage::multivec_store::MultiVecRecord;
+
+    fn unit(axis: usize) -> [f32; 8] {
+        let mut row = [0.0_f32; 8];
+        row[axis] = 1.0;
+        row
+    }
+    fn encode(rows: &[[f32; 8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+    // The same live document, first with a late-interaction matrix, then without.
+    let with_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: Some(MultiVecRecord {
+            dtype: "float32".to_string(),
+            patch_count: 2,
+            bytes: encode(&[unit(0), unit(2)]),
+        }),
+    };
+    let without_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: None,
+    };
+
+    let path = unique_temp_dir("core_mv_clear");
+    let options = open_options(&path, false, "generation");
+    // 1. Persist the matrix: a full base with a `.tvmv` base segment.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[with_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 2. Re-upsert the same live document without a matrix. The pooled vector is
+    // unchanged, so this folds as an O(changed) delta (not a base rewrite) — the
+    // path where an omitted clear would let the base matrix survive.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        engine.upsert_vectors("default", &[without_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 3. Reopen: the matrix must be gone. query_multivector skips matrix-less
+    // documents, so a resurrected base matrix would make "a" reappear here.
+    {
+        let engine = CoreEngine::open(options).unwrap();
+        let results = engine
+            .query_multivector("default", &unit(0), 1, 5, None)
+            .unwrap();
+        assert!(
+            results.hits.iter().all(|hit| hit.document_id != "a"),
+            "cleared patch matrix resurrected from the base on reload"
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn deleted_then_readded_document_does_not_resurrect_matrix() {
+    use lodedb_core::storage::multivec_store::MultiVecRecord;
+
+    fn unit(axis: usize) -> [f32; 8] {
+        let mut row = [0.0_f32; 8];
+        row[axis] = 1.0;
+        row
+    }
+    fn encode(rows: &[[f32; 8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+    let with_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: Some(MultiVecRecord {
+            dtype: "float32".to_string(),
+            patch_count: 2,
+            bytes: encode(&[unit(0), unit(2)]),
+        }),
+    };
+    let without_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: None,
+    };
+
+    let path = unique_temp_dir("core_mv_delete_readd");
+    let options = open_options(&path, false, "generation");
+    // 1. Base with a committed matrix.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[with_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 2. Delete then re-add the same document without a matrix, both before persist.
+    // The re-add cancels the pending delete, so only a delete-time clear keeps the
+    // delta from carrying nothing for the matrix.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        engine
+            .delete_documents("default", &["a".to_string()])
+            .unwrap();
+        engine
+            .upsert_vectors("default", &[without_matrix()])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    // 3. Reopen: the base matrix must not resurrect.
+    {
+        let engine = CoreEngine::open(options).unwrap();
+        let results = engine
+            .query_multivector("default", &unit(0), 1, 5, None)
+            .unwrap();
+        assert!(
+            results.hits.iter().all(|hit| hit.document_id != "a"),
+            "delete + re-add resurrected the base matrix on reload"
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn read_only_refresh_overlays_wal_tail_for_read_your_writes() {
+    let path = unique_temp_dir("core_reader_freshness");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    // A writer creates and checkpoints an empty index, then closes so an appender
+    // (and the lock-free reader) can proceed.
+    {
+        let mut engine = CoreEngine::open(writer_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+
+    // A read-only handle: a stable snapshot of the committed base, no WAL overlay.
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    let base_lsn = reader.applied_lsn("default").unwrap();
+    assert!(
+        reader
+            .list_documents("default", None, None, None)
+            .unwrap()
+            .is_empty(),
+        "the reader starts at the empty committed base"
+    );
+
+    // A separate appender durably logs a vector-in record.
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let appended_lsn = {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        appender
+            .append_vectors(&[doc("fresh", 0, metadata(&[("kind", "appended")]))])
+            .expect("append")
+    };
+
+    // Without a refresh the reader is still the snapshot: it neither sees the record
+    // nor advances its applied LSN.
+    assert_eq!(reader.applied_lsn("default").unwrap(), base_lsn);
+    assert!(reader
+        .list_documents("default", None, None, None)
+        .unwrap()
+        .is_empty());
+
+    // Refresh overlays the current WAL tail in memory (no checkpoint): the append is
+    // now visible and applied_lsn has caught up to (at least) the appended LSN.
+    reader.refresh().unwrap();
+    assert!(
+        reader.applied_lsn("default").unwrap() >= appended_lsn,
+        "refresh must fold the WAL up to the appended LSN for read-your-writes"
+    );
+    let docs = reader.list_documents("default", None, None, None).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["document_id"], serde_json::json!("fresh"));
+
+    // The WAL was overlaid, not truncated: a fresh read-only open still sees the
+    // record on its own refresh (the appender's record is still durable on disk).
+    let mut reader2 = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    reader2.refresh().unwrap();
+    assert_eq!(
+        reader2.list_documents("default", None, None, None).unwrap().len(),
+        1
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn applied_lsn_watermark_survives_a_no_op_folded_append() {
+    // A folded record need not advance `generation` one-for-one (an idempotent
+    // re-add is a full no-op), so the durable applied-LSN watermark must be tracked
+    // separately, or a reader's read-your-writes check for the appender's returned
+    // LSN would stall after the writer folds and truncates the WAL.
+    let path = unique_temp_dir("core_applied_lsn_watermark");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Append the same document twice: the first fold is a real upsert (bumps the
+    // generation), the second is an idempotent no-op (does not).
+    let (first_lsn, second_lsn) = {
+        let appender = CoreAppender::open(opts.clone()).expect("open appender");
+        let first = appender
+            .append_vectors(&[doc("dup", 0, metadata(&[]))])
+            .expect("first append");
+        let second = appender
+            .append_vectors(&[doc("dup", 0, metadata(&[]))])
+            .expect("second append");
+        (first, second)
+    };
+    assert!(second_lsn > first_lsn);
+    // A writer folds both records and checkpoints (truncating the WAL).
+    let committed_generation = {
+        let engine = CoreEngine::open(opts).unwrap();
+        engine.stats("default").unwrap().generation
+    };
+    // The no-op second fold did not advance the generation to its LSN...
+    assert!(
+        committed_generation < second_lsn,
+        "the idempotent re-add should not have advanced the generation to its LSN"
+    );
+
+    // ...but the persisted watermark did, so a fresh read-only reader (no refresh,
+    // WAL already truncated) reports read-your-writes up to the acknowledged LSN.
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(
+        reader.applied_lsn("default").unwrap(),
+        second_lsn,
+        "applied_lsn must reach the highest acknowledged append even when folded as a no-op"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn pure_no_op_fold_persists_watermark_and_truncates() {
+    // If the WAL tail folds entirely to no-ops (an appender re-adding an
+    // already-committed document), the fold advances no generation but does advance
+    // the applied-LSN watermark. The writer must still commit that watermark (a
+    // watermark-only epoch) before truncating the WAL, or the acknowledged LSN would
+    // be stranded and generation-mode recovery would see a never-emptying WAL.
+    let path = unique_temp_dir("core_pure_noop_fold");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    // Commit "dup" into the base.
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[doc("dup", 0, metadata(&[]))]).unwrap();
+        engine.persist().unwrap();
+    }
+    // An appender re-adds the identical document: its fold is a pure no-op.
+    let noop_lsn = {
+        let appender = CoreAppender::open(opts.clone()).expect("open appender");
+        appender.append_vectors(&[doc("dup", 0, metadata(&[]))]).expect("append")
+    };
+    // A writer opens (folds the no-op, commits the watermark) and closes.
+    {
+        let engine = CoreEngine::open(opts).unwrap();
+        drop(engine);
+    }
+    // The WAL was truncated: the watermark is durable, so generation-mode recovery
+    // (which rejects an unfolded WAL) stays safe.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    assert!(
+        lodedb_core::storage::wal::read_records(&wal).unwrap().is_empty(),
+        "the no-op fold's watermark should be durable, letting the WAL truncate"
+    );
+    // A fresh read-only reader reaches read-your-writes for the acknowledged LSN
+    // straight from the durable manifest watermark -- no refresh needed.
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert!(
+        reader.applied_lsn("default").unwrap() >= noop_lsn,
+        "the committed watermark must cover the acknowledged no-op LSN"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn concurrent_appenders_are_folded_by_the_next_writer() {
     let path = unique_temp_dir("core_appender");
     // Real coordination: writer takes the exclusive lock, appenders the shared one.
@@ -1439,7 +1744,7 @@ fn appender_rejects_non_native_wal() {
     // writer cannot replay. Appending native records behind it would strand them,
     // so the appender must refuse to open until a writer recovers the store.
     let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
-    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", &json!({ "documents": [] }), false)
+    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", json!({ "documents": [] }), false)
         .expect("write non-native record");
     assert!(CoreAppender::open(base).is_err());
     fs::remove_dir_all(path).unwrap();
@@ -1511,7 +1816,7 @@ fn appender_preserves_a_writers_wal_growth_across_sessions() {
         &wal,
         3,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "writer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1566,7 +1871,7 @@ fn appender_does_not_reuse_an_lsn_after_a_torn_counter() {
         &wal,
         peer_lsn,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "peer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1621,7 +1926,7 @@ fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
         &wal,
         2,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "peer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1718,6 +2023,145 @@ fn appender_retains_text_only_under_store_text() {
             None
         );
     }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_and_writer_log_byte_identical_upsert_vectors() {
+    // The upsert_vectors WAL record has a single shared builder
+    // (`wal_vector_document`), so a concurrent CoreAppender must log a record
+    // byte-identical to the one the exclusive writer's `upsert_vectors` writes for
+    // the same document (replay resolves both through the same path, so any
+    // divergence would silently change what an appended record restores). Guard the
+    // parity by running both real paths and comparing the logged payload (the LSN
+    // differs by construction and is lifted out of the payload on read).
+    let mut document = doc(
+        "captioned-parity",
+        3,
+        metadata(&[("kind", "image"), ("topic", "ops")]),
+    );
+    document.text = Some("a red bicycle by the canal".to_string());
+
+    let read_last_payload = |path: &Path| -> Value {
+        let wal = lodedb_core::storage::wal::wal_path(path, INDEX_KEY);
+        let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
+        let record = records.last().expect("a logged upsert_vectors record");
+        assert_eq!(record.op, "upsert_vectors");
+        assert!(record.payload.get("lsn").is_none(), "lsn is lifted out on read");
+        record.payload.clone()
+    };
+
+    // Writer path: create + upsert in WAL mode, then read the record it logged.
+    let writer_path = unique_temp_dir("core_wal_parity_writer");
+    let mut writer_options = open_options(&writer_path, false, "wal"); // store_text + index_text on
+    writer_options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_options).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", std::slice::from_ref(&document))
+            .unwrap();
+    }
+    let writer_payload = read_last_payload(&writer_path);
+
+    // Appender path: create + persist an identical store, then append the same doc.
+    let appender_path = unique_temp_dir("core_wal_parity_appender");
+    let mut appender_options = open_options(&appender_path, false, "wal");
+    appender_options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(appender_options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    CoreAppender::open(appender_options)
+        .expect("open appender")
+        .append_vectors(std::slice::from_ref(&document))
+        .expect("append");
+    let appender_payload = read_last_payload(&appender_path);
+
+    assert_eq!(
+        writer_payload, appender_payload,
+        "writer and appender must log byte-identical upsert_vectors records"
+    );
+
+    fs::remove_dir_all(writer_path).unwrap();
+    fs::remove_dir_all(appender_path).unwrap();
+}
+
+#[test]
+fn appender_open_reads_metadata_not_the_vector_image() {
+    // The appender opens O(metadata): it reads the committed generation and the
+    // vector dimension from the commit manifest + state base only, never the
+    // `.tvim` vectors or the sidecars (an append does not reconstruct them, and a
+    // corrupt vector image is the folding writer's problem). So corrupting the
+    // committed `.tvim` must not stop an appender from opening and logging.
+    let path = unique_temp_dir("core_appender_open_metadata");
+    let mut options = open_options(&path, false, "wal");
+    options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("seed", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    // Overwrite every committed `.tvim` base with garbage. A full store load would
+    // now fail its checksum; the appender's metadata-only open must not.
+    let gen_dir = path.join(format!("{INDEX_KEY}.gen"));
+    let mut corrupted = 0;
+    for entry in fs::read_dir(&gen_dir).unwrap() {
+        let entry_path = entry.unwrap().path();
+        if entry_path.extension().and_then(|ext| ext.to_str()) == Some("tvim") {
+            fs::write(&entry_path, b"corrupt-tvim-bytes").unwrap();
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted > 0, "expected a committed .tvim base to corrupt");
+
+    let appender = CoreAppender::open(options).expect("appender opens over a corrupt vector image");
+    let lsn = appender
+        .append_vectors(&[doc("appended", 1, metadata(&[]))])
+        .expect("append after corrupt-tvim open");
+    assert!(lsn >= 1);
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appended_lsn_exceeds_committed_generation() {
+    // The exclusive writer uses the generation as its own WAL LSN and can advance
+    // it faster than one-per-LSN, so the committed generation can exceed every WAL
+    // LSN. An appended LSN must still clear the committed generation, or a later
+    // writer's replay would treat the append as already folded and drop it.
+    let path = unique_temp_dir("core_appender_gen_clamp");
+    let mut options = open_options(&path, false, "wal");
+    options.acquire_writer_lock = true;
+    let committed_generation;
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        // Several upserts advance the generation; the checkpoint truncates the WAL,
+        // so at append time the WAL max LSN is 0 while the generation is high.
+        for i in 0..5 {
+            engine
+                .upsert_vectors("default", &[doc(&format!("d{i}"), i % 8, metadata(&[]))])
+                .unwrap();
+        }
+        engine.persist().unwrap();
+        committed_generation = engine.stats("default").unwrap().generation;
+    }
+    assert!(committed_generation >= 1);
+
+    let appender = CoreAppender::open(options).expect("open appender");
+    let lsn = appender
+        .append_vectors(&[doc("appended", 0, metadata(&[]))])
+        .expect("append");
+    assert!(
+        lsn > committed_generation,
+        "appended LSN {lsn} must exceed the committed generation {committed_generation}"
+    );
 
     fs::remove_dir_all(path).unwrap();
 }

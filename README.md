@@ -200,7 +200,16 @@ lock, so it never blocks on (or is blocked by) the writer:
 reader = LodeDB.open_readonly("./data")   # or LodeDB(path="./data", read_only=True)
 reader.search("fox", k=5)                 # reads a committed snapshot
 reader.add("nope")                        # raises ReadOnlyError
+
+reader.refresh()                          # overlay the current WAL tail (see appended records)
+reader.applied_lsn()                      # highest LSN visible; >= an Appender's returned LSN == read-your-writes
 ```
+
+The read-only handle is a stable snapshot of the last committed generation until
+you call `refresh()`, which folds in whatever another process (or an `Appender`)
+has written since, without taking a lock or checkpointing. For read-your-writes,
+compare `applied_lsn()` to the LSN an append returned: the record is visible once
+`applied_lsn() >= that_lsn`.
 
 ## Hybrid search
 
@@ -556,8 +565,9 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   `<key>.wal` ordered by a durable, process-shared sequence allocator, and the next *writable* open
   folds them into a clean generation. Appends are durable once acknowledged under
   `durability="fsync"` (the default `fast` is atomic but not fsynced, like the writer's own adds)
-  and become queryable only after that fold-in (a read-only handle still loads the last
-  checkpointed generation, not the appended tail). On Windows the shared lock degrades to an
+  and become queryable after the next writable open folds them in, or immediately in a read-only
+  handle that calls `refresh()` to overlay the WAL tail (whose `applied_lsn()` then gives
+  read-your-writes against an append's returned LSN). On Windows the shared lock degrades to an
   exclusive hold, so appenders serialize there rather than coexisting. Each record is a precomputed
   vector plus metadata, and an optional caption (e.g. for an image) retained only when the appender
   opts into `store_text` (off by default, so no raw text reaches the WAL); it requires WAL commit

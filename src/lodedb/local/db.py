@@ -1141,6 +1141,32 @@ class LodeDB:
                 self._native_persist()
             return self._native_stats()
 
+    def refresh(self) -> None:
+        """Overlays the current write-ahead log tail into this handle's in-memory
+        view without checkpointing.
+
+        A ``read_only=True`` reader loads the last committed generation on open and
+        is otherwise a stable snapshot; call this to fold in records other processes
+        appended since (e.g. via :class:`~lodedb.Appender`), and to reach
+        read-your-writes for an appended LSN (see :meth:`applied_lsn`). A no-op on a
+        writable handle, which already folds the WAL when it opens.
+        """
+
+        with self._op_lock:
+            self._native_vector_engine.refresh()
+
+    def applied_lsn(self) -> int:
+        """Returns the highest log sequence number reflected in this handle's view.
+
+        Compare it to the LSN an :class:`~lodedb.Appender` returned for
+        read-your-writes: the appended record is visible here once
+        ``applied_lsn() >= that_lsn``. On a read-only handle call :meth:`refresh`
+        first to fold the current WAL tail into the view.
+        """
+
+        with self._op_lock:
+            return int(self._native_vector_engine.applied_lsn(_LOCAL_INDEX_ID))
+
     def count(self, *, filter: Mapping[str, Any] | None = None) -> int:
         """Returns the number of documents stored, optionally matching a filter.
 
@@ -2234,37 +2260,56 @@ def _coerce_optional_text(value: Any) -> str | None:
     return value
 
 
-def _prepare_vector(
+def _finite_float_vector(
     vector: Sequence[float],
-    dim: int,
     *,
     normalize: bool,
-) -> tuple[float, ...]:
+    dim: int | None = None,
+) -> list[float]:
     """Validates a precomputed embedding and (optionally) L2-normalizes it.
 
-    Enforces the index dimension and finiteness at the SDK boundary so callers
-    get a clean ``ValueError`` instead of a deep engine/kernel error. When
-    ``normalize`` is set, the vector is scaled to unit norm so cosine scores
-    match the text path (which normalizes embeddings on write and query).
+    The shared vector-boundary check for both :meth:`LodeDB.add_vectors` and
+    :class:`~lodedb.local.appender.Appender`: coerce to Python ``float`` (float64),
+    reject non-finite values, and -- when ``normalize`` is set -- scale to unit
+    norm so cosine scores match the text path (which normalizes on write and
+    query). ``math.hypot`` scales internally, so a large-but-finite component
+    (whose square would overflow float64) cannot push the norm to inf and silently
+    zero the vector. When ``dim`` is given the length must match it; otherwise the
+    vector must merely be non-empty (the appender validates the dimension in the
+    native core against the store's shape).
     """
 
     try:
         values = [float(component) for component in vector]
     except (TypeError, ValueError) as exc:
         raise ValueError("vector must be a sequence of numbers") from exc
-    if len(values) != dim:
-        raise ValueError(f"vector must have dimension {dim}, got {len(values)}")
+    if dim is not None:
+        if len(values) != dim:
+            raise ValueError(f"vector must have dimension {dim}, got {len(values)}")
+    elif not values:
+        raise ValueError("vector must be non-empty")
     if not all(math.isfinite(component) for component in values):
         raise ValueError("vector must contain only finite values")
     if normalize:
-        # math.hypot scales internally, so a large-but-finite component (whose square
-        # would overflow float64) does not push the norm to inf and zero the vector.
         norm = math.hypot(*values)
         if norm == 0.0:
             raise ValueError(
-                "cannot normalize a zero vector; pass a non-zero vector or normalize=False"
+                "cannot normalize a zero vector; pass normalize=False to store it as-is"
             )
         if not math.isfinite(norm):
-            raise ValueError("vector norm overflows; scale the vector down before adding")
+            raise ValueError("vector norm overflows; scale the vector down first")
         values = [component / norm for component in values]
-    return tuple(values)
+    return values
+
+
+def _prepare_vector(
+    vector: Sequence[float],
+    dim: int,
+    *,
+    normalize: bool,
+) -> tuple[float, ...]:
+    """Validates a precomputed embedding, (optionally) L2-normalizes it, and
+    enforces the index dimension at the SDK boundary. See
+    :func:`_finite_float_vector`."""
+
+    return tuple(_finite_float_vector(vector, normalize=normalize, dim=dim))

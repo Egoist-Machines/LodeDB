@@ -1,7 +1,7 @@
 use crate::error::{CoreError, CoreErrorCode};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -49,6 +49,86 @@ pub(crate) fn verify_file_sha256(path: &Path, expected: &str, context: &str) -> 
         return Err(corrupt(format!("{context} failed manifest checksum")));
     }
     Ok(())
+}
+
+/// One non-blocking attempt to open `path` (creating it) and take an OS lock hold.
+///
+/// `Ok(Some(file))` holds the lock; `Ok(None)` means another holder currently
+/// blocks it and the caller should retry; `Err` is a real open/lock failure the
+/// caller wraps in its own message. Unix opens read+write+create and takes a
+/// non-blocking advisory `flock` — exclusive, or shared when `exclusive` is false
+/// (a shared `flock` interoperates with the Python writer's `fcntl.flock`).
+/// Windows has no advisory `flock` that the Python `msvcrt` byte lock can see, so
+/// it opens with an exclusive share mode (`share_mode(0)`); there is no shared
+/// form, so a shared request degrades to exclusive there. Other platforms open
+/// without locking (not a multi-writer target).
+///
+/// This is the single primitive under both the writer lock (`PersistentLock`) and
+/// the LSN counter lock (`lsn::open_exclusive`); each wraps it in its own
+/// retry-until-deadline loop with its own contention message.
+pub(crate) fn try_lock_file(path: &Path, exclusive: bool) -> std::io::Result<Option<File>> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{flock, FlockOperation};
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let operation = if exclusive {
+            FlockOperation::NonBlockingLockExclusive
+        } else {
+            FlockOperation::NonBlockingLockShared
+        };
+        match flock(&file, operation) {
+            Ok(()) => Ok(Some(file)),
+            Err(error)
+                if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(std::io::Error::from(error)),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        let _ = exclusive;
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => Ok(Some(file)),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = exclusive;
+        Ok(Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?,
+        ))
+    }
 }
 
 /// Encodes a string as a JSON string literal byte-for-byte identical to

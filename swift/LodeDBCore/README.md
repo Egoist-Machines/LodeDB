@@ -192,8 +192,9 @@ C ABI status codes (`invalidArgument`, `notFound`, `corruptStore`, `planStale`,
 For concurrent ingest, `LodeAppender` lets many processes durably log vector-in
 records to one store's WAL at once (a shared lock, distinct from the exclusive
 writer's), folded into the index by the next *writable* `LodeDB` open. A read-only
-snapshot (`openReadOnly`) ignores the WAL tail, so appended records are queryable
-only after a writable open replays and checkpoints them. It requires WAL commit
+snapshot (`openReadOnly`) reflects the last committed generation; call `refresh()`
+to overlay the WAL tail (so appended records become queryable without a writer)
+and `appliedLSN()` for read-your-writes against an append's returned LSN. It requires WAL commit
 mode. Each record is a precomputed vector plus metadata, and an optional caption
 (e.g. an image's) retained only when opened with `storeText: true` (off by default,
 so no raw text reaches the WAL):

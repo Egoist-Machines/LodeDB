@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 1u
+#define LODEDB_ABI_VERSION 2u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -183,6 +183,12 @@ uint32_t lodedb_engine_open_readonly_json(
     LodeError **error);
 uint32_t lodedb_engine_persist(LodeEngine *engine, LodeError **error);
 uint32_t lodedb_engine_close(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_refresh(LodeEngine *engine, LodeError **error);
+uint32_t lodedb_engine_applied_lsn(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    uint64_t *out_lsn,
+    LodeError **error);
 uint32_t lodedb_engine_delete_documents_json(
     LodeEngine *engine,
     LodeStringView index_id,

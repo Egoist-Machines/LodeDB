@@ -670,6 +670,50 @@ pub unsafe extern "C" fn lodedb_engine_close(
     ffi_result(error, || engine_mut(engine)?.close())
 }
 
+/// Overlays the current WAL tail into a read-only handle's in-memory view without
+/// checkpointing, giving reader freshness and read-your-writes. A no-op for a
+/// writable handle (which folds the WAL on open). After this returns,
+/// `lodedb_engine_applied_lsn` reflects the durable base plus every WAL record
+/// currently on disk.
+///
+/// # Safety
+///
+/// `engine` must be a valid engine pointer; `error` may be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_refresh(
+    engine: *mut LodeEngine,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || engine_mut(engine)?.refresh())
+}
+
+/// Writes the highest LSN reflected in `index_id`'s in-memory view to `out_lsn`
+/// (the committed base, this handle's own writer mutations, and any WAL records a
+/// refresh folded). Compare it to an appender's returned LSN for read-your-writes.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, and `out_lsn` must be valid for the duration of the call.
+/// `index_id` must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_applied_lsn(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    out_lsn: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_lsn)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let lsn = engine.applied_lsn(&index_id)?;
+        unsafe {
+            *out_lsn = lsn;
+        }
+        Ok(())
+    })
+}
+
 /// Deletes documents by id; returns a `CoreMutationResult` JSON to release with
 /// `lodedb_owned_string_free`.
 ///
