@@ -250,12 +250,15 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 /// Opens the counter file with an exclusive hold for the read-modify-write.
 ///
-/// Unix takes a blocking BSD advisory lock; Windows opens with an exclusive
-/// share mode and retries while another reserver holds it. Both release when the
-/// returned handle drops (or the process exits).
+/// Unix takes a non-blocking BSD advisory lock and retries until a deadline;
+/// Windows opens with an exclusive share mode and retries the same way. Both
+/// release when the returned handle drops (or the process exits). The deadline
+/// keeps a wedged peer (frozen process, hung disk) from stalling every other
+/// appender forever, matching the writer lock's bounded wait.
 #[cfg(unix)]
 fn open_exclusive(path: &Path) -> CoreResult<File> {
     use rustix::fs::{flock, FlockOperation};
+    use std::time::{Duration, Instant};
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -263,9 +266,21 @@ fn open_exclusive(path: &Path) -> CoreResult<File> {
         .truncate(false)
         .open(path)
         .map_err(|error| corrupt(format!("LSN counter could not be opened: {error}")))?;
-    flock(&file, FlockOperation::LockExclusive)
-        .map_err(|error| corrupt(format!("LSN counter could not be locked: {error}")))?;
-    Ok(file)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                if Instant::now() >= deadline {
+                    return Err(corrupt("LSN counter is locked by another reserver"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(corrupt(format!("LSN counter could not be locked: {error}")))
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
