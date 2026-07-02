@@ -1061,7 +1061,7 @@ impl CoreEngine {
             return invalid("query dimension does not match index");
         }
         index.require_vectors_seeded()?;
-        if index.chunk_count() == 0 {
+        if index.live_chunk_count() == 0 {
             return Ok(CoreSearchResults {
                 hits: Vec::new(),
                 total_considered: 0,
@@ -1226,7 +1226,7 @@ impl CoreEngine {
                 return invalid("query dimension does not match index");
             }
         }
-        if index.chunk_count() == 0 {
+        if index.live_chunk_count() == 0 {
             return Ok(query_vectors
                 .iter()
                 .map(|_| CoreSearchResults {
@@ -1272,7 +1272,7 @@ impl CoreEngine {
         if nq * dim != queries.len() {
             return invalid("query batch length is not a multiple of dim");
         }
-        if index.chunk_count() == 0 || nq == 0 {
+        if index.live_chunk_count() == 0 || nq == 0 {
             return Ok(VectorBatchArrays {
                 nq,
                 k: 0,
@@ -4075,16 +4075,23 @@ impl VectorOnlyIndex {
         }
         let dim = self.vector_dim;
         // Order by chunk id for a deterministic clustering, materializing the rows
-        // in that order so an entry can borrow a contiguous slice.
-        let mut order: Vec<usize> = (0..count).collect();
-        order.sort_by(|&left, &right| chunk_ids[left].cmp(&chunk_ids[right]));
+        // in that order so an entry can borrow a contiguous slice. Pair each chunk
+        // id with its stable id and original row position and sort by chunk id,
+        // moving the owned strings through the sort rather than cloning them.
+        let mut indexed: Vec<(String, u64, usize)> = chunk_ids
+            .into_iter()
+            .zip(stable_ids)
+            .enumerate()
+            .map(|(position, (chunk_id, stable_id))| (chunk_id, stable_id, position))
+            .collect();
+        indexed.sort_by(|left, right| left.0.cmp(&right.0));
         let mut sorted_chunk_ids = Vec::with_capacity(count);
         let mut sorted_stable_ids = Vec::with_capacity(count);
         let mut sorted_rows = Vec::with_capacity(rows.len());
-        for &i in &order {
-            sorted_chunk_ids.push(chunk_ids[i].clone());
-            sorted_stable_ids.push(stable_ids[i]);
-            sorted_rows.extend_from_slice(&rows[i * dim..(i + 1) * dim]);
+        for (chunk_id, stable_id, position) in indexed {
+            sorted_chunk_ids.push(chunk_id);
+            sorted_stable_ids.push(stable_id);
+            sorted_rows.extend_from_slice(&rows[position * dim..(position + 1) * dim]);
         }
         Ok(Some(ClusterSource {
             chunk_ids: sorted_chunk_ids,

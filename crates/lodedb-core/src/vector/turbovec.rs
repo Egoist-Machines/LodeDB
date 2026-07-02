@@ -204,8 +204,9 @@ impl TurboVecNativeIndex {
     /// The ANN candidate path already holds TurboVec stable ids (its postings are
     /// stable ids, resolved once at build), so it skips the chunk-id resolution
     /// `search` pays. Absent ids are filtered out (the underlying kernel panics on
-    /// an unknown id), preserving the same fail-soft contract as the chunk-id path
-    /// even though the cache-invalidation invariant already keeps candidates live.
+    /// an unknown id) and duplicates are dropped, preserving the same fail-soft,
+    /// deduplicated contract as the chunk-id path even though the ANN postings are
+    /// disjoint and the cache-invalidation invariant already keeps candidates live.
     pub fn search_with_stable_allowlist(
         &self,
         query_embedding: &[f32],
@@ -218,10 +219,16 @@ impl TurboVecNativeIndex {
         if query_embedding.len() != self.dim {
             return invalid("query dimension does not match TurboVec index");
         }
+        // Keep `present` one entry per distinct live id, so its length equals the
+        // kernel's allowlist-mask popcount. A duplicate would inflate
+        // `effective_top_k` past the number of set mask bits; the kernel clamps its
+        // result to that count, and `assemble_rows` would then reject the shorter
+        // buffer as malformed.
+        let mut seen = BTreeSet::new();
         let present: Vec<u64> = allowlist
             .iter()
             .copied()
-            .filter(|id| self.index.contains(*id))
+            .filter(|id| self.index.contains(*id) && seen.insert(*id))
             .collect();
         if present.is_empty() {
             return Ok(Vec::new());
