@@ -1439,7 +1439,7 @@ fn appender_rejects_non_native_wal() {
     // writer cannot replay. Appending native records behind it would strand them,
     // so the appender must refuse to open until a writer recovers the store.
     let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
-    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", &json!({ "documents": [] }), false)
+    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", json!({ "documents": [] }), false)
         .expect("write non-native record");
     assert!(CoreAppender::open(base).is_err());
     fs::remove_dir_all(path).unwrap();
@@ -1511,7 +1511,7 @@ fn appender_preserves_a_writers_wal_growth_across_sessions() {
         &wal,
         3,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "writer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1566,7 +1566,7 @@ fn appender_does_not_reuse_an_lsn_after_a_torn_counter() {
         &wal,
         peer_lsn,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "peer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1621,7 +1621,7 @@ fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
         &wal,
         2,
         "upsert_vectors",
-        &json!({
+        json!({
             "vectors": [{
                 "document_id": "peer-doc",
                 "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],

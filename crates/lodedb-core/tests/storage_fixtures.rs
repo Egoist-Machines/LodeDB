@@ -149,7 +149,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
         &wal_path,
         2,
         "upsert_documents",
-        &json!({
+        json!({
             "client_id": "lodedb-local",
             "index_id": "default",
             "documents": [{

@@ -1509,7 +1509,7 @@ impl CoreEngine {
             &crate::storage::wal::wal_path(&persistence.path, index_key),
             lsn,
             op,
-            &payload,
+            payload,
             persistence.fsync,
         )?;
         Ok(())
@@ -2417,7 +2417,7 @@ impl CoreAppender {
             let lsn = floor
                 .checked_add(1)
                 .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
-            crate::storage::wal::append_record(&wal, lsn, op, &payload, self.fsync)?;
+            crate::storage::wal::append_record(&wal, lsn, op, payload, self.fsync)?;
             // Record the new valid length as the next appender's watermark, after
             // the frame is durable (see `lsn::write_counter`): a crash between the
             // two leaves the watermark behind the frame, so the next appender drops

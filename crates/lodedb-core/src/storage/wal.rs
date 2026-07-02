@@ -40,7 +40,7 @@ pub fn append_record(
     path: &Path,
     lsn: u64,
     op: &str,
-    payload: &Value,
+    payload: Value,
     fsync: bool,
 ) -> CoreResult<WalAppend> {
     let body = encode_body(op, payload, lsn)?;
@@ -101,15 +101,16 @@ pub fn truncate(path: &Path, fsync: bool) -> CoreResult<()> {
 }
 
 pub fn scan_stats(path: &Path) -> CoreResult<WalStats> {
-    let records = read_records(path)?;
-    let mut byte_count = 0;
-    for record in &records {
-        let body = encode_body(&record.op, &record.payload, record.lsn.unwrap_or(0))?;
-        byte_count += 4 + body.len() + 4;
-    }
+    // The scan already computes the exact byte length of the valid frame prefix,
+    // so reuse it rather than re-encoding every record body just to count bytes.
+    // The old re-encode also stamped `lsn: 0` onto pre-LSN records that never had
+    // that key on disk, inflating their size. `valid_len` counts the full valid
+    // WAL (the 12-byte header included); that constant offset does not affect the
+    // size-based checkpoint trigger.
+    let scan = read_records_with_valid_len(path)?;
     Ok(WalStats {
-        op_count: records.len(),
-        byte_count,
+        op_count: scan.records.len(),
+        byte_count: scan.valid_len as usize,
     })
 }
 
@@ -288,22 +289,23 @@ fn decode_body(body: &[u8]) -> CoreResult<WalRecord> {
     Ok(WalRecord { op, payload, lsn })
 }
 
-fn encode_body(op: &str, payload: &Value, lsn: u64) -> CoreResult<Vec<u8>> {
+fn encode_body(op: &str, mut payload: Value, lsn: u64) -> CoreResult<Vec<u8>> {
     if op.is_empty() || op.contains('\n') {
         return Err(corrupt("WAL record op must be non-empty and newline-free"));
     }
-    let Some(object) = payload.as_object() else {
+    let Some(object) = payload.as_object_mut() else {
         return Err(corrupt("WAL record payload must be a JSON object"));
     };
     // Stamp the log sequence number into the JSON body rather than the binary
     // frame, so the frame layout (and the committed cross-version WAL fixtures)
-    // stays byte-compatible. `decode_body` lifts it back out on read.
-    let mut object = object.clone();
+    // stays byte-compatible. `decode_body` lifts it back out on read. The payload
+    // is taken by value and mutated in place: both append callers own the payload
+    // they pass, so this avoids cloning the whole value tree on the write hot path.
     object.insert("lsn".to_string(), Value::from(lsn));
     let mut body = Vec::new();
     body.extend_from_slice(op.as_bytes());
     body.push(b'\n');
-    let payload = serde_json::to_vec(&Value::Object(object))
+    let payload = serde_json::to_vec(&payload)
         .map_err(|error| corrupt(format!("WAL payload could not be encoded: {error}")))?;
     body.extend_from_slice(&payload);
     Ok(body)
@@ -716,13 +718,13 @@ mod tests {
     fn appends_and_reads_framed_records() {
         let dir = temp_dir("append-read");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         let append = append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -745,13 +747,13 @@ mod tests {
     fn drops_torn_trailing_frame() {
         let dir = temp_dir("torn-tail");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -769,13 +771,13 @@ mod tests {
     fn corrupt_interior_frame_fails_closed() {
         let dir = temp_dir("interior-corrupt");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -880,7 +882,7 @@ mod tests {
             &wal,
             1,
             "upsert_documents",
-            &json!({
+            json!({
                 "documents": [{
                     "document_id": "alpha",
                     "text": "Alpha text.",
