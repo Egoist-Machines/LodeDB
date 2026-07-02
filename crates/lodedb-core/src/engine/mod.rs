@@ -233,6 +233,7 @@ impl CoreEngine {
                 chunk_id: document.document_id.clone(),
                 vector: document.vector.clone(),
             }];
+            let retains_text = retained_text.is_some();
             let old_record = index.documents.insert(
                 document.document_id.clone(),
                 DocumentRecord {
@@ -249,6 +250,24 @@ impl CoreEngine {
                     patch_matrix: document.patch_matrix.clone(),
                 },
             );
+            let old_had_tokens = old_record
+                .as_ref()
+                .is_some_and(|record| !record.token_lists.is_empty());
+            let old_had_text = old_record
+                .as_ref()
+                .is_some_and(|record| record.text.is_some());
+            if retains_text {
+                index
+                    .pending_raw_text_clears
+                    .remove(&document.document_id);
+            } else if old_had_text {
+                // A re-add without a retained caption clears the raw text; the
+                // clear must reach the text delta as a delete, or the base's old
+                // text resurrects on reload.
+                index
+                    .pending_raw_text_clears
+                    .insert(document.document_id.clone());
+            }
             if let Some(old_record) = old_record {
                 index.remove_document_indexes(
                     &document.document_id,
@@ -272,11 +291,17 @@ impl CoreEngine {
             );
             if caption_tokens.is_empty() {
                 index.lexical_index.remove_group(&document.document_id);
+                if old_had_tokens {
+                    index
+                        .pending_lexical_clears
+                        .insert(document.document_id.clone());
+                }
             } else {
                 index.lexical_index.replace_group(
                     &document.document_id,
                     &[(document.document_id.clone(), caption_tokens)],
                 );
+                index.pending_lexical_clears.remove(&document.document_id);
             }
             // Only re-sync the vector when it actually changed; a same-vector
             // metadata refresh keeps its existing live-index row.
@@ -489,9 +514,17 @@ impl CoreEngine {
                 .as_ref()
                 .map(|text| crate::text::hash::sha256_text(text))
                 .unwrap_or_else(|| crate::text::hash::sha256_text(document_id));
+            let had_text = record.text.is_some();
             // Retain raw text only when store_text is on (privacy); otherwise the
             // updated caption must not be kept in memory or written to disk.
             record.text = if store_text { text.clone() } else { None };
+            if record.text.is_some() {
+                index.pending_raw_text_clears.remove(document_id);
+            } else if had_text {
+                // A cleared raw caption must reach the text delta as a delete, or
+                // the base's old text resurrects on reload.
+                index.pending_raw_text_clears.insert(document_id.to_string());
+            }
             // The caption changed, so refresh its lexical postings: tokenize the
             // new caption when index_text is on, otherwise clear stale postings.
             let caption_tokens: Vec<String> = if index_text {
@@ -499,6 +532,7 @@ impl CoreEngine {
             } else {
                 Vec::new()
             };
+            let had_tokens = !record.token_lists.is_empty();
             record.token_lists = if caption_tokens.is_empty() {
                 Vec::new()
             } else {
@@ -506,16 +540,26 @@ impl CoreEngine {
             };
             if caption_tokens.is_empty() {
                 index.lexical_index.remove_group(document_id);
+                if had_tokens {
+                    index.pending_lexical_clears.insert(document_id.to_string());
+                }
             } else {
                 index
                     .lexical_index
                     .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+                index.pending_lexical_clears.remove(document_id);
             }
         }
         if metadata_changed {
             let metadata = record.metadata.clone();
             index.add_document_indexes(document_id, &metadata, &chunks, &mut changed_filter_fields);
             index.finalize_filter_fields(&changed_filter_fields);
+        } else if text_for_wal.is_some() {
+            // A text-only update must still mark the document pending, or
+            // persist() no-ops and the checkpoint truncates the WAL record
+            // carrying the only durable copy of the change.
+            index.pending_deletes.remove(document_id);
+            index.pending_upserts.insert(document_id.to_string());
         }
         index.generation += 1;
         let generation = index.generation;
@@ -1567,6 +1611,11 @@ impl CoreEngine {
                             .map(ToString::to_string)
                             .collect()
                     })
+                    // A caption that tokenizes to nothing is logged as `[[]]` but
+                    // stored by the live path as no list at all; collapse empty
+                    // lists so the equality guard below compares like shapes and a
+                    // replayed store stays byte-identical to a live-written one.
+                    .filter(|tokens: &Vec<String>| !tokens.is_empty())
                     .collect(),
                 None => continue,
             };
@@ -1581,11 +1630,21 @@ impl CoreEngine {
                 }
                 _ => continue,
             }
-            let units = vec![(
-                document_id.to_string(),
-                token_lists.into_iter().next().unwrap_or_default(),
-            )];
-            index.lexical_index.replace_group(document_id, &units);
+            if token_lists.is_empty() {
+                // Mirror the live path for a cleared caption: the document leaves
+                // the lexical index instead of lingering as a zero-token unit that
+                // would inflate the BM25 doc count, and the clear is marked for the
+                // delta (the guard above proves the old tokens were non-empty).
+                index.lexical_index.remove_group(document_id);
+                index.pending_lexical_clears.insert(document_id.to_string());
+            } else {
+                let units = vec![(
+                    document_id.to_string(),
+                    token_lists.into_iter().next().unwrap_or_default(),
+                )];
+                index.lexical_index.replace_group(document_id, &units);
+                index.pending_lexical_clears.remove(document_id);
+            }
             // A token-only restore (store_text=false, index_text=true) onto an
             // otherwise-unchanged row leaves upsert_vectors a no-op, so account for
             // the mutation here: mark the row pending AND advance the generation.
@@ -1820,6 +1879,20 @@ impl CoreEngine {
             ) {
                 if let Some(persistence) = self.persistence.as_mut() {
                     persistence.compress_text = persisted;
+                }
+            }
+            if !replay_wal && !persistence_read_only {
+                // A writable generation-mode open must not proceed over unfolded
+                // WAL records: its commits advance the committed generation past
+                // their LSNs, so the next WAL-mode open would skip them as already
+                // folded and truncate the log, silently destroying acknowledged
+                // appends. Refuse instead and point at the fold path.
+                let wal = crate::storage::wal::wal_path(&persistence_path, &index_key);
+                if !crate::storage::wal::read_records(&wal)?.is_empty() {
+                    return invalid(
+                        "store has unfolded WAL records; open it with commit_mode=\"wal\" \
+                         to fold them before a generation-mode writable open",
+                    );
                 }
             }
             if replay_wal && !persistence_read_only {
@@ -2600,6 +2673,8 @@ fn index_from_loaded_store(
         base_calibration_fingerprint,
         pending_upserts: BTreeSet::new(),
         pending_deletes: BTreeSet::new(),
+        pending_lexical_clears: BTreeSet::new(),
+        pending_raw_text_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
     })
 }
@@ -2957,6 +3032,8 @@ fn persist_index_generation(
 ) -> Result<(), CoreError> {
     let nothing_pending = index.pending_upserts.is_empty()
         && index.pending_deletes.is_empty()
+        && index.pending_lexical_clears.is_empty()
+        && index.pending_raw_text_clears.is_empty()
         && index.pending_removed_stable_ids.is_empty();
     // A committed base with nothing pending is already durable on disk.
     if index.base_epoch != 0 && nothing_pending {
@@ -2974,12 +3051,14 @@ fn persist_index_generation(
     // text-free has no `.tvtext` base, and must still be delta-appendable.)
     let pending_text = store_text
         && (!index.pending_deletes.is_empty()
+            || !index.pending_raw_text_clears.is_empty()
             || index
                 .pending_upserts
                 .iter()
                 .any(|id| index.documents.get(id).is_some_and(|r| r.text.is_some())));
     let pending_lexical = index_text
         && (!index.pending_deletes.is_empty()
+            || !index.pending_lexical_clears.is_empty()
             || index.pending_upserts.iter().any(|id| {
                 index
                     .documents
@@ -3028,6 +3107,8 @@ fn persist_index_generation(
     }
     index.pending_upserts.clear();
     index.pending_deletes.clear();
+    index.pending_lexical_clears.clear();
+    index.pending_raw_text_clears.clear();
     index.pending_removed_stable_ids.clear();
     Ok(())
 }
@@ -3174,7 +3255,9 @@ fn write_index_delta(
             chunk_count_after: index.chunk_count(),
             tvim: build_tvim_delta(index)?,
             raw_text_upserts,
+            raw_text_clears: index.pending_raw_text_clears.iter().cloned().collect(),
             lexical_upserts,
+            lexical_clears: index.pending_lexical_clears.iter().cloned().collect(),
             multivec_upserts: Some(multivec_for_documents(
                 index,
                 index.pending_upserts.iter().map(String::as_str),
@@ -3394,6 +3477,17 @@ struct VectorOnlyIndex {
     pending_upserts: BTreeSet<String>,
     /// Document ids deleted since the current base.
     pending_deletes: BTreeSet<String>,
+    /// Live documents whose caption tokens went non-empty to empty since the
+    /// current base. A lexical delta cannot express the clear by omission (absence
+    /// means "unchanged", so the base's old tokens would resurrect on reload);
+    /// these ids are written to the delta as explicit lexical deletes. Dropped
+    /// when a caption returns; may overlap `pending_deletes` (the duplicate entry
+    /// in the delta's deleted list is a no-op).
+    pending_lexical_clears: BTreeSet<String>,
+    /// Live documents whose retained raw text went present to absent since the
+    /// current base; written to the text delta as explicit deletes, like
+    /// `pending_lexical_clears`.
+    pending_raw_text_clears: BTreeSet<String>,
     /// TurboVec stable ids dropped from the live index since the current base and
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
@@ -3429,6 +3523,8 @@ impl VectorOnlyIndex {
             base_calibration_fingerprint: 0,
             pending_upserts: BTreeSet::new(),
             pending_deletes: BTreeSet::new(),
+            pending_lexical_clears: BTreeSet::new(),
+            pending_raw_text_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
         }
     }
@@ -3539,7 +3635,11 @@ impl VectorOnlyIndex {
             }
         }
         // Track the document-level removal for the next generation delta; the tvim
-        // row removals are tracked at the vector-sync choke points.
+        // row removals are tracked at the vector-sync choke points. Pending caption
+        // clears are deliberately NOT dropped here: replacement upserts also run
+        // this helper, and an earlier clear must still reach the delta when the
+        // replacement stays caption-free. A true delete leaves the id in the clear
+        // sets too; the delta's deleted list tolerates the duplicate.
         self.pending_upserts.remove(document_id);
         self.pending_deletes.insert(document_id.to_string());
         for chunk in chunks {

@@ -1767,3 +1767,262 @@ fn appender_privacy_mode_tokens_persist_across_reopen() {
     }
     fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn generation_mode_writable_open_refuses_unfolded_wal_records() {
+    // A writable generation-mode open over acknowledged-but-unfolded appends must
+    // refuse: its commits would advance the committed generation past the appended
+    // LSNs, and the next WAL-mode open would then skip them as already folded and
+    // truncate the log, silently destroying the acknowledged records.
+    let path = unique_temp_dir("core_appender_generation_guard");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        appender
+            .append_vectors(&[doc("d1", 0, metadata(&[]))])
+            .expect("append vectors");
+    }
+    let mut generation = base.clone();
+    generation.commit_mode = "generation".to_string();
+    let error = match CoreEngine::open(generation.clone()) {
+        Ok(_) => panic!("generation-mode open must refuse unfolded WAL records"),
+        Err(error) => error,
+    };
+    assert!(
+        error.message().contains("unfolded WAL records"),
+        "unexpected error: {}",
+        error.message()
+    );
+    // A WAL-mode open folds the record; generation mode is accepted again after.
+    {
+        let writer = CoreEngine::open(base).unwrap();
+        assert_eq!(writer.stats("default").unwrap().document_count, 1);
+    }
+    let reopened = CoreEngine::open(generation).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn replayed_empty_caption_matches_a_live_written_store() {
+    // A caption that tokenizes to nothing ("///") is logged as an empty token list;
+    // its replay must leave the lexical index exactly as a live write does (no
+    // zero-token BM25 unit inflating n/avgdl), so scores match a never-crashed
+    // store bit-for-bit.
+    let live = unique_temp_dir("core_appender_empty_caption_live");
+    let replayed = unique_temp_dir("core_appender_empty_caption_replayed");
+    let documents = || {
+        let mut worded = doc("d1", 0, metadata(&[]));
+        worded.text = Some("alpha beta".to_string());
+        let mut empty = doc("d2", 1, metadata(&[]));
+        empty.text = Some("///".to_string());
+        vec![worded, empty]
+    };
+
+    // Live store: the writer ingests both captions directly. Keep the session
+    // open: the comparison is against the live writer's own lexical state (the
+    // reopen rebuild has its own captionless-document shape on both sides).
+    let mut base_live = open_options(&live, false, "wal");
+    base_live.store_text = false;
+    base_live.acquire_writer_lock = true;
+    let mut live_engine = CoreEngine::open(base_live.clone()).unwrap();
+    create_vector_only_index(&mut live_engine);
+    live_engine.upsert_vectors("default", &documents()).unwrap();
+    live_engine.persist().unwrap();
+
+    // Replayed store: the same records arrive through an appender and are folded
+    // by the next writable open.
+    let mut base_replayed = open_options(&replayed, false, "wal");
+    base_replayed.store_text = false;
+    base_replayed.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base_replayed.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(base_replayed.clone()).expect("open appender");
+        appender.append_vectors(&documents()).expect("append vectors");
+    }
+
+    let folded = CoreEngine::open(base_replayed).unwrap();
+    let live_plan = live_engine.prepare_query_text("alpha", "lexical").unwrap();
+    let live_hits = live_engine
+        .search_embedded_text("default", &live_plan, None, 2, None)
+        .unwrap();
+    let folded_plan = folded.prepare_query_text("alpha", "lexical").unwrap();
+    let folded_hits = folded
+        .search_embedded_text("default", &folded_plan, None, 2, None)
+        .unwrap();
+    assert_eq!(live_hits.hits.len(), 1);
+    assert_eq!(folded_hits.hits.len(), 1);
+    assert_eq!(folded_hits.hits[0].document_id, "d1");
+    assert_eq!(
+        folded_hits.hits[0].score.to_bits(),
+        live_hits.hits[0].score.to_bits(),
+        "a replayed empty caption must not inflate the BM25 statistics"
+    );
+    drop(live_engine);
+    drop(folded);
+    fs::remove_dir_all(live).unwrap();
+    fs::remove_dir_all(replayed).unwrap();
+}
+
+#[test]
+fn cleared_caption_does_not_resurrect_after_reopen() {
+    // Clearing a caption must reach the lexical delta as an explicit delete:
+    // absence means "unchanged", so the base's old tokens would resurrect on
+    // reload. Cover both clear paths: a live payload update and an appender
+    // re-caption folded by WAL replay.
+    let path = unique_temp_dir("core_caption_clear");
+    let mut base = open_options(&path, false, "wal");
+    base.store_text = false;
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut first = doc("d1", 0, metadata(&[]));
+        first.text = Some("turquoise dragon".to_string());
+        let mut second = doc("d2", 1, metadata(&[]));
+        second.text = Some("crimson kraken".to_string());
+        engine.upsert_vectors("default", &[first, second]).unwrap();
+        engine.persist().unwrap(); // the tvlex base holds both captions
+        // Live clear: replace d1's caption with one that tokenizes to nothing.
+        engine
+            .update_document_payload("default", "d1", None, Some(Some("///".to_string())))
+            .unwrap();
+        engine.persist().unwrap(); // this delta commit must carry the clear
+    }
+    // Appender clear: d2 re-captioned to nothing, folded by the next writer.
+    {
+        let appender = CoreAppender::open(base.clone()).expect("open appender");
+        let mut cleared = doc("d2", 1, metadata(&[]));
+        cleared.text = Some("///".to_string());
+        appender.append_vectors(&[cleared]).expect("append vectors");
+    }
+    {
+        let writer = CoreEngine::open(base.clone()).unwrap();
+        drop(writer); // fold + checkpoint truncates the WAL
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    for term in ["dragon", "kraken"] {
+        let plan = reopened.prepare_query_text(term, "lexical").unwrap();
+        let hits = reopened
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert!(
+            hits.hits.is_empty(),
+            "cleared caption resurrected for {term}"
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn text_only_payload_update_survives_the_checkpoint() {
+    // A text-only update (no metadata) must mark the document pending: persist()
+    // otherwise no-ops and the checkpoint truncates the WAL record carrying the
+    // only durable copy. Cover set, replace, and clear against reopens.
+    let path = unique_temp_dir("core_text_only_update");
+    let mut base = open_options(&path, false, "wal"); // store_text = true
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut captioned = doc("d1", 0, metadata(&[]));
+        captioned.text = Some("old caption".to_string());
+        engine.upsert_vectors("default", &[captioned]).unwrap();
+        engine.persist().unwrap();
+        // Replace the caption with a text-only update, then checkpoint.
+        engine
+            .update_document_payload("default", "d1", None, Some(Some("new caption".to_string())))
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    {
+        let engine = CoreEngine::open(base.clone()).unwrap();
+        assert_eq!(
+            engine.get_document_text("default", "d1").unwrap().as_deref(),
+            Some("new caption"),
+            "a text-only update was truncated away with the WAL"
+        );
+        let plan = engine.prepare_query_text("caption", "lexical").unwrap();
+        let hits = engine
+            .search_embedded_text("default", &plan, None, 1, None)
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+    }
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        // Clear the caption entirely; the delta must carry the clear for both the
+        // raw-text and lexical sidecars.
+        engine
+            .update_document_payload("default", "d1", None, Some(None))
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        reopened.get_document_text("default", "d1").unwrap(),
+        None,
+        "a cleared raw caption resurrected from the base"
+    );
+    let plan = reopened.prepare_query_text("caption", "lexical").unwrap();
+    let hits = reopened
+        .search_embedded_text("default", &plan, None, 1, None)
+        .unwrap();
+    assert!(hits.hits.is_empty(), "cleared caption tokens resurrected");
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn clear_then_reupsert_still_persists_the_clear() {
+    // A replacement upsert runs the same index-removal helper as a delete; an
+    // earlier caption clear must survive it, or the delta drops the sidecar
+    // delete and the base's old text/tokens resurrect after reopen.
+    let path = unique_temp_dir("core_caption_clear_reupsert");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let mut captioned = doc("d1", 0, metadata(&[]));
+        captioned.text = Some("turquoise dragon".to_string());
+        engine.upsert_vectors("default", &[captioned]).unwrap();
+        engine.persist().unwrap();
+        // Clear the caption, then replace the document (still caption-free)
+        // before the checkpoint.
+        engine
+            .update_document_payload("default", "d1", None, Some(None))
+            .unwrap();
+        engine
+            .upsert_vectors("default", &[doc("d1", 2, metadata(&[("kind", "moved")]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(base).unwrap();
+    assert_eq!(
+        reopened.get_document_text("default", "d1").unwrap(),
+        None,
+        "cleared raw caption resurrected past a replacement upsert"
+    );
+    let plan = reopened.prepare_query_text("dragon", "lexical").unwrap();
+    let hits = reopened
+        .search_embedded_text("default", &plan, None, 1, None)
+        .unwrap();
+    assert!(
+        hits.hits.is_empty(),
+        "cleared caption tokens resurrected past a replacement upsert"
+    );
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
