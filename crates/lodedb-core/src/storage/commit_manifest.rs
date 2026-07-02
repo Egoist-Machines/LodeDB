@@ -13,6 +13,10 @@ pub const COMMIT_MANIFEST_SCHEMA_VERSION: i64 = 1;
 #[derive(Debug, Clone)]
 pub struct CommitManifest {
     pub body: Value,
+    /// The verified body checksum from disk. Changes on every root-manifest swap, so
+    /// a lock-free reader can use it as a cheap seqlock token without re-hashing the
+    /// body (see `CoreEngine::committed_root_tokens`).
+    pub body_sha256: String,
 }
 
 impl CommitManifest {
@@ -38,6 +42,31 @@ impl CommitManifest {
             .and_then(|object| object.get("base_epoch"))
             .and_then(Value::as_u64)
             .unwrap_or(0)
+    }
+
+    /// Highest LSN durably folded into this generation: the max of the writer's
+    /// own generation-as-LSN and any appended-record LSNs it checkpointed. A reader
+    /// uses it as the base watermark for read-your-writes. Absent on manifests
+    /// written before this field (an ignored optional body key, not a schema bump),
+    /// where the generation is the best available watermark.
+    pub fn applied_lsn(&self) -> u64 {
+        self.body
+            .as_object()
+            .and_then(|object| object.get("applied_lsn"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| self.generation())
+    }
+
+    /// The index's native vector dimension, when this manifest records it. Fixed at
+    /// index creation, so [`load_store_metadata`](crate::storage::load_store_metadata)
+    /// reads it here to skip loading the state base. Absent on manifests written
+    /// before this field (an ignored optional body key, not a schema bump); the
+    /// caller then falls back to the state base, which always carries it.
+    pub fn native_dim(&self) -> Option<u64> {
+        self.body
+            .as_object()
+            .and_then(|object| object.get("native_dim"))
+            .and_then(Value::as_u64)
     }
 
     pub fn store_manifest(&self, key: &str) -> Option<&Value> {
@@ -94,17 +123,27 @@ pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
     if !body.is_object() || get_str(&document, "body_sha256").is_empty() {
         return Err(corrupt("commit manifest is missing its body or checksum"));
     }
-    if body_sha256(body)? != get_str(&document, "body_sha256") {
+    let stored_sha = get_str(&document, "body_sha256").to_string();
+    if body_sha256(body)? != stored_sha {
         return Err(corrupt("commit manifest failed body checksum"));
     }
-    Ok(Some(CommitManifest { body: body.clone() }))
+    Ok(Some(CommitManifest {
+        body: body.clone(),
+        body_sha256: stored_sha,
+    }))
 }
 
 #[derive(Debug, Clone)]
 pub struct CommitBodyInput<'a> {
     pub index_key: &'a str,
     pub generation: u64,
+    /// Highest LSN durably folded into this generation (see
+    /// [`CommitManifest::applied_lsn`]); always `>= generation`.
+    pub applied_lsn: u64,
     pub base_epoch: u64,
+    /// The index's native vector dimension, recorded so a metadata read need not load
+    /// the state base (see [`CommitManifest::native_dim`]). `None` omits the key.
+    pub native_dim: Option<u64>,
     pub document_count: usize,
     pub chunk_count: usize,
     pub json_manifest: Option<Value>,
@@ -116,9 +155,10 @@ pub struct CommitBodyInput<'a> {
 }
 
 pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "index_key": input.index_key,
         "generation": input.generation,
+        "applied_lsn": input.applied_lsn.max(input.generation),
         "base_epoch": input.base_epoch,
         "document_count": input.document_count,
         "chunk_count": input.chunk_count,
@@ -128,7 +168,13 @@ pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
         "tvlex": input.tvlex_manifest,
         "tvmv": input.tvmv_manifest,
         "tvann": input.tvann_manifest,
-    })
+    });
+    // Optional key: only recorded when the dimension is known, so a manifest carried
+    // forward from a pre-`native_dim` commit stays byte-for-byte as it was.
+    if let Some(native_dim) = input.native_dim {
+        body["native_dim"] = serde_json::json!(native_dim);
+    }
+    body
 }
 
 pub fn write_commit_manifest(path: &Path, body: &Value, fsync: bool) -> CoreResult<usize> {

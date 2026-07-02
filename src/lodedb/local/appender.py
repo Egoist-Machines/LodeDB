@@ -10,7 +10,6 @@ concurrent processes.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable, Mapping, Sequence
 from os import PathLike
 from typing import Any
@@ -19,7 +18,12 @@ from lodedb.engine._atomic_io import normalize_durability
 from lodedb.engine._filelock import ConcurrentWriterError
 from lodedb.engine.core import EngineVectorDocument
 from lodedb.engine.native_adapter import NativeCoreAdapter, NativeCoreAppenderHandle
-from lodedb.local.db import _coerce_metadata, _coerce_optional_text, _is_writer_lock_contention
+from lodedb.local.db import (
+    _coerce_metadata,
+    _coerce_optional_text,
+    _finite_float_vector,
+    _is_writer_lock_contention,
+)
 
 __all__ = ["Appender"]
 
@@ -138,7 +142,7 @@ class Appender:
             prepared.append(
                 EngineVectorDocument(
                     document_id=str(document_id),
-                    vector=_normalize_vector(vector, normalize=normalize),
+                    vector=_finite_float_vector(vector, normalize=normalize),
                     metadata=_coerce_metadata(item.get("metadata")),
                     text=_coerce_optional_text(item.get("text")),
                 )
@@ -174,29 +178,3 @@ class Appender:
         if self._handle is None:
             raise RuntimeError("appender is closed")
         return self._handle
-
-
-def _normalize_vector(vector: Sequence[float], *, normalize: bool) -> list[float]:
-    # Mirror LodeDB.add_vectors' _prepare_vector: compute in Python float (float64)
-    # and validate finiteness, so a large-but-finite vector cannot overflow to inf
-    # under a float32 norm and be stored as an all-zero (direction-losing) record.
-    try:
-        values = [float(component) for component in vector]
-    except (TypeError, ValueError) as error:
-        raise ValueError("vector must be a sequence of numbers") from error
-    if not values:
-        raise ValueError("vector must be non-empty")
-    if not all(math.isfinite(component) for component in values):
-        raise ValueError("vector must contain only finite values")
-    if normalize:
-        # math.hypot scales internally, so a large-but-finite component (whose square
-        # would overflow float64) does not push the norm to inf and zero the vector.
-        norm = math.hypot(*values)
-        if norm == 0.0:
-            raise ValueError(
-                "cannot normalize a zero vector; pass normalize=False to store it as-is"
-            )
-        if not math.isfinite(norm):
-            raise ValueError("vector norm overflows; scale the vector down before appending")
-        values = [component / norm for component in values]
-    return values

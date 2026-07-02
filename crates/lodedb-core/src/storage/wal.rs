@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 pub const WAL_SUFFIX: &str = ".wal";
 pub const WAL_MAGIC: &[u8; 8] = b"EELWAL01";
 pub const WAL_SCHEMA_VERSION: u32 = 1;
+/// Bytes of the fixed file header written once at WAL creation: the 8-byte magic
+/// plus the 4-byte big-endian schema version. Records start at this offset.
+pub const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalRecord {
@@ -40,7 +43,7 @@ pub fn append_record(
     path: &Path,
     lsn: u64,
     op: &str,
-    payload: &Value,
+    payload: Value,
     fsync: bool,
 ) -> CoreResult<WalAppend> {
     let body = encode_body(op, payload, lsn)?;
@@ -101,15 +104,16 @@ pub fn truncate(path: &Path, fsync: bool) -> CoreResult<()> {
 }
 
 pub fn scan_stats(path: &Path) -> CoreResult<WalStats> {
-    let records = read_records(path)?;
-    let mut byte_count = 0;
-    for record in &records {
-        let body = encode_body(&record.op, &record.payload, record.lsn.unwrap_or(0))?;
-        byte_count += 4 + body.len() + 4;
-    }
+    // The scan already computes the exact byte length of the valid frame prefix,
+    // so reuse it rather than re-encoding every record body just to count bytes.
+    // The old re-encode also stamped `lsn: 0` onto pre-LSN records that never had
+    // that key on disk, inflating their size. `valid_len` counts the full valid
+    // WAL (the 12-byte header included); that constant offset does not affect the
+    // size-based checkpoint trigger.
+    let scan = read_records_with_valid_len(path)?;
     Ok(WalStats {
-        op_count: records.len(),
-        byte_count,
+        op_count: scan.records.len(),
+        byte_count: scan.valid_len as usize,
     })
 }
 
@@ -140,9 +144,21 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
             total_len: 0,
         });
     }
-    let data =
-        std::fs::read(path).map_err(|error| corrupt(format!("WAL could not be read: {error}")))?;
-    if data.len() < 12 {
+    // A concurrent checkpoint can remove the WAL between the `is_file` check above
+    // and this read; treat that race as an empty WAL (a lock-free reader's refresh
+    // seqlock then retries against the new base) rather than a hard I/O error.
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalScan {
+                records: Vec::new(),
+                valid_len: 0,
+                total_len: 0,
+            });
+        }
+        Err(error) => return Err(corrupt(format!("WAL could not be read: {error}"))),
+    };
+    if data.len() < WAL_HEADER_LEN {
         return Ok(WalScan {
             records: Vec::new(),
             valid_len: 0,
@@ -161,7 +177,7 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
         )));
     }
     let mut records = Vec::new();
-    let mut offset = 12_usize;
+    let mut offset = WAL_HEADER_LEN;
     let total = data.len();
     while offset < total {
         if offset + 4 > total {
@@ -239,6 +255,11 @@ pub fn checkpoint_store(
     let input = crate::storage::GenerationCommitInput {
         index_key: &store.index_key,
         generation: next_generation,
+        // Carry the loaded store's applied-LSN watermark forward, never below it: a
+        // store folded past its committed generation reports `applied_lsn >
+        // generation`, and dropping back to `next_generation` here would regress the
+        // durable watermark a lock-free reader trusts for read-your-writes.
+        applied_lsn: store.applied_lsn.max(next_generation),
         base_epoch: next_generation,
         state: &store.state,
         tvim: None,
@@ -288,22 +309,23 @@ fn decode_body(body: &[u8]) -> CoreResult<WalRecord> {
     Ok(WalRecord { op, payload, lsn })
 }
 
-fn encode_body(op: &str, payload: &Value, lsn: u64) -> CoreResult<Vec<u8>> {
+fn encode_body(op: &str, mut payload: Value, lsn: u64) -> CoreResult<Vec<u8>> {
     if op.is_empty() || op.contains('\n') {
         return Err(corrupt("WAL record op must be non-empty and newline-free"));
     }
-    let Some(object) = payload.as_object() else {
+    let Some(object) = payload.as_object_mut() else {
         return Err(corrupt("WAL record payload must be a JSON object"));
     };
     // Stamp the log sequence number into the JSON body rather than the binary
     // frame, so the frame layout (and the committed cross-version WAL fixtures)
-    // stays byte-compatible. `decode_body` lifts it back out on read.
-    let mut object = object.clone();
+    // stays byte-compatible. `decode_body` lifts it back out on read. The payload
+    // is taken by value and mutated in place: both append callers own the payload
+    // they pass, so this avoids cloning the whole value tree on the write hot path.
     object.insert("lsn".to_string(), Value::from(lsn));
     let mut body = Vec::new();
     body.extend_from_slice(op.as_bytes());
     body.push(b'\n');
-    let payload = serde_json::to_vec(&Value::Object(object))
+    let payload = serde_json::to_vec(&payload)
         .map_err(|error| corrupt(format!("WAL payload could not be encoded: {error}")))?;
     body.extend_from_slice(&payload);
     Ok(body)
@@ -716,13 +738,13 @@ mod tests {
     fn appends_and_reads_framed_records() {
         let dir = temp_dir("append-read");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         let append = append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -745,13 +767,13 @@ mod tests {
     fn drops_torn_trailing_frame() {
         let dir = temp_dir("torn-tail");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -769,13 +791,13 @@ mod tests {
     fn corrupt_interior_frame_fails_closed() {
         let dir = temp_dir("interior-corrupt");
         let path = dir.join("default.wal");
-        append_record(&path, 1, "upsert_documents", &json!({"documents": []}), false)
+        append_record(&path, 1, "upsert_documents", json!({"documents": []}), false)
             .expect("append first");
         append_record(
             &path,
             2,
             "delete_documents",
-            &json!({"document_ids": ["alpha"]}),
+            json!({"document_ids": ["alpha"]}),
             false,
         )
         .expect("append second");
@@ -848,6 +870,7 @@ mod tests {
             layout: StoreLayout::Generation,
             index_key: index_key.to_string(),
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: empty_state(index_key),
             tvim_path: None,
@@ -880,7 +903,7 @@ mod tests {
             &wal,
             1,
             "upsert_documents",
-            &json!({
+            json!({
                 "documents": [{
                     "document_id": "alpha",
                     "text": "Alpha text.",
@@ -898,6 +921,7 @@ mod tests {
             layout: StoreLayout::Generation,
             index_key: index_key.to_string(),
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state,
             tvim_path: None,

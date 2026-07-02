@@ -40,13 +40,13 @@ public final class LodeAppender {
 
     /// Opens an appender over the store at `path`.
     ///
-    /// `commitMode` must be `.wal` (the default); generation mode is rejected because
-    /// it never replays the WAL, so appended records would be acknowledged yet never
-    /// folded in. `durability` defaults to `.fsync` (each append is fsynced before
-    /// returning, matching `LodeDB`); pass `.buffered` to trade power-loss durability
-    /// for ingest throughput. `acquireWriterLock` takes the shared
-    /// `<dir>/.lodedb.lock` so appenders exclude an exclusive writer (pass `false`
-    /// only when an outer caller owns exclusion).
+    /// The appender always uses WAL commit mode: generation mode never replays the
+    /// WAL, so an appended record would be acknowledged yet never folded in.
+    /// `durability` defaults to `.fsync` (each append is fsynced before returning,
+    /// matching `LodeDB`); pass `.buffered` to trade power-loss durability for
+    /// ingest throughput. `acquireWriterLock` takes the shared `<dir>/.lodedb.lock`
+    /// so appenders exclude an exclusive writer (pass `false` only when an outer
+    /// caller owns exclusion).
     ///
     /// `storeText`/`indexText` default to `false` (privacy: no raw text reaches the
     /// WAL). These are appender-specific defaults, so customizing another argument
@@ -55,16 +55,11 @@ public final class LodeAppender {
     /// writer drops the caption at checkpoint.
     public static func open(
         at path: URL,
-        commitMode: CommitMode = .wal,
         durability: Durability = .fsync,
         storeText: Bool = false,
         indexText: Bool = false,
         acquireWriterLock: Bool = true
     ) throws -> LodeAppender {
-        guard commitMode == .wal else {
-            throw LodeDBError.unsupported(
-                "the appender requires WAL commit mode; generation mode does not replay the WAL")
-        }
         let options = LodeStoreOptions(
             durability: durability,
             commitMode: .wal,
@@ -94,8 +89,10 @@ public final class LodeAppender {
     /// number. Appending an empty array throws.
     @discardableResult
     public func append(_ documents: [LodeAppendDocument]) throws -> UInt64 {
+        // Reuse the writer's vector-document shape so an appended record is
+        // byte-identical to a `LodeDB.addVectors` one and replays the same way.
         let payload = documents.map {
-            AppenderVectorDocumentJSON(
+            NativeVectorDocumentJSON(
                 documentID: $0.id, vector: $0.vector, metadata: $0.metadata, text: $0.text)
         }
         return try native.appendVectorsJSON(try encodeJSON(payload))
@@ -105,21 +102,5 @@ public final class LodeAppender {
     @discardableResult
     public func delete(ids: [String]) throws -> UInt64 {
         try native.appendDeletesJSON(try encodeJSON(ids))
-    }
-}
-
-private struct AppenderVectorDocumentJSON: Encodable {
-    let documentID: String
-    let vector: [Float]
-    let metadata: [String: String]
-    // The optional caption. The native appender retains it only under storeText;
-    // otherwise it is dropped, so no raw text reaches the WAL.
-    let text: String?
-
-    enum CodingKeys: String, CodingKey {
-        case documentID = "document_id"
-        case vector
-        case metadata
-        case text
     }
 }

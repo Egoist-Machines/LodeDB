@@ -50,6 +50,7 @@ fn main() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &state,
             tvim: None,
@@ -66,7 +67,7 @@ fn main() {
         &wal::wal_path(&target, INDEX_KEY),
         2,
         "upsert_documents",
-        &json!({
+        json!({
             "client_id": "lodedb-local",
             "index_id": "default",
             "documents": [{

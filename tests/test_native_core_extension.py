@@ -1327,6 +1327,38 @@ def test_public_appender_api_round_trip(tmp_path) -> None:
         reopened.close()
 
 
+def test_read_only_refresh_gives_reader_freshness_and_read_your_writes(tmp_path) -> None:
+    """A read-only LodeDB is a stable snapshot until refresh(), which overlays the
+    WAL tail an Appender wrote -- giving reader freshness and read-your-writes:
+    applied_lsn() catches up to the appended LSN and the record becomes queryable."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    reader = lodedb.LodeDB.open_vector_store(store, vector_dim=8, read_only=True)
+    try:
+        assert reader.count() == 0
+        base_lsn = reader.applied_lsn()
+
+        with lodedb.Appender.open(store) as appender:
+            lsn = appender.append(_onehot(0), id="fresh", metadata={"topic": "ops"})
+
+        # Still the snapshot: no refresh, no change.
+        assert reader.count() == 0
+        assert reader.applied_lsn() == base_lsn
+
+        # Refresh folds the WAL tail: the append is visible and applied_lsn caught up.
+        reader.refresh()
+        assert reader.applied_lsn() >= lsn
+        assert reader.count() == 1
+        hits = reader.search_by_vector(_onehot(0), k=1)
+        assert [hit.id for hit in hits] == ["fresh"]
+    finally:
+        reader.close()
+
+
 def test_public_appender_rejects_zero_vector_when_normalizing(tmp_path) -> None:
     """A zero vector cannot be L2-normalized, so the default path rejects it (matching
     LodeDB.add_vectors) rather than committing a meaningless record."""

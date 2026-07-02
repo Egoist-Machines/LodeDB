@@ -132,6 +132,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &rust_state_payload(1, &[]),
             tvim: None,
@@ -149,7 +150,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
         &wal_path,
         2,
         "upsert_documents",
-        &json!({
+        json!({
             "client_id": "lodedb-local",
             "index_id": "default",
             "documents": [{
@@ -172,6 +173,7 @@ fn wal_append_checkpoint_then_truncate_is_idempotent() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 2,
+            applied_lsn: 2,
             base_epoch: 2,
             state: &loaded.state,
             tvim: None,
@@ -370,6 +372,7 @@ fn rust_generation_writer_round_trips_state_and_sidecars() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &rust_state_payload(1, &["doc-rust-a", "doc-rust-b"]),
             tvim: None,
@@ -399,6 +402,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &rust_state_payload(1, &["old"]),
             tvim: None,
@@ -430,6 +434,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 2,
+            applied_lsn: 2,
             base_epoch: 2,
             state: &rust_state_payload(2, &["new"]),
             tvim: None,
@@ -458,6 +463,7 @@ fn generation_commit_point_and_gc_are_root_manifest_swap() {
             GenerationCommitInput {
                 index_key: INDEX_KEY,
                 generation: epoch,
+                applied_lsn: epoch,
                 base_epoch: epoch,
                 state: &rust_state_payload(epoch, &[&format!("doc-{epoch}")]),
                 tvim: None,
@@ -553,6 +559,7 @@ fn multivec_persists_through_generation_commit() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &rust_state_payload(1, &["doc-a", "doc-b"]),
             tvim: None,

@@ -394,6 +394,21 @@ final class NativeEngine {
         try Self.check(lodedb_engine_persist(handle, &error), error: error)
     }
 
+    func refresh() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try Self.check(lodedb_engine_refresh(handle, &error), error: error)
+    }
+
+    func appliedLSN() throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) {
+            lodedb_engine_applied_lsn(handle, $0, &lsn, &error)
+        }
+        try Self.check(status, error: error)
+        return lsn
+    }
+
     func close() throws {
         var error: UnsafeMutablePointer<LodeError>?
         try Self.check(lodedb_engine_close(handle, &error), error: error)

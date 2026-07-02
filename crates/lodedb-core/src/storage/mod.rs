@@ -7,7 +7,7 @@ pub mod state_journal;
 pub mod text_store;
 pub mod tvann_store;
 pub mod tvim_delta;
-mod util;
+pub(crate) mod util;
 pub mod wal;
 
 use crate::error::CoreError;
@@ -39,6 +39,10 @@ pub struct LoadedStore {
     pub layout: StoreLayout,
     pub index_key: String,
     pub generation: u64,
+    /// Highest LSN durably folded into this generation (the commit manifest's
+    /// `applied_lsn`, defaulting to `generation` for older manifests / legacy
+    /// stores). The read-your-writes base watermark; always `>= generation`.
+    pub applied_lsn: u64,
     pub base_epoch: u64,
     pub state: Value,
     pub tvim_path: Option<PathBuf>,
@@ -102,6 +106,7 @@ pub fn load_store(
             layout: StoreLayout::LegacyTopLevelJson,
             index_key: index_key.to_string(),
             generation: 0,
+            applied_lsn: 0,
             base_epoch: 0,
             state: legacy.payload,
             tvim_path: legacy_tvim_path(persistence_dir, index_key),
@@ -206,6 +211,7 @@ pub fn load_generation_store(
         layout: StoreLayout::Generation,
         index_key,
         generation: manifest.generation(),
+        applied_lsn: manifest.applied_lsn(),
         base_epoch,
         state,
         tvim_path,
@@ -215,6 +221,49 @@ pub fn load_generation_store(
         multivec,
         ann,
         wal_records,
+    })
+}
+
+/// Cheap store metadata for the append path: the committed generation and the
+/// index's vector dimension. Read from the commit manifest and the state base
+/// payload only — unlike [`load_store`] it does not read or checksum the `.tvim`
+/// vectors or the text/lexical/multivec/ann sidecars, so a `CoreAppender` open is
+/// O(state metadata) rather than O(store).
+#[derive(Debug, Clone, Copy)]
+pub struct StoreMetadata {
+    pub generation: u64,
+    /// Highest LSN durably folded into the committed generation (the manifest's
+    /// `applied_lsn`, `>= generation`). The appender clamps every reservation above
+    /// it so a fresh append never reuses an LSN the store already reports applied.
+    pub applied_lsn: u64,
+    pub native_dim: usize,
+}
+
+/// Reads [`StoreMetadata`] for a generation store, or an error when no committed
+/// generation exists for `index_key`.
+pub fn load_store_metadata(persistence_dir: &Path, index_key: &str) -> CoreResult<StoreMetadata> {
+    let manifest = read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
+        .ok_or_else(|| invalid(format!("no committed generation for index key {index_key}")))?;
+    // native_dim is fixed at index creation. Recent manifests record it directly, so
+    // the whole read is O(manifest). Fall back to the state base only for a manifest
+    // written before the field existed: it always carries native_dim (state deltas
+    // journal only document/chunk mutations), and reading just the base -- not the
+    // deltas, the vectors, or any sidecar -- keeps that fallback O(state metadata).
+    let native_dim = match manifest.native_dim() {
+        Some(dim) => dim as usize,
+        None => {
+            let base_epoch = manifest.base_epoch();
+            let state = state_journal::read_base_payload(
+                &base_json_path(persistence_dir, index_key, base_epoch),
+                manifest.store_manifest("json"),
+            )?;
+            state.get("native_dim").and_then(Value::as_u64).unwrap_or(0) as usize
+        }
+    };
+    Ok(StoreMetadata {
+        generation: manifest.generation(),
+        applied_lsn: manifest.applied_lsn(),
+        native_dim,
     })
 }
 
@@ -255,6 +304,9 @@ pub struct TvimBaseWrite<'a> {
 pub struct GenerationCommitInput<'a> {
     pub index_key: &'a str,
     pub generation: u64,
+    /// Highest LSN durably folded into this generation (see
+    /// [`commit_manifest::CommitManifest::applied_lsn`]); clamped up to `generation`.
+    pub applied_lsn: u64,
     pub base_epoch: u64,
     pub state: &'a Value,
     pub tvim: Option<TvimBaseWrite<'a>>,
@@ -344,7 +396,11 @@ pub fn write_generation_commit(
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
+        applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
+        // The full state base carries native_dim; record it so a metadata read need
+        // not reload the base to recover it.
+        native_dim: input.state.get("native_dim").and_then(Value::as_u64),
         document_count,
         chunk_count,
         json_manifest: Some(json_manifest),
@@ -417,7 +473,14 @@ pub struct GenerationDeltaInput<'a> {
     pub lexical_clears: Vec<String>,
     /// `Some` only for late-interaction stores; the changed documents' matrices.
     pub multivec_upserts: Option<MultiVecMap>,
+    /// Live documents whose late-interaction matrix was cleared since the base;
+    /// written to the multi-vector delta as explicit deletes, like
+    /// `raw_text_clears`/`lexical_clears`.
+    pub multivec_clears: Vec<String>,
     pub document_deletes: Vec<String>,
+    /// Highest LSN durably folded into this generation (see
+    /// [`commit_manifest::CommitManifest::applied_lsn`]); clamped up to `generation`.
+    pub applied_lsn: u64,
     /// Whether a new document-text delta segment is zstd-compressed. Threaded
     /// from the engine's effective (persisted-or-seeded) flag down to
     /// [`text_store::append_delta`].
@@ -553,19 +616,24 @@ pub fn write_generation_delta(
         _ => previous.store_manifest("tvlex").cloned(),
     };
     // Only append a multi-vector delta for a store that actually has a tvmv base:
-    // a patch-matrix upsert, or a delete against an existing multi-vector base.
-    // A non-late-interaction store never wrote a tvmv base, so its deletes must not
-    // try to append one (there is no manifest to read).
+    // a patch-matrix upsert, or a delete/clear against an existing multi-vector
+    // base. A non-late-interaction store never wrote a tvmv base, so its
+    // deletes/clears must not try to append one (there is no manifest to read).
     let multivec_manifest = match input.multivec_upserts {
         Some(upserts)
             if !upserts.is_empty()
-                || (!input.document_deletes.is_empty()
+                || ((!input.document_deletes.is_empty() || !input.multivec_clears.is_empty())
                     && previous.store_manifest("tvmv").is_some()) =>
         {
+            // A live document whose matrix was cleared is written as an explicit
+            // delete, or the base's matrix resurrects on reload (the delta means
+            // "unchanged" by omission), mirroring the text/lexical clear handling.
+            let mut deleted = input.document_deletes.clone();
+            deleted.extend(input.multivec_clears.iter().cloned());
             Some(multivec_store::append_delta(
                 &base_tvmv_path(persistence_dir, input.index_key, input.base_epoch),
                 &upserts,
-                &input.document_deletes,
+                &deleted,
                 input.document_count_after,
                 fsync,
             )?)
@@ -589,7 +657,11 @@ pub fn write_generation_delta(
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
+        applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
+        // native_dim is fixed at index creation; carry the previous manifest's value
+        // forward (absent only when the prior commit predates the field).
+        native_dim: previous.native_dim(),
         document_count: input.document_count_after,
         chunk_count: input.chunk_count_after,
         json_manifest: Some(json_manifest),
@@ -604,6 +676,50 @@ pub fn write_generation_delta(
         &body,
         fsync,
     )?;
+    Ok(body)
+}
+
+/// Re-seals the commit manifest at a new generation and applied-LSN watermark
+/// without writing any base or delta segment. A no-op fold (an idempotent re-add or
+/// a missing-id delete) advances the durable watermark without changing document
+/// state, so every store manifest, base epoch, and count carries forward unchanged
+/// from the previous commit; only the generation and `applied_lsn` move. This keeps
+/// a watermark flush O(manifest) instead of appending an empty state-journal segment
+/// that would otherwise bloat the journal toward compaction.
+pub fn write_generation_watermark(
+    persistence_dir: impl AsRef<Path>,
+    index_key: &str,
+    generation: u64,
+    applied_lsn: u64,
+    fsync: bool,
+) -> CoreResult<Value> {
+    let persistence_dir = persistence_dir.as_ref();
+    let previous = read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
+        .ok_or_else(|| corrupt("watermark commit requires an existing commit manifest"))?;
+    let carried_count = |key: &str| {
+        previous
+            .body
+            .as_object()
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+    let body = build_commit_body(CommitBodyInput {
+        index_key,
+        generation,
+        applied_lsn,
+        base_epoch: previous.base_epoch(),
+        native_dim: previous.native_dim(),
+        document_count: carried_count("document_count"),
+        chunk_count: carried_count("chunk_count"),
+        json_manifest: previous.store_manifest("json").cloned(),
+        tvim_manifest: previous.store_manifest("tvim").cloned(),
+        tvtext_manifest: previous.store_manifest("tvtext").cloned(),
+        tvlex_manifest: previous.store_manifest("tvlex").cloned(),
+        tvmv_manifest: previous.store_manifest("tvmv").cloned(),
+        tvann_manifest: previous.store_manifest("tvann").cloned(),
+    });
+    write_commit_manifest(&commit_manifest_path(persistence_dir, index_key), &body, fsync)?;
     Ok(body)
 }
 

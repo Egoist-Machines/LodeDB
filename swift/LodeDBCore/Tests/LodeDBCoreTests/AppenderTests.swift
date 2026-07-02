@@ -40,6 +40,40 @@ import Testing
     try reopened.close()
 }
 
+@Test func readOnlyRefreshGivesReaderFreshnessAndReadYourWrites() throws {
+    let store = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-refresh-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: store) }
+
+    // A writer creates the WAL store + index, then closes so a reader/appender can open.
+    try LodeDB(path: store, vectorDimension: 8).close()
+
+    let reader = try LodeDB.openReadOnly(path: store)
+    #expect(reader.count == 0)
+    let baseLSN = try reader.appliedLSN()
+
+    // A separate appender logs a vector-in record.
+    var appendedLSN: UInt64 = 0
+    do {
+        let appender = try LodeAppender.open(at: store)
+        appendedLSN = try appender.append(
+            id: "fresh", vector: [1, 0, 0, 0, 0, 0, 0, 0], metadata: ["topic": "ops"])
+    }
+
+    // Still the snapshot: no refresh, no change.
+    #expect(reader.count == 0)
+    #expect(try reader.appliedLSN() == baseLSN)
+
+    // Refresh overlays the WAL tail: the append is visible and applied LSN caught up.
+    try reader.refresh()
+    #expect(try reader.appliedLSN() >= appendedLSN)
+    #expect(reader.count == 1)
+    let hits = try reader.search(vector: [1, 0, 0, 0, 0, 0, 0, 0], k: 1)
+    #expect(hits.map(\.id) == ["fresh"])
+    try reader.close()
+}
+
 @Test func appenderOpenRequiresAnExistingIndex() throws {
     let empty = FileManager.default.temporaryDirectory
         .appendingPathComponent("lodedb-appender-empty-\(UUID().uuidString)")
@@ -49,19 +83,6 @@ import Testing
     // No index at the path: the appender must fail closed rather than open.
     #expect(throws: (any Error).self) {
         _ = try LodeAppender.open(at: empty)
-    }
-}
-
-@Test func appenderRejectsGenerationModeOptions() throws {
-    let store = FileManager.default.temporaryDirectory
-        .appendingPathComponent("lodedb-appender-gen-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: store) }
-
-    // Generation mode never replays the WAL, so the appender must reject it rather
-    // than acknowledge appends the next generation-mode writer would never fold in.
-    #expect(throws: LodeDBError.self) {
-        _ = try LodeAppender.open(at: store, commitMode: .generation)
     }
 }
 
