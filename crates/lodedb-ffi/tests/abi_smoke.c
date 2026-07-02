@@ -267,6 +267,39 @@ int main(void) {
   lodedb_error_free(error);
   error = 0;
 
+  // create_index_json: build an ANN-enabled index from a full options blob and
+  // confirm the ann config deserializes, is accepted, and the index serves.
+  const char *ann_options_json =
+      "{\"index_id\":\"ann-idx\",\"index_key\":\"ann-idx\",\"client_id_hash\":\"ann-idx\","
+      "\"name\":\"lodedb-local\",\"model\":\"external\",\"provider\":\"external\","
+      "\"task\":\"vector-only\",\"route_profile\":\"vector-only\","
+      "\"storage_profile\":\"turbovec_direct\",\"vector_dim\":8,\"bit_width\":4,"
+      "\"ann\":{\"algorithm\":\"cluster\",\"nprobe\":1}}";
+  assert(lodedb_engine_create_index_json(engine, sv(ann_options_json), &error) == LODE_OK);
+  assert(lodedb_engine_upsert_vectors(engine, sv("ann-idx"), &document, 1, &error) == LODE_OK);
+  LodeSearchRequest ann_request;
+  ann_request.size = sizeof(LodeSearchRequest);
+  ann_request.version = LODEDB_ABI_VERSION;
+  ann_request.index_id = sv("ann-idx");
+  ann_request.query = vector;
+  ann_request.query_len = 8;
+  ann_request.top_k = 1;
+  LodeSearchResults *ann_results = 0;
+  assert(lodedb_engine_query_vector(engine, &ann_request, &ann_results, &error) == LODE_OK);
+  assert(ann_results != 0 && ann_results->hits_len == 1);
+  lodedb_search_results_free(ann_results);
+
+  // An unknown ann algorithm fails closed through the JSON create path.
+  const char *ann_bad_json =
+      "{\"index_id\":\"ann-bad\",\"index_key\":\"ann-bad\",\"client_id_hash\":\"ann-bad\","
+      "\"name\":\"n\",\"model\":\"external\",\"provider\":\"external\",\"task\":\"vector-only\","
+      "\"route_profile\":\"vector-only\",\"storage_profile\":\"turbovec_direct\","
+      "\"vector_dim\":8,\"bit_width\":4,\"ann\":{\"algorithm\":\"hnsw\"}}";
+  assert(lodedb_engine_create_index_json(engine, sv(ann_bad_json), &error) ==
+         LODE_INVALID_ARGUMENT);
+  lodedb_error_free(error);
+  error = 0;
+
   // persist/close on an in-memory engine are no-ops that still return OK.
   assert(lodedb_engine_persist(engine, &error) == LODE_OK);
   assert(lodedb_engine_close(engine, &error) == LODE_OK);

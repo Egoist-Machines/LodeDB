@@ -51,12 +51,13 @@ public final class LodeDB {
     ///
     /// Pass `modelIdentity` (e.g. an embedder's `modelIdentity`) to bind the index to
     /// a model so a later durable reopen can reject a different same-dimension model.
-    public init(vectorDimension: Int, modelIdentity: String? = nil) throws {
+    public init(vectorDimension: Int, modelIdentity: String? = nil, ann: LodeAnnOptions? = nil) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
         }
         self.vectorDimension = vectorDimension
-        self.engine = try NativeEngine.inMemory(vectorDimension: vectorDimension, model: modelIdentity)
+        self.engine = try NativeEngine.inMemory(
+            vectorDimension: vectorDimension, model: modelIdentity, ann: ann)
         self.storesText = true
         self.indexesText = true
     }
@@ -68,7 +69,8 @@ public final class LodeDB {
         path: URL,
         vectorDimension: Int,
         options: LodeStoreOptions = LodeStoreOptions(),
-        modelIdentity: String? = nil
+        modelIdentity: String? = nil,
+        ann: LodeAnnOptions? = nil
     ) throws {
         guard vectorDimension > 0 else {
             throw LodeDBError.invalidArgument("vectorDimension must be positive")
@@ -79,12 +81,14 @@ public final class LodeDB {
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: false)
         let engine = try NativeEngine.open(optionsJSON: optionsJSON)
         // Create the index on a fresh store, or verify the identity of an existing one.
+        // `ann` is a create-time choice: on reopen the persisted config is used, so a
+        // reopen ignores this argument (the existing index keeps how it was created).
         let existing = try decodeJSON([String].self, from: engine.indexIdsJSON())
         if existing.contains(engine.indexID) {
             let stats = CollectionStats(try decodeJSON(CoreEngineStatsJSON.self, from: engine.statsJSON()))
             try LodeDB.validate(stats: stats, vectorDimension: vectorDimension, modelIdentity: modelIdentity)
         } else {
-            try engine.createIndex(vectorDimension: vectorDimension, model: modelIdentity)
+            try engine.createIndex(vectorDimension: vectorDimension, model: modelIdentity, ann: ann)
         }
         self.vectorDimension = vectorDimension
         self.engine = engine

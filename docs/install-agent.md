@@ -30,6 +30,13 @@ Search source and config for framework ownership first:
   `docstore`, `index_store`, or LlamaIndex vector-store construction.
 - mem0: `Memory.from_config`, `MemoryConfig`, `vector_store.provider`, or mem0 provider config.
 
+These names (`docstore`, `index_store`, `SimpleVectorStore`, `persist_dir`, ...) are the
+*frameworks'* terms, listed here only to detect them; they are not LodeDB options. LodeDB itself
+has no `docstore` or `index_store`. Its storage knobs are `store_text` (retain raw text) and
+`index_text` (persist the lexical index); its retrieval knob is `mode`
+(`"vector"`/`"hybrid"`/`"lexical"`); and approximate search is the opt-in `ann` option. See the
+README for the full option set.
+
 The routing rule is: **framework detection wins over direct-provider detection.** If LangChain,
 LlamaIndex, or mem0 owns the vector store, switch to the framework migration toolkit on the
 [migrate-agent page](https://egoistmachines.com/lodedb/migrate-agent). Do not continue with a direct pgvector/Qdrant/Chroma

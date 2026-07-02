@@ -38,9 +38,13 @@ public final class LodeMemory {
     /// An ephemeral in-memory memory store sized to `embedder`. Binds to the explicit
     /// `modelIdentity` when given, otherwise the embedder's own `modelIdentity` (nil
     /// for embedders that do not declare one, in which case no identity is recorded).
-    public convenience init(embedder: LodeEmbedder, modelIdentity: String? = nil) throws {
+    public convenience init(
+        embedder: LodeEmbedder,
+        modelIdentity: String? = nil,
+        ann: LodeAnnOptions? = nil
+    ) throws {
         let identity = modelIdentity ?? embedder.modelIdentity
-        let db = try LodeDB(vectorDimension: embedder.dimension, modelIdentity: identity)
+        let db = try LodeDB(vectorDimension: embedder.dimension, modelIdentity: identity, ann: ann)
         self.init(db: db, embedder: embedder)
     }
 

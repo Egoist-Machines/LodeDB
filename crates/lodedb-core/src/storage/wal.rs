@@ -245,6 +245,15 @@ pub fn checkpoint_store(
         raw_text: Some(&store.raw_text),
         lexical_tokens: Some(&store.lexical_tokens),
         multivec: Some(&store.multivec),
+        // Carry the loaded cluster assignment forward unchanged: this checkpoint
+        // does not rewrite vectors (`tvim: None`), so it stays valid. A store with
+        // no persisted clustering simply writes no `.tvann`.
+        ann: store.ann.as_ref().map(|ann| crate::storage::tvann_store::AnnBaseInput {
+            algorithm: &ann.algorithm,
+            dim: ann.dim,
+            calibration_fingerprint: ann.calibration_fingerprint,
+            postings: &ann.postings,
+        }),
         compress_text,
     };
     crate::storage::write_generation_commit(
@@ -846,6 +855,7 @@ mod tests {
             raw_text: BTreeMap::new(),
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
+            ann: None,
             wal_records: Vec::new(),
         };
 
@@ -895,6 +905,7 @@ mod tests {
             raw_text,
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
+            ann: None,
             wal_records: Vec::new(),
         };
 

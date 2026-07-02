@@ -56,9 +56,11 @@ Lower-level `LodeDB` primitives an agent host can expose as tools map cleanly:
 
 ## Capabilities and limits
 
-- The scan is exact and O(n) over a 4-bit-quantized index (not an ANN index). It suits
-  small to medium on-device corpora; it does not target billion-scale. Quantization
-  trades a little recall (about 0.95) for size and speed.
+- The scan is exact and O(n) over a 4-bit-quantized index by default (not ANN). An opt-in
+  IVF-style ANN (`LodeAnnOptions`, e.g. `ann: .cluster`) is available for larger corpora: it
+  re-scores its candidates exactly but is approximate (a neighbor in an unprobed cluster can be
+  missed), and exact scan stays the default. It suits small to medium on-device corpora; it does
+  not target billion-scale. Quantization trades a little recall (about 0.95) for size and speed.
 - Filters run natively before top-k. Supported operators: `equals`, `notEquals`,
   `greaterThan(OrEqual)`, `lessThan(OrEqual)`, `inSet`, `notInSet`, `exists`, `and`,
   `or`, `not`, plus a `documentIDs` allowlist. Metadata values are strings; ordered

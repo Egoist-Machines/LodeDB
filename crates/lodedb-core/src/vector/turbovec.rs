@@ -520,6 +520,34 @@ impl TurboVecNativeIndex {
         self.index.export_encoded(stable_ids).map_err(core_error)
     }
 
+    /// Reconstructs every live row in rotated space, paired with its chunk id.
+    ///
+    /// These are the exact rows the scan scores against, so an ANN layer that
+    /// clusters over them (and rotates the query by [`rotation_matrix`]) keeps
+    /// candidate selection in the scan's coordinate space regardless of when a
+    /// row was added, avoiding any raw-vs-rotated skew.
+    ///
+    /// [`rotation_matrix`]: Self::rotation_matrix
+    pub fn reconstruct_all_chunks(&self) -> (Vec<String>, Vec<f32>) {
+        let (stable_ids, rows) = self.index.reconstruct_all();
+        let mut chunk_ids = Vec::with_capacity(stable_ids.len());
+        let mut kept_rows = Vec::with_capacity(rows.len());
+        for (position, stable_id) in stable_ids.iter().enumerate() {
+            if let Some(chunk_id) = self.chunk_ids_by_stable_id.get(stable_id) {
+                chunk_ids.push(chunk_id.clone());
+                kept_rows.extend_from_slice(&rows[position * self.dim..(position + 1) * self.dim]);
+            }
+        }
+        (chunk_ids, kept_rows)
+    }
+
+    /// The TurboVec rotation matrix (row-major `dim * dim`), or `None` before
+    /// calibration fits one. A query must be rotated by this to share the space
+    /// of [`reconstruct_all_chunks`](Self::reconstruct_all_chunks).
+    pub fn rotation_matrix(&self) -> Option<Vec<f32>> {
+        self.index.rotation_matrix()
+    }
+
     fn from_parts(
         index: IdMapIndex,
         chunks: &[CoreVectorChunk],

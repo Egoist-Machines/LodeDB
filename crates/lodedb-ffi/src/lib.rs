@@ -252,6 +252,31 @@ pub unsafe extern "C" fn lodedb_engine_create_index_with_model(
     })
 }
 
+/// Creates a vector index from a JSON `CoreIndexCreateOptions` blob.
+///
+/// The JSON object carries the full index identity (index_id, model, dimension,
+/// bit width, ...) plus any optional `ann` config, so a binding can set options
+/// the positional `create_index*` functions do not expose without growing the
+/// ABI. The `ann` field is omitted for an exact index.
+///
+/// # Safety
+///
+/// `engine`, `options_json`, and `error` must be valid for the duration of the
+/// call. `options_json` must reference valid UTF-8 that deserializes to
+/// `CoreIndexCreateOptions`. `error` may be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_create_index_json(
+    engine: *mut LodeEngine,
+    options_json: LodeStringView,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        let engine = engine_mut(engine)?;
+        let options = read_json_view::<CoreIndexCreateOptions>(options_json)?;
+        engine.create_index_with_options(options)
+    })
+}
+
 /// Upserts contiguous f32 vector documents.
 ///
 /// # Safety

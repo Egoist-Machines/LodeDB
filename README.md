@@ -7,7 +7,7 @@
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com) - efficient full-stack infrastructure
 for reliable AI systems.*
 
-LodeDB is great for local RAG; it's _extremely fast_, exact, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
+LodeDB is great for local RAG; it's _extremely fast_, exact by default, in-process, and on-disk. We're the **best drop-in** durable memory backend for **LangChain, LlamaIndex, and mem0**: the most
 compact on disk, the fastest per single query, GPU-accelerated for batched search, and durable in
 about a millisecond per write. Point any of them at LodeDB instead of its default store. Over 17.5k
 documents, per framework default:
@@ -268,6 +268,29 @@ db.close()
 reopened = LodeDB(path="./data", index_text=True, store_text=False)
 reopened.search("E1234", k=5, mode="hybrid")  # works after reopen, rebuilt from persisted terms
 ```
+</details>
+
+<details>
+<summary><b>Approximate search (`ann="cluster"`)</b></summary>
+
+LodeDB scans exactly by default: every query compares against every vector, so recall is 100%.
+For large corpora where that full scan is the bottleneck, pass `ann="cluster"` at create time to
+opt into IVF-style cluster pruning. The query scores cluster centroids, scans only the nearest
+`nprobe` clusters, and the exact TurboVec scan re-scores those candidates. Returned scores are
+therefore exact, but the result set is approximate: a true neighbor sitting in an unprobed
+cluster can be missed, so recall drops below 100%. Exact scan stays the default and the
+authority, and probing every cluster reproduces the exact top-k.
+
+```python
+db = LodeDB(path="./data", ann="cluster")                       # opt in; exact is the default
+db = LodeDB(path="./data", ann="cluster", ann_clusters=256, ann_nprobe=16)  # optional tuning
+db.add("the turbine tripped and reported fault code E1234 overnight")
+db.search("turbine fault", k=5)                                 # nearest clusters, exact re-score
+```
+
+`ann_clusters` (partitions) defaults to about `sqrt(n)` and `ann_nprobe` (clusters probed per
+query) to about `sqrt(clusters)`. ANN is a create-time choice persisted with the index and works
+for text and bring-your-own-vector indexes alike; keep the exact default for small-to-mid corpora.
 </details>
 
 ## Multimodal & bring-your-own vectors
@@ -556,8 +579,10 @@ byte-compatible, so an index built here loads on a phone. See
 
 ## Limitations
 
-- **Exact scan, no ANN.** Built for small-to-mid corpora where exact recall matters, not
-  billion-scale.
+- **Exact scan by default; opt-in ANN.** Exact scan is the default and the authority (full
+  recall). An opt-in IVF-style cluster-prune index (`ann="cluster"`) trades a little recall for
+  speed on large corpora by scanning only the nearest clusters and exactly re-scoring the
+  candidates. Built for small-to-mid corpora, not billion-scale.
 - **GPU-resident scan is Linux/CUDA-only and opt-in** (`[gpu]`). macOS has a first-class,
   opt-in Metal (MPS) exact scan (`LODEDB_MPS_DIRECT_TURBOVEC=auto`); NEON is the default and was
   faster on the measured M1, so the MPS scan stays off by default until newer Apple GPUs are
