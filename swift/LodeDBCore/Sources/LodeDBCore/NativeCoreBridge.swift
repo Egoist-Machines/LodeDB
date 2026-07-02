@@ -82,46 +82,22 @@ final class NativeEngine {
         model: String? = nil,
         ann: LodeAnnOptions? = nil
     ) throws {
-        // ANN needs the full CoreIndexCreateOptions, which the positional create
-        // functions do not carry, so route it through the JSON create ABI. The
-        // non-ann fields mirror CoreIndexCreateOptions::native_default so an ANN
-        // index shares the exact identity and route of a positionally-created one.
-        if let ann {
-            let options = CoreIndexCreateOptionsJSON(
-                index_id: indexID,
-                index_key: indexID,
-                client_id_hash: indexID,
-                name: "lodedb-local",
-                model: model ?? "native-core",
-                provider: "native",
-                task: "native-core",
-                route_profile: "native-core",
-                storage_profile: "native-core",
-                vector_dim: vectorDimension,
-                bit_width: bitWidth,
-                ann: CoreAnnOptionsJSON(
-                    algorithm: ann.algorithm, clusters: ann.clusters, nprobe: ann.nprobe))
-            let optionsJSON = try encodeJSON(options)
-            var error: UnsafeMutablePointer<LodeError>?
-            let status = withStringView(optionsJSON) {
-                lodedb_engine_create_index_json(handle, $0, &error)
-            }
-            try Self.check(status, error: error)
-            return
-        }
+        // Single create path through the JSON ABI: send only the distinguishing
+        // fields and let the core supply the identity defaults, so exact and ANN
+        // indexes share one path and we never hand-copy native_default's literals.
+        // A nil model/ann is omitted by the encoder (exact index sends no ann key).
+        let request = CreateIndexRequestJSON(
+            index_id: indexID,
+            vector_dim: vectorDimension,
+            bit_width: bitWidth,
+            model: model,
+            ann: ann.map {
+                CoreAnnOptionsJSON(algorithm: $0.algorithm, clusters: $0.clusters, nprobe: $0.nprobe)
+            })
+        let requestJSON = try encodeJSON(request)
         var error: UnsafeMutablePointer<LodeError>?
-        let status: UInt32
-        if let model {
-            status = withStringView(indexID) { indexView in
-                withStringView(model) { modelView in
-                    lodedb_engine_create_index_with_model(
-                        handle, indexView, UInt(vectorDimension), UInt(bitWidth), modelView, &error)
-                }
-            }
-        } else {
-            status = withStringView(indexID) { indexView in
-                lodedb_engine_create_index(handle, indexView, UInt(vectorDimension), UInt(bitWidth), &error)
-            }
+        let status = withStringView(requestJSON) {
+            lodedb_engine_create_index_json(handle, $0, &error)
         }
         try Self.check(status, error: error)
     }
@@ -546,21 +522,16 @@ final class NativeAppender {
     }
 }
 
-/// Serde-shaped payload for `lodedb_engine_create_index_json`. Field names match
-/// `CoreIndexCreateOptions`; `nil` optionals (including `ann`) are omitted by the
-/// encoder, so an exact index sends no `ann` key.
-private struct CoreIndexCreateOptionsJSON: Encodable {
+/// Serde-shaped payload for `lodedb_engine_create_index_json` — a minimal
+/// `CoreIndexCreateRequest`. Only the distinguishing fields cross the boundary; the
+/// core supplies the identity defaults (name, provider, task, route/storage
+/// profile, and index_key/client_id_hash from index_id). `nil` optionals (`model`,
+/// `ann`) are omitted by the encoder, so an exact index sends no `ann` key.
+private struct CreateIndexRequestJSON: Encodable {
     let index_id: String
-    let index_key: String
-    let client_id_hash: String
-    let name: String
-    let model: String
-    let provider: String
-    let task: String
-    let route_profile: String
-    let storage_profile: String
     let vector_dim: Int
     let bit_width: Int
+    let model: String?
     let ann: CoreAnnOptionsJSON?
 }
 

@@ -199,6 +199,54 @@ impl TurboVecNativeIndex {
             .unwrap_or_default())
     }
 
+    /// Searches one query restricted to an allowlist of stable ids.
+    ///
+    /// The ANN candidate path already holds TurboVec stable ids (its postings are
+    /// stable ids, resolved once at build), so it skips the chunk-id resolution
+    /// `search` pays. Absent ids are filtered out (the underlying kernel panics on
+    /// an unknown id) and duplicates are dropped, preserving the same fail-soft,
+    /// deduplicated contract as the chunk-id path even though the ANN postings are
+    /// disjoint and the cache-invalidation invariant already keeps candidates live.
+    pub fn search_with_stable_allowlist(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        allowlist: &[u64],
+    ) -> Result<Vec<VectorSearchHit>, CoreError> {
+        if top_k == 0 {
+            return invalid("top_k must be positive");
+        }
+        if query_embedding.len() != self.dim {
+            return invalid("query dimension does not match TurboVec index");
+        }
+        // Keep `present` one entry per distinct live id, so its length equals the
+        // kernel's allowlist-mask popcount. A duplicate would inflate
+        // `effective_top_k` past the number of set mask bits; the kernel clamps its
+        // result to that count, and `assemble_rows` would then reject the shorter
+        // buffer as malformed.
+        let mut seen = BTreeSet::new();
+        let present: Vec<u64> = allowlist
+            .iter()
+            .copied()
+            .filter(|id| self.index.contains(*id) && seen.insert(*id))
+            .collect();
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
+        let effective_top_k = top_k.min(self.index.len()).min(present.len());
+        if effective_top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let (scores, stable_ids) =
+            self.index
+                .search_with_allowlist(query_embedding, effective_top_k, Some(&present));
+        Ok(self
+            .assemble_rows(&scores, &stable_ids, 1, effective_top_k)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
     /// Searches a query batch with one shared chunk allowlist.
     pub fn search_batch(
         &self,
@@ -404,6 +452,15 @@ impl TurboVecNativeIndex {
         }
     }
 
+    /// Returns the chunk id for a live stable id, or `None` when it is absent.
+    /// Used to map ANN cluster postings (stable ids) back to chunk-id strings for
+    /// the `.tvann` sidecar at persist time.
+    pub fn chunk_id_for_stable_id(&self, stable_id: u64) -> Option<&str> {
+        self.chunk_ids_by_stable_id
+            .get(&stable_id)
+            .map(String::as_str)
+    }
+
     /// Returns active stable ids for chunk ids, filtering absent chunks.
     pub fn stable_ids_for_chunks(&self, chunk_ids: &[String]) -> Vec<u64> {
         let mut seen = BTreeSet::new();
@@ -520,25 +577,29 @@ impl TurboVecNativeIndex {
         self.index.export_encoded(stable_ids).map_err(core_error)
     }
 
-    /// Reconstructs every live row in rotated space, paired with its chunk id.
+    /// Reconstructs every live row in rotated space, paired with its chunk id and
+    /// stable id (all three aligned by position).
     ///
     /// These are the exact rows the scan scores against, so an ANN layer that
     /// clusters over them (and rotates the query by [`rotation_matrix`]) keeps
     /// candidate selection in the scan's coordinate space regardless of when a
-    /// row was added, avoiding any raw-vs-rotated skew.
+    /// row was added, avoiding any raw-vs-rotated skew. The stable ids become the
+    /// cluster postings directly, so the query path never re-resolves chunk ids.
     ///
     /// [`rotation_matrix`]: Self::rotation_matrix
-    pub fn reconstruct_all_chunks(&self) -> (Vec<String>, Vec<f32>) {
+    pub fn reconstruct_all_chunks(&self) -> (Vec<String>, Vec<u64>, Vec<f32>) {
         let (stable_ids, rows) = self.index.reconstruct_all();
         let mut chunk_ids = Vec::with_capacity(stable_ids.len());
+        let mut kept_ids = Vec::with_capacity(stable_ids.len());
         let mut kept_rows = Vec::with_capacity(rows.len());
         for (position, stable_id) in stable_ids.iter().enumerate() {
             if let Some(chunk_id) = self.chunk_ids_by_stable_id.get(stable_id) {
                 chunk_ids.push(chunk_id.clone());
+                kept_ids.push(*stable_id);
                 kept_rows.extend_from_slice(&rows[position * self.dim..(position + 1) * self.dim]);
             }
         }
-        (chunk_ids, kept_rows)
+        (chunk_ids, kept_ids, kept_rows)
     }
 
     /// The TurboVec rotation matrix (row-major `dim * dim`), or `None` before

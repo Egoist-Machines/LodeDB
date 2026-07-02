@@ -30,6 +30,7 @@ import time
 import weakref
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -234,7 +235,7 @@ class LodeDB:
         chunk_character_limit: int = 900,
         store_text: bool = True,
         index_text: bool = False,
-        ann: str | None = None,
+        ann: str | AnnOptions | None = None,
         ann_clusters: int | None = None,
         ann_nprobe: int | None = None,
         compression: bool = True,
@@ -308,9 +309,11 @@ class LodeDB:
         recall is below 100%). Exact scan stays the default and the authority. Tune
         with ``ann_clusters`` (partition count, defaults to about ``sqrt(n)``) and
         ``ann_nprobe`` (clusters probed per query, defaults to about
-        ``sqrt(clusters)``); probing every cluster reproduces the exact result. ANN
-        is worthwhile for large corpora where the full scan is the bottleneck; small
-        and mid-size corpora should keep the exact default. Like ``compression``,
+        ``sqrt(clusters)``); probing every cluster reproduces the exact result.
+        Equivalently, pass a structured :class:`AnnOptions` as ``ann=`` (e.g.
+        ``ann=AnnOptions(clusters=256, nprobe=16)``) instead of the loose tuning
+        keywords. ANN is worthwhile for large corpora where the full scan is the
+        bottleneck; small and mid-size corpora should keep the exact default. Like ``compression``,
         ``ann`` is a create-time choice: on reopen of an existing store the
         persisted config wins and these arguments are ignored, so an exact store
         stays exact and an ANN store keeps its clustering (and tuning) regardless
@@ -2116,24 +2119,66 @@ def _coerce_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
     return coerced
 
 
+@dataclass(frozen=True)
+class AnnOptions:
+    """Structured ANN tuning, mirroring the native core's ``CoreAnnOptions``.
+
+    Pass to ``LodeDB(ann=...)`` (or ``open_vector_store(ann=...)``) as an
+    alternative to the loose ``ann=``/``ann_clusters=``/``ann_nprobe=`` keyword
+    arguments::
+
+        LodeDB(path, ann=AnnOptions(clusters=256, nprobe=16))
+
+    The native core is the authority on which algorithms and knobs exist and
+    validates them, so this type just carries the shape (unset knobs fall back to
+    the core's corpus-derived defaults). Keeping it in one place means a new knob
+    is added here once rather than as another loose keyword argument re-validated
+    in Python.
+    """
+
+    algorithm: str = "cluster"
+    clusters: int | None = None
+    nprobe: int | None = None
+
+    def to_core_dict(self) -> dict[str, Any]:
+        """Renders the native-core ``ann`` option dict, omitting unset knobs."""
+
+        options: dict[str, Any] = {"algorithm": str(self.algorithm)}
+        if self.clusters is not None:
+            options["clusters"] = int(self.clusters)
+        if self.nprobe is not None:
+            options["nprobe"] = int(self.nprobe)
+        return options
+
+
 def _resolve_ann_options(
-    algorithm: str | None,
+    ann: str | AnnOptions | None,
     clusters: int | None,
     nprobe: int | None,
 ) -> dict[str, Any] | None:
     """Builds the native-core ``ann`` option dict, or ``None`` for exact scan.
 
-    ``algorithm`` opts into ANN (``"cluster"`` today); ``clusters``/``nprobe`` are
-    optional tuning. The native core is the authority on which algorithms exist, so
-    the algorithm string is passed through as-is; only the local shape (tuning
-    without ``ann=``, non-positive counts) is checked here for a friendly error.
+    ``ann`` opts into ANN: an :class:`AnnOptions` (the structured form) or the
+    algorithm string (``"cluster"`` today), with ``clusters``/``nprobe`` as loose
+    tuning for the string form. The native core is the authority on which
+    algorithms and knobs exist and validates their values; the structured form
+    defers to it, and only the loose-keyword shape (tuning without ``ann=``,
+    non-positive counts) is still checked here for a friendly pre-FFI error.
     """
 
-    if algorithm is None:
+    if isinstance(ann, AnnOptions):
+        # The structured form carries its own tuning, so the loose knobs must not
+        # also be set (which would be ambiguous). Values are the core's to validate.
+        if clusters is not None or nprobe is not None:
+            raise ValueError(
+                "pass ANN tuning via AnnOptions(...) or ann_clusters/ann_nprobe, not both"
+            )
+        return ann.to_core_dict()
+    if ann is None:
         if clusters is not None or nprobe is not None:
             raise ValueError("ann_clusters/ann_nprobe require ann= to be set")
         return None
-    options: dict[str, Any] = {"algorithm": str(algorithm)}
+    options: dict[str, Any] = {"algorithm": str(ann)}
     if clusters is not None:
         if int(clusters) < 1:
             raise ValueError("ann_clusters must be a positive integer")

@@ -96,19 +96,9 @@ void lodedb_search_results_free(LodeSearchResults *results);
 
 uint32_t lodedb_engine_new_in_memory(LodeEngine **out, LodeError **error);
 void lodedb_engine_free(LodeEngine *engine);
-uint32_t lodedb_engine_create_index(
-    LodeEngine *engine,
-    LodeStringView index_id,
-    uintptr_t vector_dim,
-    uintptr_t bit_width,
-    LodeError **error);
-uint32_t lodedb_engine_create_index_with_model(
-    LodeEngine *engine,
-    LodeStringView index_id,
-    uintptr_t vector_dim,
-    uintptr_t bit_width,
-    LodeStringView model,
-    LodeError **error);
+/* Single create entry point. options_json is a minimal CoreIndexCreateRequest:
+ * {"index_id": str, "vector_dim": int, "bit_width"?: int (default 4),
+ *  "model"?: str, "ann"?: {...}}. The core supplies the identity defaults. */
 uint32_t lodedb_engine_create_index_json(
     LodeEngine *engine,
     LodeStringView options_json,

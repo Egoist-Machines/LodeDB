@@ -200,6 +200,49 @@ impl CoreIndexCreateOptions {
     }
 }
 
+fn default_bit_width() -> usize {
+    4
+}
+
+/// Minimal index-create request from a binding that lets the core supply the
+/// identity defaults rather than have every binding hand-copy
+/// [`CoreIndexCreateOptions::native_default`]'s literals. Only the distinguishing
+/// fields cross the boundary; the core fills the rest (and derives `index_key` /
+/// `client_id_hash` from `index_id`) via [`into_options`](Self::into_options).
+///
+/// Unknown fields are rejected so a stale full-`CoreIndexCreateOptions` payload
+/// (carrying `index_key`, `provider`, ... ) fails loudly rather than being
+/// silently reinterpreted with defaults for the fields it meant to set.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreIndexCreateRequest {
+    pub index_id: String,
+    pub vector_dim: usize,
+    #[serde(default = "default_bit_width")]
+    pub bit_width: usize,
+    /// Optional model identity for the reopen-time embedder guard; defaults to the
+    /// native-core identity when omitted.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional opt-in ANN tuning; omitted keeps the index exact-scan only.
+    #[serde(default)]
+    pub ann: Option<CoreAnnOptions>,
+}
+
+impl CoreIndexCreateRequest {
+    /// Expands the request into full [`CoreIndexCreateOptions`] with core-supplied
+    /// identity defaults, overriding only the model and ANN config the caller set.
+    pub fn into_options(self) -> CoreIndexCreateOptions {
+        let mut options =
+            CoreIndexCreateOptions::native_default(self.index_id, self.vector_dim, self.bit_width);
+        if let Some(model) = self.model {
+            options.model = model;
+        }
+        options.ann = self.ann;
+        options
+    }
+}
+
 /// Text document supplied by a binding layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreDocument {
