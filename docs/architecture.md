@@ -287,8 +287,11 @@ number (LSN) comes from a durable, process-shared allocator (`<key>.lsn`) whose 
 store's committed max LSN, so appended LSNs never collide with a writer's generation LSNs. The next
 writable open replays the WAL (skipping records already folded in, by LSN) and checkpoints onto a
 fresh generation. A record is durable once acknowledged under `durability="fsync"` (the default
-`fast` mode is atomic but not fsynced) and becomes queryable only after that fold-in; a read-only
-handle still loads the last checkpointed generation, not the appended tail. On Windows a shared
+`fast` mode is atomic but not fsynced) and becomes queryable after the next writable open folds it
+in, or immediately in a read-only handle whose `refresh()` overlays the WAL tail into its in-memory
+view without checkpointing (its `applied_lsn()` then reports read-your-writes against an append's
+returned LSN). The overlay reloads the base and re-tails under a manifest-checksum seqlock, so a
+checkpoint racing the refresh cannot drop committed records. On Windows a shared
 hold degrades to an exclusive one, so appenders serialize there rather than coexisting. A writable
 generation-mode open refuses a store with unfolded WAL records rather than committing past them.
 Each record carries a precomputed vector plus metadata, and (only when the appender opts into
