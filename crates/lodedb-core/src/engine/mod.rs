@@ -3722,14 +3722,17 @@ impl VectorOnlyIndex {
         for stable_id in readded {
             self.pending_removed_stable_ids.remove(&stable_id);
         }
-        // A vector value changed (this sync only runs for real changes, never a
-        // metadata-only re-emit). Record the one signal that drives both the ANN
-        // cache drop below and the persisted `.tvann` sidecar drop at commit: the
-        // corpus changed, so any cluster index is stale; the next ANN query
-        // rebuilds it from the current documents (which include these rows), so a
-        // newly-added vector is always clustered and findable.
-        self.pending_vectors_changed = true;
-        self.cluster_index.get_mut().take();
+        // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
+        // metadata-only change, whose caller still routes through here) alters no
+        // vector, so it must not dirty the cluster cache or the persisted `.tvann`.
+        // Only a real add/change records the one signal that drives both the ANN
+        // cache drop and the sidecar drop at commit: the corpus changed, so any
+        // cluster index is stale and the next ANN query rebuilds it from the
+        // current documents, keeping a newly-added vector clustered and findable.
+        if !chunks.is_empty() {
+            self.pending_vectors_changed = true;
+            self.cluster_index.get_mut().take();
+        }
         Ok(())
     }
 

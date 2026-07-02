@@ -2560,6 +2560,65 @@ fn ann_metadata_only_update_preserves_the_sidecar() {
 }
 
 #[test]
+fn ann_reused_text_upsert_preserves_the_sidecar() {
+    // A text re-apply that reuses every chunk (unchanged text) routes an empty
+    // vector sync through sync_vector_index_upsert. That must not dirty the vector
+    // set, so the persisted .tvann survives and is adopted (not rebuilt) on reopen,
+    // just like the metadata-only vector path.
+    let axes = [0usize, 2, 4, 6];
+    let mut docs: Vec<CoreDocument> = Vec::new();
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    for (blob, &axis) in axes.iter().enumerate() {
+        for i in 0..5 {
+            docs.push(text_doc(
+                &format!("b{blob}c{i}"),
+                &format!("blob {blob} row {i}"),
+                BTreeMap::new(),
+            ));
+            let mut vector = vec![0.0f32; 8];
+            vector[axis] = 1.0;
+            vector[axis + 1] = 0.02 * (i as f32 + 1.0);
+            embeddings.push(vector);
+        }
+    }
+    let path = unique_temp_dir("core_ann_text_reuse");
+    {
+        let mut engine = ann_durable(&path);
+        let plan = engine
+            .prepare_text_upsert("default", &docs, true, true, 100)
+            .unwrap();
+        assert_eq!(plan.chunks_to_embed.len(), embeddings.len());
+        engine.apply_text_upsert(&plan, &embeddings, 1.0).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"));
+        drop(engine);
+    }
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        // Re-apply the identical docs: every chunk is reused, so no embedding is
+        // requested and the vector sync runs with an empty chunk slice.
+        let reuse_plan = engine
+            .prepare_text_upsert("default", &docs, true, true, 100)
+            .unwrap();
+        assert!(reuse_plan.chunks_to_embed.is_empty());
+        let reused = engine.apply_text_upsert(&reuse_plan, &[], 0.0).unwrap();
+        assert_eq!(reused.embedded_chunks, 0);
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(
+        reopened.ann_cluster_resident("default").unwrap(),
+        "a reused text upsert changes no vector, so it must preserve the .tvann"
+    );
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn exact_store_writes_no_tvann_sidecar() {
     let path = unique_temp_dir("core_no_tvann");
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
