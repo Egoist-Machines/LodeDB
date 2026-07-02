@@ -1,6 +1,7 @@
 use crate::storage::util::{
-    body_sha256, corrupt, get_i64, get_str, read_json, sha256_file_hex, value_object,
-    verify_file_sha256, write_pretty_json_atomic, write_py_json, CoreResult,
+    body_sha256, checksummed_body_payload, corrupt, get_i64, get_str, read_checksummed_body,
+    read_json, sha256_file_hex, sidecar_base_block, validate_sidecar_manifest, value_object,
+    write_pretty_json_atomic, write_py_json, CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -31,13 +32,12 @@ pub fn load(
         return Ok(BTreeMap::new());
     }
     if let Some(manifest) = manifest {
-        let manifest = value_object(manifest, "lexical index manifest")?;
-        if get_i64(manifest, "schema_version", -1) != LEXICAL_INDEX_SCHEMA_VERSION {
-            return Err(corrupt("unsupported lexical index manifest schema version"));
-        }
-        if let Some(base) = manifest.get("base").and_then(Value::as_object) {
-            verify_file_sha256(base_path, get_str(base, "sha256"), "lexical index base")?;
-        }
+        validate_sidecar_manifest(
+            base_path,
+            manifest,
+            LEXICAL_INDEX_SCHEMA_VERSION,
+            "lexical index",
+        )?;
     }
     let mut documents = read_base(base_path)?;
     if let Some(manifest) = manifest {
@@ -93,18 +93,8 @@ pub fn load(
 }
 
 fn read_base(path: &Path) -> CoreResult<BTreeMap<String, TokenLists>> {
-    let payload = read_json(path, "lexical index base")?;
-    let payload = value_object(&payload, "lexical index base")?;
-    if get_i64(payload, "schema_version", -1) != LEXICAL_INDEX_SCHEMA_VERSION {
-        return Err(corrupt("unsupported lexical index base schema version"));
-    }
-    let body = payload
-        .get("body")
-        .ok_or_else(|| corrupt("lexical index base body is missing"))?;
-    let body_object = value_object(body, "lexical index base body")?;
-    if body_sha256(body)? != get_str(payload, "body_sha256") {
-        return Err(corrupt("lexical index base failed checksum"));
-    }
+    let body = read_checksummed_body(path, LEXICAL_INDEX_SCHEMA_VERSION, "lexical index")?;
+    let body_object = value_object(&body, "lexical index base body")?;
     let documents = body_object
         .get("documents")
         .and_then(Value::as_object)
@@ -124,11 +114,7 @@ pub fn record_base(
         "schema_version": LEXICAL_INDEX_SCHEMA_VERSION,
         "documents": documents,
     });
-    let payload = serde_json::json!({
-        "schema_version": LEXICAL_INDEX_SCHEMA_VERSION,
-        "body_sha256": body_sha256(&body)?,
-        "body": body,
-    });
+    let payload = checksummed_body_payload(LEXICAL_INDEX_SCHEMA_VERSION, body)?;
     write_py_json(base_path, &payload, fsync)?;
     let manifest_path = manifest_path(base_path);
     let previous = if manifest_path.is_file() {
@@ -152,12 +138,11 @@ pub fn record_base(
     }
     let manifest = serde_json::json!({
         "schema_version": LEXICAL_INDEX_SCHEMA_VERSION,
-        "base": {
-            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
-            "sha256": sha256_file_hex(base_path)?,
-            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("lexical index base metadata failed: {error}")))?.len(),
-            "document_count": documents.len(),
-        },
+        "base": sidecar_base_block(
+            base_path,
+            "lexical index",
+            [("document_count", Value::from(documents.len()))],
+        )?,
         "deltas": [],
         "next_seq": next_seq,
     });

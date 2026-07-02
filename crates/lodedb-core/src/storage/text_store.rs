@@ -1,7 +1,7 @@
 use crate::storage::util::{
-    body_sha256, corrupt, get_i64, get_str, read_json, read_json_object, read_maybe_zstd_json,
-    sha256_file_hex, value_object, verify_file_sha256, write_pretty_json_atomic, write_py_json,
-    write_py_json_zstd, CoreResult,
+    body_sha256, checksummed_body_payload, corrupt, get_i64, get_str, read_json, read_json_object,
+    read_maybe_zstd_json, sha256_file_hex, sidecar_base_block, validate_sidecar_manifest,
+    value_object, write_pretty_json_atomic, write_py_json, write_py_json_zstd, CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -27,13 +27,12 @@ pub fn load(base_path: &Path, manifest: Option<&Value>) -> CoreResult<BTreeMap<S
         return Ok(BTreeMap::new());
     }
     if let Some(manifest) = manifest {
-        let manifest = value_object(manifest, "document text manifest")?;
-        if get_i64(manifest, "schema_version", -1) != DOCUMENT_TEXT_SCHEMA_VERSION {
-            return Err(corrupt("unsupported document text manifest schema version"));
-        }
-        if let Some(base) = manifest.get("base").and_then(Value::as_object) {
-            verify_file_sha256(base_path, get_str(base, "sha256"), "document text base")?;
-        }
+        validate_sidecar_manifest(
+            base_path,
+            manifest,
+            DOCUMENT_TEXT_SCHEMA_VERSION,
+            "document text",
+        )?;
     }
     let mut documents = read_wrapped_document_map(base_path, DOCUMENT_TEXT_SCHEMA_VERSION)?;
     if let Some(manifest) = manifest {
@@ -105,11 +104,7 @@ pub fn record_base(
         "schema_version": DOCUMENT_TEXT_SCHEMA_VERSION,
         "documents": documents,
     });
-    let payload = serde_json::json!({
-        "schema_version": DOCUMENT_TEXT_SCHEMA_VERSION,
-        "body_sha256": body_sha256(&body)?,
-        "body": body,
-    });
+    let payload = checksummed_body_payload(DOCUMENT_TEXT_SCHEMA_VERSION, body)?;
     write_base_payload(base_path, &payload, fsync, compress)?;
     let manifest_path = manifest_path(base_path);
     let previous = if manifest_path.is_file() {
@@ -134,12 +129,11 @@ pub fn record_base(
     let manifest = serde_json::json!({
         "schema_version": DOCUMENT_TEXT_SCHEMA_VERSION,
         "compress": compress,
-        "base": {
-            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
-            "sha256": sha256_file_hex(base_path)?,
-            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("document text base metadata failed: {error}")))?.len(),
-            "document_count": documents.len(),
-        },
+        "base": sidecar_base_block(
+            base_path,
+            "document text",
+            [("document_count", Value::from(documents.len()))],
+        )?,
         "deltas": [],
         "next_seq": next_seq,
     });

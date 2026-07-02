@@ -207,6 +207,107 @@ pub(crate) fn body_sha256(body: &Value) -> CoreResult<String> {
     Ok(sha256_bytes_hex(py_canonical_json(body)?.as_bytes()))
 }
 
+/// Wraps a sidecar `body` in the checksummed base payload every JSON sidecar
+/// store (`.tvtext`, `.tvlex`, `.tvann`) writes: `{schema_version, body_sha256,
+/// body}`. The body carries its own `schema_version` too, mirroring the shape the
+/// Python writer produces and cross-verifies. Extracted so the stores share one
+/// definition of the wrap rather than re-rolling it each.
+pub(crate) fn checksummed_body_payload(schema_version: i64, body: Value) -> CoreResult<Value> {
+    Ok(serde_json::json!({
+        "schema_version": schema_version,
+        "body_sha256": body_sha256(&body)?,
+        "body": body,
+    }))
+}
+
+/// Reads a checksummed base payload written by [`checksummed_body_payload`],
+/// verifying the outer schema version and the body checksum, and returns the inner
+/// `body` value for the store to parse. `context` names the store for error
+/// messages (e.g. `"tvann index"`).
+pub(crate) fn read_checksummed_body(
+    base_path: &Path,
+    schema_version: i64,
+    context: &str,
+) -> CoreResult<Value> {
+    let payload = read_json(base_path, &format!("{context} base"))?;
+    let payload = value_object(&payload, &format!("{context} base"))?;
+    if get_i64(payload, "schema_version", -1) != schema_version {
+        return Err(corrupt(format!(
+            "unsupported {context} base schema version"
+        )));
+    }
+    let body = payload
+        .get("body")
+        .ok_or_else(|| corrupt(format!("{context} base body is missing")))?;
+    if body_sha256(body)? != get_str(payload, "body_sha256") {
+        return Err(corrupt(format!("{context} base failed checksum")));
+    }
+    Ok(body.clone())
+}
+
+/// Validates a sidecar's commit-manifest block: the schema-version gate and, when
+/// a `base` object is present, the base file's checksum. Shared by every sidecar
+/// store, which all embed a `{schema_version, base: {sha256, ...}}` block in the
+/// commit manifest. `context` names the store for error messages.
+pub(crate) fn validate_sidecar_manifest(
+    base_path: &Path,
+    manifest: &Value,
+    schema_version: i64,
+    context: &str,
+) -> CoreResult<()> {
+    let manifest = value_object(manifest, &format!("{context} manifest"))?;
+    if get_i64(manifest, "schema_version", -1) != schema_version {
+        return Err(corrupt(format!(
+            "unsupported {context} manifest schema version"
+        )));
+    }
+    if let Some(base) = manifest.get("base").and_then(Value::as_object) {
+        verify_file_sha256(
+            base_path,
+            get_str(base, "sha256"),
+            &format!("{context} base"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Builds the `base` object every sidecar store embeds in its commit manifest:
+/// `{file_name, sha256, file_bytes, ...extra}`. `extra` carries the store-specific
+/// counters (`document_count`, `cluster_count`, `calibration_fingerprint`). The
+/// caller wraps this in `{schema_version, base, ...}` (base-only stores add
+/// nothing more; delta-journaled stores also add `deltas`/`next_seq`). `context`
+/// names the store for the (rare) metadata-read error.
+pub(crate) fn sidecar_base_block(
+    base_path: &Path,
+    context: &str,
+    extra: impl IntoIterator<Item = (&'static str, Value)>,
+) -> CoreResult<Value> {
+    let file_bytes = base_path
+        .metadata()
+        .map_err(|error| corrupt(format!("{context} base metadata failed: {error}")))?
+        .len();
+    let mut base = Map::new();
+    base.insert(
+        "file_name".to_string(),
+        Value::from(
+            base_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    base.insert(
+        "sha256".to_string(),
+        Value::from(sha256_file_hex(base_path)?),
+    );
+    base.insert("file_bytes".to_string(), Value::from(file_bytes));
+    for (key, value) in extra {
+        base.insert(key.to_string(), value);
+    }
+    Ok(Value::Object(base))
+}
+
 pub(crate) fn write_py_json(path: &Path, value: &Value, fsync: bool) -> CoreResult<usize> {
     let text = py_canonical_json(value)?;
     write_text_atomic(path, &text, fsync)

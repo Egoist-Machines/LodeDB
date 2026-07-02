@@ -16,8 +16,9 @@
 //! store round-trips byte-identically across the two engines.
 
 use crate::storage::util::{
-    corrupt, get_i64, get_str, read_json, sha256_bytes_hex, sha256_file_hex, value_object,
-    verify_file_sha256, write_bytes_atomic, write_pretty_json_atomic, CoreResult,
+    corrupt, get_i64, get_str, read_json, sha256_bytes_hex, sha256_file_hex, sidecar_base_block,
+    validate_sidecar_manifest, value_object, write_bytes_atomic, write_pretty_json_atomic,
+    CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -121,13 +122,7 @@ pub fn load(base_path: &Path, manifest: Option<&Value>) -> CoreResult<MultiVecMa
         return Ok(MultiVecMap::new());
     }
     if let Some(manifest) = manifest {
-        let manifest = value_object(manifest, "multi-vector manifest")?;
-        if get_i64(manifest, "schema_version", -1) != MULTIVEC_SCHEMA_VERSION {
-            return Err(corrupt("unsupported multi-vector manifest schema version"));
-        }
-        if let Some(base) = manifest.get("base").and_then(Value::as_object) {
-            verify_file_sha256(base_path, get_str(base, "sha256"), "multi-vector base")?;
-        }
+        validate_sidecar_manifest(base_path, manifest, MULTIVEC_SCHEMA_VERSION, "multi-vector")?;
     }
     let mut documents = read_segment(base_path, MULTIVEC_BASE_MAGIC, "multi-vector base")?.1;
     let Some(manifest) = manifest else {
@@ -297,12 +292,11 @@ pub fn record_base(base_path: &Path, documents: &MultiVecMap, fsync: bool) -> Co
     }
     let manifest = serde_json::json!({
         "schema_version": MULTIVEC_SCHEMA_VERSION,
-        "base": {
-            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
-            "sha256": sha256_file_hex(base_path)?,
-            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("multi-vector base metadata failed: {error}")))?.len(),
-            "document_count": documents.len(),
-        },
+        "base": sidecar_base_block(
+            base_path,
+            "multi-vector",
+            [("document_count", Value::from(documents.len()))],
+        )?,
         "deltas": [],
         "next_seq": next_seq,
     });
