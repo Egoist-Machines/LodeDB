@@ -2246,6 +2246,66 @@ fn ann_batch_queries_match_looping_singles() {
 }
 
 #[test]
+fn ann_batch_all_decline_falls_back_to_batched_scan() {
+    // Two equal-size, well-separated blobs with one probe: each query's nearest
+    // cluster already holds exactly half the corpus, so every query declines the
+    // ANN prune (the half-corpus rule). The batch must then fall back to the
+    // batched exact scan and still equal both the exact scan and looping singles,
+    // for the struct and the flat-arrays paths.
+    let mut docs = Vec::new();
+    for i in 0..5 {
+        let mut a = vec![0.0f32; 8];
+        a[0] = 1.0;
+        a[1] = 0.02 * (i as f32 + 1.0);
+        docs.push(vector_doc(&format!("b0c{i}"), a));
+        let mut b = vec![0.0f32; 8];
+        b[2] = 1.0;
+        b[3] = 0.02 * (i as f32 + 1.0);
+        docs.push(vector_doc(&format!("b1c{i}"), b));
+    }
+    let exact = exact_engine(&docs);
+    let ann = ann_engine(&docs, 2, 1);
+    let queries = vec![axis_query(0), axis_query(2)];
+
+    let batch = ann
+        .query_vectors_batch("default", &queries, 3, None)
+        .unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let exact_hits = exact.query_vector("default", query, 3, None).unwrap();
+        let single = ann.query_vector("default", query, 3, None).unwrap();
+        assert_eq!(
+            hit_keys(&batch[i]),
+            hit_keys(&exact_hits),
+            "batch != exact at {i}"
+        );
+        assert_eq!(
+            hit_keys(&batch[i]),
+            hit_keys(&single),
+            "batch != single at {i}"
+        );
+    }
+
+    let flat: Vec<f32> = queries.iter().flatten().copied().collect();
+    let arrays = ann
+        .query_vectors_batch_arrays("default", &flat, 8, 3, None)
+        .unwrap();
+    for (i, query) in queries.iter().enumerate() {
+        let single = ann.query_vector("default", query, 3, None).unwrap();
+        let start = i * arrays.k;
+        let ids: Vec<&str> = arrays.document_ids[start..start + single.hits.len()]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let single_ids: Vec<&str> = single
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect();
+        assert_eq!(ids, single_ids, "arrays batch != single at {i}");
+    }
+}
+
+#[test]
 fn ann_tiny_corpus_falls_back_to_exact() {
     // Fewer vectors than can form a cluster: ANN must fall back to the exact scan,
     // not panic or drop the single result.
@@ -2451,6 +2511,110 @@ fn ann_reopen_reflects_reembedded_vector() {
         hits.hits.iter().any(|hit| hit.document_id == "b0c0"),
         "a re-embedded vector must be served at its new location after reopen"
     );
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn ann_metadata_only_update_preserves_the_sidecar() {
+    // A metadata-only update re-emits its unchanged vector in the tvim delta but
+    // does not change the vector set, so the engine's vectors-changed signal stays
+    // false and the persisted .tvann survives. On reopen the cluster index is
+    // adopted (resident before any query), not lazily rebuilt.
+    let path = unique_temp_dir("core_ann_meta_only");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"));
+        drop(engine);
+    }
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        // Re-upsert b0c0 with its exact vector but new metadata: a metadata-only
+        // change the content hash recognizes as an unchanged vector.
+        let mut doc = blob_docs().into_iter().next().unwrap();
+        assert_eq!(doc.document_id, "b0c0");
+        doc.metadata
+            .insert("tag".to_string(), "updated".to_string());
+        engine.upsert_vectors("default", &[doc]).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(
+        reopened.ann_cluster_resident("default").unwrap(),
+        "a metadata-only update must preserve the .tvann so it is adopted on reopen"
+    );
+    let hits = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn ann_reused_text_upsert_preserves_the_sidecar() {
+    // A text re-apply that reuses every chunk (unchanged text) routes an empty
+    // vector sync through sync_vector_index_upsert. That must not dirty the vector
+    // set, so the persisted .tvann survives and is adopted (not rebuilt) on reopen,
+    // just like the metadata-only vector path.
+    let axes = [0usize, 2, 4, 6];
+    let mut docs: Vec<CoreDocument> = Vec::new();
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    for (blob, &axis) in axes.iter().enumerate() {
+        for i in 0..5 {
+            docs.push(text_doc(
+                &format!("b{blob}c{i}"),
+                &format!("blob {blob} row {i}"),
+                BTreeMap::new(),
+            ));
+            let mut vector = vec![0.0f32; 8];
+            vector[axis] = 1.0;
+            vector[axis + 1] = 0.02 * (i as f32 + 1.0);
+            embeddings.push(vector);
+        }
+    }
+    let path = unique_temp_dir("core_ann_text_reuse");
+    {
+        let mut engine = ann_durable(&path);
+        let plan = engine
+            .prepare_text_upsert("default", &docs, true, true, 100)
+            .unwrap();
+        assert_eq!(plan.chunks_to_embed.len(), embeddings.len());
+        engine.apply_text_upsert(&plan, &embeddings, 1.0).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"));
+        drop(engine);
+    }
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        // Re-apply the identical docs: every chunk is reused, so no embedding is
+        // requested and the vector sync runs with an empty chunk slice.
+        let reuse_plan = engine
+            .prepare_text_upsert("default", &docs, true, true, 100)
+            .unwrap();
+        assert!(reuse_plan.chunks_to_embed.is_empty());
+        let reused = engine.apply_text_upsert(&reuse_plan, &[], 0.0).unwrap();
+        assert_eq!(reused.embedded_chunks, 0);
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(
+        reopened.ann_cluster_resident("default").unwrap(),
+        "a reused text upsert changes no vector, so it must preserve the .tvann"
+    );
+    drop(reopened);
     fs::remove_dir_all(path).unwrap();
 }
 

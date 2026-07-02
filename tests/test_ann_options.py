@@ -2,11 +2,46 @@
 
 import pytest
 
+import lodedb
+from lodedb import AnnOptions
 from lodedb.local.db import _native_vector_index_options, _resolve_ann_options
 
 
 def test_exact_default_resolves_to_none() -> None:
     assert _resolve_ann_options(None, None, None) is None
+
+
+def test_ann_options_is_publicly_exported() -> None:
+    assert lodedb.AnnOptions is AnnOptions
+    assert AnnOptions().algorithm == "cluster"
+
+
+def test_structured_options_resolve_to_the_core_dict() -> None:
+    assert _resolve_ann_options(AnnOptions(), None, None) == {"algorithm": "cluster"}
+    assert _resolve_ann_options(AnnOptions(clusters=256, nprobe=16), None, None) == {
+        "algorithm": "cluster",
+        "clusters": 256,
+        "nprobe": 16,
+    }
+    assert AnnOptions(clusters=4, nprobe=2).to_core_dict() == {
+        "algorithm": "cluster",
+        "clusters": 4,
+        "nprobe": 2,
+    }
+
+
+def test_structured_options_defer_value_checks_to_the_core() -> None:
+    # The structured form carries the shape without re-validating knob values; the
+    # native core is the single authority and rejects out-of-range values on create.
+    assert _resolve_ann_options(AnnOptions(clusters=0), None, None) == {
+        "algorithm": "cluster",
+        "clusters": 0,
+    }
+
+
+def test_structured_options_reject_mixed_loose_tuning() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        _resolve_ann_options(AnnOptions(clusters=4), None, 2)
 
 
 def test_tuning_without_ann_raises() -> None:

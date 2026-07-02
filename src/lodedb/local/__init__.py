@@ -19,6 +19,7 @@ from lodedb.local.backends import (
 )
 from lodedb.local.collection import LodeCollection
 from lodedb.local.db import (
+    AnnOptions,
     ImageEmbeddingUnsupportedError,
     LodeDB,
     LodeSearchHit,
@@ -33,6 +34,7 @@ from lodedb.local.presets import LOCAL_MODEL_PRESETS, LocalModelPreset, resolve_
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
+    "AnnOptions",
     "Appender",
     "ConcurrentWriterError",
     "ImageEmbeddingUnsupportedError",

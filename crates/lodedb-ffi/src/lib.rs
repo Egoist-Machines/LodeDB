@@ -3,7 +3,7 @@
 use lodedb_core::engine::{CoreAppender, CoreEngine};
 use lodedb_core::engine::{IngestPlan, QueryPlan};
 use lodedb_core::types::{
-    CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreOpenOptions, CoreVectorDocument,
+    CoreDocument, CoreIndexCreateRequest, CoreMetadata, CoreOpenOptions, CoreVectorDocument,
 };
 use lodedb_core::{CoreError, CoreErrorCode};
 use std::collections::BTreeMap;
@@ -203,67 +203,21 @@ pub unsafe extern "C" fn lodedb_engine_free(engine: *mut LodeEngine) {
     }
 }
 
-/// Creates a vector index on an engine.
+/// Creates a vector index from a minimal JSON create request.
 ///
-/// # Safety
-///
-/// `engine` must be a valid engine pointer. `index_id` must reference valid
-/// UTF-8 bytes for the duration of the call. `error` may be null or writable.
-#[no_mangle]
-pub unsafe extern "C" fn lodedb_engine_create_index(
-    engine: *mut LodeEngine,
-    index_id: LodeStringView,
-    vector_dim: usize,
-    bit_width: usize,
-    error: *mut *mut LodeError,
-) -> u32 {
-    ffi_result(error, || {
-        let engine = engine_mut(engine)?;
-        engine.create_index(read_string(index_id)?, vector_dim, bit_width)
-    })
-}
-
-/// Creates a vector index bound to a model identity.
-///
-/// Like `lodedb_engine_create_index` but records `model` as the index's persisted
-/// model identity (the rest of the metadata uses the native defaults), so a binding
-/// can reject reopening a store with a different same-dimension embedding model.
-///
-/// # Safety
-///
-/// `engine`, `index_id`, and `model` must be valid for the duration of the call.
-/// String views must contain valid UTF-8 bytes. `error` may be null or writable.
-#[no_mangle]
-pub unsafe extern "C" fn lodedb_engine_create_index_with_model(
-    engine: *mut LodeEngine,
-    index_id: LodeStringView,
-    vector_dim: usize,
-    bit_width: usize,
-    model: LodeStringView,
-    error: *mut *mut LodeError,
-) -> u32 {
-    ffi_result(error, || {
-        let engine = engine_mut(engine)?;
-        let index_id = read_string(index_id)?;
-        let model = read_string(model)?;
-        let mut options = CoreIndexCreateOptions::native_default(index_id, vector_dim, bit_width);
-        options.model = model;
-        engine.create_index_with_options(options)
-    })
-}
-
-/// Creates a vector index from a JSON `CoreIndexCreateOptions` blob.
-///
-/// The JSON object carries the full index identity (index_id, model, dimension,
-/// bit width, ...) plus any optional `ann` config, so a binding can set options
-/// the positional `create_index*` functions do not expose without growing the
-/// ABI. The `ann` field is omitted for an exact index.
+/// The JSON object carries only the distinguishing fields — `index_id`,
+/// `vector_dim`, optional `bit_width` (defaults to 4), optional `model` (the
+/// reopen-time embedder-guard identity), and optional `ann` tuning — and the core
+/// supplies the identity defaults (name, provider, task, route/storage profile,
+/// and `index_key`/`client_id_hash` from `index_id`). This is the single create
+/// entry point: an exact index simply omits `ann`, so bindings never hand-copy the
+/// native-default identity literals.
 ///
 /// # Safety
 ///
 /// `engine`, `options_json`, and `error` must be valid for the duration of the
 /// call. `options_json` must reference valid UTF-8 that deserializes to
-/// `CoreIndexCreateOptions`. `error` may be null or writable.
+/// `CoreIndexCreateRequest`. `error` may be null or writable.
 #[no_mangle]
 pub unsafe extern "C" fn lodedb_engine_create_index_json(
     engine: *mut LodeEngine,
@@ -272,8 +226,8 @@ pub unsafe extern "C" fn lodedb_engine_create_index_json(
 ) -> u32 {
     ffi_result(error, || {
         let engine = engine_mut(engine)?;
-        let options = read_json_view::<CoreIndexCreateOptions>(options_json)?;
-        engine.create_index_with_options(options)
+        let request = read_json_view::<CoreIndexCreateRequest>(options_json)?;
+        engine.create_index_with_options(request.into_options())
     })
 }
 
@@ -1498,10 +1452,7 @@ mod tests {
 
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(
-                lodedb_engine_create_index(engine, index_id, 8, 4, &mut error),
-                0
-            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
         }
 
         let query = [1.0_f32, 0.0_f32];
@@ -1537,10 +1488,7 @@ mod tests {
         let index_id = string_view("default");
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(
-                lodedb_engine_create_index(engine, index_id, 8, 4, &mut error),
-                0
-            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
         }
         let vector = [1.0_f32, 0.0_f32];
         let document = LodeVectorDocument {
@@ -1577,6 +1525,16 @@ mod tests {
             data: text.as_ptr().cast::<c_char>(),
             len: text.len(),
         }
+    }
+
+    /// Creates the shared `default` (dim 8, bit width 4) exact index through the
+    /// JSON create ABI, the single create entry point.
+    unsafe fn create_default_index(engine: *mut LodeEngine, error: *mut *mut LodeError) -> u32 {
+        lodedb_engine_create_index_json(
+            engine,
+            string_view(r#"{"index_id":"default","vector_dim":8,"bit_width":4}"#),
+            error,
+        )
     }
 
     static NEXT_APPENDER_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1638,10 +1596,7 @@ mod tests {
                 0
             );
             assert!(!engine.is_null());
-            assert_eq!(
-                lodedb_engine_create_index(engine, string_view("default"), 8, 4, &mut error),
-                0
-            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
             assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
             lodedb_engine_free(engine);
         }

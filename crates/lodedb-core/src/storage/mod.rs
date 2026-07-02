@@ -180,18 +180,22 @@ pub fn load_generation_store(
         )?,
         None => MultiVecMap::new(),
     };
+    // Load the `.tvann` cache only when the store opts into ANN (its state carries
+    // an `ann` config). The sidecar is a pure acceleration cache the engine
+    // rebuilds on demand, so verifying its checksum and parsing its corpus-sized
+    // postings for a store that will serve exact only is wasted work; gate it on
+    // the config rather than eagerly loading and discarding it.
     let ann = match manifest.store_manifest("tvann") {
-        Some(tvann_manifest) => {
-            // The `.tvann` is an optional acceleration cache, rebuildable from
-            // `.tvim`. A missing, truncated, or checksum-failing sidecar is a cache
-            // miss (the engine rebuilds), never a reason to fail opening an
-            // otherwise-intact store, so swallow any error to `None`.
+        Some(tvann_manifest) if state.get("ann").is_some() => {
+            // A missing, truncated, or checksum-failing sidecar is a cache miss
+            // (the engine rebuilds), never a reason to fail opening an otherwise-
+            // intact store, so swallow any error to `None`.
             let tvann_base_path = base_tvann_path(persistence_dir, &index_key, base_epoch);
             tvann_store::validate(&tvann_base_path, Some(tvann_manifest))
                 .and_then(|()| tvann_store::load(&tvann_base_path, Some(tvann_manifest)))
                 .unwrap_or(None)
         }
-        None => None,
+        _ => None,
     };
     let wal_records = if options.read_wal && !options.read_only {
         wal::read_records(&wal::wal_path(persistence_dir, &index_key))?
@@ -394,6 +398,11 @@ pub struct GenerationDeltaInput<'a> {
     pub chunk_count_after: usize,
     /// `Some` when the index has vectors; an empty write reuses the base manifest.
     pub tvim: Option<TvimDeltaWrite>,
+    /// The engine's authoritative "did a vector value change since the base"
+    /// signal (a real add/move/remove, not a metadata-only re-emit). Drives the
+    /// ANN sidecar decision so the storage layer no longer re-infers it from the
+    /// tvim delta, which cannot tell an unchanged re-emit from a real move.
+    pub vectors_changed: bool,
     /// `Some` only when `store_text` is on; carries the changed documents' text.
     pub raw_text_upserts: Option<BTreeMap<String, String>>,
     /// Live documents whose retained raw text was cleared since the base. A delta
@@ -446,10 +455,9 @@ pub fn write_generation_delta(
         },
     )?;
 
-    // Whether this delta changes the vector set (an upsert or a removal). Used to
-    // decide the ANN sidecar: a vector change invalidates the base clustering.
-    let tvim_changed = input.tvim.as_ref().is_some_and(|tvim| !tvim.is_empty());
-    // tvim: append a delta when vectors changed, else carry the base manifest.
+    // tvim: append a delta when it carries rows, else carry the base manifest. A
+    // metadata-only update still re-emits its unchanged row here, so a non-empty
+    // tvim is not the ANN-staleness signal; that is `input.vectors_changed` below.
     let tvim_manifest = match input.tvim {
         Some(tvim) if !tvim.is_empty() => {
             let base_tvim_path = base_tvim_path(persistence_dir, input.index_key, input.base_epoch);
@@ -565,17 +573,15 @@ pub fn write_generation_delta(
         _ => previous.store_manifest("tvmv").cloned(),
     };
 
-    // ANN has no delta journal yet, so any delta that emits a tvim change drops
-    // the tvann manifest and forces a rebuild on reopen. This is required for
-    // correctness: a re-upsert under the same chunk id moves a vector without
+    // ANN has no delta journal yet, so a delta that actually changes a vector
+    // drops the tvann manifest and forces a rebuild on reopen. This is required
+    // for correctness: a re-upsert under the same chunk id moves a vector without
     // changing the id set or (necessarily) the calibration fingerprint, so the
-    // load-time coverage check alone would wrongly adopt the stale assignment.
-    // It is deliberately conservative — a metadata-only update re-emits its
-    // (unchanged) vector in the tvim delta, so it drops the sidecar too. The
-    // storage layer cannot cheaply tell an unchanged re-emit from a real move;
-    // preserving the sidecar across metadata-only updates needs an engine-level
-    // vector-change signal and is a follow-up alongside the delta journal.
-    let tvann_manifest = if tvim_changed {
+    // load-time coverage check alone would wrongly adopt the stale assignment. The
+    // engine's `vectors_changed` signal is authoritative: a metadata-only update
+    // re-emits its unchanged vector in the tvim delta but leaves this false, so
+    // the sidecar (and its clustering) survives the update.
+    let tvann_manifest = if input.vectors_changed {
         None
     } else {
         previous.store_manifest("tvann").cloned()

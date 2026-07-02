@@ -23,8 +23,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::storage::util::{
-    body_sha256, corrupt, get_i64, get_str, read_json, sha256_file_hex, value_object,
-    verify_file_sha256, write_py_json, CoreResult,
+    checksummed_body_payload, corrupt, get_i64, get_str, read_checksummed_body, sidecar_base_block,
+    validate_sidecar_manifest, value_object, write_py_json, CoreResult,
 };
 
 /// On-disk schema version for the `.tvann` base.
@@ -59,25 +59,22 @@ pub fn record_base(base_path: &Path, ann: AnnBaseInput<'_>, fsync: bool) -> Core
         "calibration_fingerprint": ann.calibration_fingerprint,
         "postings": ann.postings,
     });
-    let payload = serde_json::json!({
-        "schema_version": TVANN_INDEX_SCHEMA_VERSION,
-        "body_sha256": body_sha256(&body)?,
-        "body": body,
-    });
+    let payload = checksummed_body_payload(TVANN_INDEX_SCHEMA_VERSION, body)?;
     write_py_json(base_path, &payload, fsync)?;
-    let file_bytes = base_path
-        .metadata()
-        .map_err(|error| corrupt(format!("tvann base metadata failed: {error}")))?
-        .len();
+    let base = sidecar_base_block(
+        base_path,
+        "tvann index",
+        [
+            ("cluster_count", Value::from(ann.postings.len())),
+            (
+                "calibration_fingerprint",
+                Value::from(ann.calibration_fingerprint),
+            ),
+        ],
+    )?;
     Ok(serde_json::json!({
         "schema_version": TVANN_INDEX_SCHEMA_VERSION,
-        "base": {
-            "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
-            "sha256": sha256_file_hex(base_path)?,
-            "file_bytes": file_bytes,
-            "cluster_count": ann.postings.len(),
-            "calibration_fingerprint": ann.calibration_fingerprint,
-        },
+        "base": base,
     }))
 }
 
@@ -86,14 +83,12 @@ pub fn validate(base_path: &Path, manifest: Option<&Value>) -> CoreResult<()> {
     let Some(manifest) = manifest else {
         return Ok(());
     };
-    let manifest = value_object(manifest, "tvann index manifest")?;
-    if get_i64(manifest, "schema_version", -1) != TVANN_INDEX_SCHEMA_VERSION {
-        return Err(corrupt("unsupported tvann index manifest schema version"));
-    }
-    if let Some(base) = manifest.get("base").and_then(Value::as_object) {
-        verify_file_sha256(base_path, get_str(base, "sha256"), "tvann index base")?;
-    }
-    Ok(())
+    validate_sidecar_manifest(
+        base_path,
+        manifest,
+        TVANN_INDEX_SCHEMA_VERSION,
+        "tvann index",
+    )
 }
 
 /// Reads and parses the `.tvann` base into a [`LoadedAnn`], or `None` when the
@@ -102,18 +97,8 @@ pub fn load(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Option<Loa
     if manifest.is_none() || !base_path.is_file() {
         return Ok(None);
     }
-    let payload = read_json(base_path, "tvann index base")?;
-    let payload = value_object(&payload, "tvann index base")?;
-    if get_i64(payload, "schema_version", -1) != TVANN_INDEX_SCHEMA_VERSION {
-        return Err(corrupt("unsupported tvann index base schema version"));
-    }
-    let body = payload
-        .get("body")
-        .ok_or_else(|| corrupt("tvann index base body is missing"))?;
-    if body_sha256(body)? != get_str(payload, "body_sha256") {
-        return Err(corrupt("tvann index base failed checksum"));
-    }
-    let body = value_object(body, "tvann index base body")?;
+    let body = read_checksummed_body(base_path, TVANN_INDEX_SCHEMA_VERSION, "tvann index")?;
+    let body = value_object(&body, "tvann index base body")?;
     let algorithm = get_str(body, "algorithm").to_string();
     let dim = usize::try_from(get_i64(body, "dim", 0))
         .map_err(|_| corrupt("tvann index base has a negative dim"))?;
