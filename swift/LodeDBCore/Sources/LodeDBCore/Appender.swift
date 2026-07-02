@@ -27,6 +27,10 @@ public struct LodeAppendDocument: Sendable, Equatable {
 /// never replays the WAL, so records appended here would be acknowledged yet never
 /// folded in — hence `open` rejects generation-mode options outright. Like
 /// `LodeDB`, a single instance is not thread-safe; serialize calls to it.
+///
+/// On Windows the shared lock degrades to an exclusive hold, so appenders exclude
+/// each other there: a second concurrent `open` waits for the first appender to
+/// close, then fails. On Unix appenders coexist freely.
 public final class LodeAppender {
     private let native: NativeAppender
 
