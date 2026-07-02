@@ -21,6 +21,8 @@
 
 use std::cmp::Ordering;
 
+use crate::vector::math::{dot, rotate};
+
 /// Lloyd iterations for the cluster build. Candidate generation needs a decent
 /// partition, not Lloyd convergence, so a small fixed cap (with an
 /// unchanged-assignment early exit) is plenty and keeps the build deterministic.
@@ -226,9 +228,7 @@ impl ClusterIndex {
             let cluster = *cluster_of.get(entry.0)?; // an unmapped live entry: stale
             stable_postings[cluster].push(entry.1);
             let base = cluster * dim;
-            for (offset, &value) in entry.2.iter().enumerate() {
-                sums[base + offset] += value as f64;
-            }
+            accumulate_into(&mut sums[base..base + dim], entry.2);
         }
         let mut centroids = vec![0.0f32; cluster_count * dim];
         for (cluster, ids) in stable_postings.iter().enumerate() {
@@ -236,10 +236,11 @@ impl ClusterIndex {
                 return None; // a persisted cluster with no live members
             }
             let base = cluster * dim;
-            let divisor = ids.len() as f64;
-            for offset in 0..dim {
-                centroids[base + offset] = (sums[base + offset] / divisor) as f32;
-            }
+            write_cluster_mean(
+                &mut centroids[base..base + dim],
+                &sums[base..base + dim],
+                ids.len(),
+            );
         }
         Some(Self {
             dim,
@@ -317,40 +318,38 @@ fn recompute_centroids(
         let cluster = assignment[i];
         counts[cluster] += 1;
         let base = cluster * dim;
-        for (offset, &value) in entry.2.iter().enumerate() {
-            sums[base + offset] += value as f64;
-        }
+        accumulate_into(&mut sums[base..base + dim], entry.2);
     }
     for (cluster, &count) in counts.iter().enumerate() {
         if count == 0 {
             continue;
         }
         let base = cluster * dim;
-        let divisor = count as f64;
-        for offset in 0..dim {
-            centroids[base + offset] = (sums[base + offset] / divisor) as f32;
-        }
+        write_cluster_mean(
+            &mut centroids[base..base + dim],
+            &sums[base..base + dim],
+            count,
+        );
     }
 }
 
-/// Rotates `query` by a row-major `dim * dim` matrix: `out[o] = Σ q[i]·R[o·dim+i]`.
-/// Matches the engine's exact-scan query rotation so centroid scoring shares the
-/// scan's coordinate space.
-fn rotate(query: &[f32], rotation: &[f32], dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; dim];
-    for (o, slot) in out.iter_mut().enumerate() {
-        let base = o * dim;
-        let mut acc = 0.0f32;
-        for (i, &value) in query.iter().enumerate().take(dim) {
-            acc += value * rotation[base + i];
-        }
-        *slot = acc;
+/// Adds `vector` into a cluster's f64 accumulator slice in ascending offset order,
+/// so the mean stays bit-reproducible across the build and the reload paths.
+fn accumulate_into(sum: &mut [f64], vector: &[f32]) {
+    for (slot, &value) in sum.iter_mut().zip(vector) {
+        *slot += value as f64;
     }
-    out
 }
 
-fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(a, b)| a * b).sum()
+/// Writes one cluster's centroid as the f64 mean of its accumulated `sum` over
+/// `count` members. Both the build's Lloyd update and the persisted-assignment
+/// reload share this so their centroids are bit-identical (the reload matching a
+/// fresh build is load-bearing for a safe adoption).
+fn write_cluster_mean(centroid: &mut [f32], sum: &[f64], count: usize) {
+    let divisor = count as f64;
+    for (slot, &value) in centroid.iter_mut().zip(sum) {
+        *slot = (value / divisor) as f32;
+    }
 }
 
 fn nearest_centroid(vector: &[f32], centroids: &[f32], cluster_count: usize, dim: usize) -> usize {

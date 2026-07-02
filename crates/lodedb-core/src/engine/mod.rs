@@ -23,6 +23,7 @@ use crate::types::{
 };
 use crate::vector::ann::ClusterIndex;
 use crate::vector::index::{CoreVectorChunk, VectorSearchHit};
+use crate::vector::math::dot;
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 use crate::vector::turbovec::TurboVecNativeIndex;
 use crate::version::{CORE_VERSION, STORAGE_SCHEMA_VERSION};
@@ -4553,13 +4554,6 @@ fn validate_ann_options(ann: &CoreAnnOptions) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| left * right)
-        .sum()
-}
-
 fn lexical_pool_width(top_k: usize) -> usize {
     (top_k * LEXICAL_POOL_FACTOR).max(LEXICAL_POOL_FLOOR)
 }
@@ -4612,15 +4606,7 @@ fn rotate_query(query: &[f32], rotation: &[f32], dim: usize) -> Result<Vec<f32>,
             "persisted TurboVec rotation matrix has invalid dimensions",
         ));
     }
-    let mut rotated = vec![0.0; dim];
-    for out_d in 0..dim {
-        let mut acc = 0.0;
-        for in_d in 0..dim {
-            acc += query[in_d] * rotation[out_d * dim + in_d];
-        }
-        rotated[out_d] = acc;
-    }
-    Ok(rotated)
+    Ok(crate::vector::math::rotate(query, rotation, dim))
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, CoreError> {
