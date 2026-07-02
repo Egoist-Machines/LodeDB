@@ -2695,6 +2695,7 @@ fn index_from_loaded_store(
         pending_lexical_clears: BTreeSet::new(),
         pending_raw_text_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
+        pending_vectors_changed: false,
     };
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
     // first ANN query rebuilds it. This skips the k-means rebuild after a clean
@@ -3143,6 +3144,10 @@ fn persist_index_generation(
     index.pending_lexical_clears.clear();
     index.pending_raw_text_clears.clear();
     index.pending_removed_stable_ids.clear();
+    // A base write persists a fresh `.tvann` (if resident) matching the current
+    // vectors, and a delta write has already consumed the flag for its tvann
+    // decision, so either way the next cycle starts from "unchanged".
+    index.pending_vectors_changed = false;
     Ok(())
 }
 
@@ -3316,6 +3321,7 @@ fn write_index_delta(
             document_count_after: index.documents.len(),
             chunk_count_after: index.chunk_count(),
             tvim: build_tvim_delta(index)?,
+            vectors_changed: index.pending_vectors_changed,
             raw_text_upserts,
             raw_text_clears: index.pending_raw_text_clears.iter().cloned().collect(),
             lexical_upserts,
@@ -3621,6 +3627,11 @@ struct VectorOnlyIndex {
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
     pending_removed_stable_ids: BTreeSet<u64>,
+    /// Whether a vector value actually changed (a real add/move/remove, not a
+    /// metadata-only re-emit) since the last commit. Set at the vector-sync choke
+    /// points alongside the cluster-cache drop, so one engine signal drives both
+    /// the in-memory cache invalidation and the persisted `.tvann` sidecar drop.
+    pending_vectors_changed: bool,
 }
 
 impl VectorOnlyIndex {
@@ -3657,6 +3668,7 @@ impl VectorOnlyIndex {
             pending_lexical_clears: BTreeSet::new(),
             pending_raw_text_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
+            pending_vectors_changed: false,
         }
     }
 
@@ -3710,9 +3722,13 @@ impl VectorOnlyIndex {
         for stable_id in readded {
             self.pending_removed_stable_ids.remove(&stable_id);
         }
-        // The corpus changed, so any cluster index is stale; the next ANN query
+        // A vector value changed (this sync only runs for real changes, never a
+        // metadata-only re-emit). Record the one signal that drives both the ANN
+        // cache drop below and the persisted `.tvann` sidecar drop at commit: the
+        // corpus changed, so any cluster index is stale; the next ANN query
         // rebuilds it from the current documents (which include these rows), so a
         // newly-added vector is always clustered and findable.
+        self.pending_vectors_changed = true;
         self.cluster_index.get_mut().take();
         Ok(())
     }
@@ -3729,9 +3745,16 @@ impl VectorOnlyIndex {
             index.remove_chunks(chunk_ids);
             removed
         };
+        if removed.is_empty() {
+            // Nothing was actually live to remove, so the vector set is unchanged
+            // and the cluster index (and any `.tvann` base) stays valid.
+            return;
+        }
         self.pending_removed_stable_ids.extend(removed);
-        // A removed vector must not linger in a stale cluster posting; drop the
-        // cluster index so the next ANN query rebuilds from the live documents.
+        // The vector set changed: record the shared signal (drives the `.tvann`
+        // drop at commit) and drop the cluster index so a removed vector cannot
+        // linger in a stale posting; the next ANN query rebuilds from live rows.
+        self.pending_vectors_changed = true;
         self.cluster_index.get_mut().take();
     }
 

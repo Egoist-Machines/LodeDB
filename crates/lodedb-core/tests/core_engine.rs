@@ -2515,6 +2515,51 @@ fn ann_reopen_reflects_reembedded_vector() {
 }
 
 #[test]
+fn ann_metadata_only_update_preserves_the_sidecar() {
+    // A metadata-only update re-emits its unchanged vector in the tvim delta but
+    // does not change the vector set, so the engine's vectors-changed signal stays
+    // false and the persisted .tvann survives. On reopen the cluster index is
+    // adopted (resident before any query), not lazily rebuilt.
+    let path = unique_temp_dir("core_ann_meta_only");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"));
+        drop(engine);
+    }
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        // Re-upsert b0c0 with its exact vector but new metadata: a metadata-only
+        // change the content hash recognizes as an unchanged vector.
+        let mut doc = blob_docs().into_iter().next().unwrap();
+        assert_eq!(doc.document_id, "b0c0");
+        doc.metadata
+            .insert("tag".to_string(), "updated".to_string());
+        engine.upsert_vectors("default", &[doc]).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(
+        reopened.ann_cluster_resident("default").unwrap(),
+        "a metadata-only update must preserve the .tvann so it is adopted on reopen"
+    );
+    let hits = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn exact_store_writes_no_tvann_sidecar() {
     let path = unique_temp_dir("core_no_tvann");
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
