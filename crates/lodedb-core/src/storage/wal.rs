@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 pub const WAL_SUFFIX: &str = ".wal";
 pub const WAL_MAGIC: &[u8; 8] = b"EELWAL01";
 pub const WAL_SCHEMA_VERSION: u32 = 1;
+/// Bytes of the fixed file header written once at WAL creation: the 8-byte magic
+/// plus the 4-byte big-endian schema version. Records start at this offset.
+pub const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalRecord {
@@ -143,7 +146,7 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
     }
     let data =
         std::fs::read(path).map_err(|error| corrupt(format!("WAL could not be read: {error}")))?;
-    if data.len() < 12 {
+    if data.len() < WAL_HEADER_LEN {
         return Ok(WalScan {
             records: Vec::new(),
             valid_len: 0,
@@ -162,7 +165,7 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
         )));
     }
     let mut records = Vec::new();
-    let mut offset = 12_usize;
+    let mut offset = WAL_HEADER_LEN;
     let total = data.len();
     while offset < total {
         if offset + 4 > total {

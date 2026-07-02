@@ -2283,25 +2283,37 @@ impl CoreAppender {
             // complete records (not behind torn bytes the next writer's replay would
             // stop at) and reserves an LSN that collides with neither a writer's
             // generation LSNs nor a frame a crashed peer already committed.
-            let floor = self.repair_and_lsn_floor(&wal, counter)?;
+            let (floor, valid_len) = self.repair_and_lsn_floor(&wal, counter)?;
             let lsn = floor
                 .checked_add(1)
                 .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
-            crate::storage::wal::append_record(&wal, lsn, op, payload, self.fsync)?;
+            let append = crate::storage::wal::append_record(&wal, lsn, op, payload, self.fsync)?;
             // Record the new valid length as the next appender's watermark, after
             // the frame is durable (see `lsn::write_counter`): a crash between the
             // two leaves the watermark behind the frame, so the next appender drops
             // the frame as an unacknowledged tail rather than trusting a phantom.
-            let new_len = std::fs::metadata(&wal)
-                .map(|meta| meta.len())
-                .map_err(core_io_error)?;
+            //
+            // Derive the new length from the repaired pre-append length plus the
+            // bytes just written, so the hot path takes no post-append stat.
+            // `append_record` writes the fixed header only when the file did not
+            // exist, which is exactly when the repaired valid length is 0 (repair
+            // removes a headerless WAL); otherwise the frame lands at `valid_len`.
+            let new_len = if valid_len == 0 {
+                crate::storage::wal::WAL_HEADER_LEN as u64 + append.record_bytes as u64
+            } else {
+                valid_len + append.record_bytes as u64
+            };
             crate::storage::lsn::write_counter(file, lsn, Some(new_len), self.fsync)?;
             Ok(lsn)
         })
     }
 
-    /// Repairs the WAL tail and returns the floor the next LSN must exceed (the
-    /// reservation is `floor + 1`). The caller must hold the counter lock.
+    /// Repairs the WAL tail and returns `(floor, valid_len)`: the floor the next
+    /// LSN must exceed (the reservation is `floor + 1`) and the WAL's valid byte
+    /// length after the repair (where the next frame will land, `0` when the file
+    /// is absent and a header must be written). The caller must hold the counter
+    /// lock, and derives the next watermark as `valid_len + bytes_written` without
+    /// a post-append stat.
     ///
     /// With a trusted watermark (the common case) this is O(1): stat the file and,
     /// if it grew past the watermark, drop the crashed peer's unacknowledged tail;
@@ -2320,7 +2332,7 @@ impl CoreAppender {
         &self,
         wal: &Path,
         counter: Option<crate::storage::lsn::Counter>,
-    ) -> Result<u64, CoreError> {
+    ) -> Result<(u64, u64), CoreError> {
         let counter_lsn = counter.map(|counter| counter.lsn).unwrap_or(0);
         let physical = match std::fs::metadata(wal) {
             Ok(meta) => meta.len(),
@@ -2330,14 +2342,14 @@ impl CoreAppender {
         match counter.and_then(|counter| counter.wal_len) {
             // Intact tail: nothing sits past the last recorded frame, and the
             // counter's LSN is the last frame's LSN. The hot path.
-            Some(mark) if physical == mark && mark > 0 => Ok(counter_lsn.max(self.floor)),
+            Some(mark) if physical == mark && mark > 0 => Ok((counter_lsn.max(self.floor), mark)),
             // Bytes past the watermark are a crashed peer's unacknowledged tail (or
             // a zero-length WAL that needs its header rewritten): drop them back to
             // the boundary. `repair_torn_tail` removes the file when the boundary is
             // zero so the next append writes a fresh header, not a headerless frame.
             Some(mark) if physical >= mark => {
                 Self::repair_torn_tail(wal, mark, physical)?;
-                Ok(counter_lsn.max(self.floor))
+                Ok((counter_lsn.max(self.floor), mark))
             }
             // No usable watermark, or one past the file: scan to repair the tail and
             // clamp the LSN above the WAL's true max so a torn counter or stale floor
@@ -2346,14 +2358,17 @@ impl CoreAppender {
                 let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
                 Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
                 let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
-                Ok(counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)))
+                Ok((
+                    counter_lsn.max(self.floor).max(wal_max.unwrap_or(0)),
+                    scan.valid_len,
+                ))
             }
         }
     }
 
     /// Drops a torn or headerless WAL tail so the next append lands after complete
-    /// records. The caller must hold the counter lock (via `with_lock` or
-    /// `with_reserved`) so no concurrent append is mid-write.
+    /// records. The caller must hold the counter lock (via `with_lock`) so no
+    /// concurrent append is mid-write.
     fn repair_torn_tail(wal: &Path, valid_len: u64, total_len: u64) -> Result<(), CoreError> {
         if !wal.is_file() {
             return Ok(());
