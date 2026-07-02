@@ -39,6 +39,10 @@ pub struct LoadedStore {
     pub layout: StoreLayout,
     pub index_key: String,
     pub generation: u64,
+    /// Highest LSN durably folded into this generation (the commit manifest's
+    /// `applied_lsn`, defaulting to `generation` for older manifests / legacy
+    /// stores). The read-your-writes base watermark; always `>= generation`.
+    pub applied_lsn: u64,
     pub base_epoch: u64,
     pub state: Value,
     pub tvim_path: Option<PathBuf>,
@@ -102,6 +106,7 @@ pub fn load_store(
             layout: StoreLayout::LegacyTopLevelJson,
             index_key: index_key.to_string(),
             generation: 0,
+            applied_lsn: 0,
             base_epoch: 0,
             state: legacy.payload,
             tvim_path: legacy_tvim_path(persistence_dir, index_key),
@@ -202,6 +207,7 @@ pub fn load_generation_store(
         layout: StoreLayout::Generation,
         index_key,
         generation: manifest.generation(),
+        applied_lsn: manifest.applied_lsn(),
         base_epoch,
         state,
         tvim_path,
@@ -222,6 +228,10 @@ pub fn load_generation_store(
 #[derive(Debug, Clone, Copy)]
 pub struct StoreMetadata {
     pub generation: u64,
+    /// Highest LSN durably folded into the committed generation (the manifest's
+    /// `applied_lsn`, `>= generation`). The appender clamps every reservation above
+    /// it so a fresh append never reuses an LSN the store already reports applied.
+    pub applied_lsn: u64,
     pub native_dim: usize,
 }
 
@@ -242,6 +252,7 @@ pub fn load_store_metadata(persistence_dir: &Path, index_key: &str) -> CoreResul
     let native_dim = state.get("native_dim").and_then(Value::as_u64).unwrap_or(0) as usize;
     Ok(StoreMetadata {
         generation: manifest.generation(),
+        applied_lsn: manifest.applied_lsn(),
         native_dim,
     })
 }
@@ -283,6 +294,9 @@ pub struct TvimBaseWrite<'a> {
 pub struct GenerationCommitInput<'a> {
     pub index_key: &'a str,
     pub generation: u64,
+    /// Highest LSN durably folded into this generation (see
+    /// [`commit_manifest::CommitManifest::applied_lsn`]); clamped up to `generation`.
+    pub applied_lsn: u64,
     pub base_epoch: u64,
     pub state: &'a Value,
     pub tvim: Option<TvimBaseWrite<'a>>,
@@ -372,6 +386,7 @@ pub fn write_generation_commit(
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
+        applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
         document_count,
         chunk_count,
@@ -445,6 +460,9 @@ pub struct GenerationDeltaInput<'a> {
     /// `raw_text_clears`/`lexical_clears`.
     pub multivec_clears: Vec<String>,
     pub document_deletes: Vec<String>,
+    /// Highest LSN durably folded into this generation (see
+    /// [`commit_manifest::CommitManifest::applied_lsn`]); clamped up to `generation`.
+    pub applied_lsn: u64,
     /// Whether a new document-text delta segment is zstd-compressed. Threaded
     /// from the engine's effective (persisted-or-seeded) flag down to
     /// [`text_store::append_delta`].
@@ -624,6 +642,7 @@ pub fn write_generation_delta(
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
+        applied_lsn: input.applied_lsn,
         base_epoch: input.base_epoch,
         document_count: input.document_count_after,
         chunk_count: input.chunk_count_after,

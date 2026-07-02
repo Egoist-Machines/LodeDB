@@ -50,6 +50,7 @@ fn main() {
         GenerationCommitInput {
             index_key: INDEX_KEY,
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: &state,
             tvim: None,

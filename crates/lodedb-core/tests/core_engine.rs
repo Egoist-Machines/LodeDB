@@ -1395,6 +1395,166 @@ fn deleted_then_readded_document_does_not_resurrect_matrix() {
 }
 
 #[test]
+fn read_only_refresh_overlays_wal_tail_for_read_your_writes() {
+    let path = unique_temp_dir("core_reader_freshness");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    // A writer creates and checkpoints an empty index, then closes so an appender
+    // (and the lock-free reader) can proceed.
+    {
+        let mut engine = CoreEngine::open(writer_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+
+    // A read-only handle: a stable snapshot of the committed base, no WAL overlay.
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    let base_lsn = reader.applied_lsn("default").unwrap();
+    assert!(
+        reader
+            .list_documents("default", None, None, None)
+            .unwrap()
+            .is_empty(),
+        "the reader starts at the empty committed base"
+    );
+
+    // A separate appender durably logs a vector-in record.
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let appended_lsn = {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        appender
+            .append_vectors(&[doc("fresh", 0, metadata(&[("kind", "appended")]))])
+            .expect("append")
+    };
+
+    // Without a refresh the reader is still the snapshot: it neither sees the record
+    // nor advances its applied LSN.
+    assert_eq!(reader.applied_lsn("default").unwrap(), base_lsn);
+    assert!(reader
+        .list_documents("default", None, None, None)
+        .unwrap()
+        .is_empty());
+
+    // Refresh overlays the current WAL tail in memory (no checkpoint): the append is
+    // now visible and applied_lsn has caught up to (at least) the appended LSN.
+    reader.refresh().unwrap();
+    assert!(
+        reader.applied_lsn("default").unwrap() >= appended_lsn,
+        "refresh must fold the WAL up to the appended LSN for read-your-writes"
+    );
+    let docs = reader.list_documents("default", None, None, None).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["document_id"], serde_json::json!("fresh"));
+
+    // The WAL was overlaid, not truncated: a fresh read-only open still sees the
+    // record on its own refresh (the appender's record is still durable on disk).
+    let mut reader2 = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    reader2.refresh().unwrap();
+    assert_eq!(
+        reader2.list_documents("default", None, None, None).unwrap().len(),
+        1
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn applied_lsn_watermark_survives_a_no_op_folded_append() {
+    // A folded record need not advance `generation` one-for-one (an idempotent
+    // re-add is a full no-op), so the durable applied-LSN watermark must be tracked
+    // separately, or a reader's read-your-writes check for the appender's returned
+    // LSN would stall after the writer folds and truncates the WAL.
+    let path = unique_temp_dir("core_applied_lsn_watermark");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Append the same document twice: the first fold is a real upsert (bumps the
+    // generation), the second is an idempotent no-op (does not).
+    let (first_lsn, second_lsn) = {
+        let appender = CoreAppender::open(opts.clone()).expect("open appender");
+        let first = appender
+            .append_vectors(&[doc("dup", 0, metadata(&[]))])
+            .expect("first append");
+        let second = appender
+            .append_vectors(&[doc("dup", 0, metadata(&[]))])
+            .expect("second append");
+        (first, second)
+    };
+    assert!(second_lsn > first_lsn);
+    // A writer folds both records and checkpoints (truncating the WAL).
+    let committed_generation = {
+        let engine = CoreEngine::open(opts).unwrap();
+        engine.stats("default").unwrap().generation
+    };
+    // The no-op second fold did not advance the generation to its LSN...
+    assert!(
+        committed_generation < second_lsn,
+        "the idempotent re-add should not have advanced the generation to its LSN"
+    );
+
+    // ...but the persisted watermark did, so a fresh read-only reader (no refresh,
+    // WAL already truncated) reports read-your-writes up to the acknowledged LSN.
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(
+        reader.applied_lsn("default").unwrap(),
+        second_lsn,
+        "applied_lsn must reach the highest acknowledged append even when folded as a no-op"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn pure_no_op_fold_persists_watermark_and_truncates() {
+    // If the WAL tail folds entirely to no-ops (an appender re-adding an
+    // already-committed document), the fold advances no generation but does advance
+    // the applied-LSN watermark. The writer must still commit that watermark (a
+    // watermark-only epoch) before truncating the WAL, or the acknowledged LSN would
+    // be stranded and generation-mode recovery would see a never-emptying WAL.
+    let path = unique_temp_dir("core_pure_noop_fold");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    // Commit "dup" into the base.
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[doc("dup", 0, metadata(&[]))]).unwrap();
+        engine.persist().unwrap();
+    }
+    // An appender re-adds the identical document: its fold is a pure no-op.
+    let noop_lsn = {
+        let appender = CoreAppender::open(opts.clone()).expect("open appender");
+        appender.append_vectors(&[doc("dup", 0, metadata(&[]))]).expect("append")
+    };
+    // A writer opens (folds the no-op, commits the watermark) and closes.
+    {
+        let engine = CoreEngine::open(opts).unwrap();
+        drop(engine);
+    }
+    // The WAL was truncated: the watermark is durable, so generation-mode recovery
+    // (which rejects an unfolded WAL) stays safe.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    assert!(
+        lodedb_core::storage::wal::read_records(&wal).unwrap().is_empty(),
+        "the no-op fold's watermark should be durable, letting the WAL truncate"
+    );
+    // A fresh read-only reader reaches read-your-writes for the acknowledged LSN
+    // straight from the durable manifest watermark -- no refresh needed.
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert!(
+        reader.applied_lsn("default").unwrap() >= noop_lsn,
+        "the committed watermark must cover the acknowledged no-op LSN"
+    );
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn concurrent_appenders_are_folded_by_the_next_writer() {
     let path = unique_temp_dir("core_appender");
     // Real coordination: writer takes the exclusive lock, appenders the shared one.

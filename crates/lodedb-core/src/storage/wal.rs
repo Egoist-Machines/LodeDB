@@ -144,8 +144,20 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
             total_len: 0,
         });
     }
-    let data =
-        std::fs::read(path).map_err(|error| corrupt(format!("WAL could not be read: {error}")))?;
+    // A concurrent checkpoint can remove the WAL between the `is_file` check above
+    // and this read; treat that race as an empty WAL (a lock-free reader's refresh
+    // seqlock then retries against the new base) rather than a hard I/O error.
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalScan {
+                records: Vec::new(),
+                valid_len: 0,
+                total_len: 0,
+            });
+        }
+        Err(error) => return Err(corrupt(format!("WAL could not be read: {error}"))),
+    };
     if data.len() < WAL_HEADER_LEN {
         return Ok(WalScan {
             records: Vec::new(),
@@ -243,6 +255,10 @@ pub fn checkpoint_store(
     let input = crate::storage::GenerationCommitInput {
         index_key: &store.index_key,
         generation: next_generation,
+        // This in-crate checkpoint helper does not track a folded-append watermark
+        // separately; the generation is the best available (its callers append no
+        // higher-LSN records than the generation they check point at).
+        applied_lsn: next_generation,
         base_epoch: next_generation,
         state: &store.state,
         tvim: None,
@@ -853,6 +869,7 @@ mod tests {
             layout: StoreLayout::Generation,
             index_key: index_key.to_string(),
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state: empty_state(index_key),
             tvim_path: None,
@@ -903,6 +920,7 @@ mod tests {
             layout: StoreLayout::Generation,
             index_key: index_key.to_string(),
             generation: 1,
+            applied_lsn: 1,
             base_epoch: 1,
             state,
             tvim_path: None,
