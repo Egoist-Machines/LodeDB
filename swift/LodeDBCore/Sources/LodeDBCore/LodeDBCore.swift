@@ -500,7 +500,11 @@ public struct TextChunk: Equatable, Sendable {
     public let tokens: [String]
 }
 
-private struct NativeVectorDocumentJSON: Encodable {
+/// The `upsert_vectors`/append vector-document JSON shape. Shared by
+/// `LodeDB.addVectors` and `LodeAppender`, whose records must be byte-identical so
+/// an appended record replays exactly like a writer-authored one. The optional
+/// caption is retained by the native core only under `storeText`.
+struct NativeVectorDocumentJSON: Encodable {
     let documentID: String
     let vector: [Float]
     let metadata: [String: String]

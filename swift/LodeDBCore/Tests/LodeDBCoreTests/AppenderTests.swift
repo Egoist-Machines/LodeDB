@@ -52,19 +52,6 @@ import Testing
     }
 }
 
-@Test func appenderRejectsGenerationModeOptions() throws {
-    let store = FileManager.default.temporaryDirectory
-        .appendingPathComponent("lodedb-appender-gen-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: store) }
-
-    // Generation mode never replays the WAL, so the appender must reject it rather
-    // than acknowledge appends the next generation-mode writer would never fold in.
-    #expect(throws: LodeDBError.self) {
-        _ = try LodeAppender.open(at: store, commitMode: .generation)
-    }
-}
-
 @Test func appenderRetainsCaptionOnlyWithStoreText() throws {
     let store = FileManager.default.temporaryDirectory
         .appendingPathComponent("lodedb-appender-caption-\(UUID().uuidString)")

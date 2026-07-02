@@ -19,6 +19,17 @@ from typing import Any, Protocol
 from lodedb.engine.core import EngineDocument, EngineQuery, EngineResponse, EngineVectorDocument
 
 
+def _dumps(payload: Any) -> str:
+    """Serializes a payload to the compact, key-sorted JSON the native core expects.
+
+    Shared by the adapter and its engine/appender handles so every FFI call and
+    every checksummed body encodes byte-identically (the native and Python engines
+    verify each other's writes, so the encoding must match).
+    """
+
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 class NativeCorePayload(dict[str, Any]):
     """Native JSON-backed dict for private adapter round-trips."""
 
@@ -137,7 +148,7 @@ class NativeCoreAdapter:
             compression=compression,
             acquire_writer_lock=acquire_writer_lock,
         )
-        return NativeCoreEngineHandle(module.CoreEngine.open(self._dumps(options)))
+        return NativeCoreEngineHandle(module.CoreEngine.open(_dumps(options)))
 
     def open_readonly_engine(
         self,
@@ -164,7 +175,7 @@ class NativeCoreAdapter:
             compression=compression,
         )
         return NativeCoreEngineHandle(
-            module.CoreEngine.open_readonly(str(path), self._dumps(options))
+            module.CoreEngine.open_readonly(str(path), _dumps(options))
         )
 
     def open_appender(
@@ -204,7 +215,7 @@ class NativeCoreAdapter:
             chunk_character_limit=8192,
             acquire_writer_lock=acquire_writer_lock,
         )
-        return NativeCoreAppenderHandle(module.CoreAppender.open(self._dumps(options)))
+        return NativeCoreAppenderHandle(module.CoreAppender.open(_dumps(options)))
 
     @staticmethod
     def document_payload(document: EngineDocument) -> dict[str, Any]:
@@ -316,10 +327,6 @@ class NativeCoreAdapter:
             },
         )
 
-    @staticmethod
-    def _dumps(payload: Any) -> str:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
     def _require_module(self) -> NativeCoreModule:
         module = self._module_or_none()
         if module is None:
@@ -346,7 +353,7 @@ class NativeCoreEngineHandle:
         self._engine.create_index(str(index_id), int(vector_dim), int(bit_width))
 
     def create_index_with_options(self, options: Mapping[str, Any]) -> None:
-        self._engine.create_index_with_options(self._dumps(dict(options)))
+        self._engine.create_index_with_options(_dumps(dict(options)))
 
     def upsert_vectors(
         self,
@@ -377,12 +384,12 @@ class NativeCoreEngineHandle:
                 }
                 for document in documents
             ]
-            return self._loads(array_upsert(str(index_id), matrix, self._dumps(sidecar)))
+            return self._loads(array_upsert(str(index_id), matrix, _dumps(sidecar)))
         payload = [NativeCoreAdapter.vector_document_payload(document) for document in documents]
         return self._loads(
             self._engine.upsert_vectors(
                 str(index_id),
-                self._dumps(payload),
+                _dumps(payload),
             )
         )
 
@@ -390,7 +397,7 @@ class NativeCoreEngineHandle:
         return self._loads(
             self._engine.delete_documents(
                 str(index_id),
-                self._dumps([str(document_id) for document_id in document_ids]),
+                _dumps([str(document_id) for document_id in document_ids]),
             )
         )
 
@@ -414,12 +421,12 @@ class NativeCoreEngineHandle:
         metadata_json = (
             None
             if metadata is None
-            else self._dumps({str(key): str(value) for key, value in metadata.items()})
+            else _dumps({str(key): str(value) for key, value in metadata.items()})
         )
         if clear_text:
-            text_json: str | None = self._dumps(None)
+            text_json: str | None = _dumps(None)
         elif text is not None:
-            text_json = self._dumps(text)
+            text_json = _dumps(text)
         else:
             text_json = None
         return self._loads(
@@ -470,7 +477,7 @@ class NativeCoreEngineHandle:
         ]
         return self._loads(
             self._engine.upsert_multivector(
-                str(index_id), matrix, patch_bytes, self._dumps(sidecar)
+                str(index_id), matrix, patch_bytes, _dumps(sidecar)
             )
         )
 
@@ -489,7 +496,7 @@ class NativeCoreEngineHandle:
         matrix = np.ascontiguousarray(np.asarray(query, dtype=np.float32))
         if matrix.ndim == 1:
             matrix = matrix.reshape(1, -1)
-        filter_json = None if filter is None else self._dumps(dict(filter))
+        filter_json = None if filter is None else _dumps(dict(filter))
         return self._loads(
             self._engine.query_multivector(str(index_id), matrix, int(top_k), filter_json)
         )
@@ -502,7 +509,7 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        filter_json = None if filter is None else self._dumps(dict(filter))
+        filter_json = None if filter is None else _dumps(dict(filter))
         array_query = getattr(self._engine, "query_vector_array", None)
         if callable(array_query):
             import numpy as np
@@ -518,7 +525,7 @@ class NativeCoreEngineHandle:
         return self._loads(
             self._engine.query_vector(
                 str(index_id),
-                self._dumps([float(value) for value in vector]),
+                _dumps([float(value) for value in vector]),
                 int(top_k),
                 filter_json,
             )
@@ -532,7 +539,7 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        filter_json = None if filter is None else self._dumps(dict(filter))
+        filter_json = None if filter is None else _dumps(dict(filter))
         array_batch = getattr(self._engine, "query_vectors_batch_array", None)
         if callable(array_batch):
             import numpy as np
@@ -545,7 +552,7 @@ class NativeCoreEngineHandle:
         else:
             raw = self._engine.query_vectors_batch(
                 str(index_id),
-                self._dumps([[float(value) for value in vector] for vector in vectors]),
+                _dumps([[float(value) for value in vector] for vector in vectors]),
                 int(top_k),
                 filter_json,
             )
@@ -579,7 +586,7 @@ class NativeCoreEngineHandle:
         matrix = np.ascontiguousarray(vectors, dtype=np.float32)
         if matrix.ndim != 2 or matrix.shape[0] == 0:
             return None
-        filter_json = None if filter is None else self._dumps(dict(filter))
+        filter_json = None if filter is None else _dumps(dict(filter))
         scores, document_ids, metadata_json, k = array_out(
             str(index_id), matrix, int(top_k), filter_json
         )
@@ -598,7 +605,7 @@ class NativeCoreEngineHandle:
         payload = [NativeCoreAdapter.document_payload(document) for document in documents]
         plan_json = self._engine.prepare_text_upsert(
             str(index_id),
-            self._dumps(payload),
+            _dumps(payload),
             bool(store_text),
             bool(index_text),
             int(chunk_character_limit),
@@ -615,7 +622,7 @@ class NativeCoreEngineHandle:
         plan_json = (
             plan.native_json
             if isinstance(plan, NativeCorePayload)
-            else self._dumps(dict(plan))
+            else _dumps(dict(plan))
         )
         embedding_rows = tuple(embeddings)
         array_apply = getattr(self._engine, "apply_text_upsert_array", None)
@@ -638,7 +645,7 @@ class NativeCoreEngineHandle:
         return self._loads(
             self._engine.apply_text_upsert(
                 plan_json,
-                self._dumps(embedding_payload),
+                _dumps(embedding_payload),
                 float(embedding_time_ms),
             )
         )
@@ -658,7 +665,7 @@ class NativeCoreEngineHandle:
         query_plan_json = (
             query_plan.native_json
             if isinstance(query_plan, NativeCorePayload)
-            else self._dumps(dict(query_plan))
+            else _dumps(dict(query_plan))
         )
         return self._search_embedded_text_json(
             index_id,
@@ -678,7 +685,7 @@ class NativeCoreEngineHandle:
         top_k: int,
         filter: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        query_plan_json = self._dumps(
+        query_plan_json = _dumps(
             {
                 "query": str(query),
                 "mode": str(mode),
@@ -721,8 +728,8 @@ class NativeCoreEngineHandle:
             }
             for query in queries
         ]
-        plans_json = self._dumps(plans)
-        filter_json = None if filter is None else self._dumps(dict(filter))
+        plans_json = _dumps(plans)
+        filter_json = None if filter is None else _dumps(dict(filter))
         if query_embeddings is not None:
             import numpy as np
 
@@ -759,7 +766,7 @@ class NativeCoreEngineHandle:
                     query_plan_json,
                     query_array,
                     int(top_k),
-                    None if filter is None else self._dumps(dict(filter)),
+                    None if filter is None else _dumps(dict(filter)),
                 )
             )
         return self._loads(
@@ -768,9 +775,9 @@ class NativeCoreEngineHandle:
                 query_plan_json,
                 None
                 if query_embedding is None
-                else self._dumps([float(value) for value in query_embedding]),
+                else _dumps([float(value) for value in query_embedding]),
                 int(top_k),
-                None if filter is None else self._dumps(dict(filter)),
+                None if filter is None else _dumps(dict(filter)),
             )
         )
 
@@ -789,7 +796,7 @@ class NativeCoreEngineHandle:
         value = json.loads(
             self._engine.get_document_texts(
                 str(index_id),
-                self._dumps([str(document_id) for document_id in document_ids]),
+                _dumps([str(document_id) for document_id in document_ids]),
             )
         )
         if not isinstance(value, dict):
@@ -815,7 +822,7 @@ class NativeCoreEngineHandle:
         value = json.loads(
             self._engine.list_documents(
                 str(index_id),
-                None if filter is None else self._dumps(dict(filter)),
+                None if filter is None else _dumps(dict(filter)),
                 None if after is None else str(after),
                 None if limit is None else int(limit),
             )
@@ -829,10 +836,6 @@ class NativeCoreEngineHandle:
 
     def close(self) -> None:
         self._engine.close()
-
-    @staticmethod
-    def _dumps(payload: Any) -> str:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
     def _loads(payload: str) -> dict[str, Any]:
@@ -861,15 +864,11 @@ class NativeCoreAppenderHandle:
 
     def append_vectors(self, documents: Iterable[EngineVectorDocument]) -> int:
         payload = [NativeCoreAdapter.vector_document_payload(document) for document in documents]
-        return int(self._appender.append_vectors(self._dumps(payload)))
+        return int(self._appender.append_vectors(_dumps(payload)))
 
     def append_deletes(self, document_ids: Iterable[str]) -> int:
         return int(
             self._appender.append_deletes(
-                self._dumps([str(document_id) for document_id in document_ids])
+                _dumps([str(document_id) for document_id in document_ids])
             )
         )
-
-    @staticmethod
-    def _dumps(payload: Any) -> str:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
