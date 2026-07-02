@@ -834,6 +834,12 @@ class NativeCoreEngineHandle:
     def persist(self) -> None:
         self._engine.persist()
 
+    def refresh(self) -> None:
+        self._engine.refresh()
+
+    def applied_lsn(self, index_id: str) -> int:
+        return int(self._engine.applied_lsn(str(index_id)))
+
     def close(self) -> None:
         self._engine.close()
 

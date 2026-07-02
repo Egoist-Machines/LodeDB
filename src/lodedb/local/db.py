@@ -1141,6 +1141,32 @@ class LodeDB:
                 self._native_persist()
             return self._native_stats()
 
+    def refresh(self) -> None:
+        """Overlays the current write-ahead log tail into this handle's in-memory
+        view without checkpointing.
+
+        A ``read_only=True`` reader loads the last committed generation on open and
+        is otherwise a stable snapshot; call this to fold in records other processes
+        appended since (e.g. via :class:`~lodedb.Appender`), and to reach
+        read-your-writes for an appended LSN (see :meth:`applied_lsn`). A no-op on a
+        writable handle, which already folds the WAL when it opens.
+        """
+
+        with self._op_lock:
+            self._native_vector_engine.refresh()
+
+    def applied_lsn(self) -> int:
+        """Returns the highest log sequence number reflected in this handle's view.
+
+        Compare it to the LSN an :class:`~lodedb.Appender` returned for
+        read-your-writes: the appended record is visible here once
+        ``applied_lsn() >= that_lsn``. On a read-only handle call :meth:`refresh`
+        first to fold the current WAL tail into the view.
+        """
+
+        with self._op_lock:
+            return int(self._native_vector_engine.applied_lsn(_LOCAL_INDEX_ID))
+
     def count(self, *, filter: Mapping[str, Any] | None = None) -> int:
         """Returns the number of documents stored, optionally matching a filter.
 

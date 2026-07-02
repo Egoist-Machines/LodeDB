@@ -1193,6 +1193,16 @@ impl PyCoreEngine {
         self.inner.persist().map_err(native_core_error_to_py)
     }
 
+    fn refresh(&mut self) -> PyResult<()> {
+        self.inner.refresh().map_err(native_core_error_to_py)
+    }
+
+    fn applied_lsn(&self, index_id: &str) -> PyResult<u64> {
+        self.inner
+            .applied_lsn(index_id)
+            .map_err(native_core_error_to_py)
+    }
+
     fn close(&mut self) -> PyResult<()> {
         self.inner.close().map_err(native_core_error_to_py)
     }

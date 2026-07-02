@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 1
+let lodeNativeExpectedABIVersion: UInt32 = 2
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -416,6 +416,21 @@ final class NativeEngine {
     func persist() throws {
         var error: UnsafeMutablePointer<LodeError>?
         try Self.check(lodedb_engine_persist(handle, &error), error: error)
+    }
+
+    func refresh() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try Self.check(lodedb_engine_refresh(handle, &error), error: error)
+    }
+
+    func appliedLSN() throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) {
+            lodedb_engine_applied_lsn(handle, $0, &lsn, &error)
+        }
+        try Self.check(status, error: error)
+        return lsn
     }
 
     func close() throws {

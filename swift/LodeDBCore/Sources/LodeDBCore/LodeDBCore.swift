@@ -104,8 +104,9 @@ public final class LodeDB {
         self.indexesText = true
     }
 
-    /// Opens a persisted store read-only (a lock-free generation snapshot). WAL tails
-    /// are ignored; the snapshot reflects the last committed generation. When
+    /// Opens a persisted store read-only (a lock-free generation snapshot). The
+    /// snapshot reflects the last committed generation; call `refresh()` to overlay
+    /// the current WAL tail for reader freshness and read-your-writes. When
     /// `modelIdentity` is given, the store's persisted model must match.
     public static func openReadOnly(
         path: URL,
@@ -452,6 +453,26 @@ public final class LodeDB {
     /// Flushes pending writes to durable storage. No-op for in-memory stores.
     public func persist() throws {
         try lockedOpen { try engine.persist() }
+    }
+
+    /// Overlays the current write-ahead log tail into this handle's in-memory view
+    /// without checkpointing.
+    ///
+    /// A `readOnly` handle loads the last committed generation on open and is
+    /// otherwise a stable snapshot; call this to fold in records other processes
+    /// appended since (e.g. via `LodeAppender`), and to reach read-your-writes for
+    /// an appended LSN (see `appliedLSN()`). A no-op on a writable handle, which
+    /// folds the WAL when it opens.
+    public func refresh() throws {
+        try lockedOpen { try engine.refresh() }
+    }
+
+    /// The highest log sequence number reflected in this handle's view. Compare it
+    /// to the LSN a `LodeAppender` returned for read-your-writes: the appended
+    /// record is visible here once `appliedLSN() >= that LSN`. On a read-only handle
+    /// call `refresh()` first to fold the current WAL tail into the view.
+    public func appliedLSN() throws -> UInt64 {
+        try lockedOpen { try engine.appliedLSN() }
     }
 
     /// Closes the writable generation (a final checkpoint) and marks the handle
