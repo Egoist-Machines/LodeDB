@@ -257,6 +257,9 @@ impl CoreEngine {
             let old_had_text = old_record
                 .as_ref()
                 .is_some_and(|record| record.text.is_some());
+            let old_had_matrix = old_record
+                .as_ref()
+                .is_some_and(|record| record.patch_matrix.is_some());
             if retains_text {
                 index
                     .pending_raw_text_clears
@@ -267,6 +270,17 @@ impl CoreEngine {
                 // text resurrects on reload.
                 index
                     .pending_raw_text_clears
+                    .insert(document.document_id.clone());
+            }
+            if document.patch_matrix.is_some() {
+                index.pending_multivec_clears.remove(&document.document_id);
+            } else if old_had_matrix {
+                // A re-add that drops the late-interaction matrix on a live document
+                // clears it; like a text/lexical clear, the delta expresses
+                // "unchanged" by omission, so without an explicit multi-vector delete
+                // the base's old matrix would resurrect on reload.
+                index
+                    .pending_multivec_clears
                     .insert(document.document_id.clone());
             }
             if let Some(old_record) = old_record {
@@ -405,6 +419,21 @@ impl CoreEngine {
                     &record.chunks,
                     &mut changed_filter_fields,
                 );
+                // Record the deleted document's sidecar payloads as pending clears.
+                // A re-add before persist cancels the pending delete
+                // (`add_document_indexes` clears it), so without these a delete +
+                // re-add-without-payload would carry neither a delete nor a clear and
+                // resurrect the base's text/tokens/matrix on reload. The re-add's own
+                // upsert logic drops the clear again when the payload returns.
+                if record.text.is_some() {
+                    index.pending_raw_text_clears.insert(document_id.clone());
+                }
+                if !record.token_lists.is_empty() {
+                    index.pending_lexical_clears.insert(document_id.clone());
+                }
+                if record.patch_matrix.is_some() {
+                    index.pending_multivec_clears.insert(document_id.clone());
+                }
                 index.lexical_index.remove_group(document_id);
                 let chunk_ids = record
                     .chunks
@@ -2600,6 +2629,7 @@ fn index_from_loaded_store(
         pending_deletes: BTreeSet::new(),
         pending_lexical_clears: BTreeSet::new(),
         pending_raw_text_clears: BTreeSet::new(),
+        pending_multivec_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
     };
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
@@ -2973,6 +3003,7 @@ fn persist_index_generation(
         && index.pending_deletes.is_empty()
         && index.pending_lexical_clears.is_empty()
         && index.pending_raw_text_clears.is_empty()
+        && index.pending_multivec_clears.is_empty()
         && index.pending_removed_stable_ids.is_empty();
     // A committed base with nothing pending is already durable on disk.
     if index.base_epoch != 0 && nothing_pending {
@@ -3048,6 +3079,7 @@ fn persist_index_generation(
     index.pending_deletes.clear();
     index.pending_lexical_clears.clear();
     index.pending_raw_text_clears.clear();
+    index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
     Ok(())
 }
@@ -3230,6 +3262,7 @@ fn write_index_delta(
                 index,
                 index.pending_upserts.iter().map(String::as_str),
             )),
+            multivec_clears: index.pending_multivec_clears.iter().cloned().collect(),
             document_deletes: deleted_document_ids,
             compress_text,
         },
@@ -3502,6 +3535,12 @@ struct VectorOnlyIndex {
     /// current base; written to the text delta as explicit deletes, like
     /// `pending_lexical_clears`.
     pending_raw_text_clears: BTreeSet<String>,
+    /// Live documents whose late-interaction patch matrix went present to absent
+    /// since the current base; written to the multi-vector delta as explicit
+    /// deletes, like `pending_lexical_clears`. Without this a re-add that drops the
+    /// matrix would leave the base's old matrix to resurrect on reload (the delta
+    /// expresses "unchanged" by omission).
+    pending_multivec_clears: BTreeSet<String>,
     /// TurboVec stable ids dropped from the live index since the current base and
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
@@ -3541,6 +3580,7 @@ impl VectorOnlyIndex {
             pending_deletes: BTreeSet::new(),
             pending_lexical_clears: BTreeSet::new(),
             pending_raw_text_clears: BTreeSet::new(),
+            pending_multivec_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
         }
     }

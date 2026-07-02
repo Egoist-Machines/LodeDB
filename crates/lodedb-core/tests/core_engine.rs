@@ -1250,6 +1250,151 @@ fn query_multivector_ranks_documents_by_maxsim() {
 }
 
 #[test]
+fn cleared_patch_matrix_does_not_resurrect_on_reload() {
+    use lodedb_core::storage::multivec_store::MultiVecRecord;
+
+    fn unit(axis: usize) -> [f32; 8] {
+        let mut row = [0.0_f32; 8];
+        row[axis] = 1.0;
+        row
+    }
+    fn encode(rows: &[[f32; 8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+    // The same live document, first with a late-interaction matrix, then without.
+    let with_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: Some(MultiVecRecord {
+            dtype: "float32".to_string(),
+            patch_count: 2,
+            bytes: encode(&[unit(0), unit(2)]),
+        }),
+    };
+    let without_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: None,
+    };
+
+    let path = unique_temp_dir("core_mv_clear");
+    let options = open_options(&path, false, "generation");
+    // 1. Persist the matrix: a full base with a `.tvmv` base segment.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[with_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 2. Re-upsert the same live document without a matrix. The pooled vector is
+    // unchanged, so this folds as an O(changed) delta (not a base rewrite) — the
+    // path where an omitted clear would let the base matrix survive.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        engine.upsert_vectors("default", &[without_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 3. Reopen: the matrix must be gone. query_multivector skips matrix-less
+    // documents, so a resurrected base matrix would make "a" reappear here.
+    {
+        let engine = CoreEngine::open(options).unwrap();
+        let results = engine
+            .query_multivector("default", &unit(0), 1, 5, None)
+            .unwrap();
+        assert!(
+            results.hits.iter().all(|hit| hit.document_id != "a"),
+            "cleared patch matrix resurrected from the base on reload"
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn deleted_then_readded_document_does_not_resurrect_matrix() {
+    use lodedb_core::storage::multivec_store::MultiVecRecord;
+
+    fn unit(axis: usize) -> [f32; 8] {
+        let mut row = [0.0_f32; 8];
+        row[axis] = 1.0;
+        row
+    }
+    fn encode(rows: &[[f32; 8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+    let with_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: Some(MultiVecRecord {
+            dtype: "float32".to_string(),
+            patch_count: 2,
+            bytes: encode(&[unit(0), unit(2)]),
+        }),
+    };
+    let without_matrix = || CoreVectorDocument {
+        document_id: "a".to_string(),
+        vector: unit(0).to_vec(),
+        metadata: metadata(&[]),
+        text: None,
+        patch_matrix: None,
+    };
+
+    let path = unique_temp_dir("core_mv_delete_readd");
+    let options = open_options(&path, false, "generation");
+    // 1. Base with a committed matrix.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &[with_matrix()]).unwrap();
+        engine.persist().unwrap();
+    }
+    // 2. Delete then re-add the same document without a matrix, both before persist.
+    // The re-add cancels the pending delete, so only a delete-time clear keeps the
+    // delta from carrying nothing for the matrix.
+    {
+        let mut engine = CoreEngine::open(options.clone()).unwrap();
+        engine
+            .delete_documents("default", &["a".to_string()])
+            .unwrap();
+        engine
+            .upsert_vectors("default", &[without_matrix()])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    // 3. Reopen: the base matrix must not resurrect.
+    {
+        let engine = CoreEngine::open(options).unwrap();
+        let results = engine
+            .query_multivector("default", &unit(0), 1, 5, None)
+            .unwrap();
+        assert!(
+            results.hits.iter().all(|hit| hit.document_id != "a"),
+            "delete + re-add resurrected the base matrix on reload"
+        );
+    }
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn concurrent_appenders_are_folded_by_the_next_writer() {
     let path = unique_temp_dir("core_appender");
     // Real coordination: writer takes the exclusive lock, appenders the shared one.

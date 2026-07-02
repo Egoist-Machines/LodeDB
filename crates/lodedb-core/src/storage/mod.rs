@@ -440,6 +440,10 @@ pub struct GenerationDeltaInput<'a> {
     pub lexical_clears: Vec<String>,
     /// `Some` only for late-interaction stores; the changed documents' matrices.
     pub multivec_upserts: Option<MultiVecMap>,
+    /// Live documents whose late-interaction matrix was cleared since the base;
+    /// written to the multi-vector delta as explicit deletes, like
+    /// `raw_text_clears`/`lexical_clears`.
+    pub multivec_clears: Vec<String>,
     pub document_deletes: Vec<String>,
     /// Whether a new document-text delta segment is zstd-compressed. Threaded
     /// from the engine's effective (persisted-or-seeded) flag down to
@@ -577,19 +581,24 @@ pub fn write_generation_delta(
         _ => previous.store_manifest("tvlex").cloned(),
     };
     // Only append a multi-vector delta for a store that actually has a tvmv base:
-    // a patch-matrix upsert, or a delete against an existing multi-vector base.
-    // A non-late-interaction store never wrote a tvmv base, so its deletes must not
-    // try to append one (there is no manifest to read).
+    // a patch-matrix upsert, or a delete/clear against an existing multi-vector
+    // base. A non-late-interaction store never wrote a tvmv base, so its
+    // deletes/clears must not try to append one (there is no manifest to read).
     let multivec_manifest = match input.multivec_upserts {
         Some(upserts)
             if !upserts.is_empty()
-                || (!input.document_deletes.is_empty()
+                || ((!input.document_deletes.is_empty() || !input.multivec_clears.is_empty())
                     && previous.store_manifest("tvmv").is_some()) =>
         {
+            // A live document whose matrix was cleared is written as an explicit
+            // delete, or the base's matrix resurrects on reload (the delta means
+            // "unchanged" by omission), mirroring the text/lexical clear handling.
+            let mut deleted = input.document_deletes.clone();
+            deleted.extend(input.multivec_clears.iter().cloned());
             Some(multivec_store::append_delta(
                 &base_tvmv_path(persistence_dir, input.index_key, input.base_epoch),
                 &upserts,
-                &input.document_deletes,
+                &deleted,
                 input.document_count_after,
                 fsync,
             )?)
