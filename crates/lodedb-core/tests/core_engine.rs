@@ -1723,6 +1723,68 @@ fn appender_retains_text_only_under_store_text() {
 }
 
 #[test]
+fn appender_and_writer_log_byte_identical_upsert_vectors() {
+    // The upsert_vectors WAL record has a single shared builder
+    // (`wal_vector_document`), so a concurrent CoreAppender must log a record
+    // byte-identical to the one the exclusive writer's `upsert_vectors` writes for
+    // the same document (replay resolves both through the same path, so any
+    // divergence would silently change what an appended record restores). Guard the
+    // parity by running both real paths and comparing the logged payload (the LSN
+    // differs by construction and is lifted out of the payload on read).
+    let mut document = doc(
+        "captioned-parity",
+        3,
+        metadata(&[("kind", "image"), ("topic", "ops")]),
+    );
+    document.text = Some("a red bicycle by the canal".to_string());
+
+    let read_last_payload = |path: &Path| -> Value {
+        let wal = lodedb_core::storage::wal::wal_path(path, INDEX_KEY);
+        let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
+        let record = records.last().expect("a logged upsert_vectors record");
+        assert_eq!(record.op, "upsert_vectors");
+        assert!(record.payload.get("lsn").is_none(), "lsn is lifted out on read");
+        record.payload.clone()
+    };
+
+    // Writer path: create + upsert in WAL mode, then read the record it logged.
+    let writer_path = unique_temp_dir("core_wal_parity_writer");
+    let mut writer_options = open_options(&writer_path, false, "wal"); // store_text + index_text on
+    writer_options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_options).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", std::slice::from_ref(&document))
+            .unwrap();
+    }
+    let writer_payload = read_last_payload(&writer_path);
+
+    // Appender path: create + persist an identical store, then append the same doc.
+    let appender_path = unique_temp_dir("core_wal_parity_appender");
+    let mut appender_options = open_options(&appender_path, false, "wal");
+    appender_options.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(appender_options.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    CoreAppender::open(appender_options)
+        .expect("open appender")
+        .append_vectors(std::slice::from_ref(&document))
+        .expect("append");
+    let appender_payload = read_last_payload(&appender_path);
+
+    assert_eq!(
+        writer_payload, appender_payload,
+        "writer and appender must log byte-identical upsert_vectors records"
+    );
+
+    fs::remove_dir_all(writer_path).unwrap();
+    fs::remove_dir_all(appender_path).unwrap();
+}
+
+#[test]
 fn appender_privacy_mode_tokens_persist_across_reopen() {
     // Privacy mode (store_text=false, index_text=true): a caption appended onto an
     // existing vector-identical document must survive a checkpoint and reopen. The

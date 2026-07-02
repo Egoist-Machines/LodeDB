@@ -315,37 +315,10 @@ impl CoreEngine {
                 chunks_upserted += 1;
             }
             if append_wal {
-                // Collect only changed rows for the WAL: never write raw text when
-                // store_text is off (privacy); when index_text is on, write derived
-                // caption tokens so replay rebuilds lexical postings without
-                // retaining raw text on disk.
-                let text = if store_text {
-                    serde_json::json!(document.text)
-                } else {
-                    Value::Null
-                };
-                let tokens = match (index_text, document.text.as_deref()) {
-                    (true, Some(text)) => serde_json::json!([tokenize(text)]),
-                    _ => Value::Null,
-                };
-                // Carry the late-interaction patch matrix so a crash/replay before
-                // checkpoint does not lose the MaxSim payload while keeping the anchor.
-                let patch_matrix = match &document.patch_matrix {
-                    Some(matrix) => serde_json::json!({
-                        "dtype": matrix.dtype,
-                        "patch_count": matrix.patch_count,
-                        "bytes": matrix.bytes,
-                    }),
-                    None => Value::Null,
-                };
-                wal_vectors.push(serde_json::json!({
-                    "document_id": document.document_id,
-                    "vector": document.vector,
-                    "metadata": document.metadata,
-                    "text": text,
-                    "tokens": tokens,
-                    "patch_matrix": patch_matrix,
-                }));
+                // Only rows that actually changed are logged (unchanged rows took
+                // the `continue` above). The record shape is the single shared
+                // builder, so an appender-authored record is byte-identical.
+                wal_vectors.push(wal_vector_document(document, store_text, index_text));
             }
             changed += 1;
         }
@@ -2356,36 +2329,10 @@ impl CoreAppender {
             if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
                 return Err(invalid_err("vector contains a non-finite or out-of-range value"));
             }
-            let patch_matrix = match &document.patch_matrix {
-                Some(matrix) => serde_json::json!({
-                    "dtype": matrix.dtype,
-                    "patch_count": matrix.patch_count,
-                    "bytes": matrix.bytes,
-                }),
-                None => Value::Null,
-            };
-            // Mirror the engine's upsert_vectors WAL record exactly: retain raw text
-            // only under store_text (privacy), and when index_text is on write the
-            // derived caption tokens so replay rebuilds BM25 postings even in the
-            // store_text=false privacy mode (a captioned vector is one chunk keyed by
-            // its document id, so its caption is one token list).
-            let text = if self.store_text {
-                serde_json::json!(document.text)
-            } else {
-                Value::Null
-            };
-            let tokens = match (self.index_text, document.text.as_deref()) {
-                (true, Some(text)) => serde_json::json!([tokenize(text)]),
-                _ => Value::Null,
-            };
-            vectors.push(serde_json::json!({
-                "document_id": document.document_id,
-                "vector": document.vector,
-                "metadata": document.metadata,
-                "text": text,
-                "tokens": tokens,
-                "patch_matrix": patch_matrix,
-            }));
+            // Byte-identical to the engine's writer-authored record via the shared
+            // builder: raw text only under store_text (privacy), caption tokens
+            // under index_text, and the late-interaction patch matrix carried along.
+            vectors.push(wal_vector_document(document, self.store_text, self.index_text));
         }
         self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
     }
@@ -3425,6 +3372,46 @@ fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> b
             | "apply_embedded_documents"
             | "update_document_payload"
     )
+}
+
+/// Builds the per-document JSON object for an `upsert_vectors` WAL record.
+///
+/// The single source of truth for that record's shape: both the exclusive writer
+/// (`CoreEngine::upsert_vectors`) and the concurrent `CoreAppender::append_vectors`
+/// log through it, so an appended record is byte-identical to a writer-authored
+/// one and replays the same way (`vector_document_from_wal` is the inverse). Raw
+/// `text` is retained only under `store_text` (privacy: it is never written to the
+/// WAL otherwise); derived caption `tokens` are written under `index_text` so
+/// lexical/BM25 search survives replay even when raw text is not stored (a
+/// captioned vector is one chunk keyed by its document id, so its caption is one
+/// token list); the late-interaction `patch_matrix` is carried so a crash/replay
+/// before checkpoint keeps the MaxSim payload alongside the anchor vector.
+fn wal_vector_document(document: &CoreVectorDocument, store_text: bool, index_text: bool) -> Value {
+    let text = if store_text {
+        serde_json::json!(document.text)
+    } else {
+        Value::Null
+    };
+    let tokens = match (index_text, document.text.as_deref()) {
+        (true, Some(text)) => serde_json::json!([tokenize(text)]),
+        _ => Value::Null,
+    };
+    let patch_matrix = match &document.patch_matrix {
+        Some(matrix) => serde_json::json!({
+            "dtype": matrix.dtype,
+            "patch_count": matrix.patch_count,
+            "bytes": matrix.bytes,
+        }),
+        None => Value::Null,
+    };
+    serde_json::json!({
+        "document_id": document.document_id,
+        "vector": document.vector,
+        "metadata": document.metadata,
+        "text": text,
+        "tokens": tokens,
+        "patch_matrix": patch_matrix,
+    })
 }
 
 fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreError> {
