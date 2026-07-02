@@ -310,7 +310,11 @@ class LodeDB:
         ``ann_nprobe`` (clusters probed per query, defaults to about
         ``sqrt(clusters)``); probing every cluster reproduces the exact result. ANN
         is worthwhile for large corpora where the full scan is the bottleneck; small
-        and mid-size corpora should keep the exact default.
+        and mid-size corpora should keep the exact default. Like ``compression``,
+        ``ann`` is a create-time choice: on reopen of an existing store the
+        persisted config wins and these arguments are ignored, so an exact store
+        stays exact and an ANN store keeps its clustering (and tuning) regardless
+        of what a reopen passes.
         ``compression`` controls whether the retained raw-text store (the
         ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
         ``True``; it has no effect when ``store_text=False``. The setting is

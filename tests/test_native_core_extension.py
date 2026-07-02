@@ -1194,3 +1194,46 @@ def test_native_core_adapter_can_discover_extension_when_installed(monkeypatch) 
     from lodedb.engine.native_adapter import NativeCoreAdapter
 
     assert NativeCoreAdapter().available is True
+
+
+def test_public_ann_option_creates_and_serves_a_cluster_store(tmp_path) -> None:
+    """The ann= kwargs flow dict -> JSON -> native create options: the store serves
+    ANN-pruned queries with exact re-scored hits, and a default reopen keeps the
+    persisted config (ann is a create-time choice)."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    # nprobe < clusters so the config actually prunes: probe-all reproduces the
+    # exact scan and would pass even if the kwargs never reached the core.
+    db = lodedb.LodeDB.open_vector_store(
+        store, vector_dim=8, ann="cluster", ann_clusters=4, ann_nprobe=2
+    )
+    try:
+        # Four well-separated blobs on orthogonal axes, five docs each.
+        for blob, axis in enumerate((0, 2, 4, 6)):
+            for i in range(5):
+                vector = [0.0] * 8
+                vector[axis] = 1.0
+                vector[axis + 1] = 0.02 * (i + 1)
+                db.add_vectors(vector, id=f"b{blob}c{i}")
+        hits = db.search_by_vector(_onehot(0), k=5)
+        assert len(hits) == 5
+        assert all(hit.id.startswith("b0") for hit in hits)
+    finally:
+        db.close()
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        hits = reopened.search_by_vector(_onehot(2), k=5)
+        assert len(hits) == 5
+        assert all(hit.id.startswith("b1") for hit in hits)
+    finally:
+        reopened.close()
+
+
+def test_public_ann_tuning_without_ann_raises(tmp_path) -> None:
+    import lodedb
+
+    with pytest.raises(ValueError, match="require ann="):
+        lodedb.LodeDB.open_vector_store(tmp_path / "store", vector_dim=8, ann_clusters=4)
