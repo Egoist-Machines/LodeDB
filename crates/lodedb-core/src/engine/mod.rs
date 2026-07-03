@@ -633,58 +633,15 @@ impl CoreEngine {
         let index = self.index(index_id)?;
         index.require_vectors_mutable()?;
         let base_generation = index.generation;
-        let mut prepared_documents = Vec::with_capacity(documents.len());
-        let mut chunks_to_embed = Vec::new();
-
-        for document in documents {
-            if document.document_id.trim().is_empty() {
-                return invalid("document_id is required");
-            }
-            if document.text.trim().is_empty() {
-                return invalid("document text is required");
-            }
-            let pieces = chunk_text(&document.text, chunk_character_limit)?;
-            let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
-            let mut chunks = Vec::with_capacity(pieces.len());
-            for piece in pieces {
-                let chunk_hash = normalized_chunk_hash(&piece);
-                let occurrence = *occurrences.get(&chunk_hash).unwrap_or(&0);
-                occurrences.insert(chunk_hash.clone(), occurrence + 1);
-                let chunk_id = chunk_id_for_hash(&document.document_id, &chunk_hash, occurrence);
-                let tokens = if index_text || store_text {
-                    tokenize(&piece)
-                } else {
-                    Vec::new()
-                };
-                // O(1) existence check via the maintained chunk->owner map rather
-                // than cloning every chunk vector in the corpus just to test
-                // membership (the latter made each incremental text add O(corpus)).
-                let needs_embedding = !index.chunk_owner_by_id.contains_key(&chunk_id);
-                if needs_embedding {
-                    chunks_to_embed.push(PlanEmbeddingChunk {
-                        document_id: document.document_id.clone(),
-                        chunk_id: chunk_id.clone(),
-                        text: piece.clone(),
-                    });
-                }
-                chunks.push(PlanDocumentChunk {
-                    chunk_id,
-                    text: piece,
-                    tokens,
-                    needs_embedding,
-                });
-            }
-            prepared_documents.push(PlanDocument {
-                document_id: document.document_id.clone(),
-                metadata: document.metadata.clone(),
-                text: if store_text {
-                    Some(document.text.clone())
-                } else {
-                    None
-                },
-                chunks,
-            });
-        }
+        // Skip re-embedding chunks already resident via the O(1) chunk->owner map (a
+        // cloned-corpus membership test made each incremental text add O(corpus)).
+        let (prepared_documents, chunks_to_embed) = plan_document_chunks(
+            documents,
+            store_text,
+            index_text,
+            chunk_character_limit,
+            |chunk_id| !index.chunk_owner_by_id.contains_key(chunk_id),
+        )?;
 
         let plan_id = self.next_plan_id;
         self.next_plan_id += 1;
@@ -823,6 +780,35 @@ impl CoreEngine {
                     patch_matrix: None,
                 },
             );
+            // Gate on the writer's OWN retention policy, not token-list presence:
+            // chunks are tokenized whenever index_text OR store_text is set (tokens
+            // feed a raw-text rebuild), so a store_text=true, index_text=false writer
+            // has non-empty token_lists yet persists no `.tvlex`. Treating that as
+            // retained would skip the clear and let a prior `.tvlex` entry win over the
+            // new raw text on reload. Mirrors the replay path's fold-policy gating.
+            let new_has_text = plan.store_text && document.text.is_some();
+            let new_has_tokens =
+                plan.index_text && token_lists.iter().any(|list| !list.is_empty());
+            let old_had_text = old_record.as_ref().is_some_and(|record| record.text.is_some());
+            let old_had_tokens = old_record
+                .as_ref()
+                .is_some_and(|record| record.token_lists.iter().any(|list| !list.is_empty()));
+            // Clear retained sidecars this upsert drops (and drop a stale clear when
+            // the payload returns), so a clean checkpoint matches a crash replay
+            // through apply_embedded_documents_wal, which does the same. A same-policy
+            // re-add agrees on retention, so both branches are no-ops; this fires only
+            // when the store's retention policy changed across opens (e.g. a
+            // store_text=false reopen replacing a store_text=true writer's document).
+            if new_has_text {
+                index.pending_raw_text_clears.remove(&document.document_id);
+            } else if old_had_text {
+                index.pending_raw_text_clears.insert(document.document_id.clone());
+            }
+            if new_has_tokens {
+                index.pending_lexical_clears.remove(&document.document_id);
+            } else if old_had_tokens {
+                index.pending_lexical_clears.insert(document.document_id.clone());
+            }
             if let Some(old_record) = old_record {
                 // A text re-add carries no patch matrix; if it replaces a
                 // late-interaction document, record a multi-vector clear so the
@@ -1704,9 +1690,23 @@ impl CoreEngine {
         payload: &Value,
     ) -> Result<(), CoreError> {
         self.require_writable()?;
+        // The folding writer's retention policy decides what will actually be
+        // persisted, which drives the replaced-document clear decision below. A WAL
+        // record can carry text/tokens an appender retained under a different policy;
+        // if this fold disables that retention it will not write the sidecar upsert,
+        // so the replaced document's old sidecar must be cleared rather than left to
+        // resurrect (mirrors gating the payload through the writer's own policy).
+        let (fold_store_text, fold_index_text) = self.text_capture_policy();
         let index = self.index_mut(index_id)?;
         index.require_vectors_mutable()?;
-        let removed_chunk_ids = payload
+        // The record's own removed_chunk_ids seed the removal set, but a concurrent
+        // appender cannot compute it (it has no index state), so it logs an empty
+        // list; the replacement loop below augments this set with each replaced
+        // document's old chunks. remove_document_indexes clears only the owner/field
+        // maps -- the turbovec rows are dropped solely by sync_vector_index_remove
+        // keyed on this set -- so without the derivation a replaced document's old
+        // vectors would linger in the base.
+        let mut removed_chunk_ids = payload
             .get("removed_chunk_ids")
             .and_then(Value::as_array)
             .into_iter()
@@ -1785,6 +1785,20 @@ impl CoreEngine {
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
+            // Normalize the replayed payload to THIS fold's retention policy up front: a
+            // record can carry text/tokens an appender kept under a different policy,
+            // but only what this writer will persist may enter the in-memory view (a
+            // store_text=false fold must not expose the appender's text until the next
+            // reopen). Keep tokens only when a source will persist them: index_text
+            // writes `.tvlex` directly, and store_text lets a reopen rebuild tokens from
+            // the retained raw text -- but only if this document actually kept text
+            // (already gated above), so a text-less store_text fold drops them too.
+            let text = if fold_store_text { text } else { None };
+            let token_lists = if fold_index_text || text.is_some() {
+                token_lists
+            } else {
+                Vec::new()
+            };
             let chunk_ids = document
                 .get("chunk_ids")
                 .and_then(Value::as_array)
@@ -1803,6 +1817,15 @@ impl CoreEngine {
                 chunks.push(ChunkRecord { chunk_id, vector });
             }
             active_chunk_ids.extend(chunks.iter().map(|chunk| chunk.chunk_id.clone()));
+            // Whether this fold PERSISTS text/tokens for the document, driving the
+            // replaced-document sidecar clear below. `text` is already gated to the
+            // fold's store_text; the `.tvlex` sidecar is written only under index_text
+            // (a store_text-only rebuild keeps tokens in memory but writes no `.tvlex`),
+            // so gate the token side on fold_index_text specifically. Captured before
+            // `text` moves into the record.
+            let new_has_text = text.is_some();
+            let new_has_tokens =
+                fold_index_text && token_lists.iter().any(|list| !list.is_empty());
             let old_record = index.documents.insert(
                 document_id.clone(),
                 DocumentRecord {
@@ -1818,6 +1841,26 @@ impl CoreEngine {
                     patch_matrix: None,
                 },
             );
+            let old_had_text = old_record.as_ref().is_some_and(|record| record.text.is_some());
+            let old_had_tokens = old_record
+                .as_ref()
+                .is_some_and(|record| record.token_lists.iter().any(|list| !list.is_empty()));
+            // Clear retained sidecars a replacement drops, and drop a stale clear when
+            // the payload returns -- mirroring upsert_vectors. Old and new agree on
+            // retention for a consistent-policy writer record, so both branches are
+            // no-ops there; this fires only when an appender's store_text/index_text
+            // differs from the writer that created the document, where the delta would
+            // otherwise leave the base's old text/tokens to resurrect on reload.
+            if new_has_text {
+                index.pending_raw_text_clears.remove(&document_id);
+            } else if old_had_text {
+                index.pending_raw_text_clears.insert(document_id.clone());
+            }
+            if new_has_tokens {
+                index.pending_lexical_clears.remove(&document_id);
+            } else if old_had_tokens {
+                index.pending_lexical_clears.insert(document_id.clone());
+            }
             if let Some(old_record) = old_record {
                 // A replayed embedded-text upsert carries no patch matrix; clear a
                 // replaced late-interaction document's matrix so it does not
@@ -1825,6 +1868,13 @@ impl CoreEngine {
                 if old_record.patch_matrix.is_some() {
                     index.pending_multivec_clears.insert(document_id.clone());
                 }
+                // Retire the replaced document's old chunks. Chunk ids are
+                // document-scoped, so this matches the set apply_text_upsert wrote
+                // into a writer-authored record's removed_chunk_ids (unioning to an
+                // identical set when both are present); the active-chunk filter below
+                // then spares any chunk the replacement still references.
+                removed_chunk_ids
+                    .extend(old_record.chunks.iter().map(|chunk| chunk.chunk_id.clone()));
                 index.remove_document_indexes(
                     &document_id,
                     &old_record.metadata,
@@ -2448,6 +2498,11 @@ pub struct CoreAppender {
     path: PathBuf,
     index_key: String,
     vector_dim: usize,
+    // The character limit `prepare_documents` chunks text at, seeded from the open
+    // options. It must match the store writer's limit or an appended text record
+    // would derive chunk ids a writer never would, so a fold could not reuse the
+    // writer's resident chunks (the "match your writer" contract, like store_text).
+    chunk_character_limit: usize,
     // The highest WAL LSN already durable when this appender opened (e.g. a peer's
     // unfolded appends). Every reservation clamps up to it so an appended LSN never
     // reuses one already on disk.
@@ -2588,6 +2643,7 @@ impl CoreAppender {
             path,
             index_key,
             vector_dim,
+            chunk_character_limit: options.chunk_character_limit,
             floor: wal_max_lsn,
             committed_generation: base_generation,
             fsync,
@@ -2638,6 +2694,172 @@ impl CoreAppender {
         self.append_one(
             "delete_documents",
             serde_json::json!({ "document_ids": document_ids }),
+        )
+    }
+
+    /// Chunks `documents` into an ingest plan the caller embeds before calling
+    /// [`Self::append_embedded_documents`]. Pure and lock-free: it captures no base
+    /// generation (text ingest through the appender is replay-independent, never
+    /// `PlanStale`) and detects no reuse, so it marks every chunk for embedding --
+    /// the appender holds no index state to know which chunks already resident. Chunk
+    /// ids come from the same planner the exclusive writer's `prepare_text_upsert`
+    /// uses, so a replayed appended record folds to the same chunks a writer would.
+    pub fn prepare_documents(&self, documents: &[CoreDocument]) -> Result<IngestPlan, CoreError> {
+        if documents.is_empty() {
+            return Err(invalid_err("prepare_documents requires at least one document"));
+        }
+        let (prepared_documents, chunks_to_embed) = plan_document_chunks(
+            documents,
+            self.store_text,
+            self.index_text,
+            self.chunk_character_limit,
+            |_| true,
+        )?;
+        Ok(IngestPlan {
+            // plan_id and base_generation are writer-only bookkeeping; the appender
+            // neither registers plans nor guards on a base generation, so they are
+            // left at 0 and ignored by append_embedded_documents.
+            plan_id: 0,
+            index_id: self.index_key.clone(),
+            base_generation: 0,
+            documents: prepared_documents,
+            chunks_to_embed,
+            store_text: self.store_text,
+            index_text: self.index_text,
+        })
+    }
+
+    /// Durably appends one `apply_embedded_documents` record for a plan returned by
+    /// [`Self::prepare_documents`], with one embedding per `plan.chunks_to_embed` in
+    /// order, returning the LSN assigned to it. The record carries every chunk as an
+    /// added chunk and an empty removed-chunk list: the folding writer resolves a
+    /// replacement's retired chunks from its own index state, so the append needs no
+    /// captured base generation. Text/token retention mirrors the store writer's
+    /// policy exactly (see [`Self::append_vectors`]).
+    pub fn append_embedded_documents(
+        &self,
+        plan: &IngestPlan,
+        embeddings: &[Vec<f32>],
+    ) -> Result<u64, CoreError> {
+        if plan.documents.is_empty() {
+            return Err(invalid_err(
+                "append_embedded_documents requires at least one document",
+            ));
+        }
+        // Reject a plan prepared under a different retention policy than this appender
+        // (a plan from another appender, or altered in transit): its documents could
+        // carry text/tokens this appender would not retain, or lack text it should
+        // keep, silently corrupting the store's text/lexical state on fold. A plan from
+        // this appender's own prepare_documents always matches.
+        if plan.store_text != self.store_text || plan.index_text != self.index_text {
+            return Err(invalid_err(
+                "prepared plan's store_text/index_text does not match this appender",
+            ));
+        }
+        if embeddings.len() != plan.chunks_to_embed.len() {
+            return Err(invalid_err(
+                "embedding count does not match the prepared plan",
+            ));
+        }
+        for embedding in embeddings {
+            if embedding.len() != self.vector_dim {
+                return Err(invalid_err("embedding dimension does not match index"));
+            }
+            // Same finiteness guard the writer's apply_text_upsert applies, so a
+            // NaN/Inf embedding cannot enter the log and fail a later replay.
+            if turbovec::first_invalid_coord(embedding, self.vector_dim).is_some() {
+                return Err(invalid_err(
+                    "embedding contains a non-finite or out-of-range value",
+                ));
+            }
+        }
+        // The appender embeds every chunk (no reuse detection), so this map covers
+        // every chunk the documents reference.
+        let embedding_by_chunk: BTreeMap<&str, &Vec<f32>> = plan
+            .chunks_to_embed
+            .iter()
+            .zip(embeddings)
+            .map(|(chunk, embedding)| (chunk.chunk_id.as_str(), embedding))
+            .collect();
+        let mut added_chunks = Vec::new();
+        let mut wal_documents = Vec::with_capacity(plan.documents.len());
+        for document in &plan.documents {
+            // Enforce this appender's OWN retention policy at the durable boundary,
+            // not the plan's. A plan can cross the FFI as JSON or come from a
+            // different-policy appender, so derive text and tokens from
+            // self.store_text/self.index_text (as append_vectors does) rather than
+            // trusting the plan's fields -- otherwise a store_text=false appender could
+            // leak raw text into `<key>.wal`, or an index_text=true appender fed a
+            // plan prepared without indexing could log empty tokens and drop the doc
+            // from BM25. Tokens are re-derived from the chunk text (not copied) so the
+            // policy holds regardless of the plan's origin; a plan produced by this
+            // appender tokenizes identically, so this is a no-op for the intended
+            // prepare/append pairing.
+            let retained_text = if self.store_text {
+                document.text.clone()
+            } else {
+                None
+            };
+            let token_lists = document
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    if self.store_text || self.index_text {
+                        tokenize(&chunk.text)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut chunk_ids = Vec::with_capacity(document.chunks.len());
+            for chunk in &document.chunks {
+                let embedding =
+                    embedding_by_chunk
+                        .get(chunk.chunk_id.as_str())
+                        .ok_or_else(|| {
+                            invalid_err("prepared plan chunk is missing its embedding")
+                        })?;
+                added_chunks.push(serde_json::json!({
+                    "chunk_id": chunk.chunk_id,
+                    "document_id": document.document_id,
+                    "content_hash": crate::text::hash::sha256_text(&chunk.text),
+                    "embedding": embedding,
+                }));
+                chunk_ids.push(chunk.chunk_id.clone());
+            }
+            // Content hash over the retained raw text when kept, else over the joined
+            // chunk texts -- identical to apply_text_upsert.
+            let content_hash = retained_text
+                .as_ref()
+                .map(|text| crate::text::hash::sha256_text(text))
+                .unwrap_or_else(|| {
+                    crate::text::hash::sha256_text(
+                        &document
+                            .chunks
+                            .iter()
+                            .map(|chunk| chunk.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                });
+            wal_documents.push(serde_json::json!({
+                "document_id": document.document_id,
+                "content_hash": content_hash,
+                "metadata": document.metadata,
+                "text": retained_text,
+                "chunk_ids": chunk_ids,
+                "tokens": token_lists,
+            }));
+        }
+        self.append_one(
+            "apply_embedded_documents",
+            serde_json::json!({
+                "documents": wal_documents,
+                "added_chunks": added_chunks,
+                // Empty: the folding writer derives a replacement's retired chunks
+                // from its own index state (see apply_embedded_documents_wal).
+                "removed_chunk_ids": [],
+            }),
         )
     }
 
@@ -3640,11 +3862,44 @@ fn write_index_delta(
         })
         .collect::<Vec<_>>();
     let deleted_document_ids = index.pending_deletes.iter().cloned().collect::<Vec<_>>();
-    let raw_text_upserts = store_text
-        .then(|| raw_text_for_documents(index, index.pending_upserts.iter().map(String::as_str)));
-    let lexical_upserts = index_text.then(|| {
-        lexical_tokens_for_documents(index, index.pending_upserts.iter().map(String::as_str))
-    });
+    // Emit the raw-text delta segment when there is a pending CLEAR, even if this
+    // writer does not retain text: a clear removes a `.tvtext` entry the base still
+    // holds (e.g. a store_text=false fold replacing a document a store_text=true
+    // writer created), and write_generation_delta only applies the clears when the
+    // upsert side is Some -- passing None would silently carry the base manifest
+    // forward and resurrect the raw text after the WAL truncates. The clear-only path
+    // passes an EMPTY upsert map, never raw_text_for_documents: a store_text=false
+    // fold retains no text, and a pending upsert whose text rode in on a
+    // store_text=true appender's WAL record must be dropped, not re-persisted.
+    let raw_text_upserts = if store_text {
+        Some(raw_text_for_documents(
+            index,
+            index.pending_upserts.iter().map(String::as_str),
+        ))
+    } else if !index.pending_raw_text_clears.is_empty() {
+        Some(BTreeMap::new())
+    } else {
+        None
+    };
+    // Same for the lexical delta: emit it for a pending clear even when index_text is
+    // off, so an index_text=false fold clears a `.tvlex` entry an index_text=true
+    // writer left. write_generation_delta gates the clear on a real `.tvlex` base
+    // existing, so a store whose tokens are only a rebuild from raw text (no `.tvlex`)
+    // does not try to append onto a missing base -- there the raw-text clear alone
+    // drops the words the tokens rebuild from. Unlike raw text, a re-added document
+    // keeps a (one-empty-list-per-chunk) token_lists that lexical_tokens_for_documents
+    // would emit as a spurious upsert, so the clear-only case passes an empty upsert
+    // map and lets only the clears (deletes) take effect.
+    let lexical_upserts = if index_text {
+        Some(lexical_tokens_for_documents(
+            index,
+            index.pending_upserts.iter().map(String::as_str),
+        ))
+    } else if !index.pending_lexical_clears.is_empty() {
+        Some(BTreeMap::new())
+    } else {
+        None
+    };
     let state_header = Value::Object(state_header_for_index(index));
     crate::storage::write_generation_delta(
         dir,
@@ -3735,6 +3990,11 @@ fn lexical_tokens_for_documents<'a>(
             index
                 .documents
                 .get(document_id)
+                // A document with no persisted tokens contributes no `.tvlex` entry.
+                // Match the native reload (lexical_index_for_documents) and the Python
+                // rebuild, which both key off outer-list presence, so a token-less text
+                // document is a (consistent) zero-token unit across every reader rather
+                // than present in one and absent in another.
                 .filter(|record| !record.token_lists.is_empty())
                 .map(|record| (document_id.to_string(), record.token_lists.clone()))
         })
@@ -4804,6 +5064,70 @@ impl VectorOnlyIndex {
         let record = self.documents.get(document_id)?;
         Some((document_id.clone(), record))
     }
+}
+
+/// Chunks documents into the ingest-plan shape shared by the exclusive writer's
+/// [`CoreEngine::prepare_text_upsert`] and the concurrent appender's
+/// [`CoreAppender::prepare_documents`], so a chunk id (and therefore reuse and
+/// replay) is derived identically on both paths. `needs_embedding` decides whether
+/// a chunk must be embedded: the writer skips chunks already resident (its O(1)
+/// owner map), while the appender -- which holds no index state -- embeds every one.
+fn plan_document_chunks(
+    documents: &[CoreDocument],
+    store_text: bool,
+    index_text: bool,
+    chunk_character_limit: usize,
+    mut needs_embedding: impl FnMut(&str) -> bool,
+) -> Result<(Vec<PlanDocument>, Vec<PlanEmbeddingChunk>), CoreError> {
+    let mut prepared_documents = Vec::with_capacity(documents.len());
+    let mut chunks_to_embed = Vec::new();
+    for document in documents {
+        if document.document_id.trim().is_empty() {
+            return invalid("document_id is required");
+        }
+        if document.text.trim().is_empty() {
+            return invalid("document text is required");
+        }
+        let pieces = chunk_text(&document.text, chunk_character_limit)?;
+        let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+        let mut chunks = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let chunk_hash = normalized_chunk_hash(&piece);
+            let occurrence = *occurrences.get(&chunk_hash).unwrap_or(&0);
+            occurrences.insert(chunk_hash.clone(), occurrence + 1);
+            let chunk_id = chunk_id_for_hash(&document.document_id, &chunk_hash, occurrence);
+            let tokens = if index_text || store_text {
+                tokenize(&piece)
+            } else {
+                Vec::new()
+            };
+            let needs = needs_embedding(&chunk_id);
+            if needs {
+                chunks_to_embed.push(PlanEmbeddingChunk {
+                    document_id: document.document_id.clone(),
+                    chunk_id: chunk_id.clone(),
+                    text: piece.clone(),
+                });
+            }
+            chunks.push(PlanDocumentChunk {
+                chunk_id,
+                text: piece,
+                tokens,
+                needs_embedding: needs,
+            });
+        }
+        prepared_documents.push(PlanDocument {
+            document_id: document.document_id.clone(),
+            metadata: document.metadata.clone(),
+            text: if store_text {
+                Some(document.text.clone())
+            } else {
+                None
+            },
+            chunks,
+        });
+    }
+    Ok((prepared_documents, chunks_to_embed))
 }
 
 /// Collects the current vectors for the given chunk ids that are NOT in `skip`

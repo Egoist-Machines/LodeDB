@@ -581,8 +581,12 @@ pub fn write_generation_delta(
     let text_manifest = match input.raw_text_upserts {
         Some(upserts)
             if !upserts.is_empty()
-                || !input.document_deletes.is_empty()
-                || !input.raw_text_clears.is_empty() =>
+                // A delete or raw-text clear only means something when a `.tvtext`
+                // base exists to remove from; a store that retains no text has none,
+                // so must not append onto a missing base (mirrors the tvmv guard).
+                || ((!input.document_deletes.is_empty()
+                    || !input.raw_text_clears.is_empty())
+                    && previous.store_manifest("tvtext").is_some()) =>
         {
             let mut deleted = input.document_deletes.clone();
             deleted.extend(input.raw_text_clears.iter().cloned());
@@ -600,8 +604,13 @@ pub fn write_generation_delta(
     let lexical_manifest = match input.lexical_upserts {
         Some(upserts)
             if !upserts.is_empty()
-                || !input.document_deletes.is_empty()
-                || !input.lexical_clears.is_empty() =>
+                // A delete or lexical clear only means something when a `.tvlex` base
+                // exists; tokens can instead be a rebuild from retained raw text (no
+                // `.tvlex`), where the raw-text clear handles it, so must not append
+                // onto a missing base (mirrors the tvmv guard).
+                || ((!input.document_deletes.is_empty()
+                    || !input.lexical_clears.is_empty())
+                    && previous.store_manifest("tvlex").is_some()) =>
         {
             let mut deleted = input.document_deletes.clone();
             deleted.extend(input.lexical_clears.iter().cloned());

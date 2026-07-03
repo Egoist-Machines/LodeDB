@@ -1928,6 +1928,387 @@ fn create_vector_only_index(engine: &mut CoreEngine) {
         .unwrap();
 }
 
+// One unit embedding per prepared chunk, in plan order, walking the axes so
+// distinct chunks get distinct vectors.
+fn plan_embeddings(plan: &lodedb_core::engine::IngestPlan) -> Vec<Vec<f32>> {
+    plan.chunks_to_embed
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let mut vector = vec![0.0_f32; 8];
+            vector[i % 8] = 1.0;
+            vector
+        })
+        .collect()
+}
+
+#[test]
+fn appended_text_documents_fold_into_the_next_writer() {
+    // A concurrent appender chunks and embeds text in the binding layer, logs one
+    // post-embedding apply_embedded_documents record under the shared lock, and the
+    // next writable open folds it -- with no captured base generation and no
+    // PlanStale, so the text path is multi-producer like the vector-in path.
+    let path = unique_temp_dir("core_text_append_fold");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let lsn = {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        let plan = appender
+            .prepare_documents(&[
+                text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+                text_doc("b", "a second appended document", metadata(&[])),
+            ])
+            .expect("prepare documents");
+        let embeddings = plan_embeddings(&plan);
+        appender
+            .append_embedded_documents(&plan, &embeddings)
+            .expect("append embedded documents")
+    };
+    assert!(lsn >= 1, "append must return the assigned LSN");
+    {
+        let engine = CoreEngine::open(writer_opts).unwrap();
+        let stats = engine.stats("default").unwrap();
+        assert_eq!(stats.document_count, 2, "appended text documents did not fold");
+        // The indexed caption tokens survive the fold, so lexical search finds them.
+        let query = engine.prepare_query_text("hello", "lexical").unwrap();
+        let hits = engine
+            .search_embedded_text("default", &query, None, 5, None)
+            .unwrap();
+        assert!(
+            hits.hits.iter().any(|hit| hit.document_id == "a"),
+            "folded appended text was not lexically searchable"
+        );
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appended_text_replacement_retires_old_chunks() {
+    // An appended text record carries an empty removed_chunk_ids: the appender holds
+    // no index state to compute it. When such a record replaces a document with
+    // different text (hence different chunk ids), the fold must retire the old
+    // chunks' vectors from TurboVec, not just the owner maps -- otherwise the live
+    // row count diverges from the JSON state and the checkpoint fails with a
+    // CorruptStore mismatch (or a stale vector resurrects on reload).
+    let path = unique_temp_dir("core_text_append_replace");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        for (text, axis) in [("original alpha text", 0_usize), ("replacement beta words", 1_usize)] {
+            let plan = appender
+                .prepare_documents(&[text_doc("a", text, metadata(&[]))])
+                .expect("prepare");
+            let embeddings: Vec<Vec<f32>> = plan
+                .chunks_to_embed
+                .iter()
+                .map(|_| {
+                    let mut vector = vec![0.0_f32; 8];
+                    vector[axis] = 1.0;
+                    vector
+                })
+                .collect();
+            appender
+                .append_embedded_documents(&plan, &embeddings)
+                .expect("append");
+        }
+    }
+    // The writable open folds both records and checkpoints; a clean open (no
+    // CorruptStore) proves the original chunk was retired from TurboVec.
+    {
+        let engine = CoreEngine::open(writer_opts).unwrap();
+        let stats = engine.stats("default").unwrap();
+        assert_eq!(stats.document_count, 1);
+        assert_eq!(
+            stats.chunk_count, 1,
+            "the replaced document's original chunk was not retired from the vector index"
+        );
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appended_text_matches_writer_authored_ingest() {
+    // Ingesting the same documents with the same embeddings through the appender
+    // (prepare_documents + append_embedded_documents, then a fold) yields the same
+    // committed store as the exclusive writer's prepare_text_upsert/apply_text_upsert.
+    let documents = [
+        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc("b", "a second appended document", metadata(&[("kind", "note")])),
+    ];
+
+    // Writer path.
+    let writer_path = unique_temp_dir("core_text_parity_writer");
+    let mut writer_opts = open_options(&writer_path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let plan = engine
+            .prepare_text_upsert("default", &documents, true, true, 900)
+            .unwrap();
+        let embeddings = plan_embeddings(&plan);
+        engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+        engine.persist().unwrap();
+    }
+    let writer_engine = CoreEngine::open(writer_opts).unwrap();
+
+    // Appender path: same documents, same embeddings (the empty store embeds every
+    // chunk on both paths, so chunks_to_embed is identical in order).
+    let appender_path = unique_temp_dir("core_text_parity_appender");
+    let mut appender_writer_opts = open_options(&appender_path, false, "wal");
+    appender_writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(appender_writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let mut appender_opts = open_options(&appender_path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        let plan = appender.prepare_documents(&documents).expect("prepare");
+        let embeddings = plan_embeddings(&plan);
+        appender
+            .append_embedded_documents(&plan, &embeddings)
+            .expect("append");
+    }
+    let appender_engine = CoreEngine::open(appender_writer_opts).unwrap();
+
+    let writer_stats = writer_engine.stats("default").unwrap();
+    let appender_stats = appender_engine.stats("default").unwrap();
+    assert_eq!(writer_stats.document_count, appender_stats.document_count);
+    assert_eq!(writer_stats.chunk_count, appender_stats.chunk_count);
+
+    // A vector query ranks the same documents in the same order on both stores.
+    let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let ranked = |engine: &CoreEngine| -> Vec<String> {
+        engine
+            .query_vector("default", &query, 5, None)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect()
+    };
+    assert_eq!(ranked(&writer_engine), ranked(&appender_engine));
+
+    // Release the writer locks before deleting the directories: on Windows an open
+    // handle's exclusive share mode blocks removal.
+    drop(writer_engine);
+    drop(appender_engine);
+    fs::remove_dir_all(writer_path).unwrap();
+    fs::remove_dir_all(appender_path).unwrap();
+}
+
+#[test]
+fn appended_text_without_retention_clears_a_prior_writers_raw_text() {
+    // A store_text writer keeps raw text, from which the lexical index is rebuilt on
+    // load. A concurrent appender opened store_text=false replaces one document with
+    // the SAME text (so its vector is unchanged) but drops the retained text. The
+    // fold must clear the replaced document's base `.tvtext` entry: raw_text_for_
+    // documents skips a text-less document, so on the delta path only an explicit
+    // clear removes the old text -- otherwise it resurrects on the next load and its
+    // words reappear in the rebuilt lexical index. Five documents plus an unchanged
+    // replaced vector keep the checkpoint on the delta path (no compaction, no
+    // fingerprint-triggered base rewrite) where the clear is load-bearing.
+    let path = unique_temp_dir("core_text_append_rawclear");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    opts.store_text = true;
+    opts.index_text = false; // the lexical index is rebuilt from raw text on load
+    // "a" first (chunk index 0 -> unit(0)) so the appender's single-doc plan embeds
+    // it to the identical vector, keeping the calibration fingerprint unchanged.
+    let seed = [
+        text_doc("a", "alpha zzzuniquezzz token", metadata(&[])),
+        text_doc("b", "second filler document", metadata(&[])),
+        text_doc("c", "third filler document", metadata(&[])),
+        text_doc("d", "fourth filler document", metadata(&[])),
+        text_doc("e", "fifth filler document", metadata(&[])),
+    ];
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let plan = engine
+            .prepare_text_upsert("default", &seed, true, false, 900)
+            .unwrap();
+        let embeddings = plan_embeddings(&plan);
+        engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+        engine.persist().unwrap();
+    }
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    appender_opts.store_text = false;
+    appender_opts.index_text = false;
+    {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        // Same text as the writer's "a" -> same chunk id and (unit(0)) vector, so the
+        // replacement drops only the retained text, not the vector.
+        let plan = appender
+            .prepare_documents(&[text_doc("a", "alpha zzzuniquezzz token", metadata(&[]))])
+            .expect("prepare");
+        let embeddings = plan_embeddings(&plan);
+        appender
+            .append_embedded_documents(&plan, &embeddings)
+            .expect("append");
+    }
+    // Fold + checkpoint (delta path) with a store_text=false writer -- the case where
+    // the clear is silently dropped without the fix (raw_text_upserts=None carries the
+    // base tvtext manifest forward). This truncates the WAL.
+    {
+        let mut fold_opts = open_options(&path, false, "wal");
+        fold_opts.acquire_writer_lock = true;
+        fold_opts.store_text = false;
+        fold_opts.index_text = false;
+        CoreEngine::open(fold_opts).unwrap();
+    }
+    // Fresh store_text=true load: "a"'s raw text must be gone, so the rebuilt lexical
+    // index has no "a" (b..e, untouched by the fold, keep their base text).
+    {
+        let engine = CoreEngine::open(opts).unwrap();
+        let query = engine.prepare_query_text("zzzuniquezzz", "lexical").unwrap();
+        let hits = engine
+            .search_embedded_text("default", &query, None, 5, None)
+            .unwrap();
+        assert!(
+            hits.hits.iter().all(|hit| hit.document_id != "a"),
+            "a replaced document's old raw text resurrected after a store_text=false append"
+        );
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appended_text_without_indexing_clears_a_prior_writers_lexical() {
+    // A postings-only writer (index_text=true, store_text=false) writes a real
+    // `.tvlex` base with a distinctive token and no raw text. A concurrent appender
+    // opened index_text=false replaces one document with the SAME text (unchanged
+    // vector) but drops the tokens. The fold must clear the replaced document's
+    // `.tvlex` entry -- with a real base present, a clear-only lexical delta removes
+    // it -- or the old tokens resurrect on a later index_text=true reopen. Five
+    // documents plus an unchanged replaced vector keep the checkpoint on the delta
+    // path where the clear is load-bearing.
+    let path = unique_temp_dir("core_text_append_lexclear");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    opts.store_text = false;
+    opts.index_text = true; // tokens live in a real `.tvlex` base, not rebuilt from text
+    let seed = [
+        text_doc("a", "alpha zzzuniquezzz token", metadata(&[])),
+        text_doc("b", "second filler document", metadata(&[])),
+        text_doc("c", "third filler document", metadata(&[])),
+        text_doc("d", "fourth filler document", metadata(&[])),
+        text_doc("e", "fifth filler document", metadata(&[])),
+    ];
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        let plan = engine
+            .prepare_text_upsert("default", &seed, false, true, 900)
+            .unwrap();
+        let embeddings = plan_embeddings(&plan);
+        engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+        engine.persist().unwrap();
+    }
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    appender_opts.store_text = false;
+    appender_opts.index_text = false;
+    {
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        let plan = appender
+            .prepare_documents(&[text_doc("a", "alpha zzzuniquezzz token", metadata(&[]))])
+            .expect("prepare");
+        let embeddings = plan_embeddings(&plan);
+        appender
+            .append_embedded_documents(&plan, &embeddings)
+            .expect("append");
+    }
+    // Fold + checkpoint (delta path) with an index_text=false writer -- the case where
+    // the clear must still reach the real `.tvlex` base. Truncates the WAL.
+    {
+        let mut fold_opts = open_options(&path, false, "wal");
+        fold_opts.acquire_writer_lock = true;
+        fold_opts.store_text = false;
+        fold_opts.index_text = false;
+        CoreEngine::open(fold_opts).unwrap();
+    }
+    // Fresh index_text=true load: "a"'s old tokens must be gone from the `.tvlex` base.
+    {
+        let engine = CoreEngine::open(opts).unwrap();
+        let query = engine.prepare_query_text("zzzuniquezzz", "lexical").unwrap();
+        let hits = engine
+            .search_embedded_text("default", &query, None, 5, None)
+            .unwrap();
+        assert!(
+            hits.hits.iter().all(|hit| hit.document_id != "a"),
+            "a replaced document's old lexical tokens resurrected after an index_text=false append"
+        );
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn append_embedded_documents_rejects_a_mismatched_policy_plan() {
+    // A plan prepared by an appender with a different retention policy must be
+    // rejected: its documents could carry text/tokens the appending appender would
+    // not retain (or lack text it should keep), silently corrupting the store's
+    // text/lexical state on fold.
+    let path = unique_temp_dir("core_text_append_policy_mismatch");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Appender A retains nothing; its plan carries store_text=false, index_text=false.
+    let mut a_opts = open_options(&path, false, "wal");
+    a_opts.acquire_writer_lock = false;
+    a_opts.store_text = false;
+    a_opts.index_text = false;
+    let plan = {
+        let a = CoreAppender::open(a_opts).expect("open appender A");
+        a.prepare_documents(&[text_doc("a", "hello world", metadata(&[]))])
+            .expect("prepare")
+    };
+    // Appender B retains text; applying A's mismatched plan must fail rather than
+    // silently drop or expose the wrong payload.
+    let mut b_opts = open_options(&path, false, "wal");
+    b_opts.acquire_writer_lock = false;
+    b_opts.store_text = true;
+    b_opts.index_text = false;
+    let b = CoreAppender::open(b_opts).expect("open appender B");
+    let embeddings: Vec<Vec<f32>> = plan
+        .chunks_to_embed
+        .iter()
+        .map(|_| {
+            let mut vector = vec![0.0_f32; 8];
+            vector[0] = 1.0;
+            vector
+        })
+        .collect();
+    assert!(
+        b.append_embedded_documents(&plan, &embeddings).is_err(),
+        "a plan prepared under a different retention policy must be rejected"
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn appender_rejects_generation_mode() {
     let path = unique_temp_dir("core_appender_gen");
