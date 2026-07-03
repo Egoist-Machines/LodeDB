@@ -16,13 +16,6 @@ import matplotlib.pyplot as plt
 _HERE = Path(__file__).resolve().parent
 _RESULTS = _HERE / "results"
 
-# Vanilla TurboVec CPU baseline (all threads) at d=1536, 4-bit, n=100,000, taken as
-# the fixed reference from benchmarks/gpu_vanilla_vs_augmented at the same config.
-# Our own native CPU path is augmented (multi-query SIMD fusion), so it is NOT this
-# baseline; the band is the plain-TurboVec starting point our GPU numbers stand on.
-_VANILLA_CPU_QPS_LOW = 8_500
-_VANILLA_CPU_QPS_HIGH = 10_400
-
 
 def _series(summary: dict, name: str) -> tuple[list[int], list[float]]:
     """Returns (batch_sizes, queries_per_sec) for one series, sorted by batch."""
@@ -56,19 +49,9 @@ def main() -> None:
     top_k = reference["top_k"]
 
     fig, ax = plt.subplots(figsize=(9, 6))
-    # Vanilla TurboVec CPU raw-scan band (all threads) as the reference baseline.
-    # It is a raw-scan number (API bypassed) while these curves are end-to-end
-    # through the public API; the GPU curves clear it by a wide margin regardless.
-    ax.axhspan(
-        _VANILLA_CPU_QPS_LOW,
-        _VANILLA_CPU_QPS_HIGH,
-        color="0.6",
-        alpha=0.25,
-        label=(
-            f"vanilla TurboVec CPU raw scan, all threads "
-            f"({_VANILLA_CPU_QPS_LOW / 1000:.1f}-{_VANILLA_CPU_QPS_HIGH / 1000:.1f}k q/s)"
-        ),
-    )
+    # Both series are end-to-end through the public API, so the GPU-vs-CPU gap is a
+    # like-for-like comparison. The vanilla-vs-augmented CPU band is deliberately not
+    # drawn: it is a raw-scan number (API bypassed), a different regime.
     series_defs = [
         ("a10", a10, {"color": "#d62728", "marker": "s"}),
         ("l40s", l40s, {"color": "#7b3ff2", "marker": "o"}),
