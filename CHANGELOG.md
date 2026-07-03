@@ -26,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Heavy dependency majors are capped to the tested range.** The numeric and embedding
-  dependencies now carry upper bounds below the next untested major (`numpy>=2.0.0,<3`,
-  `onnxruntime>=1.20.0,<2`, `transformers>=4.40.0,<5`, `sentence-transformers>=3.0.0,<6`), so a
-  future major release cannot silently resolve into an install and change behavior or memory use.
+  dependencies now carry upper bounds (`numpy>=2.0.0,<3`, `onnxruntime>=1.20.0,<2`,
+  `transformers>=4.40.0,<5`, `sentence-transformers>=3.0.0,<5`), so a future major release cannot
+  silently resolve into an install and change behavior or memory use. `sentence-transformers` is
+  held at `<5` because the 5.x line paired with `transformers` 5.x showed a large, silent embedding
+  memory regression in the field (roughly 67 GB versus 21 GB for the same workload on the 4.x
+  majors); see `docs/deployment-and-performance.md`.
 
 ## [1.2.0] - 2026-06-30
 

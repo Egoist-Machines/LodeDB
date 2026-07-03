@@ -43,10 +43,12 @@ classifiers = [
 # a preset/CLIP backend is built), so a plain `import lodedb` pulls none of them — guarded by
 # tests/test_import_boundary.py, alongside the heavy research deps
 # (faiss/modal/mteb/datasets/matplotlib/sklearn) that are deliberately never declared.
-# The heavy numeric/ML deps (numpy here; onnxruntime/transformers/sentence-transformers in the
-# extras) are capped below the next major above the tested set in uv.lock (numpy 2.x, onnxruntime
-# 1.x, transformers 4.x, sentence-transformers 5.x), so a future major cannot silently resolve into
-# an install and change behavior or memory use. Raise a cap once the new major is tested.
+# The heavy numeric/ML deps are capped below the next major above the tested set in uv.lock (numpy
+# 2.x, onnxruntime 1.x, transformers 4.x), so a future major cannot silently resolve into an install
+# and change behavior or memory use. sentence-transformers is held at <5 (tighter than the
+# tested-set rule): the 5.x line paired with transformers 5.x showed a large, silent embedding
+# memory regression in the field (~67 GB vs ~21 GB for the same workload on 4.x; see
+# docs/deployment-and-performance.md). Raise a cap once the new major is validated, then re-run uv lock.
 dependencies = [
   "numpy>=2.0.0,<3",
   "typer>=0.12.0",
@@ -63,7 +65,7 @@ embeddings = ["onnxruntime>=1.20.0,<2", "transformers>=4.40.0,<5"]
 # PyTorch embedding tier: the sentence-transformers runtime used as the fallback when a model's
 # ONNX graph is unavailable, by the CLIP preset, and by device="mps". Pulls torch. Combine with
 # the ONNX default via lodedb[embeddings,torch].
-torch = ["sentence-transformers>=3.0.0,<6"]
+torch = ["sentence-transformers>=3.0.0,<5"]
 # Opt-in GPU-resident exact scan on CUDA hosts (gpu_turbovec); absent CUDA, LodeDB uses
 # the CPU scan. cupy wheels are Linux/CUDA-only, so this resolves to nothing elsewhere.
 gpu = ["cupy-cuda12x>=13.0.0; platform_system == 'Linux'"]

@@ -158,19 +158,31 @@ precomputed vectors.
 
 Built-in embedding is opt-in. `pip install lodedb` is a dependency-light vector store (numpy, typer,
 pyyaml); the embedding runtimes come from extras. The heavy numeric and ML dependencies are capped
-below the next major above the tested set, so a future major cannot silently resolve into an install
-and change behavior or memory use.
+below the next untested major, so a future major cannot silently resolve into an install and change
+behavior or memory use.
 
 | Package | Extra | Declared range | Tested (uv.lock) |
 | --- | --- | --- | --- |
 | numpy | base | `>=2.0.0,<3` | 2.4.6 |
 | onnxruntime | `embeddings` | `>=1.20.0,<2` | 1.27.0 |
 | transformers | `embeddings` | `>=4.40.0,<5` | 4.53.3 |
-| sentence-transformers | `torch` | `>=3.0.0,<6` | 5.5.1 |
+| sentence-transformers | `torch` | `>=3.0.0,<5` | 4.1.0 |
 
 `onnxruntime-gpu` (CUDA) and `cupy-cuda12x` (the `gpu` extra, for the vector scan) are not part of
 the tested lock resolution; install them for your CUDA version as shown above. When a new major of a
 capped package is validated, raise the cap in `pyproject.toml` and re-run `uv lock`.
+
+The `sentence-transformers` cap is tighter than the others for a concrete reason. Embedding about
+300 queries with the `bge` preset used roughly 67 GB of RSS on `transformers` 5.12.1 /
+`sentence-transformers` 5.6.0 (an H100 host: GPU idle, about 27 cores pegged, no progress after 24
+minutes), versus about 21 GB for the same `bge` workload pinned to the 4.x majors. There was no
+error and no out-of-memory message, and the cause was never traced to a specific change in the 5.x
+line (the comparison also spanned two machines, so treat the exact numbers as indicative). For a
+regression this silent, a stated known-good range plus an install cap is the only practical guard,
+so `sentence-transformers` and `transformers` are both held on 4.x here. This is separate from
+running on the CPU (see [Running embedding on the GPU](#running-embedding-on-the-gpu)): that same
+4.x `bge` run was still CPU-bound and slow until `onnxruntime-gpu` was installed. Two independent
+failure modes, two independent fixes.
 
 ## Patterns
 
