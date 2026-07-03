@@ -79,7 +79,10 @@ def run_vector_search_native(
     output.mkdir(parents=True, exist_ok=True)
 
     corpus = _unit_vectors(n, dim, 0x00C0_FFEE)
-    queries = [row.tolist() for row in _unit_vectors(query_count, dim, 0x5EED_5EED)]
+    # Queries stay one contiguous f32 matrix; per-batch slices below are views, so
+    # a batch crosses to the native core with no per-query Python conversion (the
+    # shape an embedding model hands an integration).
+    queries = _unit_vectors(query_count, dim, 0x5EED_5EED)
 
     tmp = tempfile.TemporaryDirectory(prefix="lodedb-vec-native-")
     db = LodeDB.open_vector_store(
@@ -94,7 +97,7 @@ def run_vector_search_native(
         for start in range(0, n, add_chunk):
             chunk = corpus[start : start + add_chunk]
             db.add_vectors_many(
-                [{"vector": row.tolist(), "id": f"v{start + i}"} for i, row in enumerate(chunk)],
+                [{"vector": row, "id": f"v{start + i}"} for i, row in enumerate(chunk)],
                 normalize=False,  # already unit vectors
             )
         build_seconds = time.perf_counter() - started

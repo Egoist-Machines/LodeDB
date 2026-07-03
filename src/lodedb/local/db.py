@@ -838,7 +838,9 @@ class LodeDB:
 
         if k <= 0:
             raise ValueError("k must be positive")
-        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        # Shares the vectorized prepare with search_many_by_vector so a single query
+        # and a batched query normalize a vector identically.
+        prepared = _prepare_vector_matrix([vector], self._vector_dim, normalize=normalize)[0]
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
             return self._native_search_by_vector(
