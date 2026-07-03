@@ -690,21 +690,16 @@ class LodeDB:
             texts.append(_coerce_optional_text(item.get("text")))
         if not raw_vectors:
             return ids
-        # Validate + normalize the whole batch as one matrix (no per-vector Python
-        # loop), then materialize rows once; the stored vectors stay plain float
-        # tuples and normalize identically to a single add_vectors.
-        rows = _prepare_vector_matrix(raw_vectors, self._vector_dim, normalize=normalize).tolist()
-        payload = tuple(
-            EngineVectorDocument(
-                document_id=document_id,
-                vector=tuple(row),
-                metadata=metadata,
-                text=text,
-            )
-            for document_id, row, metadata, text in zip(ids, rows, metadatas, texts, strict=True)
-        )
+        # Validate + normalize the whole batch as one matrix and hand it to the
+        # native array upsert as-is: the vectors never become per-row Python tuples,
+        # and normalize identically to a single add_vectors.
+        matrix = _prepare_vector_matrix(raw_vectors, self._vector_dim, normalize=normalize)
+        sidecar = [
+            {"document_id": document_id, "metadata": metadata, "text": text}
+            for document_id, metadata, text in zip(ids, metadatas, texts, strict=True)
+        ]
         with self._op_lock:
-            self._native_upsert_vectors(payload)
+            self._native_upsert_vectors_matrix(matrix, sidecar)
         return ids
 
     def search(
@@ -1544,6 +1539,29 @@ class LodeDB:
             return
         try:
             self._native_vector_engine.upsert_vectors(_LOCAL_INDEX_ID, documents)
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_upsert_failed"
+            raise RuntimeError("native core vector upsert failed") from exc
+
+    def _native_upsert_vectors_matrix(
+        self,
+        matrix: np.ndarray,
+        sidecar: list[Mapping[str, Any]],
+    ) -> None:
+        """Upserts a prepared f32 matrix plus a per-doc sidecar (fail closed).
+
+        The zero-round-trip counterpart of :meth:`_native_upsert_vectors`: the
+        normalized ``(n, dim)`` matrix reaches the native array upsert without
+        becoming per-vector Python tuples. ``sidecar`` is the row-ordered
+        ``[{document_id, metadata, text}]`` list.
+        """
+
+        if not sidecar:
+            return
+        try:
+            self._native_vector_engine.upsert_vectors_matrix(_LOCAL_INDEX_ID, matrix, sidecar)
             if self._native_should_persist_after_mutation():
                 self._native_vector_engine.persist()
         except Exception as exc:
@@ -2474,20 +2492,20 @@ def _prepare_vector_matrix(
     The vectorized boundary for both the batched vector-in search path and the
     vector-in write path: accepts a ``(n, dim)`` float array or any sequence of
     per-row vectors, and returns a C-contiguous ``float32`` ``(n, dim)`` matrix with
-    no per-row Python. Finiteness is checked in one numpy pass (the native core
-    validates again, stricter), and normalization uses a float64 norm so a
-    large-but-finite component cannot overflow to ``inf`` and silently zero a row --
-    the same guarantee :func:`_finite_float_vector` gives per vector. Its unit result
-    can differ from the scalar path by ~1 ulp; that is ranking-neutral for queries,
-    and single- and batch-vector writes share this path so a store stays internally
-    consistent.
+    no per-row Python. The common case stays in float32; the norm is accumulated in
+    float64 (never overflows for float32-range inputs) so normalization matches the
+    scalar path within ~1 ulp -- ranking-neutral for queries, and single- and
+    batch-vector writes share this path so a store stays internally consistent. A
+    component beyond float32 range (finite only in float64) drops to a float64 path
+    that scales by max-abs before squaring, the same guard :func:`_finite_float_vector`
+    gives per vector. The native core re-validates finiteness, stricter.
     """
 
-    # Keep the batch in float64 through validation and normalization so a
-    # large-but-finite component (e.g. > float32 max) is not clipped to inf before
-    # it can be scaled; the unit result is cast to float32 at the end.
     try:
-        matrix = np.asarray(vectors, dtype=np.float64)
+        # A component beyond float32 range overflows to inf here; that is expected
+        # and handled by the finiteness fallback below, so silence the warning.
+        with np.errstate(over="ignore"):
+            matrix = np.ascontiguousarray(vectors, dtype=np.float32)
     except (TypeError, ValueError) as exc:
         raise ValueError("vectors must be sequences of numbers") from exc
     if matrix.size == 0:
@@ -2495,16 +2513,38 @@ def _prepare_vector_matrix(
     if matrix.ndim != 2 or matrix.shape[1] != dim:
         raise ValueError(f"each vector must have dimension {dim}")
     if not np.isfinite(matrix).all():
-        raise ValueError("vector must contain only finite values")
+        # A value is non-finite, or was finite but exceeded float32 range and became
+        # inf on the cast; re-read in float64 to tell them apart.
+        wide = np.asarray(vectors, dtype=np.float64)
+        if not np.isfinite(wide).all():
+            raise ValueError("vector must contain only finite values")
+        # Large-but-finite: normalize in float64, or (no normalize) let the native
+        # core reject the out-of-range value exactly as the scalar path did.
+        if normalize:
+            return _l2_normalize_wide(wide)
+        return np.ascontiguousarray(wide, dtype=np.float32)
     if normalize:
-        # Divide each row by its max abs before squaring so a component whose square
-        # would overflow cannot push the norm to inf -- the vectorized analogue of
-        # the scalar hypot path.
-        scale = np.abs(matrix).max(axis=1)
-        if (scale == 0.0).any():
-            raise ValueError(
-                "cannot normalize a zero vector; pass normalize=False to store it as-is"
-            )
-        scaled = matrix / scale[:, None]
-        matrix = scaled / np.sqrt(np.square(scaled).sum(axis=1))[:, None]
-    return np.ascontiguousarray(matrix, dtype=np.float32)
+        norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64))
+        if (norms == 0.0).any():
+            # A row is zero in float32: either a genuine zero vector or a tiny row
+            # (e.g. ~1e-300) that underflowed on the cast. Re-normalize the original
+            # in float64, which preserves tiny rows via max-abs scaling and raises
+            # only for a true zero vector.
+            return _l2_normalize_wide(np.asarray(vectors, dtype=np.float64))
+        return np.ascontiguousarray(matrix / norms[:, None], dtype=np.float32)
+    return matrix
+
+
+def _l2_normalize_wide(wide: np.ndarray) -> np.ndarray:
+    """L2-normalizes a float64 matrix, scaling each row by its max abs before
+    squaring so a large-but-finite component cannot overflow the norm to inf.
+    Returns a C-contiguous float32 matrix. See :func:`_prepare_vector_matrix`."""
+
+    scale = np.abs(wide).max(axis=1)
+    if (scale == 0.0).any():
+        raise ValueError(
+            "cannot normalize a zero vector; pass normalize=False to store it as-is"
+        )
+    scaled = wide / scale[:, None]
+    unit = scaled / np.sqrt(np.square(scaled).sum(axis=1))[:, None]
+    return np.ascontiguousarray(unit, dtype=np.float32)

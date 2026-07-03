@@ -441,6 +441,39 @@ class NativeCoreEngineHandle:
             )
         )
 
+    def upsert_vectors_matrix(
+        self,
+        index_id: str,
+        matrix: Any,
+        sidecar: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Upserts an already-prepared f32 matrix plus a per-doc sidecar.
+
+        The zero-round-trip counterpart of :meth:`upsert_vectors`: the normalized
+        ``(n, dim)`` float32 matrix goes straight to the native array upsert, so a
+        bulk vector add never rebuilds a matrix from per-vector Python tuples.
+        ``sidecar`` is the row-ordered ``[{document_id, metadata, text}]`` list.
+        Falls back to the JSON document path for engines without the array upsert.
+        """
+
+        array_upsert = getattr(self._engine, "upsert_vectors_array", None)
+        if callable(array_upsert):
+            import numpy as np
+
+            matrix = np.ascontiguousarray(matrix, dtype=np.float32)
+            return self._loads(array_upsert(str(index_id), matrix, _dumps(list(sidecar))))
+        rows = matrix.tolist() if hasattr(matrix, "tolist") else [list(row) for row in matrix]
+        documents = [
+            EngineVectorDocument(
+                document_id=str(entry["document_id"]),
+                vector=tuple(row),
+                metadata=dict(entry.get("metadata", {})),
+                text=entry.get("text"),
+            )
+            for entry, row in zip(sidecar, rows, strict=True)
+        ]
+        return self.upsert_vectors(index_id, documents)
+
     def delete_documents(self, index_id: str, document_ids: Iterable[str]) -> dict[str, Any]:
         return self._loads(
             self._engine.delete_documents(
