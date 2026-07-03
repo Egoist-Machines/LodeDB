@@ -36,7 +36,6 @@ _REMOTE_SRC = "/root/lodedb-src"
 def _build_image() -> modal.Image:
     """Builds a CUDA image with the Rust toolchain and the LodeDB workspace."""
 
-    repo_root = Path(__file__).resolve().parents[2]
     image = (
         modal.Image.from_registry(_CUDA_IMAGE, add_python="3.11")
         .apt_install("build-essential", "curl", "pkg-config")
@@ -45,22 +44,31 @@ def _build_image() -> modal.Image:
             "sh -s -- -y --default-toolchain stable --profile minimal"
         )
     )
+    # The workspace copy reads local paths that exist only during the local
+    # `modal run`. Modal re-imports this module inside the container to locate the
+    # function, where those paths are absent and __file__ resolves to /root (too few
+    # parents for parents[2]); guard the local-only steps with modal.is_local() so
+    # the container re-import is safe. The function still runs in the image built
+    # locally, which has the files baked in.
+    #
     # `cargo test -p lodedb-gpu` compiles only lodedb-gpu (deps: cudarc), but cargo
-    # must still parse every workspace member and its path deps, so ship the whole
-    # workspace: the manifests, the lockfile, all crates, and the vendored turbovec
-    # that lodedb-core path-depends on.
-    for rel in ("Cargo.toml", "Cargo.lock"):
-        image = image.add_local_file(
-            str(repo_root / rel), remote_path=f"{_REMOTE_SRC}/{rel}", copy=True
-        )
-    for rel in ("crates", "third_party/turbovec"):
-        image = image.add_local_dir(
-            str(repo_root / rel),
-            remote_path=f"{_REMOTE_SRC}/{rel}",
-            copy=True,
-            ignore=["**/target/**", "**/__pycache__/**"],
-        )
-    return image.env({"PATH": "/root/.cargo/bin:/usr/local/cuda/bin:$PATH"})
+    # must parse every workspace member and its path deps, so ship the whole
+    # workspace: manifests, lockfile, all crates, and the vendored turbovec that
+    # lodedb-core path-depends on.
+    if modal.is_local():
+        repo_root = Path(__file__).resolve().parents[2]
+        for rel in ("Cargo.toml", "Cargo.lock"):
+            image = image.add_local_file(
+                str(repo_root / rel), remote_path=f"{_REMOTE_SRC}/{rel}", copy=True
+            )
+        for rel in ("crates", "third_party/turbovec"):
+            image = image.add_local_dir(
+                str(repo_root / rel),
+                remote_path=f"{_REMOTE_SRC}/{rel}",
+                copy=True,
+                ignore=["**/target/**", "**/__pycache__/**"],
+            )
+    return image
 
 
 IMAGE = _build_image()
@@ -75,6 +83,11 @@ def _run(bench: bool, corpus: int) -> str:
 
     env = dict(os.environ)
     env["LODEDB_GPU_DEBUG"] = "1"
+    # rustup put cargo under /root/.cargo/bin; the CUDA -devel image keeps
+    # libnvrtc/libcublas under /usr/local/cuda/lib64 (dlopened by cudarc). Make both
+    # discoverable to the cargo test subprocess.
+    env["PATH"] = "/root/.cargo/bin:/usr/local/cuda/bin:" + env.get("PATH", "")
+    env["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
     # `cargo test` in the crate: the GPU tests self-gate on a CUDA driver, so on a
     # GPU host they run for real. --nocapture surfaces the timing/debug eprintln!,
     # and --test-threads=1 serializes the device work so the timing is uncontended
