@@ -1,7 +1,7 @@
 {
   "artifact_type": "lodedb_vector_search_native",
   "bit_width": 4,
-  "build_seconds": 39.889016837,
+  "build_seconds": 34.232738787,
   "dim": 1536,
   "n": 100000,
   "query_count": 1024,
@@ -9,73 +9,108 @@
   "rows": [
     {
       "batch_size": 1,
-      "ms_per_query": 8.98139073125,
-      "queries_per_sec": 111.34133119502121,
+      "ms_per_query": 7.559581987109374,
+      "queries_per_sec": 132.28244653013928,
       "queries_timed": 5120,
       "series": "cpu"
     },
     {
       "batch_size": 16,
-      "ms_per_query": 0.801996846875,
-      "queries_per_sec": 1246.887695252823,
+      "ms_per_query": 0.7602380511718743,
+      "queries_per_sec": 1315.3774642804883,
       "queries_timed": 5120,
       "series": "cpu"
     },
     {
       "batch_size": 64,
-      "ms_per_query": 0.24303233593749862,
-      "queries_per_sec": 4114.678798368514,
+      "ms_per_query": 0.2320938330078126,
+      "queries_per_sec": 4308.602202137523,
       "queries_timed": 5120,
       "series": "cpu"
     },
     {
       "batch_size": 256,
-      "ms_per_query": 0.1666190212890606,
-      "queries_per_sec": 6001.715724071746,
+      "ms_per_query": 0.15292987324218577,
+      "queries_per_sec": 6538.944803912579,
       "queries_timed": 5120,
       "series": "cpu"
     },
     {
       "batch_size": 1024,
-      "ms_per_query": 0.15173962753906312,
-      "queries_per_sec": 6590.2362897428675,
+      "ms_per_query": 0.1305888322265636,
+      "queries_per_sec": 7657.622653865696,
       "queries_timed": 5120,
       "series": "cpu"
     },
     {
       "batch_size": 1,
-      "ms_per_query": 8.435103286718748,
-      "queries_per_sec": 118.55219385096582,
+      "ms_per_query": 7.673921706640624,
+      "queries_per_sec": 130.31146762087116,
       "queries_timed": 5120,
       "series": "gpu"
     },
     {
       "batch_size": 16,
-      "ms_per_query": 0.076417679882812,
-      "queries_per_sec": 13085.976982466877,
+      "ms_per_query": 0.0876030027343766,
+      "queries_per_sec": 11415.133828598622,
       "queries_timed": 5120,
       "series": "gpu"
     },
     {
       "batch_size": 64,
-      "ms_per_query": 0.0347815175781252,
-      "queries_per_sec": 28750.90190512332,
+      "ms_per_query": 0.034914303906249944,
+      "queries_per_sec": 28641.55627118179,
       "queries_timed": 5120,
       "series": "gpu"
     },
     {
       "batch_size": 256,
-      "ms_per_query": 0.03179965859375078,
-      "queries_per_sec": 31446.8784956238,
+      "ms_per_query": 0.02902202285156308,
+      "queries_per_sec": 34456.59198583884,
       "queries_timed": 5120,
       "series": "gpu"
     },
     {
       "batch_size": 1024,
-      "ms_per_query": 0.027744566015625027,
-      "queries_per_sec": 36043.09396790801,
+      "ms_per_query": 0.02806547597656306,
+      "queries_per_sec": 35630.965276879,
       "queries_timed": 5120,
       "series": "gpu"
+    },
+    {
+      "batch_size": 1,
+      "ms_per_query": 7.631599657031252,
+      "queries_per_sec": 131.03412717393607,
+      "queries_timed": 5120,
+      "series": "gpu_arrays"
+    },
+    {
+      "batch_size": 16,
+      "ms_per_query": 0.08020026171874917,
+      "queries_per_sec": 12468.787240456357,
+      "queries_timed": 5120,
+      "series": "gpu_arrays"
+    },
+    {
+      "batch_size": 64,
+      "ms_per_query": 0.03026663398437157,
+      "queries_per_sec": 33039.68325372284,
+      "queries_timed": 5120,
+      "series": "gpu_arrays"
+    },
+    {
+      "batch_size": 256,
+      "ms_per_query": 0.020029103515628588,
+      "queries_per_sec": 49927.34693391075,
+      "queries_timed": 5120,
+      "series": "gpu_arrays"
+    },
+    {
+      "batch_size": 1024,
+      "ms_per_query": 0.01888936699218635,
+      "queries_per_sec": 52939.83649180268,
+      "queries_timed": 5120,
+      "series": "gpu_arrays"
     }
   ],
   "top_k": 10

@@ -102,31 +102,39 @@ def run_vector_search_native(
             )
         build_seconds = time.perf_counter() - started
 
+        def _run_query(series: str, batch: Any) -> None:
+            # gpu_arrays uses the flat-arrays API (scores + ids, no per-hit objects):
+            # the leanest public path, closest to raw GPU scan throughput. cpu/gpu use
+            # the default hits API (what a typical app calls).
+            if series == "gpu_arrays":
+                db.search_many_by_vector_arrays(batch, k=top_k, normalize=False)
+            else:
+                db.search_many_by_vector(batch, k=top_k, normalize=False)
+
         rows: list[dict[str, Any]] = []
-        for gpu in (False, True):
+        for series, gpu in (("cpu", False), ("gpu", True), ("gpu_arrays", True)):
             for size in batch_sizes:
                 batches = [queries[i : i + size] for i in range(0, len(queries), size)]
                 with _gpu_scan(gpu):
-                    db.search_many_by_vector(batches[0], k=top_k, normalize=False)  # warm
+                    _run_query(series, batches[0])  # warm
                     total_queries = 0
                     clock = time.perf_counter()
                     for _ in range(max(1, repeats)):
                         for batch in batches:
-                            db.search_many_by_vector(batch, k=top_k, normalize=False)
+                            _run_query(series, batch)
                             total_queries += len(batch)
                     elapsed = time.perf_counter() - clock
                 rows.append(
                     {
-                        "series": "gpu" if gpu else "cpu",
+                        "series": series,
                         "batch_size": int(size),
                         "queries_per_sec": total_queries / elapsed,
                         "ms_per_query": elapsed / total_queries * 1000.0,
                         "queries_timed": total_queries,
                     }
                 )
-                label = "gpu" if gpu else "cpu"
                 print(
-                    f"[vector-search-native] {label:>3} batch={size:>4} "
+                    f"[vector-search-native] {series:>10} batch={size:>4} "
                     f"{rows[-1]['queries_per_sec']:>10.1f} q/s  "
                     f"{rows[-1]['ms_per_query']:.4f} ms/query"
                 )
