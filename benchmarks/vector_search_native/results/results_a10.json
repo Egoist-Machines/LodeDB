@@ -1,0 +1,82 @@
+{
+  "artifact_type": "lodedb_vector_search_native",
+  "bit_width": 4,
+  "build_seconds": 45.184106688,
+  "dim": 1536,
+  "n": 100000,
+  "query_count": 1024,
+  "repeats": 5,
+  "rows": [
+    {
+      "batch_size": 1,
+      "ms_per_query": 15.143850892773436,
+      "queries_per_sec": 66.03340240738864,
+      "queries_timed": 5120,
+      "series": "cpu"
+    },
+    {
+      "batch_size": 16,
+      "ms_per_query": 1.171393869335935,
+      "queries_per_sec": 853.6838258910316,
+      "queries_timed": 5120,
+      "series": "cpu"
+    },
+    {
+      "batch_size": 64,
+      "ms_per_query": 0.48227748925780967,
+      "queries_per_sec": 2073.495077572308,
+      "queries_timed": 5120,
+      "series": "cpu"
+    },
+    {
+      "batch_size": 256,
+      "ms_per_query": 0.3244296894531262,
+      "queries_per_sec": 3082.3319582299837,
+      "queries_timed": 5120,
+      "series": "cpu"
+    },
+    {
+      "batch_size": 1024,
+      "ms_per_query": 0.2873537246093738,
+      "queries_per_sec": 3480.03145377493,
+      "queries_timed": 5120,
+      "series": "cpu"
+    },
+    {
+      "batch_size": 1,
+      "ms_per_query": 15.11693546796875,
+      "queries_per_sec": 66.15097366254545,
+      "queries_timed": 5120,
+      "series": "gpu"
+    },
+    {
+      "batch_size": 16,
+      "ms_per_query": 0.13111013105469027,
+      "queries_per_sec": 7627.175657256171,
+      "queries_timed": 5120,
+      "series": "gpu"
+    },
+    {
+      "batch_size": 64,
+      "ms_per_query": 0.07244571894531315,
+      "queries_per_sec": 13803.43814042161,
+      "queries_timed": 5120,
+      "series": "gpu"
+    },
+    {
+      "batch_size": 256,
+      "ms_per_query": 0.05106779121093474,
+      "queries_per_sec": 19581.814217684,
+      "queries_timed": 5120,
+      "series": "gpu"
+    },
+    {
+      "batch_size": 1024,
+      "ms_per_query": 0.05146828515624757,
+      "queries_per_sec": 19429.440809309985,
+      "queries_timed": 5120,
+      "series": "gpu"
+    }
+  ],
+  "top_k": 10
+}

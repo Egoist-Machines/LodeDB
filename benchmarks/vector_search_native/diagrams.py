@@ -56,9 +56,19 @@ def main() -> None:
     top_k = reference["top_k"]
 
     fig, ax = plt.subplots(figsize=(9, 6))
-    # The vanilla 8.5-10.4k band measured the RAW scan (API bypassed); these curves
-    # are end-to-end through the public API, a different regime, so the band is left
-    # out to avoid an apples-to-oranges read. See the module docstring.
+    # Vanilla TurboVec CPU raw-scan band (all threads) as the reference baseline.
+    # It is a raw-scan number (API bypassed) while these curves are end-to-end
+    # through the public API; the GPU curves clear it by a wide margin regardless.
+    ax.axhspan(
+        _VANILLA_CPU_QPS_LOW,
+        _VANILLA_CPU_QPS_HIGH,
+        color="0.6",
+        alpha=0.25,
+        label=(
+            f"vanilla TurboVec CPU raw scan, all threads "
+            f"({_VANILLA_CPU_QPS_LOW / 1000:.1f}-{_VANILLA_CPU_QPS_HIGH / 1000:.1f}k q/s)"
+        ),
+    )
     series_defs = [
         ("a10", a10, {"color": "#d62728", "marker": "s"}),
         ("l40s", l40s, {"color": "#7b3ff2", "marker": "o"}),
