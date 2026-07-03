@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 3
+let lodeNativeExpectedABIVersion: UInt32 = 4
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -547,6 +547,49 @@ final class NativeAppender {
         }
         try NativeEngine.check(status, error: error)
         return lsn
+    }
+}
+
+/// Owning wrapper around a native `LodeCheckpointer *`, statically linked from the
+/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Holds the checkpointer lease for its
+/// lifetime; `deinit` releases it. Not thread-safe; callers serialize access (see
+/// `LodeCheckpointer`).
+final class NativeCheckpointer {
+    private let handle: OpaquePointer
+
+    private init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        lodedb_checkpointer_free(handle)
+    }
+
+    /// Opens a running single-checkpointer over the single index at the store
+    /// described by a `CoreOpenOptions` JSON document (writable, WAL commit mode),
+    /// acquiring the lease.
+    static func open(optionsJSON: String) throws -> NativeCheckpointer {
+        try NativeEngine.requireABI()
+        var checkpointer: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) {
+            lodedb_checkpointer_open_json($0, &checkpointer, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        guard let checkpointer else {
+            throw LodeDBError.internalError("native core did not return a checkpointer")
+        }
+        return NativeCheckpointer(handle: checkpointer)
+    }
+
+    /// Folds the appended WAL tail into a fresh committed generation under a brief hold
+    /// of the exclusive writer lock, returning the number of records folded.
+    func checkpoint() throws -> UInt64 {
+        var folded: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = lodedb_checkpointer_checkpoint(handle, &folded, &error)
+        try NativeEngine.check(status, error: error)
+        return folded
     }
 }
 

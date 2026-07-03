@@ -17,7 +17,11 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// `lodedb_appender_append_embedded_documents_json` (and the matching PyO3
 /// `CoreAppender.prepare_documents` / `append_embedded_documents`), so a wrapper
 /// built against the new header must not pair with an older core that lacks them.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 3;
+/// Bumped to 4 for the running single-checkpointer: the new
+/// `lodedb_checkpointer_open_json` / `lodedb_checkpointer_checkpoint` /
+/// `lodedb_checkpointer_free` symbols (and the matching PyO3 `CoreCheckpointer`), so
+/// a wrapper that drives a checkpointer must not pair with an older core lacking it.
+pub const NATIVE_CORE_ABI_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -29,6 +33,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 3);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 4);
     }
 }

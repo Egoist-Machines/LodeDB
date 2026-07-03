@@ -12,7 +12,7 @@ exact about ids, since auto-generated ids would collide across concurrent proces
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from os import PathLike
 from typing import Any
 
@@ -52,9 +52,11 @@ class Appender:
         self,
         handle: NativeCoreAppenderHandle,
         embedder: EngineEmbeddingBackend | None = None,
+        path: str | PathLike[str] = "",
     ) -> None:
         self._handle: NativeCoreAppenderHandle | None = handle
         self._embedder = embedder
+        self._path = path
 
     @classmethod
     def open(
@@ -116,7 +118,7 @@ class Appender:
                     "other handle, or raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
                 ) from exc
             raise
-        return cls(handle, embedder)
+        return cls(handle, embedder, path)
 
     def append(
         self,
@@ -168,7 +170,7 @@ class Appender:
             )
         if not prepared:
             raise ValueError("append_many requires at least one document")
-        return self._require_open().append_vectors(prepared)
+        return self._logged(lambda: self._require_open().append_vectors(prepared))
 
     def delete(self, ids: str | Sequence[str]) -> int:
         """Logs a delete as one WAL record and returns its LSN.
@@ -180,7 +182,7 @@ class Appender:
         document_ids = [ids] if isinstance(ids, str) else [str(document_id) for document_id in ids]
         if not document_ids:
             raise ValueError("delete requires at least one id")
-        return self._require_open().append_deletes(document_ids)
+        return self._logged(lambda: self._require_open().append_deletes(document_ids))
 
     def append_text(
         self,
@@ -233,7 +235,7 @@ class Appender:
             str(chunk.get("text", "")) for chunk in plan.get("chunks_to_embed", [])
         )
         embeddings = embedder.embed_documents(chunks_to_embed) if chunks_to_embed else ()
-        return handle.append_embedded_documents(plan, embeddings)
+        return self._logged(lambda: handle.append_embedded_documents(plan, embeddings))
 
     def close(self) -> None:
         """Releases the shared lock by dropping the native handle. Idempotent."""
@@ -245,6 +247,27 @@ class Appender:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    def _logged(self, call: Callable[[], int]) -> int:
+        """Runs a lock-taking native append, remapping lock contention to the SDK's
+        stable :class:`ConcurrentWriterError`.
+
+        The appender takes the shared lock per append (not once for its lifetime, so a
+        running checkpointer can fold between appends), so a writer or checkpointer
+        holding the exclusive lock at the instant of an append surfaces contention
+        here, not only at :meth:`open`.
+        """
+
+        try:
+            return call()
+        except ValueError as exc:
+            if _is_writer_lock_contention(exc):
+                raise ConcurrentWriterError(
+                    f"appender at {self._path} could not take the lodedb lock (held by "
+                    "an exclusive writer or a checkpointer's fold); retry the append, or "
+                    "raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
+                ) from exc
+            raise
 
     def _require_open(self) -> NativeCoreAppenderHandle:
         if self._handle is None:

@@ -43,6 +43,7 @@ class NativeCoreModule(Protocol):
 
     def CoreEngine(self) -> Any: ...
     def CoreAppender(self) -> Any: ...
+    def CoreCheckpointer(self) -> Any: ...
     def cuda_runtime_available(self) -> bool: ...
     def native_core_abi_version(self) -> int: ...
     def native_core_version(self) -> str: ...
@@ -219,6 +220,50 @@ class NativeCoreAdapter:
             acquire_writer_lock=acquire_writer_lock,
         )
         return NativeCoreAppenderHandle(module.CoreAppender.open(_dumps(options)))
+
+    def open_checkpointer(
+        self,
+        *,
+        path: str | PathLike[str],
+        durability: str = "buffered",
+        store_text: bool = False,
+        index_text: bool = False,
+        chunk_character_limit: int = 900,
+    ) -> NativeCoreCheckpointerHandle:
+        """Opens a running single-checkpointer over the single index at ``path``.
+
+        One process at a time holds the checkpointer lease; a second open blocks
+        then fails. Each :meth:`NativeCoreCheckpointerHandle.checkpoint` folds the
+        WAL that concurrent appenders logged into a fresh committed generation under
+        a brief hold of the exclusive writer lock, so appended records become
+        durable (and visible to a reader's ``refresh``) without an application
+        re-opening a writer. The store must be in WAL commit mode.
+
+        ``store_text``/``index_text``/``chunk_character_limit`` mirror the store's
+        writer, exactly as for an appender: the fold retains a document's text only
+        under ``store_text`` and its lexical tokens only under ``index_text``, and
+        re-tokenizes at ``chunk_character_limit``. Open the checkpointer with the
+        same retention the store's writer uses, or the fold rewrites the store to
+        the checkpointer's policy (dropping retained text/tokens on a mismatch).
+        """
+
+        module = self._require_module()
+        options = self.open_options_payload(
+            path=path,
+            read_only=False,
+            durability=durability,
+            # The checkpointer folds through the WAL, which a generation-mode writer
+            # never replays, so it requires WAL commit mode.
+            commit_mode="wal",
+            store_text=store_text,
+            index_text=index_text,
+            chunk_character_limit=chunk_character_limit,
+            # The checkpointer owns the writer lock manually (per fold) via its lease;
+            # the core forces the warm engine's lifetime lock off regardless, so this
+            # is only for clarity.
+            acquire_writer_lock=False,
+        )
+        return NativeCoreCheckpointerHandle(module.CoreCheckpointer.open(_dumps(options)))
 
     @staticmethod
     def document_payload(document: EngineDocument) -> dict[str, Any]:
@@ -907,3 +952,34 @@ class NativeCoreAppenderHandle:
         return int(
             self._appender.append_embedded_documents(plan_json, _dumps(embedding_payload))
         )
+
+
+class NativeCoreCheckpointerHandle:
+    """Small wrapper over ``lodedb._native_core.CoreCheckpointer``.
+
+    Holds the crash-reclaimable checkpointer lease for its lifetime. Each
+    :meth:`checkpoint` folds the appended WAL tail into a fresh committed
+    generation and returns the number of records folded. Thread-confined like the
+    engine it wraps (the warm engine is not ``Send``): create it and call it on one
+    thread.
+    """
+
+    def __init__(self, checkpointer: Any) -> None:
+        self._checkpointer = checkpointer
+
+    def checkpoint(self) -> int:
+        """Folds the appended WAL tail, returning the record count (0 if nothing new)."""
+
+        if self._checkpointer is None:
+            raise RuntimeError("checkpointer is closed")
+        return int(self._checkpointer.checkpoint())
+
+    def close(self) -> None:
+        """Releases the lease by dropping the native checkpointer on this thread.
+
+        Idempotent. Dropping here (rather than at interpreter teardown) releases the
+        lease on the thread that owns the thread-confined engine, so a long-running
+        process can hand the store off to another checkpointer promptly.
+        """
+
+        self._checkpointer = None

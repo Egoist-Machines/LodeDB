@@ -1,5 +1,8 @@
 use lodedb_core::{
-    engine::{CoreAppender as RustCoreAppender, CoreEngine as RustCoreEngine, IngestPlan, QueryPlan},
+    engine::{
+        CoreAppender as RustCoreAppender, CoreCheckpointer as RustCoreCheckpointer,
+        CoreEngine as RustCoreEngine, IngestPlan, QueryPlan,
+    },
     CoreDocument, CoreError, CoreErrorCode, CoreIndexConfig, CoreIndexCreateOptions,
     CoreMutationResult, CoreOpenOptions, CoreQuery, CoreRoutePolicy, CoreSearchResults,
     CoreSecurityOptions, CoreStats, CoreVectorDocument,
@@ -1401,12 +1404,45 @@ impl PyCoreAppender {
     }
 }
 
+/// Wraps `lodedb_core::engine::CoreCheckpointer`: one process holds a
+/// crash-reclaimable lease and folds the WAL that concurrent appenders log into
+/// fresh generations, so appended records become durable (and visible to a reader's
+/// refresh) without an application re-opening a writer. The store must be in WAL
+/// commit mode and opened writable.
+///
+/// `unsendable` like `PyCoreEngine` (which it owns): the warm engine is not `Send`,
+/// so the checkpointer is thread-confined to whichever thread opened it.
+#[pyclass(name = "CoreCheckpointer", unsendable)]
+struct PyCoreCheckpointer {
+    inner: RustCoreCheckpointer,
+}
+
+#[pymethods]
+impl PyCoreCheckpointer {
+    #[staticmethod]
+    fn open(options_json: &str) -> PyResult<Self> {
+        let options = native_from_json::<CoreOpenOptions>(options_json)?;
+        Ok(Self {
+            inner: RustCoreCheckpointer::open(options).map_err(native_core_error_to_py)?,
+        })
+    }
+
+    /// Folds the appended WAL tail into a fresh committed generation under a brief
+    /// hold of the exclusive writer lock, returning the number of records folded
+    /// (zero when nothing new was appended). Reloads a stale warm base first when a
+    /// concurrent writer advanced the committed generation.
+    fn checkpoint(&mut self) -> PyResult<usize> {
+        self.inner.checkpoint().map_err(native_core_error_to_py)
+    }
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
     m.add_class::<PyCoreEngine>()?;
     m.add_class::<PyCoreAppender>()?;
+    m.add_class::<PyCoreCheckpointer>()?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
