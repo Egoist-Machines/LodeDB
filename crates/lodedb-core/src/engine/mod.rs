@@ -1455,6 +1455,102 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Folds the appended WAL tail into the warm in-memory index and checkpoints a
+    /// fresh generation, then truncates the WAL; returns the number of records folded.
+    ///
+    /// This is the running checkpointer's incremental fold. Unlike a writable open,
+    /// which reloads the base and replays the whole WAL, this folds only records above
+    /// the applied-LSN watermark onto the already-warm index, so a checkpointer that
+    /// keeps this engine open across folds is O(appended), not O(store). The caller
+    /// MUST hold the exclusive writer lock for the duration (so no appender races the
+    /// truncation) -- [`CoreCheckpointer`] takes it per fold -- and must have opened
+    /// writable in WAL mode. It assumes the warm base is still the committed one;
+    /// `CoreCheckpointer` reopens the engine when it detects a concurrent writer
+    /// advanced the base, so this never folds onto a stale base.
+    pub fn fold_wal_tail(&mut self) -> Result<usize, CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return invalid("in-memory engine has no WAL to fold");
+        };
+        if persistence.read_only {
+            return invalid("read-only engine cannot fold a WAL");
+        }
+        if persistence.commit_mode != "wal" {
+            return invalid("folding a WAL tail requires wal commit mode");
+        }
+        let path = persistence.path.clone();
+        let index_ids: Vec<String> = self.indexes.keys().cloned().collect();
+        let mut folded = 0usize;
+        for index_id in index_ids {
+            let (index_key, applied) = match self.indexes.get(&index_id) {
+                Some(index) => (index.index_key.clone(), index.applied_lsn),
+                None => continue,
+            };
+            let wal = crate::storage::wal::wal_path(&path, &index_key);
+            let records = crate::storage::wal::read_records(&wal)?;
+            // Records at or below the applied watermark were already folded. In steady
+            // state the WAL was truncated after the last fold, so every record is new;
+            // the filter keeps the fold idempotent if a stale record ever lingers.
+            let pending = records
+                .iter()
+                .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
+                .count();
+            if pending == 0 {
+                continue;
+            }
+            if records
+                .iter()
+                .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
+                .any(|record| !is_native_replayable_wal_record(record))
+            {
+                return Err(CoreError::new(
+                    CoreErrorCode::Unsupported,
+                    "the store's WAL has records only the Python engine can replay; \
+                     open it with a writer to recover before checkpointing",
+                ));
+            }
+            self.replaying_wal = true;
+            let result = records
+                .iter()
+                .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
+                .try_for_each(|record| {
+                    self.apply_native_wal_record(&index_id, record)?;
+                    if let Some(index) = self.indexes.get_mut(&index_id) {
+                        index.applied_lsn = index.applied_lsn.max(record.lsn.unwrap_or(0));
+                    }
+                    Ok::<(), CoreError>(())
+                });
+            self.replaying_wal = false;
+            result?;
+            folded += pending;
+            // Clamp the generation up to the watermark so a later mutation never mints
+            // an LSN at or below one already applied (mirrors the writable-open replay).
+            if let Some(index) = self.indexes.get_mut(&index_id) {
+                index.generation = index.generation.max(index.applied_lsn);
+            }
+        }
+        if folded > 0 {
+            self.persist()?;
+        }
+        Ok(folded)
+    }
+
+    /// Total WAL records currently on disk across this engine's indexes. After any
+    /// successful fold the WAL is truncated, so this counts exactly the un-folded
+    /// records a fold (or a fold-on-open reload) would process -- the checkpointer
+    /// uses it to report records folded during a reload, whose fold-on-open returns
+    /// no count.
+    fn wal_record_count(&self) -> Result<usize, CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for index in self.indexes.values() {
+            let wal = crate::storage::wal::wal_path(&persistence.path, &index.index_key);
+            count += crate::storage::wal::read_records(&wal)?.len();
+        }
+        Ok(count)
+    }
+
     fn index(&self, index_id: &str) -> Result<&VectorOnlyIndex, CoreError> {
         self.indexes
             .get(index_id)
@@ -2414,7 +2510,12 @@ impl PersistentLock {
     /// releases when the handle is dropped and the sentinel file is left in place,
     /// matching Python. Honours ``LODEDB_PERSIST_LOCK_TIMEOUT``.
     fn acquire(path: &Path) -> Result<Self, CoreError> {
-        Self::acquire_with_timeout(path, LockMode::Exclusive, lock_timeout_seconds())
+        Self::acquire_lock(
+            &path.join(".lodedb.lock"),
+            LockMode::Exclusive,
+            LockMode::Exclusive.contention_message(),
+            lock_timeout_seconds(),
+        )
     }
 
     /// Takes a shared hold: many shared holders coexist, but a shared hold still
@@ -2423,24 +2524,44 @@ impl PersistentLock {
     /// checkpointing writer, which is what keeps their appends from racing a WAL
     /// truncation.
     fn acquire_shared(path: &Path) -> Result<Self, CoreError> {
-        Self::acquire_with_timeout(path, LockMode::Shared, lock_timeout_seconds())
+        Self::acquire_lock(
+            &path.join(".lodedb.lock"),
+            LockMode::Shared,
+            LockMode::Shared.contention_message(),
+            lock_timeout_seconds(),
+        )
     }
 
-    fn acquire_with_timeout(
-        path: &Path,
+    /// Takes the running-checkpointer lease on `<dir>/.lodedb.checkpoint.lock`, a
+    /// sentinel distinct from the writer lock so it neither excludes appenders nor
+    /// the exclusive writer -- it only elects one checkpointer at a time. It is
+    /// crash-reclaimable exactly like the writer lock: the OS releases the flock (or
+    /// the exclusive share-mode handle on Windows) when the holder dies, so a fresh
+    /// checkpointer can take over. Honours `LODEDB_PERSIST_LOCK_TIMEOUT`.
+    fn acquire_checkpoint_lease(path: &Path) -> Result<Self, CoreError> {
+        Self::acquire_lock(
+            &path.join(".lodedb.checkpoint.lock"),
+            LockMode::Exclusive,
+            "another process holds the lodedb checkpointer lease",
+            lock_timeout_seconds(),
+        )
+    }
+
+    fn acquire_lock(
+        lock_path: &Path,
         mode: LockMode,
+        contention_message: &str,
         timeout_secs: f64,
     ) -> Result<Self, CoreError> {
-        let lock_path = path.join(".lodedb.lock");
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
-            match Self::try_lock(&lock_path, mode) {
+            match Self::try_lock(lock_path, mode) {
                 Ok(file) => return Ok(Self { _file: file }),
                 Err(TryLock::Contended) => {
                     if Instant::now() >= deadline {
                         return Err(CoreError::new(
                             CoreErrorCode::InvalidArgument,
-                            mode.contention_message().to_string(),
+                            contention_message.to_string(),
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(25));
@@ -2503,19 +2624,6 @@ pub struct CoreAppender {
     // would derive chunk ids a writer never would, so a fold could not reuse the
     // writer's resident chunks (the "match your writer" contract, like store_text).
     chunk_character_limit: usize,
-    // The highest WAL LSN already durable when this appender opened (e.g. a peer's
-    // unfolded appends). Every reservation clamps up to it so an appended LSN never
-    // reuses one already on disk.
-    floor: u64,
-    // The committed generation at open. The exclusive writer uses the generation
-    // as its own WAL LSN and can advance it faster than one-per-LSN (a captioned
-    // fold bumps it as upsert + token restore), so the counter can lag it. Clamping
-    // every reservation up to this makes the "an appended LSN always exceeds the
-    // committed generation" invariant local to the reservation, rather than resting
-    // on the shared/exclusive lock keeping an appender from spanning a fold. The
-    // generation is frozen for the appender's lifetime (a fold needs the exclusive
-    // lock this appender's shared lock excludes), so the open-time value stays valid.
-    committed_generation: u64,
     fsync: bool,
     // The raw-text/lexical retention policy for appended captions, mirroring the
     // engine's vector-in text policy exactly so an appended `upsert_vectors` record
@@ -2526,10 +2634,15 @@ pub struct CoreAppender {
     // the store's writer, or the writer drops the payload at checkpoint.
     store_text: bool,
     index_text: bool,
-    // Held for the appender's lifetime; dropping it releases the shared lock.
-    // `None` when the caller opts out of the shared lock (`acquire_writer_lock`
-    // false) because an outer coordinator owns exclusion, matching CoreEngine.
-    _lock: Option<PersistentLock>,
+    // Whether each append takes the shared `.lodedb.lock` for the duration of its
+    // write (and open takes it for the scan/seed). Unlike the exclusive writer, the
+    // appender does NOT hold this for its lifetime -- it releases it between appends
+    // -- so a running checkpointer (or an exclusive writer) can take the exclusive
+    // lock and fold WHILE this appender stays open. Each append re-reads the committed
+    // generation under the lock, so a fold that advanced it between appends can never
+    // strand a reserved LSN below the new base. `false` when an outer coordinator owns
+    // exclusion (matching CoreEngine).
+    acquire_writer_lock: bool,
 }
 
 impl CoreAppender {
@@ -2548,10 +2661,12 @@ impl CoreAppender {
                 "append requires wal commit mode; generation mode does not replay the WAL",
             ));
         }
-        // Take the shared lock first: once it is held no exclusive writer is
-        // active, so the shape and LSN floor read below cannot change under us. A
+        // Take the shared lock only for this open-time metadata read and WAL
+        // scan/seed, then release it before returning (each append retakes it). Unlike
+        // the exclusive writer, the appender does NOT hold it for its lifetime, so a
+        // running checkpointer (or a writer) can fold while this appender stays open. A
         // caller that manages exclusion itself opts out with acquire_writer_lock.
-        let lock = if options.acquire_writer_lock {
+        let open_lock = if options.acquire_writer_lock {
             Some(PersistentLock::acquire_shared(&path)?)
         } else {
             None
@@ -2594,7 +2709,7 @@ impl CoreAppender {
         // must still land above every LSN the store already reports applied.
         let base_generation = metadata.applied_lsn.max(metadata.generation);
         let fsync = options.durability == "fsync";
-        let wal_max_lsn = crate::storage::lsn::with_lock(&path, &index_key, |file| {
+        crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
             Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
             // Refuse if the WAL already holds records only the Python engine can
@@ -2637,19 +2752,21 @@ impl CoreAppender {
                 .unwrap_or(0);
             let seeded_lsn = existing_lsn.max(floor);
             crate::storage::lsn::write_counter(file, seeded_lsn, Some(scan.valid_len), fsync)?;
-            Ok(wal_max_lsn)
+            Ok(())
         })?;
+        // Release the open-time lock: the returned appender holds no lock and retakes
+        // the shared lock (and re-reads the committed generation) per append, so a
+        // concurrent fold is never blocked for longer than a single append.
+        drop(open_lock);
         Ok(Self {
             path,
             index_key,
             vector_dim,
             chunk_character_limit: options.chunk_character_limit,
-            floor: wal_max_lsn,
-            committed_generation: base_generation,
             fsync,
             store_text: options.store_text,
             index_text: options.index_text,
-            _lock: lock,
+            acquire_writer_lock: options.acquire_writer_lock,
         })
     }
 
@@ -2864,6 +2981,21 @@ impl CoreAppender {
     }
 
     fn append_one(&self, op: &str, payload: Value) -> Result<u64, CoreError> {
+        // Hold the shared lock for the whole write so a concurrent fold cannot
+        // truncate the WAL mid-append; releasing it between appends is what lets a
+        // running checkpointer fold while this appender stays open. A caller that owns
+        // exclusion itself opts out with acquire_writer_lock.
+        let _lock = if self.acquire_writer_lock {
+            Some(PersistentLock::acquire_shared(&self.path)?)
+        } else {
+            None
+        };
+        // Re-read the committed generation under the lock: a fold since the last append
+        // may have advanced it, and every reserved LSN must clear it or the next fold
+        // would skip the appended record as already folded and drop it. Reading it here
+        // (not caching it at open) is what makes the appender safe to span folds.
+        let metadata = crate::storage::load_store_metadata(&self.path, &self.index_key)?;
+        let committed_generation = metadata.applied_lsn.max(metadata.generation);
         let wal = crate::storage::wal::wal_path(&self.path, &self.index_key);
         crate::storage::lsn::with_lock(&self.path, &self.index_key, |file| {
             let counter = crate::storage::lsn::read_counter(file)?;
@@ -2872,7 +3004,8 @@ impl CoreAppender {
             // complete records (not behind torn bytes the next writer's replay would
             // stop at) and reserves an LSN that collides with neither a writer's
             // generation LSNs nor a frame a crashed peer already committed.
-            let (floor, valid_len) = self.repair_and_lsn_floor(&wal, counter)?;
+            let (floor, valid_len) =
+                self.repair_and_lsn_floor(&wal, counter, committed_generation)?;
             let lsn = floor
                 .checked_add(1)
                 .ok_or_else(|| invalid_err("LSN counter would overflow u64"))?;
@@ -2921,6 +3054,7 @@ impl CoreAppender {
         &self,
         wal: &Path,
         counter: Option<crate::storage::lsn::Counter>,
+        committed_generation: u64,
     ) -> Result<(u64, u64), CoreError> {
         let counter_lsn = counter.map(|counter| counter.lsn).unwrap_or(0);
         let physical = match std::fs::metadata(wal) {
@@ -2931,50 +3065,41 @@ impl CoreAppender {
         // Every reservation clamps up to the committed generation as well as the
         // counter and WAL floors, so an appended LSN always exceeds the generation
         // even though the writer can advance the generation faster than the counter.
-        let generation = self.committed_generation;
+        // The caller re-reads the generation under the shared lock per append, so a
+        // fold that advanced it between appends is reflected here.
+        let generation = committed_generation;
         match counter.and_then(|counter| counter.wal_len) {
             // Intact tail: nothing sits past the last recorded frame, and the
-            // counter's LSN is the last frame's LSN. The hot path.
+            // counter's LSN is the last frame's LSN. The steady-state hot path --
+            // once this appender acks a frame the watermark equals the file length,
+            // so every later append in the session lands here in O(1) with no scan.
             Some(mark) if physical == mark && mark > 0 => {
-                Ok((counter_lsn.max(self.floor).max(generation), mark))
+                Ok((counter_lsn.max(generation), mark))
             }
-            // Bytes at or past the watermark: a crashed peer's unacknowledged tail,
-            // or a zero-length WAL that needs its header rewritten. Scan for the
-            // WAL's true max LSN and clamp the floor above it BEFORE dropping the
-            // tail: `refresh` overlays every CRC-valid frame, so a reader may have
-            // transiently observed an unacknowledged past-watermark frame at some
-            // LSN; re-minting that LSN for a different record would leave that
-            // reader's `applied_lsn` pointing at the wrong record. The tail is still
-            // dropped back to the boundary (an unacknowledged frame is not
-            // committed), and `repair_torn_tail` removes the file when the boundary
-            // is zero so the next append writes a fresh header, not a headerless
-            // frame. This scan is off the steady-state hot path: once this appender
-            // acks its frame the watermark equals the file length and the intact-tail
-            // arm above handles every later append in O(1).
-            Some(mark) if physical >= mark => {
-                let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
-                let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
-                Self::repair_torn_tail(wal, mark, physical)?;
-                Ok((
-                    counter_lsn
-                        .max(self.floor)
-                        .max(generation)
-                        .max(wal_max.unwrap_or(0)),
-                    mark,
-                ))
-            }
-            // No usable watermark, or one past the file: scan to repair the tail and
-            // clamp the LSN above the WAL's true max so a torn counter or stale floor
-            // cannot reuse an LSN a peer already wrote.
+            // Anything else: a torn trailing frame, a zero-length WAL, a watermark
+            // past the file, or -- now that an appender no longer holds the writer
+            // lock for its lifetime -- committed frames a concurrent writer appended
+            // (or a checkpointer left after truncating) past our stale in-session
+            // watermark. Scan and repair only the torn trailing bytes, truncating to
+            // the last CRC-valid frame, so a writer's committed records that grew the
+            // WAL without touching our watermark are PRESERVED, not dropped back to
+            // the stale boundary. This matches how a fresh `open` re-seeds and how
+            // `refresh` folds every CRC-valid frame: a complete-but-unpublished
+            // trailing frame is left in place to self-heal on the next fold rather
+            // than being silently lost. The floor is clamped above the WAL's true max
+            // LSN so a torn counter or stale watermark cannot re-mint an LSN a peer
+            // already wrote -- a reader's `refresh` may have transiently observed a
+            // past-watermark frame's LSN, and re-minting it for a different record
+            // would leave that reader's `applied_lsn` pointing at the wrong record.
+            // `repair_torn_tail` removes a zero-length file so the next append writes
+            // a fresh header, not a headerless frame. This scan is off the hot path:
+            // once this appender acks its frame the intact-tail arm above takes over.
             _ => {
                 let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
                 Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
                 let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
                 Ok((
-                    counter_lsn
-                        .max(self.floor)
-                        .max(generation)
-                        .max(wal_max.unwrap_or(0)),
+                    counter_lsn.max(generation).max(wal_max.unwrap_or(0)),
                     scan.valid_len,
                 ))
             }
@@ -2998,6 +3123,132 @@ impl CoreAppender {
             crate::storage::wal::truncate_to(wal, valid_len)?;
         }
         Ok(())
+    }
+}
+
+/// A running single-checkpointer over one store.
+///
+/// One process holds a crash-reclaimable *lease* and folds the WAL that concurrent
+/// appenders log into fresh generations, so appended records become durably folded
+/// (and visible to a reader's `refresh`) without an application re-opening a writer.
+/// Unlike the exclusive writer it does NOT hold the writer lock for its lifetime: it
+/// keeps only the lease (a separate `<dir>/.lodedb.checkpoint.lock` sentinel that
+/// excludes neither appenders nor the writer) and takes the exclusive writer lock
+/// only for the brief window of each fold, so appenders keep logging between folds.
+///
+/// The lease elects a single checkpointer -- a second `open` on the same store blocks
+/// then fails -- and a dead lessee's lease is reclaimable because the OS releases the
+/// flock (or the Windows share-mode handle) on death. Single-applier WAL ordering is
+/// preserved because every fold runs under the exclusive writer lock, the same lock a
+/// writable open takes. Dropping the checkpointer releases the lease.
+pub struct CoreCheckpointer {
+    /// The warm writable engine (opened `acquire_writer_lock=false`; the checkpointer
+    /// takes the writer lock itself per fold). Kept warm so folds are incremental.
+    engine: CoreEngine,
+    /// Retained to reopen the warm engine after a concurrent writer advances the base.
+    options: CoreOpenOptions,
+    path: PathBuf,
+    /// The committed-manifest tokens seen after the last fold, per index. A change
+    /// before the next fold means another writer checkpointed, so the warm base is
+    /// stale and must be reloaded before folding onto it.
+    committed_tokens: BTreeMap<String, String>,
+    /// Set when a fold's commit failed after advancing the warm `applied_lsn`: the
+    /// warm state then disagrees with disk (the WAL is uncheckpointed but its LSNs
+    /// look applied), so the next checkpoint must reload from disk before folding
+    /// rather than skip the stranded records and wedge.
+    needs_reload: bool,
+    /// Held for the checkpointer's lifetime; dropping it releases the lease.
+    _lease: PersistentLock,
+}
+
+impl CoreCheckpointer {
+    /// Opens a checkpointer over the store at `options.path`, acquiring the lease.
+    /// Fails if another process holds the lease, if the store is not in WAL commit
+    /// mode (generation mode keeps no WAL to fold), or if opened read-only. The
+    /// initial open folds any pending WAL under the writer lock so the checkpointer
+    /// starts current.
+    pub fn open(options: CoreOpenOptions) -> Result<Self, CoreError> {
+        if options.read_only {
+            return Err(invalid_err("checkpointer requires a writable open"));
+        }
+        if options.commit_mode != "wal" {
+            return Err(invalid_err(
+                "checkpointer requires wal commit mode; generation mode keeps no WAL to fold",
+            ));
+        }
+        let path = PathBuf::from(&options.path);
+        if !path.is_dir() {
+            return Err(invalid_err("checkpoint path does not exist"));
+        }
+        // Elect the single checkpointer before touching the store.
+        let lease = PersistentLock::acquire_checkpoint_lease(&path)?;
+        let engine = Self::open_warm(&options, &path)?;
+        let committed_tokens = engine.committed_root_tokens()?;
+        Ok(Self {
+            engine,
+            options,
+            path,
+            committed_tokens,
+            needs_reload: false,
+            _lease: lease,
+        })
+    }
+
+    /// Folds the appended WAL tail into a fresh generation and returns the number of
+    /// records folded. Takes the exclusive writer lock only for the fold, so appenders
+    /// run freely between calls; drive it on a loop or a timer to keep a store
+    /// continuously checkpointed. If a concurrent writer advanced the committed base
+    /// since the last fold, the warm state is reloaded first (so the fold never
+    /// targets a stale base and cannot clobber that writer's commit).
+    pub fn checkpoint(&mut self) -> Result<usize, CoreError> {
+        let _writer = PersistentLock::acquire(&self.path)?;
+        // Reload the warm state from disk when it can no longer be trusted: a changed
+        // committed token means another writer checkpointed while we held only the
+        // lease, and `needs_reload` means our own last fold's commit failed after
+        // advancing the warm watermark. Either way the reopen reloads the current base
+        // and folds any pending WAL under the lock we already hold; count those records
+        // first, since the fold-on-open returns no count.
+        let stale = self.engine.committed_root_tokens()? != self.committed_tokens;
+        let mut folded = 0;
+        if self.needs_reload || stale {
+            folded += self.engine.wal_record_count()?;
+            self.engine = Self::reload_warm_under_lock(&self.options)?;
+            self.needs_reload = false;
+        }
+        match self.engine.fold_wal_tail() {
+            Ok(more) => {
+                folded += more;
+                self.committed_tokens = self.engine.committed_root_tokens()?;
+                Ok(folded)
+            }
+            Err(error) => {
+                // The fold advanced the warm watermark but may not have committed, so
+                // force a reload before the next fold instead of skipping the stranded
+                // WAL records as already applied.
+                self.needs_reload = true;
+                Err(error)
+            }
+        }
+        // `_writer` drops here, releasing the writer lock.
+    }
+
+    /// Opens the warm engine under a briefly-held writer lock so the fold-on-open
+    /// cannot race an appender, then releases the writer lock (the warm engine holds
+    /// no lock; the checkpointer retakes the writer lock per fold).
+    fn open_warm(options: &CoreOpenOptions, path: &Path) -> Result<CoreEngine, CoreError> {
+        let _writer = PersistentLock::acquire(path)?;
+        Self::reload_warm_under_lock(options)
+    }
+
+    /// Opens the warm engine while the caller ALREADY holds the writer lock (the
+    /// fold-on-open is safe under it). Never acquires the writer lock itself, so it
+    /// cannot self-deadlock against a lock the caller holds.
+    fn reload_warm_under_lock(options: &CoreOpenOptions) -> Result<CoreEngine, CoreError> {
+        let mut warm_options = options.clone();
+        // The checkpointer owns the writer lock manually (per fold); the warm engine
+        // must not hold it for its lifetime, or appenders could never run.
+        warm_options.acquire_writer_lock = false;
+        CoreEngine::open(warm_options)
     }
 }
 
@@ -5409,17 +5660,34 @@ mod lock_tests {
         // An exclusive writer cannot acquire while shared holders are alive; use a
         // short explicit timeout so the assertion does not wait the full default.
         assert!(
-            PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05).is_err(),
+            PersistentLock::acquire_lock(
+                &dir.join(".lodedb.lock"),
+                LockMode::Exclusive,
+                LockMode::Exclusive.contention_message(),
+                0.05,
+            )
+            .is_err(),
             "exclusive must be blocked while shared holds exist"
         );
         drop(first);
         drop(second);
         // With the shared holds gone, the exclusive writer acquires...
-        let writer = PersistentLock::acquire_with_timeout(&dir, LockMode::Exclusive, 0.05)
-            .expect("exclusive after shared released");
+        let writer = PersistentLock::acquire_lock(
+            &dir.join(".lodedb.lock"),
+            LockMode::Exclusive,
+            LockMode::Exclusive.contention_message(),
+            0.05,
+        )
+        .expect("exclusive after shared released");
         // ...and now a shared hold is blocked while the writer is alive.
         assert!(
-            PersistentLock::acquire_with_timeout(&dir, LockMode::Shared, 0.05).is_err(),
+            PersistentLock::acquire_lock(
+                &dir.join(".lodedb.lock"),
+                LockMode::Shared,
+                LockMode::Shared.contention_message(),
+                0.05,
+            )
+            .is_err(),
             "shared must be blocked while an exclusive writer exists"
         );
         drop(writer);

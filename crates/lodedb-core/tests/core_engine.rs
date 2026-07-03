@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lodedb_core::engine::{CoreAppender, CoreEngine};
+use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
 use lodedb_core::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
     CoreVectorDocument,
@@ -2310,6 +2310,159 @@ fn append_embedded_documents_rejects_a_mismatched_policy_plan() {
 }
 
 #[test]
+fn checkpointer_folds_appends_into_fresh_generations() {
+    // A running checkpointer holds a lease (not the lifetime writer lock), so
+    // appenders keep logging; each checkpoint() folds the WAL tail into a fresh
+    // generation, making the appends visible to a reader without a writer re-open.
+    let path = unique_temp_dir("core_checkpointer_fold");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let mut checkpointer = CoreCheckpointer::open(writer_opts.clone()).expect("open checkpointer");
+    // An appender logs records while the checkpointer holds only the lease.
+    {
+        let mut appender_opts = open_options(&path, false, "wal");
+        appender_opts.acquire_writer_lock = true;
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        appender
+            .append_vectors(&[doc("a", 0, metadata(&[("kind", "appended")]))])
+            .unwrap();
+        appender
+            .append_vectors(&[doc("b", 1, metadata(&[("kind", "appended")]))])
+            .unwrap();
+    }
+    // The checkpointer folds both records into a fresh generation.
+    assert_eq!(checkpointer.checkpoint().expect("checkpoint"), 2);
+    // A read-only reader (no writer re-open) now sees the folded records.
+    {
+        let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+        assert_eq!(reader.stats("default").unwrap().document_count, 2);
+    }
+    // A second checkpoint with no new appends folds nothing.
+    assert_eq!(checkpointer.checkpoint().expect("idempotent checkpoint"), 0);
+    // Release the lease before deleting the directory (Windows blocks removal of an
+    // open handle's file).
+    drop(checkpointer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkpointer_lease_excludes_a_second_checkpointer() {
+    let path = unique_temp_dir("core_checkpointer_lease");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    // Fail fast on lease contention instead of waiting the default timeout.
+    std::env::set_var("LODEDB_PERSIST_LOCK_TIMEOUT", "0");
+    let first = CoreCheckpointer::open(opts.clone()).expect("first checkpointer takes the lease");
+    // A second checkpointer cannot take the lease while the first holds it.
+    let second = CoreCheckpointer::open(opts);
+    std::env::remove_var("LODEDB_PERSIST_LOCK_TIMEOUT");
+    assert!(second.is_err(), "the lease must exclude a second checkpointer");
+    drop(first); // release the lease before deleting the directory
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn checkpointer_reloads_after_a_concurrent_writer() {
+    // The checkpointer holds only the lease, so an ad-hoc writable open can still take
+    // the writer lock and advance the base between folds. The next checkpoint must
+    // reload the advanced base before folding, or it would fold the appended record
+    // onto its stale warm base and clobber the ad-hoc writer's document.
+    let path = unique_temp_dir("core_checkpointer_stale");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("seed", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let mut checkpointer = CoreCheckpointer::open(opts.clone()).expect("open checkpointer");
+    // An ad-hoc writer advances the committed base while the checkpointer is idle.
+    {
+        let mut writer = CoreEngine::open(opts.clone()).unwrap();
+        writer
+            .upsert_vectors("default", &[doc("adhoc", 1, metadata(&[]))])
+            .unwrap();
+        writer.close().unwrap();
+    }
+    // An appender then logs one more record.
+    {
+        let mut appender_opts = open_options(&path, false, "wal");
+        appender_opts.acquire_writer_lock = true;
+        let appender = CoreAppender::open(appender_opts).expect("open appender");
+        appender
+            .append_vectors(&[doc("appended", 2, metadata(&[]))])
+            .unwrap();
+    }
+    // The checkpoint reloads the advanced base, then folds the append onto it.
+    checkpointer
+        .checkpoint()
+        .expect("checkpoint after a concurrent writer");
+    // All three documents survive: the ad-hoc writer's was not clobbered.
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(reader.stats("default").unwrap().document_count, 3);
+    // Release the lease and the reader's handles before deleting the directory.
+    drop(reader);
+    drop(checkpointer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkpointer_folds_while_a_long_lived_appender_stays_open() {
+    // The appender releases the shared lock between appends, so the checkpointer's
+    // per-fold exclusive lock succeeds even while the appender handle stays open --
+    // the running-checkpointer-with-concurrent-appenders model. A lifetime shared hold
+    // (the pre-rework behavior) would make the exclusive acquire below fail.
+    let path = unique_temp_dir("core_checkpointer_concurrent");
+    // Fail fast if the exclusive fold ever contends a lifetime hold, rather than
+    // waiting the default timeout.
+    std::env::set_var("LODEDB_PERSIST_LOCK_TIMEOUT", "0");
+    let mut opts = open_options(&path, false, "wal");
+    opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let mut checkpointer = CoreCheckpointer::open(opts.clone()).expect("open checkpointer");
+    // A long-lived appender (default acquire_writer_lock=true) stays open across folds.
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let appender = CoreAppender::open(appender_opts).expect("open appender");
+    appender
+        .append_vectors(&[doc("a", 0, metadata(&[]))])
+        .unwrap();
+    // The checkpointer folds while the appender is STILL open.
+    assert_eq!(checkpointer.checkpoint().expect("fold with appender open"), 1);
+    // The appender keeps logging after the fold; a second checkpoint folds that too.
+    appender
+        .append_vectors(&[doc("b", 1, metadata(&[]))])
+        .unwrap();
+    assert_eq!(checkpointer.checkpoint().expect("second fold"), 1);
+    std::env::remove_var("LODEDB_PERSIST_LOCK_TIMEOUT");
+    drop(appender);
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(reader.stats("default").unwrap().document_count, 2);
+    drop(reader);
+    drop(checkpointer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn appender_rejects_generation_mode() {
     let path = unique_temp_dir("core_appender_gen");
     let mut wal_opts = open_options(&path, false, "wal");
@@ -2444,10 +2597,71 @@ fn append_after_a_crashed_peer_tail_never_reuses_its_lsn() {
     );
     drop(appender);
 
-    // The unacknowledged frame is dropped; the writer replays only the two
-    // acknowledged records.
+    // The injected frame carried no vectors, so the writer replays two documents
+    // whether the empty frame is retained or dropped; the point this test guards is
+    // the LSN clamp above, not the frame's fate.
     let writer = CoreEngine::open(base).unwrap();
     assert_eq!(writer.stats("default").unwrap().document_count, 2);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn appender_preserves_a_writers_wal_growth_within_a_session() {
+    // The same-session counterpart of the cross-session growth test: an appender no
+    // longer holds the writer lock for its lifetime, so a writer can commit a frame
+    // to the WAL while the appender stays open. The appender's next append re-reads
+    // the committed generation and repairs the tail, and must PRESERVE the writer's
+    // committed frame rather than truncate it back to the stale in-session watermark.
+    let path = unique_temp_dir("core_appender_writer_growth_in_session");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let appender = CoreAppender::open(base.clone()).expect("open appender");
+    // One acknowledged append: the in-session watermark now sits at its end.
+    let first = appender
+        .append_vectors(&[doc("appended-1", 0, metadata(&[("s", "1")]))])
+        .expect("append 1");
+    // A writer commits a real record past that watermark without touching the LSN
+    // counter (the single-writer path uses its in-memory generation, not the shared
+    // allocator). Its LSN stays above the base generation so replay keeps it.
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        first + 1,
+        "upsert_vectors",
+        json!({
+            "vectors": [{
+                "document_id": "writer-doc",
+                "vector": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "metadata": {},
+                "text": null,
+                "tokens": null,
+                "patch_matrix": null
+            }]
+        }),
+        false,
+    )
+    .expect("writer grows the wal mid-session");
+    // The same appender's next append must land above the writer's frame and leave
+    // it intact, not drop it back to the stale watermark.
+    let second = appender
+        .append_vectors(&[doc("appended-2", 1, metadata(&[("s", "2")]))])
+        .expect("append 2 after the writer's growth");
+    assert!(
+        second > first + 1,
+        "append reused the writer's LSN: {second} !> {}",
+        first + 1
+    );
+    drop(appender);
+
+    // The writer replays all three durable records: both appends and the writer's.
+    let writer = CoreEngine::open(base).unwrap();
+    assert_eq!(writer.stats("default").unwrap().document_count, 3);
     drop(writer);
     fs::remove_dir_all(path).unwrap();
 }
