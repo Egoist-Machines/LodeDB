@@ -215,11 +215,17 @@ class LodeCollection:
 
     @staticmethod
     def _privacy_flags(store_text: Any, index_text: Any) -> dict[str, bool]:
-        """Resolves the collection-owned privacy/indexing flags (LodeDB defaults)."""
+        """Resolves the collection-owned privacy/indexing flags (LodeDB defaults).
 
+        ``index_text`` defaults to match ``store_text`` (as :class:`LodeDB` does), so a
+        default space persists its lexical index and a ``store_text=False`` space
+        retains no tokens either unless ``index_text=True`` is stated explicitly.
+        """
+
+        resolved_store_text = True if store_text is _UNSET else bool(store_text)
         return {
-            "store_text": True if store_text is _UNSET else bool(store_text),
-            "index_text": False if index_text is _UNSET else bool(index_text),
+            "store_text": resolved_store_text,
+            "index_text": resolved_store_text if index_text is _UNSET else bool(index_text),
         }
 
     @staticmethod

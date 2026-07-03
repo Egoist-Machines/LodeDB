@@ -121,13 +121,20 @@ def test_hybrid_persists_a_tvlex_sidecar(tmp_path):
     db.close()
 
 
-# -- default is off: byte-for-byte unchanged --------------------------------
+# -- index_text=False opts out: no lexical artifacts -----------------------
 
 
-def test_default_writes_no_tvlex(tmp_path):
-    """index_text defaults to False and writes no .tvlex/.lxd artifacts at all."""
+def test_index_text_off_writes_no_tvlex(tmp_path):
+    """index_text=False writes no .tvlex/.lxd artifacts at all.
 
-    db = LodeDB(path=tmp_path, _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    index_text now defaults to match store_text (True by default), so opting out is
+    explicit; a store_text=True store still serves lexical/hybrid by rebuilding from
+    retained raw text on open, just without the durable postings sidecar.
+    """
+
+    db = LodeDB(
+        path=tmp_path, index_text=False, _embedding_backend=HashEmbeddingBackend(native_dim=384)
+    )
     assert db.index_text is False
     db.add("a document mentioning E1234 in its body", id="a")
     db.persist()
@@ -135,15 +142,17 @@ def test_default_writes_no_tvlex(tmp_path):
     db.close()
 
 
-def test_default_layout_matches_no_lexical_store(tmp_path):
-    """With index_text off, the on-disk artifact set is identical to a plain DB.
+def test_index_text_off_layout_matches_no_lexical_store(tmp_path):
+    """With index_text=False, the on-disk artifact set carries no lexical sidecar.
 
-    Guards the "standard flow byte-for-byte unchanged" invariant: enabling the
-    feature must add files only under index_text=True, never by default.
+    Guards that opting out of lexical persistence really removes the .tvlex/.lxd
+    files, so a caller who does not want the durable postings pays nothing for them.
     """
 
     plain_dir = tmp_path / "plain"
-    db = LodeDB(path=plain_dir, _embedding_backend=HashEmbeddingBackend(native_dim=384))
+    db = LodeDB(
+        path=plain_dir, index_text=False, _embedding_backend=HashEmbeddingBackend(native_dim=384)
+    )
     db.add("payload one", id="a")
     db.add("payload two", id="b")
     db.persist()
@@ -151,7 +160,7 @@ def test_default_layout_matches_no_lexical_store(tmp_path):
     artifacts = sorted(
         p.name for p in plain_dir.rglob("*") if p.is_file()
     )
-    # No lexical sidecar artifacts exist in the default layout.
+    # No lexical sidecar artifacts exist when index_text is off.
     assert not any(name.endswith((".tvlex", ".lxd")) for name in artifacts)
 
 

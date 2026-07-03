@@ -140,11 +140,11 @@ Each index is a per-index generation directory plus a single atomically-swapped 
     `g<epoch>.json.json-delta/`,
   - `g<epoch>.tvim` — the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
     encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
-  - `g<epoch>.tvtext` — the opt-in raw-text base (`store_text=True`): the full
+  - `g<epoch>.tvtext` — the raw-text base (`store_text`, on by default): the full
     `document_id -> text` map, plus its `.txd` text journal under `g<epoch>.tvtext.tvtext-delta/`,
     governed by the same root manifest,
-  - `g<epoch>.tvlex` — the opt-in lexical-index base (`index_text=True`): the full
-    `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
+  - `g<epoch>.tvlex` — the lexical-index base (`index_text`, which defaults to match `store_text`):
+    the full `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
     `g<epoch>.tvlex.tvlex-delta/`, governed by the same root manifest.
 
 A commit writes any new artifacts first — bases are generation-addressed and never
@@ -241,11 +241,12 @@ query of a generation and discarded when the generation advances. It is never wr
 `.json`/`.jsd`/`.tvim`/`.tvd` artifacts or to telemetry, which stays metrics-only (counts, bytes,
 latency, never tokens or terms).
 
-That serving index needs a source. By default it is rebuilt from the raw-text store, so hybrid and
-lexical search work whenever `store_text=True`. Opening with `index_text=True` adds a durable
-source: the per-chunk tokens of each document are captured at `add` time and kept in a dedicated
-lexical sidecar mapping `document_id -> per-chunk token lists`, a `g<epoch>.tvlex` base plus a
-`.lxd` delta journal. This mirrors the `.tvtext`/`.txd` raw-text pattern exactly: an incremental
+That serving index needs a source, and `index_text` defaults to match `store_text` (both on by
+default), so the default source is a durable one: the per-chunk tokens of each document are
+captured at `add` time and kept in a dedicated lexical sidecar mapping
+`document_id -> per-chunk token lists`, a `g<epoch>.tvlex` base plus a `.lxd` delta journal. With
+`index_text=False` the serving index is instead rebuilt from the raw-text store on open, so hybrid
+and lexical still work whenever `store_text=True`, just re-tokenized rather than loaded. This mirrors the `.tvtext`/`.txd` raw-text pattern exactly: an incremental
 commit journals only the upserted token lists and deleted ids (O(changed), not a full-map
 rewrite), a load replays the deltas onto the base, every base and segment is checksum-guarded and
 fails closed on a corrupt/mismatched file, and the manifest is pinned by the same root commit so

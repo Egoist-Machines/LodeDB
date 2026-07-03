@@ -234,7 +234,7 @@ class LodeDB:
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
         store_text: bool = True,
-        index_text: bool = False,
+        index_text: bool | None = None,
         ann: str | AnnOptions | None = None,
         ann_clusters: int | None = None,
         ann_nprobe: int | None = None,
@@ -291,15 +291,20 @@ class LodeDB:
         text at all — telemetry, audit, and the redacted snapshot never carry text
         regardless of this flag. Reopen the same path with the same ``store_text``
         value you wrote with.
-        ``index_text`` controls durable lexical-index persistence and defaults to
-        ``False``: when ``True``, the per-chunk tokens of each added document are
-        kept in a dedicated ``.tvlex`` sidecar (base + ``.lxd`` journal, committed
-        O(changed) per write), so ``mode="hybrid"``/``"lexical"`` survive a reopen
-        without rebuilding from raw text and without requiring ``store_text=True``.
-        The sidecar holds payload-derived terms only and, like the raw-text
-        sidecar, never reaches telemetry, audit, or the redacted snapshot. The
-        default leaves the on-disk layout byte-for-byte unchanged. Reopen the same
-        path with the same ``index_text`` value you wrote with.
+        ``index_text`` controls durable lexical-index persistence and **defaults to
+        match** ``store_text`` (so ``True`` by default, and ``False`` when you disable
+        ``store_text``): the per-chunk tokens of each added document are kept in a
+        dedicated ``.tvlex`` sidecar (base + ``.lxd`` journal, committed O(changed) per
+        write), so ``mode="hybrid"``/``"lexical"`` are ready out of the box and survive
+        a reopen without rebuilding from raw text. Tying the default to ``store_text``
+        keeps the ``store_text=False`` "retain no text at all" promise: opting out of
+        raw text also opts out of persisting tokens. The sidecar holds payload-derived
+        terms only and, like the raw-text sidecar, never reaches telemetry, audit, or
+        the redacted snapshot. Pass an explicit bool to decouple the two: ``True`` on a
+        ``store_text=False`` store persists a lexical index without retaining raw text;
+        ``False`` on a ``store_text=True`` store skips the ``.tvlex`` and rebuilds the
+        lexical index from retained raw text on open instead. Reopen the same path with
+        the same effective ``index_text`` value you wrote with.
         ``ann`` opts into approximate nearest-neighbor acceleration for the vector
         scan and defaults to ``None`` (exact scan, full recall). Pass
         ``ann="cluster"`` to enable IVF-style cluster pruning: the query scores
@@ -331,7 +336,11 @@ class LodeDB:
 
         self.path = Path(path)
         self.store_text = bool(store_text)
-        self.index_text = bool(index_text)
+        # index_text defaults to match store_text: retaining text also persists its
+        # lexical index (so hybrid/lexical are ready out of the box), and opting out
+        # of text retention also opts out of persisting tokens (store_text=False keeps
+        # its "no text at all" promise). Pass an explicit bool to decouple them.
+        self.index_text = self.store_text if index_text is None else bool(index_text)
         # Opt-in ANN config (None => exact scan). Validated here for a friendly
         # error; the native core is the authority and re-validates the algorithm.
         self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)

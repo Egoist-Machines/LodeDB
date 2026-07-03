@@ -144,7 +144,7 @@ first.
     model: minilm           # "minilm" (fast) or "bge" (quality)
     device: auto            # auto | cpu | mps | cuda
     store_text: true        # keep on for hybrid/lexical retrieval
-    index_text: false
+    index_text: true        # persist the lexical index; omit to follow store_text
   ```
 
   This needs no PrivateGPT fork (`register_vector_store` is the documented extension seam), but
