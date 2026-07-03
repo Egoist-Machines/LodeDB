@@ -576,6 +576,17 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   captured base generation. It requires WAL commit mode. Exposed as the native `CoreAppender`, over
   the C ABI, in Python (`lodedb.Appender`: `append`/`append_many` for vectors,
   `append_text`/`append_text_many` for text), and in Swift (`LodeAppender`).
+- **Running checkpointer (WAL mode).** So appended records become durable without an
+  application re-opening a writer, a *running checkpointer* folds the WAL into fresh
+  generations continuously. It holds a crash-reclaimable lease (a sentinel distinct from
+  the writer lock, so it elects one checkpointer at a time) and takes the exclusive writer
+  lock only for the brief window of each fold, so appenders keep logging between folds.
+  Drive its `checkpoint()` on a loop or timer; each fold advances the committed generation,
+  so a read-only handle's `refresh()` (or a fresh open) sees the appended records shortly
+  after they are logged, with no writable open in the loop. A dead lease-holder's lease is
+  reclaimable, so a fresh checkpointer takes over after a crash. Exposed as the native
+  `CoreCheckpointer`, over the C ABI, in Python (`lodedb.Checkpointer`), and in Swift
+  (`LodeCheckpointer`).
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Swift / iOS

@@ -217,6 +217,25 @@ let text = try LodeAppender.open(at: url, storeText: true, indexText: true)
 _ = try text.append(text: "the deploy runbook for payments", id: "doc-3", embedder: embedder)
 ```
 
+So appended records become durable without an application re-opening a writer, a
+`LodeCheckpointer` folds the WAL into fresh committed generations continuously. One
+process holds a crash-reclaimable lease (distinct from the writer lock, so it neither
+excludes appenders nor the writer) and takes the exclusive writer lock only for the
+brief window of each fold, so appenders keep logging in between. Drive `checkpoint()`
+on a loop or timer; each fold advances the committed generation, so a read-only
+snapshot's `refresh()` sees the appends shortly after they are logged. It requires WAL
+commit mode, and its `storeText`/`indexText`/`chunkCharacterLimit` must match the
+store's writer just as an appender's do (a mismatch rewrites the store to the
+checkpointer's retention on fold):
+
+```swift
+let checkpointer = try LodeCheckpointer.open(at: url)
+while running {
+    let folded = try checkpointer.checkpoint()   // 0 when nothing new was appended
+    if folded == 0 { try await Task.sleep(for: .seconds(1)) }
+}
+```
+
 ## Out of scope
 
 The CLI, dev server, MCP server, model-download flow, framework adapters
