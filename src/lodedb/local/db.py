@@ -262,7 +262,17 @@ class LodeDB:
         ``embedding_runtime`` selects the embedding runtime: ``"auto"`` (default;
         prefer ONNX Runtime, fall back to PyTorch sentence-transformers when ONNX
         cannot be set up), ``"onnx"`` (force ONNX Runtime), or ``"torch"`` (force
-        sentence-transformers). ``embedding_resolution`` reports which was used.
+        sentence-transformers). ``embedding_resolution`` reports which was used,
+        including whether a CUDA request fell back to the CPU (the default
+        ``onnxruntime`` wheel is CPU-only; install ``onnxruntime-gpu`` for the GPU,
+        and see ``docs/deployment-and-performance.md``).
+        ``batch_size`` (default ``32``) is how many texts are embedded per forward
+        pass; a larger batch raises embedding throughput on a GPU (and, less so, on
+        the CPU) at some memory cost. ``search``/``search_many`` embed their query
+        set in one batch, so a large batched query benefits from a bigger
+        ``batch_size`` or a GPU. ``max_seq_length`` (default ``256`` tokens) is the
+        per-document token budget before truncation: raise it for long documents
+        whose tail carries meaning, lower it to embed faster.
         ``read_only=True`` opens a non-mutating snapshot handle that takes **no**
         writer lock, so it can read a path while another process holds the
         single-writer lock (e.g. query while ``lodedb serve`` runs); mutating
@@ -331,6 +341,14 @@ class LodeDB:
         passed value only seeds a freshly created store. Reads are unaffected (the
         reader detects compression on disk), so a store written either way always
         reads back, and an existing store created before this option keeps loading.
+        On reopen the persisted index identity is re-enforced: the embedding model,
+        dimension, provider, task, storage profile, and bit width must match what
+        the path was written with, and so must the effective ``store_text`` /
+        ``index_text`` flags. Reopening a path with a different ``model`` (or
+        ``embedder`` / ``vector_dim`` / ``bit_width``) raises rather than silently
+        rescoring, so changing any of these means a fresh path and a reindex, not an
+        in-place conversion (a vector-only path, for one, cannot be reopened as a
+        text-in preset index).
         ``_embedding_backend`` is an internal hook for tests/fixtures.
         """
 
@@ -719,6 +737,15 @@ class LodeDB:
         :class:`ValueError`. The serving index lives in memory, is maintained
         incrementally across mutations (a small change folds in only the changed
         chunks), and never changes the on-disk format.
+
+        A document longer than ``chunk_character_limit`` (the ``LodeDB(...)``
+        default is 900 characters) is split into chunks, and every mode scores
+        chunks, so one long document can appear in the results more than once: each
+        such hit carries the **same** ``id`` (the document id) with a different
+        per-chunk ``score``. For one row per document, dedupe by ``hit.id`` keeping
+        the first (best-scoring) occurrence. ``k`` counts chunk hits, so request a
+        larger ``k`` when long documents are expected. :meth:`get` / :meth:`get_texts`
+        return the reassembled full document text for an id regardless of chunking.
 
         ``filter`` narrows results by metadata and is pushed into the TurboVec
         allowlist by the engine, so ``k`` still returns the true top-``k`` of the
