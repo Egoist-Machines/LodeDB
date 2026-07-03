@@ -180,7 +180,7 @@ extern "C" __global__ void chunk_topk(
     if (rows_this <= 0) return;
 
     // Dynamic shared: [chunk scores: chunk_rows f32][reduce vals: nt f32][reduce idx: nt u32].
-    extern __shared__ unsigned char smem[];
+    extern __shared__ char smem[];
     float* schunk = (float*)smem;
     float* rval = schunk + chunk_rows;
     unsigned int* ridx = (unsigned int*)(rval + nt);
@@ -244,7 +244,7 @@ extern "C" __global__ void merge_topk(
     const int nt = blockDim.x;
     const int total = num_chunks * k;
 
-    extern __shared__ unsigned char smem[];
+    extern __shared__ char smem[];
     float* sval = (float*)smem;
     unsigned int* sidx = (unsigned int*)(sval + nt);
     const size_t base = (size_t)q * (size_t)total;
