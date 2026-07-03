@@ -92,8 +92,8 @@ Prebuilt wheels cover Linux, macOS (Apple Silicon and Intel), and Windows on Pyt
 bundle the TurboVec (Rust) core, so there's nothing to compile. Confirm the install with `lodedb
 doctor`.
 
-Bringing your own vectors or embedding model? The base install carries no embedding runtime —
-it's a dependency-light vector store (`open_vector_store` / `add_vectors` / `search_by_vector`,
+Bringing your own vectors or embedding model? The base install carries no embedding runtime. It's
+a dependency-light vector store (`open_vector_store` / `add_vectors` / `search_by_vector`,
 or pass your own `embedder=`):
 
 ```bash

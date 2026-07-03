@@ -7,33 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **GPU embedding fallback is no longer silent.** When the resolved device is CUDA but ONNX Runtime
-  exposes no `CUDAExecutionProvider` (the default `onnxruntime` wheel is CPU-only), LodeDB logs a
-  warning at index open that embedding will run on the CPU and to install `onnxruntime-gpu`, and
-  `lodedb doctor` flags the same mismatch on one line. `embedding_resolution` now reports the
-  effective device as `cpu` (and `fallback_used=True`) in this case, so the CLI `index`/`query`
-  output and `doctor` agree with what actually ran.
-- **`docs/deployment-and-performance.md`** deployment and performance reference: running on the GPU
-  (ONNX Runtime and PyTorch, with verification commands), the constructor performance knobs, the
-  model-alias table, dependency compatibility ranges, and operational gotchas (chunked-document
-  duplicate ids, reopen format identity, single-writer locking).
-- README "Two ways to use LodeDB" capability matrix and a "Gotchas" section, plus `batch_size` /
-  `max_seq_length` and reopen-identity documentation on the `LodeDB` constructor and a
-  chunked-document duplicate-id note on `search`.
-
-### Changed
-
-- **Heavy dependency majors are capped to the tested range.** The numeric and embedding
-  dependencies now carry upper bounds (`numpy>=2.0.0,<3`, `onnxruntime>=1.20.0,<2`,
-  `transformers>=4.40.0,<5`, `sentence-transformers>=3.0.0,<5`), so a future major release cannot
-  silently resolve into an install and change behavior or memory use. `sentence-transformers` is
-  held at `<5` because the 5.x line paired with `transformers` 5.x showed a large, silent embedding
-  memory regression in the field (roughly 67 GB versus 21 GB for the same workload on the 4.x
-  majors); see `docs/deployment-and-performance.md`.
-
-## [1.2.0] - 2026-06-30
+## [1.2.0] - 2026-07-02
 
 ### Changed
 
@@ -46,12 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without an embedding runtime now raises a clear install hint instead of a deep
   `ModuleNotFoundError` at encode time. Existing installs that relied on `pip install lodedb`
   embedding text out of the box should switch to `pip install lodedb[embeddings]`.
+- **Heavy dependency majors are capped to the tested range.** The numeric and embedding
+  dependencies now carry upper bounds (`numpy>=2.0.0,<3`, `onnxruntime>=1.20.0,<2`,
+  `transformers>=4.40.0,<5`, `sentence-transformers>=3.0.0,<5`), so a future major release cannot
+  silently resolve into an install and change behavior or memory use. `sentence-transformers` is
+  held at `<5` because the 5.x line paired with `transformers` 5.x showed a large, silent embedding
+  memory regression in the field (roughly 67 GB versus 21 GB for the same workload on the 4.x
+  majors); see `docs/deployment-and-performance.md`.
 
 ### Added
 
 - `lodedb[embeddings]` and `lodedb[torch]` extras for the built-in embedding runtimes, plus a
   `lodedb[all]` convenience extra (embeddings, torch, image, MCP, and the framework adapters).
   The `lodedb[image]` extra now pulls the PyTorch tier itself.
+- **GPU embedding fallback is no longer silent.** When the resolved device is CUDA but ONNX Runtime
+  exposes no `CUDAExecutionProvider` (the default `onnxruntime` wheel is CPU-only), LodeDB logs a
+  warning at index open that embedding will run on the CPU and to install `onnxruntime-gpu`, and
+  `lodedb doctor` flags the same mismatch on one line. `embedding_resolution` now reports the
+  effective device as `cpu` (and `fallback_used=True`) in this case, so the CLI `index`/`query`
+  output and `doctor` agree with what actually ran.
+- **`docs/deployment-and-performance.md`** deployment and performance reference: running on the GPU
+  (ONNX Runtime and PyTorch, with verification commands), the constructor performance knobs, the
+  model-alias table, dependency compatibility ranges, and operational gotchas (chunked-document
+  duplicate ids, reopen format identity, single-writer locking).
+- README "Two ways to use LodeDB" capability matrix (text-in vs vector-in), plus `batch_size` /
+  `max_seq_length` and reopen-identity documentation on the `LodeDB` constructor and a
+  chunked-document duplicate-id note on `search`.
 
 ## [1.1.0] - 2026-06-30
 
