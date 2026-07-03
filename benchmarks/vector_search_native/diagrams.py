@@ -59,15 +59,17 @@ def main() -> None:
     for label, summary, style in series_defs:
         if summary is None:
             continue
+        # Both lines are the default hits API (`search_many_by_vector`), so the
+        # GPU-vs-CPU gap is like-for-like. They coincide at batch 1, where nq is
+        # below the GPU batch threshold (4) and the query runs on the CPU. The
+        # arrays fast path is a separate series, reported in the README table.
         gpu_x, gpu_y = _series(summary, "gpu")
         cpu_x, cpu_y = _series(summary, "cpu")
-        ax.plot(
-            gpu_x, gpu_y, label=f"{label.upper()} GPU (native default)", linewidth=2, **style
-        )
+        ax.plot(gpu_x, gpu_y, label=f"{label.upper()} GPU", linewidth=2, **style)
         ax.plot(
             cpu_x,
             cpu_y,
-            label=f"{label.upper()} CPU (native, augmented)",
+            label=f"{label.upper()} CPU scan",
             linewidth=1.3,
             linestyle="--",
             alpha=0.7,
@@ -80,8 +82,8 @@ def main() -> None:
     ax.set_xlabel("query batch size")
     ax.set_ylabel("throughput (queries / sec)")
     ax.set_title(
-        f"Native vector search, end-to-end public API: GPU default vs augmented CPU\n"
-        f"(d={dim}, {bit_width}-bit, n={n:,}, k={top_k})"
+        f"Native vector search throughput: GPU vs CPU scan\n"
+        f"(default hits API, end-to-end, d={dim}, {bit_width}-bit, n={n:,}, k={top_k})"
     )
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
