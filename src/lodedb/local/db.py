@@ -726,19 +726,23 @@ class LodeDB:
         *,
         k: int = 10,
         filter: Mapping[str, Any] | None = None,
-        mode: str = "vector",
+        mode: str | None = None,
     ) -> list[LodeSearchHit]:
         """Returns the top-``k`` hits as ``(score, id, metadata)``-style rows.
 
-        ``mode`` selects the retrieval strategy and defaults to ``"vector"``
-        (pure vector search, behavior unchanged):
+        ``mode`` selects the retrieval strategy. Left unset (the default) it
+        resolves to ``"hybrid"`` when a lexical source is available
+        (``store_text=True`` or ``index_text=True``, both on by default) and to
+        ``"vector"`` otherwise, so the recommended fused ranking is the default
+        wherever it can run while a vector-only store still searches without
+        raising. Pass an explicit mode to override:
 
         - ``"vector"`` — embedding cosine similarity only.
         - ``"hybrid"`` — runs a lexical BM25 ranker alongside the vector scan and
           fuses the two ranked lists with Reciprocal Rank Fusion, so exact tokens
           that the embedding misses (error codes like ``E1234``, serials like
           ``ABC-123``, dates like ``2024-01-15``) are surfaced when they appear in
-          the document body. Recommended for local RAG, where a missed exact match
+          the document body. The default for local RAG, where a missed exact match
           is the difference between a usable and a useless answer.
         - ``"lexical"`` — the BM25 ranking alone (no vector scan).
 
@@ -746,8 +750,10 @@ class LodeDB:
         lexical source, so they require opening LodeDB with either
         ``index_text=True`` (a durable postings store that survives reopens
         without raw text) or ``store_text=True`` (the index rebuilt from the
-        retained raw text, the default); requesting them with neither raises
-        :class:`ValueError`. The serving index lives in memory, is maintained
+        retained raw text, the default); requesting either *explicitly* with
+        neither source raises :class:`ValueError`, whereas the unset default
+        falls back to ``"vector"`` instead of raising. The serving index lives in
+        memory, is maintained
         incrementally across mutations (a small change folds in only the changed
         chunks), and never changes the on-disk format.
 
@@ -804,7 +810,7 @@ class LodeDB:
         *,
         k: int = 10,
         filter: Mapping[str, Any] | None = None,
-        mode: str = "vector",
+        mode: str | None = None,
     ) -> list[list[LodeSearchHit]]:
         """Returns top-``k`` hits for each query, preserving query order.
 
@@ -815,10 +821,10 @@ class LodeDB:
         the same exact-match-or-predicate grammar as :meth:`search` and is applied
         identically to every query in the batch.
 
-        ``mode`` matches :meth:`search` (``"vector"`` default, ``"hybrid"``,
-        ``"lexical"``) and applies to every query in the batch;
-        ``search_many(mode="hybrid")`` returns the same result as the
-        corresponding repeated single :meth:`search` call. ``"hybrid"`` and
+        ``mode`` matches :meth:`search` (unset resolves to ``"hybrid"`` when a
+        lexical source is available, else ``"vector"``) and applies to every
+        query in the batch; ``search_many(mode="hybrid")`` returns the same result
+        as the corresponding repeated single :meth:`search` call. ``"hybrid"`` and
         ``"lexical"`` require a lexical source (``index_text=True`` or
         ``store_text=True``). A batch of hybrid queries batches its vector half on
         the shared scan (the GPU serves it where available) and fuses each query's
@@ -1983,16 +1989,24 @@ class LodeDB:
                 "this LodeDB handle is read-only; open without read_only=True to modify it"
             )
 
-    def _resolve_mode(self, mode: str) -> str:
+    def _resolve_mode(self, mode: str | None) -> str:
         """Validates a search mode and enforces the lexical-source requirement.
 
+        ``None`` (the search default) resolves to ``"hybrid"`` when a lexical
+        source is available (``index_text=True`` or ``store_text=True``) and to
+        ``"vector"`` otherwise, so the fused ranking is the default wherever it
+        can run and a vector-only store never raises on an unset mode.
+
         Returns the canonical lowercase mode. Raises :class:`ValueError` for an
-        unknown mode, or when a lexical/hybrid mode is requested on a handle that
-        has no lexical source — neither ``index_text=True`` (a persisted BM25
-        postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
-        retained raw text), so there is nothing to build the index from.
+        unknown mode, or when a lexical/hybrid mode is requested *explicitly* on a
+        handle that has no lexical source — neither ``index_text=True`` (a
+        persisted BM25 postings store) nor ``store_text=True`` (the BM25 index
+        rebuilt from the retained raw text), so there is nothing to build the
+        index from.
         """
 
+        if mode is None:
+            return "hybrid" if (self.index_text or self.store_text) else "vector"
         if not isinstance(mode, str):
             raise ValueError("mode must be a string")
         value = mode.strip().lower() or "vector"

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Hybrid search is now the default.** `LodeDB.search` / `search_many` (and the graph
+  `semantic_nodes` / `semantic_edges` / `search_subgraph`) default to `mode="hybrid"` when a
+  lexical source is available (`store_text=True` or `index_text=True`, both on by default) and
+  fall back to `mode="vector"` when neither is present, so the fused BM25 + vector ranking that
+  recovers exact tokens (error codes, serials, dates) is the default without ever raising on a
+  vector-only store. A default query on a text-retaining store now returns Reciprocal Rank Fusion
+  scores rather than raw cosine similarities; pass `mode="vector"` for the previous pure-vector
+  behavior. Explicitly requesting `mode="hybrid"`/`"lexical"` with no lexical source still raises
+  the same actionable error. The `lodedb` MCP server already defaulted to hybrid, so its behavior
+  is unchanged.
+
 ## [1.2.0] - 2026-07-02
 
 ### Changed

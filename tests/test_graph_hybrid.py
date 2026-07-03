@@ -67,7 +67,7 @@ def test_semantic_nodes_hybrid_surfaces_exact_label_token(tmp_path, open_kwargs)
     kg = _kg(tmp_path, **open_kwargs)
     carrier = _seed_carrier_and_distractors(kg)
 
-    vector_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3)]
+    vector_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3, mode="vector")]
     hybrid_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3, mode="hybrid")]
     lexical_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3, mode="lexical")]
 
@@ -117,13 +117,13 @@ def test_graph_embedding_with_nonvector_mode_raises(tmp_path):
     kg.close()
 
 
-def test_graph_default_mode_is_vector(tmp_path):
-    """Omitting mode equals mode='vector': the default graph behavior is unchanged."""
+def test_graph_default_mode_is_hybrid(tmp_path):
+    """Omitting mode equals mode='hybrid': the exact code recovers the carrier."""
 
-    kg = _kg(tmp_path)
+    kg = _kg(tmp_path)  # store_text=True, so a lexical source exists
     carrier = _seed_carrier_and_distractors(kg)
     default_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3)]
-    vector_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3, mode="vector")]
-    assert default_ids == vector_ids
-    assert carrier not in default_ids
+    hybrid_ids = [node.id for _score, node in kg.semantic_nodes("E1234", k=3, mode="hybrid")]
+    assert default_ids == hybrid_ids
+    assert carrier in default_ids  # hybrid recovers the label token a vector scan misses
     kg.close()
