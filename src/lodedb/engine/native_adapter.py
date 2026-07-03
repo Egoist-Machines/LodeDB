@@ -616,14 +616,17 @@ class NativeCoreEngineHandle:
         *,
         top_k: int,
         filter: Mapping[str, Any] | None = None,
+        want_metadata: bool = True,
     ) -> tuple[Any, list[str], list[dict[str, Any]], int] | None:
         """Near-zero-copy batch query.
 
         Returns ``(scores, document_ids, metadata, k)`` as flat ``[nq * k]`` buffers
         (scores a numpy array, ids a string list, metadata a dict list) when the
         native array-out path is available, else ``None`` so the caller uses the
-        JSON path. The query matrix is built once via numpy rather than a Python
-        tuple-of-tuples, and only metadata crosses as JSON.
+        JSON path. A contiguous ``float32`` ``(nq, dim)`` matrix passes straight
+        through with no copy. When ``want_metadata`` is false, the native core skips
+        serializing per-hit metadata and this returns an empty metadata list, for
+        callers that only need scores and ids.
         """
 
         array_out = getattr(self._engine, "query_vectors_batch_array_out", None)
@@ -636,9 +639,9 @@ class NativeCoreEngineHandle:
             return None
         filter_json = None if filter is None else _dumps(dict(filter))
         scores, document_ids, metadata_json, k = array_out(
-            str(index_id), matrix, int(top_k), filter_json
+            str(index_id), matrix, int(top_k), filter_json, bool(want_metadata)
         )
-        metadata = json.loads(metadata_json) if metadata_json else []
+        metadata = json.loads(metadata_json) if (want_metadata and metadata_json) else []
         return scores, list(document_ids), list(metadata), int(k)
 
     def prepare_text_upsert(

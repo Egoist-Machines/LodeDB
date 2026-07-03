@@ -961,6 +961,7 @@ impl PyCoreEngine {
         query_vectors: PyReadonlyArray2<f32>,
         top_k: usize,
         filter_json: Option<&str>,
+        want_metadata: bool,
     ) -> PyResult<(Bound<'py, PyArray1<f32>>, Vec<String>, String, usize)> {
         let arr = query_vectors.as_array();
         let dim = arr.ncols();
@@ -974,12 +975,33 @@ impl PyCoreEngine {
         }
         validate_queries(slice, dim)?;
         let filter = native_optional_value(filter_json)?;
-        let arrays = self
-            .inner
-            .query_vectors_batch_arrays(index_id, slice, dim, top_k, filter.as_ref())
+        // Copy the queries out of the numpy buffer (its borrow is GIL-bound) and own
+        // the index id, so the scan can run with the GIL released: one memcpy of the
+        // batch, after which other Python threads make progress while it scans.
+        let queries: Vec<f32> = slice.to_vec();
+        let index_id = index_id.to_owned();
+        // Pass the engine as an integer address so the closure is `Ungil` without a
+        // custom impl (a raw-pointer wrapper trips coherence's conservative future-
+        // `Send` reasoning); `usize` is `Ungil` via pyo3's blanket impl.
+        let engine_addr = &self.inner as *const RustCoreEngine as usize;
+        let arrays = py
+            .detach(move || {
+                // SAFETY: `self` outlives this synchronous `detach` call and the
+                // closure runs on the current (engine-owning) thread, so the address
+                // is valid and the engine is never shared across threads; the scan is
+                // pure native and touches no Python state while the GIL is released.
+                let inner: &RustCoreEngine = unsafe { &*(engine_addr as *const RustCoreEngine) };
+                inner.query_vectors_batch_arrays(&index_id, &queries, dim, top_k, filter.as_ref())
+            })
             .map_err(native_core_error_to_py)?;
-        let metadata_json = serde_json::to_string(&arrays.metadata)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Metadata is the only part that crosses as JSON; skip serializing it when
+        // the caller only needs scores and ids.
+        let metadata_json = if want_metadata {
+            serde_json::to_string(&arrays.metadata)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+        } else {
+            String::new()
+        };
         let scores = arrays.scores.into_pyarray(py);
         Ok((scores, arrays.document_ids, metadata_json, arrays.k))
     }
