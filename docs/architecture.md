@@ -298,3 +298,14 @@ Each record carries a precomputed vector plus metadata, and (only when the appen
 `store_text`, off by default) a caption. So the appender honors the same `store_text` payload
 boundary as the single-writer paths above: it writes raw text to `<key>.wal` only when text
 retention is on, never otherwise.
+
+The appender also ingests full text, so text writes are multi-producer too. Because the core cannot
+embed (embeddings live in the binding layer), the appender takes the *post-embedding* shape: it
+chunks the documents (`prepare_documents`, using the store writer's `chunk_character_limit` so chunk
+ids match), the binding embeds the returned chunks, and `append_embedded_documents` logs one
+`apply_embedded_documents` record. This path is replay-independent -- it captures no base generation
+and is never `PlanStale` like the single-writer `prepare_text_upsert`/`apply_text_upsert` -- because
+the folding writer resolves a replacement's retired chunks from its own index state (so the appended
+record carries an empty removed-chunk list) and normalizes each record's text/tokens to its own
+`store_text`/`index_text` on fold. It is `append_text`/`append_text_many` in Python (`lodedb.Appender`,
+given an `embedder=`) and `append(text:...)` in Swift (`LodeAppender`, given a `LodeEmbedder`).

@@ -568,11 +568,14 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   and become queryable after the next writable open folds them in, or immediately in a read-only
   handle that calls `refresh()` to overlay the WAL tail (whose `applied_lsn()` then gives
   read-your-writes against an append's returned LSN). On Windows the shared lock degrades to an
-  exclusive hold, so appenders serialize there rather than coexisting. Each record is a precomputed
-  vector plus metadata, and an optional caption (e.g. for an image) retained only when the appender
-  opts into `store_text` (off by default, so no raw text reaches the WAL); it requires WAL commit
-  mode. Exposed as the native `CoreAppender`, over the C ABI, in Python (`lodedb.Appender`), and in
-  Swift (`LodeAppender`).
+  exclusive hold, so appenders serialize there rather than coexisting. A record is a precomputed
+  vector plus metadata (with an optional caption, e.g. for an image, retained only when the appender
+  opts into `store_text` -- off by default, so no raw text reaches the WAL); with an embedder
+  configured, the appender also ingests full text (chunked by the core, embedded in the binding
+  layer, then logged as a post-embedding record) so text writes are multi-producer too, without a
+  captured base generation. It requires WAL commit mode. Exposed as the native `CoreAppender`, over
+  the C ABI, in Python (`lodedb.Appender`: `append`/`append_many` for vectors,
+  `append_text`/`append_text_many` for text), and in Swift (`LodeAppender`).
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Swift / iOS

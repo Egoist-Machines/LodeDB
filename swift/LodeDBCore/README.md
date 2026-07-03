@@ -195,9 +195,12 @@ writer's), folded into the index by the next *writable* `LodeDB` open. A read-on
 snapshot (`openReadOnly`) reflects the last committed generation; call `refresh()`
 to overlay the WAL tail (so appended records become queryable without a writer)
 and `appliedLSN()` for read-your-writes against an append's returned LSN. It requires WAL commit
-mode. Each record is a precomputed vector plus metadata, and an optional caption
+mode. A record is a precomputed vector plus metadata, with an optional caption
 (e.g. an image's) retained only when opened with `storeText: true` (off by default,
-so no raw text reaches the WAL):
+so no raw text reaches the WAL). Given a `LodeEmbedder`, `append(text:...)` also ingests
+full text -- chunked by the core and embedded on device, then logged as a post-embedding
+record -- so text writes are multi-producer too (`chunkCharacterLimit` must match the store
+writer's, and retention follows `storeText`/`indexText`):
 
 ```swift
 let appender = try LodeAppender.open(at: url)  // storeText defaults off
@@ -208,6 +211,10 @@ _ = try appender.delete(ids: ["doc-1"])
 // Retain a caption (only for a store whose writer also uses store_text):
 let captioned = try LodeAppender.open(at: url, storeText: true)
 _ = try captioned.append(id: "img-1", vector: clipVector, text: "a red bicycle")
+
+// Full text ingest: chunk + embed + append (match the writer's retention/chunking).
+let text = try LodeAppender.open(at: url, storeText: true, indexText: true)
+_ = try text.append(text: "the deploy runbook for payments", id: "doc-3", embedder: embedder)
 ```
 
 ## Out of scope
