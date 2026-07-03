@@ -28,6 +28,7 @@ by the other.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import platform
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from lodedb.engine.embedding_backends import (
 )
 from lodedb.local.onnx_artifacts import OnnxMaterializationError, materialize_onnx_model
 from lodedb.local.presets import LocalModelPreset
+
+logger = logging.getLogger("lodedb.local")
 
 
 @dataclass(frozen=True)
@@ -234,7 +237,7 @@ def _resolve_onnx_providers(device: str) -> tuple[str, ...]:
 def _onnx_backend(
     preset: LocalModelPreset,
     *,
-    device: str,
+    providers: tuple[str, ...],
     batch_size: int,
     max_seq_length: int,
 ) -> ONNXRuntimeEmbeddingBackend:
@@ -249,7 +252,7 @@ def _onnx_backend(
         native_dim=preset.native_dim,
         onnx_model_path=artifact.model_path,
         tokenizer_name_or_path=str(artifact.tokenizer_dir),
-        providers=_resolve_onnx_providers(device),
+        providers=providers,
         batch_size=batch_size,
         max_seq_length=max_seq_length,
         query_prefix=preset.query_prefix,
@@ -313,16 +316,46 @@ def build_local_embedding_backend(
         if runtime == "onnx" and not onnxruntime_available():
             raise _missing_embedding_runtime_error(runtime="onnx", onnx_installed=False)
         if runtime == "onnx" or onnxruntime_available():
+            providers = _resolve_onnx_providers(resolved)
+            # A CUDA device with no CUDAExecutionProvider means the CPU-only onnxruntime wheel is
+            # installed: embedding runs on the CPU (typically 10-50x slower) with no error.
+            cuda_fell_back_to_cpu = resolved == "cuda" and "CUDAExecutionProvider" not in providers
             try:
                 backend = _onnx_backend(
-                    preset, device=resolved, batch_size=batch_size, max_seq_length=max_seq_length
+                    preset,
+                    providers=providers,
+                    batch_size=batch_size,
+                    max_seq_length=max_seq_length,
                 )
+                # Log/warn only now that ONNX is the committed runtime: in "auto" the build above
+                # can still raise and fall back to torch (which may reach the GPU), so warning early
+                # would misreport the device. Surfacing the CPU fallback is the single highest-value
+                # fix reported from real GPU deployments that silently embedded on the CPU: a log
+                # line reaches the operator where docs do not.
+                logger.info(
+                    "embedding runtime=onnx device=%s (requested %s) providers=%s",
+                    resolved,
+                    device,
+                    ",".join(providers),
+                )
+                if cuda_fell_back_to_cpu:
+                    logger.warning(
+                        "LodeDB is embedding on the CPU: the device resolved to CUDA but ONNX "
+                        "Runtime has no CUDAExecutionProvider (the default onnxruntime wheel is "
+                        "CPU-only, typically 10-50x slower). Install onnxruntime-gpu to use the "
+                        "NVIDIA GPU (`lodedb doctor` then lists CUDAExecutionProvider)."
+                    )
                 return backend, LocalEmbeddingResolution(
                     requested_device=device,
                     backend_name=backend.name,
-                    effective_device=resolved,
-                    fallback_used=False,
-                    fallback_reason="",
+                    effective_device="cpu" if cuda_fell_back_to_cpu else resolved,
+                    fallback_used=cuda_fell_back_to_cpu,
+                    fallback_reason=(
+                        "cuda requested but onnxruntime has no CUDAExecutionProvider; embedding on "
+                        "cpu (install onnxruntime-gpu)"
+                        if cuda_fell_back_to_cpu
+                        else ""
+                    ),
                 )
             except (OnnxMaterializationError, RuntimeError, ImportError) as exc:
                 if runtime == "onnx":

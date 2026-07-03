@@ -59,6 +59,8 @@ incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
   (counts, bytes, latency), never raw payloads.
 - **Local embeddings**: ONNX Runtime by default (lower per-query latency), with a PyTorch
   `sentence-transformers` fallback; runs on CPU, CUDA, or MPS. Pick with `embedding_runtime=`.
+  On an NVIDIA GPU install `onnxruntime-gpu` (the default wheel is CPU-only); LodeDB warns if
+  embedding silently falls back to the CPU. [Running on the GPU](docs/deployment-and-performance.md#running-embedding-on-the-gpu).
 - **Multimodal**: index images and text in one shared CLIP space (`model="clip"`) for
   cross-modal search, or bring your own vectors from any model.
   [How it works](#multimodal--bring-your-own-vectors).
@@ -210,6 +212,31 @@ you call `refresh()`, which folds in whatever another process (or an `Appender`)
 has written since, without taking a lock or checkpointing. For read-your-writes,
 compare `applied_lsn()` to the LSN an append returned: the record is visible once
 `applied_lsn() >= that_lsn`.
+
+## Two ways to use LodeDB
+
+Pick the mode by who owns the embeddings. The Quickstart above uses the recommended default; the
+other is for when you already compute vectors yourself.
+
+- **Text-in (recommended for RAG).** `LodeDB(path, model="minilm")` owns the embedder: you `add`
+  and `search` **text**, and LodeDB embeds it, retains it, and can run hybrid BM25 + vector search.
+  This is what most applications want.
+- **Vector-in (bring your own vectors).** `LodeDB.open_vector_store(path, vector_dim=...)` has no
+  embedder: you `add_vectors` and `search_by_vector` with vectors computed elsewhere (any model or
+  hosted API). Use it when you own the embedding step or need a model LodeDB does not bundle.
+
+| | Text-in (`model=`) | Vector-in (`open_vector_store`) |
+| --- | --- | --- |
+| Add | `add` / `add_many` (text) | `add_vectors` / `add_vectors_many` (vectors) |
+| Search | `search` / `search_many` (text) | `search_by_vector` / `search_many_by_vector` |
+| Hybrid / lexical BM25 | yes (`mode="hybrid"`) | no (no text to rank) |
+| Raw-text retrieval (`get`) | yes (`store_text=True`, default) | no (metadata still returned) |
+| Embedding runtime | bundled (ONNX / PyTorch) | none (you bring vectors) |
+| Calling text verbs on it | works | raises `VectorOnlyIndexError` |
+
+For per-tenant isolation, open one text-in `LodeDB` per tenant at its own path (optionally sharing a
+single loaded model with `embedder=`). GPU setup, the performance knobs, the model-alias table, and
+operational gotchas live in [Deployment and performance](docs/deployment-and-performance.md).
 
 ## Hybrid search
 

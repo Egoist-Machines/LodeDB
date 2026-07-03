@@ -186,6 +186,25 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
     cpu_flags = detect_cpu_flags()
     capability = turbovec_capability()
 
+    runtime_status = _embedding_runtime_status()
+    # The silent-CPU-fallback footgun: the device resolves to CUDA but the installed onnxruntime
+    # wheel is CPU-only, so text embedding runs on the CPU. Key on the *resolved* device, which
+    # covers both device="auto" picking CUDA and an explicit --device cuda (the setup the docs
+    # recommend when torch is absent and auto cannot see the GPU), and does not fire for a
+    # deliberate --device cpu on a CUDA host. Flag it rather than leaving the operator to compare
+    # the CUDA and providers lines by eye.
+    cpu_fallback_warning = ""
+    if (
+        effective_device == "cuda"
+        and runtime_status["onnxruntime_available"]
+        and "CUDAExecutionProvider" not in runtime_status["onnx_providers"]
+    ):
+        cpu_fallback_warning = (
+            "the device resolves to CUDA but ONNX Runtime has no CUDAExecutionProvider: text "
+            "embedding runs on the CPU. Install onnxruntime-gpu (pip install onnxruntime-gpu) to "
+            "use the GPU."
+        )
+
     return {
         "platform": {
             "apple_silicon": apple_silicon,
@@ -195,7 +214,8 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
             "auto_resolves_to": effective_device,
             "mps_available": mps,
             "cuda_available": cuda,
-            "runtime": _embedding_runtime_status(),
+            "runtime": runtime_status,
+            "cpu_fallback_warning": cpu_fallback_warning,
         },
         "image_embedding": _image_embedding_status(),
         "compact_backend": {
@@ -230,6 +250,7 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  onnxruntime available  : {emb['runtime']['onnxruntime_available']}",
         f"  sentence-transformers  : {emb['runtime']['sentence_transformers_available']}",
         f"  onnx providers         : {', '.join(emb['runtime']['onnx_providers']) or 'none'}",
+        *([f"  ! {emb['cpu_fallback_warning']}"] if emb.get("cpu_fallback_warning") else []),
         "",
         "Image + text embedding (CLIP, optional [image] extra)",
         f"  available              : {img['image_embedding_available']}",
