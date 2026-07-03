@@ -47,6 +47,23 @@ const TOPK_BLOCK: u32 = 256;
 /// Threads per block for the scatter (in-place patch) kernel.
 const SCATTER_BLOCK: u32 = 256;
 
+/// Rows per chunk in the opt-in fused two-stage top-k (`LODEDB_GPU_FUSED_TOPK`).
+///
+/// Each stage-1 block stages this many scores into shared memory once, so this
+/// bounds the stage-1 shared footprint (`chunk_rows` f32 + `TOPK_BLOCK` reduction
+/// slots) and, with `k`, the stage-2 partial count (`num_chunks * k`). Chosen well
+/// under the 48 KB default dynamic-shared limit; it is a correctness-neutral tuning
+/// knob, so Modal (A10/L40S) is the place to sweep it.
+const FUSED_CHUNK_ROWS: usize = 2048;
+
+/// Largest batch the fused path serves. Its stage-1 grid maps `nq` onto
+/// `gridDim.y`, which every CUDA device caps at 65,535; a larger batch falls back
+/// to the default `topk_argmax` path (which maps the batch onto the ~2^31 `gridDim.x`)
+/// rather than failing the launch. `num_chunks` rides `gridDim.x`, so corpus size is
+/// unaffected. Batches this large never reach the GPU in practice, but the fallback
+/// keeps the opt-in flag from ever regressing a shape the default path handles.
+const FUSED_MAX_NQ: usize = 65_535;
+
 /// The CUDA kernels compiled into the session's module.
 ///
 /// `topk_argmax` is the exact per-query top-k over a dense `batch x corpus` score
@@ -122,6 +139,153 @@ extern "C" __global__ void scatter_rows(
     size_t d = tid % (size_t)dim;
     dst[(size_t)slots[i] * (size_t)dim + d] = baked[i * (size_t)dim + d];
 }
+
+#define UINT_INVALID (0xffffffffu)
+
+// Strict "is candidate (va,ia) better than (vb,ib)": higher score wins, ties break
+// to the lower slot, and an INVALID slot is always worst. This is the exact
+// (score desc, slot asc) total order topk_argmax realizes, so the two-stage fused
+// path below selects the identical top-k from the identical cuBLAS scores.
+__device__ __forceinline__ int fused_gt(float va, unsigned int ia, float vb, unsigned int ib) {
+    if (ia == UINT_INVALID) return 0;
+    if (ib == UINT_INVALID) return 1;
+    if (va > vb) return 1;
+    if (va < vb) return 0;
+    return ia < ib;
+}
+
+// Stage 1 of the opt-in fused top-k. Each block reads ONE query's slice of ONE
+// row-chunk of the cuBLAS score matrix into shared memory exactly once, then picks
+// that chunk's top-k by (score desc, slot asc) with an on-chip k-pass argmax (no
+// global re-read), emitting k (slot, score) partials for the (query, chunk). The
+// default topk_argmax rescans the whole n-score row from global memory k times;
+// reading each score once instead is the HBM win, and because the scores are the
+// cuBLAS output untouched, the selected top-k is bit-identical to the default path.
+extern "C" __global__ void chunk_topk(
+    const float* scores,          // nq * n, row-major cuBLAS output: scores[q*n + row]
+    const int n,
+    const int k,
+    const int chunk_rows,
+    const int num_chunks,
+    unsigned int* part_idx,       // nq * num_chunks * k
+    float* part_val)
+{
+    const int chunk = blockIdx.x;
+    const int q = blockIdx.y;
+    const int t = threadIdx.x;
+    const int nt = blockDim.x;
+    const long row0 = (long)chunk * (long)chunk_rows;
+    int rows_this = (int)((long)n - row0);
+    if (rows_this > chunk_rows) rows_this = chunk_rows;
+    if (rows_this <= 0) return;
+
+    // Dynamic shared: [chunk scores: chunk_rows f32][reduce vals: nt f32][reduce idx: nt u32].
+    extern __shared__ unsigned char smem[];
+    float* schunk = (float*)smem;
+    float* rval = schunk + chunk_rows;
+    unsigned int* ridx = (unsigned int*)(rval + nt);
+
+    // Stage the chunk's scores into shared memory: the single read of scores_dev.
+    const float* srow = scores + (size_t)q * (size_t)n + (size_t)row0;
+    for (int r = t; r < rows_this; r += nt) {
+        schunk[r] = srow[r];
+    }
+    __syncthreads();
+
+    for (int pass = 0; pass < k; ++pass) {
+        float best = NEG_SENTINEL;
+        unsigned int bi = UINT_INVALID;
+        for (int r = t; r < rows_this; r += nt) {
+            float v = schunk[r];
+            if (v == NEG_SENTINEL) continue;   // an already-selected (masked) row
+            unsigned int slot = (unsigned int)(row0 + r);
+            if (fused_gt(v, slot, best, bi)) { best = v; bi = slot; }
+        }
+        rval[t] = best;
+        ridx[t] = bi;
+        __syncthreads();
+        for (int s = nt >> 1; s > 0; s >>= 1) {
+            if (t < s) {
+                if (fused_gt(rval[t + s], ridx[t + s], rval[t], ridx[t])) {
+                    rval[t] = rval[t + s];
+                    ridx[t] = ridx[t + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (t == 0) {
+            unsigned int win = ridx[0];
+            size_t out = ((size_t)q * (size_t)num_chunks + (size_t)chunk) * (size_t)k + (size_t)pass;
+            part_idx[out] = win;
+            part_val[out] = (win == UINT_INVALID) ? NEG_SENTINEL : rval[0];
+            if (win != UINT_INVALID) {
+                schunk[(long)win - row0] = NEG_SENTINEL;   // mask for the next pass
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Stage 2 of the opt-in fused top-k. One block per query merges that query's
+// num_chunks * k partials into the final top-k under the same (score desc, slot
+// asc) order. The partials are a union of per-chunk top-ks, which provably contains
+// the global top-k, so the merge equals topk_argmax exactly. Slots are globally
+// unique, so masking the selected slot each pass excludes exactly one partial.
+extern "C" __global__ void merge_topk(
+    unsigned int* part_idx,       // nq * num_chunks * k, consumed/masked in place
+    float* part_val,
+    const int k,
+    const int num_chunks,
+    unsigned int* out_idx,        // nq * k
+    float* out_val)
+{
+    const int q = blockIdx.x;
+    const int t = threadIdx.x;
+    const int nt = blockDim.x;
+    const int total = num_chunks * k;
+
+    extern __shared__ unsigned char smem[];
+    float* sval = (float*)smem;
+    unsigned int* sidx = (unsigned int*)(sval + nt);
+    const size_t base = (size_t)q * (size_t)total;
+
+    for (int pass = 0; pass < k; ++pass) {
+        float best = NEG_SENTINEL;
+        unsigned int bi = UINT_INVALID;
+        for (int i = t; i < total; i += nt) {
+            float v = part_val[base + (size_t)i];
+            unsigned int idx = part_idx[base + (size_t)i];
+            if (fused_gt(v, idx, best, bi)) { best = v; bi = idx; }
+        }
+        sval[t] = best;
+        sidx[t] = bi;
+        __syncthreads();
+        for (int s = nt >> 1; s > 0; s >>= 1) {
+            if (t < s) {
+                if (fused_gt(sval[t + s], sidx[t + s], sval[t], sidx[t])) {
+                    sval[t] = sval[t + s];
+                    sidx[t] = sidx[t + s];
+                }
+            }
+            __syncthreads();
+        }
+        unsigned int win = sidx[0];
+        if (t == 0) {
+            out_idx[(size_t)q * (size_t)k + (size_t)pass] = (win == UINT_INVALID) ? 0u : win;
+            out_val[(size_t)q * (size_t)k + (size_t)pass] = sval[0];
+        }
+        __syncthreads();
+        if (win != UINT_INVALID) {
+            for (int i = t; i < total; i += nt) {
+                if (part_idx[base + (size_t)i] == win) {
+                    part_idx[base + (size_t)i] = UINT_INVALID;
+                    part_val[base + (size_t)i] = NEG_SENTINEL;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
 "#;
 
 /// Why the GPU scan could not run; every variant is a signal to fall back to the
@@ -158,6 +322,25 @@ fn debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("LODEDB_GPU_DEBUG").is_some())
 }
 
+/// Whether the opt-in fused two-stage top-k is enabled (`LODEDB_GPU_FUSED_TOPK`).
+///
+/// Off by default: the proven cuBLAS GEMM + `topk_argmax` path stays the default
+/// until the fused path is validated on real hardware (A10/L40S), since it cannot
+/// be compiled or profiled on a CPU-only host. Enabled for any value other than the
+/// usual falsey set. It only changes how the top-k is selected from the identical
+/// cuBLAS scores, so results are unchanged; the flag exists to de-risk an
+/// unprofiled kernel, not to alter output.
+fn fused_topk_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("LODEDB_GPU_FUSED_TOPK") {
+        Ok(value) => {
+            let v = value.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "off" || v == "false" || v == "no")
+        }
+        Err(_) => false,
+    })
+}
+
 /// Returns whether a CUDA driver library can be opened at all.
 ///
 /// Cached after the first probe. cudarc panics (rather than returning an error) if
@@ -184,6 +367,10 @@ struct GpuScratch {
     scores_dev: CudaSlice<f32>, // nq * n, GEMM output (beta=0 overwrites, no zeroing needed)
     idx_dev: CudaSlice<u32>,    // nq * k, top-k slots
     val_dev: CudaSlice<f32>,    // nq * k, top-k scores
+    // nq * num_chunks * k stage-1 partials, allocated the first time the opt-in
+    // fused top-k runs for this shape; None while only the default path is used.
+    part_idx: Option<CudaSlice<u32>>,
+    part_val: Option<CudaSlice<f32>>,
 }
 
 /// A generation's reconstructed rows resident on the GPU, plus the host-side
@@ -196,6 +383,9 @@ pub struct GpuScanSession {
     func: CudaFunction,
     // Scatters baked rows into `rows_dev` at given slots for an in-place patch.
     scatter_func: CudaFunction,
+    // Opt-in fused two-stage top-k over the cuBLAS score matrix (chunk then merge).
+    chunk_topk_func: CudaFunction,
+    merge_topk_func: CudaFunction,
     // Resident rows pre-multiplied by the rotation (rows @ rotation), so queries
     // are scored raw (no per-query rotation). See `build_inner`.
     rows_dev: CudaSlice<f32>,
@@ -329,6 +519,12 @@ impl GpuScanSession {
         let scatter_func = module
             .load_function("scatter_rows")
             .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let chunk_topk_func = module
+            .load_function("chunk_topk")
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let merge_topk_func = module
+            .load_function("merge_topk")
+            .map_err(|err| GpuScanError::Device(err.to_string()))?;
         // Reverse map for O(1) slot resolution during a patch. Slot order is the
         // index's slot order, which is unique by construction; guard anyway.
         let mut slot_by_id = HashMap::with_capacity(n);
@@ -348,6 +544,8 @@ impl GpuScanSession {
             _module: module,
             func,
             scatter_func,
+            chunk_topk_func,
+            merge_topk_func,
             rows_dev,
             stable_ids: stable_ids.to_vec(),
             slot_by_id,
@@ -530,11 +728,25 @@ impl GpuScanSession {
         nq: usize,
         k: usize,
     ) -> Result<(Vec<f32>, Vec<u64>), GpuScanError> {
+        self.search_variant(queries, nq, k, fused_topk_enabled())
+    }
+
+    /// [`Self::search`] with the top-k backend chosen explicitly rather than from
+    /// the env flag. Both backends read the same cuBLAS scores and select the same
+    /// (score desc, slot asc) top-k, so they return identical results; the parameter
+    /// exists so a parity test can exercise both on one built session.
+    fn search_variant(
+        &self,
+        queries: &[f32],
+        nq: usize,
+        k: usize,
+        fused: bool,
+    ) -> Result<(Vec<f32>, Vec<u64>), GpuScanError> {
         // Defense in depth: a built session has already loaded its CUDA libraries,
         // so a panic here is not expected, but the scan must never crash the host
         // process; a panic falls back to the CPU kernel like any device error.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.search_inner(queries, nq, k)
+            self.search_inner(queries, nq, k, fused)
         })) {
             Ok(result) => result,
             Err(_) => Err(GpuScanError::Device("CUDA scan panicked; using CPU kernel".into())),
@@ -546,6 +758,7 @@ impl GpuScanSession {
         queries: &[f32],
         nq: usize,
         k: usize,
+        fused: bool,
     ) -> Result<(Vec<f32>, Vec<u64>), GpuScanError> {
         if nq == 0 || k == 0 {
             return Err(GpuScanError::Invalid("nq and k must be positive".into()));
@@ -564,15 +777,23 @@ impl GpuScanSession {
             )));
         }
 
+        // The fused stage-1 grid maps nq onto gridDim.y (capped at 65,535); a larger
+        // batch falls back to the default path rather than failing the launch. This
+        // effective flag drives the scratch allocation and the launch below alike.
+        let fused = fused && nq <= FUSED_MAX_NQ;
+
         // Queries are scored raw: the rotation is baked into the resident rows at
         // build (rows @ rotation), so there is no per-query host rotation.
 
         // Reuse device scratch for this (nq, k) shape; allocate only on first sight.
         // The serving layer drives a small set of shapes, so steady-state queries
         // do no device allocation or zeroing — only copies and kernels.
+        // ceil(n / FUSED_CHUNK_ROWS) without div_ceil (MSRV 1.70); only used when fused.
+        let num_chunks = self.n / FUSED_CHUNK_ROWS + usize::from(self.n % FUSED_CHUNK_ROWS != 0);
+
         let mut cache = self.scratch.borrow_mut();
-        if !cache.contains_key(&(nq, k)) {
-            let scratch = GpuScratch {
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry((nq, k)) {
+            entry.insert(GpuScratch {
                 q_dev: self
                     .stream
                     .alloc_zeros::<f32>(nq * self.dim)
@@ -589,14 +810,39 @@ impl GpuScanSession {
                     .stream
                     .alloc_zeros::<f32>(nq * k)
                     .map_err(|err| GpuScanError::Device(err.to_string()))?,
-            };
-            cache.insert((nq, k), scratch);
+                part_idx: None,
+                part_val: None,
+            });
+        }
+        // Allocate the stage-1 partial buffers the first time the fused path runs for
+        // this shape (nq * num_chunks * k). Done before the destructure so the shared
+        // `&mut` borrow stays simple.
+        if fused {
+            let entry = cache.get_mut(&(nq, k)).expect("scratch was just inserted");
+            if entry.part_idx.is_none() {
+                let part_len = nq
+                    .checked_mul(num_chunks)
+                    .and_then(|value| value.checked_mul(k))
+                    .ok_or_else(|| GpuScanError::Invalid("fused partial count overflow".into()))?;
+                entry.part_idx = Some(
+                    self.stream
+                        .alloc_zeros::<u32>(part_len)
+                        .map_err(|err| GpuScanError::Device(err.to_string()))?,
+                );
+                entry.part_val = Some(
+                    self.stream
+                        .alloc_zeros::<f32>(part_len)
+                        .map_err(|err| GpuScanError::Device(err.to_string()))?,
+                );
+            }
         }
         let GpuScratch {
             q_dev,
             scores_dev,
             idx_dev,
             val_dev,
+            part_idx,
+            part_val,
         } = cache.get_mut(&(nq, k)).expect("scratch was just inserted");
 
         // Upload the raw queries into the cached query buffer (in place).
@@ -624,31 +870,88 @@ impl GpuScanSession {
         unsafe { self.blas.gemm(cfg, &self.rows_dev, &*q_dev, &mut *scores_dev) }
             .map_err(|err| GpuScanError::Device(err.to_string()))?;
 
-        let cfg_launch = LaunchConfig {
-            grid_dim: (nq as u32, 1, 1),
-            block_dim: (TOPK_BLOCK, 1, 1),
-            shared_mem_bytes: TOPK_BLOCK
-                * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>()) as u32,
-        };
         let n_i32 = self.n as i32;
         let k_i32 = k as i32;
-        let mut builder = self.stream.launch_builder(&self.func);
-        builder
-            .arg(&mut *scores_dev)
-            .arg(&n_i32)
-            .arg(&k_i32)
-            .arg(&mut *idx_dev)
-            .arg(&mut *val_dev);
-        // SAFETY: the kernel reads/writes only the bound buffers within bounds
-        // (`scores_dev` is nq*n, `idx_dev`/`val_dev` are nq*k, grid is nq blocks);
-        // shared memory matches `block_dim`'s two per-thread scratch arrays.
-        unsafe { builder.launch(cfg_launch) }
-            .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        let reduce_bytes =
+            TOPK_BLOCK * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>()) as u32;
+
+        if fused {
+            // Two-stage top-k over the cuBLAS score matrix: stage 1 reads each score
+            // once into shared memory and emits per-chunk top-k partials; stage 2
+            // merges them. Same scores, same (score desc, slot asc) order, so the
+            // result equals the default topk_argmax path.
+            let chunk_rows_i32 = FUSED_CHUNK_ROWS as i32;
+            let num_chunks_i32 = num_chunks as i32;
+            let part_idx = part_idx.as_mut().expect("fused partials allocated above");
+            let part_val = part_val.as_mut().expect("fused partials allocated above");
+
+            let stage1 = LaunchConfig {
+                grid_dim: (num_chunks as u32, nq as u32, 1),
+                block_dim: (TOPK_BLOCK, 1, 1),
+                shared_mem_bytes: FUSED_CHUNK_ROWS as u32 * std::mem::size_of::<f32>() as u32
+                    + reduce_bytes,
+            };
+            let mut builder = self.stream.launch_builder(&self.chunk_topk_func);
+            builder
+                .arg(&*scores_dev)
+                .arg(&n_i32)
+                .arg(&k_i32)
+                .arg(&chunk_rows_i32)
+                .arg(&num_chunks_i32)
+                .arg(&mut *part_idx)
+                .arg(&mut *part_val);
+            // SAFETY: grid is (num_chunks, nq); each block reads its query's chunk of
+            // `scores_dev` (nq*n) and writes k partials into `part_*` (nq*num_chunks*k);
+            // dynamic shared holds chunk_rows f32 plus the block's reduction scratch.
+            unsafe { builder.launch(stage1) }
+                .map_err(|err| GpuScanError::Device(err.to_string()))?;
+
+            let stage2 = LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (TOPK_BLOCK, 1, 1),
+                shared_mem_bytes: reduce_bytes,
+            };
+            let mut builder = self.stream.launch_builder(&self.merge_topk_func);
+            builder
+                .arg(&mut *part_idx)
+                .arg(&mut *part_val)
+                .arg(&k_i32)
+                .arg(&num_chunks_i32)
+                .arg(&mut *idx_dev)
+                .arg(&mut *val_dev);
+            // SAFETY: grid is nq blocks; each merges its num_chunks*k partials
+            // (`part_*` is nq*num_chunks*k) into `idx_dev`/`val_dev` (nq*k); dynamic
+            // shared matches the block's reduction scratch.
+            unsafe { builder.launch(stage2) }
+                .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        } else {
+            let cfg_launch = LaunchConfig {
+                grid_dim: (nq as u32, 1, 1),
+                block_dim: (TOPK_BLOCK, 1, 1),
+                shared_mem_bytes: reduce_bytes,
+            };
+            let mut builder = self.stream.launch_builder(&self.func);
+            builder
+                .arg(&mut *scores_dev)
+                .arg(&n_i32)
+                .arg(&k_i32)
+                .arg(&mut *idx_dev)
+                .arg(&mut *val_dev);
+            // SAFETY: the kernel reads/writes only the bound buffers within bounds
+            // (`scores_dev` is nq*n, `idx_dev`/`val_dev` are nq*k, grid is nq blocks);
+            // shared memory matches `block_dim`'s two per-thread scratch arrays.
+            unsafe { builder.launch(cfg_launch) }
+                .map_err(|err| GpuScanError::Device(err.to_string()))?;
+        }
 
         if debug_enabled() {
             static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             LOGGED.get_or_init(|| {
-                eprintln!("lodedb_gpu: GPU scan engaged (nq={nq}, k={k}, rows={})", self.n);
+                let path = if fused { "fused" } else { "cublas" };
+                eprintln!(
+                    "lodedb_gpu: GPU scan engaged ({path}, nq={nq}, k={k}, rows={})",
+                    self.n
+                );
             });
         }
 
@@ -865,6 +1168,173 @@ mod tests {
             assert!(
                 (patched - rebuilt).abs() <= tol,
                 "patched score {patched} != rebuilt score {rebuilt}"
+            );
+        }
+    }
+
+    /// Device top-k order: higher score first, ties broken by lower slot, using the
+    /// same float `>`/`<`/`==` comparisons as the device `fused_gt`.
+    fn kernel_order(a: &(f32, u32), b: &(f32, u32)) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if a.0 > b.0 {
+            Ordering::Less
+        } else if a.0 < b.0 {
+            Ordering::Greater
+        } else {
+            a.1.cmp(&b.1)
+        }
+    }
+
+    /// Brute-force global top-k: the reference the fused decomposition must match.
+    fn brute_topk_ref(scores: &[f32], k: usize) -> Vec<(f32, u32)> {
+        let mut all: Vec<(f32, u32)> =
+            scores.iter().enumerate().map(|(i, &s)| (s, i as u32)).collect();
+        all.sort_by(kernel_order);
+        all.truncate(k);
+        all
+    }
+
+    /// Host model of the two device stages: stage 1 selects each chunk's top-k, stage
+    /// 2 merges the partials. Exercises the chunking, merge, and tie-break logic the
+    /// `chunk_topk`/`merge_topk` kernels implement, with no GPU.
+    fn chunked_topk_ref(scores: &[f32], k: usize, chunk_rows: usize) -> Vec<(f32, u32)> {
+        let n = scores.len();
+        let num_chunks = n / chunk_rows + usize::from(n % chunk_rows != 0);
+        let mut partials: Vec<(f32, u32)> = Vec::new();
+        for c in 0..num_chunks {
+            let row0 = c * chunk_rows;
+            let end = (row0 + chunk_rows).min(n);
+            let mut chunk: Vec<(f32, u32)> = (row0..end).map(|r| (scores[r], r as u32)).collect();
+            chunk.sort_by(kernel_order);
+            chunk.truncate(k); // a chunk with < k rows contributes fewer (implicit INVALID pad)
+            partials.extend(chunk);
+        }
+        partials.sort_by(kernel_order);
+        partials.truncate(k);
+        partials
+    }
+
+    #[test]
+    fn fused_chunked_topk_matches_bruteforce() {
+        // The fused path's correctness rests on two claims: the union of per-chunk
+        // top-ks contains the global top-k, and both stages apply one strict
+        // (score desc, slot asc) order. Fuzz the host model of that decomposition
+        // against brute force across sizes, k, chunk sizes, and heavy ties (small
+        // integer scores) so the algorithm is validated without a GPU. k <= n and
+        // chunk_rows may be smaller or larger than k, matching the kernel's inputs.
+        let mut seed = 0x00C0_FFEE_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for case in 0..4000 {
+            let n = 1 + (next() as usize % 300);
+            let k = 1 + (next() as usize % n.min(40));
+            let chunk_rows = 1 + (next() as usize % 40);
+            // Small integer scores force frequent exact ties, exercising slot tie-break.
+            let modulo = 1 + (next() % 6);
+            let scores: Vec<f32> = (0..n).map(|_| (next() % modulo) as f32).collect();
+            let brute = brute_topk_ref(&scores, k);
+            let chunked = chunked_topk_ref(&scores, k, chunk_rows);
+            assert_eq!(
+                chunked, brute,
+                "case {case}: n={n} k={k} chunk_rows={chunk_rows} disagreed with brute force"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_fused_topk_matches_two_pass() {
+        // The opt-in fused two-stage top-k must return exactly what the default
+        // cuBLAS + topk_argmax path returns: both read the same cuBLAS scores and
+        // select the same total-order top-k. Runs only where a CUDA driver is
+        // present; a no-op elsewhere (CI/macOS).
+        if !cuda_runtime_available() {
+            eprintln!("skipping gpu_fused_topk_matches_two_pass: no CUDA runtime");
+            return;
+        }
+        // Corpus spans several fused chunks with a ragged last chunk (n not a
+        // multiple of FUSED_CHUNK_ROWS) and a large k, so stage 1 hits chunk
+        // exhaustion and stage 2 does real merging.
+        let (dim, nq, k) = (96usize, 12usize, 100usize);
+        let n = FUSED_CHUNK_ROWS * 2 + 777;
+        let rows = pseudo_fill(n * dim, 0x1357_9bdf);
+        let rotation = pseudo_fill(dim * dim, 0x2468_ace0);
+        let queries = pseudo_fill(nq * dim, 0x0bad_f00d);
+        let stable_ids: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(2_654_435_761) | 1).collect();
+
+        let session = GpuScanSession::build(&rows, &stable_ids, &rotation, dim)
+            .expect("session build on a CUDA host");
+
+        let (base_scores, base_ids) = session
+            .search_variant(&queries, nq, k, false)
+            .expect("cublas + topk_argmax path");
+        let (fused_scores, fused_ids) = session
+            .search_variant(&queries, nq, k, true)
+            .expect("fused two-stage path");
+
+        // Same cuBLAS scores + same total order => identical selection and values.
+        assert_eq!(fused_ids, base_ids, "fused ids differ from the default path");
+        assert_eq!(
+            fused_scores, base_scores,
+            "fused scores differ from the default path"
+        );
+    }
+
+    #[test]
+    fn gpu_fused_topk_timing() {
+        // Perf comparison of the default cuBLAS + topk_argmax path against the fused
+        // two-stage top-k, across batch sizes. Opt-in (needs a large corpus and many
+        // iterations): runs only with a CUDA driver AND LODEDB_GPU_BENCH set, so it
+        // is a no-op on CI/macOS and in ordinary test runs. Corpus size overridable
+        // via LODEDB_GPU_BENCH_N. This is where the fused path's win (or regression)
+        // is measured on real hardware; it asserts nothing.
+        use std::time::Instant;
+        if !cuda_runtime_available() || std::env::var_os("LODEDB_GPU_BENCH").is_none() {
+            eprintln!("skipping gpu_fused_topk_timing: set LODEDB_GPU_BENCH=1 on a CUDA host");
+            return;
+        }
+        let dim = 128usize;
+        let k = 100usize;
+        let n = std::env::var("LODEDB_GPU_BENCH_N")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200_000);
+        let rows = pseudo_fill(n * dim, 0x5eed_1234);
+        let rotation = pseudo_fill(dim * dim, 0x5eed_5678);
+        let stable_ids: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(2_654_435_761) | 1).collect();
+        let session = GpuScanSession::build(&rows, &stable_ids, &rotation, dim)
+            .expect("session build on a CUDA host");
+
+        eprintln!("gpu_fused_topk_timing: n={n} dim={dim} k={k}");
+        let iters = 20;
+        for &nq in &[4usize, 16, 64, 256, 1024] {
+            let queries = pseudo_fill(nq * dim, 0xa11ce ^ nq as u64);
+            // Warm both paths (allocates scratch, primes caches) before timing.
+            let _ = session.search_variant(&queries, nq, k, false).expect("warm default");
+            let _ = session.search_variant(&queries, nq, k, true).expect("warm fused");
+
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                session.search_variant(&queries, nq, k, false).expect("default");
+            }
+            let base = t0.elapsed().as_secs_f64() / iters as f64;
+
+            let t1 = Instant::now();
+            for _ in 0..iters {
+                session.search_variant(&queries, nq, k, true).expect("fused");
+            }
+            let fused = t1.elapsed().as_secs_f64() / iters as f64;
+
+            eprintln!(
+                "  nq={nq:>4}: default={:>8.3} ms  fused={:>8.3} ms  speedup={:.2}x",
+                base * 1e3,
+                fused * 1e3,
+                base / fused
             );
         }
     }
