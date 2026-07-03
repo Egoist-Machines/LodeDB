@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
 from lodedb.engine._commit_manifest import (
     COMMIT_MANIFEST_SUFFIX,
@@ -661,7 +663,12 @@ class LodeDB:
 
         self._require_writable()
         document_id = str(id) if id is not None else self._next_auto_id()
-        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        # Shares the vectorized prepare with add_vectors_many so a single add and a
+        # batched add normalize a vector identically; tolist() keeps the stored
+        # vector a plain float tuple.
+        prepared = tuple(
+            _prepare_vector_matrix([vector], self._vector_dim, normalize=normalize)[0].tolist()
+        )
         document = EngineVectorDocument(
             document_id=document_id,
             vector=prepared,
@@ -686,25 +693,31 @@ class LodeDB:
         """
 
         self._require_writable()
-        payload: list[EngineVectorDocument] = []
+        raw_vectors: list[Any] = []
         ids: list[str] = []
+        metadatas: list[Mapping[str, str]] = []
+        texts: list[str | None] = []
         for item in documents:
             vector = item.get("vector")
             if vector is None:
                 raise ValueError("each document needs a 'vector'")
+            raw_vectors.append(vector)
             document_id = str(item["id"]) if item.get("id") is not None else self._next_auto_id()
             ids.append(document_id)
-            payload.append(
-                EngineVectorDocument(
-                    document_id=document_id,
-                    vector=_prepare_vector(vector, self._vector_dim, normalize=normalize),
-                    metadata=_coerce_metadata(item.get("metadata")),
-                    text=_coerce_optional_text(item.get("text")),
-                )
-            )
-        if payload:
-            with self._op_lock:
-                self._native_upsert_vectors(tuple(payload))
+            metadatas.append(_coerce_metadata(item.get("metadata")))
+            texts.append(_coerce_optional_text(item.get("text")))
+        if not raw_vectors:
+            return ids
+        # Validate + normalize the whole batch as one matrix and hand it to the
+        # native array upsert as-is: the vectors never become per-row Python tuples,
+        # and normalize identically to a single add_vectors.
+        matrix = _prepare_vector_matrix(raw_vectors, self._vector_dim, normalize=normalize)
+        sidecar = [
+            {"document_id": document_id, "metadata": metadata, "text": text}
+            for document_id, metadata, text in zip(ids, metadatas, texts, strict=True)
+        ]
+        with self._op_lock:
+            self._native_upsert_vectors_matrix(matrix, sidecar)
         return ids
 
     def search(
@@ -847,7 +860,9 @@ class LodeDB:
 
         if k <= 0:
             raise ValueError("k must be positive")
-        prepared = _prepare_vector(vector, self._vector_dim, normalize=normalize)
+        # Shares the vectorized prepare with search_many_by_vector so a single query
+        # and a batched query normalize a vector identically.
+        prepared = _prepare_vector_matrix([vector], self._vector_dim, normalize=normalize)[0]
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
             return self._native_search_by_vector(
@@ -856,7 +871,7 @@ class LodeDB:
 
     def search_many_by_vector(
         self,
-        vectors: list[Sequence[float]],
+        vectors: list[Sequence[float]] | np.ndarray,
         *,
         k: int = 10,
         filter: Mapping[str, Any] | None = None,
@@ -865,21 +880,64 @@ class LodeDB:
         """Returns top-``k`` hits for each precomputed query vector, preserving order.
 
         Batched vector-in search; like :meth:`search_many` it is the path that
-        lets CUDA hosts use the GPU-resident scan for eligible batches.
+        lets CUDA hosts use the GPU-resident scan for eligible batches. ``vectors``
+        may be a list of per-query vectors or a ``(nq, dim)`` float array; passing a
+        contiguous ``float32`` array is fastest (the batch crosses to the native
+        core with no per-query Python). For raw scores and ids without building hit
+        objects, see :meth:`search_many_by_vector_arrays`.
         """
 
-        if not isinstance(vectors, list) or not vectors:
-            raise ValueError("vectors must be a non-empty list")
         if k <= 0:
             raise ValueError("k must be positive")
+        matrix = _prepare_vector_matrix(vectors, self._vector_dim, normalize=normalize)
         normalized_filter = _normalize_filter(filter)
-        prepared_vectors = [
-            _prepare_vector(vector, self._vector_dim, normalize=normalize) for vector in vectors
-        ]
         with self._op_lock:
             return self._native_search_many_by_vector(
-                prepared_vectors, k=int(k), filter=normalized_filter
+                matrix, k=int(k), filter=normalized_filter
             )
+
+    def search_many_by_vector_arrays(
+        self,
+        vectors: list[Sequence[float]] | np.ndarray,
+        *,
+        k: int = 10,
+        filter: Mapping[str, Any] | None = None,
+        normalize: bool = True,
+        include_metadata: bool = False,
+    ) -> tuple[np.ndarray, list[list[str]], int]:
+        """Batched vector search returning flat arrays instead of hit objects.
+
+        The throughput-oriented counterpart of :meth:`search_many_by_vector`:
+        returns ``(scores, ids, k)`` where ``scores`` is a ``(nq, k)`` ``float32``
+        array and ``ids`` is an ``nq``-long list of ``k`` document-id lists, without
+        constructing a :class:`LodeSearchHit` per hit. ``k`` is the served width
+        (``min(k, corpus)``, and ``min(k, allowlist)`` under a filter). When
+        ``include_metadata`` is set, each hit's redacted metadata is returned too,
+        as a fourth ``(nq, k)`` nested list. Use this when driving many queries and
+        you only need scores and ids.
+        """
+
+        if k <= 0:
+            raise ValueError("k must be positive")
+        matrix = _prepare_vector_matrix(vectors, self._vector_dim, normalize=normalize)
+        nq = int(matrix.shape[0])
+        normalized_filter = _normalize_filter(filter)
+        with self._op_lock:
+            scores, ids_flat, metadata_flat, served_k = self._native_search_many_by_vector_arrays(
+                matrix, k=int(k), filter=normalized_filter, want_metadata=include_metadata
+            )
+        served_k = int(served_k)
+        scores2d = np.asarray(scores, dtype=np.float32).reshape(nq, served_k)
+
+        def _nest(flat: list[Any]) -> list[list[Any]]:
+            if not served_k:
+                return [[] for _ in range(nq)]
+            return [flat[base : base + served_k] for base in range(0, nq * served_k, served_k)]
+
+        ids = _nest(ids_flat)
+        if include_metadata:
+            return scores2d, ids, _nest(metadata_flat), served_k  # type: ignore[return-value]
+        return scores2d, ids, served_k
 
     def add_image(
         self,
@@ -1514,6 +1572,29 @@ class LodeDB:
             self._native_core_fallback_reason = "native_core_upsert_failed"
             raise RuntimeError("native core vector upsert failed") from exc
 
+    def _native_upsert_vectors_matrix(
+        self,
+        matrix: np.ndarray,
+        sidecar: list[Mapping[str, Any]],
+    ) -> None:
+        """Upserts a prepared f32 matrix plus a per-doc sidecar (fail closed).
+
+        The zero-round-trip counterpart of :meth:`_native_upsert_vectors`: the
+        normalized ``(n, dim)`` matrix reaches the native array upsert without
+        becoming per-vector Python tuples. ``sidecar`` is the row-ordered
+        ``[{document_id, metadata, text}]`` list.
+        """
+
+        if not sidecar:
+            return
+        try:
+            self._native_vector_engine.upsert_vectors_matrix(_LOCAL_INDEX_ID, matrix, sidecar)
+            if self._native_should_persist_after_mutation():
+                self._native_vector_engine.persist()
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_upsert_failed"
+            raise RuntimeError("native core vector upsert failed") from exc
+
     def _native_upsert_text_documents(self, documents: tuple[EngineDocument, ...]) -> None:
         """Embeds and upserts text documents through the native core (fail closed).
 
@@ -1621,6 +1702,37 @@ class LodeDB:
             self._native_core_fallback_reason = "native_core_batch_query_failed"
             raise RuntimeError("native core vector batch query failed") from exc
         return [self._hits_from_native_rows(batch.get("hits", [])) for batch in batches]
+
+    def _native_search_many_by_vector_arrays(
+        self,
+        matrix: np.ndarray,
+        *,
+        k: int,
+        filter: Mapping[str, Any] | None,
+        want_metadata: bool,
+    ) -> tuple[Any, list[str], list[Mapping[str, Any]], int]:
+        """Returns flat native arrays ``(scores, ids, metadata, k)`` for a query batch.
+
+        The un-hydrated counterpart of :meth:`_native_search_many_by_vector`: the
+        near-zero-copy arrays cross the boundary and are returned as-is, so the
+        caller can hand back scores and ids without a per-hit object. Requires the
+        native array-out path (present in the bundled extension); fails closed.
+        """
+
+        arrays_query = getattr(self._native_vector_engine, "query_vectors_batch_arrays", None)
+        if not callable(arrays_query):
+            raise RuntimeError("native core lacks the arrays vector-batch query")
+        try:
+            arrays = arrays_query(
+                _LOCAL_INDEX_ID, matrix, top_k=k, filter=filter, want_metadata=want_metadata
+            )
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_batch_query_failed"
+            raise RuntimeError("native core vector batch query failed") from exc
+        if arrays is None:
+            raise RuntimeError("native core arrays vector-batch query is unavailable")
+        scores, document_ids, metadata, served_k = arrays
+        return scores, document_ids, metadata, served_k
 
     def _native_search_text(
         self,
@@ -2394,3 +2506,72 @@ def _prepare_vector(
     :func:`_finite_float_vector`."""
 
     return tuple(_finite_float_vector(vector, normalize=normalize, dim=dim))
+
+
+def _prepare_vector_matrix(
+    vectors: Any,
+    dim: int,
+    *,
+    normalize: bool,
+) -> np.ndarray:
+    """Validates and (optionally) L2-normalizes a batch of vectors as one f32 matrix.
+
+    The vectorized boundary for both the batched vector-in search path and the
+    vector-in write path: accepts a ``(n, dim)`` float array or any sequence of
+    per-row vectors, and returns a C-contiguous ``float32`` ``(n, dim)`` matrix with
+    no per-row Python. The common case stays in float32; the norm is accumulated in
+    float64 (never overflows for float32-range inputs) so normalization matches the
+    scalar path within ~1 ulp -- ranking-neutral for queries, and single- and
+    batch-vector writes share this path so a store stays internally consistent. A
+    component beyond float32 range (finite only in float64) drops to a float64 path
+    that scales by max-abs before squaring, the same guard :func:`_finite_float_vector`
+    gives per vector. The native core re-validates finiteness, stricter.
+    """
+
+    try:
+        # A component beyond float32 range overflows to inf here; that is expected
+        # and handled by the finiteness fallback below, so silence the warning.
+        with np.errstate(over="ignore"):
+            matrix = np.ascontiguousarray(vectors, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vectors must be sequences of numbers") from exc
+    if matrix.size == 0:
+        raise ValueError("vectors must be a non-empty batch")
+    if matrix.ndim != 2 or matrix.shape[1] != dim:
+        raise ValueError(f"each vector must have dimension {dim}")
+    if not np.isfinite(matrix).all():
+        # A value is non-finite, or was finite but exceeded float32 range and became
+        # inf on the cast; re-read in float64 to tell them apart.
+        wide = np.asarray(vectors, dtype=np.float64)
+        if not np.isfinite(wide).all():
+            raise ValueError("vector must contain only finite values")
+        # Large-but-finite: normalize in float64, or (no normalize) let the native
+        # core reject the out-of-range value exactly as the scalar path did.
+        if normalize:
+            return _l2_normalize_wide(wide)
+        return np.ascontiguousarray(wide, dtype=np.float32)
+    if normalize:
+        norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64))
+        if (norms == 0.0).any():
+            # A row is zero in float32: either a genuine zero vector or a tiny row
+            # (e.g. ~1e-300) that underflowed on the cast. Re-normalize the original
+            # in float64, which preserves tiny rows via max-abs scaling and raises
+            # only for a true zero vector.
+            return _l2_normalize_wide(np.asarray(vectors, dtype=np.float64))
+        return np.ascontiguousarray(matrix / norms[:, None], dtype=np.float32)
+    return matrix
+
+
+def _l2_normalize_wide(wide: np.ndarray) -> np.ndarray:
+    """L2-normalizes a float64 matrix, scaling each row by its max abs before
+    squaring so a large-but-finite component cannot overflow the norm to inf.
+    Returns a C-contiguous float32 matrix. See :func:`_prepare_vector_matrix`."""
+
+    scale = np.abs(wide).max(axis=1)
+    if (scale == 0.0).any():
+        raise ValueError(
+            "cannot normalize a zero vector; pass normalize=False to store it as-is"
+        )
+    scaled = wide / scale[:, None]
+    unit = scaled / np.sqrt(np.square(scaled).sum(axis=1))[:, None]
+    return np.ascontiguousarray(unit, dtype=np.float32)

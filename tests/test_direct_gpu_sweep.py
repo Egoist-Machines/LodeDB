@@ -2,9 +2,10 @@
 
 The sweep drives the native CUDA GPU-resident scan, which runs in the Rust core
 (cudarc) and cannot be faked from Python, so this is a CUDA-host integration test:
-it gates on a CUDA-capable runtime and skips cleanly on CI / macOS. The bundled
-native extension already exercises the GPU patch + scan directly under
-``benchmarks/gpu_patch/modal_rust_gpu_test.py`` on real hardware.
+it gates on a CUDA-capable runtime and skips cleanly on CI / macOS. The native
+``lodedb-gpu`` crate exercises the GPU patch + scan (and the opt-in fused top-k)
+directly via ``cargo test`` under
+``benchmarks/gpu_fused_topk/modal_rust_gpu_test.py`` on real hardware.
 """
 
 from __future__ import annotations

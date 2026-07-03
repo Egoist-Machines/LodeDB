@@ -441,6 +441,39 @@ class NativeCoreEngineHandle:
             )
         )
 
+    def upsert_vectors_matrix(
+        self,
+        index_id: str,
+        matrix: Any,
+        sidecar: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Upserts an already-prepared f32 matrix plus a per-doc sidecar.
+
+        The zero-round-trip counterpart of :meth:`upsert_vectors`: the normalized
+        ``(n, dim)`` float32 matrix goes straight to the native array upsert, so a
+        bulk vector add never rebuilds a matrix from per-vector Python tuples.
+        ``sidecar`` is the row-ordered ``[{document_id, metadata, text}]`` list.
+        Falls back to the JSON document path for engines without the array upsert.
+        """
+
+        array_upsert = getattr(self._engine, "upsert_vectors_array", None)
+        if callable(array_upsert):
+            import numpy as np
+
+            matrix = np.ascontiguousarray(matrix, dtype=np.float32)
+            return self._loads(array_upsert(str(index_id), matrix, _dumps(list(sidecar))))
+        rows = matrix.tolist() if hasattr(matrix, "tolist") else [list(row) for row in matrix]
+        documents = [
+            EngineVectorDocument(
+                document_id=str(entry["document_id"]),
+                vector=tuple(row),
+                metadata=dict(entry.get("metadata", {})),
+                text=entry.get("text"),
+            )
+            for entry, row in zip(sidecar, rows, strict=True)
+        ]
+        return self.upsert_vectors(index_id, documents)
+
     def delete_documents(self, index_id: str, document_ids: Iterable[str]) -> dict[str, Any]:
         return self._loads(
             self._engine.delete_documents(
@@ -616,14 +649,17 @@ class NativeCoreEngineHandle:
         *,
         top_k: int,
         filter: Mapping[str, Any] | None = None,
+        want_metadata: bool = True,
     ) -> tuple[Any, list[str], list[dict[str, Any]], int] | None:
         """Near-zero-copy batch query.
 
         Returns ``(scores, document_ids, metadata, k)`` as flat ``[nq * k]`` buffers
         (scores a numpy array, ids a string list, metadata a dict list) when the
         native array-out path is available, else ``None`` so the caller uses the
-        JSON path. The query matrix is built once via numpy rather than a Python
-        tuple-of-tuples, and only metadata crosses as JSON.
+        JSON path. A contiguous ``float32`` ``(nq, dim)`` matrix passes straight
+        through with no copy. When ``want_metadata`` is false, the native core skips
+        serializing per-hit metadata and this returns an empty metadata list, for
+        callers that only need scores and ids.
         """
 
         array_out = getattr(self._engine, "query_vectors_batch_array_out", None)
@@ -636,9 +672,9 @@ class NativeCoreEngineHandle:
             return None
         filter_json = None if filter is None else _dumps(dict(filter))
         scores, document_ids, metadata_json, k = array_out(
-            str(index_id), matrix, int(top_k), filter_json
+            str(index_id), matrix, int(top_k), filter_json, bool(want_metadata)
         )
-        metadata = json.loads(metadata_json) if metadata_json else []
+        metadata = json.loads(metadata_json) if (want_metadata and metadata_json) else []
         return scores, list(document_ids), list(metadata), int(k)
 
     def prepare_text_upsert(

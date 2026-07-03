@@ -40,12 +40,12 @@ All numbers are reported as the mean of 3 independent runs on a L40S server. [Fu
 > and it will migrate your existing store onto the LodeDB backend.
 
 Most embedded vector databases stop at the CPU. LodeDB runs the same on-disk index **on the
-GPU** when you have one: batched search hits *24k queries/sec on an A10 and 50k qps on an L40S*,
-2.8× to 4.8× the all-CPU ceiling, with recall unchanged. It also persists changed rows
-incrementally, so a commit stays **sub-millisecond even at 1M vectors**.
+GPU** when you have one: batched search hits *24k queries/sec on an A10 and 53k qps on an L40S*,
+with recall matching the CPU scan. It also persists changed rows incrementally, so a commit
+stays **sub-millisecond even at 1M vectors**.
 
-- **GPU-resident batch search**: an fp16 copy of the index lives on the GPU, scored with a
-  tiled GEMM plus a streaming top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
+- **GPU-resident batch search**: a float32 copy of the index lives on the GPU, scored with a
+  cuBLAS GEMM plus an on-device top-k (`[gpu]`, Linux/CUDA). [How it works](#gpu-resident-index).
 - **O(changed) persistence**: commits only the rows that changed, 173× to 1,308× faster
   than a full rewrite. [How it works](#delta-persistence).
 - **Compact storage**: the MIT [TurboVec](#turbovec) core packs vectors into 2/4-bit codes
@@ -391,37 +391,43 @@ persists with the index. See [`docs/late-interaction.md`](docs/late-interaction.
 
 ## GPU-resident index
 
-With the `[gpu]` extra on a CUDA host, LodeDB reconstructs the compact index into an fp16
-matrix resident on the GPU and scores batched `search_many` with a tiled GEMM plus a
-streaming top-k. It is opt-in and lazy: single queries, non-CUDA hosts, and GPU-memory
+With the `[gpu]` extra on a CUDA host, LodeDB keeps a reconstructed float32 copy of the
+compact index resident on the GPU and scores a batched `search_many` with a cuBLAS GEMM plus
+an on-device top-k. It is opt-in and lazy: single queries, non-CUDA hosts, and GPU-memory
 rejection fall back to the CPU scan, which stays the source of truth.
 
-GPU throughput climbs with batch size while the CPU scan is flat. Same 4-bit index
-(d=1536, 100K), same host, only the scoring step differs. Crossover is around batch 50:
+Both scans stream the corpus once per batch and amortize that read across the queries, so
+per-query throughput climbs with batch size; the GPU pulls away as the batch grows and its
+parallelism dominates. End-to-end through the public arrays API
+(`search_many_by_vector_arrays`, scores and ids) on a 4-bit index (d=1536, 100K):
 
 | query batch | A10 GPU | L40S GPU |
 |---:|---:|---:|
-| 1 | 261 q/s | 432 q/s |
-| 16 | 3,531 | 5,562 |
-| 64 | 11,463 | 18,175 |
-| 256 | 19,998 | 39,449 |
-| 1024 | **24,037** | **50,326** |
+| 16 | 8,413 | 12,469 |
+| 64 | 19,030 | 33,040 |
+| 256 | 23,669 | 49,927 |
+| 1024 | **24,359** | **52,940** |
 
-Vanilla TurboVec CPU (all threads) on the same boxes: 8,497 q/s (A10 host), 10,420 q/s
-(L40S host). At batch 1024 the GPU is 2.8× / 4.8× that, and it scales with GPU class.
+These are the arrays fast path; the default hits API (per-hit result objects) runs somewhat
+lower, about 18.4k / 35.6k q/s at batch 1024. A single query stays on the CPU (the GPU batch
+path engages at batch >= 4) and is one exact scan over the whole corpus, so its cost is bound
+by memory bandwidth rather than the API; batching amortizes that corpus read, which is what
+the throughput above exploits.
 
-![GPU throughput vs batch size: A10 and L40S vs the vanilla CPU scan](benchmarks/gpu_vanilla_vs_augmented/docs/speed_batch.png)
+The curves below are the GPU and CPU scans through that same default hits API, so the gap is
+like-for-like:
 
-Recall is unchanged: the GPU scores the exact 4-bit reconstruction, so R@1 tracks the CPU
-scan across datasets and bit-widths, and edges ahead on GloVe-200 where quantization error
-is largest.
+![Native vector-search throughput: GPU vs CPU on the default hits API](benchmarks/vector_search_native/docs/throughput_batch.png)
 
-![Recall: vanilla CPU scan vs GPU fp16 reconstruction](benchmarks/gpu_vanilla_vs_augmented/docs/recall.png)
+A one-line reproduction is in [benchmarks/vector_search_native](benchmarks/vector_search_native/).
+
+Recall matches the CPU scan: the GPU scores the same 4-bit reconstruction, and LodeDB's
+parity tests hold its document recall within 0.002 of the CPU scan across batch sizes, so
+moving a query to the GPU changes its latency, not its results.
 
 Other in-process vector databases stay CPU-bound. Alibaba's
 [zvec](https://github.com/alibaba/zvec) reports about 8.4k q/s (VectorDBBench, 16-vCPU CPU,
-Cohere 768-dim): the same class as the TurboVec CPU scan, and a different regime from ours,
-so read it as the CPU-class baseline. The GPU-resident path is what clears it.
+Cohere 768-dim); read it as the CPU-class baseline that the GPU-resident path clears.
 
 **Scope.** GPU search is Linux/CUDA-only and opt-in (`[gpu]`). macOS scans on the CPU by
 default; a first-class opt-in MPS exact scan exists (`LODEDB_MPS_DIRECT_TURBOVEC`) but NEON
@@ -439,8 +445,6 @@ rows that changed (O(changed)), so a 1,000-row commit stays sub-millisecond at a
 | 100K | 42.4 ms | 0.25 ms | 173× |
 | 500K | 190.4 ms | 0.24 ms | 782× |
 | 1M | 404.9 ms | 0.31 ms | **1,308×** |
-
-![Persist time: full rewrite vs delta export](benchmarks/gpu_vanilla_vs_augmented/docs/update.png)
 
 The GPU path makes reads fast; the delta makes writes cheap. The on-disk format stays a
 plain snapshot that replays on reopen.
@@ -463,8 +467,6 @@ and the complete figure set are in [docs/benchmarks.md](docs/benchmarks.md); eac
 
 Local is the common case. On an Apple M1 (MiniLM, 20K docs) the CPU scan is ~0.25 ms p50,
 and end-to-end single-query latency is 5.7 ms p50.
-
-![Single-query latency on a laptop](benchmarks/laptop/docs/query_latency.png)
 
 ## CLI
 
