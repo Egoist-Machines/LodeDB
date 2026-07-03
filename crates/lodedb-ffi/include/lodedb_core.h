@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 2u
+#define LODEDB_ABI_VERSION 4u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -30,6 +30,8 @@ typedef struct LodeError {
 typedef struct LodeEngine LodeEngine;
 
 typedef struct LodeAppender LodeAppender;
+
+typedef struct LodeCheckpointer LodeCheckpointer;
 
 typedef struct LodeStringView {
   uint32_t size;
@@ -290,6 +292,27 @@ uint32_t lodedb_appender_append_deletes_json(
     const LodeAppender *appender,
     LodeStringView document_ids_json,
     uint64_t *out_lsn,
+    LodeError **error);
+uint32_t lodedb_appender_prepare_documents_json(
+    const LodeAppender *appender,
+    LodeStringView documents_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_appender_append_embedded_documents_json(
+    const LodeAppender *appender,
+    LodeStringView plan_json,
+    LodeStringView embeddings_json,
+    uint64_t *out_lsn,
+    LodeError **error);
+
+uint32_t lodedb_checkpointer_open_json(
+    LodeStringView options_json,
+    LodeCheckpointer **out,
+    LodeError **error);
+void lodedb_checkpointer_free(LodeCheckpointer *checkpointer);
+uint32_t lodedb_checkpointer_checkpoint(
+    LodeCheckpointer *checkpointer,
+    uint64_t *out_folded,
     LodeError **error);
 
 #ifdef __cplusplus

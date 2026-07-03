@@ -1,6 +1,6 @@
 //! C ABI for the native LodeDB core.
 
-use lodedb_core::engine::{CoreAppender, CoreEngine};
+use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
 use lodedb_core::engine::{IngestPlan, QueryPlan};
 use lodedb_core::types::{
     CoreDocument, CoreIndexCreateRequest, CoreMetadata, CoreOpenOptions, CoreVectorDocument,
@@ -31,6 +31,11 @@ pub struct LodeEngine {
 #[repr(C)]
 pub struct LodeAppender {
     appender: CoreAppender,
+}
+
+#[repr(C)]
+pub struct LodeCheckpointer {
+    checkpointer: CoreCheckpointer,
 }
 
 #[repr(C)]
@@ -1207,6 +1212,137 @@ pub unsafe extern "C" fn lodedb_appender_append_deletes_json(
     })
 }
 
+/// Chunks a JSON array of `CoreDocument` objects into an `IngestPlan` the caller
+/// embeds before calling `lodedb_appender_append_embedded_documents_json`.
+///
+/// Embeddings stay in the caller. The returned JSON is an `IngestPlan` and must be
+/// released with `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `appender`, `documents_json`, and `out` must be valid for the duration of the
+/// call. `documents_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_prepare_documents_json(
+    appender: *const LodeAppender,
+    documents_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let appender = appender_ref(appender)?;
+        let documents = read_json_view::<Vec<CoreDocument>>(documents_json)?;
+        let plan = appender.prepare_documents(&documents)?;
+        let result = owned_json(&plan)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Durably appends one `apply_embedded_documents` record from a JSON `IngestPlan`
+/// (returned by `lodedb_appender_prepare_documents_json`) and caller-provided
+/// embeddings JSON (one per `chunks_to_embed`, in order), writing the assigned LSN
+/// to `out_lsn`. The plan's `store_text`/`index_text` must match the appender.
+///
+/// # Safety
+///
+/// `appender`, `plan_json`, `embeddings_json`, and `out_lsn` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_append_embedded_documents_json(
+    appender: *const LodeAppender,
+    plan_json: LodeStringView,
+    embeddings_json: LodeStringView,
+    out_lsn: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_lsn)?;
+        let appender = appender_ref(appender)?;
+        let plan = read_json_view::<IngestPlan>(plan_json)?;
+        let embeddings = read_json_view::<Vec<Vec<f32>>>(embeddings_json)?;
+        let lsn = appender.append_embedded_documents(&plan, &embeddings)?;
+        unsafe {
+            *out_lsn = lsn;
+        }
+        Ok(())
+    })
+}
+
+/// Opens a running single-checkpointer over the single index at `options.path`,
+/// acquiring the crash-reclaimable checkpointer lease.
+///
+/// One process at a time holds the lease; a second open blocks then fails with a
+/// contention error. The checkpointer folds records that concurrent appenders log
+/// into fresh generations without holding the writer lock for its lifetime, so
+/// appended records become durable (and visible to a reader's refresh) without an
+/// application re-opening a writer. The store must be in WAL commit mode and opened
+/// writable. The returned handle must be released with `lodedb_checkpointer_free`.
+///
+/// # Safety
+///
+/// `options_json` and `out` must be valid for the duration of the call;
+/// `options_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_checkpointer_open_json(
+    options_json: LodeStringView,
+    out: *mut *mut LodeCheckpointer,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let options = read_json_view::<CoreOpenOptions>(options_json)?;
+        let checkpointer = CoreCheckpointer::open(options)?;
+        let handle = Box::new(LodeCheckpointer { checkpointer });
+        unsafe {
+            *out = Box::into_raw(handle);
+        }
+        Ok(())
+    })
+}
+
+/// Folds the appended WAL tail into a fresh committed generation under a brief hold
+/// of the exclusive writer lock, writing the number of records folded to
+/// `out_folded` (zero when nothing new was appended). Reloads a stale warm base
+/// first when a concurrent writer advanced the committed generation.
+///
+/// # Safety
+///
+/// `checkpointer` and `out_folded` must be valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_checkpointer_checkpoint(
+    checkpointer: *mut LodeCheckpointer,
+    out_folded: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_folded)?;
+        let checkpointer = checkpointer_mut(checkpointer)?;
+        let folded = checkpointer.checkpoint()?;
+        unsafe {
+            *out_folded = folded as u64;
+        }
+        Ok(())
+    })
+}
+
+/// Frees a checkpointer handle allocated by this library, releasing its lease.
+///
+/// # Safety
+///
+/// `checkpointer` must be null or a pointer returned by
+/// `lodedb_checkpointer_open_json`. It must not be used after this call and must not
+/// be freed more than once.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_checkpointer_free(checkpointer: *mut LodeCheckpointer) {
+    if !checkpointer.is_null() {
+        let _ = Box::from_raw(checkpointer);
+    }
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -1281,6 +1417,15 @@ fn appender_ref<'a>(appender: *const LodeAppender) -> Result<&'a CoreAppender, C
         return invalid("appender pointer is null");
     }
     Ok(unsafe { &(*appender).appender })
+}
+
+fn checkpointer_mut<'a>(
+    checkpointer: *mut LodeCheckpointer,
+) -> Result<&'a mut CoreCheckpointer, CoreError> {
+    if checkpointer.is_null() {
+        return invalid("checkpointer pointer is null");
+    }
+    Ok(unsafe { &mut (*checkpointer).checkpointer })
 }
 
 fn read_string(view: LodeStringView) -> Result<String, CoreError> {
@@ -1715,6 +1860,220 @@ mod tests {
             assert!(
                 stats_json.contains("\"document_count\":0"),
                 "expected doc-a folded in then deleted: {stats_json}"
+            );
+            lodedb_owned_string_free(stats);
+            lodedb_engine_free(engine);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn appender_text_ffi_round_trips_through_a_durable_store() {
+        let dir = appender_temp_dir();
+        // Retain text + tokens so the folded document is present after the fold.
+        let options = serde_json::json!({
+            "path": dir.to_str().expect("utf-8 temp path"),
+            "read_only": false,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": true,
+            "index_text": true,
+            "acquire_writer_lock": true,
+        })
+        .to_string();
+        let options_view = borrowed_view(&options);
+
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            lodedb_engine_free(engine);
+        }
+
+        // Prepare a text document into an IngestPlan, embed its chunks, and append the
+        // post-embedding record -- all through the appender FFI.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut appender: *mut LodeAppender = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_open_json(options_view, &mut appender, &mut error),
+                0
+            );
+            let documents = r#"[{"document_id":"doc-a","text":"hello world","metadata":{}}]"#;
+            let mut plan_out: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_prepare_documents_json(
+                    appender,
+                    string_view(documents),
+                    &mut plan_out,
+                    &mut error
+                ),
+                0
+            );
+            let plan_json = owned_to_string(plan_out);
+            lodedb_owned_string_free(plan_out);
+            // One unit embedding per chunk the plan asks to embed.
+            let plan: serde_json::Value = serde_json::from_str(&plan_json).expect("plan json");
+            let chunk_count = plan["chunks_to_embed"].as_array().expect("chunks").len();
+            assert!(chunk_count >= 1);
+            let embeddings = serde_json::json!((0..chunk_count)
+                .map(|_| [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .collect::<Vec<_>>())
+            .to_string();
+            let mut lsn: u64 = 0;
+            assert_eq!(
+                lodedb_appender_append_embedded_documents_json(
+                    appender,
+                    borrowed_view(&plan_json),
+                    borrowed_view(&embeddings),
+                    &mut lsn,
+                    &mut error
+                ),
+                0
+            );
+            assert!(lsn > 0, "expected a positive LSN, got {lsn}");
+            lodedb_appender_free(appender);
+        }
+
+        // The next writer folds the appended text document in.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            let mut stats: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
+                0
+            );
+            let stats_json = owned_to_string(stats);
+            assert!(
+                stats_json.contains("\"document_count\":1"),
+                "expected the appended text document folded in: {stats_json}"
+            );
+            lodedb_owned_string_free(stats);
+            lodedb_engine_free(engine);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpointer_ffi_folds_an_appended_record() {
+        let dir = appender_temp_dir();
+        let options = wal_options_json(&dir);
+        let options_view = borrowed_view(&options); // outlives every use below
+
+        // A writer creates the index and checkpoints an empty base, then closes.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            lodedb_engine_free(engine);
+        }
+
+        // The checkpointer opens (folding nothing: the WAL is empty), THEN an appender
+        // logs a record. This is the running-checkpointer order: the record is folded
+        // by checkpoint(), not by the checkpointer's warm open.
+        let mut error: *mut LodeError = ptr::null_mut();
+        let mut checkpointer: *mut LodeCheckpointer = ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                lodedb_checkpointer_open_json(options_view, &mut checkpointer, &mut error),
+                0
+            );
+            assert!(!checkpointer.is_null());
+        }
+
+        unsafe {
+            let mut appender: *mut LodeAppender = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_open_json(options_view, &mut appender, &mut error),
+                0
+            );
+            let documents = r#"[{"document_id":"doc-a","vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"metadata":{"topic":"ops"},"text":null}]"#;
+            let mut lsn: u64 = 0;
+            assert_eq!(
+                lodedb_appender_append_vectors_json(
+                    appender,
+                    string_view(documents),
+                    &mut lsn,
+                    &mut error
+                ),
+                0
+            );
+            lodedb_appender_free(appender);
+        }
+
+        // checkpoint() folds the appended record into a fresh generation; a second
+        // checkpoint finds nothing new.
+        unsafe {
+            let mut folded: u64 = 0;
+            assert_eq!(
+                lodedb_checkpointer_checkpoint(checkpointer, &mut folded, &mut error),
+                0
+            );
+            assert!(folded >= 1, "expected at least one record folded, got {folded}");
+            let mut again: u64 = 0;
+            assert_eq!(
+                lodedb_checkpointer_checkpoint(checkpointer, &mut again, &mut error),
+                0
+            );
+            assert_eq!(again, 0, "second checkpoint folded {again}, expected 0");
+            lodedb_checkpointer_free(checkpointer);
+        }
+
+        // A null checkpointer is rejected as an invalid argument, not a crash.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut folded: u64 = 0;
+            let status =
+                lodedb_checkpointer_checkpoint(ptr::null_mut(), &mut folded, &mut error);
+            assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
+            lodedb_error_free(error);
+        }
+
+        // A read-only open reads only the committed generation (it never replays the
+        // WAL), so doc-a is present iff the checkpointer folded it in -- no writable
+        // open did.
+        let ro_options = serde_json::json!({
+            "path": dir.to_str().expect("utf-8 temp path"),
+            "read_only": true,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": false,
+            "index_text": false,
+        })
+        .to_string();
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(borrowed_view(&ro_options), &mut engine, &mut error),
+                0
+            );
+            let mut stats: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
+                0
+            );
+            let stats_json = owned_to_string(stats);
+            assert!(
+                stats_json.contains("\"document_count\":1"),
+                "expected the checkpointer to have folded doc-a: {stats_json}"
             );
             lodedb_owned_string_free(stats);
             lodedb_engine_free(engine);

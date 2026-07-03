@@ -10,14 +10,18 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// wrapper linked against a mismatched core fails the runtime version check
 /// cleanly instead of a missing-symbol error or a silent shape mismatch.
 ///
-/// Bumped to 2 for two changes in this release's ABI: the reader-freshness FFI
-/// (`lodedb_engine_refresh` / `lodedb_engine_applied_lsn`) was added, and the C
-/// create ABI was consolidated (the positional
-/// `lodedb_engine_create_index`/`_with_model` functions were retired for the
-/// single `lodedb_engine_create_index_json` entry point taking a minimal create
-/// request). The Python create path (PyO3 `create_index_with_options`) is
-/// unchanged.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 2;
+/// Bumped to 2 earlier this release for the reader-freshness FFI
+/// (`lodedb_engine_refresh` / `lodedb_engine_applied_lsn`) and the consolidated C
+/// create ABI. Bumped to 3 for the multi-producer text-append surface: the appender
+/// gained `lodedb_appender_prepare_documents_json` /
+/// `lodedb_appender_append_embedded_documents_json` (and the matching PyO3
+/// `CoreAppender.prepare_documents` / `append_embedded_documents`), so a wrapper
+/// built against the new header must not pair with an older core that lacks them.
+/// Bumped to 4 for the running single-checkpointer: the new
+/// `lodedb_checkpointer_open_json` / `lodedb_checkpointer_checkpoint` /
+/// `lodedb_checkpointer_free` symbols (and the matching PyO3 `CoreCheckpointer`), so
+/// a wrapper that drives a checkpointer must not pair with an older core lacking it.
+pub const NATIVE_CORE_ABI_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -29,6 +33,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 2);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 4);
     }
 }

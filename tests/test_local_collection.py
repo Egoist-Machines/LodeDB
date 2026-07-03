@@ -64,14 +64,14 @@ def test_manifest_persists_across_reopen(tmp_path):
         "vector_dim": 8,
         "bit_width": 4,
         "store_text": True,
-        "index_text": False,
+        "index_text": True,
     }
     assert reopened.space_config("notes") == {
         "kind": "preset",
         "model": "minilm",
         "bit_width": 4,
         "store_text": True,
-        "index_text": False,
+        "index_text": True,
     }
     reopened.close()
 
@@ -87,7 +87,7 @@ def test_custom_embedder_space_records_identity_and_reopens(tmp_path):
         "model_identity": "my-model",
         "bit_width": 4,
         "store_text": True,
-        "index_text": False,
+        "index_text": True,
     }
     col.close()
 
@@ -114,7 +114,7 @@ def test_preset_space_records_effective_bit_width(tmp_path):
         "model": "minilm",
         "bit_width": 4,
         "store_text": True,
-        "index_text": False,
+        "index_text": True,
     }
     col.close()
 

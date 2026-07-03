@@ -140,11 +140,11 @@ Each index is a per-index generation directory plus a single atomically-swapped 
     `g<epoch>.json.json-delta/`,
   - `g<epoch>.tvim` — the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
     encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
-  - `g<epoch>.tvtext` — the opt-in raw-text base (`store_text=True`): the full
+  - `g<epoch>.tvtext` — the raw-text base (`store_text`, on by default): the full
     `document_id -> text` map, plus its `.txd` text journal under `g<epoch>.tvtext.tvtext-delta/`,
     governed by the same root manifest,
-  - `g<epoch>.tvlex` — the opt-in lexical-index base (`index_text=True`): the full
-    `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
+  - `g<epoch>.tvlex` — the lexical-index base (`index_text`, which defaults to match `store_text`):
+    the full `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
     `g<epoch>.tvlex.tvlex-delta/`, governed by the same root manifest.
 
 A commit writes any new artifacts first — bases are generation-addressed and never
@@ -241,11 +241,12 @@ query of a generation and discarded when the generation advances. It is never wr
 `.json`/`.jsd`/`.tvim`/`.tvd` artifacts or to telemetry, which stays metrics-only (counts, bytes,
 latency, never tokens or terms).
 
-That serving index needs a source. By default it is rebuilt from the raw-text store, so hybrid and
-lexical search work whenever `store_text=True`. Opening with `index_text=True` adds a durable
-source: the per-chunk tokens of each document are captured at `add` time and kept in a dedicated
-lexical sidecar mapping `document_id -> per-chunk token lists`, a `g<epoch>.tvlex` base plus a
-`.lxd` delta journal. This mirrors the `.tvtext`/`.txd` raw-text pattern exactly: an incremental
+That serving index needs a source, and `index_text` defaults to match `store_text` (both on by
+default), so the default source is a durable one: the per-chunk tokens of each document are
+captured at `add` time and kept in a dedicated lexical sidecar mapping
+`document_id -> per-chunk token lists`, a `g<epoch>.tvlex` base plus a `.lxd` delta journal. With
+`index_text=False` the serving index is instead rebuilt from the raw-text store on open, so hybrid
+and lexical still work whenever `store_text=True`, just re-tokenized rather than loaded. This mirrors the `.tvtext`/`.txd` raw-text pattern exactly: an incremental
 commit journals only the upserted token lists and deleted ids (O(changed), not a full-map
 rewrite), a load replays the deltas onto the base, every base and segment is checksum-guarded and
 fails closed on a corrupt/mismatched file, and the manifest is pinned by the same root commit so
@@ -298,3 +299,37 @@ Each record carries a precomputed vector plus metadata, and (only when the appen
 `store_text`, off by default) a caption. So the appender honors the same `store_text` payload
 boundary as the single-writer paths above: it writes raw text to `<key>.wal` only when text
 retention is on, never otherwise.
+
+The appender also ingests full text, so text writes are multi-producer too. Because the core cannot
+embed (embeddings live in the binding layer), the appender takes the *post-embedding* shape: it
+chunks the documents (`prepare_documents`, using the store writer's `chunk_character_limit` so chunk
+ids match), the binding embeds the returned chunks, and `append_embedded_documents` logs one
+`apply_embedded_documents` record. This path is replay-independent -- it captures no base generation
+and is never `PlanStale` like the single-writer `prepare_text_upsert`/`apply_text_upsert` -- because
+the folding writer resolves a replacement's retired chunks from its own index state (so the appended
+record carries an empty removed-chunk list) and normalizes each record's text/tokens to its own
+`store_text`/`index_text` on fold. It is `append_text`/`append_text_many` in Python (`lodedb.Appender`,
+given an `embedder=`) and `append(text:...)` in Swift (`LodeAppender`, given a `LodeEmbedder`).
+
+**Running checkpointer.** Folding the WAL used to require re-opening a writable engine. A *running
+checkpointer* (`CoreCheckpointer`, exposed over the C ABI, in Python as `lodedb.Checkpointer`, and in
+Swift as `LodeCheckpointer`) removes that: one process folds the WAL into fresh committed generations
+continuously while appenders keep logging, so appended records become durable (and visible to a
+reader's `refresh`) without an application ever taking a writable open. It holds a crash-reclaimable
+*lease* on a `<dir>/.lodedb.checkpoint.lock` sentinel -- distinct from the writer lock, so it excludes
+neither appenders nor the writer and only elects one checkpointer at a time -- and takes the exclusive
+writer lock solely for the brief window of each `checkpoint()`. Single-applier ordering is preserved
+because every fold runs under that same exclusive lock a writable open would take; the fold is
+incremental (only records above the applied-LSN watermark, onto the already-warm index), and if a
+concurrent writer advanced the committed base since the last fold, the warm state is reloaded first so
+a fold never targets a stale base. A dead lessee's lease is reclaimed by the OS, so a fresh
+checkpointer takes over after a crash. The core exposes the mechanism (a one-shot `checkpoint()`
+returning the number of records folded); a binding drives it on a loop or timer.
+
+Because a checkpointer folds while appenders stay open, an appender no longer holds the shared lock for
+its lifetime: it takes the shared lock per append (re-reading the committed generation each time, so a
+reservation always clears a fold that advanced it between appends) and releases it in between, which is
+what lets the checkpointer take the exclusive lock to fold. This makes the appender's O(1) torn-tail
+repair span concurrent WAL growth: when bytes sit past its in-session watermark, it scans and truncates
+only to the last CRC-valid frame -- preserving records a concurrent writer or checkpointer left there
+-- rather than dropping the tail back to a now-stale boundary.

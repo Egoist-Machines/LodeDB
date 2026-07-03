@@ -17,6 +17,7 @@ from lodedb.local.backends import (
     build_local_embedding_backend,
     resolve_local_device,
 )
+from lodedb.local.checkpointer import Checkpointer
 from lodedb.local.collection import LodeCollection
 from lodedb.local.db import (
     AnnOptions,
@@ -36,6 +37,7 @@ __all__ = [
     "LOCAL_MODEL_PRESETS",
     "AnnOptions",
     "Appender",
+    "Checkpointer",
     "ConcurrentWriterError",
     "ImageEmbeddingUnsupportedError",
     "LodeCollection",

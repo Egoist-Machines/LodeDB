@@ -95,7 +95,7 @@ def _build_factory_class() -> type:
         from an optional ``lodedb:`` block in ``settings.yaml`` (see :func:`_lodedb_settings`):
         ``path`` (default ``local_data/lodedb``), ``model`` (default ``minilm``), ``device``
         (default ``auto``), ``store_text`` (default ``True``; keep it on for hybrid/lexical), and
-        ``index_text`` (default ``False``).
+        ``index_text`` (default follows ``store_text``, so ``True`` unless ``store_text`` is off).
         """
 
         def __init__(self, settings: Any, embed_dim: int | None = None) -> None:
@@ -106,7 +106,8 @@ def _build_factory_class() -> type:
             self._model = str(opts["model"])
             self._device = str(opts["device"])
             self._store_text = bool(opts["store_text"])
-            self._index_text = bool(opts["index_text"])
+            # None means "follow store_text" (LodeDB resolves it); preserve it.
+            self._index_text = None if opts["index_text"] is None else bool(opts["index_text"])
 
         def vector_store(self, collection: str) -> BasePydanticVectorStore:
             """Returns (caching per collection) a LodeDB-backed store for ``collection``."""
@@ -141,7 +142,7 @@ _DEFAULT_LODEDB_OPTIONS: dict[str, Any] = {
     "model": "minilm",
     "device": "auto",
     "store_text": True,
-    "index_text": False,
+    "index_text": None,
 }
 
 

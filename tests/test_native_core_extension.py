@@ -108,7 +108,7 @@ def _text_add_search_embed_counts(mode, write_mode, store_dir, monkeypatch):
 
 
 def test_native_core_extension_executes_vector_store_flow() -> None:
-    assert native_core.native_core_abi_version() == 2
+    assert native_core.native_core_abi_version() == 4
     engine = native_core.CoreEngine()
     engine.create_index("default", 8, 4)
     mutation = _loads(
@@ -1327,6 +1327,51 @@ def test_public_appender_api_round_trip(tmp_path) -> None:
         reopened.close()
 
 
+def test_public_appender_append_text_round_trip(tmp_path) -> None:
+    """The public `lodedb.Appender.append_text` chunks and embeds a document through
+    the configured backend, logs a post-embedding text record, and the next writable
+    `LodeDB` open folds it in, leaving the appended text searchable."""
+
+    import lodedb
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+    store = tmp_path / "store"
+    backend = HashEmbeddingBackend(native_dim=384)
+    db = lodedb.LodeDB(store, _embedding_backend=backend, store_text=True, index_text=True)
+    db.add("a seed document about apples", id="seed")
+    db.close()  # release the writer lock so the shared-lock appender can open
+
+    with lodedb.Appender.open(
+        store, store_text=True, index_text=True, embedder=backend
+    ) as appender:
+        lsn = appender.append_text(
+            "launch code report zebra", id="doc-a", metadata={"topic": "ops"}
+        )
+        assert lsn > 0
+
+    reopened = lodedb.LodeDB(store, _embedding_backend=backend, store_text=True, index_text=True)
+    try:
+        assert reopened.count() == 2  # seed + the appended document
+        hits = reopened.search("zebra", k=5, mode="lexical")
+        assert any(hit.id == "doc-a" for hit in hits)
+    finally:
+        reopened.close()
+
+
+def test_public_appender_append_text_requires_embedder(tmp_path) -> None:
+    """`append_text` on an appender opened without an embedder raises, not silently
+    no-ops: text ingest needs one and the vector-in path never embeds."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    db.close()
+    with lodedb.Appender.open(store) as appender:
+        with pytest.raises(RuntimeError, match="embedder"):
+            appender.append_text("hello world", id="doc-a")
+
+
 def test_read_only_refresh_gives_reader_freshness_and_read_your_writes(tmp_path) -> None:
     """A read-only LodeDB is a stable snapshot until refresh(), which overlays the
     WAL tail an Appender wrote -- giving reader freshness and read-your-writes:
@@ -1459,6 +1504,135 @@ def test_public_appender_retains_caption_text(tmp_path) -> None:
         assert reopened.get_text("vec-2") is None
     finally:
         reopened.close()
+
+
+def test_public_appender_append_time_contention_raises_concurrent_writer_error(tmp_path) -> None:
+    """Per-append lock contention surfaces the SDK's stable ConcurrentWriterError, not a
+    bare ValueError. The appender takes the shared lock per append (not for its
+    lifetime, so a running checkpointer can fold between appends), so a writer or
+    checkpointer holding the exclusive lock at the instant of an append contends here,
+    after open."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    previous = os.environ.get("LODEDB_PERSIST_LOCK_TIMEOUT")
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        # The appender holds no lock between appends, so a writable open succeeds while
+        # it stays open; that writer then holds the exclusive lock the next append needs.
+        appender = lodedb.Appender.open(store)
+        writer = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+        try:
+            with pytest.raises(lodedb.ConcurrentWriterError):
+                appender.append(_onehot(0), id="doc-a")
+        finally:
+            writer.close()
+        appender.close()
+    finally:
+        if previous is None:
+            os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+        else:
+            os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = previous
+
+
+def test_native_core_checkpointer_folds_through_the_adapter(tmp_path) -> None:
+    """The `NativeCoreAdapter.open_checkpointer` wrapper drives the real extension: a
+    checkpoint folds an appended record and returns the count, and a second pass folds
+    nothing new."""
+
+    from lodedb.engine.core import EngineVectorDocument
+    from lodedb.engine.native_adapter import NativeCoreAdapter
+
+    store = tmp_path / "store"
+    store.mkdir()
+    engine = native_core.CoreEngine.open(_wal_store_options(store))
+    engine.create_index("default", 8, 4)
+    engine.persist()
+    del engine
+
+    adapter = NativeCoreAdapter()
+    # Open the checkpointer first (folds nothing), then append: checkpoint() folds it.
+    checkpointer = adapter.open_checkpointer(path=store)
+    appender = adapter.open_appender(path=store)
+    lsn = appender.append_vectors(
+        [EngineVectorDocument("doc-a", _onehot(0), metadata={"topic": "ops"}, text=None)]
+    )
+    assert lsn > 0
+    del appender
+
+    assert checkpointer.checkpoint() >= 1
+    assert checkpointer.checkpoint() == 0
+    checkpointer.close()
+
+    # A read-only open reads only the committed base (it never replays the WAL): doc-a
+    # is there because the checkpointer folded it, not because a writable open did.
+    read_only_options = json.dumps(
+        {
+            "path": str(store),
+            "read_only": True,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": False,
+            "index_text": False,
+        }
+    )
+    reader = native_core.CoreEngine.open_readonly(str(store), read_only_options)
+    stats = _loads(reader.stats("default"))
+    assert stats["document_count"] == 1
+    del reader
+
+
+def test_public_checkpointer_folds_appends_into_the_committed_generation(tmp_path) -> None:
+    """The headline of the running checkpointer: it folds a concurrently-appended record
+    into a fresh COMMITTED generation while the appender stays open, with no application
+    re-opening a writable LodeDB. A brand-new read-only open (which reads only the
+    committed base, not the WAL) sees it."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    with lodedb.Checkpointer.open(store) as checkpointer, lodedb.Appender.open(store) as appender:
+        lsn = appender.append(_onehot(0), id="fresh", metadata={"topic": "ops"})
+        assert lsn > 0
+        # Fold while the appender is still open (the checkpointer takes the writer lock
+        # only for this fold; the appender takes the shared lock only per append).
+        assert checkpointer.checkpoint() >= 1
+        assert checkpointer.checkpoint() == 0
+
+    reader = lodedb.LodeDB.open_vector_store(store, vector_dim=8, read_only=True)
+    try:
+        assert reader.count() == 1
+        hits = reader.search_by_vector(_onehot(0), k=1)
+        assert [hit.id for hit in hits] == ["fresh"]
+    finally:
+        reader.close()
+
+
+def test_public_checkpointer_lease_excludes_a_second_checkpointer(tmp_path) -> None:
+    """One checkpointer at a time: while one holds the lease, a second open fails fast
+    with ConcurrentWriterError (LODEDB_PERSIST_LOCK_TIMEOUT=0)."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    lodedb.LodeDB.open_vector_store(store, vector_dim=8).close()
+
+    previous = os.environ.get("LODEDB_PERSIST_LOCK_TIMEOUT")
+    os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = "0"
+    try:
+        with lodedb.Checkpointer.open(store):
+            with pytest.raises(lodedb.ConcurrentWriterError):
+                lodedb.Checkpointer.open(store)
+    finally:
+        if previous is None:
+            os.environ.pop("LODEDB_PERSIST_LOCK_TIMEOUT", None)
+        else:
+            os.environ["LODEDB_PERSIST_LOCK_TIMEOUT"] = previous
 
 
 def test_public_ann_option_creates_and_serves_a_cluster_store(tmp_path) -> None:

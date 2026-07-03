@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from lodedb._turbovec import (  # type: ignore[attr-defined]
     CoreAppender,
+    CoreCheckpointer,
     CoreEngine,
     core_document_to_json,
     cuda_runtime_available,
@@ -22,6 +23,7 @@ __version__ = native_core_version()
 
 __all__ = [
     "CoreAppender",
+    "CoreCheckpointer",
     "CoreEngine",
     "__version__",
     "core_document_to_json",

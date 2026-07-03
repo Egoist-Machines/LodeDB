@@ -703,7 +703,8 @@ def test_privategpt_provider_settings_defaults_and_override(tmp_path, monkeypatc
     defaults = _lodedb_settings(_StubSettings(lodedb=None))
     assert defaults["model"] == "minilm"
     assert defaults["store_text"] is True
-    assert defaults["index_text"] is False
+    # index_text default follows store_text (resolved by LodeDB); None until set.
+    assert defaults["index_text"] is None
     assert defaults["path"] == "local_data/lodedb"
 
     # A partial block overrides only the keys it sets.

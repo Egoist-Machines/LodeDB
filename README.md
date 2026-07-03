@@ -237,11 +237,13 @@ source enabled when you open the database. `mode="vector"` (the default) needs n
 | --- | --- | --- |
 | `"vector"` (default) | nothing | not used |
 | `"hybrid"`, `"lexical"` | `store_text=True` (on by default) | rebuilt in memory from the retained raw text |
-| `"hybrid"`, `"lexical"` | `index_text=True` | a durable on-disk postings store, no raw text required |
+| `"hybrid"`, `"lexical"` | `index_text=True` (on by default, follows `store_text`) | a durable on-disk postings store, no raw text required |
 
-Either source is enough and you can enable both. `store_text=True` is the default, so hybrid
-works out of the box. With neither source enabled, a hybrid or lexical query raises a clear,
-actionable error rather than silently degrading.
+Both sources are on by default, so hybrid and lexical work out of the box: `store_text=True`
+retains the raw text and `index_text` defaults to match it, persisting the lexical postings.
+Either source alone is enough, and `index_text` decouples from `store_text` when set explicitly.
+With neither source enabled (`store_text=False, index_text=False`), a hybrid or lexical query
+raises a clear, actionable error rather than silently degrading.
 </details>
 
 <details>
@@ -258,16 +260,17 @@ chunks into the existing index, so a single `add` never forces a full re-tokeniz
 <details>
 <summary><b>Durable lexical index (`index_text=True`)</b></summary>
 
-By default the BM25 index is rebuilt from the retained raw text, so it needs `store_text=True`
-and is re-tokenized on the first hybrid query after opening. Pass `index_text=True` to persist
-it instead: each document's per-chunk terms are captured at `add` time into a dedicated `.tvlex`
-sidecar (a base plus a `.lxd` delta journal, committed O(changed) per write), so hybrid and
-lexical search survive a reopen rebuilt straight from the persisted terms, with no
-re-tokenization and without retaining the raw text at all. The `.tvlex` sidecar holds
-payload-derived terms only and, like the raw-text sidecar, never reaches the redacted artifacts
-or telemetry. The tokenizer lowercases and splits on punctuation but keeps code-like tokens
-whole, so `ABC-123` and `2024-01-15` stay findable as single tokens. Reopen with the same
-`index_text` value you wrote with.
+`index_text` defaults to match `store_text` (on by default), so each document's per-chunk terms
+are captured at `add` time into a dedicated `.tvlex` sidecar (a base plus a `.lxd` delta journal,
+committed O(changed) per write). Hybrid and lexical search then survive a reopen rebuilt straight
+from the persisted terms, with no re-tokenization. Pass `index_text=False` to skip persistence:
+with `store_text=True` the index is instead rebuilt in memory from the retained raw text on the
+first hybrid query after opening. Set it explicitly to decouple the two, e.g. `index_text=True,
+store_text=False` for a durable lexical index that retains no raw text at all. The `.tvlex`
+sidecar holds payload-derived terms only and, like the raw-text sidecar, never reaches the
+redacted artifacts or telemetry. The tokenizer lowercases and splits on punctuation but keeps
+code-like tokens whole, so `ABC-123` and `2024-01-15` stay findable as single tokens. Reopen with
+the same effective `index_text` value you wrote with.
 
 ```python
 db = LodeDB(path="./data", index_text=True, store_text=False)  # durable lexical index, no raw text
@@ -568,11 +571,25 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
   and become queryable after the next writable open folds them in, or immediately in a read-only
   handle that calls `refresh()` to overlay the WAL tail (whose `applied_lsn()` then gives
   read-your-writes against an append's returned LSN). On Windows the shared lock degrades to an
-  exclusive hold, so appenders serialize there rather than coexisting. Each record is a precomputed
-  vector plus metadata, and an optional caption (e.g. for an image) retained only when the appender
-  opts into `store_text` (off by default, so no raw text reaches the WAL); it requires WAL commit
-  mode. Exposed as the native `CoreAppender`, over the C ABI, in Python (`lodedb.Appender`), and in
-  Swift (`LodeAppender`).
+  exclusive hold, so appenders serialize there rather than coexisting. A record is a precomputed
+  vector plus metadata (with an optional caption, e.g. for an image, retained only when the appender
+  opts into `store_text` -- off by default, so no raw text reaches the WAL); with an embedder
+  configured, the appender also ingests full text (chunked by the core, embedded in the binding
+  layer, then logged as a post-embedding record) so text writes are multi-producer too, without a
+  captured base generation. It requires WAL commit mode. Exposed as the native `CoreAppender`, over
+  the C ABI, in Python (`lodedb.Appender`: `append`/`append_many` for vectors,
+  `append_text`/`append_text_many` for text), and in Swift (`LodeAppender`).
+- **Running checkpointer (WAL mode).** So appended records become durable without an
+  application re-opening a writer, a *running checkpointer* folds the WAL into fresh
+  generations continuously. It holds a crash-reclaimable lease (a sentinel distinct from
+  the writer lock, so it elects one checkpointer at a time) and takes the exclusive writer
+  lock only for the brief window of each fold, so appenders keep logging between folds.
+  Drive its `checkpoint()` on a loop or timer; each fold advances the committed generation,
+  so a read-only handle's `refresh()` (or a fresh open) sees the appended records shortly
+  after they are logged, with no writable open in the loop. A dead lease-holder's lease is
+  reclaimable, so a fresh checkpointer takes over after a crash. Exposed as the native
+  `CoreCheckpointer`, over the C ABI, in Python (`lodedb.Checkpointer`), and in Swift
+  (`LodeCheckpointer`).
 - **Local filesystems only.** The OS advisory lock is unreliable on NFS/SMB.
 
 ## Swift / iOS

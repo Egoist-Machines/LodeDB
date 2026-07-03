@@ -539,7 +539,9 @@ struct NativeVectorDocumentJSON: Encodable {
     }
 }
 
-private struct NativeCoreDocumentJSON: Encodable {
+// Internal (not private): also encoded/decoded by `LodeAppender`'s text-append path
+// in Appender.swift, which reuses the exact writer shapes.
+struct NativeCoreDocumentJSON: Encodable {
     let documentID: String
     let text: String
     let metadata: [String: String]
@@ -551,7 +553,7 @@ private struct NativeCoreDocumentJSON: Encodable {
     }
 }
 
-private struct NativeIngestPlanJSON: Decodable {
+struct NativeIngestPlanJSON: Decodable {
     let documents: [NativePlanDocumentJSON]
     let chunksToEmbed: [NativePlanEmbeddingChunkJSON]
 
@@ -561,7 +563,7 @@ private struct NativeIngestPlanJSON: Decodable {
     }
 }
 
-private struct NativePlanDocumentJSON: Decodable {
+struct NativePlanDocumentJSON: Decodable {
     let documentID: String
     let metadata: [String: String]
     let text: String?
@@ -575,7 +577,7 @@ private struct NativePlanDocumentJSON: Decodable {
     }
 }
 
-private struct NativePlanDocumentChunkJSON: Decodable {
+struct NativePlanDocumentChunkJSON: Decodable {
     let chunkID: String
     let text: String
     let tokens: [String]
@@ -587,7 +589,7 @@ private struct NativePlanDocumentChunkJSON: Decodable {
     }
 }
 
-private struct NativePlanEmbeddingChunkJSON: Decodable {
+struct NativePlanEmbeddingChunkJSON: Decodable {
     let text: String
 }
 

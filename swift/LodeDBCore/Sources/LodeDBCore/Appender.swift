@@ -52,19 +52,23 @@ public final class LodeAppender {
     /// WAL). These are appender-specific defaults, so customizing another argument
     /// never turns retention on by accident. To retain appended captions, pass
     /// `storeText: true`, and only for a store whose writer also retains text, or the
-    /// writer drops the caption at checkpoint.
+    /// writer drops the caption at checkpoint. `chunkCharacterLimit` (used only by
+    /// `append(text:...)`) must match the store writer's (`LodeDB.addText`'s default
+    /// is 8192) so appended text chunks identically.
     public static func open(
         at path: URL,
         durability: Durability = .fsync,
         storeText: Bool = false,
         indexText: Bool = false,
-        acquireWriterLock: Bool = true
+        acquireWriterLock: Bool = true,
+        chunkCharacterLimit: Int = 8192
     ) throws -> LodeAppender {
         let options = LodeStoreOptions(
             durability: durability,
             commitMode: .wal,
             storeText: storeText,
             indexText: indexText,
+            chunkCharacterLimit: chunkCharacterLimit,
             acquireWriterLock: acquireWriterLock
         )
         let optionsJSON = try options.coreOpenOptionsJSON(path: path.path, readOnly: false)
@@ -102,5 +106,38 @@ public final class LodeAppender {
     @discardableResult
     public func delete(ids: [String]) throws -> UInt64 {
         try native.appendDeletesJSON(try encodeJSON(ids))
+    }
+
+    /// Chunks and embeds `text` (via `embedder`), logs one post-embedding text record,
+    /// and returns its log sequence number.
+    ///
+    /// The document is chunked by the native core exactly as `LodeDB.addText` chunks
+    /// it (at the appender's `chunkCharacterLimit`), each chunk is embedded, and the
+    /// record is logged for the next writable open to fold. Whether the raw text and
+    /// lexical tokens are retained follows the `storeText`/`indexText` the appender was
+    /// opened with (match the store's writer). The vector-in `append` never embeds and
+    /// needs no embedder. `id` is required (auto-ids would collide across writers).
+    @discardableResult
+    public func append(
+        text: String,
+        id: String,
+        metadata: [String: String] = [:],
+        embedder: LodeEmbedder
+    ) throws -> UInt64 {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LodeDBError.invalidArgument("id is required")
+        }
+        let documentsJSON = try encodeJSON([
+            NativeCoreDocumentJSON(documentID: id, text: text, metadata: metadata)
+        ])
+        let planJSON = try native.prepareDocumentsJSON(documentsJSON)
+        let plan = try decodeJSON(NativeIngestPlanJSON.self, from: planJSON)
+        // The native core validates the embedding dimension against the index; embed
+        // the chunks it asked for and log the post-embedding record.
+        let embeddings = try embedder.embed(texts: plan.chunksToEmbed.map(\.text), role: .document)
+        return try native.appendEmbeddedDocumentsJSON(
+            planJSON: planJSON,
+            embeddingsJSON: try encodeJSON(embeddings)
+        )
     }
 }

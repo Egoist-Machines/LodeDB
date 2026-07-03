@@ -118,3 +118,47 @@ import Testing
         try reopened.close()
     }
 }
+
+/// A tiny deterministic embedder: axis 1 for text containing "zebra", axis 0
+/// otherwise. Enough to exercise the text-append path without a real model.
+private struct KeywordEmbedder: LodeEmbedder {
+    var dimension: Int { 8 }
+    func embed(texts: [String]) throws -> [[Float]] {
+        texts.map { text in
+            var vector = [Float](repeating: 0, count: 8)
+            vector[text.contains("zebra") ? 1 : 0] = 1
+            return vector
+        }
+    }
+}
+
+@Test func appenderFoldsEmbeddedTextIntoNextWriter() throws {
+    let store = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lodedb-appender-text-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: store) }
+
+    let embedder = KeywordEmbedder()
+
+    // A writer creates the text store (store_text/index_text on by default) with one
+    // seed document, then closes so the shared appender can open.
+    let writer = try LodeDB(path: store, vectorDimension: embedder.dimension)
+    try writer.addText("a seed document about apples", id: "seed", embedder: embedder)
+    try writer.close()
+
+    // The appender chunks + embeds a text document and logs a post-embedding record.
+    do {
+        let appender = try LodeAppender.open(at: store, storeText: true, indexText: true)
+        let lsn = try appender.append(
+            text: "launch code report zebra", id: "doc-a", metadata: ["topic": "ops"],
+            embedder: embedder)
+        #expect(lsn > 0)
+    }
+
+    // The next writer folds the appended text in: both documents present, and the
+    // appended raw text is retained (store_text on).
+    let reopened = try LodeDB(path: store, vectorDimension: embedder.dimension)
+    #expect(reopened.count == 2)
+    #expect(try reopened.get("doc-a") == "launch code report zebra")
+    try reopened.close()
+}
