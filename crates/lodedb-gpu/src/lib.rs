@@ -322,22 +322,22 @@ fn debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("LODEDB_GPU_DEBUG").is_some())
 }
 
-/// Whether the opt-in fused two-stage top-k is enabled (`LODEDB_GPU_FUSED_TOPK`).
+/// Whether the fused two-stage top-k is enabled (`LODEDB_GPU_FUSED_TOPK`).
 ///
-/// Off by default: the proven cuBLAS GEMM + `topk_argmax` path stays the default
-/// until the fused path is validated on real hardware (A10/L40S), since it cannot
-/// be compiled or profiled on a CPU-only host. Enabled for any value other than the
-/// usual falsey set. It only changes how the top-k is selected from the identical
-/// cuBLAS scores, so results are unchanged; the flag exists to de-risk an
-/// unprofiled kernel, not to alter output.
+/// On by default: the fused path reads each cuBLAS score once instead of the `k`
+/// times `topk_argmax` rescans it, and returns the identical top-k (same cuBLAS
+/// scores, same (score desc, slot asc) order) — verified by exact-parity tests on
+/// A10 and L40S. Set `LODEDB_GPU_FUSED_TOPK=off` (or `0`/`false`/`no`) to force the
+/// legacy `topk_argmax` path. Mirrors the on-by-default `LODEDB_GPU_DIRECT_TURBOVEC`
+/// knob: any other value leaves it enabled.
 fn fused_topk_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("LODEDB_GPU_FUSED_TOPK") {
         Ok(value) => {
             let v = value.trim().to_ascii_lowercase();
-            !(v.is_empty() || v == "0" || v == "off" || v == "false" || v == "no")
+            !(v == "0" || v == "off" || v == "false" || v == "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 
@@ -1255,11 +1255,11 @@ mod tests {
             eprintln!("skipping gpu_fused_topk_matches_two_pass: no CUDA runtime");
             return;
         }
-        // Corpus spans several fused chunks with a ragged last chunk (n not a
-        // multiple of FUSED_CHUNK_ROWS) and a large k, so stage 1 hits chunk
-        // exhaustion and stage 2 does real merging.
+        // Corpus spans many fused chunks with a ragged last chunk (n not a multiple
+        // of FUSED_CHUNK_ROWS) and a large k, so stage 2 merges a large partial set
+        // (num_chunks * k) and stage 1 hits chunk exhaustion.
         let (dim, nq, k) = (96usize, 12usize, 100usize);
-        let n = FUSED_CHUNK_ROWS * 2 + 777;
+        let n = FUSED_CHUNK_ROWS * 40 + 777;
         let rows = pseudo_fill(n * dim, 0x1357_9bdf);
         let rotation = pseudo_fill(dim * dim, 0x2468_ace0);
         let queries = pseudo_fill(nq * dim, 0x0bad_f00d);
@@ -1311,6 +1311,23 @@ mod tests {
             .expect("session build on a CUDA host");
 
         eprintln!("gpu_fused_topk_timing: n={n} dim={dim} k={k}");
+
+        // Parity at the bench corpus (n is 1,000,000 under bench_a10/bench_l40s):
+        // the fused path must match the default exactly here too, not only in the
+        // smaller-corpus gpu_fused_topk_matches_two_pass test.
+        let probe = pseudo_fill(16 * dim, 0x0000_fa11);
+        let (probe_base_scores, probe_base_ids) = session
+            .search_variant(&probe, 16, k, false)
+            .expect("default probe");
+        let (probe_fused_scores, probe_fused_ids) = session
+            .search_variant(&probe, 16, k, true)
+            .expect("fused probe");
+        assert_eq!(probe_fused_ids, probe_base_ids, "fused ids differ from default at n={n}");
+        assert_eq!(
+            probe_fused_scores, probe_base_scores,
+            "fused scores differ from default at n={n}"
+        );
+
         let iters = 20;
         for &nq in &[4usize, 16, 64, 256, 1024] {
             let queries = pseudo_fill(nq * dim, 0xa11ce ^ nq as u64);
