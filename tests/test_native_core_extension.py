@@ -108,7 +108,7 @@ def _text_add_search_embed_counts(mode, write_mode, store_dir, monkeypatch):
 
 
 def test_native_core_extension_executes_vector_store_flow() -> None:
-    assert native_core.native_core_abi_version() == 2
+    assert native_core.native_core_abi_version() == 3
     engine = native_core.CoreEngine()
     engine.create_index("default", 8, 4)
     mutation = _loads(
@@ -1325,6 +1325,51 @@ def test_public_appender_api_round_trip(tmp_path) -> None:
         assert hits[0].metadata.get("topic") == "ops"
     finally:
         reopened.close()
+
+
+def test_public_appender_append_text_round_trip(tmp_path) -> None:
+    """The public `lodedb.Appender.append_text` chunks and embeds a document through
+    the configured backend, logs a post-embedding text record, and the next writable
+    `LodeDB` open folds it in, leaving the appended text searchable."""
+
+    import lodedb
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+
+    store = tmp_path / "store"
+    backend = HashEmbeddingBackend(native_dim=384)
+    db = lodedb.LodeDB(store, _embedding_backend=backend, store_text=True, index_text=True)
+    db.add("a seed document about apples", id="seed")
+    db.close()  # release the writer lock so the shared-lock appender can open
+
+    with lodedb.Appender.open(
+        store, store_text=True, index_text=True, embedder=backend
+    ) as appender:
+        lsn = appender.append_text(
+            "launch code report zebra", id="doc-a", metadata={"topic": "ops"}
+        )
+        assert lsn > 0
+
+    reopened = lodedb.LodeDB(store, _embedding_backend=backend, store_text=True, index_text=True)
+    try:
+        assert reopened.count() == 2  # seed + the appended document
+        hits = reopened.search("zebra", k=5, mode="lexical")
+        assert any(hit.id == "doc-a" for hit in hits)
+    finally:
+        reopened.close()
+
+
+def test_public_appender_append_text_requires_embedder(tmp_path) -> None:
+    """`append_text` on an appender opened without an embedder raises, not silently
+    no-ops: text ingest needs one and the vector-in path never embeds."""
+
+    import lodedb
+
+    store = tmp_path / "store"
+    db = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    db.close()
+    with lodedb.Appender.open(store) as appender:
+        with pytest.raises(RuntimeError, match="embedder"):
+            appender.append_text("hello world", id="doc-a")
 
 
 def test_read_only_refresh_gives_reader_freshness_and_read_your_writes(tmp_path) -> None:

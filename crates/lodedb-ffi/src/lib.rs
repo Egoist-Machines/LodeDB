@@ -1207,6 +1207,66 @@ pub unsafe extern "C" fn lodedb_appender_append_deletes_json(
     })
 }
 
+/// Chunks a JSON array of `CoreDocument` objects into an `IngestPlan` the caller
+/// embeds before calling `lodedb_appender_append_embedded_documents_json`.
+///
+/// Embeddings stay in the caller. The returned JSON is an `IngestPlan` and must be
+/// released with `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `appender`, `documents_json`, and `out` must be valid for the duration of the
+/// call. `documents_json` must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_prepare_documents_json(
+    appender: *const LodeAppender,
+    documents_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let appender = appender_ref(appender)?;
+        let documents = read_json_view::<Vec<CoreDocument>>(documents_json)?;
+        let plan = appender.prepare_documents(&documents)?;
+        let result = owned_json(&plan)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
+/// Durably appends one `apply_embedded_documents` record from a JSON `IngestPlan`
+/// (returned by `lodedb_appender_prepare_documents_json`) and caller-provided
+/// embeddings JSON (one per `chunks_to_embed`, in order), writing the assigned LSN
+/// to `out_lsn`. The plan's `store_text`/`index_text` must match the appender.
+///
+/// # Safety
+///
+/// `appender`, `plan_json`, `embeddings_json`, and `out_lsn` must be valid for the
+/// duration of the call. String views must contain valid UTF-8 JSON.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_appender_append_embedded_documents_json(
+    appender: *const LodeAppender,
+    plan_json: LodeStringView,
+    embeddings_json: LodeStringView,
+    out_lsn: *mut u64,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out_value(out_lsn)?;
+        let appender = appender_ref(appender)?;
+        let plan = read_json_view::<IngestPlan>(plan_json)?;
+        let embeddings = read_json_view::<Vec<Vec<f32>>>(embeddings_json)?;
+        let lsn = appender.append_embedded_documents(&plan, &embeddings)?;
+        unsafe {
+            *out_lsn = lsn;
+        }
+        Ok(())
+    })
+}
+
 fn ffi_result(error: *mut *mut LodeError, f: impl FnOnce() -> Result<(), CoreError>) -> u32 {
     clear_error(error);
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -1715,6 +1775,104 @@ mod tests {
             assert!(
                 stats_json.contains("\"document_count\":0"),
                 "expected doc-a folded in then deleted: {stats_json}"
+            );
+            lodedb_owned_string_free(stats);
+            lodedb_engine_free(engine);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn appender_text_ffi_round_trips_through_a_durable_store() {
+        let dir = appender_temp_dir();
+        // Retain text + tokens so the folded document is present after the fold.
+        let options = serde_json::json!({
+            "path": dir.to_str().expect("utf-8 temp path"),
+            "read_only": false,
+            "durability": "buffered",
+            "commit_mode": "wal",
+            "store_text": true,
+            "index_text": true,
+            "acquire_writer_lock": true,
+        })
+        .to_string();
+        let options_view = borrowed_view(&options);
+
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            lodedb_engine_free(engine);
+        }
+
+        // Prepare a text document into an IngestPlan, embed its chunks, and append the
+        // post-embedding record -- all through the appender FFI.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut appender: *mut LodeAppender = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_open_json(options_view, &mut appender, &mut error),
+                0
+            );
+            let documents = r#"[{"document_id":"doc-a","text":"hello world","metadata":{}}]"#;
+            let mut plan_out: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_appender_prepare_documents_json(
+                    appender,
+                    string_view(documents),
+                    &mut plan_out,
+                    &mut error
+                ),
+                0
+            );
+            let plan_json = owned_to_string(plan_out);
+            lodedb_owned_string_free(plan_out);
+            // One unit embedding per chunk the plan asks to embed.
+            let plan: serde_json::Value = serde_json::from_str(&plan_json).expect("plan json");
+            let chunk_count = plan["chunks_to_embed"].as_array().expect("chunks").len();
+            assert!(chunk_count >= 1);
+            let embeddings = serde_json::json!((0..chunk_count)
+                .map(|_| [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .collect::<Vec<_>>())
+            .to_string();
+            let mut lsn: u64 = 0;
+            assert_eq!(
+                lodedb_appender_append_embedded_documents_json(
+                    appender,
+                    borrowed_view(&plan_json),
+                    borrowed_view(&embeddings),
+                    &mut lsn,
+                    &mut error
+                ),
+                0
+            );
+            assert!(lsn > 0, "expected a positive LSN, got {lsn}");
+            lodedb_appender_free(appender);
+        }
+
+        // The next writer folds the appended text document in.
+        unsafe {
+            let mut error: *mut LodeError = ptr::null_mut();
+            let mut engine: *mut LodeEngine = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_open_json(options_view, &mut engine, &mut error),
+                0
+            );
+            let mut stats: *mut LodeOwnedString = ptr::null_mut();
+            assert_eq!(
+                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
+                0
+            );
+            let stats_json = owned_to_string(stats);
+            assert!(
+                stats_json.contains("\"document_count\":1"),
+                "expected the appended text document folded in: {stats_json}"
             );
             lodedb_owned_string_free(stats);
             lodedb_engine_free(engine);

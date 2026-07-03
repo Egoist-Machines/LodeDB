@@ -186,6 +186,7 @@ class NativeCoreAdapter:
         store_text: bool = False,
         index_text: bool = False,
         acquire_writer_lock: bool = True,
+        chunk_character_limit: int = 900,
     ) -> NativeCoreAppenderHandle:
         """Opens a shared-lock appender over the single index at ``path``.
 
@@ -212,7 +213,9 @@ class NativeCoreAdapter:
             commit_mode="wal",
             store_text=store_text,
             index_text=index_text,
-            chunk_character_limit=8192,
+            # Match the store writer's chunking (LodeDB defaults to 900) so an appended
+            # text document is chunked identically to one added by the writer.
+            chunk_character_limit=chunk_character_limit,
             acquire_writer_lock=acquire_writer_lock,
         )
         return NativeCoreAppenderHandle(module.CoreAppender.open(_dumps(options)))
@@ -877,4 +880,30 @@ class NativeCoreAppenderHandle:
             self._appender.append_deletes(
                 _dumps([str(document_id) for document_id in document_ids])
             )
+        )
+
+    def prepare_documents(self, documents: Iterable[EngineDocument]) -> NativeCorePayload:
+        """Chunks text documents into an ingest plan (embeddings stay in the caller).
+
+        The plan's ``chunks_to_embed`` are embedded by the caller and handed back to
+        :meth:`append_embedded_documents`; the appender captures no base generation.
+        """
+
+        payload = [NativeCoreAdapter.document_payload(document) for document in documents]
+        plan_json = self._appender.prepare_documents(_dumps(payload))
+        return NativeCorePayload(json.loads(plan_json), native_json=plan_json)
+
+    def append_embedded_documents(
+        self,
+        plan: Mapping[str, Any],
+        embeddings: Iterable[Iterable[float]],
+    ) -> int:
+        """Durably logs one post-embedding text record for ``plan`` and returns its LSN."""
+
+        plan_json = (
+            plan.native_json if isinstance(plan, NativeCorePayload) else _dumps(dict(plan))
+        )
+        embedding_payload = [[float(value) for value in row] for row in embeddings]
+        return int(
+            self._appender.append_embedded_documents(plan_json, _dumps(embedding_payload))
         )

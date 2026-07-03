@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 2
+let lodeNativeExpectedABIVersion: UInt32 = 3
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -451,7 +451,7 @@ final class NativeEngine {
         }
     }
 
-    private static func copyOwnedString(_ out: UnsafeMutablePointer<LodeOwnedString>?) throws -> String {
+    fileprivate static func copyOwnedString(_ out: UnsafeMutablePointer<LodeOwnedString>?) throws -> String {
         guard let out else {
             throw LodeDBError.internalError("native core did not return JSON")
         }
@@ -516,6 +516,34 @@ final class NativeAppender {
         var error: UnsafeMutablePointer<LodeError>?
         let status = withStringView(documentIDsJSON) {
             lodedb_appender_append_deletes_json(handle, $0, &lsn, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
+    }
+
+    /// Chunks a `CoreDocument` JSON array into an `IngestPlan` JSON the caller embeds
+    /// before calling `appendEmbeddedDocumentsJSON`.
+    func prepareDocumentsJSON(_ documentsJSON: String) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentsJSON) {
+            lodedb_appender_prepare_documents_json(handle, $0, &out, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return try NativeEngine.copyOwnedString(out)
+    }
+
+    /// Durably logs one `apply_embedded_documents` record from an `IngestPlan` JSON
+    /// (from `prepareDocumentsJSON`) and its per-chunk embeddings JSON, returning the
+    /// assigned LSN.
+    func appendEmbeddedDocumentsJSON(planJSON: String, embeddingsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(planJSON) { planView in
+            withStringView(embeddingsJSON) { embeddingsView in
+                lodedb_appender_append_embedded_documents_json(
+                    handle, planView, embeddingsView, &lsn, &error)
+            }
         }
         try NativeEngine.check(status, error: error)
         return lsn

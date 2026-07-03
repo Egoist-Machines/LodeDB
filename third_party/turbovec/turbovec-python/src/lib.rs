@@ -1374,6 +1374,31 @@ impl PyCoreAppender {
             .append_deletes(&ids)
             .map_err(native_core_error_to_py)
     }
+
+    /// Chunks a JSON `CoreDocument` array into an `IngestPlan` (JSON) the caller
+    /// embeds before calling `append_embedded_documents`. Pure and lock-free; embeds
+    /// nothing and captures no base generation.
+    fn prepare_documents(&self, documents_json: &str) -> PyResult<String> {
+        let documents = native_from_json::<Vec<CoreDocument>>(documents_json)?;
+        native_to_json(
+            &self
+                .inner
+                .prepare_documents(&documents)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Durably appends one `apply_embedded_documents` record from a JSON `IngestPlan`
+    /// (from `prepare_documents`) and its per-chunk embeddings (JSON, one per
+    /// `chunks_to_embed`), returning the assigned LSN. The plan's store_text/index_text
+    /// must match the appender.
+    fn append_embedded_documents(&self, plan_json: &str, embeddings_json: &str) -> PyResult<u64> {
+        let plan = native_from_json::<IngestPlan>(plan_json)?;
+        let embeddings = native_from_json::<Vec<Vec<f32>>>(embeddings_json)?;
+        self.inner
+            .append_embedded_documents(&plan, &embeddings)
+            .map_err(native_core_error_to_py)
+    }
 }
 
 #[pymodule]

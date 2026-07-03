@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 2u
+#define LODEDB_ABI_VERSION 3u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -289,6 +289,17 @@ uint32_t lodedb_appender_append_vectors_json(
 uint32_t lodedb_appender_append_deletes_json(
     const LodeAppender *appender,
     LodeStringView document_ids_json,
+    uint64_t *out_lsn,
+    LodeError **error);
+uint32_t lodedb_appender_prepare_documents_json(
+    const LodeAppender *appender,
+    LodeStringView documents_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_appender_append_embedded_documents_json(
+    const LodeAppender *appender,
+    LodeStringView plan_json,
+    LodeStringView embeddings_json,
     uint64_t *out_lsn,
     LodeError **error);
 
