@@ -535,6 +535,7 @@ name = "lodedb-core"
 version = "1.2.0"
 dependencies = [
  "lodedb-gpu",
+ "rayon",
  "rustix",
  "serde",
  "serde_json",

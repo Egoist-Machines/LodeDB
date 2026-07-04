@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The opt-in ANN index (`ann="cluster"`) build is parallelized.** The k-means partition that
+  `ann="cluster"` builds was single-threaded, so the one-time build grew as `O(n^1.5)` and was
+  impractical at the multi-million-vector scale ANN is meant for. The seeding and Lloyd assignment
+  passes now run across all cores; the clustering is byte-identical to the previous serial build
+  (order-preserving parallelism), so results, determinism, defaults, and recall are unchanged. On a
+  32-vCPU host a 200k-vector build drops from ~275s to ~10s and a 2M-vector build from ~2.4h to
+  ~4.8min at the default `sqrt(n)` cluster count; pass an explicit `ann_clusters` cap to trade a
+  little pruning for a faster build at larger scale.
 - **Hybrid search is now the default.** `LodeDB.search` / `search_many` (and the graph
   `semantic_nodes` / `semantic_edges` / `search_subgraph`) default to `mode="hybrid"` when a
   lexical source is available (`store_text=True` or `index_text=True`, both on by default) and
