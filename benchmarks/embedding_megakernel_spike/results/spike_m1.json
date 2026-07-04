@@ -1,0 +1,499 @@
+{
+  "spike": "embedding_megakernel_gate",
+  "issue": 67,
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "machine": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.12.12",
+    "apple_silicon": true,
+    "cpu_count": 8,
+    "ram_bytes": 17179869184,
+    "onnxruntime_version": "1.27.0",
+    "onnxruntime_providers": [
+      "CoreMLExecutionProvider",
+      "AzureExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "torch_version": "2.12.0",
+    "torch_mps": true,
+    "torch_cuda": false,
+    "transformers_version": "4.53.3"
+  },
+  "config": {
+    "iters": 120,
+    "warmup": 20,
+    "query_count": 8
+  },
+  "baselines": {
+    "onnx-cpu": {
+      "runtime": "onnx",
+      "device": "cpu",
+      "providers": [
+        "CPUExecutionProvider"
+      ],
+      "embed_query": {
+        "p50_ms": 3.00915,
+        "p90_ms": 4.02337,
+        "p95_ms": 4.30293,
+        "p99_ms": 5.46695,
+        "iqr_ms": 1.07856,
+        "min_ms": 1.41188,
+        "samples": 960
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    },
+    "onnx-coreml": {
+      "runtime": "onnx",
+      "device": "coreml",
+      "providers": [
+        "CoreMLExecutionProvider",
+        "CPUExecutionProvider"
+      ],
+      "embed_query": {
+        "p50_ms": 26.42838,
+        "p90_ms": 35.40711,
+        "p95_ms": 41.79465,
+        "p99_ms": 90.90939,
+        "iqr_ms": 7.604,
+        "min_ms": 18.34175,
+        "samples": 960
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    },
+    "torch-cpu": {
+      "runtime": "torch",
+      "device": "cpu",
+      "providers": [],
+      "embed_query": {
+        "p50_ms": 8.1234,
+        "p90_ms": 10.22718,
+        "p95_ms": 11.77244,
+        "p99_ms": 15.15429,
+        "iqr_ms": 2.00724,
+        "min_ms": 6.03642,
+        "samples": 960
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    },
+    "torch-mps": {
+      "runtime": "torch",
+      "device": "mps",
+      "providers": [],
+      "embed_query": {
+        "p50_ms": 8.37298,
+        "p90_ms": 9.12179,
+        "p95_ms": 9.56855,
+        "p99_ms": 11.62156,
+        "iqr_ms": 0.59642,
+        "min_ms": 7.35171,
+        "samples": 960
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    }
+  },
+  "attribution": {
+    "onnx-cpu": {
+      "end_to_end": {
+        "p50_ms": 3.42598,
+        "p90_ms": 5.31631,
+        "p95_ms": 6.38656,
+        "p99_ms": 12.38322,
+        "iqr_ms": 1.6139,
+        "min_ms": 1.51258,
+        "samples": 960
+      },
+      "tokenize": {
+        "p50_ms": 0.04708,
+        "p90_ms": 0.06375,
+        "p95_ms": 0.14076,
+        "p99_ms": 0.31513,
+        "iqr_ms": 0.01222,
+        "min_ms": 0.03025,
+        "samples": 960
+      },
+      "session_run": {
+        "p50_ms": 2.37092,
+        "p90_ms": 3.38102,
+        "p95_ms": 3.6334,
+        "p99_ms": 4.4057,
+        "iqr_ms": 0.86865,
+        "min_ms": 1.14217,
+        "samples": 960
+      },
+      "pool": {
+        "p50_ms": 0.00608,
+        "p90_ms": 0.00658,
+        "p95_ms": 0.00667,
+        "p99_ms": 0.01301,
+        "iqr_ms": 0.00067,
+        "min_ms": 0.00521,
+        "samples": 960
+      },
+      "normalize": {
+        "p50_ms": 0.00442,
+        "p90_ms": 0.0045,
+        "p95_ms": 0.00458,
+        "p99_ms": 0.00747,
+        "iqr_ms": 8e-05,
+        "min_ms": 0.00417,
+        "samples": 960
+      },
+      "to_tuple": {
+        "p50_ms": 0.02258,
+        "p90_ms": 0.02371,
+        "p95_ms": 0.02844,
+        "p99_ms": 0.06681,
+        "iqr_ms": 0.00062,
+        "min_ms": 0.02208,
+        "samples": 960
+      }
+    },
+    "onnx-coreml": {
+      "end_to_end": {
+        "p50_ms": 23.1966,
+        "p90_ms": 28.24421,
+        "p95_ms": 31.67985,
+        "p99_ms": 50.31141,
+        "iqr_ms": 3.20523,
+        "min_ms": 18.42279,
+        "samples": 960
+      },
+      "tokenize": {
+        "p50_ms": 0.04712,
+        "p90_ms": 0.05938,
+        "p95_ms": 0.08955,
+        "p99_ms": 0.21636,
+        "iqr_ms": 0.01233,
+        "min_ms": 0.03033,
+        "samples": 960
+      },
+      "session_run": {
+        "p50_ms": 23.79302,
+        "p90_ms": 32.58785,
+        "p95_ms": 37.89415,
+        "p99_ms": 87.6115,
+        "iqr_ms": 4.92784,
+        "min_ms": 18.15479,
+        "samples": 960
+      },
+      "pool": {
+        "p50_ms": 0.00604,
+        "p90_ms": 0.00667,
+        "p95_ms": 0.00829,
+        "p99_ms": 0.03175,
+        "iqr_ms": 0.00071,
+        "min_ms": 0.00517,
+        "samples": 960
+      },
+      "normalize": {
+        "p50_ms": 0.00438,
+        "p90_ms": 0.00454,
+        "p95_ms": 0.00475,
+        "p99_ms": 0.01603,
+        "iqr_ms": 0.00017,
+        "min_ms": 0.00417,
+        "samples": 960
+      },
+      "to_tuple": {
+        "p50_ms": 0.02254,
+        "p90_ms": 0.02444,
+        "p95_ms": 0.03085,
+        "p99_ms": 0.06838,
+        "iqr_ms": 0.00113,
+        "min_ms": 0.02208,
+        "samples": 960
+      }
+    },
+    "torch-cpu": {
+      "end_to_end": {
+        "p50_ms": 6.35033,
+        "p90_ms": 7.04885,
+        "p95_ms": 7.37385,
+        "p99_ms": 10.80768,
+        "iqr_ms": 0.78493,
+        "min_ms": 4.50137,
+        "samples": 960
+      },
+      "tokenize": {
+        "p50_ms": 0.05477,
+        "p90_ms": 0.06458,
+        "p95_ms": 0.08249,
+        "p99_ms": 0.24354,
+        "iqr_ms": 0.01272,
+        "min_ms": 0.03738,
+        "samples": 960
+      },
+      "forward": {
+        "p50_ms": 6.1319,
+        "p90_ms": 7.50788,
+        "p95_ms": 8.84295,
+        "p99_ms": 14.51806,
+        "iqr_ms": 1.01957,
+        "min_ms": 4.23171,
+        "samples": 960
+      },
+      "pool_normalize": {
+        "p50_ms": 0.01662,
+        "p90_ms": 0.01825,
+        "p95_ms": 0.02297,
+        "p99_ms": 0.07663,
+        "iqr_ms": 0.0008,
+        "min_ms": 0.01575,
+        "samples": 960
+      },
+      "manual_pipeline_min_parity_cosine": 1.0
+    },
+    "torch-mps": {
+      "end_to_end": {
+        "p50_ms": 8.40592,
+        "p90_ms": 9.44121,
+        "p95_ms": 11.14679,
+        "p99_ms": 16.71702,
+        "iqr_ms": 0.55712,
+        "min_ms": 7.10738,
+        "samples": 960
+      },
+      "tokenize": {
+        "p50_ms": 0.71873,
+        "p90_ms": 1.93491,
+        "p95_ms": 2.06423,
+        "p99_ms": 2.2326,
+        "iqr_ms": 0.36493,
+        "min_ms": 0.4975,
+        "samples": 960
+      },
+      "forward": {
+        "p50_ms": 7.52654,
+        "p90_ms": 9.62995,
+        "p95_ms": 12.94493,
+        "p99_ms": 24.04062,
+        "iqr_ms": 1.66675,
+        "min_ms": 5.43908,
+        "samples": 960
+      },
+      "pool_normalize": {
+        "p50_ms": 0.45383,
+        "p90_ms": 1.1883,
+        "p95_ms": 1.60121,
+        "p99_ms": 2.02897,
+        "iqr_ms": 0.21285,
+        "min_ms": 0.33521,
+        "samples": 960
+      },
+      "manual_pipeline_min_parity_cosine": 1.0
+    }
+  },
+  "compiler": {
+    "onnx-cpu": {
+      "optimization_sweep": {
+        "disable_all": {
+          "forward": {
+            "p50_ms": 3.53021,
+            "p90_ms": 5.12953,
+            "p95_ms": 6.8583,
+            "p99_ms": 16.99015,
+            "iqr_ms": 0.97624,
+            "min_ms": 2.35646,
+            "samples": 120
+          },
+          "optimized_node_count": 562,
+          "fused_op_counts": {}
+        },
+        "enable_basic": {
+          "forward": {
+            "p50_ms": 3.18235,
+            "p90_ms": 5.26503,
+            "p95_ms": 6.13574,
+            "p99_ms": 8.55073,
+            "iqr_ms": 1.14362,
+            "min_ms": 2.166,
+            "samples": 120
+          },
+          "optimized_node_count": 418,
+          "fused_op_counts": {}
+        },
+        "enable_extended": {
+          "forward": {
+            "p50_ms": 4.28056,
+            "p90_ms": 7.54889,
+            "p95_ms": 9.56189,
+            "p99_ms": 62.69344,
+            "iqr_ms": 2.53832,
+            "min_ms": 2.22008,
+            "samples": 120
+          },
+          "optimized_node_count": 284,
+          "fused_op_counts": {
+            "LayerNormalization": 13,
+            "BiasGelu": 6
+          }
+        },
+        "enable_all": {
+          "forward": {
+            "p50_ms": 2.584,
+            "p90_ms": 3.89682,
+            "p95_ms": 4.01799,
+            "p99_ms": 5.11465,
+            "iqr_ms": 1.11196,
+            "min_ms": 1.89308,
+            "samples": 120
+          },
+          "optimized_node_count": 284,
+          "fused_op_counts": {
+            "LayerNormalization": 13,
+            "BiasGelu": 6
+          }
+        }
+      },
+      "profiler_nodes": {
+        "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
+        "distinct_graph_nodes": 284,
+        "graph_nodes_per_run": 284.0,
+        "summed_profiled_operator_us": 4672.28,
+        "model_run_us": 5377.34,
+        "model_run_minus_nodes_us": 705.07,
+        "forward_runs_profiled": 163
+      }
+    },
+    "onnx-coreml": {
+      "optimization_sweep": {
+        "disable_all": {
+          "forward": {
+            "p50_ms": 15.35621,
+            "p90_ms": 19.77554,
+            "p95_ms": 23.11431,
+            "p99_ms": 27.55977,
+            "iqr_ms": 2.88034,
+            "min_ms": 10.97492,
+            "samples": 120
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_basic": {
+          "forward": {
+            "p50_ms": 13.81721,
+            "p90_ms": 20.75145,
+            "p95_ms": 24.65693,
+            "p99_ms": 34.1261,
+            "iqr_ms": 4.26494,
+            "min_ms": 10.78783,
+            "samples": 120
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_extended": {
+          "forward": {
+            "p50_ms": 16.92148,
+            "p90_ms": 23.9285,
+            "p95_ms": 26.76506,
+            "p99_ms": 32.89907,
+            "iqr_ms": 5.3655,
+            "min_ms": 10.17692,
+            "samples": 120
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_all": {
+          "forward": {
+            "p50_ms": 15.03244,
+            "p90_ms": 21.38957,
+            "p95_ms": 24.86353,
+            "p99_ms": 29.25577,
+            "iqr_ms": 3.87384,
+            "min_ms": 11.2225,
+            "samples": 120
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        }
+      },
+      "profiler_nodes": {
+        "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
+        "distinct_graph_nodes": 174,
+        "graph_nodes_per_run": 174.0,
+        "summed_profiled_operator_us": 23302.46,
+        "model_run_us": 23778.34,
+        "model_run_minus_nodes_us": 475.88,
+        "forward_runs_profiled": 163
+      }
+    }
+  },
+  "roofline": {
+    "weight_budget": {
+      "onnx_file_bytes": 90405214,
+      "total_param_bytes": 90261504,
+      "streamed_weight_bytes": 42590208,
+      "gathered_table_bytes_full": 47671296,
+      "initializer_count": 101,
+      "node_count": 780,
+      "dtype_histogram": {
+        "float32": 90261504
+      },
+      "hidden_size": 384,
+      "num_layers": 6,
+      "intermediate_size": 1536,
+      "vocab_size": 30522,
+      "gathered_table_count": 3
+    },
+    "floor": {
+      "provenance": "derived",
+      "note": "streamed_bytes / vendor_peak_bandwidth: an optimistic lower bound on batch-1 forward latency. A megakernel cannot beat this; real kernels reach 60-80% of peak. fp16 assumes a half-precision kernel.",
+      "seq_len": 16,
+      "streamed_bytes_native": 42590208,
+      "streamed_bytes_fp16": 21295104,
+      "gathered_read_bytes": 73728,
+      "floors_ms": {
+        "m1_gpu": {
+          "peak_bandwidth_gbps": 68.0,
+          "floor_ms_native": 0.62741,
+          "floor_ms_fp16": 0.31425
+        },
+        "a10": {
+          "peak_bandwidth_gbps": 600.0,
+          "floor_ms_native": 0.07111,
+          "floor_ms_fp16": 0.03561
+        },
+        "l40s": {
+          "peak_bandwidth_gbps": 864.0,
+          "floor_ms_native": 0.04938,
+          "floor_ms_fp16": 0.02473
+        },
+        "h100_sxm": {
+          "peak_bandwidth_gbps": 3350.0,
+          "floor_ms_native": 0.01274,
+          "floor_ms_fp16": 0.00638
+        }
+      }
+    }
+  },
+  "verdict": {
+    "forward_pass_share_of_e2e": {
+      "onnx-cpu": 0.692,
+      "onnx-coreml": 1.026,
+      "torch-cpu": 0.966,
+      "torch-mps": 0.895
+    },
+    "ort_free_fusion_speedup": {
+      "onnx-cpu": 1.366,
+      "onnx-coreml": 1.111
+    },
+    "note": "forward_pass_share_of_e2e answers gate step 1 (is the forward pass the majority). ort_free_fusion_speedup is how much the tuned ONNX compiler already gains from graph fusion with no custom kernel (gate step 2). The megakernel bar is a durable multiplicative win over the BEST compiler path AND the roofline floor (gate step 3). See README for the decision rule and the recommendation."
+  }
+}

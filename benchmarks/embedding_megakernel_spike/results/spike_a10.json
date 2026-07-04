@@ -1,0 +1,468 @@
+{
+  "spike": "embedding_megakernel_gate_cuda",
+  "issue": 67,
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "machine": {
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "python": "3.11.9",
+    "apple_silicon": false,
+    "cpu_count": 24,
+    "ram_bytes": 1081276284928,
+    "onnxruntime_version": "1.20.1",
+    "onnxruntime_providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "torch_version": "2.4.1+cu124",
+    "torch_mps": false,
+    "torch_cuda": true,
+    "cuda_device": "NVIDIA A10",
+    "transformers_version": "4.57.6"
+  },
+  "config": {
+    "iters": 200,
+    "warmup": 30,
+    "query_count": 8,
+    "fixed_seq_len": 16
+  },
+  "baselines": {
+    "onnx-cuda": {
+      "runtime": "onnx",
+      "device": "cuda",
+      "providers": [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider"
+      ],
+      "embed_query": {
+        "p50_ms": 1.48634,
+        "p90_ms": 1.55012,
+        "p95_ms": 1.57833,
+        "p99_ms": 1.69752,
+        "iqr_ms": 0.05866,
+        "min_ms": 1.36765,
+        "samples": 1600
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    },
+    "torch-cuda": {
+      "runtime": "torch",
+      "device": "cuda",
+      "providers": [],
+      "embed_query": {
+        "p50_ms": 4.13183,
+        "p90_ms": 4.32536,
+        "p95_ms": 4.36452,
+        "p99_ms": 4.45525,
+        "iqr_ms": 0.14431,
+        "min_ms": 3.9972,
+        "samples": 1600
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    },
+    "onnx-tensorrt": {
+      "runtime": "onnx",
+      "device": "tensorrt",
+      "providers": [
+        "TensorrtExecutionProvider",
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider"
+      ],
+      "embed_query": {
+        "p50_ms": 1.31207,
+        "p90_ms": 1.3605,
+        "p95_ms": 1.37496,
+        "p99_ms": 1.40674,
+        "iqr_ms": 0.04688,
+        "min_ms": 1.22841,
+        "samples": 1600
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 1.0,
+        "mean": 1.0
+      }
+    }
+  },
+  "attribution": {
+    "onnx-cuda": {
+      "end_to_end": {
+        "p50_ms": 1.34659,
+        "p90_ms": 1.51613,
+        "p95_ms": 1.54338,
+        "p99_ms": 1.70163,
+        "iqr_ms": 0.1259,
+        "min_ms": 1.22696,
+        "samples": 1600
+      },
+      "tokenize": {
+        "p50_ms": 0.09312,
+        "p90_ms": 0.10177,
+        "p95_ms": 0.10268,
+        "p99_ms": 0.106,
+        "iqr_ms": 0.01703,
+        "min_ms": 0.071,
+        "samples": 1600
+      },
+      "session_run": {
+        "p50_ms": 1.15768,
+        "p90_ms": 1.18132,
+        "p95_ms": 1.18541,
+        "p99_ms": 1.19229,
+        "iqr_ms": 0.02848,
+        "min_ms": 1.05513,
+        "samples": 1600
+      },
+      "pool": {
+        "p50_ms": 0.01026,
+        "p90_ms": 0.01127,
+        "p95_ms": 0.01142,
+        "p99_ms": 0.01356,
+        "iqr_ms": 0.00123,
+        "min_ms": 0.00905,
+        "samples": 1600
+      },
+      "normalize": {
+        "p50_ms": 0.00765,
+        "p90_ms": 0.00774,
+        "p95_ms": 0.00777,
+        "p99_ms": 0.00798,
+        "iqr_ms": 9e-05,
+        "min_ms": 0.00744,
+        "samples": 1600
+      },
+      "to_tuple": {
+        "p50_ms": 0.02766,
+        "p90_ms": 0.02796,
+        "p95_ms": 0.02807,
+        "p99_ms": 0.03113,
+        "iqr_ms": 0.00026,
+        "min_ms": 0.02708,
+        "samples": 1600
+      }
+    },
+    "torch-cuda": {
+      "end_to_end": {
+        "p50_ms": 3.00621,
+        "p90_ms": 3.0998,
+        "p95_ms": 3.14087,
+        "p99_ms": 3.19734,
+        "iqr_ms": 0.10273,
+        "min_ms": 2.87172,
+        "samples": 1600
+      },
+      "tokenize": {
+        "p50_ms": 0.19195,
+        "p90_ms": 0.20608,
+        "p95_ms": 0.20869,
+        "p99_ms": 0.21431,
+        "iqr_ms": 0.02766,
+        "min_ms": 0.15877,
+        "samples": 1600
+      },
+      "forward": {
+        "p50_ms": 2.50491,
+        "p90_ms": 2.57149,
+        "p95_ms": 2.58449,
+        "p99_ms": 2.5986,
+        "iqr_ms": 0.02399,
+        "min_ms": 2.39102,
+        "samples": 1600
+      },
+      "pool_normalize": {
+        "p50_ms": 0.10541,
+        "p90_ms": 0.10926,
+        "p95_ms": 0.11069,
+        "p99_ms": 0.11256,
+        "iqr_ms": 0.00123,
+        "min_ms": 0.10345,
+        "samples": 1600
+      },
+      "manual_pipeline_min_parity_cosine": 1.0
+    },
+    "onnx-tensorrt": {
+      "end_to_end": {
+        "p50_ms": 1.3191,
+        "p90_ms": 1.51011,
+        "p95_ms": 1.54141,
+        "p99_ms": 1.60391,
+        "iqr_ms": 0.07264,
+        "min_ms": 1.2195,
+        "samples": 1600
+      },
+      "tokenize": {
+        "p50_ms": 0.09265,
+        "p90_ms": 0.10581,
+        "p95_ms": 0.1088,
+        "p99_ms": 0.11447,
+        "iqr_ms": 0.01772,
+        "min_ms": 0.07071,
+        "samples": 1600
+      },
+      "session_run": {
+        "p50_ms": 1.17349,
+        "p90_ms": 1.20102,
+        "p95_ms": 1.20634,
+        "p99_ms": 1.21578,
+        "iqr_ms": 0.09544,
+        "min_ms": 0.91549,
+        "samples": 1600
+      },
+      "pool": {
+        "p50_ms": 0.00996,
+        "p90_ms": 0.01033,
+        "p95_ms": 0.01046,
+        "p99_ms": 0.01347,
+        "iqr_ms": 0.00059,
+        "min_ms": 0.00879,
+        "samples": 1600
+      },
+      "normalize": {
+        "p50_ms": 0.00761,
+        "p90_ms": 0.00781,
+        "p95_ms": 0.00798,
+        "p99_ms": 0.00902,
+        "iqr_ms": 0.00011,
+        "min_ms": 0.00742,
+        "samples": 1600
+      },
+      "to_tuple": {
+        "p50_ms": 0.02792,
+        "p90_ms": 0.02827,
+        "p95_ms": 0.02843,
+        "p99_ms": 0.03166,
+        "iqr_ms": 0.00029,
+        "min_ms": 0.0273,
+        "samples": 1600
+      }
+    }
+  },
+  "compiler": {
+    "onnx-cuda": {
+      "optimization_sweep": {
+        "disable_all": {
+          "forward": {
+            "p50_ms": 1.4978,
+            "p90_ms": 1.50533,
+            "p95_ms": 1.50831,
+            "p99_ms": 1.52412,
+            "iqr_ms": 0.00703,
+            "min_ms": 1.48399,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_basic": {
+          "forward": {
+            "p50_ms": 1.6674,
+            "p90_ms": 1.6904,
+            "p95_ms": 1.69663,
+            "p99_ms": 1.71868,
+            "iqr_ms": 0.31131,
+            "min_ms": 1.36047,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_extended": {
+          "forward": {
+            "p50_ms": 1.0561,
+            "p90_ms": 1.06286,
+            "p95_ms": 1.06605,
+            "p99_ms": 1.09018,
+            "iqr_ms": 0.00626,
+            "min_ms": 1.04549,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_all": {
+          "forward": {
+            "p50_ms": 1.04523,
+            "p90_ms": 1.05311,
+            "p95_ms": 1.05647,
+            "p99_ms": 1.06511,
+            "iqr_ms": 0.00752,
+            "min_ms": 1.03032,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        }
+      },
+      "profiler_nodes": {
+        "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
+        "distinct_graph_nodes": 290,
+        "graph_nodes_per_run": 290.0,
+        "summed_profiled_operator_us": 4885.61,
+        "model_run_us": 14532.9,
+        "model_run_minus_nodes_us": 9647.28,
+        "forward_runs_profiled": 163
+      }
+    },
+    "onnx-tensorrt": {
+      "optimization_sweep": {
+        "disable_all": {
+          "forward": {
+            "p50_ms": 1.79127,
+            "p90_ms": 1.80479,
+            "p95_ms": 1.81182,
+            "p99_ms": 1.87595,
+            "iqr_ms": 0.28672,
+            "min_ms": 1.49513,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_basic": {
+          "forward": {
+            "p50_ms": 1.39631,
+            "p90_ms": 1.40259,
+            "p95_ms": 1.40456,
+            "p99_ms": 1.41836,
+            "iqr_ms": 0.00596,
+            "min_ms": 1.38802,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_extended": {
+          "forward": {
+            "p50_ms": 0.90332,
+            "p90_ms": 0.90863,
+            "p95_ms": 0.91048,
+            "p99_ms": 0.91615,
+            "iqr_ms": 0.00453,
+            "min_ms": 0.8909,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        },
+        "enable_all": {
+          "forward": {
+            "p50_ms": 1.03784,
+            "p90_ms": 1.04455,
+            "p95_ms": 1.04601,
+            "p99_ms": 1.04879,
+            "iqr_ms": 0.00715,
+            "min_ms": 1.0213,
+            "samples": 200
+          },
+          "optimized_node_count": null,
+          "fused_op_counts": {}
+        }
+      },
+      "profiler_nodes": {
+        "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
+        "distinct_graph_nodes": 290,
+        "graph_nodes_per_run": 290.0,
+        "summed_profiled_operator_us": 4557.29,
+        "model_run_us": 14304.72,
+        "model_run_minus_nodes_us": 9747.43,
+        "forward_runs_profiled": 163
+      }
+    },
+    "low_maintenance_fusion": {
+      "ort_cuda_graph": {
+        "error": "Fail: [ONNXRuntimeError] : 1 : FAIL : This session cannot use the graph capture feature as requested by the user  as all compute graph nodes have not been partitioned to the CUDAExecutionProvider"
+      },
+      "torch_compile": {
+        "eager_forward": {
+          "p50_ms": 2.59881,
+          "p90_ms": 2.63013,
+          "p95_ms": 2.63616,
+          "p99_ms": 2.66979,
+          "iqr_ms": 0.02077,
+          "min_ms": 2.57444,
+          "samples": 200
+        },
+        "compiled_forward": {
+          "p50_ms": 0.66547,
+          "p90_ms": 0.67305,
+          "p95_ms": 0.67842,
+          "p99_ms": 0.70343,
+          "iqr_ms": 0.00706,
+          "min_ms": 0.65764,
+          "samples": 200
+        },
+        "compile_speedup": 3.905,
+        "seq_len": 16,
+        "note": "torch.compile(reduce-overhead) = Inductor fusion + CUDA graphs; no custom kernel. Not a genuine single kernel (KernelBench-Mega)."
+      }
+    }
+  },
+  "roofline": {
+    "weight_budget": {
+      "onnx_file_bytes": 90405214,
+      "total_param_bytes": 90261504,
+      "streamed_weight_bytes": 42590208,
+      "gathered_table_bytes_full": 47671296,
+      "initializer_count": 101,
+      "node_count": 780,
+      "dtype_histogram": {
+        "float32": 90261504
+      },
+      "hidden_size": 384,
+      "num_layers": 6,
+      "intermediate_size": 1536,
+      "vocab_size": 30522,
+      "gathered_table_count": 3
+    },
+    "floor": {
+      "provenance": "derived",
+      "note": "streamed_bytes / vendor_peak_bandwidth: an optimistic lower bound on batch-1 forward latency. A megakernel cannot beat this; real kernels reach 60-80% of peak. fp16 assumes a half-precision kernel.",
+      "seq_len": 16,
+      "streamed_bytes_native": 42590208,
+      "streamed_bytes_fp16": 21295104,
+      "gathered_read_bytes": 73728,
+      "floors_ms": {
+        "m1_gpu": {
+          "peak_bandwidth_gbps": 68.0,
+          "floor_ms_native": 0.62741,
+          "floor_ms_fp16": 0.31425
+        },
+        "a10": {
+          "peak_bandwidth_gbps": 600.0,
+          "floor_ms_native": 0.07111,
+          "floor_ms_fp16": 0.03561
+        },
+        "l40s": {
+          "peak_bandwidth_gbps": 864.0,
+          "floor_ms_native": 0.04938,
+          "floor_ms_fp16": 0.02473
+        },
+        "h100_sxm": {
+          "peak_bandwidth_gbps": 3350.0,
+          "floor_ms_native": 0.01274,
+          "floor_ms_fp16": 0.00638
+        }
+      }
+    }
+  },
+  "verdict": {
+    "forward_pass_share_of_e2e": {
+      "onnx-cuda": 0.86,
+      "torch-cuda": 0.833,
+      "onnx-tensorrt": 0.89
+    },
+    "ort_free_fusion_speedup": {
+      "onnx-cuda": 1.433,
+      "onnx-tensorrt": 1.983
+    },
+    "note": "forward_pass_share_of_e2e answers gate step 1 (is the forward pass the majority). ort_free_fusion_speedup is how much the tuned ONNX compiler already gains from graph fusion with no custom kernel (gate step 2). The megakernel bar is a durable multiplicative win over the BEST compiler path AND the roofline floor (gate step 3). See README for the decision rule and the recommendation.",
+    "low_maintenance_fusion_note": "ort_cuda_graph and torch_compile are the best no-custom-kernel fusion paths; the megakernel bar is a durable multiplicative win over the fastest of these AND the roofline floor. Both use CUDA graphs, which KernelBench-Mega does not count as a genuine single kernel, so they are the bar, not the megakernel itself."
+  }
+}

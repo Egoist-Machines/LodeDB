@@ -16,6 +16,7 @@ Provenance is tagged inline in [`../docs/benchmarks.md`](../docs/benchmarks.md):
 | [`mps_vs_neon/`](mps_vs_neon) | Does the Apple-GPU (MPS) exact scan beat the default CPU NEON scan on a Mac? | Apple Silicon (local) | see folder README |
 | [`memory_integrations/`](memory_integrations) | As the memory backend behind LangChain / LlamaIndex / mem0, how does LodeDB compare to each framework's default and common stores (in-memory, FAISS, Chroma, Qdrant) on ingest, recall, footprint, and durable single-add? | Modal A10 / L40S (CUDA) | `modal run benchmarks/memory_integrations/modal_bench.py::main_a10` |
 | [`multimodal_image/`](multimodal_image) | Holding CLIP-dimension vectors fixed, how does LodeDB compare to Chroma and Qdrant on image-vector footprint, query latency, recall, and ingest? | Any host (local) | `uv run python benchmarks/multimodal_image/run.py` |
+| [`embedding_megakernel_spike/`](embedding_megakernel_spike) | Where does single-query MiniLM embedding latency go, and does a fused batch-1 megakernel beat the best low-maintenance compiler path (issue #67 gate)? | Apple M1 (local) / Modal A10 / L40S (CUDA) | `python benchmarks/embedding_megakernel_spike/run.py` |
 
 Headline launch and laptop numbers (with figures) are collected in
 [`../docs/benchmarks.md`](../docs/benchmarks.md); per-benchmark figures live in each
