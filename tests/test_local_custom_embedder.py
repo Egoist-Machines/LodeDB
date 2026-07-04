@@ -37,8 +37,10 @@ def test_custom_embedder_text_roundtrip(tmp_path):
     db.add("beta document", metadata={"k": "2"})
     assert db.count() == 2
     # The hash embedder maps identical text to the same vector, so the matching
-    # query is the top hit.
-    hits = db.search("alpha document", k=2)
+    # query is the top hit. Assert on the vector mode so the score is the cosine
+    # similarity this exercises (the default resolves to hybrid, whose fused RRF
+    # score is not a cosine).
+    hits = db.search("alpha document", k=2, mode="vector")
     assert hits[0].id == a
     assert hits[0].score > 0.9
 

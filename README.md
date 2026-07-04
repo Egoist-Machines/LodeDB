@@ -240,37 +240,42 @@ operational gotchas live in [Deployment and performance](docs/deployment-and-per
 
 ## Hybrid search
 
-Vector search alone misses exact tokens the embedding does not capture: error codes
-(`E1234`), serial numbers (`ABC-123`), dates (`2024-01-15`). Pass `mode="hybrid"` to run a
-lexical BM25 ranker alongside the vector scan and fuse the two ranked lists with Reciprocal
-Rank Fusion. The lexical ranker matches those tokens exactly, so a document whose body carries
-the code is recovered even when the embedding ranks it nowhere near the top.
+Hybrid retrieval is the default. Vector search alone misses exact tokens the embedding does not
+capture: error codes (`E1234`), serial numbers (`ABC-123`), dates (`2024-01-15`). By default
+LodeDB runs a lexical BM25 ranker alongside the vector scan and fuses the two ranked lists with
+Reciprocal Rank Fusion, so a document whose body carries the code is recovered even when the
+embedding ranks it nowhere near the top. The default resolves to hybrid whenever a text source is
+available (the out-of-the-box configuration) and falls back to a plain vector scan otherwise, so
+it never raises on a vector-only store.
 
 ```python
 db.add("the turbine tripped and reported fault code E1234 overnight", metadata={"unit": "t3"})
 
-db.search("E1234", k=5)                 # mode="vector" (default): may miss the exact code
-db.search("E1234", k=5, mode="hybrid")  # BM25 + RRF: surfaces it in the top-k
-db.search("E1234", k=5, mode="lexical") # BM25 ranking alone, no vector scan
+db.search("E1234", k=5)                  # default: hybrid (BM25 + RRF) when text is retained
+db.search("E1234", k=5, mode="vector")   # vector scan alone: may miss the exact code
+db.search("E1234", k=5, mode="lexical")  # BM25 ranking alone, no vector scan
 ```
 
 <details>
 <summary><b>Prerequisites</b></summary>
 
 `mode="hybrid"` and `mode="lexical"` build a BM25 index over your text, so they need a text
-source enabled when you open the database. `mode="vector"` (the default) needs nothing.
+source enabled when you open the database. Both text sources are on by default, so the hybrid
+default works out of the box; `mode="vector"` needs nothing and is the automatic fallback when no
+text source is present.
 
 | Mode | Enable | Source of the BM25 index |
 | --- | --- | --- |
-| `"vector"` (default) | nothing | not used |
-| `"hybrid"`, `"lexical"` | `store_text=True` (on by default) | rebuilt in memory from the retained raw text |
-| `"hybrid"`, `"lexical"` | `index_text=True` (on by default, follows `store_text`) | a durable on-disk postings store, no raw text required |
+| `"hybrid"` (default), `"lexical"` | `store_text=True` (on by default) | rebuilt in memory from the retained raw text |
+| `"hybrid"` (default), `"lexical"` | `index_text=True` (on by default, follows `store_text`) | a durable on-disk postings store, no raw text required |
+| `"vector"` (fallback) | nothing | not used |
 
 Both sources are on by default, so hybrid and lexical work out of the box: `store_text=True`
 retains the raw text and `index_text` defaults to match it, persisting the lexical postings.
 Either source alone is enough, and `index_text` decouples from `store_text` when set explicitly.
-With neither source enabled (`store_text=False, index_text=False`), a hybrid or lexical query
-raises a clear, actionable error rather than silently degrading.
+With neither source enabled (`store_text=False, index_text=False`), the default resolves to a
+plain vector scan; an *explicit* `mode="hybrid"`/`"lexical"` then raises a clear, actionable
+error rather than silently degrading.
 </details>
 
 <details>

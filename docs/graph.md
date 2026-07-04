@@ -127,13 +127,14 @@ index from the SQLite source of truth, using enumeration to drop orphans, which
 makes the index a derived, throwaway artifact.
 
 `semantic_nodes`, `semantic_edges`, and `search_subgraph` take a `mode` argument
-forwarded to LodeDB search: `"vector"` (default), or `"hybrid"`/`"lexical"` to also
-match exact tokens in a node `label` or edge `fact` (error codes, serials, dates)
-the embedding misses. Lexical modes rank the query string, so they cannot be
-combined with a precomputed `embedding`, and they need the graph opened with
-`store_text=True` (the default) or `index_text=True`. This lexical fusion is
-distinct from the structural "hybrid retrieval" above (semantic seeds plus k-hop
-expansion); the two compose.
+forwarded to LodeDB search. Left unset it defaults to `"hybrid"` when a text source
+is available (`store_text=True` or `index_text=True`, both on by default) and to
+`"vector"` otherwise, so exact tokens in a node `label` or edge `fact` (error codes,
+serials, dates) the embedding misses are matched by default; pass `mode="vector"` for
+a pure vector scan. Lexical ranking uses the query string, so an explicit
+`"hybrid"`/`"lexical"` mode cannot be combined with a precomputed `embedding`. This
+lexical fusion is distinct from the structural "hybrid retrieval" above (semantic
+seeds plus k-hop expansion); the two compose.
 
 > `reindex()` rebuilds a labelled node from its `label`. For vector-in nodes, open
 > the graph with `retain_vectors=True`: the topology store then keeps each node's

@@ -76,7 +76,7 @@ def test_hybrid_surfaces_exact_token_vector_misses(tmp_path, token):
     db = _open(tmp_path)
     carrier = _seed_with_exact_token(db, token=token)
 
-    vector_ids = [hit.id for hit in db.search(token, k=3)]
+    vector_ids = [hit.id for hit in db.search(token, k=3, mode="vector")]
     hybrid_ids = [hit.id for hit in db.search(token, k=3, mode="hybrid")]
 
     # The hash embedding does not encode the literal token, so pure vector does
@@ -269,18 +269,30 @@ def test_invalid_mode_raises(tmp_path):
     db.close()
 
 
-# -- default mode is unchanged ----------------------------------------------
+# -- default mode -----------------------------------------------------------
 
 
-def test_default_mode_is_vector_and_unchanged(tmp_path):
-    """Omitting mode and passing mode='vector' produce identical vector results."""
+def test_default_mode_is_hybrid_when_lexical_source_available(tmp_path):
+    """Omitting mode matches mode='hybrid' when a lexical source is available."""
 
-    db = _open(tmp_path)
+    db = _open(tmp_path)  # store_text=True, so a lexical source exists
     _seed_with_exact_token(db, token="E1234")
     default_hits = db.search("turbine recovered", k=5)
-    explicit_hits = db.search("turbine recovered", k=5, mode="vector")
-    assert [hit.id for hit in default_hits] == [hit.id for hit in explicit_hits]
-    assert [hit.score for hit in default_hits] == [hit.score for hit in explicit_hits]
+    hybrid_hits = db.search("turbine recovered", k=5, mode="hybrid")
+    assert [hit.id for hit in default_hits] == [hit.id for hit in hybrid_hits]
+    assert [hit.score for hit in default_hits] == [hit.score for hit in hybrid_hits]
+    db.close()
+
+
+def test_default_mode_falls_back_to_vector_without_lexical_source(tmp_path):
+    """With no lexical source the unset default resolves to vector, never raising."""
+
+    db = _open(tmp_path, store_text=False)  # store_text=False -> index_text=False
+    _seed_with_exact_token(db, token="E1234")
+    default_hits = db.search("turbine recovered", k=5)
+    vector_hits = db.search("turbine recovered", k=5, mode="vector")
+    assert [hit.id for hit in default_hits] == [hit.id for hit in vector_hits]
+    assert [hit.score for hit in default_hits] == [hit.score for hit in vector_hits]
     db.close()
 
 

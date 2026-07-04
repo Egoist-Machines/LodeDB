@@ -530,18 +530,20 @@ class KnowledgeGraph:
         k: int = 10,
         node_type: str | None = None,
         filter: Mapping[str, Any] | None = None,
-        mode: str = "vector",
+        mode: str | None = None,
     ) -> list[tuple[float, Node]]:
         """Returns the top-``k`` nodes most relevant to ``query`` (or ``embedding``).
 
         This is the semantic entry-point step: a LodeDB similarity search scoped
         to node documents, optionally narrowed by ``node_type`` or an arbitrary
         metadata ``filter`` (same predicate grammar as :meth:`LodeDB.search`).
-        ``mode`` matches :meth:`LodeDB.search`: ``"vector"`` (default), or
-        ``"hybrid"``/``"lexical"`` to also match exact tokens in node labels
-        (error codes, serials, dates) the embedding misses. Lexical modes rank the
-        ``query`` text, so they cannot be combined with ``embedding`` and need the
-        graph opened with ``store_text=True`` (the default) or ``index_text=True``.
+        ``mode`` matches :meth:`LodeDB.search`: left unset it defaults to
+        ``"hybrid"`` when a lexical source is available (``store_text=True`` or
+        ``index_text=True``, both on by default) and to ``"vector"`` otherwise, so
+        exact tokens in node labels (error codes, serials, dates) the embedding
+        misses are matched by default. Lexical ranking uses the ``query`` text, so
+        an explicit ``"hybrid"``/``"lexical"`` mode cannot be combined with a
+        precomputed ``embedding`` (a pure vector query).
         """
 
         hits = self._search_index(
@@ -571,14 +573,15 @@ class KnowledgeGraph:
         embedding: Sequence[float] | None = None,
         k: int = 10,
         relation: str | None = None,
-        mode: str = "vector",
+        mode: str | None = None,
     ) -> list[tuple[float, Edge]]:
         """Returns the top-``k`` indexed edges most relevant to ``query``.
 
         Requires ``index_edges=True`` and that the edges were added with a
         ``fact`` (or ``embedding``); otherwise the result is empty. ``mode``
-        matches :meth:`semantic_nodes` (``"vector"`` default, or
-        ``"hybrid"``/``"lexical"`` over the edge ``fact`` text).
+        matches :meth:`semantic_nodes` (unset defaults to ``"hybrid"`` when a
+        lexical source is available, else ``"vector"``, over the edge ``fact``
+        text).
         """
 
         if not self.index_edges:
@@ -612,7 +615,7 @@ class KnowledgeGraph:
         relation: str | None = None,
         node_type: str | None = None,
         filter: Mapping[str, Any] | None = None,
-        mode: str = "vector",
+        mode: str | None = None,
     ) -> Subgraph:
         """Semantic entry points + k-hop graph expansion.
 
@@ -620,10 +623,11 @@ class KnowledgeGraph:
         semantic step), then expands ``hops`` hops around them over the topology
         (the structural step), returning the combined subgraph with the seed
         nodes and their scores recorded on :attr:`Subgraph.seeds`. ``mode`` is
-        forwarded to the seed search (:meth:`semantic_nodes`): pass ``"hybrid"``
-        to fuse a lexical BM25 ranker with the vector seeds so exact tokens in
-        node labels are not missed. This is orthogonal to the structural
-        expansion, which composes either way.
+        forwarded to the seed search (:meth:`semantic_nodes`), which by default
+        fuses a lexical BM25 ranker with the vector seeds (hybrid) so exact tokens
+        in node labels are not missed; pass ``mode="vector"`` for vector-only
+        seeds. This is orthogonal to the structural expansion, which composes
+        either way.
         """
 
         seeds = self.semantic_nodes(
@@ -804,14 +808,16 @@ class KnowledgeGraph:
         kind: str,
         entity_type: str | None,
         extra_filter: Mapping[str, Any] | None,
-        mode: str = "vector",
+        mode: str | None = None,
     ):
         """Runs the scoped LodeDB search shared by semantic_nodes/_edges.
 
         ``mode`` is forwarded to :meth:`LodeDB.search` on the text-query path
-        (``"vector"`` default, or ``"hybrid"``/``"lexical"``). A precomputed
-        ``embedding`` is a pure vector query, so a non-vector ``mode`` paired with
-        an ``embedding`` is rejected (lexical ranking needs the query string).
+        (unset resolves to ``"hybrid"`` when a lexical source is available, else
+        ``"vector"``). A precomputed ``embedding`` is a pure vector query, so an
+        explicit lexical/hybrid ``mode`` paired with an ``embedding`` is rejected
+        (lexical ranking needs the query string); an unset ``mode`` with an
+        ``embedding`` runs the vector query.
         """
 
         base: dict[str, Any] = {"kind": kind}
@@ -822,7 +828,7 @@ class KnowledgeGraph:
         else:
             search_filter = base
         if embedding is not None:
-            if mode != "vector":
+            if mode not in (None, "vector"):
                 raise ValueError(
                     "mode must be 'vector' when searching by embedding; "
                     "'hybrid'/'lexical' rank the query text, not a precomputed vector"
