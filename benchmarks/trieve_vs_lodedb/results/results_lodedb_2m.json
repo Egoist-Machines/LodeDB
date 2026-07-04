@@ -1,29 +1,62 @@
 {
   "axis_a": {
+    "ann": [
+      {
+        "algorithm": "cluster",
+        "cluster_build_seconds": 177.21,
+        "clusters": 32,
+        "footprint": {
+          "by_extension_bytes": {
+            ".json": 511337374,
+            ".lock": 0,
+            ".tvim": 408003090,
+            ".tvtext": 157239232
+          },
+          "file_count": 10,
+          "total_bytes": 1076579696
+        },
+        "index_recall_at_k": {
+          "k": 10,
+          "note": "ANN result set vs fp32 brute-force top-k (same metric as the exact row)",
+          "query_sample": 1000,
+          "recall": 0.9366
+        },
+        "ingest_seconds": 363.538,
+        "label": "cluster-32",
+        "nprobe": 8,
+        "persist_seconds": 591.616,
+        "single_query_latency_ms": {
+          "count": 1000,
+          "mean_ms": 331.83254578100514,
+          "p50_ms": 350.04506199993557,
+          "p95_ms": 448.67538000016793
+        }
+      }
+    ],
     "axis": "A",
     "batched_throughput": [
       {
         "batch_size": 1,
-        "per_query_ms": 132.8104,
-        "qps": 7.5,
+        "per_query_ms": 58.1768,
+        "qps": 17.2,
         "repeats": 20
       },
       {
         "batch_size": 16,
-        "per_query_ms": 8.6185,
-        "qps": 116.0,
+        "per_query_ms": 3.9429,
+        "qps": 253.6,
         "repeats": 20
       },
       {
         "batch_size": 64,
-        "per_query_ms": 2.1987,
-        "qps": 454.8,
+        "per_query_ms": 1.144,
+        "qps": 874.1,
         "repeats": 15
       },
       {
         "batch_size": 256,
-        "per_query_ms": 0.884,
-        "qps": 1131.2,
+        "per_query_ms": 0.6908,
+        "qps": 1447.7,
         "repeats": 3
       }
     ],
@@ -32,16 +65,16 @@
     "count_after_ingest": 2000000,
     "dataset": "ccdv/govreport-summarization",
     "dim": 384,
-    "embed_seconds": 429.17,
+    "embed_seconds": 444.23,
     "footprint": {
       "by_extension_bytes": {
-        ".json": 511337218,
+        ".json": 511337250,
         ".lock": 0,
         ".tvim": 408003090,
         ".tvtext": 157239232
       },
       "file_count": 10,
-      "total_bytes": 1076579540
+      "total_bytes": 1076579572
     },
     "index_recall_at_k": {
       "k": 10,
@@ -49,16 +82,16 @@
       "query_sample": 1000,
       "recall": 0.9437
     },
-    "ingest_seconds": 366.625,
-    "ingest_throughput_per_s": 5455.2,
+    "ingest_seconds": 371.337,
+    "ingest_throughput_per_s": 5385.9,
     "k": 10,
-    "peak_rss_bytes": 26859962368,
-    "persist_seconds": 548.45,
+    "peak_rss_bytes": 25654607872,
+    "persist_seconds": 610.275,
     "single_query_latency_ms": {
       "count": 1000,
-      "mean_ms": 130.25146318099792,
-      "p50_ms": 131.22793499996988,
-      "p95_ms": 142.23979799999142
+      "mean_ms": 47.66243668399534,
+      "p50_ms": 45.50938199986376,
+      "p95_ms": 57.760744000006525
     }
   },
   "scale_2m": true

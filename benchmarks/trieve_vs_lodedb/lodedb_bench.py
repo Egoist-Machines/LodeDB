@@ -360,6 +360,119 @@ def _brute_force_recall_at_k(
     return overlap_sum / counted if counted else 0.0
 
 
+def _measure_ann_config(
+    ann_path: str,
+    config: dict[str, Any],
+    *,
+    corpus_ids: list[str],
+    corpus_vectors: NDArray[np.float32],
+    corpus_texts: list[str],
+    query_vectors: NDArray[np.float32],
+    k: int,
+    ingest_batch: int,
+    latency_iters: int,
+    warmup: int,
+    recall_sample: int,
+) -> dict[str, Any]:
+    """Builds one ANN (cluster-prune) store over the already-embedded corpus and
+    measures its single-query latency, index-fidelity recall, and footprint.
+
+    ANN is a create-time choice in LodeDB (the ``clusters``/``nprobe`` tuning is
+    persisted with the store), so every config is a fresh store built from the same
+    precomputed vectors rather than a reopen of the exact store. Returned scores stay
+    exact -- the exact TurboVec scan re-scores the probed candidates -- so the only
+    approximation is set membership: a true neighbor in an unprobed cluster is missed,
+    which is the recall/latency trade this measures against the exact scan. Recall uses
+    the *same* fp32 brute-force ground truth as the exact row, so the two are directly
+    comparable and the drop is the cluster-pruning cost (on top of 4-bit quantization).
+    """
+
+    from lodedb.local.db import LodeDB
+
+    algorithm = str(config.get("algorithm", "cluster"))
+    clusters = config.get("clusters")
+    nprobe = config.get("nprobe")
+    result: dict[str, Any] = {
+        "label": str(config.get("label", algorithm)),
+        "algorithm": algorithm,
+        "clusters": clusters,
+        "nprobe": nprobe,
+    }
+    # store_text=True / index_text=False mirrors the exact store (vector path only, no
+    # unused lexical index), so the footprint is directly comparable and the only structural
+    # difference is ANN's own metadata. The cluster-prune partition is built in memory on the
+    # first query (a warmup cost, not charged to the timed loop).
+    db = LodeDB(
+        ann_path,
+        model="minilm",
+        store_text=True,
+        index_text=False,
+        ann=algorithm,
+        ann_clusters=clusters,
+        ann_nprobe=nprobe,
+    )
+    try:
+        ingest_seconds = _ingest_vectors(
+            db, corpus_ids, corpus_vectors, corpus_texts, None, batch=ingest_batch
+        )
+        persist_started = time.perf_counter()
+        db.persist()
+        result["ingest_seconds"] = round(ingest_seconds, 3)
+        result["persist_seconds"] = round(time.perf_counter() - persist_started, 3)
+        result["footprint"] = _dir_footprint(Path(ann_path))
+
+        query_list = [row.tolist() for row in query_vectors]
+        if not query_list:
+            raise ValueError("ANN measurement needs at least one held-out query vector")
+        # The first query builds the k-means cluster index. That build is O(n * clusters * dim)
+        # and dominates ANN setup at scale (with the default ~sqrt(n) clusters it is impractical
+        # past ~1M vectors), so time it explicitly and print around it -- otherwise the run looks
+        # hung during the build. Charged as cluster_build_seconds, not to the query latency below.
+        print(
+            f"[trieve-vs-lodedb] ANN {result['label']}: building cluster index over "
+            f"{len(corpus_ids)} vectors (clusters={clusters}, first-query k-means)...",
+            flush=True,
+        )
+        build_started = time.perf_counter()
+        db.search_by_vector(query_list[0], k=k)
+        result["cluster_build_seconds"] = round(time.perf_counter() - build_started, 2)
+        print(
+            f"[trieve-vs-lodedb] ANN {result['label']}: cluster index built in "
+            f"{result['cluster_build_seconds']}s",
+            flush=True,
+        )
+        for warm_index in range(min(warmup, len(query_list))):
+            db.search_by_vector(query_list[warm_index], k=k)
+        samples_ms: list[float] = []
+        for iteration in range(latency_iters):
+            vector = query_list[iteration % len(query_list)]
+            started = time.perf_counter()
+            db.search_by_vector(vector, k=k)
+            samples_ms.append((time.perf_counter() - started) * 1000.0)
+        result["single_query_latency_ms"] = _summary_ms(samples_ms)
+
+        sample = min(recall_sample, len(query_list))
+        sample_vectors = query_vectors[:sample]
+        served_ids = [
+            [hit.id for hit in db.search_by_vector(sample_vectors[index].tolist(), k=k)]
+            for index in range(sample)
+        ]
+        result["index_recall_at_k"] = {
+            "k": k,
+            "query_sample": sample,
+            "recall": round(
+                _brute_force_recall_at_k(
+                    corpus_vectors, sample_vectors, served_ids, corpus_ids, k=k
+                ),
+                4,
+            ),
+            "note": "ANN result set vs fp32 brute-force top-k (same metric as the exact row)",
+        }
+    finally:
+        db.close()
+    return result
+
+
 def run_axis_a_govreport(
     db_path: str,
     *,
@@ -375,6 +488,7 @@ def run_axis_a_govreport(
     device: str = "cuda",
     embed_batch_size: int = 512,
     recall_sample: int = 1000,
+    ann_configs: tuple[dict[str, Any], ...] = (),
     corpus_vectors: NDArray[np.float32] | None = None,
     corpus_texts: list[str] | None = None,
     query_vectors: NDArray[np.float32] | None = None,
@@ -385,6 +499,11 @@ def run_axis_a_govreport(
     corpus/query embeddings may be passed in (for the local smoke) or embedded here
     from streamed GovReport text. ``recall_sample`` bounds the brute-force ground
     truth to a query subsample (the full corpus matrix is scanned per query).
+
+    ``ann_configs`` opts into the approximate-search comparison: each entry (a dict of
+    optional ``label``/``clusters``/``nprobe``) builds a separate ANN cluster-prune store
+    over the same precomputed vectors and reports its single-query latency and index
+    recall under ``out["ann"]``, alongside the exact scan. Empty by default (exact only).
     """
 
     from lodedb.local.db import LodeDB
@@ -412,7 +531,12 @@ def run_axis_a_govreport(
     out["chunk_character_limit"] = chunk_character_limit
     corpus_ids = [f"c{index}" for index in range(corpus_count)]
 
-    db = LodeDB(db_path, model="minilm", store_text=True)
+    # index_text=False: axis A is the vector-scale/latency/footprint path and never runs
+    # hybrid/lexical search, so skip the durable BM25 lexical index. Since v1.2.0 index_text
+    # defaults to store_text (True here), leaving it unset would build and persist an unused
+    # ~100 MB .tvlex sidecar, inflating ingest, persist, and footprint and making the vector
+    # comparison unfair. store_text stays True to retain the text payload (footprint parity).
+    db = LodeDB(db_path, model="minilm", store_text=True, index_text=False)
     try:
         ingest_seconds = _ingest_vectors(
             db, corpus_ids, corpus_vectors, corpus_texts, None, batch=ingest_batch
@@ -428,6 +552,12 @@ def run_axis_a_govreport(
         )
         out["footprint"] = _dir_footprint(Path(db_path))
         out["peak_rss_bytes"] = _peak_rss_bytes()
+        print(
+            f"[trieve-vs-lodedb] axis A exact: ingested {out['count_after_ingest']} "
+            f"({out['ingest_throughput_per_s']}/s), persisted in {out['persist_seconds']}s; "
+            f"measuring latency/recall...",
+            flush=True,
+        )
 
         query_list = [row.tolist() for row in query_vectors]
         if not query_list:
@@ -485,6 +615,36 @@ def run_axis_a_govreport(
             ),
             "note": "index fidelity vs fp32 brute-force top-k over the same vectors",
         }
+
+        # Checkpoint the exact-scan result to stdout before the (potentially very slow) ANN
+        # cluster build, so the essential baseline survives even if the ANN phase times out or
+        # the client disconnects (recoverable from Modal's worker logs). See issue #71: the
+        # k-means build is impractical at 2M, so the exact baseline must not depend on it.
+        import json as _json
+
+        print(f"LODEDB_RESULT axis_a_exact {_json.dumps(out, sort_keys=True)}", flush=True)
+
+        # (7) opt-in ANN (cluster-prune) latency/recall trade vs the exact scan above.
+        # Each config is a separate store (ANN tuning is create-time), built from the
+        # same precomputed vectors, so this isolates the approximate-search win at scale:
+        # the exact single-query latency grows with the corpus, ANN stays sub-linear.
+        if ann_configs:
+            out["ann"] = [
+                _measure_ann_config(
+                    f"{db_path}-ann{index}",
+                    config,
+                    corpus_ids=corpus_ids,
+                    corpus_vectors=corpus_vectors,
+                    corpus_texts=corpus_texts,
+                    query_vectors=query_vectors,
+                    k=k,
+                    ingest_batch=ingest_batch,
+                    latency_iters=latency_iters,
+                    warmup=warmup,
+                    recall_sample=recall_sample,
+                )
+                for index, config in enumerate(ann_configs)
+            ]
     finally:
         db.close()
     return out
@@ -671,8 +831,12 @@ def _synthetic_axis_a(db_path: str) -> dict[str, Any]:
 
     rng = np.random.default_rng(0)
     corpus_count = 200
-    corpus_vectors = _l2_normalize(rng.standard_normal((corpus_count, MINILM_DIM)).astype(np.float32))
-    corpus_texts = [f"synthetic government report chunk number {index}" for index in range(corpus_count)]
+    corpus_vectors = _l2_normalize(
+        rng.standard_normal((corpus_count, MINILM_DIM)).astype(np.float32)
+    )
+    corpus_texts = [
+        f"synthetic government report chunk number {index}" for index in range(corpus_count)
+    ]
     # Held-out queries are near a few corpus rows so recall is meaningfully nonzero.
     query_vectors = _l2_normalize(
         corpus_vectors[:5] + 0.05 * rng.standard_normal((5, MINILM_DIM)).astype(np.float32)
@@ -686,6 +850,9 @@ def _synthetic_axis_a(db_path: str) -> dict[str, Any]:
         latency_iters=50,
         warmup=5,
         recall_sample=5,
+        # A tiny cluster count keeps the synthetic 200-row corpus well above the
+        # per-cluster minimum so the ANN path actually engages in the smoke.
+        ann_configs=({"label": "cluster-default", "clusters": 8, "nprobe": 4},),
         corpus_vectors=corpus_vectors,
         corpus_texts=corpus_texts,
         query_vectors=query_vectors,
@@ -724,7 +891,10 @@ def _synthetic_axis_b(db_path: str) -> dict[str, Any]:
                 "relevant_docids": [docid],
             }
         )
-        query_rows.append(corpus_vectors[anchor_row] + 0.02 * rng.standard_normal(MINILM_DIM).astype(np.float32))
+        query_rows.append(
+            corpus_vectors[anchor_row]
+            + 0.02 * rng.standard_normal(MINILM_DIM).astype(np.float32)
+        )
     query_vectors = _l2_normalize(np.vstack(query_rows).astype(np.float32))
     return run_axis_b_mldr(
         db_path,

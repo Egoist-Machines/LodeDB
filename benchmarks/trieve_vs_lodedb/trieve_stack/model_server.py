@@ -356,20 +356,20 @@ def build_app() -> Any:
     # torch/GPU forward passes never starve the event loop when Trieve fires the
     # dense + sparse + rerank calls for one hybrid query concurrently.
     @app.post("/embeddings")
-    def embeddings(payload: dict = Body(...)) -> JSONResponse:
+    def embeddings(payload: dict = Body(...)) -> JSONResponse:  # noqa: B008 (FastAPI body binding)
         texts = normalize_input(payload.get("input"))
         vectors = encode_dense(models, texts)
         return JSONResponse(dense_response(vectors))
 
     @app.post("/embed_sparse")
-    def embed_sparse(payload: dict = Body(...)) -> JSONResponse:
+    def embed_sparse(payload: dict = Body(...)) -> JSONResponse:  # noqa: B008 (FastAPI body binding)
         inputs = [str(item) for item in payload.get("inputs", [])]
         encode_type = str(payload.get("encode_type", "doc"))
         weights = encode_sparse(models, inputs, encode_type)
         return JSONResponse(sparse_response(weights))
 
     @app.post("/rerank")
-    def rerank(payload: dict = Body(...)) -> JSONResponse:
+    def rerank(payload: dict = Body(...)) -> JSONResponse:  # noqa: B008 (FastAPI body binding)
         query = str(payload.get("query", ""))
         texts = [str(item) for item in payload.get("texts", [])]
         scores = score_rerank(models, query, texts)

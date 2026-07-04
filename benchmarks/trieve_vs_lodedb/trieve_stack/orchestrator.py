@@ -27,11 +27,10 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
-from typing import Any
-
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Any
 
 # Ports (kept in sync with the env block in trieve_modal / PLAN.md).
 POSTGRES_PORT = 5432
@@ -183,7 +182,10 @@ def start_postgres() -> subprocess.Popen[bytes]:
         _log("initdb (trust auth for the local single-container superuser)")
         subprocess.run(
             _as_postgres(
-                [initdb, "-D", str(PG_DATA_DIR), "-U", "postgres", "--auth=trust", "--encoding=UTF8"]
+                [
+                    initdb, "-D", str(PG_DATA_DIR), "-U", "postgres",
+                    "--auth=trust", "--encoding=UTF8",
+                ]
             ),
             check=True,
             stdout=subprocess.DEVNULL,
@@ -232,8 +234,10 @@ def start_postgres() -> subprocess.Popen[bytes]:
     # postgres:password so mirror that.
     _log("configuring postgres role + trieve database")
     subprocess.run(
-        [psql, "-h", "127.0.0.1", "-p", str(POSTGRES_PORT), "-U", "postgres", "-v", "ON_ERROR_STOP=0",
-         "-c", "ALTER USER postgres WITH PASSWORD 'password';"],
+        [
+            psql, "-h", "127.0.0.1", "-p", str(POSTGRES_PORT), "-U", "postgres",
+            "-v", "ON_ERROR_STOP=0", "-c", "ALTER USER postgres WITH PASSWORD 'password';",
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
     )

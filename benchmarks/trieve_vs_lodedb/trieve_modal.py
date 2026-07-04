@@ -221,8 +221,8 @@ def run_trieve_bench(spec: dict) -> dict:
 
     _apply_stack_env()
 
-    from trieve_stack import orchestrator
     import trieve_bench
+    from trieve_stack import orchestrator
 
     handle = orchestrator.boot_and_bootstrap(embedding_size=384, model_name="all-MiniLM-L6-v2")
     base_url = handle["base_url"]
@@ -241,7 +241,9 @@ def run_trieve_bench(spec: dict) -> dict:
                 k=int(axis_a.get("k", 10)),
                 chunk_character_limit=int(axis_a.get("chunk_character_limit", 360)),
                 latency_iters=int(axis_a.get("latency_iters", 1000)),
-                batch_sizes=tuple(int(size) for size in axis_a.get("batch_sizes", (1, 16, 64, 256))),
+                batch_sizes=tuple(
+                    int(size) for size in axis_a.get("batch_sizes", (1, 16, 64, 256))
+                ),
             )
 
         axis_b = spec.get("axis_b")
@@ -303,7 +305,7 @@ def main(out: str = "benchmarks/trieve_vs_lodedb/results/trieve_results.json") -
                 "latency_iters": 1000,
             },
             "axis_b": {
-                "max_docs": 1500,  # all ~800 qrel-relevant docs + distractors to 1500 (~150k chunks)
+                "max_docs": 1500,  # ~800 qrel-relevant docs + distractors to 1500 (~150k chunks)
                 "k": 100,
                 "recall_ks": (10, 100),
                 "ndcg_k": 10,

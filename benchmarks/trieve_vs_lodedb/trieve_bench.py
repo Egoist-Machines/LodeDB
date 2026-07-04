@@ -193,7 +193,12 @@ class TrieveClient:
         return headers
 
     def _request(
-        self, method: str, path: str, *, payload: Any = None, extra_headers: dict[str, str] | None = None,
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Any = None,
+        extra_headers: dict[str, str] | None = None,
         timeout: float = 120.0,
     ) -> tuple[int, dict[str, str], Any]:
         """Issues one request; returns (status, response_headers, parsed_json_or_none)."""
@@ -357,7 +362,9 @@ def ingest_corpus(
     and any non-200 batch statuses.
     """
 
-    batches = [payloads[start : start + batch_size] for start in range(0, len(payloads), batch_size)]
+    batches = [
+        payloads[start : start + batch_size] for start in range(0, len(payloads), batch_size)
+    ]
     started = time.perf_counter()
     statuses: list[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -585,7 +592,9 @@ def _score_mode(
     rerank_ms: list[float] = []
     for query in queries:
         relevant = set(query["relevant_docids"])
-        hits, timing, elapsed_ms = client.search(query["query"], search_type=search_type, page_size=k)
+        hits, timing, elapsed_ms = client.search(
+            query["query"], search_type=search_type, page_size=k
+        )
         latencies_ms.append(elapsed_ms)
         if timing:
             embed_ms.append(timing["embed_ms"])
@@ -712,7 +721,11 @@ def _self_test() -> int:
     check("rank_docids dedup order", rank_docids(mapped) == ["D1", "D2", "D3"])
 
     # V1 fallback extraction.
-    v1_body = {"score_chunks": [{"metadata": [{"tracking_id": "X", "metadata": {"docid": "X"}}], "score": 1.0}]}
+    v1_body = {
+        "score_chunks": [
+            {"metadata": [{"tracking_id": "X", "metadata": {"docid": "X"}}], "score": 1.0}
+        ]
+    }
     check("v1 extract", _extract_hits(v1_body)[0]["docid"] == "X")
 
     # Quality math: perfect ranking = recall 1.0 and nDCG 1.0.
