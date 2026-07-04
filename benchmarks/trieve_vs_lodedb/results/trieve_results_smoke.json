@@ -1,0 +1,178 @@
+{
+  "axis_a": {
+    "axis": "A",
+    "batched_throughput": [
+      {
+        "concurrency": 1,
+        "per_query_ms": 52.4525,
+        "qps": 19.1
+      },
+      {
+        "concurrency": 8,
+        "per_query_ms": 55.1481,
+        "qps": 18.1
+      },
+      {
+        "concurrency": 16,
+        "per_query_ms": 53.3812,
+        "qps": 18.7
+      }
+    ],
+    "chunk_character_limit": 360,
+    "corpus_count": 1000,
+    "count_after_ingest": 1000,
+    "dataset": "ccdv/govreport-summarization",
+    "enqueue": {
+      "batch_count": 9,
+      "enqueue_seconds": 0.298,
+      "enqueue_throughput_per_s": 3353.8,
+      "non_200_batches": 0
+    },
+    "index_wait": {
+      "expected_count": 1000,
+      "final_chunk_count": 1000,
+      "index_wait_seconds": 15.06
+    },
+    "ingest_seconds": 15.358,
+    "ingest_throughput_per_s": 65.1,
+    "k": 10,
+    "server_timing": {
+      "embed_ms": {
+        "count": 50,
+        "mean_ms": 48.92,
+        "p50_ms": 47.0,
+        "p95_ms": 56.0
+      },
+      "note": "per-phase from Trieve Server-Timing; qdrant_ms is the vector-store phase",
+      "phases_sample": {
+        "computed_query_vector": 54.0,
+        "fetched_from_postgres": 1.0,
+        "fetched_from_qdrant": 1.0,
+        "highlight_chunks": 0.0,
+        "reranking": 0.0,
+        "search_chunks": 0.0,
+        "send_to_clickhouse": 0.0,
+        "start_to_create_query_vector": 0.0
+      },
+      "qdrant_ms": {
+        "count": 50,
+        "mean_ms": 1.02,
+        "p50_ms": 1.0,
+        "p95_ms": 1.0
+      },
+      "raw_header_sample": "start_to_create_query_vector;dur=0, computed_query_vector;dur=54, fetched_from_qdrant;dur=1, fetched_from_postgres;dur=1, highlight_chunks;dur=0, reranking;dur=0, search_chunks;dur=0, send_to_clickhouse;dur=0"
+    },
+    "single_query_latency_ms": {
+      "count": 50,
+      "mean_ms": 55.74315623999893,
+      "p50_ms": 53.142118000010896,
+      "p95_ms": 64.94649900000127
+    },
+    "system": "trieve"
+  },
+  "axis_b": {
+    "axis": "B",
+    "chunk_character_limit": 360,
+    "corpus_chunk_count": 4022,
+    "corpus_doc_count": 30,
+    "count_after_ingest": 4022,
+    "dataset": "Shitao/MLDR/en",
+    "enqueue": {
+      "batch_count": 34,
+      "enqueue_seconds": 0.085,
+      "enqueue_throughput_per_s": 47497.1,
+      "non_200_batches": 0
+    },
+    "hybrid": {
+      "metrics": {
+        "ndcg@10": 0.9064,
+        "recall@10": 1.0,
+        "recall@100": 1.0
+      },
+      "mode": "hybrid",
+      "query_count": 30,
+      "query_latency_ms": {
+        "count": 30,
+        "mean_ms": 671.110723299995,
+        "p50_ms": 678.8451250000094,
+        "p95_ms": 885.2291040000182
+      },
+      "server_timing": {
+        "embed_ms": {
+          "count": 30,
+          "mean_ms": 84.83333333333333,
+          "p50_ms": 81.0,
+          "p95_ms": 105.0
+        },
+        "qdrant_ms": {
+          "count": 30,
+          "mean_ms": 2.7,
+          "p50_ms": 3.0,
+          "p95_ms": 4.0
+        },
+        "rerank_ms": {
+          "count": 30,
+          "mean_ms": 573.4,
+          "p50_ms": 581.0,
+          "p95_ms": 735.0
+        }
+      }
+    },
+    "index_wait": {
+      "expected_count": 4022,
+      "final_chunk_count": 4022,
+      "index_wait_seconds": 60.17
+    },
+    "ingest_seconds": 60.255,
+    "k": 100,
+    "query_count": 30,
+    "system": "trieve",
+    "vector": {
+      "metrics": {
+        "ndcg@10": 0.9254,
+        "recall@10": 0.9667,
+        "recall@100": 0.9667
+      },
+      "mode": "semantic",
+      "query_count": 30,
+      "query_latency_ms": {
+        "count": 30,
+        "mean_ms": 53.62317190000567,
+        "p50_ms": 53.661775000023226,
+        "p95_ms": 56.38450500003955
+      },
+      "server_timing": {
+        "embed_ms": {
+          "count": 30,
+          "mean_ms": 44.46666666666667,
+          "p50_ms": 45.0,
+          "p95_ms": 46.0
+        },
+        "qdrant_ms": {
+          "count": 30,
+          "mean_ms": 1.6666666666666667,
+          "p50_ms": 2.0,
+          "p95_ms": 3.0
+        },
+        "rerank_ms": {
+          "count": 30,
+          "mean_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0
+        }
+      }
+    }
+  },
+  "handle": {
+    "base_url": "http://localhost:8090",
+    "dataset_id": "4c78c2f2-7dd3-4210-a2c8-8d6df9aee902",
+    "org_id": "c8118e27-f110-45ec-8907-677694545286"
+  },
+  "handle_axis_b": {
+    "base_url": "http://localhost:8090",
+    "dataset_id": "8c73850e-592d-4784-9d71-1bee2285d0cf",
+    "org_id": "19689e32-6df2-4934-babb-739e50730939"
+  },
+  "smoke": true,
+  "trieve_sha": "a99b21e23f21025757b44efb594676c4a7b7495f"
+}

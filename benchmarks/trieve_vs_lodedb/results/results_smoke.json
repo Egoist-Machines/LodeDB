@@ -1,0 +1,161 @@
+{
+  "axis_a": {
+    "ann": [
+      {
+        "algorithm": "cluster",
+        "clusters": null,
+        "footprint": {
+          "by_extension_bytes": {
+            ".json": 9817726,
+            ".lock": 0,
+            ".tvim": 8163090,
+            ".tvlex": 21320503,
+            ".tvtext": 3166157
+          },
+          "file_count": 12,
+          "total_bytes": 42467476
+        },
+        "index_recall_at_k": {
+          "k": 10,
+          "note": "ANN result set vs fp32 brute-force top-k (same metric as the exact row)",
+          "query_sample": 200,
+          "recall": 0.956
+        },
+        "ingest_seconds": 12.319,
+        "label": "cluster-default",
+        "nprobe": null,
+        "persist_seconds": 15.79,
+        "single_query_latency_ms": {
+          "count": 200,
+          "mean_ms": 1.3074829699993984,
+          "p50_ms": 1.3144710000005944,
+          "p95_ms": 1.5563030000009803
+        }
+      }
+    ],
+    "axis": "A",
+    "batched_throughput": [
+      {
+        "batch_size": 1,
+        "per_query_ms": 0.8496,
+        "qps": 1177.0,
+        "repeats": 20
+      },
+      {
+        "batch_size": 16,
+        "per_query_ms": 0.3465,
+        "qps": 2886.3,
+        "repeats": 12
+      },
+      {
+        "batch_size": 64,
+        "per_query_ms": 0.1325,
+        "qps": 7547.8,
+        "repeats": 3
+      }
+    ],
+    "chunk_character_limit": 360,
+    "corpus_count": 40000,
+    "count_after_ingest": 40000,
+    "dataset": "ccdv/govreport-summarization",
+    "dim": 384,
+    "embed_seconds": 9.23,
+    "footprint": {
+      "by_extension_bytes": {
+        ".json": 9817660,
+        ".lock": 0,
+        ".tvim": 8163090,
+        ".tvlex": 21320503,
+        ".tvtext": 3166157
+      },
+      "file_count": 12,
+      "total_bytes": 42467410
+    },
+    "index_recall_at_k": {
+      "k": 10,
+      "note": "index fidelity vs fp32 brute-force top-k over the same vectors",
+      "query_sample": 200,
+      "recall": 0.9655
+    },
+    "ingest_seconds": 12.8,
+    "ingest_throughput_per_s": 3124.9,
+    "k": 10,
+    "peak_rss_bytes": 6251126784,
+    "persist_seconds": 16.14,
+    "single_query_latency_ms": {
+      "count": 200,
+      "mean_ms": 0.8923649250002086,
+      "p50_ms": 0.8841109999977448,
+      "p95_ms": 0.9504360000036627
+    }
+  },
+  "axis_b": {
+    "axis": "B",
+    "chunk_character_limit": 360,
+    "corpus_chunk_count": 203167,
+    "corpus_doc_count": 2000,
+    "count_after_ingest": 203167,
+    "dataset": "Shitao/MLDR/en",
+    "embed_seconds": 57.94,
+    "footprint": {
+      "by_extension_bytes": {
+        ".json": 67394833,
+        ".lock": 0,
+        ".tvim": 41449158,
+        ".tvlex": 109982660,
+        ".tvtext": 21268905
+      },
+      "file_count": 12,
+      "total_bytes": 240095556
+    },
+    "hybrid": {
+      "metrics": {
+        "ndcg@10": 0.9116,
+        "recall@10": 0.9587,
+        "recall@100": 0.985
+      },
+      "mode": "hybrid",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 17.48346874124941,
+        "p50_ms": 16.400172000032853,
+        "p95_ms": 25.493242999971244
+      }
+    },
+    "ingest_seconds": 60.906,
+    "k": 100,
+    "lexical": {
+      "metrics": {
+        "ndcg@10": 0.9052,
+        "recall@10": 0.9475,
+        "recall@100": 0.975
+      },
+      "mode": "lexical",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 4.553967511251145,
+        "p50_ms": 3.9797899999598485,
+        "p95_ms": 9.719384999982594
+      }
+    },
+    "query_count": 800,
+    "vector": {
+      "metrics": {
+        "ndcg@10": 0.852,
+        "recall@10": 0.9075,
+        "recall@100": 0.96
+      },
+      "mode": "vector",
+      "query_count": 800,
+      "query_latency_ms": {
+        "count": 800,
+        "mean_ms": 4.132944681250308,
+        "p50_ms": 4.107901999987007,
+        "p95_ms": 4.269171000032657
+      }
+    }
+  },
+  "smoke": true
+}
