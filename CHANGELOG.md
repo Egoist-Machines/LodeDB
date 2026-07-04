@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in `torch.compile` embedding runtime for GPU query serving.**
+  `embedding_runtime="torch-compile"` runs the encoder through `torch.compile` (CUDA-graph replay
+  on CUDA), producing embeddings identical to the ONNX and sentence-transformers runtimes (parity
+  1.0 on MiniLM). It cuts single-query `embed_query` latency about 1.3x on an A10 and 1.4x on an
+  L40S versus the ONNX-CUDA default for short queries: the forward pass alone is roughly 4x faster,
+  but tokenization and the device copy do not compile away, so the end-to-end gain is smaller.
+  CUDA is where it pays (off CUDA it falls back to inductor-only compilation), and it rides the
+  existing `lodedb[torch]` tier with no new dependency. Because CUDA graphs need a static shape it
+  pads every input to `max_seq_length`, so set a small value (32-64) for the query path or short
+  queries run slower than the default. Background and measurements:
+  `benchmarks/embedding_megakernel_spike/` (the issue #67 gate).
+
 ## [1.3.0] - 2026-07-04
 
 ### Changed

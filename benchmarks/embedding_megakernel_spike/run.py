@@ -79,8 +79,12 @@ def run_spike(baselines: tuple[str, ...], *, iters: int, warmup: int) -> dict:
             "parity_cosine_vs_onnx_cpu": _parity(backend, queries, reference),
         }
 
-    # Attribution: ONNX via the backend seams; torch via the parity-checked HF pipeline.
+    # Attribution: ONNX via the backend seams; the plain torch baselines via the
+    # parity-checked HF pipeline. The torch-compile baseline is measured end-to-end only
+    # (its e2e embed_query above is the point); a per-stage split is not meaningful for it.
     for name, backend in built.items():
+        if name not in ONNX_BASELINES and name not in ("torch-cpu", "torch-mps", "torch-cuda"):
+            continue
         print(f"[spike] attributing {name} ...", file=sys.stderr)
         try:
             if backend.runtime == "onnx":

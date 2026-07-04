@@ -3,7 +3,9 @@
 A metrics-only spike that runs the gate from
 [issue #67](https://github.com/Egoist-Machines/LodeDB/issues/67) ("fused single-query MiniLM
 embedding megakernel") on real hardware, so the moonshot can be accepted or rejected on data
-rather than intuition. It changes no shipping code and no storage format; it only measures.
+rather than intuition. The spike itself only measures (no storage-format change); acting on its
+result, it also ships the low-maintenance lever it surfaced as an opt-in embedding runtime (see
+"Shipping the compiler path" below), rather than the hand kernel the issue gated.
 
 The idea in the issue: for a single query, embedding dominates end-to-end latency while the
 TurboVec scan is already sub-millisecond, so the embedding forward pass is the remaining
@@ -123,17 +125,24 @@ dispatch-bound.
 
 ### Server GPU (Modal), the regime a megakernel would target
 
-| GPU | `onnx-cuda` p50 | `onnx-tensorrt` p50 | `torch-cuda` p50 | `torch.compile` forward (eager -> compiled) | fp16 roofline floor |
-|---|---:|---:|---:|---:|---:|
-| A10 | 1.49 ms | 1.31 ms | 4.13 ms | 2.60 -> 0.67 ms (3.9x) | 0.036 ms |
-| L40S | 1.06 ms | 1.07 ms | 3.26 ms | 1.89 -> 0.42 ms (4.5x) | 0.025 ms |
+`embed_query` p50 through the SDK (`torch-compile-cuda` is the shipped opt-in path, pad 32):
+
+| GPU | `onnx-cuda` | `onnx-tensorrt` | `torch-cuda` | `torch-compile-cuda` | `torch.compile` forward (eager->compiled) | fp16 roofline floor |
+|---|---:|---:|---:|---:|---:|---:|
+| A10 | 1.384 ms | 1.314 ms | 4.134 ms | **1.097 ms** | 2.70 -> 0.70 ms (3.85x) | 0.036 ms |
+| L40S | 1.172 ms | 1.195 ms | 2.889 ms | **0.812 ms** | 1.67 -> 0.43 ms (3.91x) | 0.025 ms |
 
 All CUDA baselines are parity 1.0 against the `onnx-cpu` reference. ORT graph optimization alone
 gives ~1.4x on the A10 and ~1.6x on the L40S (`ORT_DISABLE_ALL` -> `ORT_ENABLE_ALL`). ORT CUDA
 Graph capture is **blocked** on this graph: the dynamic-shape export inserts `Memcpy` nodes that
 are not partitioned to the CUDA provider, so `torch.compile` and TensorRT are the viable
-low-maintenance fusion paths. (The `torch.compile` speedup varies run to run with the eager
-baseline; the compiled forward is the stable number, ~0.4-0.7 ms.)
+low-maintenance fusion paths.
+
+The forward-only `torch.compile` gain is ~4x, but the shipped `embed_query` path wins only
+**1.26x (A10) / 1.44x (L40S)** end to end: the ~4x is the forward pass alone, while `onnx-cuda`
+already uses dynamic padding + ORT fusion, and the compiled path's fixed pad plus tokenization
+and the device->host copy absorb most of the forward gain. The end-to-end win grows as queries
+lengthen toward the pad; for short queries it is modest.
 
 ### Roofline
 
@@ -186,3 +195,29 @@ survives end-to-end. Concretely:
 Because the low-maintenance paths already capture the multiplicative win, the gate's step-3
 kernel prototype is not warranted; the go/no-go can be settled without one. If MiniLM
 single-query GPU latency is ever prioritized, adopt a compiler path first and re-measure.
+
+## Shipping the compiler path: `embedding_runtime="torch-compile"`
+
+Acting on the spike, LodeDB now ships the low-maintenance lever as an opt-in embedding runtime
+rather than a hand kernel:
+
+```python
+db = LodeDB(path="./data", model="minilm", device="cuda",
+            embedding_runtime="torch-compile", max_seq_length=32)
+```
+
+It loads the raw HF encoder and runs it through `torch.compile` (CUDA-graph replay on CUDA),
+producing embeddings identical to the ONNX/torch runtimes (parity 1.0 on MiniLM, verified in
+`tests/test_torch_compile_runtime.py`). Measured `embed_query` speedup vs the default ONNX-CUDA
+path: **1.26x on the A10, 1.44x on the L40S** for short queries (the forward pass alone is ~4x;
+tokenization and the copy do not compile away). Scope and caveats, all honest:
+
+- **CUDA is where it pays.** Off CUDA it falls back to inductor-only compilation with a smaller
+  gain; the laptop default stays `onnx-cpu`, which a compiler-on-GPU does not touch.
+- **Keep the pad small.** CUDA graphs need a static shape, so every input is padded to
+  `max_seq_length`; a large value (the SDK default is 256) makes short queries slower than
+  ONNX's dynamic padding. Set 32-64 for the query fast path (a warning fires above 128).
+- **No new dependency:** it rides the existing `lodedb[torch]` tier and imports lazily.
+
+This is the spike's actual conclusion in shipped form: a stock compiler over a fixed shape, not
+a per-architecture hand kernel.

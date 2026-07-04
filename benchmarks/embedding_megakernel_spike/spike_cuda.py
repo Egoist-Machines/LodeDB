@@ -27,7 +27,7 @@ import spike_backends as sb  # noqa: E402
 import spike_measure as sm  # noqa: E402
 from run import run_spike  # noqa: E402
 
-CUDA_BASELINES = ("onnx-cuda", "torch-cuda", "onnx-tensorrt")
+CUDA_BASELINES = ("onnx-cuda", "torch-cuda", "onnx-tensorrt", "torch-compile-cuda")
 
 
 def run_cuda_spike(*, iters: int, warmup: int, seq_len: int = 16) -> dict:
@@ -131,7 +131,13 @@ def measure_ort_cuda_graph(*, iters: int, warmup: int, seq_len: int) -> dict:
 
 
 def measure_torch_compile(*, iters: int, warmup: int, seq_len: int) -> dict:
-    """Times eager vs torch.compile(reduce-overhead) forward at a fixed sequence length."""
+    """Eager vs torch.compile(reduce-overhead) over VARYING queries at a fixed pad length.
+
+    Uses different fixture queries each call (production-realistic: cudagraphs must handle
+    changing input values, not one repeated tensor) padded to a static ``seq_len`` shape.
+    Reports the forward-only speedup and the full-embed speedup (tokenize + forward + pool +
+    normalize + device->host), so the end-to-end number is not overstated by the forward.
+    """
 
     import torch
 
@@ -139,52 +145,64 @@ def measure_torch_compile(*, iters: int, warmup: int, seq_len: int) -> dict:
         return {"skipped": "no CUDA torch device"}
 
     manual = sb.ManualTorchMiniLM("cuda", max_seq_length=seq_len)
-    tokens = manual.tokenizer(
-        [f"{sb.FIXTURE_QUERIES[3]}"],
-        padding="max_length",
-        truncation=True,
-        max_length=seq_len,
-        return_tensors="pt",
-    ).to("cuda")
-
-    def _run(model):
-        with torch.no_grad():
-            return model(**tokens)
-
-    # Eager forward at the same fixed shape (fair baseline for the compile speedup).
-    for _ in range(warmup + 3):
-        _run(manual.model)
-    torch.cuda.synchronize()
-    eager = []
-    for _ in range(iters):
-        start = time.perf_counter()
-        _run(manual.model)
-        torch.cuda.synchronize()
-        eager.append((time.perf_counter() - start) * 1000.0)
-
+    queries = list(sb.FIXTURE_QUERIES)
+    # Fixed-pad each query to [1, seq_len]: static shape (cudagraph-safe), varying content.
+    fixed_tokens = {
+        q: manual.tokenizer(
+            [q], padding="max_length", truncation=True, max_length=seq_len, return_tensors="pt"
+        ).to("cuda")
+        for q in queries
+    }
     compiled_model = torch.compile(manual.model, mode="reduce-overhead")
-    for _ in range(warmup + 5):  # compile + cudagraph capture
-        _run(compiled_model)
-    torch.cuda.synchronize()
-    compiled = []
-    for _ in range(iters):
-        start = time.perf_counter()
-        _run(compiled_model)
-        torch.cuda.synchronize()
-        compiled.append((time.perf_counter() - start) * 1000.0)
 
-    eager_stats = sm.percentiles(eager)
-    compiled_stats = sm.percentiles(compiled)
-    speedup = None
-    if eager_stats.get("p50_ms") and compiled_stats.get("p50_ms"):
-        speedup = round(eager_stats["p50_ms"] / compiled_stats["p50_ms"], 3)
+    def forward(model, q):
+        with torch.no_grad():
+            return model(**fixed_tokens[q])
+
+    def embed(model, q):
+        tokens = manual.tokenizer(
+            [q], padding="max_length", truncation=True, max_length=seq_len, return_tensors="pt"
+        ).to("cuda")
+        with torch.no_grad():
+            outputs = model(**tokens)
+        vec = manual.pool_normalize(outputs, tokens["attention_mask"])
+        return vec[0].detach().to("cpu").numpy()
+
+    def _cycle_time(fn, model) -> list[float]:
+        for i in range(warmup + 5):  # compile + cudagraph capture on the compiled model
+            fn(model, queries[i % len(queries)])
+        torch.cuda.synchronize()
+        samples = []
+        for i in range(iters):
+            q = queries[i % len(queries)]
+            start = time.perf_counter()
+            fn(model, q)
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - start) * 1000.0)
+        return samples
+
+    fwd_eager = sm.percentiles(_cycle_time(forward, manual.model))
+    fwd_compiled = sm.percentiles(_cycle_time(forward, compiled_model))
+    embed_eager = sm.percentiles(_cycle_time(embed, manual.model))
+    embed_compiled = sm.percentiles(_cycle_time(embed, compiled_model))
+
+    def _speedup(a, b):
+        if a.get("p50_ms") and b.get("p50_ms"):
+            return round(a["p50_ms"] / b["p50_ms"], 3)
+        return None
+
     return {
-        "eager_forward": eager_stats,
-        "compiled_forward": compiled_stats,
-        "compile_speedup": speedup,
+        "eager_forward": fwd_eager,
+        "compiled_forward": fwd_compiled,
+        "compile_speedup": _speedup(fwd_eager, fwd_compiled),
+        "eager_embed": embed_eager,
+        "compiled_embed": embed_compiled,
+        "embed_speedup": _speedup(embed_eager, embed_compiled),
         "seq_len": seq_len,
         "note": (
-            "torch.compile(reduce-overhead) = Inductor fusion + CUDA graphs; no custom "
-            "kernel. Not a genuine single kernel (KernelBench-Mega)."
+            "Varying queries, fixed pad length. compile_speedup is forward-only; "
+            "embed_speedup includes tokenize + pool + normalize + device->host copy and is "
+            "the realistic end-to-end figure. torch.compile(reduce-overhead) = Inductor fusion "
+            "+ CUDA graphs, no custom kernel; not a genuine single kernel (KernelBench-Mega)."
         ),
     }

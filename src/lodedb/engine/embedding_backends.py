@@ -129,6 +129,160 @@ class SentenceTransformerEmbeddingBackend:
         return self._model
 
 
+class CompiledTorchEmbeddingBackend:
+    """Embeds text with a ``torch.compile``d Hugging Face encoder for low single-query latency.
+
+    An opt-in fast path for GPU serving. It loads the raw HF encoder (``AutoModel``) and runs
+    it through ``torch.compile`` so a stock compiler fuses the forward pass and (on CUDA, with
+    ``mode="reduce-overhead"``) replays it as a CUDA graph, removing per-op launch overhead.
+    The embedding spike measured this at roughly 4x on the forward pass and about 2x
+    end-to-end vs the eager encoder on an A10/L40S; tokenization and the device->host copy do
+    not compile away, which is why the end-to-end gain is smaller than the forward gain.
+
+    Correctness is preserved: it reproduces the same computation as the ONNX / sentence-
+    transformers backends (the model encoder, then mean pooling over the attention mask or CLS
+    pooling, then L2 normalization), so an index built with either stays usable by this one.
+
+    CUDA graphs require a static input shape, so every input is padded to ``max_seq_length``
+    (mean/CLS pooling ignores the padding via the attention mask, so parity is unaffected).
+    ``torch`` and ``transformers`` import lazily, so a plain ``import lodedb`` never pays for
+    them. This is the ``lodedb[torch]`` tier; it adds no dependency beyond it.
+    """
+
+    name = "torch_compile"
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        native_dim: int,
+        device: str = "cuda",
+        batch_size: int = 32,
+        max_seq_length: int = 256,
+        query_prefix: str = "",
+        document_prefix: str = "",
+        pooling: str = "mean",
+        normalize: bool = True,
+        compile_mode: str = "reduce-overhead",
+    ) -> None:
+        """Stores config while keeping the torch import and model load/compile lazy."""
+
+        if not model_name:
+            raise ValueError("model_name is required")
+        if native_dim <= 0:
+            raise ValueError("native_dim must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if max_seq_length <= 0:
+            raise ValueError("max_seq_length must be positive")
+        if pooling not in {"cls", "mean"}:
+            raise ValueError("pooling must be cls or mean")
+        self.model_name = model_name
+        self.required_model_name = model_name
+        self.native_dim = native_dim
+        self.device = device
+        self.batch_size = batch_size
+        self.max_seq_length = max_seq_length
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
+        self.pooling = pooling
+        self.normalize = normalize
+        self.compile_mode = compile_mode
+        self._model: object | None = None
+        self._tokenizer: object | None = None
+
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Embeds document chunks with the configured document prefix."""
+
+        return self._encode(tuple(f"{self.document_prefix}{text}" for text in texts))
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        """Embeds one retrieval query with the configured query prefix."""
+
+        return self._encode((f"{self.query_prefix}{text}",))[0]
+
+    def _encode(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        """Tokenizes (fixed-pad), runs the compiled encoder, pools, normalizes, validates."""
+
+        if not texts:
+            return ()
+        import torch
+
+        model = self._load_model()
+        tokenizer = self._load_tokenizer()
+        rows: list[Any] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = list(texts[start : start + self.batch_size])
+            # Pad to a static shape so the CUDA graph capture stays valid across calls.
+            tokens = tokenizer(
+                batch,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_seq_length,
+                return_tensors="pt",
+            ).to(self.device)
+            with torch.no_grad():
+                outputs = model(**tokens)
+            pooled = self._pool(outputs, tokens["attention_mask"])
+            rows.append(pooled.detach().to("cpu"))
+        array = np.vstack([row.numpy() for row in rows]).astype(np.float32, copy=False)
+        if self.normalize:
+            array = _l2_normalize_rows(array)
+        _validate_embedding_array(array, native_dim=self.native_dim, model_name=self.model_name)
+        return tuple(tuple(float(value) for value in row) for row in array)
+
+    def _pool(self, outputs: object, attention_mask: object) -> object:
+        """Pools token embeddings into one sentence vector (CLS or mask-mean), in torch."""
+
+        import torch
+
+        token_embeddings = outputs.last_hidden_state  # type: ignore[attr-defined]
+        if self.pooling == "cls":
+            return token_embeddings[:, 0, :]
+        mask = attention_mask.unsqueeze(-1).to(token_embeddings.dtype)
+        summed = (token_embeddings * mask).sum(dim=1)
+        counts = torch.clamp(mask.sum(dim=1), min=1.0)
+        return summed / counts
+
+    def _load_model(self) -> object:
+        """Loads and compiles the HF encoder lazily (first call pays the compile cost)."""
+
+        if self._model is None:
+            try:
+                import torch
+                from transformers import AutoModel
+            except ImportError as exc:  # pragma: no cover - optional runtime
+                raise RuntimeError(
+                    "the torch-compile embedding runtime needs torch + transformers "
+                    "(install lodedb[embeddings,torch])."
+                ) from exc
+            model = AutoModel.from_pretrained(self.model_name).to(self.device)
+            model.eval()
+            # reduce-overhead uses CUDA graphs (CUDA only); off CUDA fall back to the default
+            # inductor mode so the path still works (with a smaller gain) on CPU/MPS.
+            mode = self.compile_mode
+            if mode == "reduce-overhead" and self.device != "cuda":
+                mode = "default"
+            try:
+                self._model = torch.compile(model, mode=mode)
+            except Exception:  # noqa: BLE001 - no compiler backend on this platform: run eager
+                self._model = model
+        return self._model
+
+    def _load_tokenizer(self) -> object:
+        """Loads the Hugging Face tokenizer lazily to avoid import cost on a plain import."""
+
+        if self._tokenizer is None:
+            try:
+                from transformers import AutoTokenizer
+            except ImportError as exc:  # pragma: no cover - optional runtime
+                raise RuntimeError(
+                    "transformers is required to tokenize for the torch-compile runtime."
+                ) from exc
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        return self._tokenizer
+
+
 class ClipEmbeddingBackend:
     """Embeds text and images into one shared CLIP space for cross-modal search.
 

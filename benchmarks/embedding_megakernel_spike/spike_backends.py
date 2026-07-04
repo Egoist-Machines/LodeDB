@@ -179,6 +179,20 @@ def build_named_backend(name: str) -> NamedBackend | None:
         if device == "cuda" and not _torch_has("cuda"):
             return None
         return NamedBackend(name, "torch", device, (), torch_backend(device))
+    if name == "torch-compile-cuda":
+        # The shipped SDK opt-in path (embedding_runtime="torch-compile"). Query-tuned pad of
+        # 32: the fixed pad must be small or its extra tokens erase the compile win vs
+        # onnx-cuda's dynamic (~query-length) padding.
+        if not _torch_has("cuda"):
+            return None
+        from lodedb.local.backends import build_local_embedding_backend
+        backend, _res = build_local_embedding_backend(
+            resolve_preset("minilm"),
+            device="cuda",
+            embedding_runtime="torch-compile",
+            max_seq_length=32,
+        )
+        return NamedBackend(name, "torch-compile", "cuda", (), backend)
     raise ValueError(f"unknown baseline {name!r}")
 
 
