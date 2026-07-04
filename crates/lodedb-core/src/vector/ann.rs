@@ -14,12 +14,17 @@
 //! Everything here is deterministic: no clocks, no RNG (`unsafe_code = forbid`
 //! and no `rand` dependency), fixed iteration counts, and stable-order tie
 //! breaks. The same corpus always yields the same clustering and the same
-//! candidates. Vectors are the TurboVec-reconstructed rows (rotated space), and
-//! the index stores the matching rotation so it can rotate a raw query into that
-//! space itself before scoring centroids. The metric is dot product to match the
-//! exact scan.
+//! candidates. The seeding and assignment passes run under rayon, but each is
+//! order-preserving (indexed collects) or per-element independent (an in-place
+//! max), so the clustering never depends on thread count or scheduling and is
+//! byte-identical to a serial build. Vectors are the TurboVec-reconstructed rows
+//! (rotated space), and the index stores the matching rotation so it can rotate a
+//! raw query into that space itself before scoring centroids. The metric is dot
+//! product to match the exact scan.
 
 use std::cmp::Ordering;
+
+use rayon::prelude::*;
 
 use crate::vector::math::{dot, rotate};
 
@@ -65,12 +70,13 @@ impl ClusterIndex {
         let n = entries.len();
         let k = requested_k.clamp(1, n.max(1));
 
-        // Deterministic farthest-first seeding: start from the first (lowest
-        // chunk id) row, then repeatedly take the unseeded row least similar to
-        // every seed chosen so far. No RNG. Only unseeded rows are considered, so
-        // a zero- or low-norm first row (whose dot with everything is near zero)
-        // cannot make the search re-pick an already-seeded index and collapse the
-        // corpus to a single cluster.
+        // Deterministic farthest-first seeding: start from the first (lowest chunk
+        // id) row, then repeatedly take the unseeded row least similar to every seed
+        // chosen so far. No RNG. Only unseeded rows are considered, so a zero- or
+        // low-norm first row (whose dot with everything is near zero) cannot make the
+        // search re-pick an already-seeded index and collapse the corpus to a single
+        // cluster. Each seed's similarity fold over the corpus is parallel; the
+        // argmin pick is a cheap serial scan with a lowest-index tie-break.
         let mut seeds: Vec<usize> = Vec::with_capacity(k);
         let mut seeded = vec![false; n];
         seeds.push(0);
@@ -104,24 +110,13 @@ impl ClusterIndex {
             centroids[cluster * dim..(cluster + 1) * dim].copy_from_slice(entries[row].2);
         }
 
-        // Lloyd iterations: assign by max dot product, update centroids to the
-        // mean of their members. Means accumulate in f64 in a fixed order so the
-        // build is bit-reproducible for the same entries.
-        let mut assignment = vec![usize::MAX; n];
-        for _ in 0..MAX_ITERS {
-            let mut changed = false;
-            for (i, entry) in entries.iter().enumerate() {
-                let cluster = nearest_centroid(entry.2, &centroids, cluster_count, dim);
-                if cluster != assignment[i] {
-                    assignment[i] = cluster;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-            recompute_centroids(&mut centroids, entries, &assignment, cluster_count, dim);
-        }
+        // Lloyd iterations: assign every row to its nearest centroid (parallel) and
+        // update centroids to the f64 mean of their members (serial, fixed order so
+        // the means are bit-reproducible). Both parallel passes are order-preserving
+        // or per-row independent, so the clustering is byte-identical regardless of
+        // thread count, and the final centroids are the means of the returned
+        // assignment (so a persisted reload via `from_assignment` reproduces them).
+        let assignment = lloyd(&mut centroids, entries, cluster_count, dim);
 
         // Materialize postings and drop empty clusters. An empty cluster owns no
         // chunks, so probing it can only waste a probe slot; dropping it keeps
@@ -352,6 +347,48 @@ fn write_cluster_mean(centroid: &mut [f32], sum: &[f64], count: usize) {
     }
 }
 
+/// Runs Lloyd's algorithm in place over `entries`: assign every entry to its
+/// nearest centroid (parallel), update each centroid to the f64 mean of its
+/// members (sequential, fixed order for bit-reproducibility), repeat up to
+/// [`MAX_ITERS`] with an unchanged-assignment early exit. Returns the final
+/// assignment. On an early exit the centroids are the means of that assignment
+/// *and* every entry's nearest centroid is its assigned cluster; at the iteration
+/// cap only the former holds. Empty clusters keep their prior centroid and are
+/// dropped later by the caller.
+fn lloyd(
+    centroids: &mut [f32],
+    entries: &[ClusterEntry<'_>],
+    cluster_count: usize,
+    dim: usize,
+) -> Vec<usize> {
+    let mut assignment = vec![usize::MAX; entries.len()];
+    for _ in 0..MAX_ITERS {
+        let next = assign_all(entries, centroids, cluster_count, dim);
+        if next == assignment {
+            break;
+        }
+        assignment = next;
+        recompute_centroids(centroids, entries, &assignment, cluster_count, dim);
+    }
+    assignment
+}
+
+/// Assigns every entry to its nearest centroid, in parallel. The per-row result
+/// depends only on that row and the (shared, read-only) centroids, and the
+/// indexed collect preserves order, so the assignment is byte-identical to a
+/// sequential pass regardless of thread count.
+fn assign_all(
+    entries: &[ClusterEntry<'_>],
+    centroids: &[f32],
+    cluster_count: usize,
+    dim: usize,
+) -> Vec<usize> {
+    entries
+        .par_iter()
+        .map(|entry| nearest_centroid(entry.2, centroids, cluster_count, dim))
+        .collect()
+}
+
 fn nearest_centroid(vector: &[f32], centroids: &[f32], cluster_count: usize, dim: usize) -> usize {
     let mut best = 0usize;
     let mut best_dot = f32::NEG_INFINITY;
@@ -368,13 +405,19 @@ fn nearest_centroid(vector: &[f32], centroids: &[f32], cluster_count: usize, dim
     best
 }
 
+/// Folds a newly chosen seed's similarities into the running per-row nearest-seed
+/// maxima, in parallel. Each slot is updated from its own row only (an in-place
+/// max), so the result is independent of thread count.
 fn update_nearest(nearest: &mut [f32], entries: &[ClusterEntry<'_>], centroid: &[f32]) {
-    for (slot, entry) in nearest.iter_mut().zip(entries) {
-        let similarity = dot(entry.2, centroid);
-        if similarity > *slot {
-            *slot = similarity;
-        }
-    }
+    nearest
+        .par_iter_mut()
+        .zip(entries.par_iter())
+        .for_each(|(slot, entry)| {
+            let similarity = dot(entry.2, centroid);
+            if similarity > *slot {
+                *slot = similarity;
+            }
+        });
 }
 
 #[cfg(test)]
@@ -552,6 +595,34 @@ mod tests {
         assert!(
             ClusterIndex::from_assignment(&refs(&extra_owned), 3, string_postings, None).is_none()
         );
+    }
+
+    #[test]
+    fn parallel_build_recovers_each_row_with_a_single_probe() {
+        // Posting/centroid consistency on a larger, converging corpus: after the
+        // parallel Lloyd, each row's own cluster is the one a self-query scores
+        // highest, so probing just the single nearest cluster recovers the row. This
+        // guards against the centroids drifting out of sync with the postings they
+        // were grouped from (which would drop true neighbors from the probed set).
+        let mut rows = Vec::new();
+        for blob in 0..8 {
+            for i in 0..40 {
+                let mut vector = vec![0.0f32; 8];
+                vector[blob] = 1.0;
+                vector[(blob + 1) % 8] = 0.001 * (i as f32 + 1.0);
+                rows.push((format!("b{blob}c{i:02}"), vector));
+            }
+        }
+        let (owned, reverse) = entries(&rows);
+        let index = ClusterIndex::build(&refs(&owned), 8, 16, None);
+        assert_eq!(index.num_vectors(), owned.len());
+        for (id, _, vector) in &owned {
+            let hits = chunk_ids(&index.candidate_stable_ids(vector, 1, 1), &reverse);
+            assert!(
+                hits.contains(id),
+                "self-query for {id} must probe the cluster that owns it"
+            );
+        }
     }
 
     #[test]
