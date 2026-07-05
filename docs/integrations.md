@@ -68,7 +68,7 @@ lodedb migrate validate --manifest ./data/lodedb/migration.json
 | [LangChain](https://github.com/langchain-ai/langchain) | Framework | 139k | `VectorStore` adapter (`lodedb[langchain]`) | ✅ Shipped |
 | [LlamaIndex](https://github.com/run-llama/llama_index) | Framework | 50k | `VectorStore` + `PropertyGraphStore` adapters (`lodedb[llama-index]`) | ✅ Shipped ([#7](https://github.com/Egoist-Machines/LodeDB/pull/7)) |
 | [mem0](https://github.com/mem0ai/mem0) | Agent memory | 59k | `VectorStoreBase` provider (`lodedb[mem0]`) | ✅ Shipped ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16)) |
-| [cognee](https://github.com/topoteretes/cognee) | Graph memory | 7k | `VectorDBInterface` provider (`lodedb[cognee]`) | 🚧 In review |
+| [cognee](https://github.com/topoteretes/cognee) | Graph memory | 7k | `VectorDBInterface` provider (`lodedb[cognee]`) | 🚧 In review ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74)) |
 | [PrivateGPT](https://github.com/zylon-ai/private-gpt) | Local RAG app | 57k | LlamaIndex provider shim + `settings.yaml` key | ✅ Shipped |
 | [Haystack](https://github.com/deepset-ai/haystack) | Framework | 25k | `DocumentStore` protocol | 📋 Backlog |
 | [txtai](https://github.com/neuml/txtai) | Framework | n/a | `custom` backend (resolvable class string) | 📋 Backlog |
@@ -98,7 +98,7 @@ first.
 
 ## Recently shipped
 
-### cognee (in review)
+### cognee ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74), in review)
 - **Repo:** topoteretes/cognee (~7k★, Apache-2.0). AI memory that builds a knowledge graph
   over your data. **Install:** `lodedb[cognee]` (`cognee>=1.1.0,<2`).
 - **Pattern:** `CogneeLodeDBAdapter` implements cognee's `VectorDBInterface`; call
