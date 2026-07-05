@@ -125,24 +125,30 @@ dispatch-bound.
 
 ### Server GPU (Modal), the regime a megakernel would target
 
-`embed_query` p50 through the SDK (`torch-compile-cuda` is the shipped opt-in path, pad 32):
+Single-query `embed_query` p50 through the shipped SDK (`embedding_runtime="torch-compile"`,
+fp32 and fp16), speedup vs the `onnx-cuda` default:
 
-| GPU | `onnx-cuda` | `onnx-tensorrt` | `torch-cuda` | `torch-compile-cuda` | `torch.compile` forward (eager->compiled) | fp16 roofline floor |
+| GPU | `onnx-cuda` | `onnx-tensorrt` | `torch-cuda` | torch-compile fp32 | torch-compile fp16 | fp16 floor |
 |---|---:|---:|---:|---:|---:|---:|
-| A10 | 1.384 ms | 1.314 ms | 4.134 ms | **1.097 ms** | 2.70 -> 0.70 ms (3.85x) | 0.036 ms |
-| L40S | 1.172 ms | 1.195 ms | 2.889 ms | **0.812 ms** | 1.67 -> 0.43 ms (3.91x) | 0.025 ms |
+| A10 | 1.429 ms | 1.451 ms | 4.088 ms | 1.049 ms (1.36x) | **0.834 ms (1.71x)** | 0.036 ms |
+| L40S | 1.084 ms | 1.030 ms | 2.830 ms | 0.735 ms (1.47x) | **0.636 ms (1.70x)** | 0.025 ms |
 
-All CUDA baselines are parity 1.0 against the `onnx-cpu` reference. ORT graph optimization alone
-gives ~1.4x on the A10 and ~1.6x on the L40S (`ORT_DISABLE_ALL` -> `ORT_ENABLE_ALL`). ORT CUDA
-Graph capture is **blocked** on this graph: the dynamic-shape export inserts `Memcpy` nodes that
-are not partitioned to the CUDA provider, so `torch.compile` and TensorRT are the viable
-low-maintenance fusion paths.
+Bulk `embed_documents` throughput (docs/s, batch 128, mixed-length synthetic corpus):
 
-The forward-only `torch.compile` gain is ~4x, but the shipped `embed_query` path wins only
-**1.26x (A10) / 1.44x (L40S)** end to end: the ~4x is the forward pass alone, while `onnx-cuda`
-already uses dynamic padding + ORT fusion, and the compiled path's fixed pad plus tokenization
-and the device->host copy absorb most of the forward gain. The end-to-end win grows as queries
-lengthen toward the pad; for short queries it is modest.
+| GPU | `onnx-cuda` | torch-compile fp32 | torch-compile fp16 |
+|---|---:|---:|---:|
+| A10 | 2,130 | 2,564 | **3,848 (1.81x)** |
+| L40S | 3,460 | 4,277 | **5,464 (1.58x)** |
+
+All CUDA baselines are parity 1.0 against the `onnx-cpu` reference; fp16 is 0.999999 (recall-
+preserving, not bit-identical). The forward pass alone compiles ~4x (A10 2.71 -> 0.70 ms, L40S
+1.65 -> 0.41 ms); the end-to-end query win is smaller because tokenization and the device->host
+copy do not compile away, and fp16 recovers roughly another ~1.3x on top of fused fp32 by halving
+the weight bytes streamed. Length **buckets** (32/64/128/max) mean short queries no longer pay
+the full `max_seq_length` pad, so the fixed-pad footgun is gone. ORT graph optimization alone
+gives ~1.4x on the A10 / ~1.6x on the L40S (`ORT_DISABLE_ALL` -> `ORT_ENABLE_ALL`); ORT CUDA Graph
+capture stays **blocked** on this dynamic-shape graph (`Memcpy` nodes unpartitioned to CUDA), so
+`torch.compile` and TensorRT remain the viable low-maintenance fusion paths.
 
 ### Roofline
 
@@ -198,26 +204,30 @@ single-query GPU latency is ever prioritized, adopt a compiler path first and re
 
 ## Shipping the compiler path: `embedding_runtime="torch-compile"`
 
-Acting on the spike, LodeDB now ships the low-maintenance lever as an opt-in embedding runtime
+Acting on the spike, LodeDB ships the low-maintenance lever as an opt-in embedding runtime
 rather than a hand kernel:
 
 ```python
 db = LodeDB(path="./data", model="minilm", device="cuda",
-            embedding_runtime="torch-compile", max_seq_length=32)
+            embedding_runtime="torch-compile", embedding_dtype="float16")
 ```
 
-It loads the raw HF encoder and runs it through `torch.compile` (CUDA-graph replay on CUDA),
-producing embeddings identical to the ONNX/torch runtimes (parity 1.0 on MiniLM, verified in
-`tests/test_torch_compile_runtime.py`). Measured `embed_query` speedup vs the default ONNX-CUDA
-path: **1.26x on the A10, 1.44x on the L40S** for short queries (the forward pass alone is ~4x;
-tokenization and the copy do not compile away). Scope and caveats, all honest:
+It runs a fused encoder + pooling + L2-normalize module through `torch.compile` (CUDA-graph
+replay on CUDA), producing embeddings that match the ONNX/torch runtimes (fp32 parity 1.0,
+fp16 0.999999 on MiniLM, verified in `tests/test_torch_compile_runtime.py`). Measured `embed_query`
+speedup vs the default ONNX-CUDA path: **1.71x (A10) / 1.70x (L40S) with fp16** (1.36x/1.47x at
+fp32); bulk `add_many` throughput reaches **~1.8x** with fp16. Scope and caveats, all honest:
 
+- **fp16 is opt-in and CUDA-first.** It halves the weight bytes streamed per forward, the
+  dominant batch-1 cost. Embeddings stay within cosine 0.999 of fp32 (recall-preserving, not
+  bit-identical); both are L2-normalized fp32, so a store built at one dtype searches from the
+  other. Off CUDA, fp16 coerces to fp32 (bf16 stays on CPU); bf16 without Ampere support falls
+  back to fp16.
+- **Buckets, not a fixed pad.** Inputs pad to length buckets (32/64/128/max), so short queries
+  are cheap even at the SDK default `max_seq_length=256`; the earlier small-pad footgun is gone.
 - **CUDA is where it pays.** Off CUDA it falls back to inductor-only compilation with a smaller
   gain; the laptop default stays `onnx-cpu`, which a compiler-on-GPU does not touch.
-- **Keep the pad small.** CUDA graphs need a static shape, so every input is padded to
-  `max_seq_length`; a large value (the SDK default is 256) makes short queries slower than
-  ONNX's dynamic padding. Set 32-64 for the query fast path (a warning fires above 128).
 - **No new dependency:** it rides the existing `lodedb[torch]` tier and imports lazily.
 
-This is the spike's actual conclusion in shipped form: a stock compiler over a fixed shape, not
-a per-architecture hand kernel.
+This is the spike's actual conclusion in shipped form: a stock compiler (plus half precision and
+bucketed shapes) over the existing model, not a per-architecture hand kernel.

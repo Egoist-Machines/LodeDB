@@ -279,14 +279,17 @@ def build_local_embedding_backend(
     batch_size: int = 32,
     max_seq_length: int = 256,
     embedding_runtime: str = "auto",
+    embedding_dtype: str = "float32",
 ) -> tuple[EngineEmbeddingBackend, LocalEmbeddingResolution]:
     """Builds the embedding backend for a preset, runtime, and device.
 
     ``embedding_runtime`` is ``"auto"`` (prefer ONNX Runtime, fall back to torch),
     ``"onnx"`` (force ONNX Runtime), ``"torch"`` (force sentence-transformers), or
     ``"torch-compile"`` (opt-in ``torch.compile``d encoder for low single-query GPU-serving
-    latency; text presets only, biggest win on CUDA). Returns the backend plus a
-    :class:`LocalEmbeddingResolution` describing the runtime/device actually selected (and any
+    latency; text presets only, biggest win on CUDA). ``embedding_dtype`` (``"float32"`` default,
+    ``"float16"``/``"bfloat16"``) is honored only by ``"torch-compile"`` and halves the weights
+    streamed per forward on CUDA; it is rejected for the other runtimes. Returns the backend plus
+    a :class:`LocalEmbeddingResolution` describing the runtime/device actually selected (and any
     fallback), so the SDK and ``doctor`` can report it.
     """
 
@@ -296,11 +299,23 @@ def build_local_embedding_backend(
             f"unknown embedding_runtime {embedding_runtime!r}; "
             "choose auto, onnx, torch, or torch-compile"
         )
+    dtype = (embedding_dtype or "float32").strip().lower()
+    if dtype not in {"float32", "float16", "bfloat16"}:
+        raise ValueError(
+            f"unknown embedding_dtype {embedding_dtype!r}; choose float32, float16, or bfloat16"
+        )
+    if dtype != "float32" and runtime != "torch-compile":
+        raise ValueError(
+            f"embedding_dtype={dtype!r} is only supported with embedding_runtime='torch-compile' "
+            f"(got {runtime!r})"
+        )
     resolved = resolve_local_device(device)
 
-    # Opt-in torch.compile fast path (text presets only). Fuses the encoder forward and, on
-    # CUDA, replays it as a CUDA graph; measured ~4x forward / ~3x end-to-end vs eager on an
-    # A10/L40S. Off CUDA it still compiles (inductor) with a smaller gain.
+    # Opt-in torch.compile fast path (text presets only). Fuses encoder + pooling + normalize
+    # and, on CUDA, replays it as a CUDA graph; measured ~4x forward / ~1.3-1.4x end-to-end vs
+    # the ONNX-CUDA default on an A10/L40S, more with fp16. Off CUDA it still compiles (inductor)
+    # with a smaller gain. Inputs pad to length buckets, so a large max_seq_length is only a
+    # truncation cap, not a per-query tax.
     if runtime == "torch-compile":
         if preset.multimodal:
             raise ValueError("torch-compile runtime does not support the multimodal 'clip' preset")
@@ -315,12 +330,14 @@ def build_local_embedding_backend(
             query_prefix=preset.query_prefix,
             document_prefix=preset.document_prefix,
             pooling=preset.pooling,
+            dtype=dtype,
         )
         logger.info(
-            "embedding runtime=torch-compile device=%s (requested %s) max_seq_length=%d",
+            "embedding runtime=torch-compile device=%s (requested %s) dtype=%s (requested %s)",
             resolved,
             device,
-            max_seq_length,
+            backend.effective_dtype,
+            dtype,
         )
         if resolved != "cuda":
             logger.warning(
@@ -328,15 +345,6 @@ def build_local_embedding_backend(
                 "needs an NVIDIA GPU; on %s it falls back to a smaller inductor-only gain.",
                 resolved,
                 resolved,
-            )
-        elif max_seq_length > 128:
-            # CUDA graphs need a static shape, so every input is padded to max_seq_length.
-            # A large pad makes short queries do far more work than the ONNX path's dynamic
-            # padding and can erase the win; the query fast path wants a small value.
-            logger.warning(
-                "torch-compile pads every input to max_seq_length=%d; for single-query serving "
-                "set a small value (e.g. 32-64) or short queries run slower than the ONNX path.",
-                max_seq_length,
             )
         return backend, LocalEmbeddingResolution(
             requested_device=device,

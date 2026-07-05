@@ -9,7 +9,7 @@
     "python": "3.11.9",
     "apple_silicon": false,
     "cpu_count": 24,
-    "ram_bytes": 1081276293120,
+    "ram_bytes": 1081276284928,
     "onnxruntime_version": "1.20.1",
     "onnxruntime_providers": [
       "TensorrtExecutionProvider",
@@ -37,12 +37,12 @@
         "CPUExecutionProvider"
       ],
       "embed_query": {
-        "p50_ms": 1.38375,
-        "p90_ms": 1.47583,
-        "p95_ms": 1.48917,
-        "p99_ms": 1.51289,
-        "iqr_ms": 0.15551,
-        "min_ms": 1.19622,
+        "p50_ms": 1.42885,
+        "p90_ms": 1.48524,
+        "p95_ms": 1.49837,
+        "p99_ms": 1.54446,
+        "iqr_ms": 0.08754,
+        "min_ms": 1.23922,
         "samples": 1600
       },
       "parity_cosine_vs_onnx_cpu": {
@@ -55,12 +55,12 @@
       "device": "cuda",
       "providers": [],
       "embed_query": {
-        "p50_ms": 4.13367,
-        "p90_ms": 4.26842,
-        "p95_ms": 4.31527,
-        "p99_ms": 4.45762,
-        "iqr_ms": 0.11696,
-        "min_ms": 3.97635,
+        "p50_ms": 4.0878,
+        "p90_ms": 4.16137,
+        "p95_ms": 4.17894,
+        "p99_ms": 4.22737,
+        "iqr_ms": 0.05309,
+        "min_ms": 3.97119,
         "samples": 1600
       },
       "parity_cosine_vs_onnx_cpu": {
@@ -77,12 +77,12 @@
         "CPUExecutionProvider"
       ],
       "embed_query": {
-        "p50_ms": 1.31437,
-        "p90_ms": 1.36283,
-        "p95_ms": 1.37968,
-        "p99_ms": 1.40576,
-        "iqr_ms": 0.05265,
-        "min_ms": 1.22017,
+        "p50_ms": 1.45107,
+        "p90_ms": 1.50331,
+        "p95_ms": 1.52172,
+        "p99_ms": 1.55941,
+        "iqr_ms": 0.05714,
+        "min_ms": 1.33879,
         "samples": 1600
       },
       "parity_cosine_vs_onnx_cpu": {
@@ -95,169 +95,187 @@
       "device": "cuda",
       "providers": [],
       "embed_query": {
-        "p50_ms": 1.09713,
-        "p90_ms": 1.12691,
-        "p95_ms": 1.137,
-        "p99_ms": 1.15862,
-        "iqr_ms": 0.02985,
-        "min_ms": 1.03879,
+        "p50_ms": 1.04903,
+        "p90_ms": 1.06787,
+        "p95_ms": 1.07242,
+        "p99_ms": 1.08278,
+        "iqr_ms": 0.02296,
+        "min_ms": 1.00856,
         "samples": 1600
       },
       "parity_cosine_vs_onnx_cpu": {
         "min": 1.0,
         "mean": 1.0
       }
+    },
+    "torch-compile-cuda-fp16": {
+      "runtime": "torch-compile",
+      "device": "cuda",
+      "providers": [],
+      "embed_query": {
+        "p50_ms": 0.83414,
+        "p90_ms": 0.85307,
+        "p95_ms": 0.85837,
+        "p99_ms": 0.86591,
+        "iqr_ms": 0.02262,
+        "min_ms": 0.79157,
+        "samples": 1600
+      },
+      "parity_cosine_vs_onnx_cpu": {
+        "min": 0.999999,
+        "mean": 0.999999
+      }
     }
   },
   "attribution": {
     "onnx-cuda": {
       "end_to_end": {
-        "p50_ms": 1.31739,
-        "p90_ms": 1.36427,
-        "p95_ms": 1.37649,
-        "p99_ms": 1.41004,
-        "iqr_ms": 0.04764,
-        "min_ms": 1.22712,
+        "p50_ms": 1.35494,
+        "p90_ms": 1.39234,
+        "p95_ms": 1.40301,
+        "p99_ms": 1.4262,
+        "iqr_ms": 0.05254,
+        "min_ms": 1.23633,
         "samples": 1600
       },
       "tokenize": {
-        "p50_ms": 0.09519,
-        "p90_ms": 0.10141,
-        "p95_ms": 0.10254,
-        "p99_ms": 0.10641,
-        "iqr_ms": 0.01651,
-        "min_ms": 0.07115,
+        "p50_ms": 0.09687,
+        "p90_ms": 0.10397,
+        "p95_ms": 0.1053,
+        "p99_ms": 0.10945,
+        "iqr_ms": 0.01727,
+        "min_ms": 0.07245,
         "samples": 1600
       },
       "session_run": {
-        "p50_ms": 0.99524,
-        "p90_ms": 1.01446,
-        "p95_ms": 1.02057,
-        "p99_ms": 1.05651,
-        "iqr_ms": 0.02153,
-        "min_ms": 0.91635,
+        "p50_ms": 1.0268,
+        "p90_ms": 1.04369,
+        "p95_ms": 1.04765,
+        "p99_ms": 1.05862,
+        "iqr_ms": 0.01973,
+        "min_ms": 0.94417,
         "samples": 1600
       },
       "pool": {
-        "p50_ms": 0.00982,
-        "p90_ms": 0.01036,
-        "p95_ms": 0.01229,
-        "p99_ms": 0.01346,
-        "iqr_ms": 0.00061,
-        "min_ms": 0.009,
+        "p50_ms": 0.01011,
+        "p90_ms": 0.0108,
+        "p95_ms": 0.01204,
+        "p99_ms": 0.01336,
+        "iqr_ms": 0.00083,
+        "min_ms": 0.00871,
         "samples": 1600
       },
       "normalize": {
-        "p50_ms": 0.00781,
-        "p90_ms": 0.00805,
-        "p95_ms": 0.00822,
-        "p99_ms": 0.00903,
-        "iqr_ms": 0.00015,
-        "min_ms": 0.00762,
+        "p50_ms": 0.00753,
+        "p90_ms": 0.00762,
+        "p95_ms": 0.00766,
+        "p99_ms": 0.00796,
+        "iqr_ms": 9e-05,
+        "min_ms": 0.00733,
         "samples": 1600
       },
       "to_tuple": {
-        "p50_ms": 0.02818,
-        "p90_ms": 0.02905,
-        "p95_ms": 0.03259,
-        "p99_ms": 0.04013,
-        "iqr_ms": 0.00068,
-        "min_ms": 0.02712,
+        "p50_ms": 0.0287,
+        "p90_ms": 0.02901,
+        "p95_ms": 0.02913,
+        "p99_ms": 0.0325,
+        "iqr_ms": 0.00028,
+        "min_ms": 0.02805,
         "samples": 1600
       }
     },
     "torch-cuda": {
       "end_to_end": {
-        "p50_ms": 2.96538,
-        "p90_ms": 3.0627,
-        "p95_ms": 3.09766,
-        "p99_ms": 3.22965,
-        "iqr_ms": 0.08019,
-        "min_ms": 2.84799,
+        "p50_ms": 3.00827,
+        "p90_ms": 3.0867,
+        "p95_ms": 3.11734,
+        "p99_ms": 3.17833,
+        "iqr_ms": 0.08244,
+        "min_ms": 2.88929,
         "samples": 1600
       },
       "tokenize": {
-        "p50_ms": 0.19274,
-        "p90_ms": 0.20695,
-        "p95_ms": 0.21066,
-        "p99_ms": 0.21429,
-        "iqr_ms": 0.02691,
-        "min_ms": 0.15949,
+        "p50_ms": 0.19765,
+        "p90_ms": 0.21074,
+        "p95_ms": 0.21444,
+        "p99_ms": 0.21991,
+        "iqr_ms": 0.02435,
+        "min_ms": 0.16553,
         "samples": 1600
       },
       "forward": {
-        "p50_ms": 2.44083,
-        "p90_ms": 2.55027,
-        "p95_ms": 2.57125,
-        "p99_ms": 2.65038,
-        "iqr_ms": 0.08664,
-        "min_ms": 2.36594,
+        "p50_ms": 2.45843,
+        "p90_ms": 2.50776,
+        "p95_ms": 2.52662,
+        "p99_ms": 2.55554,
+        "iqr_ms": 0.04297,
+        "min_ms": 2.40489,
         "samples": 1600
       },
       "pool_normalize": {
-        "p50_ms": 0.10664,
-        "p90_ms": 0.1133,
-        "p95_ms": 0.11575,
-        "p99_ms": 0.13588,
-        "iqr_ms": 0.00168,
-        "min_ms": 0.10366,
+        "p50_ms": 0.10818,
+        "p90_ms": 0.11216,
+        "p95_ms": 0.1137,
+        "p99_ms": 0.11505,
+        "iqr_ms": 0.00118,
+        "min_ms": 0.10626,
         "samples": 1600
       },
       "manual_pipeline_min_parity_cosine": 1.0
     },
     "onnx-tensorrt": {
       "end_to_end": {
-        "p50_ms": 1.31489,
-        "p90_ms": 1.36852,
-        "p95_ms": 1.38448,
-        "p99_ms": 1.41267,
-        "iqr_ms": 0.05423,
-        "min_ms": 1.21634,
+        "p50_ms": 1.44505,
+        "p90_ms": 1.49776,
+        "p95_ms": 1.51307,
+        "p99_ms": 1.54509,
+        "iqr_ms": 0.05696,
+        "min_ms": 1.33427,
         "samples": 1600
       },
       "tokenize": {
-        "p50_ms": 0.09628,
-        "p90_ms": 0.10436,
-        "p95_ms": 0.10547,
-        "p99_ms": 0.11146,
-        "iqr_ms": 0.01874,
-        "min_ms": 0.07138,
+        "p50_ms": 0.09544,
+        "p90_ms": 0.10328,
+        "p95_ms": 0.10475,
+        "p99_ms": 0.11012,
+        "iqr_ms": 0.01823,
+        "min_ms": 0.07108,
         "samples": 1600
       },
       "session_run": {
-        "p50_ms": 0.99306,
-        "p90_ms": 1.01098,
-        "p95_ms": 1.01542,
-        "p99_ms": 1.04199,
-        "iqr_ms": 0.01944,
-        "min_ms": 0.91468,
+        "p50_ms": 1.04058,
+        "p90_ms": 1.05962,
+        "p95_ms": 1.06495,
+        "p99_ms": 1.16466,
+        "iqr_ms": 0.01882,
+        "min_ms": 0.95443,
         "samples": 1600
       },
       "pool": {
-        "p50_ms": 0.01071,
-        "p90_ms": 0.0124,
-        "p95_ms": 0.01331,
-        "p99_ms": 0.01412,
-        "iqr_ms": 0.00127,
-        "min_ms": 0.00917,
+        "p50_ms": 0.0105,
+        "p90_ms": 0.01223,
+        "p95_ms": 0.01329,
+        "p99_ms": 0.01405,
+        "iqr_ms": 0.00118,
+        "min_ms": 0.00871,
         "samples": 1600
       },
       "normalize": {
-        "p50_ms": 0.00782,
-        "p90_ms": 0.00796,
-        "p95_ms": 0.00803,
-        "p99_ms": 0.0087,
-        "iqr_ms": 0.00011,
-        "min_ms": 0.00763,
+        "p50_ms": 0.00756,
+        "p90_ms": 0.00767,
+        "p95_ms": 0.00776,
+        "p99_ms": 0.00844,
+        "iqr_ms": 0.0001,
+        "min_ms": 0.00733,
         "samples": 1600
       },
       "to_tuple": {
-        "p50_ms": 0.0275,
-        "p90_ms": 0.02773,
-        "p95_ms": 0.02785,
-        "p99_ms": 0.03179,
-        "iqr_ms": 0.00021,
-        "min_ms": 0.02707,
+        "p50_ms": 0.02787,
+        "p90_ms": 0.02819,
+        "p95_ms": 0.02834,
+        "p99_ms": 0.03173,
+        "iqr_ms": 0.00027,
+        "min_ms": 0.02736,
         "samples": 1600
       }
     }
@@ -267,12 +285,12 @@
       "optimization_sweep": {
         "disable_all": {
           "forward": {
-            "p50_ms": 1.50485,
-            "p90_ms": 1.51947,
-            "p95_ms": 1.54411,
-            "p99_ms": 1.60245,
-            "iqr_ms": 0.00851,
-            "min_ms": 1.49332,
+            "p50_ms": 1.74695,
+            "p90_ms": 1.78421,
+            "p95_ms": 1.79412,
+            "p99_ms": 1.80612,
+            "iqr_ms": 0.01866,
+            "min_ms": 1.71852,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -280,12 +298,12 @@
         },
         "enable_basic": {
           "forward": {
-            "p50_ms": 1.38142,
-            "p90_ms": 1.3936,
-            "p95_ms": 1.42681,
-            "p99_ms": 1.52637,
-            "iqr_ms": 0.00742,
-            "min_ms": 1.37074,
+            "p50_ms": 1.45074,
+            "p90_ms": 1.46333,
+            "p95_ms": 1.47602,
+            "p99_ms": 1.50216,
+            "iqr_ms": 0.00941,
+            "min_ms": 1.4331,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -293,12 +311,12 @@
         },
         "enable_extended": {
           "forward": {
-            "p50_ms": 0.90683,
-            "p90_ms": 1.04168,
-            "p95_ms": 1.04646,
-            "p99_ms": 1.06165,
-            "iqr_ms": 0.04869,
-            "min_ms": 0.89488,
+            "p50_ms": 0.95298,
+            "p90_ms": 0.9585,
+            "p95_ms": 0.96115,
+            "p99_ms": 0.96492,
+            "iqr_ms": 0.00429,
+            "min_ms": 0.9375,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -306,12 +324,12 @@
         },
         "enable_all": {
           "forward": {
-            "p50_ms": 1.04429,
-            "p90_ms": 1.04951,
-            "p95_ms": 1.05119,
-            "p99_ms": 1.05457,
-            "iqr_ms": 0.00549,
-            "min_ms": 1.03436,
+            "p50_ms": 0.94092,
+            "p90_ms": 0.94536,
+            "p95_ms": 0.94718,
+            "p99_ms": 0.95251,
+            "iqr_ms": 0.0048,
+            "min_ms": 0.92883,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -322,9 +340,9 @@
         "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
         "distinct_graph_nodes": 290,
         "graph_nodes_per_run": 290.0,
-        "summed_profiled_operator_us": 4975.32,
-        "model_run_us": 15087.89,
-        "model_run_minus_nodes_us": 10112.57,
+        "summed_profiled_operator_us": 4596.35,
+        "model_run_us": 14346.12,
+        "model_run_minus_nodes_us": 9749.77,
         "forward_runs_profiled": 163
       }
     },
@@ -332,12 +350,12 @@
       "optimization_sweep": {
         "disable_all": {
           "forward": {
-            "p50_ms": 1.82141,
-            "p90_ms": 1.8306,
-            "p95_ms": 1.8348,
-            "p99_ms": 1.84269,
-            "iqr_ms": 0.01073,
-            "min_ms": 1.79707,
+            "p50_ms": 1.58088,
+            "p90_ms": 1.79596,
+            "p95_ms": 1.91754,
+            "p99_ms": 2.03543,
+            "iqr_ms": 0.06038,
+            "min_ms": 1.56258,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -345,12 +363,12 @@
         },
         "enable_basic": {
           "forward": {
-            "p50_ms": 1.65974,
-            "p90_ms": 1.66992,
-            "p95_ms": 1.67292,
-            "p99_ms": 1.67811,
-            "iqr_ms": 0.00876,
-            "min_ms": 1.6459,
+            "p50_ms": 1.61398,
+            "p90_ms": 1.63463,
+            "p95_ms": 1.65536,
+            "p99_ms": 1.66717,
+            "iqr_ms": 0.0118,
+            "min_ms": 1.59283,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -358,12 +376,12 @@
         },
         "enable_extended": {
           "forward": {
-            "p50_ms": 1.05003,
-            "p90_ms": 1.05584,
-            "p95_ms": 1.05825,
-            "p99_ms": 1.06298,
-            "iqr_ms": 0.00593,
-            "min_ms": 1.03693,
+            "p50_ms": 0.95608,
+            "p90_ms": 0.96046,
+            "p95_ms": 0.96236,
+            "p99_ms": 0.96636,
+            "iqr_ms": 0.00509,
+            "min_ms": 0.94363,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -371,12 +389,12 @@
         },
         "enable_all": {
           "forward": {
-            "p50_ms": 0.90077,
-            "p90_ms": 0.90887,
-            "p95_ms": 0.91545,
-            "p99_ms": 0.95104,
-            "iqr_ms": 0.00456,
-            "min_ms": 0.89029,
+            "p50_ms": 1.02323,
+            "p90_ms": 1.03633,
+            "p95_ms": 1.04415,
+            "p99_ms": 1.10146,
+            "iqr_ms": 0.0075,
+            "min_ms": 1.0122,
             "samples": 200
           },
           "optimized_node_count": null,
@@ -387,9 +405,9 @@
         "note": "ORT CPU-profiler aggregates. summed_profiled_operator_us is profiled operator time (not device kernel time); model_run_minus_nodes_us is unprofiled span (scheduler/alloc/sync/profiling overhead), NOT clean launch overhead; graph_nodes_per_run counts graph nodes executed, not GPU kernel launches.",
         "distinct_graph_nodes": 290,
         "graph_nodes_per_run": 290.0,
-        "summed_profiled_operator_us": 4735.14,
-        "model_run_us": 14681.29,
-        "model_run_minus_nodes_us": 9946.15,
+        "summed_profiled_operator_us": 4396.61,
+        "model_run_us": 13175.47,
+        "model_run_minus_nodes_us": 8778.87,
         "forward_runs_profiled": 163
       }
     },
@@ -399,43 +417,43 @@
       },
       "torch_compile": {
         "eager_forward": {
-          "p50_ms": 2.696,
-          "p90_ms": 2.72796,
-          "p95_ms": 2.74668,
-          "p99_ms": 2.81742,
-          "iqr_ms": 0.0291,
-          "min_ms": 2.66157,
+          "p50_ms": 2.7073,
+          "p90_ms": 2.73554,
+          "p95_ms": 2.74454,
+          "p99_ms": 2.76934,
+          "iqr_ms": 0.02477,
+          "min_ms": 2.67889,
           "samples": 200
         },
         "compiled_forward": {
-          "p50_ms": 0.7005,
-          "p90_ms": 0.70886,
-          "p95_ms": 0.71157,
-          "p99_ms": 1.12843,
-          "iqr_ms": 0.00654,
-          "min_ms": 0.6934,
+          "p50_ms": 0.69956,
+          "p90_ms": 0.70971,
+          "p95_ms": 0.71454,
+          "p99_ms": 0.72887,
+          "iqr_ms": 0.0074,
+          "min_ms": 0.69151,
           "samples": 200
         },
-        "compile_speedup": 3.849,
+        "compile_speedup": 3.87,
         "eager_embed": {
-          "p50_ms": 3.29544,
-          "p90_ms": 3.36507,
-          "p95_ms": 3.39833,
-          "p99_ms": 3.42521,
-          "iqr_ms": 0.06674,
-          "min_ms": 3.21946,
+          "p50_ms": 3.18535,
+          "p90_ms": 3.24801,
+          "p95_ms": 3.28701,
+          "p99_ms": 3.58189,
+          "iqr_ms": 0.06482,
+          "min_ms": 3.10011,
           "samples": 200
         },
         "compiled_embed": {
-          "p50_ms": 1.06457,
-          "p90_ms": 1.0881,
-          "p95_ms": 1.0926,
-          "p99_ms": 1.10999,
-          "iqr_ms": 0.03152,
-          "min_ms": 1.01868,
+          "p50_ms": 1.04161,
+          "p90_ms": 1.0661,
+          "p95_ms": 1.07109,
+          "p99_ms": 1.09195,
+          "iqr_ms": 0.02584,
+          "min_ms": 1.00154,
           "samples": 200
         },
-        "embed_speedup": 3.096,
+        "embed_speedup": 3.058,
         "seq_len": 16,
         "note": "Varying queries, fixed pad length. compile_speedup is forward-only; embed_speedup includes tokenize + pool + normalize + device->host copy and is the realistic end-to-end figure. torch.compile(reduce-overhead) = Inductor fusion + CUDA graphs, no custom kernel; not a genuine single kernel (KernelBench-Mega)."
       }
@@ -491,15 +509,55 @@
   },
   "verdict": {
     "forward_pass_share_of_e2e": {
-      "onnx-cuda": 0.755,
-      "torch-cuda": 0.823,
-      "onnx-tensorrt": 0.755
+      "onnx-cuda": 0.758,
+      "torch-cuda": 0.817,
+      "onnx-tensorrt": 0.72
     },
     "ort_free_fusion_speedup": {
-      "onnx-cuda": 1.659,
-      "onnx-tensorrt": 2.022
+      "onnx-cuda": 1.857,
+      "onnx-tensorrt": 1.654
     },
     "note": "forward_pass_share_of_e2e answers gate step 1 (is the forward pass the majority). ort_free_fusion_speedup is how much the tuned ONNX compiler already gains from graph fusion with no custom kernel (gate step 2). The megakernel bar is a durable multiplicative win over the BEST compiler path AND the roofline floor (gate step 3). See README for the decision rule and the recommendation.",
     "low_maintenance_fusion_note": "ort_cuda_graph and torch_compile are the best no-custom-kernel fusion paths; the megakernel bar is a durable multiplicative win over the fastest of these AND the roofline floor. Both use CUDA graphs, which KernelBench-Mega does not count as a genuine single kernel, so they are the bar, not the megakernel itself."
+  },
+  "bulk_throughput": {
+    "n_docs": 3000,
+    "batch_sizes": [
+      32,
+      128
+    ],
+    "runtimes": {
+      "onnx-cuda": {
+        "32": {
+          "docs_per_s": 2424.6,
+          "elapsed_s": 1.2373
+        },
+        "128": {
+          "docs_per_s": 2129.9,
+          "elapsed_s": 1.4085
+        }
+      },
+      "torch-compile-fp32": {
+        "32": {
+          "docs_per_s": 2451.2,
+          "elapsed_s": 1.2239
+        },
+        "128": {
+          "docs_per_s": 2563.8,
+          "elapsed_s": 1.1701
+        }
+      },
+      "torch-compile-fp16": {
+        "32": {
+          "docs_per_s": 3734.1,
+          "elapsed_s": 0.8034
+        },
+        "128": {
+          "docs_per_s": 3848.3,
+          "elapsed_s": 0.7796
+        }
+      }
+    },
+    "note": "Steady-state docs/s (warmed on the full corpus first, so per-shape compile/capture is excluded). Synthetic neutral corpus, mixed lengths; metrics-only."
   }
 }

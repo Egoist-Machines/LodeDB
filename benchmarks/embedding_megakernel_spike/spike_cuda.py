@@ -27,7 +27,13 @@ import spike_backends as sb  # noqa: E402
 import spike_measure as sm  # noqa: E402
 from run import run_spike  # noqa: E402
 
-CUDA_BASELINES = ("onnx-cuda", "torch-cuda", "onnx-tensorrt", "torch-compile-cuda")
+CUDA_BASELINES = (
+    "onnx-cuda",
+    "torch-cuda",
+    "onnx-tensorrt",
+    "torch-compile-cuda",
+    "torch-compile-cuda-fp16",
+)
 
 
 def run_cuda_spike(*, iters: int, warmup: int, seq_len: int = 16) -> dict:
@@ -51,6 +57,9 @@ def run_cuda_spike(*, iters: int, warmup: int, seq_len: int = 16) -> dict:
         "roofline floor. Both use CUDA graphs, which KernelBench-Mega does not count as a "
         "genuine single kernel, so they are the bar, not the megakernel itself."
     )
+    # Bulk indexing throughput (docs/s) for the shipped runtimes, the other regime the fp16 +
+    # fused + bucketed batching targets. Metrics-only (no corpus text in the artifact).
+    result["bulk_throughput"] = _safe(measure_bulk_throughput, warmup=warmup)
     return result
 
 
@@ -204,5 +213,89 @@ def measure_torch_compile(*, iters: int, warmup: int, seq_len: int) -> dict:
             "embed_speedup includes tokenize + pool + normalize + device->host copy and is "
             "the realistic end-to-end figure. torch.compile(reduce-overhead) = Inductor fusion "
             "+ CUDA graphs, no custom kernel; not a genuine single kernel (KernelBench-Mega)."
+        ),
+    }
+
+
+# Neutral vocabulary for the synthetic bulk corpus. No user data; deterministic by index.
+_BULK_VOCAB = (
+    "vector database embedding retrieval index query latency throughput kernel fused "
+    "compile bucket batch token pooling normalize cosine similarity nearest neighbor scan "
+    "gpu tensor matrix bandwidth memory cache pipeline document chunk model runtime graph"
+).split()
+
+
+def _synthetic_corpus(n_docs: int) -> tuple[str, ...]:
+    """Deterministic neutral chunks with mixed lengths (metrics-only; never written to disk)."""
+
+    docs = []
+    for i in range(n_docs):
+        word_count = 4 + (i * 7) % 60  # 4..63 words, deterministic spread across buckets
+        words = [_BULK_VOCAB[(i + j) % len(_BULK_VOCAB)] for j in range(word_count)]
+        docs.append(" ".join(words))
+    return tuple(docs)
+
+
+def measure_bulk_throughput(
+    *, warmup: int, n_docs: int = 3000, batch_sizes: tuple[int, ...] = (32, 128)
+) -> dict:
+    """Bulk embed_documents throughput (docs/s) for the shipped CUDA runtimes.
+
+    Each variant is warmed on the full corpus (so all bucket/batch shapes are captured), then
+    timed on it. Reports steady-state docs/s; warmup cost is excluded by design and noted.
+    """
+
+    import time
+
+    import torch
+
+    from lodedb.local.backends import build_local_embedding_backend
+    from lodedb.local.presets import resolve_preset
+
+    if not torch.cuda.is_available():
+        return {"skipped": "no CUDA torch device"}
+
+    preset = resolve_preset("minilm")
+    corpus = _synthetic_corpus(n_docs)
+    variants = {
+        "onnx-cuda": {"embedding_runtime": "onnx"},
+        "torch-compile-fp32": {"embedding_runtime": "torch-compile", "embedding_dtype": "float32"},
+        "torch-compile-fp16": {"embedding_runtime": "torch-compile", "embedding_dtype": "float16"},
+    }
+    runtimes: dict[str, dict] = {}
+    for vname, kw in variants.items():
+        per_bs: dict[str, dict] = {}
+        for batch_size in batch_sizes:
+            try:
+                backend, resolution = build_local_embedding_backend(
+                    preset, device="cuda", batch_size=batch_size, max_seq_length=256, **kw
+                )
+                # Guard against silently timing a CPU fallback (e.g. a CPU-only onnxruntime) and
+                # labeling it as CUDA throughput, which would make the comparison misleading.
+                if resolution.effective_device != "cuda":
+                    per_bs[str(batch_size)] = {
+                        "skipped": f"backend ran on {resolution.effective_device}, not cuda"
+                    }
+                    continue
+                backend.embed_documents(corpus)  # warm: compile + capture every shape
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                backend.embed_documents(corpus)
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+                per_bs[str(batch_size)] = {
+                    "docs_per_s": round(len(corpus) / elapsed, 1),
+                    "elapsed_s": round(elapsed, 4),
+                }
+            except Exception as exc:  # noqa: BLE001 - record, keep the sweep alive
+                per_bs[str(batch_size)] = {"error": f"{type(exc).__name__}: {exc}"}
+        runtimes[vname] = per_bs
+    return {
+        "n_docs": len(corpus),
+        "batch_sizes": list(batch_sizes),
+        "runtimes": runtimes,
+        "note": (
+            "Steady-state docs/s (warmed on the full corpus first, so per-shape compile/capture "
+            "is excluded). Synthetic neutral corpus, mixed lengths; metrics-only."
         ),
     }

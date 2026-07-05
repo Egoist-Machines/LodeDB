@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import math
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+
+logger = logging.getLogger("lodedb.engine.embedding")
 
 
 class EngineEmbeddingBackend(Protocol):
@@ -129,24 +133,105 @@ class SentenceTransformerEmbeddingBackend:
         return self._model
 
 
+_EMBEDDING_DTYPES = ("float32", "float16", "bfloat16")
+
+
+@dataclass(frozen=True)
+class _PlannedBatch:
+    """One embedding batch: original indices to fill, and the pad length they share."""
+
+    indices: tuple[int, ...]
+    pad_len: int
+
+
+def _resolve_pad_buckets(
+    max_seq_length: int, pad_buckets: tuple[int, ...] | None
+) -> tuple[int, ...]:
+    """Returns the ascending pad-length buckets, always capped by (and ending at) max_seq_length.
+
+    ``None`` derives ``(32, 64, 128, max_seq_length)``. Buckets above ``max_seq_length`` are
+    dropped and ``max_seq_length`` is always included as the final (truncation) bucket, so a
+    text longer than every smaller bucket pads to the cap rather than overflowing it.
+    """
+
+    candidates = (32, 64, 128) if pad_buckets is None else tuple(pad_buckets)
+    buckets = sorted({int(b) for b in candidates if 0 < int(b) < max_seq_length})
+    return (*buckets, max_seq_length)
+
+
+def _select_bucket(longest_len: int, buckets: tuple[int, ...]) -> int:
+    """Returns the smallest bucket that fits ``longest_len`` (the last bucket is the cap)."""
+
+    for bucket in buckets:
+        if longest_len <= bucket:
+            return bucket
+    return buckets[-1]
+
+
+def _plan_batches(
+    lengths: list[int], batch_size: int, buckets: tuple[int, ...]
+) -> list[_PlannedBatch]:
+    """Groups texts by pad bucket, then chunks each group into ``batch_size`` batches.
+
+    Grouping by bucket means a batch never mixes pad lengths (short texts stop paying the
+    longest text's pad), and every batch carries its original indices so the caller can scatter
+    results back into input order. Relative order within a bucket is preserved (stable).
+    """
+
+    by_bucket: dict[int, list[int]] = {}
+    for index, length in enumerate(lengths):
+        by_bucket.setdefault(_select_bucket(length, buckets), []).append(index)
+    batches: list[_PlannedBatch] = []
+    for bucket in sorted(by_bucket):
+        indices = by_bucket[bucket]
+        for start in range(0, len(indices), batch_size):
+            batches.append(_PlannedBatch(tuple(indices[start : start + batch_size]), bucket))
+    return batches
+
+
+def _resolve_embedding_dtype(requested: str, device: str) -> tuple[str, str]:
+    """Resolves a requested embedding dtype to the one usable on ``device``.
+
+    Returns ``(effective_dtype, warning_or_empty)``. CUDA honors fp16/bf16; CPU honors bf16 but
+    coerces fp16 to fp32 (fp16 CPU inference is slow/patchy); MPS coerces both to fp32
+    (conservative). The message is returned rather than logged so this stays torch-free/testable.
+    """
+
+    if requested == "float32":
+        return "float32", ""
+    if device == "cuda":
+        return requested, ""
+    if device == "cpu" and requested == "bfloat16":
+        return "bfloat16", ""
+    reason = "fp16 CPU inference is slow/patchy" if device == "cpu" else "MPS half is untested here"
+    return "float32", (
+        f"embedding_dtype={requested} is not used on device={device}; running float32 ({reason})."
+    )
+
+
 class CompiledTorchEmbeddingBackend:
     """Embeds text with a ``torch.compile``d Hugging Face encoder for low single-query latency.
 
-    An opt-in fast path for GPU serving. It loads the raw HF encoder (``AutoModel``) and runs
-    it through ``torch.compile`` so a stock compiler fuses the forward pass and (on CUDA, with
-    ``mode="reduce-overhead"``) replays it as a CUDA graph, removing per-op launch overhead.
-    The embedding spike measured this at roughly 4x on the forward pass and about 2x
-    end-to-end vs the eager encoder on an A10/L40S; tokenization and the device->host copy do
-    not compile away, which is why the end-to-end gain is smaller than the forward gain.
+    An opt-in fast path for GPU serving. It loads the raw HF encoder (``AutoModel``), wraps
+    encoder + pooling + L2 normalization in one module, and runs that through ``torch.compile``
+    so a stock compiler fuses the whole forward and (on CUDA, with ``mode="reduce-overhead"``)
+    replays it as a CUDA graph, removing per-op launch overhead. The embedding spike measured
+    the forward at roughly 4x and end-to-end ``embed_query`` at ~1.3x (A10) / ~1.4x (L40S) vs
+    the ONNX-CUDA default; tokenization and the device->host copy do not compile away, which is
+    why the end-to-end gain is smaller than the forward gain.
 
-    Correctness is preserved: it reproduces the same computation as the ONNX / sentence-
-    transformers backends (the model encoder, then mean pooling over the attention mask or CLS
-    pooling, then L2 normalization), so an index built with either stays usable by this one.
+    Optionally runs the model in half precision (``dtype="float16"``/``"bfloat16"``, CUDA), which
+    halves the weight bytes streamed per forward. Half-precision embeddings are not bit-identical
+    to fp32 (measured cosine ~0.999 on MiniLM); pooling output is cast to fp32 before
+    normalization and the backend always returns fp32, so a store built at one dtype stays
+    searchable from another.
 
-    CUDA graphs require a static input shape, so every input is padded to ``max_seq_length``
-    (mean/CLS pooling ignores the padding via the attention mask, so parity is unaffected).
-    ``torch`` and ``transformers`` import lazily, so a plain ``import lodedb`` never pays for
-    them. This is the ``lodedb[torch]`` tier; it adds no dependency beyond it.
+    Correctness is otherwise preserved: it reproduces the same computation as the ONNX /
+    sentence-transformers backends (encoder, then mean pooling over the attention mask or CLS
+    pooling, then L2 normalization). CUDA graphs require a static input shape, so inputs are
+    padded to one of a few length buckets (mean/CLS pooling ignores the padding via the
+    attention mask, so parity is unaffected). ``torch`` and ``transformers`` import lazily, so a
+    plain ``import lodedb`` never pays for them. This is the ``lodedb[torch]`` tier.
     """
 
     name = "torch_compile"
@@ -164,6 +249,8 @@ class CompiledTorchEmbeddingBackend:
         pooling: str = "mean",
         normalize: bool = True,
         compile_mode: str = "reduce-overhead",
+        dtype: str = "float32",
+        pad_buckets: tuple[int, ...] | None = None,
     ) -> None:
         """Stores config while keeping the torch import and model load/compile lazy."""
 
@@ -177,6 +264,8 @@ class CompiledTorchEmbeddingBackend:
             raise ValueError("max_seq_length must be positive")
         if pooling not in {"cls", "mean"}:
             raise ValueError("pooling must be cls or mean")
+        if dtype not in _EMBEDDING_DTYPES:
+            raise ValueError(f"dtype must be one of {_EMBEDDING_DTYPES}")
         self.model_name = model_name
         self.required_model_name = model_name
         self.native_dim = native_dim
@@ -188,8 +277,12 @@ class CompiledTorchEmbeddingBackend:
         self.pooling = pooling
         self.normalize = normalize
         self.compile_mode = compile_mode
+        self.dtype = dtype
+        self.effective_dtype, self._dtype_warning = _resolve_embedding_dtype(dtype, device)
+        self.pad_buckets = _resolve_pad_buckets(max_seq_length, pad_buckets)
         self._model: object | None = None
         self._tokenizer: object | None = None
+        self._compiled = False
 
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Embeds document chunks with the configured document prefix."""
@@ -202,7 +295,7 @@ class CompiledTorchEmbeddingBackend:
         return self._encode((f"{self.query_prefix}{text}",))[0]
 
     def _encode(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
-        """Tokenizes (fixed-pad), runs the compiled encoder, pools, normalizes, validates."""
+        """Tokenizes, buckets, runs the fused compiled encoder, and scatters back into order."""
 
         if not texts:
             return ()
@@ -210,63 +303,135 @@ class CompiledTorchEmbeddingBackend:
 
         model = self._load_model()
         tokenizer = self._load_tokenizer()
-        rows: list[Any] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch = list(texts[start : start + self.batch_size])
-            # Pad to a static shape so the CUDA graph capture stays valid across calls.
-            tokens = tokenizer(
-                batch,
+        encoded = tokenizer(
+            list(texts), padding=False, truncation=True, max_length=self.max_seq_length
+        )
+        lengths = [len(ids) for ids in encoded["input_ids"]]
+        keys = [k for k in ("input_ids", "attention_mask", "token_type_ids") if k in encoded]
+        plan = _plan_batches(lengths, self.batch_size, self.pad_buckets)
+        # Pad the batch dimension to batch_size only for genuinely bulk CUDA calls with a live
+        # CUDA graph: it collapses the per-shape captures to {1, batch_size} x buckets. A small
+        # single-batch call (e.g. add() with a few chunks) is left at its own size so it does
+        # not do batch_size-worth of work.
+        pad_to_full = self._compiled and self.device == "cuda" and len(texts) > self.batch_size
+
+        out = np.empty((len(texts), self.native_dim), dtype=np.float32)
+        for batch in plan:
+            slice_encoded = {k: [encoded[k][i] for i in batch.indices] for k in keys}
+            tokens = tokenizer.pad(
+                slice_encoded,
                 padding="max_length",
-                truncation=True,
-                max_length=self.max_seq_length,
+                max_length=batch.pad_len,
                 return_tensors="pt",
-            ).to(self.device)
+            )
+            real = len(batch.indices)
+            feed = {k: tokens[k].to(self.device) for k in keys}
+            if pad_to_full and real < self.batch_size:
+                pad_rows = self.batch_size - real
+                feed = {
+                    k: torch.cat([v, v[:1].expand(pad_rows, -1)], dim=0) for k, v in feed.items()
+                }
             with torch.no_grad():
-                outputs = model(**tokens)
-            pooled = self._pool(outputs, tokens["attention_mask"])
-            rows.append(pooled.detach().to("cpu"))
-        array = np.vstack([row.numpy() for row in rows]).astype(np.float32, copy=False)
-        if self.normalize:
-            array = _l2_normalize_rows(array)
-        _validate_embedding_array(array, native_dim=self.native_dim, model_name=self.model_name)
-        return tuple(tuple(float(value) for value in row) for row in array)
+                pooled = model(**feed)
+            # reduce-overhead reuses the CUDA-graph output buffer on the next replay, so the
+            # result must leave the device before the next batch runs: .cpu() copies it out.
+            pooled_cpu = pooled[:real].detach().to("cpu").numpy().astype(np.float32, copy=False)
+            for row, index in enumerate(batch.indices):
+                out[index] = pooled_cpu[row]
 
-    def _pool(self, outputs: object, attention_mask: object) -> object:
-        """Pools token embeddings into one sentence vector (CLS or mask-mean), in torch."""
-
-        import torch
-
-        token_embeddings = outputs.last_hidden_state  # type: ignore[attr-defined]
-        if self.pooling == "cls":
-            return token_embeddings[:, 0, :]
-        mask = attention_mask.unsqueeze(-1).to(token_embeddings.dtype)
-        summed = (token_embeddings * mask).sum(dim=1)
-        counts = torch.clamp(mask.sum(dim=1), min=1.0)
-        return summed / counts
+        _validate_embedding_array(out, native_dim=self.native_dim, model_name=self.model_name)
+        return tuple(tuple(float(value) for value in row) for row in out)
 
     def _load_model(self) -> object:
-        """Loads and compiles the HF encoder lazily (first call pays the compile cost)."""
+        """Loads, fuses (encoder + pool + norm), and compiles the encoder lazily."""
 
-        if self._model is None:
-            try:
-                import torch
-                from transformers import AutoModel
-            except ImportError as exc:  # pragma: no cover - optional runtime
-                raise RuntimeError(
-                    "the torch-compile embedding runtime needs torch + transformers "
-                    "(install lodedb[embeddings,torch])."
-                ) from exc
-            model = AutoModel.from_pretrained(self.model_name).to(self.device)
-            model.eval()
-            # reduce-overhead uses CUDA graphs (CUDA only); off CUDA fall back to the default
-            # inductor mode so the path still works (with a smaller gain) on CPU/MPS.
-            mode = self.compile_mode
-            if mode == "reduce-overhead" and self.device != "cuda":
-                mode = "default"
-            try:
-                self._model = torch.compile(model, mode=mode)
-            except Exception:  # noqa: BLE001 - no compiler backend on this platform: run eager
-                self._model = model
+        if self._model is not None:
+            return self._model
+        try:
+            import torch
+            from torch import nn
+            from torch.nn import functional as functional_nn
+            from transformers import AutoModel
+        except ImportError as exc:  # pragma: no cover - optional runtime
+            raise RuntimeError(
+                "the torch-compile embedding runtime needs torch + transformers "
+                "(install lodedb[embeddings,torch])."
+            ) from exc
+
+        if self._dtype_warning:
+            logger.warning("%s", self._dtype_warning)
+        # bf16 needs an Ampere-or-newer GPU (sm_80+); older CUDA cards (e.g. T4/V100) would
+        # accept the .to(bfloat16) cast but fail in the kernels. Fall back to fp16 there, which
+        # every CUDA GPU LodeDB targets supports. (Resolved here, not in the torch-free helper.)
+        if (
+            self.effective_dtype == "bfloat16"
+            and self.device == "cuda"
+            and not torch.cuda.is_bf16_supported()
+        ):
+            logger.warning(
+                "bfloat16 is not supported on this CUDA device; using float16 instead."
+            )
+            self.effective_dtype = "float16"
+        torch_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }[self.effective_dtype]
+
+        pooling, normalize = self.pooling, self.normalize
+
+        class _FusedSentenceEncoder(nn.Module):
+            """Encoder + pooling + L2 normalize in one module, so the CUDA graph covers it all."""
+
+            def __init__(self, encoder: object) -> None:
+                super().__init__()
+                self.encoder = encoder
+
+            def forward(self, input_ids, attention_mask, token_type_ids=None):  # type: ignore[no-untyped-def]
+                kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                if token_type_ids is not None:
+                    kwargs["token_type_ids"] = token_type_ids
+                tokens = self.encoder(**kwargs).last_hidden_state
+                if pooling == "cls":
+                    pooled = tokens[:, 0, :]
+                else:
+                    mask = attention_mask.unsqueeze(-1).to(tokens.dtype)
+                    summed = (tokens * mask).sum(dim=1)
+                    counts = torch.clamp(mask.sum(dim=1), min=1.0)
+                    pooled = summed / counts
+                # Cast to fp32 before normalizing so half-precision norms stay stable, and so the
+                # backend always returns fp32. eps=1e-12 matches _l2_normalize_rows on zero rows.
+                pooled = pooled.float()
+                if normalize:
+                    pooled = functional_nn.normalize(pooled, p=2, dim=1, eps=1e-12)
+                return pooled
+
+        encoder = AutoModel.from_pretrained(self.model_name)
+        encoder = encoder.to(device=self.device, dtype=torch_dtype)
+        encoder.eval()
+        fused = _FusedSentenceEncoder(encoder).eval()
+        # dynamic=False specializes one graph per (batch, bucket) shape, so the encoder
+        # legitimately needs more than dynamo's default 8 cached graphs (a few buckets x a few
+        # batch dims, across every compiled backend built in the process, all sharing this one
+        # forward code object). Raise the limit so later shapes stay compiled instead of silently
+        # falling back to eager once the cache fills.
+        try:
+            import torch._dynamo as _dynamo
+
+            _dynamo.config.cache_size_limit = max(_dynamo.config.cache_size_limit, 64)
+        except Exception:  # noqa: BLE001 - config knob is best-effort
+            pass
+        # reduce-overhead uses CUDA graphs (CUDA only); off CUDA fall back to the default inductor
+        # mode so the path still works (smaller gain) on CPU/MPS.
+        mode = self.compile_mode
+        if mode == "reduce-overhead" and self.device != "cuda":
+            mode = "default"
+        try:
+            self._model = torch.compile(fused, mode=mode, dynamic=False)
+            self._compiled = True
+        except Exception:  # noqa: BLE001 - no compiler backend on this platform: run eager
+            self._model = fused
+            self._compiled = False
         return self._model
 
     def _load_tokenizer(self) -> object:
