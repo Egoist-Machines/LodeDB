@@ -50,7 +50,7 @@ for _root in _FORBIDDEN:
         print("LOADED " + _root)
 """
 
-# The optional framework adapters (langchain/llama-index/mem0) and the `lodedb migrate`
+# The optional framework adapters (langchain/llama-index/mem0/cognee) and the `lodedb migrate`
 # source providers (psycopg/qdrant-client/chromadb/lancedb) are imported only inside the
 # adapter or exporter that uses them. `import lodedb` reaches the `lodedb migrate` CLI
 # sub-app (registered in lodedb.local.cli), so its source exporters must keep their provider
@@ -60,7 +60,7 @@ import importlib, sys
 for _m in ("lodedb", "lodedb.local.cli"):
     importlib.import_module(_m)
 _FORBIDDEN = (
-    "langchain", "langchain_core", "llama_index", "mem0",
+    "langchain", "langchain_core", "llama_index", "mem0", "cognee",
     "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}

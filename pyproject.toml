@@ -81,12 +81,16 @@ langchain = ["langchain-core>=0.3.0"]
 llama-index = ["llama-index-core>=0.11.0"]
 # Optional mem0 vector-store adapter.
 mem0 = ["mem0ai>=2.0.0"]
+# Optional cognee vector-database adapter: registers LodeDB as a cognee vector_db_provider
+# (CogneeLodeDBAdapter implements cognee's VectorDBInterface). Targets the cognee 1.x line.
+cognee = ["cognee>=1.1.0,<2"]
 # Optional image + text (CLIP) embedding via the "clip" preset / add_image. CLIP runs on the
 # sentence-transformers stack (the [torch] tier) and adds Pillow for decoding image files. Both
 # are imported lazily, so a plain `import lodedb` pulls neither (tests/test_import_boundary.py).
 image = ["pillow>=10.0.0", "lodedb[torch]"]
 # Everything a user would reach for: built-in embedding (ONNX + PyTorch), image search, the MCP
-# server, and the framework adapters. Excludes the niche [onnx-export]/[gpu] and the [dev] set.
+# server, and the framework adapters. Excludes the niche [onnx-export]/[gpu] and the [dev] set,
+# and [cognee] (its large transitive stack — litellm/lancedb/sqlalchemy/fastapi — is opt-in).
 all = ["lodedb[embeddings,torch,image,mcp,langchain,llama-index,mem0]"]
 # ruff is pinned (not floored) so `ruff format`/`ruff check` are reproducible across
 # contributors and CI — the formatter's output can change between ruff releases.

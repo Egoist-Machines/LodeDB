@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cognee vector-database adapter (`lodedb[cognee]`).** `CogneeLodeDBAdapter` implements
+  cognee's `VectorDBInterface`, so cognee can use LodeDB as its `vector_db_provider`. Register it
+  with `register_cognee_adapter()` and select it via
+  `cognee.config.set_vector_db_config({"vector_db_provider": "lodedb", "vector_db_url": "<dir>"})`.
+  cognee owns embedding (its `EmbeddingEngine`), so the adapter uses LodeDB's vector-in path: one
+  LodeDB index per cognee collection under `vector_db_url`, the serialized DataPoint payload kept
+  in LodeDB's raw-text sidecar for `retrieve`/`include_payload`, and `belongs_to_set` membership
+  stored as scalar presence keys so `node_name` (NodeSet) filtering pushes into the metadata
+  planner. Covers the full interface plus `remove_belongs_to_set_tags` and `upsert_raw_vectors`.
+  Also packaged for the cognee-community plugin repo as `cognee-community-vector-adapter-lodedb`.
+  See `examples/cognee_provider.py` and `docs/integrations.md`.
 - **Opt-in `torch.compile` embedding runtime for GPU serving, with optional half precision.**
   `embedding_runtime="torch-compile"` runs a fused encoder + pooling + L2-normalize module through
   `torch.compile` (CUDA-graph replay on CUDA), producing embeddings that match the ONNX and
