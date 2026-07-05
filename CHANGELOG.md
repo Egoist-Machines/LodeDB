@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in `torch.compile` embedding runtime for GPU serving, with optional half precision.**
+  `embedding_runtime="torch-compile"` runs a fused encoder + pooling + L2-normalize module through
+  `torch.compile` (CUDA-graph replay on CUDA), producing embeddings that match the ONNX and
+  sentence-transformers runtimes (fp32 parity 1.0 on MiniLM). `embedding_dtype="float16"` (or
+  `"bfloat16"`) halves the weight bytes streamed per forward on CUDA; half-precision embeddings
+  are not bit-identical to fp32 but stay within measured cosine 0.999 and every runtime returns
+  L2-normalized fp32 vectors, so a store built at one dtype is searchable from another. Measured
+  vs the ONNX-CUDA default: single-query `embed_query` ~1.4x (fp32) / ~1.7x (fp16) on an A10 and
+  L40S, and bulk `add_many` embedding throughput up to ~1.8x with fp16. Inputs pad to length
+  buckets (32/64/128/
+  max) rather than always to `max_seq_length`, so short queries are cheap even at the default cap.
+  CUDA is where it pays (off CUDA it falls back to inductor-only compilation with a smaller gain);
+  it rides the existing `lodedb[torch]` tier with no new dependency and imports lazily.
+  Background and measurements: `benchmarks/embedding_megakernel_spike/` (the issue #67 gate).
+
 ## [1.3.0] - 2026-07-04
 
 ### Changed

@@ -232,6 +232,7 @@ class LodeDB:
         bit_width: int | None = None,
         device: str = "auto",
         embedding_runtime: str = "auto",
+        embedding_dtype: str = "float32",
         batch_size: int = 32,
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
@@ -267,7 +268,15 @@ class LodeDB:
         sentence-transformers). ``embedding_resolution`` reports which was used,
         including whether a CUDA request fell back to the CPU (the default
         ``onnxruntime`` wheel is CPU-only; install ``onnxruntime-gpu`` for the GPU,
-        and see ``docs/deployment-and-performance.md``).
+        and see ``docs/deployment-and-performance.md``). A fourth runtime,
+        ``"torch-compile"``, is an opt-in ``torch.compile``d encoder for low
+        single-query GPU-serving latency (text presets only).
+        ``embedding_dtype`` (``"float32"`` default, ``"float16"``/``"bfloat16"``) is
+        honored only by ``"torch-compile"`` and, on CUDA, halves the weight bytes
+        streamed per forward. Half-precision embeddings are not bit-identical to fp32
+        (measured cosine ~0.999 on MiniLM) but are recall-preserving, and every
+        runtime returns L2-normalized fp32 vectors, so a store built at one dtype
+        stays searchable from another.
         ``batch_size`` (default ``32``) is how many texts are embedded per forward
         pass; a larger batch raises embedding throughput on a GPU (and, less so, on
         the CPU) at some memory cost. ``search``/``search_many`` embed their query
@@ -489,6 +498,7 @@ class LodeDB:
                     batch_size=batch_size,
                     max_seq_length=seq_len,
                     embedding_runtime=embedding_runtime,
+                    embedding_dtype=embedding_dtype,
                 )
             self._embedding_backend = backend
             route_policy = self.preset.route_policy

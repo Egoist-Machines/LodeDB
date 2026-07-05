@@ -126,7 +126,8 @@ low-latency single-process store; change them when the note applies.
 | Argument | Default | What it controls | Change it when |
 | --- | --- | --- | --- |
 | `device` | `"auto"` | Embedding device: `auto` / `cpu` / `mps` / `cuda`. Affects embedding only, not the vector scan. | You have a GPU (see above), or want to pin CPU for reproducibility. |
-| `embedding_runtime` | `"auto"` | `auto` (prefer ONNX, fall back to PyTorch) / `onnx` / `torch`. | Force `onnx` for lowest single-query latency, or `torch` for the PyTorch path / CLIP / MPS. |
+| `embedding_runtime` | `"auto"` | `auto` (prefer ONNX, fall back to PyTorch) / `onnx` / `torch` / `torch-compile`. | Force `onnx` for lowest single-query latency, `torch` for the PyTorch path / CLIP / MPS, or `torch-compile` for a `torch.compile`d encoder on an NVIDIA GPU (see below). |
+| `embedding_dtype` | `"float32"` | `float32` / `float16` / `bfloat16`. Honored only by `torch-compile` (rejected otherwise). | Pass `float16` on an NVIDIA GPU to roughly halve the embedding forward's weight traffic (about 1.7x single-query, up to ~1.8x bulk vs ONNX-CUDA), within cosine 0.999 of fp32. |
 | `batch_size` | `32` | Texts embedded per forward pass. | Raise it for throughput on a GPU or for large batched `search_many`; lower it under memory pressure. |
 | `max_seq_length` | `256` | Token budget per document before truncation. | Raise for long documents whose tail carries meaning; lower to embed faster. |
 | `chunk_character_limit` | `900` | Characters before a document is split into chunks. | Raise to keep long documents as one chunk (fewer duplicate-id hits, see gotchas); lower for finer-grained retrieval. |

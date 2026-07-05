@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 from lodedb.engine.embedding_backends import (
     ClipEmbeddingBackend,
+    CompiledTorchEmbeddingBackend,
     EngineEmbeddingBackend,
     ONNXRuntimeEmbeddingBackend,
     SentenceTransformerEmbeddingBackend,
@@ -165,6 +166,15 @@ def sentence_transformers_available() -> bool:
     return importlib.util.find_spec("sentence_transformers") is not None
 
 
+def _torch_compile_available() -> bool:
+    """Returns whether the torch-compile runtime's deps (torch + transformers) are importable."""
+
+    return (
+        importlib.util.find_spec("torch") is not None
+        and importlib.util.find_spec("transformers") is not None
+    )
+
+
 def _missing_embedding_runtime_error(*, runtime: str, onnx_installed: bool) -> ModuleNotFoundError:
     """Builds a clear error for a text model requested with no usable embedding runtime.
 
@@ -269,22 +279,80 @@ def build_local_embedding_backend(
     batch_size: int = 32,
     max_seq_length: int = 256,
     embedding_runtime: str = "auto",
+    embedding_dtype: str = "float32",
 ) -> tuple[EngineEmbeddingBackend, LocalEmbeddingResolution]:
     """Builds the embedding backend for a preset, runtime, and device.
 
     ``embedding_runtime`` is ``"auto"`` (prefer ONNX Runtime, fall back to torch),
-    ``"onnx"`` (force ONNX Runtime), or ``"torch"`` (force sentence-transformers).
-    Returns the backend plus a :class:`LocalEmbeddingResolution` describing the
-    runtime/device actually selected (and any fallback), so the SDK and ``doctor``
-    can report it.
+    ``"onnx"`` (force ONNX Runtime), ``"torch"`` (force sentence-transformers), or
+    ``"torch-compile"`` (opt-in ``torch.compile``d encoder for low single-query GPU-serving
+    latency; text presets only, biggest win on CUDA). ``embedding_dtype`` (``"float32"`` default,
+    ``"float16"``/``"bfloat16"``) is honored only by ``"torch-compile"`` and halves the weights
+    streamed per forward on CUDA; it is rejected for the other runtimes. Returns the backend plus
+    a :class:`LocalEmbeddingResolution` describing the runtime/device actually selected (and any
+    fallback), so the SDK and ``doctor`` can report it.
     """
 
     runtime = (embedding_runtime or "auto").strip().lower()
-    if runtime not in {"auto", "onnx", "torch"}:
+    if runtime not in {"auto", "onnx", "torch", "torch-compile"}:
         raise ValueError(
-            f"unknown embedding_runtime {embedding_runtime!r}; choose auto, onnx, or torch"
+            f"unknown embedding_runtime {embedding_runtime!r}; "
+            "choose auto, onnx, torch, or torch-compile"
+        )
+    dtype = (embedding_dtype or "float32").strip().lower()
+    if dtype not in {"float32", "float16", "bfloat16"}:
+        raise ValueError(
+            f"unknown embedding_dtype {embedding_dtype!r}; choose float32, float16, or bfloat16"
+        )
+    if dtype != "float32" and runtime != "torch-compile":
+        raise ValueError(
+            f"embedding_dtype={dtype!r} is only supported with embedding_runtime='torch-compile' "
+            f"(got {runtime!r})"
         )
     resolved = resolve_local_device(device)
+
+    # Opt-in torch.compile fast path (text presets only). Fuses encoder + pooling + normalize
+    # and, on CUDA, replays it as a CUDA graph; measured ~4x forward / ~1.3-1.4x end-to-end vs
+    # the ONNX-CUDA default on an A10/L40S, more with fp16. Off CUDA it still compiles (inductor)
+    # with a smaller gain. Inputs pad to length buckets, so a large max_seq_length is only a
+    # truncation cap, not a per-query tax.
+    if runtime == "torch-compile":
+        if preset.multimodal:
+            raise ValueError("torch-compile runtime does not support the multimodal 'clip' preset")
+        if not _torch_compile_available():
+            raise _missing_embedding_runtime_error(runtime="torch", onnx_installed=False)
+        backend = CompiledTorchEmbeddingBackend(
+            model_name=preset.model_name,
+            native_dim=preset.native_dim,
+            device=resolved,
+            batch_size=batch_size,
+            max_seq_length=max_seq_length,
+            query_prefix=preset.query_prefix,
+            document_prefix=preset.document_prefix,
+            pooling=preset.pooling,
+            dtype=dtype,
+        )
+        logger.info(
+            "embedding runtime=torch-compile device=%s (requested %s) dtype=%s (requested %s)",
+            resolved,
+            device,
+            backend.effective_dtype,
+            dtype,
+        )
+        if resolved != "cuda":
+            logger.warning(
+                "torch-compile embedding is on %s: the CUDA-graph fast path (the large win) "
+                "needs an NVIDIA GPU; on %s it falls back to a smaller inductor-only gain.",
+                resolved,
+                resolved,
+            )
+        return backend, LocalEmbeddingResolution(
+            requested_device=device,
+            backend_name=backend.name,
+            effective_device=resolved,
+            fallback_used=False,
+            fallback_reason="",
+        )
 
     # A multimodal preset ("clip") embeds text and images into one shared space via
     # sentence-transformers; it does not use the ONNX/torch text runtime selection.
