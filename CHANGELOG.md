@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-08
+
 ### Added
 
 - **cognee vector-database adapter (`lodedb[cognee]`).** `CogneeLodeDBAdapter` implements
