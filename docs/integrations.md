@@ -68,6 +68,7 @@ lodedb migrate validate --manifest ./data/lodedb/migration.json
 | [LangChain](https://github.com/langchain-ai/langchain) | Framework | 139k | `VectorStore` adapter (`lodedb[langchain]`) | ✅ Shipped |
 | [LlamaIndex](https://github.com/run-llama/llama_index) | Framework | 50k | `VectorStore` + `PropertyGraphStore` adapters (`lodedb[llama-index]`) | ✅ Shipped ([#7](https://github.com/Egoist-Machines/LodeDB/pull/7)) |
 | [mem0](https://github.com/mem0ai/mem0) | Agent memory | 59k | `VectorStoreBase` provider (`lodedb[mem0]`) | ✅ Shipped ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16)) |
+| [cognee](https://github.com/topoteretes/cognee) | Graph memory | 7k | `VectorDBInterface` provider (`lodedb[cognee]`) | 🚧 In review ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74)) |
 | [PrivateGPT](https://github.com/zylon-ai/private-gpt) | Local RAG app | 57k | LlamaIndex provider shim + `settings.yaml` key | ✅ Shipped |
 | [Haystack](https://github.com/deepset-ai/haystack) | Framework | 25k | `DocumentStore` protocol | 📋 Backlog |
 | [txtai](https://github.com/neuml/txtai) | Framework | n/a | `custom` backend (resolvable class string) | 📋 Backlog |
@@ -96,6 +97,31 @@ LocalGPT, Open WebUI); the JS/TS apps (AnythingLLM, Flowise, Dify) need the loca
 first.
 
 ## Recently shipped
+
+### cognee ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74), in review)
+- **Repo:** topoteretes/cognee (~7k★, Apache-2.0). AI memory that builds a knowledge graph
+  over your data. **Install:** `lodedb[cognee]` (`cognee>=1.1.0,<2`).
+- **Pattern:** `CogneeLodeDBAdapter` implements cognee's `VectorDBInterface`; call
+  `register_cognee_adapter()` to register the `"lodedb"` provider, then select it with
+  `cognee.config.set_vector_db_config({"vector_db_provider": "lodedb", "vector_db_url": "<dir>"})`.
+  See [`examples/cognee_provider.py`](../examples/cognee_provider.py). Also packaged for the
+  [cognee-community](https://github.com/topoteretes/cognee-community) plugin repo as
+  `cognee-community-vector-adapter-lodedb`, whose `register` module registers this same adapter.
+- **Why it fits:** cognee is a graph-memory layer whose vector index accrues via incremental
+  data-point adds and NodeSet re-tagging, which is exactly the workload LodeDB's O(changed) delta
+  persistence is built for. It ships LanceDB as its embedded local default, so a zero-server exact
+  store is a category match.
+- **Embeddings:** cognee owns embedding (its `EmbeddingEngine`), so the adapter uses LodeDB's
+  vector-in path. Each cognee collection is one LodeDB index under `vector_db_url`; the serialized
+  DataPoint payload goes to LodeDB's raw-text sidecar (so `retrieve` and `include_payload` searches
+  return it), while `belongs_to_set` membership is stored as scalar presence keys so cognee's
+  `node_name` (NodeSet) filtering pushes into the metadata planner. cognee ranks by cosine distance
+  (lower is better), so searches report `1 - similarity`.
+- **Scope:** vector store (`VectorDBInterface`), including `create_data_points` / `search` /
+  `batch_search` / `retrieve` / `delete_data_points` / `create_vector_index` / `index_data_points`
+  / `prune`, plus `remove_belongs_to_set_tags` and `upsert_raw_vectors` for dataset-deletion
+  consistency and system-owned vectors. cognee's graph and relational stores are separate providers
+  and unchanged.
 
 ### mem0 ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16))
 - **Repo:** mem0ai/mem0 (~59k★, Apache-2.0). **Install:** `lodedb[mem0]` (`mem0ai>=2.0.0`).
@@ -183,8 +209,8 @@ Same sweet spot as mem0; surfaced by research but not yet scoped:
 [Letta/MemGPT](https://github.com/letta-ai/letta),
 [Microsoft AutoGen](https://github.com/microsoft/autogen),
 [CrewAI](https://github.com/crewAIInc/crewAI),
-[cognee](https://github.com/topoteretes/cognee),
-[Graphiti](https://github.com/getzep/graphiti).
+[Graphiti](https://github.com/getzep/graphiti)
+(cognee has shipped an adapter, see below).
 LodeDB now ships a knowledge-graph layer (`lodedb.graph.KnowledgeGraph`) and a LlamaIndex
 `PropertyGraphStore` adapter, which strengthens the fit for the graph-memory targets here.
 

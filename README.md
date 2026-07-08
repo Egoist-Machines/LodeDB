@@ -66,7 +66,8 @@ stays **sub-millisecond even at 1M vectors**.
   [How it works](#multimodal--bring-your-own-vectors).
 - **Batteries included**: a `lodedb` CLI, a loopback/private-network dev server, an
   [MCP server](#use-as-an-mcp-server), LangChain, LlamaIndex, and mem0 adapters
-  (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), and a one-line
+  (`VectorStore`s, plus a LlamaIndex `PropertyGraphStore`), a
+  [cognee](https://github.com/topoteretes/cognee) vector-DB provider, and a one-line
   [PrivateGPT](https://github.com/zylon-ai/private-gpt) vector-store provider built on the
   LlamaIndex adapter.
 - **Swift / iOS bindings**: a native Swift package for macOS and iOS over the same Rust
@@ -107,8 +108,9 @@ pip install "lodedb[embeddings,torch]"               # + PyTorch fallback, CLIP,
 pip install "lodedb[gpu]"                            # GPU-resident scan (Linux/CUDA)
 pip install "lodedb[image]"                          # image + text (CLIP) embedding (model="clip")
 pip install "lodedb[mcp,langchain,llama-index,mem0]" # MCP server + LangChain/LlamaIndex/mem0 adapters
+pip install "lodedb[cognee]"                         # register LodeDB as a cognee vector_db_provider
 pip install "lodedb[onnx-export]"                    # export ONNX for a custom model (Optimum); presets need no export
-pip install "lodedb[all]"                            # everything above
+pip install "lodedb[all]"                            # everything above (except gpu/onnx-export/cognee)
 ```
 
 Using LodeDB as memory for a coding assistant? After installing the `mcp,embeddings` extras,
