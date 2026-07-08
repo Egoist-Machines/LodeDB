@@ -2,7 +2,7 @@
 
 This document tracks LodeDB's integrations into the open-source RAG and agent ecosystem:
 what ships today, what's in progress, and what's planned. It's a living tracker; status and
-star counts are approximate and dated (last reviewed 2026-06).
+star counts are approximate and dated (last reviewed 2026-07).
 
 LodeDB is a strong fit wherever a project already treats vector storage as a pluggable
 backend, or where its current local default makes LodeDB's strengths easy to show:
@@ -77,10 +77,58 @@ lodedb migrate validate --manifest ./data/lodedb/migration.json
 | [Flowise](https://github.com/FlowiseAI/Flowise) | Agent app (TS) | 53k | LangChain vector-store node / bridge | 📋 Backlog |
 | [kotaemon](https://github.com/Cinnamon/kotaemon) | Local RAG app | 26k | Swappable backend (`flowsettings.py`) | 📋 Backlog |
 | [LocalGPT](https://github.com/PromtEngineer/localGPT) | Local RAG app | 22k | Replace bundled LanceDB | 📋 Backlog |
+| [Msty](https://msty.app/) | Local AI workspace | n/a | Knowledge Stack storage/index bridge | 🔬 Evaluating |
+| [GPT4All](https://github.com/nomic-ai/gpt4all) | Local LLM app | n/a | LocalDocs storage backend | 🔬 Evaluating |
+| [DocsGPT](https://github.com/arc53/DocsGPT) | Private AI / enterprise search | 18k | Vector-store provider | 🔬 Evaluating |
+| [Frigate](https://github.com/blakeblackshear/frigate) | Local NVR / edge vision | n/a | Semantic-search vector sidecar | 🔬 Evaluating |
+| [Paperless-ngx](https://github.com/paperless-ngx/paperless-ngx) | Local document management | n/a | Semantic document-similarity sidecar | 🔬 Evaluating |
 | [Dify](https://github.com/langgenius/dify) | RAG platform (TS) | 145k | `VECTOR_STORE` provider | 🔬 Evaluating (heavy stack) |
 | [Khoj](https://github.com/khoj-ai/khoj) | App | 35k | config-key backend | ⛔ Blocked (AGPL-3.0) |
 
 Legend: ✅ shipped · 🚧 in review · 🔜 planned · 📋 backlog · 🔬 evaluating · ⛔ blocked.
+
+## 2026-07 target review
+
+A July research pass looked for products where an embedded, low-footprint vector store removes
+specific friction: local RAG rebuilds, private memory, media search, or document search without a
+separate Chroma/Qdrant/LanceDB service. The result was a prioritization pass, not a new
+integration class.
+
+Overlap with current work:
+
+- **Already shipped:** mem0 and PrivateGPT. Do not start new adapters here; keep the next work to
+  benchmarks, examples, migration docs, and upstream usage notes.
+- **In review:** cognee. Finish the existing adapter and the cognee-community package before adding
+  another graph-memory target.
+- **Already on the backlog:** Haystack, txtai, AnythingLLM, Open WebUI, Flowise, kotaemon,
+  LocalGPT, and Dify. Keep them in the existing sequence below; the research only changes the
+  order inside that queue.
+- **Blocked / licensing review:** Khoj remains blocked by AGPL-3.0. Immich is also AGPL-3.0, so
+  treat it as a visibility demo or local sidecar only unless legal review says otherwise.
+
+Recommended order from this pass:
+
+1. **kotaemon.** It is Python, local-RAG focused, and already exposes `KH_VECTORSTORE` in
+   `flowsettings.py`. This is the cleanest app demo after the framework adapters.
+2. **Haystack and txtai.** These are still the best ecosystem multipliers. They should precede
+   most one-off app integrations unless an app partner is ready to test.
+3. **Open WebUI and DocsGPT.** Both are Python-heavy private AI apps with user-visible document
+   search. Start with a provider proof of concept and a benchmark against their current local
+   default.
+4. **Msty and GPT4All.** Both have the exact local-docs workload. The first useful step is a
+   loopback/local-service prototype because neither is naturally a Python package consumer.
+5. **AnythingLLM and Flowise.** Broad distribution, but JS/TS. Reuse the same local bridge used for
+   Msty/GPT4All before considering native bindings.
+6. **Frigate and Paperless-ngx.** These are not generic RAG apps, but both have local, private
+   corpora and search features where compact semantic indexes matter. Treat them as second-wave
+   demos after the local-RAG apps.
+
+Watch-only until there is an owner:
+[Obsidian](https://obsidian.md/), [Anytype](https://anytype.io/),
+[Jan](https://github.com/janhq/jan), [AFFiNE](https://github.com/toeverything/AFFiNE),
+[Zotero](https://github.com/zotero/zotero), [Ente](https://github.com/ente-io/ente),
+and [DEVONthink](https://www.devontechnologies.com/apps/devonthink). Each needs a plugin,
+Swift/mobile binding, or proprietary-app relationship before it becomes actionable.
 
 ## Sequencing
 
@@ -90,11 +138,13 @@ foundation is in place and every app built on those abstractions is reachable wi
 adapter. **PrivateGPT** ships on top of it as a provider shim plus one config key: its store
 layer *is* LlamaIndex's `BasePydanticVectorStore`, so no new adapter was needed.
 
-**Now.** Framework breadth: **Haystack** and **txtai**, both low-effort drop-in adapters.
+**Now.** Framework breadth: **Haystack** and **txtai**, both low-effort drop-in adapters. In
+parallel, build the first local-RAG app demo against **kotaemon**, where the provider seam is
+already explicit and Python-native.
 
-**Later.** High-visibility local apps. Lead with permissively licensed Python apps (kotaemon,
-LocalGPT, Open WebUI); the JS/TS apps (AnythingLLM, Flowise, Dify) need the local-bridge step
-first.
+**Later.** High-visibility local apps. Lead with permissively licensed Python apps (Open WebUI,
+DocsGPT, LocalGPT); the JS/TS or desktop apps (AnythingLLM, Flowise, Msty, GPT4All, Dify) need
+the local-bridge step first.
 
 ## Recently shipped
 
@@ -201,6 +251,16 @@ first.
 - **Open WebUI** (~140k★): `VECTOR_DB` selector; its docs warn the default Chroma/SQLite path
   is unsafe under multiple workers or replicas, so LodeDB is both a performance and a *simpler
   local persistence* story. Note its license has branding requirements (see Licensing).
+- **DocsGPT** (~18k★, MIT): private AI / enterprise-search app with local-model support and
+  document ingestion. Evaluate a vector-store provider rather than a fork.
+- **Msty**: Knowledge Stacks ingest files, folders, Obsidian vaults, notes, and transcripts, then
+  search them locally. Start with a local bridge or native binding plan.
+- **GPT4All**: LocalDocs indexes folders into embedding vectors for private desktop RAG. The first
+  step is to benchmark LodeDB as a LocalDocs storage backend against the current index.
+- **Frigate**: semantic search over tracked-object thumbnails and descriptions runs locally and
+  has explicit RAM/GPU pressure. Keep this as an edge/media demo, not a core RAG adapter.
+- **Paperless-ngx**: local OCR document archive with full-text search and "more like this"; a
+  semantic sidecar can improve similarity search without replacing the document store.
 - **AnythingLLM** (~62k★, JS) / **Flowise** (~53k★, TS): reach via the provider/node layer;
   both need a local bridge for a first demo (see language boundary below).
 
