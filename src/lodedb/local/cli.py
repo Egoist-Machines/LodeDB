@@ -307,7 +307,8 @@ def serve(
 
     Endpoints: ``POST /add {"text","id"?,"metadata"?}``,
     ``POST /search {"query","k"?,"filter"?}``, ``POST /get {"id"}`` (on by
-    default; disabled by ``--no-store-text``), ``GET /stats``, ``GET /healthz``.
+    default; disabled by ``--no-store-text``), ``POST /v1/embeddings``
+    (OpenAI-compatible), ``GET /stats``, ``GET /healthz``.
     Bound to loopback by default; a dev convenience.
     """
 
