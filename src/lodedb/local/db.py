@@ -48,6 +48,7 @@ from lodedb.engine.core import (
     EngineDocument,
     EngineVectorDocument,
     _state_from_payload,
+    chunk_text,
     index_state_key_for_client_hash,
     sha256_text,
 )
@@ -636,6 +637,51 @@ class LodeDB:
             with self._op_lock:
                 self._native_upsert_text_documents(tuple(payload))
         return ids
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embeds a batch of texts with the index's document embedding model.
+
+        Uses the same document-side embedding path as :meth:`add` without
+        storing anything. Texts longer than the index chunk limit are embedded
+        as chunks, mean-pooled, and L2-normalized. Returns one vector per input
+        text, in input order.
+        """
+
+        self._require_text_capable()
+        if not isinstance(texts, list) or not texts:
+            raise ValueError("texts must be a non-empty list of strings")
+        for text in texts:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("each text must be a non-empty string")
+        backend = self._embedding_backend
+        if backend is None:
+            raise RuntimeError("text embedding requires an embedding backend")
+
+        chunks_by_text = [chunk_text(text, self._chunk_character_limit) for text in texts]
+        chunks: list[str] = []
+        offsets: list[tuple[int, int]] = []
+        for text, text_chunks in zip(texts, chunks_by_text, strict=True):
+            start = len(chunks)
+            # Preserve the existing one-text embedding behavior exactly. chunk_text
+            # strips its input, while a one-chunk endpoint request previously reached
+            # the backend unchanged.
+            chunks.extend((text,) if len(text_chunks) == 1 else text_chunks)
+            offsets.append((start, len(chunks)))
+
+        with self._op_lock:
+            vectors = backend.embed_documents(tuple(chunks))
+
+        embeddings: list[list[float]] = []
+        for start, end in offsets:
+            if end - start == 1:
+                embeddings.append(list(vectors[start]))
+                continue
+            pooled = np.asarray(vectors[start:end], dtype=np.float64).mean(axis=0)
+            norm = float(np.linalg.norm(pooled))
+            if norm == 0.0:
+                raise ValueError("mean-pooled embedding has zero norm")
+            embeddings.append((pooled / norm).tolist())
+        return embeddings
 
     def add_vectors(
         self,

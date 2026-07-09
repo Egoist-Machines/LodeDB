@@ -36,6 +36,43 @@ backend, or where its current local default makes LodeDB's strengths easy to sho
    can bind to a trusted private-network address for LAN demos; it is unauthenticated and is
    not a public-network service.
 
+## LodeDB as a local embeddings provider
+
+`lodedb serve` exposes `POST /v1/embeddings` (and `POST /embeddings`), an OpenAI-compatible
+embeddings endpoint backed by LodeDB's local ONNX embedding runtime. Any client that can point
+an OpenAI-style `baseUrl` at a custom host can use LodeDB as a local embeddings provider without
+an API key. Documents and queries never leave the machine. The embedding model itself is downloaded
+once from Hugging Face on first use, so prefetch it before going offline or operating air-gapped. By
+default, the server binds to loopback and is unauthenticated. The `Authorization` header is accepted
+and ignored.
+
+The request's `model` field is echoed back in the response; it does not select the embedding model.
+The preset selected at `lodedb serve --model ...` is authoritative. If `dimensions` is present,
+it must match the preset's native dimension or the request is rejected: `minilm` is 384, `bge` is
+768, and `clip` is 512. The OpenAI wire format has no query/document role, so `minilm` is the
+recommended preset because it is symmetric.
+
+For [OpenKnowledge](https://github.com/inkeep/open-knowledge) (`inkeep/open-knowledge`),
+semantic search consumes this API and whitelists `http://localhost`:
+
+```bash
+lodedb serve --model minilm --port 8088
+```
+
+```yaml
+# <wiki>/.ok/local/config.yml
+search:
+  semantic:
+    enabled: true
+    baseUrl: http://127.0.0.1:8088
+    model: minilm
+    dimensions: 384
+```
+
+OpenKnowledge requires a non-empty API key before it will enable semantic search. Set
+`OK_EMBEDDINGS_API_KEY` to any placeholder value, such as `local-placeholder`. It is only ever
+sent to the loopback server, which ignores it.
+
 ## Migrating onto LodeDB
 
 The `lodedb migrate` toolkit moves an existing store onto LodeDB along an
@@ -47,9 +84,9 @@ Reports and the `migration.json` manifest are payload-free, and connection strin
 
 Two public agent pages cover the two entry points:
 
-- [migrate-agent](migrate-agent.md) — framework-first migration (LangChain, LlamaIndex, mem0).
+- [migrate-agent](migrate-agent.md): framework-first migration (LangChain, LlamaIndex, mem0).
   Source: `https://egoistmachines.com/lodedb/migrate-agent`.
-- [install-agent](install-agent.md) — provider-first install-and-migrate for direct providers
+- [install-agent](install-agent.md): provider-first install-and-migrate for direct providers
   (pgvector first), which hands framework projects off to the page above.
   Source: `https://egoistmachines.com/lodedb/install-agent`.
 
@@ -68,8 +105,9 @@ lodedb migrate validate --manifest ./data/lodedb/migration.json
 | [LangChain](https://github.com/langchain-ai/langchain) | Framework | 139k | `VectorStore` adapter (`lodedb[langchain]`) | ✅ Shipped |
 | [LlamaIndex](https://github.com/run-llama/llama_index) | Framework | 50k | `VectorStore` + `PropertyGraphStore` adapters (`lodedb[llama-index]`) | ✅ Shipped ([#7](https://github.com/Egoist-Machines/LodeDB/pull/7)) |
 | [mem0](https://github.com/mem0ai/mem0) | Agent memory | 59k | `VectorStoreBase` provider (`lodedb[mem0]`) | ✅ Shipped ([#16](https://github.com/Egoist-Machines/LodeDB/pull/16)) |
-| [cognee](https://github.com/topoteretes/cognee) | Graph memory | 7k | `VectorDBInterface` provider (`lodedb[cognee]`) | 🚧 In review ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74)) |
+| [cognee](https://github.com/topoteretes/cognee) | Graph memory | 7k | `VectorDBInterface` provider (`lodedb[cognee]`) | ✅ Shipped ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74)) |
 | [PrivateGPT](https://github.com/zylon-ai/private-gpt) | Local RAG app | 57k | LlamaIndex provider shim + `settings.yaml` key | ✅ Shipped |
+| [OpenKnowledge](https://github.com/inkeep/open-knowledge) | LLM wiki / editor (TS) | n/a | OpenAI-compatible embeddings endpoint (`lodedb serve`) | ✅ Shipped |
 | [Haystack](https://github.com/deepset-ai/haystack) | Framework | 25k | `DocumentStore` protocol | 📋 Backlog |
 | [txtai](https://github.com/neuml/txtai) | Framework | n/a | `custom` backend (resolvable class string) | 📋 Backlog |
 | [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) | Local RAG app (JS) | 62k | Provider layer + local bridge | 📋 Backlog |
