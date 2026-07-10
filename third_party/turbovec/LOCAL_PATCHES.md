@@ -101,5 +101,7 @@ Added while LodeDB migrates toward a shared Rust engine:
 - `turbovec-python/Cargo.toml`: local path dependency on `crates/lodedb-core`.
 - `turbovec-python/src/lib.rs`: registers the private native-core JSON helpers
   and `CoreEngine` handle on the bundled `_turbovec` extension.
+- `turbovec-python/src/lib.rs`: exposes `native_build_profile()` so Python can
+  identify debug extension builds, whose kernels are roughly 100x slower.
 - `src/lodedb/_native_core.py`: re-exports those symbols at the stable private
   import path `lodedb._native_core` without importing them during `import lodedb`.

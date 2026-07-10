@@ -129,6 +129,16 @@ def _gpu_vector_scan_status() -> dict[str, Any]:
     }
 
 
+def _native_build_profile() -> str:
+    """Returns the loaded extension profile without making doctor depend on the extension."""
+
+    try:
+        from lodedb import _native_core
+    except ImportError:
+        return "unavailable"
+    return _native_core.native_build_profile()
+
+
 def _embedding_runtime_status() -> dict[str, Any]:
     """Reports the embedding runtime ``embedding_runtime="auto"`` prefers, plus ONNX details.
 
@@ -221,6 +231,7 @@ def local_capability_report(*, device: str = "auto") -> dict[str, Any]:
         "compact_backend": {
             **capability.to_dict(),
             "inferred_native_dispatch": turbovec_native_backend_from_flags(cpu_flags),
+            "native_build_profile": _native_build_profile(),
         },
         "gpu_vector_scan": _gpu_vector_scan_status(),
         "windows_gpu_hint": _windows_gpu_embedding_hint(),
@@ -261,6 +272,16 @@ def format_capability_report(report: dict[str, Any]) -> str:
         f"  available              : {backend['available']}",
         f"  native dispatch        : {backend.get('native_backend', '?')}"
         f" (inferred {backend.get('inferred_native_dispatch', '?')})",
+        f"  native build profile   : {backend.get('native_build_profile', 'unavailable')}",
+        *(
+            [
+                "  ! native extension was compiled without optimizations; vector search runs "
+                "roughly 100x slower. Rebuild it with "
+                "`uv run --with maturin maturin develop --release` from the repository root."
+            ]
+            if backend.get("native_build_profile") == "debug"
+            else []
+        ),
         f"  vendored target        : turbovec {backend.get('version', '?')}"
         f" (tag {backend.get('source_tag', '?')})",
     ]

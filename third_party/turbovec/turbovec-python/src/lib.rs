@@ -1238,6 +1238,17 @@ fn native_core_version() -> &'static str {
     lodedb_core::CORE_VERSION
 }
 
+/// Reports the Cargo build profile; debug kernels are about 100x slower and otherwise
+/// indistinguishable at runtime.
+#[pyfunction]
+fn native_build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
 #[pyfunction]
 fn native_core_abi_version() -> u32 {
     lodedb_core::NATIVE_CORE_ABI_VERSION
@@ -1466,6 +1477,7 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCoreAppender>()?;
     m.add_class::<PyCoreCheckpointer>()?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
+    m.add_function(wrap_pyfunction!(native_build_profile, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_runtime_available, m)?)?;

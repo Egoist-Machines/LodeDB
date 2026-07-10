@@ -44,6 +44,7 @@ def test_cli_doctor_text_and_json():
     assert json_result.exit_code == 0, json_result.output
     report = json.loads(json_result.output)
     assert "compact_backend" in report
+    assert "native_build_profile" in report["compact_backend"]
     assert "gpu_vector_scan" in report
 
 
