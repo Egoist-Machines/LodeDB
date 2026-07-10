@@ -9,7 +9,7 @@ use lodedb_core::{
 };
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyBytes, PyType};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1228,6 +1228,45 @@ impl PyCoreEngine {
             .map_err(native_core_error_to_py)
     }
 
+    /// Decodes an unstamped WAL segment, stamps record `i` with `first_lsn + i`,
+    /// and applies the batch in memory via `apply_wal_records`; returns the number
+    /// of records actually applied (records at or below the store's applied
+    /// watermark skip for refold idempotence). Refuses a segment that already
+    /// carries LSNs -- stamping is this binding's job, and a pre-stamped blob
+    /// signals a re-upload of an already-folded file. Does NOT persist: the caller
+    /// publishes one generation delta per fold batch via `persist()`. Decode +
+    /// stamp + apply run in one native call so embedding-heavy records never
+    /// round-trip through Python JSON.
+    fn fold_wal_segment(
+        &mut self,
+        index_id: &str,
+        segment: &[u8],
+        first_lsn: u64,
+    ) -> PyResult<u64> {
+        let mut records = lodedb_core::storage::wal::decode_wal_segment(segment)
+            .map_err(native_core_error_to_py)?;
+        if records.iter().any(|record| record.lsn.is_some()) {
+            return Err(native_core_error_to_py(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                "segment records already carry LSNs; segments on the wire must be unstamped",
+            )));
+        }
+        for (offset, record) in records.iter_mut().enumerate() {
+            let lsn = first_lsn.checked_add(offset as u64).ok_or_else(|| {
+                native_core_error_to_py(CoreError::new(
+                    CoreErrorCode::InvalidArgument,
+                    "LSN stamping would overflow u64",
+                ))
+            })?;
+            record.lsn = Some(lsn);
+        }
+        let applied = self
+            .inner
+            .apply_wal_records(index_id, &records)
+            .map_err(native_core_error_to_py)?;
+        Ok(applied as u64)
+    }
+
     fn close(&mut self) -> PyResult<()> {
         self.inner.close().map_err(native_core_error_to_py)
     }
@@ -1295,6 +1334,106 @@ fn round_trip_core_json(type_name: &str, json: &str) -> PyResult<String> {
             "unknown core type",
         ))),
     }
+}
+
+/// Store-free ingest planning: chunks a JSON `CoreDocument` array into the
+/// appender-shaped `IngestPlan` (every chunk marked for embedding). The text
+/// flags and chunk limit must match the target store's writer, or chunk ids and
+/// text retention diverge at fold time.
+#[pyfunction]
+fn plan_segment_documents(
+    documents_json: &str,
+    store_text: bool,
+    index_text: bool,
+    chunk_character_limit: usize,
+) -> PyResult<String> {
+    let documents = native_from_json::<Vec<CoreDocument>>(documents_json)?;
+    native_to_json(
+        &lodedb_core::engine::plan_documents(
+            &documents,
+            store_text,
+            index_text,
+            chunk_character_limit,
+        )
+        .map_err(native_core_error_to_py)?,
+    )
+}
+
+/// Builds the `apply_embedded_documents` WAL payload (as JSON) for an
+/// `IngestPlan` JSON plus a contiguous `(n, dim)` f32 embedding matrix, one row
+/// per `plan.chunks_to_embed` in order. Count, dimension, and finiteness are
+/// validated natively so a poison record can never be encoded and uploaded.
+#[pyfunction]
+fn build_embedded_documents_payload(
+    plan_json: &str,
+    embeddings: PyReadonlyArray2<f32>,
+    vector_dim: usize,
+) -> PyResult<String> {
+    let plan = native_from_json::<IngestPlan>(plan_json)?;
+    let embeddings = embeddings_from_array(embeddings)?;
+    native_to_json(
+        &lodedb_core::engine::build_embedded_documents_payload(&plan, &embeddings, vector_dim)
+            .map_err(native_core_error_to_py)?,
+    )
+}
+
+/// Encodes a JSON array of `{op, payload}` records into an immutable
+/// LodeDB WAL-format segment (file header + CRC-framed records, LSNs
+/// unassigned). Ops are validated against the native-replayable set and
+/// records must be unstamped -- both fail closed here, before an upload.
+#[pyfunction]
+fn encode_wal_segment<'py>(py: Python<'py>, records_json: &str) -> PyResult<Bound<'py, PyBytes>> {
+    #[derive(serde::Deserialize)]
+    struct SegmentRecordIn {
+        op: String,
+        payload: Value,
+        #[serde(default)]
+        lsn: Option<u64>,
+    }
+    let rows = native_from_json::<Vec<SegmentRecordIn>>(records_json)?;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !lodedb_core::engine::is_native_replayable_op(&row.op) {
+            return Err(native_core_error_to_py(CoreError::new(
+                CoreErrorCode::Unsupported,
+                format!("native WAL replay does not support {}", row.op),
+            )));
+        }
+        if row.lsn.is_some() {
+            return Err(native_core_error_to_py(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                "segment records must not carry LSNs; the fold stamps them",
+            )));
+        }
+        records.push(lodedb_core::storage::wal::WalRecord {
+            op: row.op,
+            payload: row.payload,
+            lsn: None,
+        });
+    }
+    let data = lodedb_core::storage::wal::encode_wal_segment(&records)
+        .map_err(native_core_error_to_py)?;
+    Ok(PyBytes::new(py, &data))
+}
+
+/// Strictly decodes segment bytes to a JSON array of `{op, payload, lsn}`
+/// records; any torn or corrupt frame raises (a segment is a complete
+/// immutable blob). For tests and writer-side validation.
+#[pyfunction]
+fn decode_wal_segment(segment: &[u8]) -> PyResult<String> {
+    let records = lodedb_core::storage::wal::decode_wal_segment(segment)
+        .map_err(native_core_error_to_py)?;
+    let rows: Vec<Value> = records
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "op": record.op,
+                "payload": record.payload,
+                "lsn": record.lsn,
+            })
+        })
+        .collect();
+    native_to_json(&rows)
 }
 
 fn native_round_trip<T>(json: &str) -> PyResult<String>
@@ -1483,5 +1622,9 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_runtime_available, m)?)?;
     m.add_function(wrap_pyfunction!(core_document_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(round_trip_core_json, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_segment_documents, m)?)?;
+    m.add_function(wrap_pyfunction!(build_embedded_documents_payload, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_wal_segment, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_wal_segment, m)?)?;
     Ok(())
 }

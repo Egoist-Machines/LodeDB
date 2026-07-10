@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **WAL segment primitives for out-of-band ingest (`lodedb.local.segments`).** Store-free
+  planning (`plan_documents`), record building (`build_embedded_documents_record`,
+  `delete_documents_record`), immutable WAL-format segment encode/decode
+  (`encode_segment`/`decode_segment`, strict), and `fold_segment` — fold a downloaded
+  segment into a warm writable `commit_mode="generation"` handle, stamping LSNs at fold
+  time and publishing one O(changed) generation delta per batch via `LodeDB.persist()`.
+  Enables cloud multi-writer pipelines (writers encode and upload segments lease-free; a
+  single fold orchestrator batches them into one commit). Core: `plan_documents`,
+  `build_embedded_documents_payload`, `is_native_replayable_op`, and
+  `CoreEngine::apply_wal_records` in `lodedb-core`; segments reuse the WAL frame format
+  byte-for-byte and carry raw text only under `store_text=True`. Advanced API — not
+  re-exported from the package root.
+
 ## [1.3.1] - 2026-07-08
 
 ### Added
