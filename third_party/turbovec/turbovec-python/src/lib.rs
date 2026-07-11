@@ -1270,6 +1270,13 @@ impl PyCoreEngine {
     fn close(&mut self) -> PyResult<()> {
         self.inner.close().map_err(native_core_error_to_py)
     }
+
+    /// Releases the store without persisting: un-persisted in-memory state is
+    /// dropped and the writer lock is released. The abort path after a failed
+    /// fold -- a graceful `close()` would persist partially applied state.
+    fn discard(&mut self) {
+        self.inner.discard();
+    }
 }
 
 #[pyfunction]

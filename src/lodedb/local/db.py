@@ -1366,6 +1366,27 @@ class LodeDB:
     def close(self) -> None:
         """Closes the native core (folding writes durably); state stays on disk."""
 
+        self._shutdown_native(persist=True)
+
+    def discard(self) -> None:
+        """Closes the handle WITHOUT persisting; the writer lock is released.
+
+        Un-persisted in-memory state is dropped and the store stays at its last
+        committed state on disk. This is the abort path for a writable handle
+        whose in-memory batch failed mid-apply (e.g. a partially applied fold
+        segment): a graceful :meth:`close` would persist the poisoned state.
+        WAL-mode writes are unaffected -- each was already durably logged at
+        write time and replays on the next open. Idempotent, and equivalent to
+        :meth:`close` for read-only handles.
+        """
+
+        self._shutdown_native(persist=False)
+
+    def _shutdown_native(self, *, persist: bool) -> None:
+        """Tears down the native engine on its home worker thread and stops the
+        executor. ``persist=True`` closes the store (folding writes durably);
+        ``persist=False`` discards un-persisted state. Idempotent."""
+
         with self._op_lock:
             executor = self._native_executor
             if executor is None:
@@ -1390,12 +1411,15 @@ class LodeDB:
             on_worker = home_thread_id is not None and threading.get_ident() == home_thread_id
 
             def _close_on_worker() -> None:
-                # Runs on the home worker: pop and close the engine so its final
-                # decref lands here, on the thread that created it.
+                # Runs on the home worker: pop and close (or discard) the engine so
+                # its final decref lands here, on the thread that created it.
                 if holder:
                     engine = holder.pop()
                     try:
-                        engine.close()
+                        if persist:
+                            engine.close()
+                        else:
+                            engine.discard()
                     finally:
                         # Drop the unsendable native handle here on the home
                         # worker even if close() raised: otherwise it stays
@@ -1414,7 +1438,8 @@ class LodeDB:
                 native_close_error = exc
             executor.shutdown(wait=not on_worker)
         if native_close_error is not None:
-            raise RuntimeError("native core close failed") from native_close_error
+            action = "close" if persist else "discard"
+            raise RuntimeError(f"native core {action} failed") from native_close_error
 
     def __enter__(self) -> LodeDB:
         """Enters a context manager; state is already loaded on open."""

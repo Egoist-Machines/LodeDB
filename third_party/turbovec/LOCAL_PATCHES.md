@@ -124,6 +124,9 @@ consumed by cloud multi-writer pipelines):
   `CoreEngine::apply_wal_records` in one native call (embedding-heavy records
   never round-trip through Python JSON); refuses pre-stamped segments; does not
   persist.
+- `turbovec-python/src/lib.rs`: `PyCoreEngine::discard()` — releases the store
+  without persisting (`CoreEngine::discard`): the abort path after a failed
+  fold, where a graceful `close()` would persist partially applied state.
 - `src/lodedb/_native_core.py`: re-exports the four functions.
 
 Purely additive: no existing binding, storage format, or API changes.

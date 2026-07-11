@@ -933,6 +933,12 @@ class NativeCoreEngineHandle:
     def close(self) -> None:
         self._engine.close()
 
+    def discard(self) -> None:
+        """Releases the store without persisting: un-persisted in-memory state is
+        dropped (the store stays at its last committed generation) and the writer
+        lock is released. The abort path after a failed fold."""
+        self._engine.discard()
+
     @staticmethod
     def _loads(payload: str) -> dict[str, Any]:
         value = json.loads(payload)

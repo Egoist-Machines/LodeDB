@@ -1455,6 +1455,18 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Releases the engine WITHOUT persisting and releases its writer lock.
+    ///
+    /// The abort path for a caller whose in-memory batch failed mid-apply (e.g. a
+    /// partially applied WAL segment): a graceful `close()` would persist the
+    /// poisoned state, `discard()` drops it and the store stays at its last
+    /// committed generation. WAL-mode appends are unaffected -- they are already
+    /// durable in the WAL and replay on the next writable open. Idempotent, and a
+    /// no-op beyond the lock release for read-only handles.
+    pub fn discard(&mut self) {
+        self.persistence = None;
+    }
+
     /// Folds the appended WAL tail into the warm in-memory index and checkpoints a
     /// fresh generation, then truncates the WAL; returns the number of records folded.
     ///

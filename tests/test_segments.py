@@ -171,6 +171,42 @@ def test_fold_failure_modes(tmp_path):
         wal_db.close()
 
 
+def test_discard_abandons_a_partially_applied_fold(tmp_path):
+    """A fold that raises mid-batch leaves partial state in memory only;
+    ``discard()`` abandons it without persisting (a graceful ``close()`` would
+    publish it) and releases the writer lock immediately."""
+
+    _writer(tmp_path).close()
+    plan = plan_documents([{"text": "partially applied survivor", "id": "partial"}])
+    chunk_texts = tuple(str(chunk["text"]) for chunk in plan["chunks_to_embed"])
+    good = build_embedded_documents_record(
+        plan, _be().embed_documents(chunk_texts), vector_dim=DIM
+    )
+    # Record 1 applies, record 2 raises at apply time: a well-formed frame whose
+    # payload fails validation inside the engine (missing `documents`).
+    poison = encode_segment([good, {"op": "apply_embedded_documents", "payload": {}}])
+
+    db = _writer(tmp_path)
+    try:
+        committed_lsn = db.applied_lsn()
+        with pytest.raises(Exception, match="documents"):
+            fold_segment(db, poison, first_lsn=committed_lsn + 1)
+        # The poisoned in-memory state a graceful close() would persist.
+        assert db.count() == 1
+    finally:
+        db.discard()
+
+    # The discard released the writer lock (this open would fail otherwise) and
+    # persisted nothing: the store is still at its committed (empty) state.
+    reopened = _writer(tmp_path)
+    try:
+        assert reopened.count() == 0
+        assert reopened.get("partial") is None
+        assert reopened.applied_lsn() == committed_lsn
+    finally:
+        reopened.close()
+
+
 def test_record_builder_failure_modes():
     plan = plan_documents([{"text": "validation fixture", "id": "a"}], store_text=True)
     chunk_count = len(plan["chunks_to_embed"])

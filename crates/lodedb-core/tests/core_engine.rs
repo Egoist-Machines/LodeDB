@@ -4322,3 +4322,47 @@ fn apply_wal_records_refuses_invalid_batches_and_handles() {
     let error = in_memory.apply_wal_records("default", &[stamped(1)]).unwrap_err();
     assert!(error.to_string().contains("in-memory"), "{error}");
 }
+
+#[test]
+fn discard_drops_unpersisted_folds_and_releases_the_writer_lock() {
+    // The fold abort path: a batch applied in memory but never persisted must
+    // vanish on discard() -- a graceful close() would persist it -- and the
+    // writer lock must release immediately so a fresh handle can take over.
+    let path = generation_store("core_engine_discard");
+    let documents = [text_doc("committed", "the committed document", metadata(&[]))];
+    let plan = plan_documents(&documents, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut records = vec![WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload,
+        lsn: None,
+    }];
+    stamp_records(&mut records, floor + 1);
+    assert_eq!(engine.apply_wal_records("default", &records).unwrap(), 1);
+    assert_eq!(engine.stats("default").unwrap().document_count, 1);
+    engine.discard();
+
+    // The lock is free while the discarded handle is still alive: a second
+    // writable open succeeds and sees only the committed (empty) state.
+    let mut reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(
+        reopened.stats("default").unwrap().document_count,
+        0,
+        "discard() must not persist the un-persisted fold"
+    );
+    assert_eq!(reopened.applied_lsn("default").unwrap(), floor);
+    // The abandoned batch re-applies cleanly on the fresh handle.
+    assert_eq!(reopened.apply_wal_records("default", &records).unwrap(), 1);
+    reopened.persist().unwrap();
+    drop(reopened);
+    drop(engine);
+
+    let survivor = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(survivor.stats("default").unwrap().document_count, 1);
+    drop(survivor);
+    fs::remove_dir_all(&path).unwrap();
+}

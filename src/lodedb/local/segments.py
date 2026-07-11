@@ -161,9 +161,10 @@ def fold_segment(db: LodeDB, data: bytes, *, first_lsn: int) -> int:
     for refold idempotence -- compare the returned count to the segment's
     record count and treat an unexpected shortfall as an LSN-allocation bug
     (stamp from ``max(committed applied_lsn, last stamped) + 1``; see
-    :meth:`LodeDB.applied_lsn`). On any exception discard the handle and reopen
-    before retrying: in-memory state may be partially applied, disk is
-    untouched.
+    :meth:`LodeDB.applied_lsn`). On any exception the in-memory state may be
+    partially applied (disk is untouched): abandon the handle with
+    :meth:`LodeDB.discard` -- never :meth:`LodeDB.close`, which would persist
+    the partial batch -- and reopen before retrying.
     """
 
     db._require_writable()

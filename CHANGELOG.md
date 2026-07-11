@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CoreEngine::apply_wal_records` in `lodedb-core`; segments reuse the WAL frame format
   byte-for-byte and carry raw text only under `store_text=True`. Advanced API — not
   re-exported from the package root.
+- **`LodeDB.discard()` — close without persisting.** Releases the handle and its writer
+  lock while dropping un-persisted in-memory state, leaving the store at its last
+  committed generation. The abort path after a failed `fold_segment` batch, where the
+  in-memory state may be partially applied and a graceful `close()` would persist it.
+  WAL-mode writes are unaffected (each was already durably logged at write time and
+  replays on the next open); for read-only handles it is equivalent to `close()`.
+  Core: `CoreEngine::discard()`.
 
 ## [1.3.1] - 2026-07-08
 
