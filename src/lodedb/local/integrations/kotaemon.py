@@ -42,7 +42,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from lodedb.engine._atomic_io import durable_replace
+from lodedb.engine._atomic_io import durability_from_env, durable_replace
 from lodedb.local.db import LodeDB
 
 # One row's kotaemon id is mirrored into this reserved metadata key so kotaemon's
@@ -133,7 +133,7 @@ class LodeDBVectorStore:
                 "(set 'path' in KH_VECTORSTORE or pass path=...)"
             )
         self._base_path = Path(path)
-        self._collection_name = str(collection_name)
+        self._collection_name = _validated_collection_name(collection_name)
         self._collection_path = self._base_path / self._collection_name
         self._store_text = bool(store_text)
         self._bit_width = int(bit_width)
@@ -216,7 +216,7 @@ class LodeDBVectorStore:
         stores take backend-specific options there).
         """
 
-        db = self._db
+        db = self._get_db()
         if db is None:
             return
         for doc_id in ids:
@@ -253,7 +253,7 @@ class LodeDBVectorStore:
             )
         if top_k <= 0:
             raise ValueError("top_k must be positive")
-        db = self._db
+        db = self._get_db()
         if db is None or allowlist == []:
             # No index yet (nothing was ever added) or an explicitly empty scope.
             return [], [], []
@@ -300,7 +300,8 @@ class LodeDBVectorStore:
     def count(self) -> int:
         """Returns the number of stored vectors (0 before the first add)."""
 
-        return 0 if self._db is None else self._db.count()
+        db = self._get_db()
+        return 0 if db is None else db.count()
 
     def close(self) -> None:
         """Closes the underlying LodeDB handle (reopened lazily on next use)."""
@@ -329,24 +330,41 @@ class LodeDBVectorStore:
 
         return self._collection_path / _META_FILENAME
 
+    def _get_db(self) -> LodeDB | None:
+        """Returns the handle, lazily reopening a closed-but-existing collection.
+
+        ``None`` means the collection was never created (nothing added yet). A
+        handle that was ``close()``d but whose shape sidecar is on disk reopens
+        here, so a closed adapter never masquerades as an empty collection.
+        """
+
+        if self._db is None and self._meta_path().exists():
+            self._open_existing()
+        return self._db
+
     def _open_existing(self) -> None:
         """Reopens a collection whose shape sidecar is already on disk."""
 
         with self._open_lock:
-            if self._db is not None:
-                return
-            meta = json.loads(self._meta_path().read_text(encoding="utf-8"))
-            self._vector_dim = int(meta["vector_dim"])
-            self._padded_dim = int(meta["padded_dim"])
-            # A LodeDB store must be reopened with the store_text value it was
-            # written with; the recorded value wins over a changed config.
-            self._store_text = bool(meta["store_text"])
-            self._db = LodeDB.open_vector_store(
-                self._collection_path,
-                vector_dim=self._padded_dim,
-                bit_width=self._bit_width,
-                store_text=self._store_text,
-            )
+            self._open_existing_locked()
+
+    def _open_existing_locked(self) -> None:
+        """Reopen body; the caller must hold ``_open_lock``."""
+
+        if self._db is not None:
+            return
+        meta = json.loads(self._meta_path().read_text(encoding="utf-8"))
+        self._vector_dim = int(meta["vector_dim"])
+        self._padded_dim = int(meta["padded_dim"])
+        # A LodeDB store must be reopened with the store_text value it was
+        # written with; the recorded value wins over a changed config.
+        self._store_text = bool(meta["store_text"])
+        self._db = LodeDB.open_vector_store(
+            self._collection_path,
+            vector_dim=self._padded_dim,
+            bit_width=self._bit_width,
+            store_text=self._store_text,
+        )
 
     def _ensure_open(self, *, vector_dim: int) -> LodeDB:
         """Opens (creating if needed) the index and pins the embedding dimension.
@@ -358,6 +376,10 @@ class LodeDBVectorStore:
         """
 
         with self._open_lock:
+            if self._db is None and self._meta_path().exists():
+                # A close()d handle on an existing collection: reopen the
+                # recorded shape rather than re-deriving it from this add.
+                self._open_existing_locked()
             if self._db is not None:
                 if vector_dim != self._vector_dim:
                     raise ValueError(
@@ -383,7 +405,13 @@ class LodeDBVectorStore:
             return self._db
 
     def _write_meta(self) -> None:
-        """Persists the collection shape sidecar atomically."""
+        """Persists the collection shape sidecar atomically.
+
+        A later open depends on this sidecar to know the collection's shape, so
+        it follows the same durability mode as the LodeDB store it describes
+        (the adapter opens the store without an explicit ``durability=``, which
+        resolves from ``LODEDB_DURABILITY`` — mirror that here).
+        """
 
         payload = json.dumps(
             {
@@ -398,7 +426,7 @@ class LodeDBVectorStore:
         )
         with open(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
-        durable_replace(tmp, self._meta_path(), fsync=False)
+        durable_replace(tmp, self._meta_path(), fsync=durability_from_env())
 
     def _pad(self, vector: Sequence[float]) -> list[float]:
         """Validates a vector's dimension and zero-pads it to the index shape."""
@@ -411,6 +439,30 @@ class LodeDBVectorStore:
                 f"expected a {self._vector_dim}-dim embedding, got {len(values)}-dim"
             )
         return values + [0.0] * (self._padded_dim - len(values))
+
+
+def _validated_collection_name(collection_name: str) -> str:
+    """Returns the collection name, rejecting anything but a single path component.
+
+    The collection directory is joined under the configured base ``path`` and
+    :meth:`LodeDBVectorStore.drop` deletes it recursively, so a name carrying
+    path separators, ``..``, or an absolute prefix must never reach that join —
+    it would let a config value write to (and drop) a directory outside the
+    vector-store root.
+    """
+
+    name = str(collection_name)
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or name != Path(name).name
+    ):
+        raise ValueError(
+            f"collection_name must be a single path component, got {collection_name!r}"
+        )
+    return name
 
 
 def _scalar_metadata(metadata: Mapping[str, Any], doc_id: str) -> dict[str, Any]:

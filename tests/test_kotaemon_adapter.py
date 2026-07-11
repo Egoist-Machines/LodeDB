@@ -317,6 +317,58 @@ def test_mismatched_lengths_raise(tmp_path):
         db.add(embeddings=EMBEDDINGS, metadatas=[{}])
 
 
+def test_close_then_reuse_reopens_lazily(tmp_path):
+    """A close()d handle must reopen from the sidecar, not act like an empty store."""
+
+    db = _store(tmp_path)
+    db.add(embeddings=EMBEDDINGS, metadatas=METADATAS, ids=IDS)
+    db.close()
+
+    # query/count on the same instance see the persisted rows again.
+    assert db.count() == 3
+    _, _, out_ids = db.query(embedding=[0.1, 0.2, 0.3], top_k=1)
+    assert out_ids == ["a"]
+
+    # add after close keeps the recorded 3-dim shape: a different logical dim
+    # that pads to the same physical shape must raise, never silently mix.
+    db.close()
+    with pytest.raises(ValueError, match="3-dim"):
+        db.add(embeddings=[[0.1] * 8], ids=["z"])
+    db.close()
+    db.add(embeddings=[[0.9, 0.1, 0.0]], ids=["d"])
+    assert db.count() == 4
+    db.close()
+
+    # delete after close also reopens rather than no-oping.
+    db.delete(ids=["d"])
+    assert db.count() == 3
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["../outside", "a/b", "a\\b", "/absolute", "..", ".", ""],
+)
+def test_rejects_path_escaping_collection_names(tmp_path, bad_name):
+    """drop() rmtrees the collection dir, so the name must be a single component."""
+
+    with pytest.raises(ValueError, match="single path component"):
+        LodeDBVectorStore(path=str(tmp_path), collection_name=bad_name)
+
+
+def test_fsync_durability_covers_shape_sidecar(tmp_path, monkeypatch):
+    """LODEDB_DURABILITY=fsync must apply to the sidecar write path too."""
+
+    monkeypatch.setenv("LODEDB_DURABILITY", "fsync")
+    db = _store(tmp_path)
+    db.add(embeddings=EMBEDDINGS, ids=IDS)
+    assert (tmp_path / "test" / "kotaemon_store.json").exists()
+    db.close()
+    db2 = _store(tmp_path)
+    assert db2.count() == 3
+    db2.close()
+
+
 def test_store_text_retains_doc_text(tmp_path):
     db = _store(tmp_path, store_text=True)
     documents = [
