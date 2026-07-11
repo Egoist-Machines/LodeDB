@@ -1646,10 +1646,6 @@ class LodeDB:
             real_handle = executor.submit(_open).result()
         except Exception as exc:
             executor.shutdown(wait=True)
-            # Reopen option guards intentionally raise ValueError so callers can
-            # correct their arguments without having to unwrap init plumbing.
-            if isinstance(exc, ValueError):
-                raise
             if _is_writer_lock_contention(exc):
                 # Another process holds the native single-writer lock. Surface the
                 # SDK's stable single-writer error (LodeDB is single-writer per
@@ -1660,6 +1656,12 @@ class LodeDB:
                     "(LodeDB is single-writer per path); close the other handle, or "
                     "raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
                 ) from exc
+            # Reopen option guards intentionally raise ValueError so callers can
+            # correct their arguments without having to unwrap init plumbing. The
+            # contention check runs first: the native lock error also surfaces as
+            # a ValueError and must stay ConcurrentWriterError.
+            if isinstance(exc, ValueError):
+                raise
             self._native_core_fallback_reason = "native_core_init_failed"
             raise RuntimeError(f"failed to initialize native core: {exc!r}") from exc
         self._native_executor = executor

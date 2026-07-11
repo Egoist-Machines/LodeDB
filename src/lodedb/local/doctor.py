@@ -106,11 +106,14 @@ def _read_exact(file: BinaryIO, size: int, label: str) -> bytes:
 
 
 def _row_stride(dtype: str, dim: int) -> int:
-    widths = {"float16": 2, "float32": 4, "int8": 1}
-    width = widths.get(dtype)
-    if width is None:
-        raise ValueError("TVVF header has an invalid dtype")
-    return dim * width
+    if dtype == "float16":
+        return dim * 2
+    if dtype == "float32":
+        return dim * 4
+    if dtype == "int8":
+        # A 4-byte per-row scale precedes the dim int8 codes.
+        return 4 + dim
+    raise ValueError("TVVF header has an invalid dtype")
 
 
 def _read_tvvf_segment(

@@ -300,6 +300,23 @@ def test_doctor_reports_a_corrupt_tvvf_without_removing_it(tmp_path) -> None:
         reopened.close()
 
 
+def test_doctor_validates_a_healthy_int8_sidecar(tmp_path) -> None:
+    """The int8 row stride includes the per-row scale, so a healthy store is ok."""
+
+    store = tmp_path / "doctor_int8"
+    db = lodedb.LodeDB.open_vector_store(
+        store, vector_dim=8, rescore="original", rescore_dtype="int8"
+    )
+    db.add_vectors([1.0] + [0.0] * 7, id="one", normalize=False)
+    db.add_vectors([0.0, 1.0] + [0.0] * 6, id="two", normalize=False)
+    db.persist()
+    db.close()
+
+    findings = native_store_findings(store)
+    finding = next(item for item in findings if item["name"] == "tvvf_sidecar")
+    assert finding["status"] == "ok", finding["message"]
+
+
 def test_doctor_fails_on_a_missing_or_non_directory_store_path(tmp_path) -> None:
     """A mistyped path is a failure finding, not a clean empty report."""
 
