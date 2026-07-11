@@ -64,12 +64,10 @@ modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::download
 modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::prepare --target-rows 21015300
 modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::ground_truth --target-rows 21015300
 
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::build_store \
-  --spec '{"label":"exact_bw4","bit_width":4}' --target-rows 21015300
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::build_store \
-  --spec '{"label":"ann1000_np16","bit_width":4,"ann_clusters":1000,"ann_nprobe":16}' \
-  --target-rows 21015300
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::main --target-rows 21015300
+modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::build \
+  --labels exact_bw4,ann1000,ann4096 --target-rows 21015300
+modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::main \
+  --labels exact_bw4,ann1000_np16,ann4096_np64 --target-rows 21015300
 ```
 
 For a cheap end-to-end check that does not download from Hugging Face, use:
@@ -90,9 +88,10 @@ for the configured duration, and a request is measured from immediately before `
 until it returns. It does not use an open-loop request queue. Batched QPS uses
 `search_many_by_vector_arrays` for batches of 64, 256, and 1000 vectors.
 
-Every ANN configuration gets its own store directory because LodeDB clustering is a create-time
-choice. The first ANN query is separately timed as cluster-index construction, not included in
-sequential latency.
+Every distinct ANN cluster layout gets its own store directory because clustering is a create-time
+choice. Reopen-time nprobe and rescore oversample values are session overrides, so their serve
+configurations reuse that durable store. The first ANN query is separately timed as cluster-index
+construction, not included in sequential latency.
 
 `report.py` includes two fixed published comparison references, labeled not rerun: Qdrant at 111.9
 aggregate QPS, 37.3 per node, and 0.9596 recall on three 4vCPU/16GB nodes; Elastic DiskBBQ at 32.4

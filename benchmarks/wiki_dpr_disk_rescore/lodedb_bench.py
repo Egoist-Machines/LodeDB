@@ -9,6 +9,7 @@ document text retention.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -39,6 +40,7 @@ def _requires_engine(feature: str) -> EngineFeatureRequired:
 
 
 _STORE_CONFIG_NAME = "benchmark_store_config.json"
+_RESCORE_DTYPES = {"fp16": "float16", "fp32": "float32"}
 
 
 def _summary_ms(samples_ms: list[float]) -> dict[str, float | int]:
@@ -131,7 +133,25 @@ def _load_store_config(store_dir: Path) -> dict[str, Any]:
     return loaded
 
 
-def _guard_existing_store_config(store_dir: Path, requested: dict[str, Any]) -> None:
+def _supports_session_overrides() -> bool:
+    """Returns whether this LodeDB build can apply reopen-time session knobs."""
+
+    from lodedb.local.db import LodeDB
+
+    # The companion engine branch adds rescore_oversample at the same time as
+    # applying both knobs to the native handle on reopen. Older releases accept
+    # ann_nprobe but ignore it for an existing store, so using this capability
+    # signal keeps an override benchmark from producing mislabeled results.
+    return "rescore_oversample" in inspect.signature(LodeDB).parameters
+
+
+def _guard_existing_store_config(
+    store_dir: Path,
+    requested: dict[str, Any],
+    *,
+    serve_nprobe: int | None,
+    serve_oversample: float | None,
+) -> None:
     """Rejects a store built for a different corpus or create-time configuration."""
 
     persisted = _load_store_config(store_dir)
@@ -152,6 +172,14 @@ def _guard_existing_store_config(store_dir: Path, requested: dict[str, Any]) -> 
     if not matches("ann_nprobe"):
         raise _requires_engine("open-time ann_nprobe override")
     if not matches("oversample"):
+        raise _requires_engine("open-time rescore oversample override")
+    effective_nprobe = requested["ann_nprobe"] if serve_nprobe is None else serve_nprobe
+    if effective_nprobe != persisted["ann_nprobe"] and not _supports_session_overrides():
+        raise _requires_engine("open-time ann_nprobe override")
+    effective_oversample = (
+        requested["oversample"] if serve_oversample is None else serve_oversample
+    )
+    if effective_oversample != persisted["oversample"] and not _supports_session_overrides():
         raise _requires_engine("open-time rescore oversample override")
 
 
@@ -204,6 +232,8 @@ def _open_store(
     rescore: str,
     oversample: float,
     rows: int,
+    serve_nprobe: int | None = None,
+    serve_oversample: float | None = None,
 ) -> Any:
     """Opens a pure vector LodeDB store, guarding future rescore keywords."""
 
@@ -228,7 +258,8 @@ def _open_store(
     if rescore != "none":
         # These are intentionally feature-gated. The engine branch adds both
         # create-time options; current releases reject the keywords cleanly.
-        kwargs["rescore_dtype"] = rescore
+        kwargs["rescore"] = "original"
+        kwargs["rescore_dtype"] = _RESCORE_DTYPES[rescore]
         kwargs["rescore_oversample"] = oversample
     existing_store = path.exists() and any(path.iterdir())
     requested_config = _store_config(
@@ -241,7 +272,16 @@ def _open_store(
         dim=dim,
     )
     if existing_store:
-        _guard_existing_store_config(path, requested_config)
+        _guard_existing_store_config(
+            path,
+            requested_config,
+            serve_nprobe=serve_nprobe,
+            serve_oversample=serve_oversample,
+        )
+        if serve_nprobe is not None:
+            kwargs["ann_nprobe"] = serve_nprobe
+        if serve_oversample is not None:
+            kwargs["rescore_oversample"] = serve_oversample
     try:
         db = LodeDB(path, **kwargs)
     except TypeError as exc:
@@ -406,12 +446,23 @@ def validate_result_schema(result: dict[str, Any]) -> None:
     if dataset.get("gt") != "fp32-exact-top100":
         raise ValueError("result dataset must identify the fp32 exact top-100 reference")
     store = result["store"]
-    for key in ("bit_width", "ann", "rescore", "layout", "build", "footprint", "open"):
+    for key in (
+        "bit_width",
+        "ann",
+        "rescore",
+        "serve_overrides",
+        "layout",
+        "build",
+        "footprint",
+        "open",
+    ):
         if key not in store:
             raise ValueError(f"result store is missing {key!r}")
     serve = result["serve"]
     if serve is not None:
         for key in (
+            "effective_nprobe",
+            "effective_oversample",
             "recall_at_100",
             "sequential_latency_ms",
             "closed_loop",
@@ -439,6 +490,8 @@ def run_benchmark(
     compact: bool = False,
     rescore: str = "none",
     oversample: float = 4.0,
+    serve_nprobe: int | None = None,
+    serve_oversample: float | None = None,
     report_block_skips: bool = False,
 ) -> dict[str, Any]:
     """Builds and/or serves one exact or cluster-pruned vector store configuration."""
@@ -449,6 +502,16 @@ def run_benchmark(
         raise ValueError("rescore must be none, fp16, or fp32")
     if oversample <= 0:
         raise ValueError("oversample must be positive")
+    if serve_nprobe is not None:
+        if ann_clusters is None:
+            raise ValueError("serve_nprobe requires an ANN store")
+        if serve_nprobe < 1:
+            raise ValueError("serve_nprobe must be positive")
+    if serve_oversample is not None:
+        if rescore == "none":
+            raise ValueError("serve_oversample requires a rescore store")
+        if serve_oversample <= 0:
+            raise ValueError("serve_oversample must be positive")
     if compact and not build:
         raise _requires_engine("compact() is a build-time operation")
     manifest, base, queries, gt_indices, _ = dataset_arrays(data_dir, require_gt=serve)
@@ -460,6 +523,13 @@ def run_benchmark(
         if ann_clusters is None
         else {"algorithm": "cluster", "clusters": ann_clusters, "nprobe": ann_nprobe}
     )
+    effective_nprobe = serve_nprobe if serve_nprobe is not None else ann_nprobe
+    if rescore == "none":
+        effective_oversample = None
+    elif serve_oversample is not None:
+        effective_oversample = serve_oversample
+    else:
+        effective_oversample = oversample
     result: dict[str, Any] = {
         "label": label,
         "env": _environment(),
@@ -473,7 +543,13 @@ def run_benchmark(
         "store": {
             "bit_width": bit_width,
             "ann": ann,
-            "rescore": None if rescore == "none" else {"dtype": rescore, "oversample": oversample},
+            "rescore": (
+                None if rescore == "none" else {"dtype": rescore, "oversample": oversample}
+            ),
+            "serve_overrides": {
+                "ann_nprobe": serve_nprobe,
+                "oversample": serve_oversample,
+            },
             "layout": {"compacted": bool(compact)},
             "build": None,
             "footprint": None,
@@ -546,6 +622,8 @@ def run_benchmark(
             rescore=rescore,
             oversample=oversample,
             rows=int(manifest["rows"]),
+            serve_nprobe=serve_nprobe,
+            serve_oversample=serve_oversample,
         )
         try:
             db.search_by_vector(queries[0], k=k, normalize=False)
@@ -563,7 +641,7 @@ def run_benchmark(
                 counter_delta = int(read()) - counter_before
                 total_blocks = int(len(queries) * math.ceil(base.shape[0] / 32))
                 candidate_fraction = (
-                    1.0 if ann is None else float(ann_nprobe) / float(ann_clusters)
+                    1.0 if ann is None else float(effective_nprobe) / float(ann_clusters)
                 )
                 block_skip = {
                     "fraction": counter_delta / total_blocks if total_blocks else 0.0,
@@ -572,6 +650,8 @@ def run_benchmark(
                     "candidate_fraction_f": candidate_fraction,
                 }
             result["serve"] = {
+                "effective_nprobe": effective_nprobe,
+                "effective_oversample": effective_oversample,
                 "recall_at_100": recall,
                 "sequential_latency_ms": _sequential_latency(db, queries, k=k),
                 "closed_loop": _closed_loop(
@@ -609,6 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compact", action="store_true")
     parser.add_argument("--rescore", choices=("none", "fp16", "fp32"), default="none")
     parser.add_argument("--oversample", type=float, default=4.0)
+    parser.add_argument("--serve-nprobe", type=int)
+    parser.add_argument("--serve-oversample", type=float)
     parser.add_argument("--report-block-skips", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("results/wiki_dpr.json"))
     return parser
@@ -637,6 +719,8 @@ def main(argv: list[str] | None = None) -> None:
             compact=args.compact,
             rescore=args.rescore,
             oversample=args.oversample,
+            serve_nprobe=args.serve_nprobe,
+            serve_oversample=args.serve_oversample,
             report_block_skips=args.report_block_skips,
         )
     except EngineFeatureRequired as exc:

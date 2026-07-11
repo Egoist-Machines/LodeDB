@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ import modal
 _REMOTE_SRC = "/root/lodedb-src"
 _REMOTE_BENCH = "/root/benchmarks/wiki_dpr_disk_rescore"
 _VOLUME_PATH = "/vol"
+_SERVE_CPU = 4.0
+_SERVE_MEMORY_MB = 131072
 
 
 def _build_image() -> modal.Image:
@@ -170,37 +173,55 @@ def ground_truth(target_rows: int = 21_015_300, block_rows: int = 100_000) -> di
 
 
 @app.function(cpu=32.0, memory=131072, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
-def build_store(spec: dict[str, Any], target_rows: int = 21_015_300) -> dict[str, Any]:
-    """Builds one named config directly on the volume, with serving disabled."""
+def build_store(
+    store_label: str,
+    target_rows: int = 21_015_300,
+    git_sha: str | None = None,
+) -> dict[str, Any]:
+    """Builds one named reusable store directly on the volume, without serving."""
 
     from lodedb_bench import run_benchmark
+    from sweep import STORES
 
-    label = str(spec["label"])
-    kwargs = dict(spec)
-    kwargs.pop("label")
+    try:
+        store = STORES[store_label]
+    except KeyError as exc:
+        raise ValueError(f"unknown store label: {store_label}") from exc
+    store_dir = Path(_store_dir(target_rows, store_label))
+    config_path = store_dir / "benchmark_store_config.json"
+    if config_path.exists():
+        return {"label": store_label, "resumed": True, "store": {"build": None}}
+    kwargs = dict(store)
     kwargs.pop("requires_engine", None)
     result = run_benchmark(
         data_dir=_prepared_dir(target_rows),
-        store_dir=_store_dir(target_rows, label),
-        label=label,
+        store_dir=store_dir,
+        label=store_label,
         build=True,
         serve=False,
         **kwargs,
     )
+    if git_sha is not None:
+        result["env"]["git_sha"] = git_sha
     VOLUME.commit()
     _log_result(result)
     return result
 
 
 def _serve_from_local_copy(
-    spec: dict[str, Any], target_rows: int, *, data_dir: str | Path | None = None
+    spec: dict[str, Any],
+    target_rows: int,
+    *,
+    data_dir: str | Path | None = None,
+    store_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Copies one durable store to local SSD, then runs all serving measurements."""
 
     from lodedb_bench import run_benchmark
 
     label = str(spec["label"])
-    source = Path(_store_dir(target_rows, label))
+    store_label = str(spec.get("store", label))
+    source = Path(_store_dir(target_rows, store_label))
     if not source.exists():
         raise FileNotFoundError(f"store is not built: {source}")
     local_root = Path(tempfile.mkdtemp(prefix=f"wiki-dpr-{label}-"))
@@ -208,9 +229,16 @@ def _serve_from_local_copy(
     started = time.perf_counter()
     shutil.copytree(source, local_store)
     copy_seconds = time.perf_counter() - started
-    kwargs = dict(spec)
-    kwargs.pop("label")
+    if store_kwargs is None:
+        from sweep import STORES
+
+        try:
+            store_kwargs = STORES[store_label]
+        except KeyError as exc:
+            raise ValueError(f"unknown store label: {store_label}") from exc
+    kwargs = dict(store_kwargs)
     kwargs.pop("requires_engine", None)
+    overrides = dict(spec.get("serve_overrides", {}))
     try:
         result = run_benchmark(
             data_dir=_prepared_dir(target_rows) if data_dir is None else data_dir,
@@ -218,6 +246,8 @@ def _serve_from_local_copy(
             label=label,
             build=False,
             serve=True,
+            serve_nprobe=overrides.get("ann_nprobe"),
+            serve_oversample=overrides.get("oversample"),
             **kwargs,
         )
     finally:
@@ -226,27 +256,80 @@ def _serve_from_local_copy(
     return result
 
 
-@app.function(cpu=4.0, memory=131072, timeout=14_400, volumes={_VOLUME_PATH: VOLUME})
-def serve(spec: dict[str, Any], target_rows: int = 21_015_300) -> dict[str, Any]:
+@app.function(
+    cpu=_SERVE_CPU,
+    memory=_SERVE_MEMORY_MB,
+    timeout=14_400,
+    volumes={_VOLUME_PATH: VOLUME},
+)
+def serve(
+    spec: dict[str, Any],
+    target_rows: int = 21_015_300,
+    git_sha: str | None = None,
+) -> dict[str, Any]:
     """Serves a volume-built store from container-local disk and logs the result."""
 
     result = _serve_from_local_copy(spec, target_rows)
+    result["env"].update(
+        {
+            "requested_cpu": _SERVE_CPU,
+            "requested_memory_mb": _SERVE_MEMORY_MB,
+        }
+    )
+    if git_sha is not None:
+        result["env"]["git_sha"] = git_sha
     _log_result(result)
     return result
+
+
+def _local_git_sha() -> str | None:
+    """Returns the local checkout revision for a remote container result."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+@app.local_entrypoint()
+def build(target_rows: int = 21_015_300, labels: str = "exact_bw4,ann1000") -> None:
+    """Builds the requested reusable stores as durable stores on the volume."""
+
+    from sweep import STORES
+
+    wanted = [label.strip() for label in labels.split(",") if label.strip()]
+    unknown = sorted(set(wanted) - set(STORES))
+    if unknown:
+        raise ValueError(f"unknown labels: {unknown}")
+    git_sha = _local_git_sha()
+    results = build_store.starmap((label, target_rows, git_sha) for label in wanted)
+    for label, result in zip(wanted, results, strict=False):
+        build_seconds = (result.get("store") or {}).get("build")
+        print(f"built {label} rows={target_rows}: {build_seconds}")
 
 
 @app.local_entrypoint()
 def main(target_rows: int = 21_015_300, labels: str = "exact_bw4,ann1000_np16") -> None:
     """Collects serving results from stores that were built with ``build_store``."""
 
-    from sweep import CONFIGS
+    from sweep import SERVE_CONFIGS
 
     wanted = {label.strip() for label in labels.split(",") if label.strip()}
-    specs = [config for config in CONFIGS if config["label"] in wanted]
+    specs = [config for config in SERVE_CONFIGS if config["label"] in wanted]
     if len(specs) != len(wanted):
-        unknown = sorted(wanted - {config["label"] for config in CONFIGS})
+        unknown = sorted(wanted - {config["label"] for config in SERVE_CONFIGS})
         raise ValueError(f"unknown labels: {unknown}")
-    results = [serve.remote(spec, target_rows=target_rows) for spec in specs]
+    git_sha = _local_git_sha()
+    results = [
+        serve.remote(spec, target_rows=target_rows, git_sha=git_sha) for spec in specs
+    ]
     out = Path(__file__).resolve().parent / "results" / "modal_serve_results.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
@@ -263,14 +346,24 @@ def smoke() -> dict[str, Any]:
     data = Path(_VOLUME_PATH) / "prepared" / "smoke_50k"
     make_synthetic_dataset(data, rows=50_000, dim=256, n_queries=50, seed=42)
     specs = (
-        {"label": "smoke_exact", "bit_width": 4},
-        {"label": "smoke_ann", "bit_width": 4, "ann_clusters": 64, "ann_nprobe": 8},
+        {
+            "label": "smoke_exact",
+            "store": "smoke_exact",
+            "serve_overrides": {},
+            "store_kwargs": {"bit_width": 4},
+        },
+        {
+            "label": "smoke_ann",
+            "store": "smoke_ann",
+            "serve_overrides": {},
+            "store_kwargs": {"bit_width": 4, "ann_clusters": 64, "ann_nprobe": 8},
+        },
     )
     results: list[dict[str, Any]] = []
     for spec in specs:
         store = Path(_store_dir(50_000, str(spec["label"])))
-        kwargs = dict(spec)
-        label = str(kwargs.pop("label"))
+        kwargs = dict(spec["store_kwargs"])
+        label = str(spec["label"])
         built = run_benchmark(
             data_dir=data,
             store_dir=store,
@@ -281,7 +374,12 @@ def smoke() -> dict[str, Any]:
             **kwargs,
         )
         _log_result(built)
-        served = _serve_from_local_copy(spec, target_rows=50_000, data_dir=data)
+        served = _serve_from_local_copy(
+            spec,
+            target_rows=50_000,
+            data_dir=data,
+            store_kwargs=kwargs,
+        )
         if float(served["serve"]["recall_at_100"]) <= 0.9:
             recall = served["serve"]["recall_at_100"]
             raise AssertionError(f"{label} recall did not clear 0.9: {recall}")

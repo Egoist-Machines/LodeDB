@@ -1,0 +1,151 @@
+[
+  {
+    "dataset": {
+      "dim": 768,
+      "gt": "fp32-exact-top100",
+      "n_queries": 1000,
+      "rows": 1000000,
+      "seed": 42
+    },
+    "env": {
+      "cpu_count": 20,
+      "git_sha": null,
+      "host": "modal",
+      "lodedb_version": "1.3.1",
+      "numpy": "2.4.6",
+      "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35"
+    },
+    "label": "exact_bw4",
+    "serve": {
+      "batched": [
+        {
+          "batch_size": 64,
+          "qps": 973.557457833836
+        },
+        {
+          "batch_size": 256,
+          "qps": 1034.8672172282777
+        },
+        {
+          "batch_size": 1000,
+          "qps": 1232.7968895745335
+        }
+      ],
+      "block_skip": null,
+      "closed_loop": {
+        "concurrency": 4,
+        "latency_ms": {
+          "p50_ms": 192.82476299997597,
+          "p95_ms": 196.78356799988705
+        },
+        "qps": 20.75169954711862,
+        "seconds": 20.19111731299995
+      },
+      "recall_at_100": 0.9407600000000058,
+      "sequential_latency_ms": {
+        "count": 1000,
+        "mean_ms": 47.71085208800014,
+        "p50_ms": 47.94273099992097,
+        "p95_ms": 50.131865000025755
+      }
+    },
+    "store": {
+      "ann": null,
+      "bit_width": 4,
+      "build": null,
+      "footprint": {
+        "by_extension_bytes": {
+          ".json": 246336672,
+          ".lock": 0,
+          ".tvim": 396006162
+        },
+        "total_bytes": 642342834
+      },
+      "layout": {
+        "compacted": false
+      },
+      "open": {
+        "open_plus_first_query_seconds": 717.878928808
+      },
+      "rescore": null
+    },
+    "volume_copy_seconds": 3.1830433690000004
+  },
+  {
+    "dataset": {
+      "dim": 768,
+      "gt": "fp32-exact-top100",
+      "n_queries": 1000,
+      "rows": 1000000,
+      "seed": 42
+    },
+    "env": {
+      "cpu_count": 20,
+      "git_sha": null,
+      "host": "modal",
+      "lodedb_version": "1.3.1",
+      "numpy": "2.4.6",
+      "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35"
+    },
+    "label": "ann1000_np16",
+    "serve": {
+      "batched": [
+        {
+          "batch_size": 64,
+          "qps": 59.12150566180937
+        },
+        {
+          "batch_size": 256,
+          "qps": 55.07596615883735
+        },
+        {
+          "batch_size": 1000,
+          "qps": 56.65718205269106
+        }
+      ],
+      "block_skip": null,
+      "closed_loop": {
+        "concurrency": 4,
+        "latency_ms": {
+          "p50_ms": 85.739985000032,
+          "p95_ms": 110.32786300006592
+        },
+        "qps": 46.431816519866416,
+        "seconds": 20.072443205000013
+      },
+      "recall_at_100": 0.8759300000000022,
+      "sequential_latency_ms": {
+        "count": 1000,
+        "mean_ms": 19.207941920999815,
+        "p50_ms": 18.586985999945682,
+        "p95_ms": 28.523544000108814
+      }
+    },
+    "store": {
+      "ann": {
+        "algorithm": "cluster",
+        "clusters": 1000,
+        "nprobe": 16
+      },
+      "bit_width": 4,
+      "build": null,
+      "footprint": {
+        "by_extension_bytes": {
+          ".json": 246337029,
+          ".lock": 0,
+          ".tvann": 9891124,
+          ".tvim": 396006162
+        },
+        "total_bytes": 652234315
+      },
+      "layout": {
+        "compacted": false
+      },
+      "open": {
+        "open_plus_first_query_seconds": 907.339073291
+      },
+      "rescore": null
+    },
+    "volume_copy_seconds": 2.7857289819999997
+  }
+]

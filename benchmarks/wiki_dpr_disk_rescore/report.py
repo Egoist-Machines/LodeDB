@@ -38,9 +38,9 @@ def render_report(results_dir: str | Path) -> str:
         if isinstance(result, dict) and "store" in result:
             rows.append(result)
     lines = [
-        "| config | layout | rescore | recall@100 | seq p50 ms | CL-4 QPS | batch-256 QPS | "
-        "blocks skipped | f |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|",
+        "| config | layout | rescore | override np | override ov | effective np | effective ov | "
+        "recall@100 | seq p50 ms | CL-4 QPS | batch-256 QPS | blocks skipped | f |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in rows:
         store = result["store"]
@@ -53,15 +53,21 @@ def render_report(results_dir: str | Path) -> str:
         rescore_cell = (
             "none" if not rescore else f"{rescore.get('dtype')} x{rescore.get('oversample')}"
         )
+        overrides = store.get("serve_overrides") or {}
         sequential = serve.get("sequential_latency_ms", {})
         closed_loop = serve.get("closed_loop", {})
         block_skip = serve.get("block_skip") or {}
         lines.append(
-            "| {label} | {layout} | {rescore} | {recall} | {seq} | {cl} | {batch} | "
+            "| {label} | {layout} | {rescore} | {override_nprobe} | {override_oversample} | "
+            "{effective_nprobe} | {effective_oversample} | {recall} | {seq} | {cl} | {batch} | "
             "{skip} | {fraction} |".format(
                 label=result.get("label", "unknown"),
                 layout=layout,
                 rescore=rescore_cell,
+                override_nprobe=_number(overrides.get("ann_nprobe"), 0),
+                override_oversample=_number(overrides.get("oversample"), 1),
+                effective_nprobe=_number(serve.get("effective_nprobe"), 0),
+                effective_oversample=_number(serve.get("effective_oversample"), 1),
                 recall=_number(serve.get("recall_at_100"), 4),
                 seq=_number(sequential.get("p50_ms"), 3),
                 cl=_number(closed_loop.get("qps"), 2),
