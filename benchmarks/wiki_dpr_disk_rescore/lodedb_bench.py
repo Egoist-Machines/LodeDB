@@ -571,6 +571,7 @@ def run_benchmark(
         )
         try:
             ingest_seconds = _ingest_vectors(db, base, batch=ingest_batch)
+            print(f"[wiki-dpr] {label}: ingest done in {ingest_seconds:.1f}s", flush=True)
             cluster_build_seconds: float | None = None
             if ann is not None:
                 started = time.perf_counter()
@@ -586,9 +587,11 @@ def run_benchmark(
                 started = time.perf_counter()
                 compact_fn()
                 compact_seconds = time.perf_counter() - started
+            print(f"[wiki-dpr] {label}: warm query done, persisting", flush=True)
             started = time.perf_counter()
             db.persist()
             persist_seconds = time.perf_counter() - started
+            print(f"[wiki-dpr] {label}: persist done in {persist_seconds:.1f}s", flush=True)
             result["store"]["build"] = {
                 "ingest_seconds": ingest_seconds,
                 "ingest_rows_per_s": base.shape[0] / ingest_seconds if ingest_seconds else 0.0,
@@ -598,6 +601,7 @@ def run_benchmark(
             }
         finally:
             db.close()
+        print(f"[wiki-dpr] {label}: store closed", flush=True)
         result["store"]["footprint"] = _dir_footprint(store_dir)
         _write_store_config(
             store_dir,
