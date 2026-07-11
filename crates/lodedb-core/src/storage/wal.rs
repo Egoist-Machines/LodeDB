@@ -367,11 +367,11 @@ fn encode_body(op: &str, mut payload: Value, lsn: Option<u64>) -> CoreResult<Vec
     };
     // Stamp the log sequence number into the JSON body rather than the binary
     // frame, so the frame layout (and the committed cross-version WAL fixtures)
-    // stays byte-compatible. `decode_body` lifts it back out on read. Segment
-    // records are deliberately unstamped (`None`): the fold assigns LSNs after
-    // download, so no key is written at all. The payload is taken by value and
-    // mutated in place: append callers own the payload they pass, so this avoids
-    // cloning the whole value tree on the write hot path.
+    // stays byte-compatible. `decode_body` lifts it back out on read. `Some`
+    // writes the `lsn` key; `None` writes none -- the local append path passes
+    // `Some`, the cloud segment path passes `None`. The payload is taken by
+    // value and mutated in place: append callers own the payload they pass, so
+    // this avoids cloning the whole value tree on the write hot path.
     if let Some(lsn) = lsn {
         object.insert("lsn".to_string(), Value::from(lsn));
     }
