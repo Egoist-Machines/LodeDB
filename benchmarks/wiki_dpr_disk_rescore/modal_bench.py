@@ -191,6 +191,12 @@ def build_store(
     config_path = store_dir / "benchmark_store_config.json"
     if config_path.exists():
         return {"label": store_label, "resumed": True, "store": {"build": None}}
+    if store_dir.exists() and any(store_dir.iterdir()):
+        # A store directory without its config file is a crashed earlier build;
+        # it cannot be trusted or served, so rebuild it from scratch.
+        print(f"[wiki-dpr] wiping incomplete store {store_dir}", flush=True)
+        shutil.rmtree(store_dir)
+        VOLUME.commit()
     kwargs = dict(store)
     kwargs.pop("requires_engine", None)
     result = run_benchmark(
@@ -299,8 +305,16 @@ def _local_git_sha() -> str | None:
 
 
 @app.local_entrypoint()
-def build(target_rows: int = 21_015_300, labels: str = "exact_bw4,ann1000") -> None:
-    """Builds the requested reusable stores as durable stores on the volume."""
+def build(
+    target_rows: int = 21_015_300,
+    labels: str = "exact_bw4,ann1000",
+    parallel: bool = False,
+) -> None:
+    """Builds the requested reusable stores as durable stores on the volume.
+
+    Sequential by default: concurrent containers committing large files to one
+    volume can collide, killing a build between its persist and its config write.
+    """
 
     from sweep import STORES
 
@@ -309,7 +323,10 @@ def build(target_rows: int = 21_015_300, labels: str = "exact_bw4,ann1000") -> N
     if unknown:
         raise ValueError(f"unknown labels: {unknown}")
     git_sha = _local_git_sha()
-    results = build_store.starmap((label, target_rows, git_sha) for label in wanted)
+    if parallel:
+        results = list(build_store.starmap((label, target_rows, git_sha) for label in wanted))
+    else:
+        results = [build_store.remote(label, target_rows, git_sha) for label in wanted]
     for label, result in zip(wanted, results, strict=False):
         build_seconds = (result.get("store") or {}).get("build")
         print(f"built {label} rows={target_rows}: {build_seconds}")
