@@ -7,8 +7,15 @@ pub mod state_journal;
 pub mod text_store;
 pub mod tvann_store;
 pub mod tvim_delta;
+pub mod tvvf_store;
 pub(crate) mod util;
 pub mod wal;
+
+pub use tvvf_store::{
+    append_delta, append_delta_with_fsync, base_path as tvvf_base_path, fold, fold_with_fsync,
+    manifest_path as tvvf_manifest_path, record_base as record_tvvf_base, record_base_with_fsync,
+    TvvfDtype, TvvfError, TvvfManifestEntry, TvvfReader, TvvfResult,
+};
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{

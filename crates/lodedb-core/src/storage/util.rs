@@ -2,7 +2,7 @@ use crate::error::{CoreError, CoreErrorCode};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub(crate) type CoreResult<T> = Result<T, CoreError>;
@@ -35,9 +35,92 @@ pub(crate) fn sha256_bytes_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn sha256_file_hex(path: &Path) -> CoreResult<String> {
-    let data = fs::read(path)
+    let mut file = File::open(path)
         .map_err(|error| corrupt(format!("{} could not be read: {error}", path.display())))?;
-    Ok(sha256_bytes_hex(&data))
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| corrupt(format!("{} could not be read: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// FNV-1a-64, shared by compact binary sidecars for lightweight section and
+/// record checksums. This matches TurboVec's calibration-fingerprint hash.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+pub(crate) fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// IEEE 754 half-precision bits to f32, matching numpy's float16 conversion.
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = if (bits >> 15) & 1 == 1 { -1.0_f32 } else { 1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = (bits & 0x3ff) as f32;
+    let magnitude = match exponent {
+        0 => mantissa * 2.0_f32.powi(-24),
+        0x1f => {
+            if mantissa == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent as i32 - 15),
+    };
+    sign * magnitude
+}
+
+/// Converts f32 to IEEE 754 binary16 with round-to-nearest, ties-to-even.
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+
+    if exponent == 0xff {
+        let payload = ((mantissa >> 13) as u16) & 0x03ff;
+        return sign | 0x7c00 | if mantissa == 0 { 0 } else { payload.max(1) };
+    }
+
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let significand = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut half = (significand >> shift) as u16;
+        let remainder = significand & ((1_u32 << shift) - 1);
+        let halfway = 1_u32 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && half & 1 == 1) {
+            half += 1;
+        }
+        return sign | half;
+    }
+
+    let mut half = ((half_exponent as u16) << 10) | ((mantissa >> 13) as u16);
+    let remainder = mantissa & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    sign | half
 }
 
 pub(crate) fn verify_file_sha256(path: &Path, expected: &str, context: &str) -> CoreResult<()> {
