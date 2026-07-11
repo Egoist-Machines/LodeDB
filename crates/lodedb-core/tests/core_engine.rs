@@ -448,7 +448,12 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
     assert!(!record["content_hash"].as_str().unwrap().is_empty());
     assert!(!record.as_object().unwrap().contains_key("text"));
     let listed = engine
-        .list_documents("text", Some(&json!({"metadata": {"topic": "ops"}})), None, None)
+        .list_documents(
+            "text",
+            Some(&json!({"metadata": {"topic": "ops"}})),
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["document_id"], "doc-a");
@@ -517,8 +522,16 @@ fn search_embedded_text_batch_matches_looped_single() {
             "text",
             &[
                 text_doc("doc-a", "fault code E1234", metadata(&[("topic", "ops")])),
-                text_doc("doc-b", "quarterly revenue report", metadata(&[("topic", "finance")])),
-                text_doc("doc-c", "revenue forecast E1234", metadata(&[("topic", "ops")])),
+                text_doc(
+                    "doc-b",
+                    "quarterly revenue report",
+                    metadata(&[("topic", "finance")]),
+                ),
+                text_doc(
+                    "doc-c",
+                    "revenue forecast E1234",
+                    metadata(&[("topic", "ops")]),
+                ),
             ],
             true,
             true,
@@ -684,7 +697,13 @@ fn wal_replay_preserves_multivector_patches() {
     drop(engine);
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     let hits = reopened
-        .query_multivector("default", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, 1, None)
+        .query_multivector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+            1,
+            None,
+        )
         .unwrap();
     assert_eq!(hits.hits.len(), 1);
     assert_eq!(hits.hits[0].document_id, "mv");
@@ -1448,9 +1467,17 @@ fn text_reupsert_clears_a_prior_patch_matrix_on_reload() {
     {
         let mut engine = CoreEngine::open(options.clone()).unwrap();
         let plan = engine
-            .prepare_text_upsert("default", &[text_doc("a", "hello world", metadata(&[]))], true, true, 900)
+            .prepare_text_upsert(
+                "default",
+                &[text_doc("a", "hello world", metadata(&[]))],
+                true,
+                true,
+                900,
+            )
             .unwrap();
-        engine.apply_text_upsert(&plan, &[unit(0).to_vec()], 1.0).unwrap();
+        engine
+            .apply_text_upsert(&plan, &[unit(0).to_vec()], 1.0)
+            .unwrap();
         engine.persist().unwrap();
     }
     // 3. Reopen: the base matrix must not resurrect (query_multivector skips
@@ -1971,7 +1998,11 @@ fn appended_text_documents_fold_into_the_next_writer() {
         let appender = CoreAppender::open(appender_opts).expect("open appender");
         let plan = appender
             .prepare_documents(&[
-                text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+                text_doc(
+                    "a",
+                    "hello world from lodedb",
+                    metadata(&[("kind", "note")]),
+                ),
                 text_doc("b", "a second appended document", metadata(&[])),
             ])
             .expect("prepare documents");
@@ -2018,7 +2049,10 @@ fn appended_text_replacement_retires_old_chunks() {
     appender_opts.acquire_writer_lock = true;
     {
         let appender = CoreAppender::open(appender_opts).expect("open appender");
-        for (text, axis) in [("original alpha text", 0_usize), ("replacement beta words", 1_usize)] {
+        for (text, axis) in [
+            ("original alpha text", 0_usize),
+            ("replacement beta words", 1_usize),
+        ] {
             let plan = appender
                 .prepare_documents(&[text_doc("a", text, metadata(&[]))])
                 .expect("prepare");
@@ -2056,8 +2090,16 @@ fn appended_text_matches_writer_authored_ingest() {
     // (prepare_documents + append_embedded_documents, then a fold) yields the same
     // committed store as the exclusive writer's prepare_text_upsert/apply_text_upsert.
     let documents = [
-        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
-        text_doc("b", "a second appended document", metadata(&[("kind", "note")])),
+        text_doc(
+            "a",
+            "hello world from lodedb",
+            metadata(&[("kind", "note")]),
+        ),
+        text_doc(
+            "b",
+            "a second appended document",
+            metadata(&[("kind", "note")]),
+        ),
     ];
 
     // Writer path.
@@ -2718,8 +2760,14 @@ fn appender_rejects_non_native_wal() {
     // writer cannot replay. Appending native records behind it would strand them,
     // so the appender must refuse to open until a writer recovers the store.
     let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
-    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", json!({ "documents": [] }), false)
-        .expect("write non-native record");
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        1,
+        "upsert_documents",
+        json!({ "documents": [] }),
+        false,
+    )
+    .expect("write non-native record");
     assert!(CoreAppender::open(base).is_err());
     fs::remove_dir_all(path).unwrap();
 }
@@ -3497,6 +3545,19 @@ fn blob_docs() -> Vec<CoreVectorDocument> {
     docs
 }
 
+/// The same four separated blobs, but with rows interleaved across blobs. A
+/// durable cluster-layout reorder is therefore observable in the persisted tvim.
+fn interleaved_blob_docs() -> Vec<CoreVectorDocument> {
+    let by_blob = blob_docs();
+    let mut docs = Vec::with_capacity(by_blob.len());
+    for row in 0..5 {
+        for blob in 0..4 {
+            docs.push(by_blob[blob * 5 + row].clone());
+        }
+    }
+    docs
+}
+
 fn hit_keys(results: &CoreSearchResults) -> Vec<(String, u32)> {
     results
         .hits
@@ -3544,6 +3605,102 @@ fn ann_probe_all_matches_exact() {
             "probe-all must equal exact for axis {axis}"
         );
     }
+}
+
+#[test]
+fn session_overrides_take_precedence_without_changing_create_options() {
+    let docs = blob_docs();
+    let exact = exact_engine(&docs);
+    let mut ann = ann_engine(&docs, 4, 1);
+    let query = axis_query(0);
+    ann.set_session_overrides("default", Some(4), None).unwrap();
+    assert_eq!(
+        hit_keys(&exact.query_vector("default", &query, 5, None).unwrap()),
+        hit_keys(&ann.query_vector("default", &query, 5, None).unwrap()),
+        "a session probe-all override must reproduce exact scan"
+    );
+    assert_eq!(
+        ann.index_options("default")
+            .unwrap()
+            .ann
+            .and_then(|options| options.nprobe),
+        Some(1),
+        "session tuning must not change durable create options"
+    );
+    assert!(ann.set_session_overrides("default", Some(0), None).is_err());
+
+    let (documents, query) = rescore_boundary_docs();
+    let mut rescored = rescore_engine(&documents, 1.0);
+    rescored
+        .set_session_overrides("default", None, Some(32.0))
+        .unwrap();
+    let expected = exact_fp32_hits(&documents, &query, None, 3)
+        .into_iter()
+        .map(|(document_id, _)| document_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rescored
+            .query_vector("default", &query, 3, None)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        rescored
+            .index_options("default")
+            .unwrap()
+            .rescore
+            .and_then(|options| options.oversample),
+        Some(1.0)
+    );
+    assert!(rescored
+        .set_session_overrides("default", None, Some(f32::NAN))
+        .is_err());
+}
+
+#[test]
+fn readonly_refresh_preserves_session_ann_override() {
+    let path = unique_temp_dir("core_refresh_session_ann");
+    let (documents, query) = rescore_boundary_docs();
+    let exact = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let mut writer = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let mut options = ann_options(4, 1);
+    options.index_key = INDEX_KEY.to_string();
+    options.client_id_hash = INDEX_KEY.to_string();
+    writer.create_index_with_options(options).unwrap();
+    writer.upsert_vectors("default", &documents).unwrap();
+    writer.persist().unwrap();
+
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    reader
+        .set_session_overrides("default", Some(4), None)
+        .unwrap();
+
+    // Commit a metadata-only update so refresh replaces the reader's loaded
+    // index while the durable nprobe remains one.
+    let mut updated = documents[0].clone();
+    updated
+        .metadata
+        .insert("refresh".to_string(), "new-generation".to_string());
+    writer.upsert_vectors("default", &[updated]).unwrap();
+    writer.persist().unwrap();
+
+    reader.refresh().unwrap();
+    let refreshed = reader.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(hit_keys(&refreshed), hit_keys(&exact));
+    assert!(
+        !reader.ann_cluster_resident("default").unwrap(),
+        "the retained probe-all override must take the exact path after refresh"
+    );
+
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -3834,13 +3991,132 @@ fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
     })
 }
 
-fn ann_durable(path: &Path) -> CoreEngine {
+fn ann_durable_with_nprobe(path: &Path, nprobe: usize) -> CoreEngine {
     let mut engine = CoreEngine::open(open_options(path, false, "wal")).unwrap();
-    let mut options = ann_options(4, 1);
+    let mut options = ann_options(4, nprobe);
     options.index_key = INDEX_KEY.to_string();
     options.client_id_hash = INDEX_KEY.to_string();
     engine.create_index_with_options(options).unwrap();
     engine
+}
+
+fn ann_durable(path: &Path) -> CoreEngine {
+    ann_durable_with_nprobe(path, 1)
+}
+
+#[test]
+fn durable_probe_all_ignores_session_pruning_when_persisting() {
+    let path = unique_temp_dir("core_ann_durable_probe_all");
+    let documents = interleaved_blob_docs();
+    let mut engine = ann_durable_with_nprobe(&path, 4);
+    engine.upsert_vectors("default", &documents).unwrap();
+    engine
+        .set_session_overrides("default", Some(1), None)
+        .unwrap();
+    let _ = engine
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(
+        engine.ann_cluster_resident("default").unwrap(),
+        "the smaller session nprobe should warm an in-memory cluster index"
+    );
+    engine.persist().unwrap();
+
+    assert!(
+        !has_file_with_ext(&path, "tvann"),
+        "a durable probe-all store must not persist a session-only ANN sidecar"
+    );
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        INDEX_KEY,
+        lodedb_core::storage::LoadOptions {
+            read_only: true,
+            read_wal: false,
+        },
+    )
+    .unwrap();
+    let persisted = IdMapIndex::load(loaded.tvim_path.as_ref().unwrap()).unwrap();
+    let mut durable_chunk_ids = documents
+        .iter()
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    // The document map canonically writes chunks in id order before any optional
+    // cluster-layout reorder runs.
+    durable_chunk_ids.sort();
+    let original_slots = stable_uint64_ids_for_chunk_ids(&durable_chunk_ids);
+    assert_eq!(
+        persisted.reconstruct_all().0,
+        original_slots,
+        "a session-only ANN setting must not reorder the durable base layout"
+    );
+
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn durable_pruning_persists_ann_after_a_session_probe_all_query() {
+    let path = unique_temp_dir("core_ann_durable_pruning");
+    let documents = interleaved_blob_docs();
+    let exact = exact_engine(&documents);
+    let mut engine = ann_durable(&path);
+    engine.upsert_vectors("default", &documents).unwrap();
+    // Warm the sidecar payload under the durable pruning setting, then switch the
+    // session to probe-all. The query must use the exact scan, but persistence
+    // must still honor the durable setting that created this store.
+    let _ = engine
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(engine.ann_cluster_resident("default").unwrap());
+    engine
+        .set_session_overrides("default", Some(4), None)
+        .unwrap();
+    assert_eq!(
+        hit_keys(
+            &engine
+                .query_vector("default", &axis_query(0), 5, None)
+                .unwrap()
+        ),
+        hit_keys(
+            &exact
+                .query_vector("default", &axis_query(0), 5, None)
+                .unwrap()
+        ),
+        "a session probe-all override must take the exact query path"
+    );
+    engine.persist().unwrap();
+
+    assert!(
+        has_file_with_ext(&path, "tvann"),
+        "a durable pruning store must persist its warmed ANN sidecar"
+    );
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        INDEX_KEY,
+        lodedb_core::storage::LoadOptions {
+            read_only: true,
+            read_wal: false,
+        },
+    )
+    .unwrap();
+    let posting_ids = loaded
+        .ann
+        .as_ref()
+        .expect("durable pruning must write ANN postings")
+        .postings
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let persisted = IdMapIndex::load(loaded.tvim_path.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        persisted.reconstruct_all().0,
+        stable_uint64_ids_for_chunk_ids(&posting_ids),
+        "a durable pruning store must retain its cluster-contiguous base layout"
+    );
+
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -3906,7 +4182,13 @@ fn warm_ann_base_uses_cluster_contiguous_slots_and_reopens() {
         assert_eq!(persisted.reconstruct_all().0, expected_slots);
         hits.hits
             .iter()
-            .map(|hit| (hit.document_id.clone(), hit.chunk_id.clone(), hit.score.to_bits()))
+            .map(|hit| {
+                (
+                    hit.document_id.clone(),
+                    hit.chunk_id.clone(),
+                    hit.score.to_bits(),
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -3917,7 +4199,13 @@ fn warm_ann_base_uses_cluster_contiguous_slots_and_reopens() {
         .unwrap()
         .hits
         .iter()
-        .map(|hit| (hit.document_id.clone(), hit.chunk_id.clone(), hit.score.to_bits()))
+        .map(|hit| {
+            (
+                hit.document_id.clone(),
+                hit.chunk_id.clone(),
+                hit.score.to_bits(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(after, before);
     drop(reopened);
@@ -4169,10 +4457,7 @@ fn rescore_options(dtype: &str) -> CoreIndexCreateOptions {
     rescore_options_with_oversample(dtype, None)
 }
 
-fn rescore_options_with_oversample(
-    dtype: &str,
-    oversample: Option<f32>,
-) -> CoreIndexCreateOptions {
+fn rescore_options_with_oversample(dtype: &str, oversample: Option<f32>) -> CoreIndexCreateOptions {
     let mut options = CoreIndexCreateOptions::native_default("default", 8, 4);
     options.rescore = Some(CoreRescoreOptions {
         mode: CoreRescoreOptions::ORIGINAL.to_string(),
@@ -4197,7 +4482,12 @@ fn exact_fp32_hits(
         .filter(|document| {
             allowed.is_none_or(|allowed| allowed.contains_key(&document.document_id))
         })
-        .map(|document| (document.document_id.clone(), fp32_dot(query, &document.vector)))
+        .map(|document| {
+            (
+                document.document_id.clone(),
+                fp32_dot(query, &document.vector),
+            )
+        })
         .collect::<Vec<_>>();
     hits.sort_by(|left, right| {
         right
@@ -4238,16 +4528,10 @@ fn rescore_boundary_docs() -> (Vec<CoreVectorDocument>, Vec<f32>) {
     (documents, query)
 }
 
-fn rescore_engine(
-    documents: &[CoreVectorDocument],
-    oversample: f32,
-) -> CoreEngine {
+fn rescore_engine(documents: &[CoreVectorDocument], oversample: f32) -> CoreEngine {
     let mut engine = CoreEngine::new_in_memory();
     engine
-        .create_index_with_options(rescore_options_with_oversample(
-            "float32",
-            Some(oversample),
-        ))
+        .create_index_with_options(rescore_options_with_oversample("float32", Some(oversample)))
         .unwrap();
     engine.upsert_vectors("default", documents).unwrap();
     engine
@@ -4506,7 +4790,11 @@ fn rescore_ann_candidates_are_rescored_before_truncation() {
     let cluster_entries = entries
         .iter()
         .map(|(chunk_id, stable_id, position)| {
-            (*chunk_id, *stable_id, &rows[position * 8..(position + 1) * 8])
+            (
+                *chunk_id,
+                *stable_id,
+                &rows[position * 8..(position + 1) * 8],
+            )
         })
         .collect::<Vec<_>>();
     let assignment = loaded.ann.as_ref().unwrap();
@@ -4653,7 +4941,9 @@ fn rescore_float16_overflow_keeps_finite_quantized_scores() {
     let documents = vec![
         CoreVectorDocument {
             document_id: "overflow".to_string(),
-            vector: vec![70_000.0, -80_000.0, 70_000.0, -70_000.0, 1.0, -1.0, 1.0, -1.0],
+            vector: vec![
+                70_000.0, -80_000.0, 70_000.0, -70_000.0, 1.0, -1.0, 1.0, -1.0,
+            ],
             metadata: BTreeMap::new(),
             text: None,
             patch_matrix: None,
@@ -4662,11 +4952,20 @@ fn rescore_float16_overflow_keeps_finite_quantized_scores() {
     ];
     engine.upsert_vectors("default", &documents).unwrap();
     let results = engine
-        .query_vector("default", &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 2, None)
+        .query_vector(
+            "default",
+            &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            2,
+            None,
+        )
         .unwrap();
     assert_eq!(results.hits.len(), 2);
     for hit in &results.hits {
-        assert!(hit.score.is_finite(), "score for {} is not finite", hit.document_id);
+        assert!(
+            hit.score.is_finite(),
+            "score for {} is not finite",
+            hit.document_id
+        );
     }
 }
 
@@ -4760,10 +5059,7 @@ fn rescore_fold_limits_tiny_delta_segments() {
     // segment bound; the 65th delta must fold the sidecar.
     for cycle in 1..=65 {
         engine
-            .upsert_vectors(
-                "default",
-                &[rescore_vector("doc-0", cycle as f32 * 0.01)],
-            )
+            .upsert_vectors("default", &[rescore_vector("doc-0", cycle as f32 * 0.01)])
             .unwrap();
         engine.persist().unwrap();
     }
@@ -4794,7 +5090,11 @@ fn rescore_fold_keeps_live_and_previous_vf_epochs() {
     drop(engine);
     let (manifest, rows) = tvvf_rows(&path, &["doc-0", "doc-1"]);
     assert_eq!(manifest["vf_epoch"], 3);
-    assert_rows_close(rows[0].as_ref().unwrap(), &rescore_vector("doc-0", 0.2).vector, 0.0);
+    assert_rows_close(
+        rows[0].as_ref().unwrap(),
+        &rescore_vector("doc-0", 0.2).vector,
+        0.0,
+    );
     assert!(
         !lodedb_core::storage::tvvf_base_path(&path, "default", 1).exists(),
         "older folded tvvf epoch should be collected"

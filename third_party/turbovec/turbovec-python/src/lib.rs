@@ -654,6 +654,31 @@ impl PyCoreEngine {
             .map_err(native_core_error_to_py)
     }
 
+    /// Returns the index's durable create options. Session-only query overrides
+    /// are excluded so bindings can validate reopen arguments against persisted
+    /// identity without reading storage files themselves.
+    fn index_options(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .index_options(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Applies query-time tuning for this engine lifetime only. Neither override
+    /// is persisted into a state header or commit manifest.
+    fn set_session_overrides(
+        &mut self,
+        index_id: &str,
+        ann_nprobe: Option<usize>,
+        rescore_oversample: Option<f32>,
+    ) -> PyResult<()> {
+        self.inner
+            .set_session_overrides(index_id, ann_nprobe, rescore_oversample)
+            .map_err(native_core_error_to_py)
+    }
+
     fn upsert_vectors(&mut self, index_id: &str, documents_json: &str) -> PyResult<String> {
         let documents = native_from_json::<Vec<CoreVectorDocument>>(documents_json)?;
         native_to_json(

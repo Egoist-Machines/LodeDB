@@ -145,6 +145,41 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Returns the persisted creation options for an index.
+    ///
+    /// Session-only query overrides intentionally do not appear here: bindings
+    /// use this read-only view to distinguish an index's durable identity from
+    /// knobs applied only to the current engine lifetime.
+    pub fn index_options(&self, index_id: &str) -> Result<CoreIndexCreateOptions, CoreError> {
+        Ok(self.index(index_id)?.create_options())
+    }
+
+    /// Applies query-time tuning for this engine lifetime only.
+    ///
+    /// Neither setting changes state headers, manifests, or sidecars. `nprobe`
+    /// is clamped against the current cluster count at query time just like its
+    /// persisted counterpart, so a value suitable for one corpus size remains
+    /// safe after later writes in the same session.
+    pub fn set_session_overrides(
+        &mut self,
+        index_id: &str,
+        ann_nprobe: Option<usize>,
+        rescore_oversample: Option<f32>,
+    ) -> Result<(), CoreError> {
+        if ann_nprobe == Some(0) {
+            return invalid("ann_nprobe must be positive");
+        }
+        if let Some(oversample) = rescore_oversample {
+            if !oversample.is_finite() || oversample < 1.0 {
+                return invalid("rescore_oversample must be finite and at least 1.0");
+            }
+        }
+        let index = self.index_mut(index_id)?;
+        index.session_ann_nprobe = ann_nprobe;
+        index.session_rescore_oversample = rescore_oversample;
+        Ok(())
+    }
+
     /// Upserts vector documents into an existing index.
     pub fn upsert_vectors(
         &mut self,
@@ -965,7 +1000,9 @@ impl CoreEngine {
             let embeddings = query_embeddings
                 .ok_or_else(|| invalid_err("query embeddings are required for this mode"))?;
             if embeddings.len() != query_plans.len() {
-                return Err(invalid_err("query embeddings count does not match query plans"));
+                return Err(invalid_err(
+                    "query embeddings count does not match query plans",
+                ));
             }
             Ok(embeddings)
         };
@@ -2243,6 +2280,18 @@ impl CoreEngine {
         // an error always restores the last-good view, never a half-built or
         // seqlock-rejected one.
         let saved = std::mem::take(&mut self.indexes);
+        // The indexes rebuilt below contain only durable state. Preserve the
+        // reader handle's query-only tuning separately so it can be restored onto
+        // each successful replacement by index id.
+        let session_overrides = saved
+            .iter()
+            .map(|(index_id, index)| {
+                (
+                    index_id.clone(),
+                    (index.session_ann_nprobe, index.session_rescore_oversample),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut outcome = Ok(());
         for _ in 0..8 {
             self.indexes.clear();
@@ -2253,10 +2302,15 @@ impl CoreEngine {
                     break;
                 }
             };
-            if let Err(error) = self
-                .load_persisted_indexes(false)
-                .and_then(|()| self.overlay_wal_tails())
-            {
+            if let Err(error) = self.load_persisted_indexes(false).and_then(|()| {
+                for (index_id, (ann_nprobe, rescore_oversample)) in &session_overrides {
+                    if let Some(index) = self.indexes.get_mut(index_id) {
+                        index.session_ann_nprobe = *ann_nprobe;
+                        index.session_rescore_oversample = *rescore_oversample;
+                    }
+                }
+                self.overlay_wal_tails()
+            }) {
                 outcome = Err(error);
                 break;
             }
@@ -2305,9 +2359,7 @@ impl CoreEngine {
     /// when a counter cannot be read this pass -- a concurrent appender holds it with
     /// an exclusive share mode on Windows -- so the caller skips the fast path and
     /// does a normal reload rather than surfacing a spurious error.
-    fn refresh_signature(
-        &self,
-    ) -> Result<Option<BTreeMap<String, (String, u64, u64)>>, CoreError> {
+    fn refresh_signature(&self) -> Result<Option<BTreeMap<String, (String, u64, u64)>>, CoreError> {
         let Some(persistence) = &self.persistence else {
             return Ok(Some(BTreeMap::new()));
         };
@@ -2418,7 +2470,13 @@ impl CoreEngine {
         let targets: Vec<(String, String, u64)> = self
             .indexes
             .values()
-            .map(|index| (index.index_id.clone(), index.index_key.clone(), index.generation))
+            .map(|index| {
+                (
+                    index.index_id.clone(),
+                    index.index_key.clone(),
+                    index.generation,
+                )
+            })
             .collect();
         for (index_id, index_key, base_generation) in targets {
             let wal = crate::storage::wal::wal_path(&path, &index_key);
@@ -2711,7 +2769,9 @@ impl CoreAppender {
         let metadata = crate::storage::load_store_metadata(&path, &index_key)?;
         let vector_dim = metadata.native_dim;
         if vector_dim == 0 {
-            return Err(invalid_err("index has no vector dimension to append against"));
+            return Err(invalid_err(
+                "index has no vector dimension to append against",
+            ));
         }
         // Under the counter lock (so no concurrent appender is mid-write), scan the
         // WAL to seed the LSN floor and repair any torn tail a crash left behind.
@@ -2807,12 +2867,18 @@ impl CoreAppender {
             // Same finiteness guard the writer's upsert_vectors applies, so a
             // NaN/Inf vector cannot enter the log and fail a later replay.
             if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
-                return Err(invalid_err("vector contains a non-finite or out-of-range value"));
+                return Err(invalid_err(
+                    "vector contains a non-finite or out-of-range value",
+                ));
             }
             // Byte-identical to the engine's writer-authored record via the shared
             // builder: raw text only under store_text (privacy), caption tokens
             // under index_text, and the late-interaction patch matrix carried along.
-            vectors.push(wal_vector_document(document, self.store_text, self.index_text));
+            vectors.push(wal_vector_document(
+                document,
+                self.store_text,
+                self.index_text,
+            ));
         }
         self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
     }
@@ -2820,7 +2886,9 @@ impl CoreAppender {
     /// Durably appends one `delete_documents` record, returning its LSN.
     pub fn append_deletes(&self, document_ids: &[String]) -> Result<u64, CoreError> {
         if document_ids.is_empty() {
-            return Err(invalid_err("append_deletes requires at least one document id"));
+            return Err(invalid_err(
+                "append_deletes requires at least one document id",
+            ));
         }
         if document_ids.iter().any(|id| id.trim().is_empty()) {
             return Err(invalid_err("document_id is required"));
@@ -2840,7 +2908,9 @@ impl CoreAppender {
     /// uses, so a replayed appended record folds to the same chunks a writer would.
     pub fn prepare_documents(&self, documents: &[CoreDocument]) -> Result<IngestPlan, CoreError> {
         if documents.is_empty() {
-            return Err(invalid_err("prepare_documents requires at least one document"));
+            return Err(invalid_err(
+                "prepare_documents requires at least one document",
+            ));
         }
         let (prepared_documents, chunks_to_embed) = plan_document_chunks(
             documents,
@@ -2947,12 +3017,9 @@ impl CoreAppender {
                 .collect::<Vec<_>>();
             let mut chunk_ids = Vec::with_capacity(document.chunks.len());
             for chunk in &document.chunks {
-                let embedding =
-                    embedding_by_chunk
-                        .get(chunk.chunk_id.as_str())
-                        .ok_or_else(|| {
-                            invalid_err("prepared plan chunk is missing its embedding")
-                        })?;
+                let embedding = embedding_by_chunk
+                    .get(chunk.chunk_id.as_str())
+                    .ok_or_else(|| invalid_err("prepared plan chunk is missing its embedding"))?;
                 added_chunks.push(serde_json::json!({
                     "chunk_id": chunk.chunk_id,
                     "document_id": document.document_id,
@@ -3090,9 +3157,7 @@ impl CoreAppender {
             // counter's LSN is the last frame's LSN. The steady-state hot path --
             // once this appender acks a frame the watermark equals the file length,
             // so every later append in the session lands here in O(1) with no scan.
-            Some(mark) if physical == mark && mark > 0 => {
-                Ok((counter_lsn.max(generation), mark))
-            }
+            Some(mark) if physical == mark && mark > 0 => Ok((counter_lsn.max(generation), mark)),
             // Anything else: a torn trailing frame, a zero-length WAL, a watermark
             // past the file, or -- now that an appender no longer holds the writer
             // lock for its lifetime -- committed frames a concurrent writer appended
@@ -3476,7 +3541,9 @@ fn index_from_loaded_store(
             // or invalid tuning) so it never runs the wrong algorithm; the index
             // then serves exact, which is always correct.
             .filter(|ann| validate_ann_options(ann).is_ok()),
+        session_ann_nprobe: None,
         rescore_options,
+        session_rescore_oversample: None,
         pending_rescore_upserts: BTreeMap::new(),
         tvvf_reader: RefCell::new(tvvf_reader),
         tvvf_manifest,
@@ -4295,7 +4362,7 @@ fn write_index_base(
     // are stable ids; they are mapped back to chunk-id strings for the sidecar
     // (the payload boundary the other sidecars hold to). A probe-all or too-small
     // configuration writes no `.tvann`.
-    let persist_ann = index.ann_prunes() && tvim_base.is_some();
+    let persist_ann = index.ann_prunes_durable() && tvim_base.is_some();
     let ann_postings = if persist_ann {
         index.ann_persisted_postings()?
     } else {
@@ -4768,9 +4835,14 @@ struct VectorOnlyIndex {
     vector_index: RefCell<Option<TurboVecNativeIndex>>,
     /// Opt-in ANN tuning; `None` keeps the index exact-scan only.
     ann_options: Option<CoreAnnOptions>,
-    /// Opt-in original-precision capture for a later rescore stage. The query
-    /// path deliberately does not consume this in this work package.
+    /// Query-time ANN probe override. This belongs to the live engine only and
+    /// deliberately never reaches the state header or commit manifest.
+    session_ann_nprobe: Option<usize>,
+    /// Opt-in original-precision capture for the two-stage rescore query path.
     rescore_options: Option<CoreRescoreOptions>,
+    /// Query-time candidate oversampling override. Like `session_ann_nprobe`,
+    /// this is engine-lifetime state only.
+    session_rescore_oversample: Option<f32>,
     /// Caller-supplied rows, encoded at ingest before the live TurboVec index
     /// quantizes them. A BTreeMap makes WAL replay and multi-producer folding
     /// idempotent: a repeated stable id overwrites its pending payload.
@@ -4836,6 +4908,25 @@ struct VectorOnlyIndex {
 }
 
 impl VectorOnlyIndex {
+    /// Reconstructs the durable creation payload without any session overrides.
+    fn create_options(&self) -> CoreIndexCreateOptions {
+        CoreIndexCreateOptions {
+            index_id: self.index_id.clone(),
+            index_key: self.index_key.clone(),
+            client_id_hash: self.client_id_hash.clone(),
+            name: self.name.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            task: self.task.clone(),
+            route_profile: self.route_profile.clone(),
+            storage_profile: self.storage_profile.clone(),
+            vector_dim: self.vector_dim,
+            bit_width: self.bit_width,
+            ann: self.ann_options.clone(),
+            rescore: self.rescore_options.clone(),
+        }
+    }
+
     fn rescore_dtype(&self) -> Option<crate::storage::TvvfDtype> {
         self.rescore_options.as_ref().map(|options| {
             match options.dtype.as_deref().unwrap_or("float16") {
@@ -4915,7 +5006,9 @@ impl VectorOnlyIndex {
             lexical_index: Bm25Index::empty(),
             vector_index: RefCell::new(None),
             ann_options: options.ann,
+            session_ann_nprobe: None,
             rescore_options: options.rescore,
+            session_rescore_oversample: None,
             pending_rescore_upserts: BTreeMap::new(),
             tvvf_reader: RefCell::new(None),
             tvvf_manifest: None,
@@ -5301,10 +5394,12 @@ impl VectorOnlyIndex {
     /// of at least one, and the scan still owns its normal final clamp.
     fn rescore_candidate_count(&self, top_k: usize, scan_capacity: usize) -> usize {
         let oversample = self
-            .rescore_options
-            .as_ref()
-            .expect("rescore candidate count requires rescore options")
-            .oversample
+            .session_rescore_oversample
+            .or_else(|| {
+                self.rescore_options
+                    .as_ref()
+                    .and_then(|options| options.oversample)
+            })
             .unwrap_or(4.0) as f64;
         ((oversample * top_k as f64).ceil() as usize).min(scan_capacity)
     }
@@ -5411,7 +5506,7 @@ impl VectorOnlyIndex {
             // A single cluster holds the whole corpus; probing it is the exact scan.
             return Ok(None);
         }
-        let nprobe = self.ann_nprobe(num_clusters);
+        let nprobe = self.ann_nprobe_effective(num_clusters);
         if nprobe >= num_clusters {
             // Probing every cluster reproduces the exact top-k, so skip the union
             // work and let the exact full scan run.
@@ -5575,7 +5670,7 @@ impl VectorOnlyIndex {
     }
 
     fn reorder_for_cluster_layout(&mut self) {
-        if !self.ann_prunes() {
+        if !self.ann_prunes_durable() {
             return;
         }
         let ids = {
@@ -5595,13 +5690,28 @@ impl VectorOnlyIndex {
     /// Number of clusters to build: the configured override, else a `sqrt(n)`
     /// heuristic capped so the build cost and centroid memory stay bounded.
     fn ann_cluster_count(&self, n: usize) -> usize {
-        let configured = self.ann_options.as_ref().and_then(|options| options.clusters);
+        let configured = self
+            .ann_options
+            .as_ref()
+            .and_then(|options| options.clusters);
         let clusters = configured.unwrap_or_else(|| (n as f64).sqrt().round() as usize);
         clusters.clamp(1, n.max(1)).min(4096)
     }
 
-    /// Clusters probed per query: the configured override, else `ceil(sqrt(k))`.
-    fn ann_nprobe(&self, num_clusters: usize) -> usize {
+    /// Clusters probed by the current handle: a session override, durable
+    /// configuration, or `ceil(sqrt(k))`.
+    fn ann_nprobe_effective(&self, num_clusters: usize) -> usize {
+        let configured = self
+            .session_ann_nprobe
+            .or_else(|| self.ann_options.as_ref().and_then(|options| options.nprobe));
+        let nprobe = configured.unwrap_or_else(|| (num_clusters as f64).sqrt().ceil() as usize);
+        nprobe.clamp(1, num_clusters)
+    }
+
+    /// Clusters represented by the durable base layout and sidecars. Session
+    /// overrides are intentionally excluded so one handle cannot change what a
+    /// later handle inherits from disk.
+    fn ann_nprobe_durable(&self, num_clusters: usize) -> usize {
         let configured = self.ann_options.as_ref().and_then(|options| options.nprobe);
         let nprobe = configured.unwrap_or_else(|| (num_clusters as f64).sqrt().ceil() as usize);
         nprobe.clamp(1, num_clusters)
@@ -5612,15 +5722,25 @@ impl VectorOnlyIndex {
     /// is already bounded by its allowlist), and only when the config would prune.
     /// Centralized so lifting the unfiltered-only restriction is a one-site change.
     fn ann_should_prune(&self, filter: Option<&Value>) -> bool {
-        filter.is_none() && self.ann_prunes()
+        filter.is_none() && self.ann_prunes_effective()
     }
 
-    /// Whether ANN is enabled and would actually prune for the current corpus:
-    /// more than one cluster and fewer probes than clusters. This is derived from
-    /// config and corpus size with no cluster build, so the query and batch paths
-    /// can stay exact (and keep their optimized scans) for probe-all or too-small
-    /// configurations without paying to build a cluster index that goes unused.
-    fn ann_prunes(&self) -> bool {
+    /// Whether the durable ANN configuration would prune for the current corpus.
+    /// Base-layout and `.tvann` persistence use this form exclusively.
+    fn ann_prunes_durable(&self) -> bool {
+        self.ann_prunes_with(|clusters| self.ann_nprobe_durable(clusters))
+    }
+
+    /// Whether this handle's effective ANN configuration would prune for the
+    /// current corpus. Query paths use this form so their session override can
+    /// select the exact scan without constructing a cluster index.
+    fn ann_prunes_effective(&self) -> bool {
+        self.ann_prunes_with(|clusters| self.ann_nprobe_effective(clusters))
+    }
+
+    /// Evaluates the common corpus/config gate with either durable or effective
+    /// probe selection. It does not construct a cluster index.
+    fn ann_prunes_with(&self, nprobe_for_clusters: impl FnOnce(usize) -> usize) -> bool {
         if self.ann_options.is_none() {
             return false;
         }
@@ -5629,7 +5749,7 @@ impl VectorOnlyIndex {
             return false;
         }
         let clusters = self.ann_cluster_count(n);
-        clusters > 1 && self.ann_nprobe(clusters) < clusters
+        clusters > 1 && nprobe_for_clusters(clusters) < clusters
     }
 
     /// Live chunk (vector row) count in O(1): the chunk-owner map holds exactly one

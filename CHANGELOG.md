@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cluster-contiguous ANN layout and two-stage rescore.** ANN base builds place each cluster's
+  rows together for more effective SIMD block skipping. `rescore="original"` captures an
+  original-precision sidecar and re-ranks compact-scan candidates with exact fp32 dots; float16
+  sidecars use about 2 bytes per dimension per vector. `ann_nprobe` and `rescore_oversample` can
+  now be overridden for one reopened engine session without rebuilding or changing persisted state.
+
 ## [1.3.1] - 2026-07-08
 
 ### Added

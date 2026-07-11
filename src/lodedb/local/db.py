@@ -241,6 +241,9 @@ class LodeDB:
         ann: str | AnnOptions | None = None,
         ann_clusters: int | None = None,
         ann_nprobe: int | None = None,
+        rescore: str | RescoreOptions | None = None,
+        rescore_dtype: str | None = None,
+        rescore_oversample: float | None = None,
         compression: bool = True,
         read_only: bool = False,
         durability: str | None = None,
@@ -342,8 +345,23 @@ class LodeDB:
         bottleneck; small and mid-size corpora should keep the exact default. Like ``compression``,
         ``ann`` is a create-time choice: on reopen of an existing store the
         persisted config wins and these arguments are ignored, so an exact store
-        stays exact and an ANN store keeps its clustering (and tuning) regardless
-        of what a reopen passes.
+        stays exact and an ANN store keeps its clustering regardless of what a
+        reopen passes. ``ann_nprobe`` is the query-time exception: on reopen it
+        applies only to this engine session, is clamped to the current cluster
+        count at use, and is never written back. ``ann`` and ``ann_clusters``
+        remain persisted-config-wins choices.
+        ``rescore`` opts into two-stage search. At ingest it captures each original
+        vector in a sidecar (``float16`` by default, or ``float32``/``int8`` via
+        ``rescore_dtype``); at query time it re-scores the first-stage candidates
+        with fp32 dots from that sidecar. Re-scored candidate scores are exact,
+        although a restricted candidate set can still miss a true neighbor. Use
+        ``rescore="original"`` (or :class:`RescoreOptions`) at creation, with an
+        optional ``rescore_oversample`` candidate multiplier. Original vectors are
+        discarded when a non-rescore store first ingests data, so rescore cannot be
+        retro-enabled later: rebuild instead. On reopen, any supplied ``rescore``
+        mode and ``rescore_dtype`` must match the persisted sidecar; a supplied
+        ``rescore_oversample`` is an engine-lifetime session override and is never
+        persisted.
         ``compression`` controls whether the retained raw-text store (the
         ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
         ``True``; it has no effect when ``store_text=False``. The setting is
@@ -372,7 +390,40 @@ class LodeDB:
         self.index_text = self.store_text if index_text is None else bool(index_text)
         # Opt-in ANN config (None => exact scan). Validated here for a friendly
         # error; the native core is the authority and re-validates the algorithm.
-        self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)
+        self._requested_ann_nprobe = (
+            ann_nprobe
+            if ann_nprobe is not None
+            else ann.nprobe if isinstance(ann, AnnOptions) else None
+        )
+        # A bare nprobe is meaningful only while reopening an ANN store, where it
+        # becomes a session override. Defer that create-vs-reopen distinction to
+        # the native identity check below; all other loose ANN forms retain the
+        # ordinary resolver's friendly early error.
+        if ann is None and ann_clusters is None and ann_nprobe is not None:
+            if int(ann_nprobe) < 1:
+                raise ValueError("ann_nprobe must be a positive integer")
+            self.ann = None
+        else:
+            self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)
+        self._requested_rescore = rescore
+        self._requested_rescore_dtype = rescore_dtype
+        self._requested_rescore_oversample = (
+            rescore_oversample
+            if rescore_oversample is not None
+            else rescore.oversample if isinstance(rescore, RescoreOptions) else None
+        )
+        # Loose rescore settings without ``rescore=`` can be valid reopen
+        # requests: dtype verifies a durable sidecar and oversample changes this
+        # handle's candidate pool. A fresh store still rejects them before it
+        # creates an index.
+        if rescore is None and (rescore_dtype is not None or rescore_oversample is not None):
+            if rescore_oversample is not None:
+                _validate_rescore_oversample(rescore_oversample)
+            self.rescore = None
+        else:
+            self.rescore = _resolve_rescore_options(
+                rescore, rescore_dtype, rescore_oversample
+            )
         self.compression = bool(compression)
         self.read_only = bool(read_only)
         # The native core is the sole reader/writer for this handle. It is an
@@ -525,6 +576,7 @@ class LodeDB:
             provider=route_policy.provider,
             task=route_policy.task,
             ann=self.ann,
+            rescore=self.rescore,
         )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
@@ -1394,6 +1446,7 @@ class LodeDB:
         provider: str,
         task: str,
         ann: dict[str, Any] | None = None,
+        rescore: dict[str, Any] | None = None,
     ) -> None:
         """Opens the native core engine on a dedicated worker thread.
 
@@ -1425,6 +1478,7 @@ class LodeDB:
             vector_dim=self._vector_dim,
             bit_width=bit_width,
             ann=ann,
+            rescore=rescore,
         )
         read_only = self.read_only
 
@@ -1440,16 +1494,46 @@ class LodeDB:
                     # committed store on disk has an identity contradicting this
                     # handle (a missing index is an empty store and serves nothing).
                     _validate_native_index_identity(self.path, index_options)
+                    try:
+                        persisted_options = handle.index_options(_LOCAL_INDEX_ID)
+                    except Exception:
+                        return handle
+                    _validate_reopen_rescore_options(
+                        persisted_options.get("rescore"),
+                        self._requested_rescore,
+                        self._requested_rescore_dtype,
+                        self._requested_rescore_oversample,
+                    )
+                    _apply_session_overrides(
+                        handle,
+                        ann_nprobe=self._requested_ann_nprobe,
+                        rescore_oversample=self._requested_rescore_oversample,
+                    )
                     return handle
                 try:
                     handle.stats(_LOCAL_INDEX_ID)
-                except Exception:
+                except Exception as error:
                     # Fresh store: create the index and commit an initial generation
                     # so a root manifest exists on disk. In WAL mode the native
                     # recovery path only replays a `<key>.wal` that sits alongside a
                     # committed `<key>.commit.json`; without this seed commit, a
                     # crash before the first checkpoint would leave an orphan WAL the
                     # next open could not discover.
+                    if self._requested_ann_nprobe is not None and ann is None:
+                        raise ValueError(
+                            "ann_nprobe requires ann= when creating a store"
+                        ) from error
+                    if (
+                        self._requested_rescore is None
+                        and (
+                            self._requested_rescore_dtype is not None
+                            or self._requested_rescore_oversample is not None
+                        )
+                    ):
+                        raise ValueError(
+                            "rescore_dtype/rescore_oversample require rescore= "
+                            "when creating a store"
+                        ) from error
                     handle.create_index_with_options(index_options)
                     handle.persist()
                 else:
@@ -1458,6 +1542,18 @@ class LodeDB:
                     # mutating, so a reopen at a different model / dim / bit width
                     # fails fast.
                     _validate_native_index_identity(self.path, index_options)
+                    persisted_options = handle.index_options(_LOCAL_INDEX_ID)
+                    _validate_reopen_rescore_options(
+                        persisted_options.get("rescore"),
+                        self._requested_rescore,
+                        self._requested_rescore_dtype,
+                        self._requested_rescore_oversample,
+                    )
+                    _apply_session_overrides(
+                        handle,
+                        ann_nprobe=self._requested_ann_nprobe,
+                        rescore_oversample=self._requested_rescore_oversample,
+                    )
                 return handle
             except Exception:
                 # The engine is open on this worker. Close it (releasing the writer
@@ -1533,6 +1629,10 @@ class LodeDB:
             real_handle = executor.submit(_open).result()
         except Exception as exc:
             executor.shutdown(wait=True)
+            # Reopen option guards intentionally raise ValueError so callers can
+            # correct their arguments without having to unwrap init plumbing.
+            if isinstance(exc, ValueError):
+                raise
             if _is_writer_lock_contention(exc):
                 # Another process holds the native single-writer lock. Surface the
                 # SDK's stable single-writer error (LodeDB is single-writer per
@@ -2362,6 +2462,139 @@ def _resolve_ann_options(
     return options
 
 
+@dataclass(frozen=True)
+class RescoreOptions:
+    """Structured two-stage rescore tuning for a newly created index.
+
+    Pass to ``LodeDB(rescore=...)`` (or ``open_vector_store(rescore=...)``) as
+    an alternative to the loose ``rescore=``/``rescore_dtype=``/
+    ``rescore_oversample=`` keywords::
+
+        LodeDB(path, rescore=RescoreOptions(dtype="float32", oversample=4))
+
+    Rescore captures the original vector before TurboVec's compact encoding and
+    uses it to re-score the first-stage candidate pool. The core validates the
+    supported mode and exact dtype strings, keeping this type a small transport
+    object rather than a second validation authority.
+    """
+
+    mode: str = "original"
+    dtype: str | None = None
+    oversample: float | None = None
+
+    def to_core_dict(self) -> dict[str, Any]:
+        """Renders the native-core ``rescore`` option dict, omitting unset knobs."""
+
+        options: dict[str, Any] = {"mode": str(self.mode)}
+        if self.dtype is not None:
+            options["dtype"] = str(self.dtype)
+        if self.oversample is not None:
+            options["oversample"] = float(self.oversample)
+        return options
+
+
+def _validate_rescore_oversample(oversample: float) -> float:
+    """Checks the loose query candidate multiplier before crossing the FFI."""
+
+    value = float(oversample)
+    if not math.isfinite(value) or value < 1.0:
+        raise ValueError("rescore_oversample must be finite and at least 1.0")
+    return value
+
+
+def _resolve_rescore_options(
+    rescore: str | RescoreOptions | None,
+    dtype: str | None,
+    oversample: float | None,
+) -> dict[str, Any] | None:
+    """Builds the native-core ``rescore`` create payload, or ``None`` when off.
+
+    Structured values carry their own settings and defer value validation to the
+    core. The loose form requires ``rescore=`` so a new store cannot silently
+    discard requested originals; its numeric oversample gets a friendly boundary
+    check before native creation.
+    """
+
+    if isinstance(rescore, RescoreOptions):
+        if dtype is not None or oversample is not None:
+            raise ValueError(
+                "pass rescore tuning via RescoreOptions(...) or "
+                "rescore_dtype/rescore_oversample, not both"
+            )
+        return rescore.to_core_dict()
+    if rescore is None:
+        if dtype is not None or oversample is not None:
+            raise ValueError("rescore_dtype/rescore_oversample require rescore= to be set")
+        return None
+    options: dict[str, Any] = {"mode": str(rescore)}
+    if dtype is not None:
+        # Keep the native core as the single dtype authority. In particular, no
+        # fp16/fp32 aliases are accepted at this Python boundary.
+        options["dtype"] = str(dtype)
+    if oversample is not None:
+        options["oversample"] = _validate_rescore_oversample(oversample)
+    return options
+
+
+def _validate_reopen_rescore_options(
+    persisted: Mapping[str, Any] | None,
+    requested_rescore: str | RescoreOptions | None,
+    requested_dtype: str | None,
+    requested_oversample: float | None,
+) -> None:
+    """Enforces rescore's create-time identity on an existing native index."""
+
+    supplied = (
+        requested_rescore is not None
+        or requested_dtype is not None
+        or requested_oversample is not None
+    )
+    if persisted is None:
+        if supplied:
+            raise ValueError(
+                "this store was created without rescore; original vectors were discarded "
+                "at first ingest, so rescore cannot be retro-enabled. Rebuild the store "
+                "with rescore='original'."
+            )
+        return
+
+    expected_mode: str | None = None
+    expected_dtype = requested_dtype
+    if isinstance(requested_rescore, RescoreOptions):
+        expected_mode = str(requested_rescore.mode)
+        if requested_rescore.dtype is not None:
+            expected_dtype = str(requested_rescore.dtype)
+    elif requested_rescore is not None:
+        expected_mode = str(requested_rescore)
+    if expected_mode is not None and expected_mode != str(persisted.get("mode", "original")):
+        raise ValueError(
+            "rescore mode does not match the persisted store; rebuild the store to change it"
+        )
+    if expected_dtype is not None:
+        persisted_dtype = str(persisted.get("dtype") or "float16")
+        if str(expected_dtype) != persisted_dtype:
+            raise ValueError(
+                "rescore_dtype does not match the persisted store; rebuild the store to change it"
+            )
+
+
+def _apply_session_overrides(
+    handle: NativeCoreEngineHandle,
+    *,
+    ann_nprobe: int | None,
+    rescore_oversample: float | None,
+) -> None:
+    """Installs non-persistent query knobs after a successful existing-store open."""
+
+    if ann_nprobe is None and rescore_oversample is None:
+        return
+    handle.set_session_overrides(
+        _LOCAL_INDEX_ID,
+        ann_nprobe=ann_nprobe,
+        rescore_oversample=rescore_oversample,
+    )
+
+
 def _native_vector_index_options(
     *,
     index_id: str,
@@ -2376,6 +2609,7 @@ def _native_vector_index_options(
     vector_dim: int,
     bit_width: int,
     ann: dict[str, Any] | None = None,
+    rescore: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Builds the native-core index creation payload for the local vector store."""
 
@@ -2396,6 +2630,10 @@ def _native_vector_index_options(
     # state header) stays byte-for-byte unchanged for non-ANN indexes.
     if ann is not None:
         options["ann"] = ann
+    # Original-precision capture is also opt-in. Omitting it preserves the
+    # exact-only header shape for stores that do not need two-stage rescore.
+    if rescore is not None:
+        options["rescore"] = rescore
     return options
 
 

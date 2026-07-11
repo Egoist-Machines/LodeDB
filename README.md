@@ -337,6 +337,42 @@ db.search("turbine fault", k=5)                                 # nearest cluste
 `ann_clusters` (partitions) defaults to about `sqrt(n)` and `ann_nprobe` (clusters probed per
 query) to about `sqrt(clusters)`. ANN is a create-time choice persisted with the index and works
 for text and bring-your-own-vector indexes alike; keep the exact default for small-to-mid corpora.
+On reopen, `ann_nprobe` is a session-only override, so benchmark handles can change probe breadth
+without rebuilding; the algorithm and partition count remain the persisted configuration.
+
+For large corpora, these are useful starting ranges to measure, not recall or latency promises:
+
+| Knob | Useful range | Trade-off |
+| --- | --- | --- |
+| `ann_nprobe` | 64 to 256 clusters | More probes raise recall and scan work; probing every cluster is exact. |
+| `rescore_oversample` | 2 to 8 times `k` | More candidates improve the chance that fp32 re-ranking repairs compact-code errors, at more sidecar reads. |
+</details>
+
+<details>
+<summary><b>Two-stage rescore (`rescore="original"`)</b></summary>
+
+TurboVec's compact 4-bit scan is fast, but its quantized first-stage ranking can put close
+neighbors in the wrong order. Enable rescore at creation to retain each input vector in a separate
+original-precision sidecar, then re-score the first-stage candidate pool with fp32 dot products:
+
+```python
+db = LodeDB(
+    path="./data",
+    ann="cluster",
+    ann_clusters=1024,
+    rescore="original",
+    rescore_dtype="float16",      # default; about 2 bytes per dimension per vector
+    rescore_oversample=4,
+)
+```
+
+`float16` sidecars add about 2 bytes per dimension per vector (`float32` adds 4; `int8` adds 1).
+They let the final ordering rise above the practical 4-bit ranking ceiling while retaining the
+compact index for candidate generation. Re-scored candidate scores are exact fp32 dots, but the
+overall result can still be approximate when ANN or a too-small candidate pool excludes a true
+neighbor. Rescore is a create-time capture choice: originals are not recoverable after a normal
+store's first ingest, so enabling it later requires a rebuild. On a rescore-enabled reopen,
+`rescore_oversample` is a session-only override; mode and dtype must match the persisted sidecar.
 </details>
 
 ## Multimodal & bring-your-own vectors

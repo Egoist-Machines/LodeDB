@@ -132,6 +132,9 @@ low-latency single-process store; change them when the note applies.
 | `max_seq_length` | `256` | Token budget per document before truncation. | Raise for long documents whose tail carries meaning; lower to embed faster. |
 | `chunk_character_limit` | `900` | Characters before a document is split into chunks. | Raise to keep long documents as one chunk (fewer duplicate-id hits, see gotchas); lower for finer-grained retrieval. |
 | `ann` | `None` (exact scan) | `"cluster"` opts into IVF-style cluster pruning with exact re-score. Create-time only. | The corpus is large enough that the full exact scan is the query bottleneck. Small and mid-size corpora should stay exact. |
+| `ann_nprobe` | corpus-derived | Clusters probed by ANN. Persisted at creation; supplied on reopen it is a session-only override. | For large corpora, measure 64 to 256 as a starting range. More probes cost scan work; probe-all is exact. |
+| `rescore` | `None` | `"original"` captures source vectors for compact-scan candidates to be re-ranked by fp32 dots. Create-time only. | Close-result ordering is limited by 4-bit codes and the sidecar footprint is acceptable. `float16` costs about 2 bytes per dimension per vector. |
+| `rescore_oversample` | `4` | First-stage candidate multiplier for a rescore-enabled store. Supplied on reopen it is session-only. | For large corpora, measure 2 to 8. More candidates can improve final ordering and add sidecar read work. |
 | `commit_mode` | `"wal"` | `wal` (append per mutation, checkpoint periodically) / `generation` (publish an MVCC generation per commit). | Keep `wal` for low-latency single-process writes; use `generation` when lock-free readers must see every uncheckpointed write. |
 | `durability` | `"fast"` | `fast` (atomic rename) / `fsync` (fsync each file and directory on commit). | Use `fsync` when you need power-loss durability and can trade commit throughput. |
 | `compression` | `True` | zstd-compress the retained raw-text store. Create-time only. | Rarely; leave on unless you have measured a reason not to. |
@@ -139,6 +142,11 @@ low-latency single-process store; change them when the note applies.
 `store_text` and `index_text` are capability switches, not performance knobs: they decide whether
 `get`/`get_texts` and `mode="hybrid"`/`"lexical"` are available. See the constructor docstring for
 their exact semantics. The docstring is authoritative for the full argument list.
+
+Rescore does not make an ANN result globally exact: it makes the final scores and ordering exact
+among the candidates that survived the compact first stage. A store created without `rescore` has
+already discarded the original vectors at first ingest, so enabling it later requires rebuilding.
+Mode and dtype must match on reopen; only the candidate multiplier is an engine-lifetime override.
 
 ## Model aliases
 
