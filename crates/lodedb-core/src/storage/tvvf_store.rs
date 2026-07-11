@@ -1,12 +1,14 @@
 //! Original-precision vector sidecar with positional row reads.
 //!
 //! Unlike the other sidecars, this module intentionally retains only ID indexes
-//! in RAM and reads candidate payloads by absolute file offset.
+//! and one open file handle per segment in RAM, then reads candidate payloads by
+//! absolute file offset. The retained handles keep a reader's committed snapshot
+//! readable when a later writer collects its unlinked epoch.
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::generation_dir;
 use crate::storage::util::{
-    f16_bits_to_f32, f32_to_f16_bits, fnv1a64, fnv1a64_update, py_canonical_json, sha256_file_hex,
+    f16_bits_to_f32, f32_to_f16_bits, fnv1a64, fnv1a64_update, py_canonical_json,
     write_pretty_json_atomic,
 };
 use rayon::prelude::*;
@@ -18,6 +20,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub const TVVF_SCHEMA_VERSION: u64 = 1;
 pub const TVVF_BASE_MAGIC: &[u8; 8] = b"EEVFB001";
@@ -393,15 +396,12 @@ pub(crate) fn load_latest_delta_segment(
         .ok_or_else(|| corrupt("tvvf delta entry is missing sha256"))?;
     let base = base_path(dir, index_key, vf_epoch);
     let path = delta_dir(&base).join(name);
-    if sha256_file_hex(&path).map_err(core_error)? != expected {
-        return Err(corrupt(format!(
-            "tvvf delta segment failed checksum: {name}"
-        )));
-    }
     Ok(TvvfDeltaSegment {
         sequence,
         name: name.to_string(),
-        index: read_index(&path, TVVF_DELTA_MAGIC, true)?,
+        // Open before validating so the attached segment and every byte checked
+        // below are from one inode even if a later epoch GC unlinks the pathname.
+        index: read_index(&path, TVVF_DELTA_MAGIC, true, Some(expected))?,
     })
 }
 
@@ -497,7 +497,7 @@ impl TvvfReader {
         let root = dir.as_ref();
         let (index_key, vf_epoch) = validate_manifest_identity(manifest, "", 0)?;
         let base_file = base_path(root, &index_key, vf_epoch);
-        let base = read_index(&base_file, TVVF_BASE_MAGIC, false)?;
+        let base = read_index(&base_file, TVVF_BASE_MAGIC, false, None)?;
         validate_manifest_base(manifest, &base_file, &base)?;
         let mut previous = None;
         let mut deltas = Vec::new();
@@ -526,12 +526,10 @@ impl TvvfReader {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| corrupt("tvvf delta entry is missing sha256"))?;
             let path = delta_dir(&base_file).join(name);
-            if sha256_file_hex(&path).map_err(core_error)? != expected {
-                return Err(corrupt(format!(
-                    "tvvf delta segment failed checksum: {name}"
-                )));
-            }
-            let segment = read_index(&path, TVVF_DELTA_MAGIC, true)?;
+            // read_index opens first, then validates its checksum, header, and
+            // identifiers through the retained descriptor. This makes an open
+            // reader immune to a concurrent GC unlink after the open succeeds.
+            let segment = read_index(&path, TVVF_DELTA_MAGIC, true, Some(expected))?;
             validate_delta_segment(&segment, &base, name)?;
             deltas.push(segment);
         }
@@ -699,9 +697,10 @@ impl TvvfReader {
         rows: &[(usize, Vec<usize>)],
         runs: &[std::ops::Range<usize>],
     ) -> Vec<(usize, Option<Vec<f32>>)> {
-        // Each Rayon task opens an independent handle because Windows
-        // positional reads move the file cursor.
-        let Ok(file) = File::open(&segment.path) else {
+        // Each Rayon task clones the reader-held handle because Windows positional
+        // reads move the file cursor. The held handle preserves this snapshot's
+        // segment after a later epoch GC unlinks its path on Unix.
+        let Ok(file) = segment.file.try_clone() else {
             self.corrupt_rows_seen.fetch_add(
                 runs.iter().map(|run| run.len() as u64).sum::<u64>(),
                 Ordering::Relaxed,
@@ -769,6 +768,9 @@ impl TvvfReader {
 #[derive(Debug, Clone)]
 struct SegmentIndex {
     path: PathBuf,
+    /// Kept for the lifetime of the reader so epoch GC cannot invalidate an open
+    /// snapshot's positional reads after unlinking this segment on Unix.
+    file: Arc<File>,
     dtype: TvvfDtype,
     dim: usize,
     row_stride: usize,
@@ -1206,6 +1208,10 @@ fn validate_manifest_base(manifest: &Value, path: &Path, base: &SegmentIndex) ->
 
 fn read_header(path: &Path, magic: &[u8; 8], delta: bool) -> TvvfResult<Header> {
     let file = File::open(path)?;
+    read_header_from_file(&file, magic, delta)
+}
+
+fn read_header_from_file(file: &File, magic: &[u8; 8], delta: bool) -> TvvfResult<Header> {
     let length = file.metadata()?.len();
     let mut prefix = [0; 16];
     read_exact_at(&file, &mut prefix, 0)
@@ -1309,9 +1315,32 @@ fn read_header(path: &Path, magic: &[u8; 8], delta: bool) -> TvvfResult<Header> 
     })
 }
 
-fn read_index(path: &Path, magic: &[u8; 8], delta: bool) -> TvvfResult<SegmentIndex> {
-    let header = read_header(path, magic, delta)?;
-    let file = File::open(path)?;
+fn read_index(
+    path: &Path,
+    magic: &[u8; 8],
+    delta: bool,
+    expected_sha256: Option<&str>,
+) -> TvvfResult<SegmentIndex> {
+    let file = Arc::new(File::open(path)?);
+    read_index_from_file(path, file, magic, delta, expected_sha256)
+}
+
+fn read_index_from_file(
+    path: &Path,
+    file: Arc<File>,
+    magic: &[u8; 8],
+    delta: bool,
+    expected_sha256: Option<&str>,
+) -> TvvfResult<SegmentIndex> {
+    if let Some(expected) = expected_sha256 {
+        if sha256_file_hex_from_file(&file)? != expected {
+            return Err(corrupt(format!(
+                "tvvf delta segment failed checksum: {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+    }
+    let header = read_header_from_file(&file, magic, delta)?;
     let mut ids = Vec::with_capacity(header.row_count);
     let mut hash = 0xcbf2_9ce4_8422_2325;
     let mut offset = header.ids_offset;
@@ -1350,6 +1379,7 @@ fn read_index(path: &Path, magic: &[u8; 8], delta: bool) -> TvvfResult<SegmentIn
     }
     Ok(SegmentIndex {
         path: path.to_path_buf(),
+        file,
         dtype: header.dtype,
         dim: header.dim,
         row_stride: header.row_stride,
@@ -1503,6 +1533,24 @@ fn json_object<'a>(value: &'a Value, context: &str) -> TvvfResult<&'a Map<String
 
 fn core_error(error: CoreError) -> TvvfError {
     corrupt(error.message())
+}
+
+/// Hashes a descriptor rather than reopening its pathname. The caller retains the
+/// descriptor for the reader's lifetime, so validation and later serving always
+/// refer to the same file even if epoch GC unlinks the name on Unix.
+fn sha256_file_hex_from_file(file: &File) -> io::Result<String> {
+    let mut copy = file.try_clone()?;
+    copy.seek(SeekFrom::Start(0))?;
+    let mut sha = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = copy.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", sha.finalize()))
 }
 
 fn corrupt(message: impl Into<String>) -> TvvfError {
@@ -1664,6 +1712,66 @@ mod tests {
             ]
         );
         assert_eq!(reader.coverage(), (3, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_fetches_base_and_delta_after_their_paths_are_unlinked() {
+        let dir = temp_dir("unlinked_snapshot");
+        let base = vec![(1, vec![1.0, 1.0]), (2, vec![2.0, 2.0])];
+        record_base(
+            &dir,
+            "index",
+            0,
+            TvvfDtype::Float32,
+            2,
+            &borrowed(&base),
+        )
+        .unwrap();
+        let updates = vec![(2, vec![20.0, 20.0]), (3, vec![3.0, 3.0])];
+        let manifest = append_delta(&dir, "index", 0, &borrowed(&updates), &[]).unwrap();
+        let delta_name = manifest["deltas"][0]["file_name"]
+            .as_str()
+            .expect("delta file name");
+        let delta_checksum = manifest["deltas"][0]["sha256"]
+            .as_str()
+            .expect("delta checksum")
+            .to_string();
+        let reader = TvvfReader::open(&dir, &manifest).unwrap();
+
+        let base_path = base_path(&dir, "index", 0);
+        // Retain handles before unlinking, then run the same validation helper
+        // TvvfReader::open and the incremental attach path use. This proves the
+        // header, checksum, and ID validation never reopens the vanished name.
+        let held_base = Arc::new(File::open(&base_path).unwrap());
+        let delta_path = delta_dir(&base_path).join(delta_name);
+        let held_delta = Arc::new(File::open(&delta_path).unwrap());
+        fs::remove_file(&base_path).unwrap();
+        fs::remove_file(&delta_path).unwrap();
+
+        let validated_base =
+            read_index_from_file(&base_path, held_base, TVVF_BASE_MAGIC, false, None).unwrap();
+        let validated_delta = read_index_from_file(
+            &delta_path,
+            held_delta,
+            TVVF_DELTA_MAGIC,
+            true,
+            Some(&delta_checksum),
+        )
+        .unwrap();
+        assert_eq!(validated_base.ids, vec![1, 2]);
+        assert_eq!(validated_delta.ids, vec![2, 3]);
+
+        assert_eq!(
+            reader.fetch_rows(&[1, 2, 3]),
+            vec![
+                Some(vec![1.0, 1.0]),
+                Some(vec![20.0, 20.0]),
+                Some(vec![3.0, 3.0]),
+            ]
+        );
+        drop(reader);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

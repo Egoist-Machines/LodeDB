@@ -5105,6 +5105,86 @@ fn rescore_fold_keeps_live_and_previous_vf_epochs() {
 }
 
 #[test]
+fn readonly_rescore_snapshot_survives_tvvf_epoch_gc_until_refresh() {
+    let path = unique_temp_dir("rescore_snapshot_gc");
+    let (mut documents, query) = rescore_boundary_docs();
+    let snapshot_documents = documents.clone();
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .create_index_with_options(rescore_options_with_oversample("float32", Some(16.0)))
+        .unwrap();
+    writer.upsert_vectors("default", &documents).unwrap();
+    writer.persist().unwrap();
+
+    // Opening the read-only handle indexes epoch one and retains every segment
+    // handle. Do not refresh it while the writer advances two folded epochs.
+    let mut reader =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    for cycle in 1..=2 {
+        let updates = (0..4)
+            .map(|index| {
+                let id = documents[index].document_id.clone();
+                let updated = rescore_vector(&id, cycle as f32 * 0.1 + index as f32 * 0.01);
+                documents[index].vector = updated.vector;
+                documents[index].clone()
+            })
+            .collect::<Vec<_>>();
+        writer.upsert_vectors("default", &updates).unwrap();
+        writer.persist().unwrap();
+    }
+
+    #[cfg(unix)]
+    assert!(
+        !lodedb_core::storage::tvvf_base_path(&path, "default", 1).exists(),
+        "the second published fold must unlink the reader's old epoch on Unix"
+    );
+
+    let snapshot = reader
+        .query_vector("default", &query, snapshot_documents.len(), None)
+        .unwrap();
+    let expected_snapshot = exact_fp32_hits(
+        &snapshot_documents,
+        &query,
+        None,
+        snapshot_documents.len(),
+    );
+    assert_eq!(
+        snapshot
+            .hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected_snapshot
+            .iter()
+            .map(|(id, score)| (id.clone(), score.to_bits()))
+            .collect::<Vec<_>>(),
+        "an unrefreshed reader must keep exact scores from its old sidecar epoch"
+    );
+
+    reader.refresh().unwrap();
+    let refreshed = reader
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    let expected_refreshed = exact_fp32_hits(&documents, &query, None, documents.len());
+    assert_eq!(
+        refreshed
+            .hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected_refreshed
+            .iter()
+            .map(|(id, score)| (id.clone(), score.to_bits()))
+            .collect::<Vec<_>>(),
+        "refresh must switch the reader to the newly published sidecar epoch"
+    );
+
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn rescore_wal_replay_captures_caller_originals() {
     let path = unique_temp_dir("rescore_wal");
     {

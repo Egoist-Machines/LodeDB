@@ -4181,7 +4181,6 @@ fn flush_tvvf(
         .iter()
         .map(|(stable_id, bytes)| (*stable_id, bytes.as_slice()))
         .collect::<Vec<_>>();
-    let mut folded = None;
     let mut manifest = match index.tvvf_manifest.as_ref() {
         Some(previous) => {
             let vf_epoch = previous
@@ -4264,11 +4263,7 @@ fn flush_tvvf(
         manifest = crate::storage::fold_with_fsync(dir, &index.index_key, vf_epoch, fsync)
             .map_err(tvvf_error)?;
         let reader = crate::storage::TvvfReader::open(dir, &manifest).map_err(tvvf_error)?;
-        folded = Some(reader.vf_epoch());
         *index.tvvf_reader.get_mut() = Some(reader);
-    }
-    if let Some(vf_epoch) = folded {
-        gc_tvvf_epochs(dir, &index.index_key, vf_epoch);
     }
     index.tvvf_manifest = Some(manifest.clone());
     Ok(Some(manifest))
@@ -4321,10 +4316,24 @@ fn tvvf_should_fold(manifest: &Value, reader: Option<&crate::storage::TvvfReader
 }
 
 /// tvvf epochs do not share the state-generation lifecycle: a `.tvim` base
-/// rewrite must never sweep this only copy of original precision. Keep the live
-/// folded epoch and its immediate predecessor for recovery, then remove older
-/// independent tvvf epochs.
-fn gc_tvvf_epochs(dir: &Path, index_key: &str, live_epoch: u64) {
+/// rewrite must never sweep this only copy of original precision. Read the
+/// durable root after its swap, keep its live epoch and immediate predecessor for
+/// recovery, then remove only strictly older independent tvvf epochs. A failed
+/// unlink retains the whole epoch for a later GC pass, which keeps Windows open
+/// handles non-fatal and Unix snapshot readers safe through their held handles.
+fn gc_tvvf_epochs(dir: &Path, index_key: &str) {
+    let Ok(Some(root)) = crate::storage::commit_manifest::read_commit_manifest(
+        &crate::storage::commit_manifest::commit_manifest_path(dir, index_key),
+    ) else {
+        return;
+    };
+    let Some(live_epoch) = root
+        .store_manifest("tvvf")
+        .and_then(|manifest| manifest.get("vf_epoch"))
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
     let generation_dir = crate::storage::commit_manifest::generation_dir(dir, index_key);
     let Ok(entries) = fs::read_dir(&generation_dir) else {
         return;
@@ -4334,7 +4343,13 @@ fn gc_tvvf_epochs(dir: &Path, index_key: &str, live_epoch: u64) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(epoch) = name
+        // A prior pass can unlink the base but leave its delta directory behind.
+        // Recognize either entry so that orphaned directories get another cleanup
+        // attempt instead of disappearing from the GC scan with the base file.
+        let sidecar_name = name
+            .strip_suffix(crate::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX)
+            .unwrap_or(name);
+        let Some(epoch) = sidecar_name
             .strip_prefix("vf")
             .and_then(|name| name.strip_suffix(".tvvf"))
             .and_then(|epoch| epoch.parse::<u64>().ok())
@@ -4345,7 +4360,15 @@ fn gc_tvvf_epochs(dir: &Path, index_key: &str, live_epoch: u64) {
             continue;
         }
         let base = crate::storage::tvvf_base_path(dir, index_key, epoch);
-        let _ = fs::remove_file(&base);
+        // Windows rejects an unlink while a read-only snapshot still holds the
+        // segment. Retain both the base and its deltas in that case, then retry on
+        // a later successful post-commit GC. A missing base has already been
+        // collected, so its delta directory is still eligible for cleanup.
+        match fs::remove_file(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
         let _ = fs::remove_dir_all(base.with_file_name(format!(
             "{}{}",
             base.file_name().unwrap_or_default().to_string_lossy(),
@@ -4439,6 +4462,10 @@ fn write_index_base(
             retained_epochs: 4,
         },
     )?;
+    // The root swap above is the only publication point. Deriving retention from
+    // it rather than this invocation's fold result also collects old epochs when
+    // a failed folded attempt is later published by a small delta retry.
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
@@ -4460,6 +4487,7 @@ fn write_index_watermark(
         index.applied_lsn.max(generation),
         fsync,
     )?;
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
@@ -4553,6 +4581,9 @@ fn write_index_delta(
         },
         fsync,
     )?;
+    // See write_index_base: this is deliberately unconditional after a root
+    // publication and becomes a cheap no-op for indexes without a tvvf manifest.
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
@@ -6465,6 +6496,244 @@ fn invalid_err(message: impl Into<String>) -> CoreError {
 
 fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::new(CoreErrorCode::Internal, error.to_string())
+}
+
+#[cfg(test)]
+mod tvvf_gc_tests {
+    use super::{flush_tvvf, gc_tvvf_epochs, CoreEngine};
+    use crate::storage;
+    use crate::storage::commit_manifest::{
+        build_commit_body, commit_manifest_path, generation_dir, write_commit_manifest,
+        CommitBodyInput,
+    };
+    use crate::types::{
+        CoreIndexCreateOptions, CoreMetadata, CoreOpenOptions, CoreRescoreOptions,
+        CoreVectorDocument,
+    };
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lodedb-tvvf-gc-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn publish_tvvf_root(dir: &Path, manifest: Value) {
+        let body = build_commit_body(CommitBodyInput {
+            index_key: "index",
+            generation: 1,
+            applied_lsn: 1,
+            base_epoch: 1,
+            native_dim: Some(8),
+            document_count: 0,
+            chunk_count: 0,
+            json_manifest: None,
+            tvim_manifest: None,
+            tvtext_manifest: None,
+            tvlex_manifest: None,
+            tvmv_manifest: None,
+            tvann_manifest: None,
+            tvvf_manifest: Some(manifest),
+        });
+        write_commit_manifest(&commit_manifest_path(dir, "index"), &body, false)
+            .expect("publish durable root");
+    }
+
+    fn open_options(dir: &Path) -> CoreOpenOptions {
+        CoreOpenOptions {
+            path: dir.to_string_lossy().to_string(),
+            read_only: false,
+            durability: "relaxed".to_string(),
+            commit_mode: "generation".to_string(),
+            store_text: false,
+            index_text: false,
+            compress_text: true,
+            chunk_character_limit: 900,
+            acquire_writer_lock: false,
+        }
+    }
+
+    fn rescore_options() -> CoreIndexCreateOptions {
+        let mut options = CoreIndexCreateOptions::native_default("index", 8, 4);
+        options.rescore = Some(CoreRescoreOptions {
+            mode: CoreRescoreOptions::ORIGINAL.to_string(),
+            dtype: Some("float32".to_string()),
+            oversample: None,
+        });
+        options
+    }
+
+    fn vector(id: &str, offset: f32) -> CoreVectorDocument {
+        CoreVectorDocument {
+            document_id: id.to_string(),
+            vector: vec![
+                0.113 + offset,
+                -0.237 + offset * 0.5,
+                0.419 - offset * 0.25,
+                -0.571 + offset * 0.125,
+                0.683 - offset * 0.0625,
+                -0.797 + offset * 0.03125,
+                0.887 - offset * 0.015625,
+                -0.941 + offset * 0.0078125,
+            ],
+            metadata: CoreMetadata::new(),
+            text: None,
+            patch_matrix: None,
+        }
+    }
+
+    #[test]
+    fn gc_keeps_durable_root_epoch_when_unpublished_folds_advance() {
+        let dir = temp_dir("unpublished-folds");
+        let row = [1.0_f32; 8];
+        let manifest = storage::record_tvvf_base(
+            &dir,
+            "index",
+            1,
+            "float32",
+            8,
+            &[(7, row.as_slice())],
+        )
+        .expect("record epoch one");
+        publish_tvvf_root(&dir, manifest);
+
+        // Simulate two retries after the root-manifest write failed: both folds
+        // exist on disk, but the only durable root still references epoch one.
+        storage::fold(&dir, "index", 1).expect("unpublished epoch two");
+        storage::fold(&dir, "index", 2).expect("unpublished epoch three");
+        gc_tvvf_epochs(&dir, "index");
+
+        for epoch in 1..=3 {
+            assert!(
+                storage::tvvf_base_path(&dir, "index", epoch).exists(),
+                "GC must retain epoch {epoch} until a root publishes a newer epoch"
+            );
+        }
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn gc_retains_an_epoch_when_unlink_fails() {
+        let dir = temp_dir("unlink-failure");
+        fs::create_dir_all(generation_dir(&dir, "index"))
+            .expect("create generation directory");
+        publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
+        let retained = storage::tvvf_base_path(&dir, "index", 1);
+        // A directory at the base-file path makes remove_file fail on every
+        // platform, exercising the same retain-and-retry branch as a Windows
+        // sharing violation without making this test platform-specific.
+        fs::create_dir_all(&retained).expect("create unlink-resistant entry");
+
+        gc_tvvf_epochs(&dir, "index");
+
+        assert!(retained.is_dir(), "failed unlink must retain the epoch");
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn gc_removes_orphaned_delta_dir_when_the_base_is_already_missing() {
+        let dir = temp_dir("orphan-delta-dir");
+        fs::create_dir_all(generation_dir(&dir, "index"))
+            .expect("create generation directory");
+        publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
+        let orphan_base = storage::tvvf_base_path(&dir, "index", 1);
+        let orphan_delta = orphan_base.with_file_name(format!(
+            "{}{}",
+            orphan_base.file_name().unwrap_or_default().to_string_lossy(),
+            storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+        ));
+        fs::create_dir_all(&orphan_delta).expect("create orphan delta directory");
+        fs::write(orphan_delta.join("orphan.tvfd"), b"orphan")
+            .expect("write orphan delta segment");
+
+        gc_tvvf_epochs(&dir, "index");
+
+        assert!(
+            !orphan_delta.exists(),
+            "an old delta directory must be removed even when its base is gone"
+        );
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn small_delta_retry_collects_old_epochs_after_an_unpublished_fold() {
+        let dir = temp_dir("small-delta-retry");
+        let mut engine = CoreEngine::open(open_options(&dir)).expect("open engine");
+        engine
+            .create_index_with_options(rescore_options())
+            .expect("create rescore index");
+        let initial = (0..8)
+            .map(|row| vector(&format!("doc-{row}"), row as f32 * 0.01))
+            .collect::<Vec<_>>();
+        engine
+            .upsert_vectors("index", &initial)
+            .expect("seed vectors");
+        engine.persist().expect("publish epoch one");
+
+        // Epoch zero is an old sidecar that must be collected after the retry
+        // publishes epoch two. It is deliberately not referenced by the root.
+        let orphan_row = [1.0_f32; 8];
+        storage::record_tvvf_base(
+            &dir,
+            "index",
+            0,
+            "float32",
+            8,
+            &[(99, orphan_row.as_slice())],
+        )
+        .expect("record old epoch");
+
+        // Simulate a failed persist after flush_tvvf folded epoch one into epoch
+        // two, but before write_generation_delta swapped the root manifest.
+        engine
+            .upsert_vectors("index", &[vector("doc-0", 0.2), vector("doc-1", 0.3)])
+            .expect("prepare folding mutation");
+        {
+            let index = engine.indexes.get_mut("index").expect("live index");
+            let generation = index.generation;
+            let manifest = flush_tvvf(index, &dir, false, generation)
+                .expect("prepare unpublished fold")
+                .expect("tvvf manifest");
+            assert_eq!(manifest["vf_epoch"], 2);
+            index.pending_rescore_upserts.clear();
+            index.pending_removed_stable_ids.clear();
+        }
+
+        // The retry has only one new sidecar row, so it attaches a delta to epoch
+        // two and publishes it without another fold. GC must still run after this
+        // successful root swap and discard only epochs older than its predecessor.
+        engine
+            .upsert_vectors("index", &[vector("doc-2", 0.4)])
+            .expect("prepare small retry delta");
+        engine.persist().expect("publish small retry delta");
+
+        let root = storage::commit_manifest::read_commit_manifest(
+            &storage::commit_manifest::commit_manifest_path(&dir, "index"),
+        )
+        .expect("read root")
+        .expect("published root");
+        let manifest = root.store_manifest("tvvf").expect("tvvf root entry");
+        assert_eq!(manifest["vf_epoch"], 2);
+        assert_eq!(manifest["deltas"].as_array().map(Vec::len), Some(1));
+        assert!(
+            !storage::tvvf_base_path(&dir, "index", 0).exists(),
+            "old epoch must be collected on the non-folding retry publication"
+        );
+        assert!(storage::tvvf_base_path(&dir, "index", 1).exists());
+        assert!(storage::tvvf_base_path(&dir, "index", 2).exists());
+
+        drop(engine);
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
 }
 
 // Unix-only: it asserts that two shared holds coexist, which is the true `flock`
