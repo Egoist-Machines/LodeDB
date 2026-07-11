@@ -26,6 +26,11 @@ STORES: dict[str, dict[str, Any]] = {
         "requires_engine": True,
     },
     "ann1000": {"ann_clusters": 1000, "ann_nprobe": 16},
+    # Reuses the store directory built before the cluster-contiguous layout
+    # change (same create parameters as ann1000). Serving it isolates the
+    # physical-layout effect: identical engine, clustering, and codes, but
+    # insertion-ordered rows.
+    "ann1000_np16": {"ann_clusters": 1000, "ann_nprobe": 16},
     "ann4096": {"ann_clusters": 4096, "ann_nprobe": 64},
     "ann4096_rs_fp16": {
         "ann_clusters": 4096,
@@ -85,6 +90,29 @@ SERVE_CONFIGS: list[dict[str, Any]] = [
     {
         "label": "ann1000_np128",
         "store": "ann1000",
+        "serve_overrides": {"ann_nprobe": 128},
+        "requires_engine": True,
+    },
+    {
+        "label": "prechange_layout_np16",
+        "store": "ann1000_np16",
+        "serve_overrides": {},
+    },
+    {
+        "label": "prechange_layout_np32",
+        "store": "ann1000_np16",
+        "serve_overrides": {"ann_nprobe": 32},
+        "requires_engine": True,
+    },
+    {
+        "label": "prechange_layout_np64",
+        "store": "ann1000_np16",
+        "serve_overrides": {"ann_nprobe": 64},
+        "requires_engine": True,
+    },
+    {
+        "label": "prechange_layout_np128",
+        "store": "ann1000_np16",
         "serve_overrides": {"ann_nprobe": 128},
         "requires_engine": True,
     },
