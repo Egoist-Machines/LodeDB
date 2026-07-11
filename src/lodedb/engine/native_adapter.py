@@ -938,6 +938,16 @@ class NativeCoreEngineHandle:
     def persist(self) -> None:
         self._engine.persist()
 
+    def ann_warm(self, index_id: str) -> bool:
+        """Builds an index's ANN cluster cache without issuing a query."""
+
+        return bool(self._engine.ann_warm(str(index_id)))
+
+    def compact(self, index_id: str) -> None:
+        """Schedules a full base rewrite for the next native persist."""
+
+        self._engine.compact(str(index_id))
+
     def refresh(self) -> None:
         self._engine.refresh()
 

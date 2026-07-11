@@ -1243,6 +1243,23 @@ impl PyCoreEngine {
         self.inner.persist().map_err(native_core_error_to_py)
     }
 
+    /// Builds this index's ANN cluster cache without issuing a query. Returns
+    /// whether an ANN cluster index is resident after warming.
+    fn ann_warm(&self, index_id: &str) -> PyResult<bool> {
+        self.inner
+            .ann_warm(index_id)
+            .map_err(native_core_error_to_py)
+    }
+
+    /// Schedules a full base rewrite for the next `persist`; does not persist by
+    /// itself. The public Python `LodeDB.compact()` operator combines warming,
+    /// scheduling, and persistence in one call.
+    fn compact(&mut self, index_id: &str) -> PyResult<()> {
+        self.inner
+            .compact(index_id)
+            .map_err(native_core_error_to_py)
+    }
+
     fn refresh(&mut self) -> PyResult<()> {
         self.inner.refresh().map_err(native_core_error_to_py)
     }
@@ -1261,6 +1278,24 @@ impl PyCoreEngine {
 #[pyfunction]
 fn native_core_version() -> &'static str {
     lodedb_core::CORE_VERSION
+}
+
+#[pyfunction]
+/// Returns the process-global count of SIMD blocks skipped by the mask path.
+///
+/// This counter is intended for benchmarking. Sample it before and after a
+/// workload because searches from every thread in this process contribute.
+fn blocks_skipped_by_mask() -> u64 {
+    turbovec_core::search::blocks_skipped_by_mask()
+}
+
+#[pyfunction]
+/// Resets the process-global SIMD mask block-skip counter used for benchmarking.
+///
+/// This affects every thread in the current process, so do not use it as a
+/// per-request production metric.
+fn reset_blocks_skipped_by_mask() {
+    turbovec_core::search::reset_blocks_skipped_by_mask();
 }
 
 #[pyfunction]
@@ -1490,6 +1525,8 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCoreEngine>()?;
     m.add_class::<PyCoreAppender>()?;
     m.add_class::<PyCoreCheckpointer>()?;
+    m.add_function(wrap_pyfunction!(blocks_skipped_by_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_blocks_skipped_by_mask, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;
     m.add_function(wrap_pyfunction!(storage_schema_version, m)?)?;

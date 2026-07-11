@@ -107,6 +107,15 @@ Added for LodeDB's late-interaction retrieval (multi-vector / MaxSim, issue #25)
 This is purely additive (a new module + one exported function + one binding); it
 does not touch the quantized index, its storage format, or any existing API.
 
+## Mask block-skip benchmark counter
+
+- `turbovec/src/search.rs` already exposes the process-global
+  `blocks_skipped_by_mask` counter and reset helper used by the filtering tests.
+- `turbovec-python/src/lib.rs` registers both as module-level
+  `blocks_skipped_by_mask()` and `reset_blocks_skipped_by_mask()` functions for
+  benchmark harnesses. No Rust visibility change was needed because the search
+  helpers are already public.
+
 ## Native-core packaging bridge
 
 Added while LodeDB migrates toward a shared Rust engine:

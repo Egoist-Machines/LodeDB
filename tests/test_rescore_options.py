@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 import lodedb
 from lodedb import AnnOptions, RescoreOptions
 from lodedb.local.db import _native_vector_index_options, _resolve_rescore_options
+from lodedb.local.doctor import native_store_findings
 
 
 def _boundary_vectors() -> tuple[list[tuple[str, list[float]]], list[float]]:
@@ -210,3 +212,124 @@ def test_reopen_ann_nprobe_override_can_probe_all_clusters(tmp_path) -> None:
         assert actual_ids == expected_ids
     finally:
         structured.close()
+
+
+def test_compact_and_stats_expose_ann_rescore_and_mask_skips(tmp_path) -> None:
+    """The deployment compact operator persists warmed ANN and rescore state."""
+
+    from lodedb import _turbovec
+
+    store = tmp_path / "compact"
+    db = lodedb.LodeDB.open_vector_store(
+        store,
+        vector_dim=8,
+        ann="cluster",
+        ann_clusters=4,
+        ann_nprobe=1,
+        rescore="original",
+        rescore_dtype="float32",
+        rescore_oversample=4,
+    )
+    vectors: list[dict[str, object]] = []
+    for cluster, axis in enumerate((0, 2, 4, 6)):
+        for row in range(32):
+            vector = [0.0] * 8
+            vector[axis] = 1.0
+            vector[(axis + 1) % 8] = (row + 1) * 0.001
+            vectors.append({"id": f"c{cluster}-{row}", "vector": vector})
+    db.add_vectors_many(vectors, normalize=False)
+    try:
+        before = db.search_by_vector([1.0] + [0.0] * 7, k=5, normalize=False)
+        outcome = db.compact()
+        assert outcome == {"ann_warmed": True, "base_rewritten": True}
+
+        stats = db.stats()
+        assert stats["rescore"]["dtype"] == "float32"
+        assert stats["rescore"]["sidecar_rows"] == len(vectors)
+        assert stats["rescore"]["pending_rows"] == 0
+        assert stats["ann"] == {
+            "clusters": 4,
+            "nprobe_effective": 1,
+            "cluster_resident": True,
+        }
+
+        _turbovec.reset_blocks_skipped_by_mask()
+        skips_before = _turbovec.blocks_skipped_by_mask()
+        after = db.search_by_vector([1.0] + [0.0] * 7, k=5, normalize=False)
+        skips_after = _turbovec.blocks_skipped_by_mask()
+        assert skips_after >= skips_before
+        assert skips_after > 0
+        assert [(hit.id, hit.score) for hit in after] == [
+            (hit.id, hit.score) for hit in before
+        ]
+    finally:
+        db.close()
+
+
+def test_doctor_reports_a_corrupt_tvvf_without_removing_it(tmp_path) -> None:
+    """TVVF corruption is a doctor finding and leaves the base vector store openable."""
+
+    store = tmp_path / "doctor"
+    db = lodedb.LodeDB.open_vector_store(
+        store, vector_dim=8, rescore="original", rescore_dtype="float32"
+    )
+    db.add_vectors([1.0] + [0.0] * 7, id="one", normalize=False)
+    db.persist()
+    db.close()
+
+    commit_path = next(store.glob("*.commit.json"))
+    commit = json.loads(commit_path.read_text(encoding="utf-8"))
+    body = commit["body"]
+    index_key = body["index_key"]
+    vf_epoch = body["tvvf"]["vf_epoch"]
+    sidecar = store / f"{index_key}.gen" / f"vf{vf_epoch}.tvvf"
+    corrupted = bytearray(sidecar.read_bytes())
+    corrupted[-1] ^= 0xFF
+    sidecar.write_bytes(corrupted)
+
+    findings = native_store_findings(store)
+    finding = next(item for item in findings if item["name"] == "tvvf_sidecar")
+    assert finding["status"] == "fail"
+    assert "never removes files" in finding["message"]
+    assert sidecar.read_bytes() == corrupted
+
+    reopened = lodedb.LodeDB.open_vector_store(store, vector_dim=8)
+    try:
+        assert reopened.count() == 1
+    finally:
+        reopened.close()
+
+
+def test_doctor_fails_on_a_missing_or_non_directory_store_path(tmp_path) -> None:
+    """A mistyped path is a failure finding, not a clean empty report."""
+
+    missing = native_store_findings(tmp_path / "nowhere")
+    assert missing and missing[0]["status"] == "fail"
+    assert "not an existing directory" in missing[0]["message"]
+
+    regular_file = tmp_path / "file.txt"
+    regular_file.write_text("not a store")
+    as_file = native_store_findings(regular_file)
+    assert as_file and as_file[0]["status"] == "fail"
+
+
+def test_doctor_rejects_a_tampered_commit_manifest_body(tmp_path) -> None:
+    """A body edit that breaks the root checksum cannot yield a healthy TVVF report."""
+
+    store = tmp_path / "doctor_root"
+    db = lodedb.LodeDB.open_vector_store(
+        store, vector_dim=8, rescore="original", rescore_dtype="float32"
+    )
+    db.add_vectors([1.0] + [0.0] * 7, id="one", normalize=False)
+    db.persist()
+    db.close()
+
+    commit_path = next(store.glob("*.commit.json"))
+    commit = json.loads(commit_path.read_text(encoding="utf-8"))
+    commit["body"]["document_count"] = 999
+    commit_path.write_text(json.dumps(commit, sort_keys=True), encoding="utf-8")
+
+    findings = native_store_findings(store)
+    finding = next(item for item in findings if item["name"] == "tvvf_sidecar")
+    assert finding["status"] == "fail"
+    assert "checksum" in finding["message"]

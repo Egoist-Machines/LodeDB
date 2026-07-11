@@ -1130,6 +1130,31 @@ impl CoreEngine {
         Ok(index.cluster_index.borrow().is_some())
     }
 
+    /// Builds the ANN cluster index now, without issuing a vector query.
+    ///
+    /// Returns `true` when an ANN cluster index is resident after the call. Exact
+    /// indexes, and ANN indexes too small to form more than one cluster, return
+    /// `false` without doing any work.
+    pub fn ann_warm(&self, index_id: &str) -> Result<bool, CoreError> {
+        let index = self.index(index_id)?;
+        if index.ann_options.is_none() {
+            return Ok(false);
+        }
+        index.ensure_cluster_index()?;
+        Ok(index.cluster_index.borrow().is_some())
+    }
+
+    /// Marks an index for a full base rewrite on its next [`Self::persist`].
+    ///
+    /// This is intentionally only a scheduling operation: callers can warm ANN,
+    /// force a cluster-contiguous base and sidecar fold opportunity, then choose
+    /// when to publish the resulting generation with `persist`.
+    pub fn compact(&mut self, index_id: &str) -> Result<(), CoreError> {
+        self.require_writable()?;
+        self.index_mut(index_id)?.force_base_rewrite = true;
+        Ok(())
+    }
+
     fn query_vector_scalar(
         &self,
         index_id: &str,
@@ -1362,6 +1387,8 @@ impl CoreEngine {
             vector_dim: index.vector_dim,
             bit_width: index.bit_width,
             raw_payload_text_present: false,
+            rescore: index.rescore_stats(),
+            ann: index.ann_stats(),
         })
     }
 
@@ -3549,6 +3576,7 @@ fn index_from_loaded_store(
         tvvf_manifest,
         tvvf_sidecar_unavailable,
         drop_tvvf_manifest: false,
+        force_base_rewrite: false,
         cluster_index: RefCell::new(None),
         field_indexes,
         all_docs,
@@ -3951,12 +3979,13 @@ fn persist_index_generation(
     // reader waiting on it could never catch up.
     let watermark_only = nothing_pending && index.applied_lsn > index.persisted_applied_lsn;
     // A committed base with nothing pending and no watermark to flush is durable.
-    if index.base_epoch != 0 && nothing_pending && !watermark_only {
+    if index.base_epoch != 0 && nothing_pending && !watermark_only && !index.force_base_rewrite {
         return Ok(());
     }
-    // A watermark-only commit did not advance the mutation counter, so bump the
-    // generation to a fresh epoch or the delta would target the committed base.
-    if watermark_only && index.generation <= index.base_epoch {
+    // A watermark-only or operator-forced base rewrite may not have advanced the
+    // mutation counter. Bump to a fresh epoch so it cannot overwrite the committed
+    // base generation it is meant to replace.
+    if (watermark_only || index.force_base_rewrite) && index.generation <= index.base_epoch {
         index.generation = index.base_epoch + 1;
     }
     let generation = index.generation.max(1);
@@ -3985,7 +4014,8 @@ fn persist_index_generation(
                     .get(id)
                     .is_some_and(|r| !r.token_lists.is_empty())
             }));
-    let needs_base = index.base_epoch == 0
+    let needs_base = index.force_base_rewrite
+        || index.base_epoch == 0
         || !index.vectors_seeded
         || live_fingerprint != index.base_calibration_fingerprint
         || !native_base_appendable(
@@ -4015,6 +4045,7 @@ fn persist_index_generation(
         )?;
         index.base_epoch = generation;
         index.base_calibration_fingerprint = live_fingerprint;
+        index.force_base_rewrite = false;
     } else if watermark_only {
         // No document state changed -- only the applied-LSN watermark advanced. Carry
         // the committed base and all its store manifests forward and re-seal just the
@@ -4859,6 +4890,9 @@ struct VectorOnlyIndex {
     /// Makes the next generation root omit `tvvf` instead of carrying a known
     /// stale sidecar manifest forward.
     drop_tvvf_manifest: bool,
+    /// Operator-requested full-base rewrite. `compact()` sets this flag and the
+    /// next successful persist consumes it, so the operator controls publication.
+    force_base_rewrite: bool,
     /// Lazily-built cluster index for ANN candidate generation; `None` means
     /// "dirty, rebuild on the next ANN query". Interior mutability keeps the
     /// query path read-only, mirroring `vector_index`.
@@ -5014,6 +5048,7 @@ impl VectorOnlyIndex {
             tvvf_manifest: None,
             tvvf_sidecar_unavailable: Cell::new(false),
             drop_tvvf_manifest: false,
+            force_base_rewrite: false,
             cluster_index: RefCell::new(None),
             field_indexes: BTreeMap::new(),
             all_docs: DocSet::new(),
@@ -5388,6 +5423,53 @@ impl VectorOnlyIndex {
     fn rescore_applies(&self) -> bool {
         self.rescore_options.is_some()
             && (!self.pending_rescore_upserts.is_empty() || self.tvvf_reader.borrow().is_some())
+    }
+
+    /// Metrics-only rescore state. This intentionally never opens a cold sidecar:
+    /// stats must remain O(1) with respect to the corpus. A resident reader has
+    /// already indexed coverage, so its counts are cheap to report.
+    fn rescore_stats(&self) -> Option<CoreRescoreStats> {
+        let options = self.rescore_options.as_ref()?;
+        let reader = self.tvvf_reader.borrow();
+        let (sidecar_rows, tombstones, corrupt_rows_seen) = match reader.as_ref() {
+            Some(reader) => {
+                let (sidecar_rows, tombstones) = reader.coverage();
+                (
+                    Some(sidecar_rows),
+                    Some(tombstones),
+                    reader.corrupt_rows_seen(),
+                )
+            }
+            None => (None, None, 0),
+        };
+        Some(CoreRescoreStats {
+            dtype: options
+                .dtype
+                .clone()
+                .unwrap_or_else(|| "float16".to_string()),
+            oversample: self
+                .session_rescore_oversample
+                .or(options.oversample)
+                .unwrap_or(4.0),
+            sidecar_rows,
+            tombstones,
+            pending_rows: self.pending_rescore_upserts.len(),
+            corrupt_rows_seen,
+            reader_resident: reader.is_some(),
+        })
+    }
+
+    /// Metrics-only ANN state. The configured cluster count and effective probe
+    /// count are derived without constructing the cluster index, so stats also
+    /// exposes a session override without paying the warm-up cost.
+    fn ann_stats(&self) -> Option<CoreAnnStats> {
+        self.ann_options.as_ref()?;
+        let clusters = self.ann_cluster_count(self.live_chunk_count());
+        Some(CoreAnnStats {
+            clusters,
+            nprobe_effective: self.ann_nprobe_effective(clusters),
+            cluster_resident: self.cluster_index.borrow().is_some(),
+        })
     }
 
     /// Candidate count for the first stage. Validation guarantees a finite factor
@@ -6127,7 +6209,7 @@ struct ChunkRecord {
 }
 
 /// Metrics-only stats for the in-memory engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreEngineStats {
     pub index_id: String,
     /// The persisted model identity the index was created with (bindings use this to
@@ -6145,6 +6227,35 @@ pub struct CoreEngineStats {
     pub vector_dim: usize,
     pub bit_width: usize,
     pub raw_payload_text_present: bool,
+    /// Original-precision sidecar observability. `None` means rescore is disabled.
+    pub rescore: Option<CoreRescoreStats>,
+    /// ANN cluster observability. `None` means ANN is disabled.
+    pub ann: Option<CoreAnnStats>,
+}
+
+/// Metrics-only original-precision rescore state for one vector index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreRescoreStats {
+    pub dtype: String,
+    pub oversample: f32,
+    /// Live rows known by a resident sidecar reader. `None` avoids opening a
+    /// cold sidecar merely to report stats.
+    pub sidecar_rows: Option<u64>,
+    /// Sidecar tombstones known by a resident reader, or `None` when cold.
+    pub tombstones: Option<u64>,
+    /// Captured rows not yet committed into the sidecar.
+    pub pending_rows: usize,
+    /// Candidate rows whose checksum failed during this reader's lifetime.
+    pub corrupt_rows_seen: u64,
+    pub reader_resident: bool,
+}
+
+/// Metrics-only ANN cluster state for one vector index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreAnnStats {
+    pub clusters: usize,
+    pub nprobe_effective: usize,
+    pub cluster_resident: bool,
 }
 
 /// Text ingest plan returned to a binding before embeddings are computed.

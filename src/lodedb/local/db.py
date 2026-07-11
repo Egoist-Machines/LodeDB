@@ -1306,6 +1306,23 @@ class LodeDB:
                 self._native_persist()
             return self._native_stats()
 
+    def compact(self) -> dict[str, bool]:
+        """Writes a fresh serving base for deployment.
+
+        Use this on a build box after ingest: ``ingest, compact, ship the store
+        directory``. When ANN is enabled it builds the cluster index before the
+        rewrite, so serving nodes adopt the persisted cluster-contiguous layout and
+        cluster sidecar without waiting for their first query. This call persists
+        the new base before returning.
+        """
+
+        self._require_writable()
+        with self._op_lock:
+            ann_warmed = bool(self._native_vector_engine.ann_warm(_LOCAL_INDEX_ID))
+            self._native_vector_engine.compact(_LOCAL_INDEX_ID)
+            self._native_persist()
+        return {"ann_warmed": ann_warmed, "base_rewritten": True}
+
     def refresh(self) -> None:
         """Overlays the current write-ahead log tail into this handle's in-memory
         view without checkpointing.
