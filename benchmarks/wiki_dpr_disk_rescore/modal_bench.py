@@ -198,14 +198,27 @@ def _build_store_impl(
         VOLUME.commit()
     kwargs = dict(store)
     kwargs.pop("requires_engine", None)
-    result = run_benchmark(
-        data_dir=_prepared_dir(target_rows),
-        store_dir=store_dir,
-        label=store_label,
-        build=True,
-        serve=False,
-        **kwargs,
-    )
+    # Build on container-local disk, then copy the finished store to the volume
+    # in one bulk pass. The engine's small fsync-heavy writes wedge the FUSE
+    # volume mount (runner heartbeats stop and the container is killed); local
+    # NVMe absorbs them and FUSE only sees a sequential copy.
+    local_root = Path(tempfile.mkdtemp(prefix=f"wiki-dpr-build-{store_label}-"))
+    local_store = local_root / "store"
+    try:
+        result = run_benchmark(
+            data_dir=_prepared_dir(target_rows),
+            store_dir=local_store,
+            label=store_label,
+            build=True,
+            serve=False,
+            **kwargs,
+        )
+        print(f"[wiki-dpr] {store_label}: copying store to volume", flush=True)
+        started = time.perf_counter()
+        shutil.copytree(local_store, store_dir)
+        result["volume_upload_seconds"] = time.perf_counter() - started
+    finally:
+        shutil.rmtree(local_root, ignore_errors=True)
     if git_sha is not None:
         result["env"]["git_sha"] = git_sha
     VOLUME.commit()
