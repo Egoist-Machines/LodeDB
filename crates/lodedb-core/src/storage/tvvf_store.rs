@@ -157,6 +157,49 @@ pub fn record_base_with_fsync<D: AsRef<str>>(
     )
 }
 
+/// Records a base from rows already encoded with [`encode_row`]. This stays
+/// crate-visible because the engine captures caller vectors before its lossy
+/// TurboVec path and holds the encoded payloads until the commit is sealed.
+pub(crate) fn record_encoded_base_with_fsync(
+    dir: impl AsRef<Path>,
+    index_key: &str,
+    vf_epoch: u64,
+    dtype: TvvfDtype,
+    dim: usize,
+    rows: &[(u64, &[u8])],
+    fsync: bool,
+) -> TvvfResult<TvvfManifestEntry> {
+    if index_key.is_empty() {
+        return Err(invalid("tvvf index key must not be empty"));
+    }
+    validate_encoded_rows(dtype, dim, rows)?;
+    let base = base_path(dir, index_key, vf_epoch);
+    let mut ids = |emit: &mut dyn FnMut(u64) -> TvvfResult<()>| {
+        for (id, _) in rows {
+            emit(*id)?;
+        }
+        Ok(())
+    };
+    let mut payloads = |emit: &mut dyn FnMut(&[u8]) -> TvvfResult<()>| {
+        for (_, row) in rows {
+            emit(row)?;
+        }
+        Ok(())
+    };
+    let written = write_segment(
+        &base,
+        TVVF_BASE_MAGIC,
+        dtype,
+        dim,
+        rows.len(),
+        &[],
+        fsync,
+        &mut ids,
+        &mut payloads,
+    )?;
+    write_base_manifest(&base, index_key, vf_epoch, dtype, dim, rows.len(), written, fsync)
+}
+
 pub fn append_delta(
     dir: impl AsRef<Path>,
     index_key: &str,
@@ -178,7 +221,7 @@ pub fn append_delta_with_fsync(
     let base = base_path(&dir, index_key, vf_epoch);
     let base_header = read_header(&base, TVVF_BASE_MAGIC, false)?;
     validate_rows(base_header.dtype, base_header.dim, upserts)?;
-    let deleted = validate_deleted(deleted, upserts)?;
+    let deleted = validate_deleted(deleted, upserts.iter().map(|(id, _)| *id))?;
     let manifest_file = manifest_path(dir, index_key, vf_epoch);
     let mut manifest = read_manifest(&manifest_file)?;
     validate_manifest_identity(&manifest, index_key, vf_epoch)?;
@@ -234,6 +277,134 @@ pub fn append_delta_with_fsync(
     Ok(manifest)
 }
 
+/// Appends a delta from rows already encoded with [`encode_row`]. See
+/// [`record_encoded_base_with_fsync`] for why this is crate-visible.
+pub(crate) fn append_encoded_delta_with_fsync(
+    dir: impl AsRef<Path>,
+    index_key: &str,
+    vf_epoch: u64,
+    upserts: &[(u64, &[u8])],
+    deleted: &[u64],
+    fsync: bool,
+) -> TvvfResult<TvvfManifestEntry> {
+    let base = base_path(&dir, index_key, vf_epoch);
+    let base_header = read_header(&base, TVVF_BASE_MAGIC, false)?;
+    validate_encoded_rows(base_header.dtype, base_header.dim, upserts)?;
+    let deleted = validate_deleted(deleted, upserts.iter().map(|(id, _)| *id))?;
+    let manifest_file = manifest_path(dir, index_key, vf_epoch);
+    let mut manifest = read_manifest(&manifest_file)?;
+    validate_manifest_identity(&manifest, index_key, vf_epoch)?;
+    let sequence = json_object(&manifest, "tvvf manifest")?
+        .get("next_seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt("tvvf manifest is missing next_seq"))?;
+    let next_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| corrupt("tvvf manifest next_seq overflow"))?;
+    let file_name = format!("delta-{sequence:08}.tvfd");
+    let segment = delta_dir(&base).join(&file_name);
+    let mut ids = |emit: &mut dyn FnMut(u64) -> TvvfResult<()>| {
+        for (id, _) in upserts {
+            emit(*id)?;
+        }
+        Ok(())
+    };
+    let mut payloads = |emit: &mut dyn FnMut(&[u8]) -> TvvfResult<()>| {
+        for (_, row) in upserts {
+            emit(row)?;
+        }
+        Ok(())
+    };
+    let written = write_segment(
+        &segment,
+        TVVF_DELTA_MAGIC,
+        base_header.dtype,
+        base_header.dim,
+        upserts.len(),
+        &deleted,
+        fsync,
+        &mut ids,
+        &mut payloads,
+    )?;
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| corrupt("tvvf manifest must be an object"))?;
+    object
+        .get_mut("deltas")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| corrupt("tvvf manifest deltas must be an array"))?
+        .push(serde_json::json!({
+            "file_name": file_name,
+            "sha256": written.sha256,
+            "file_bytes": written.file_bytes,
+            "seq": sequence,
+            "upsert_rows": upserts.len(),
+            "deleted_rows": deleted.len(),
+        }));
+    object.insert("next_seq".to_string(), Value::from(next_sequence));
+    write_manifest(&manifest_file, &manifest, fsync)?;
+    Ok(manifest)
+}
+
+/// Restores the sidecar-local manifest from the generation root's committed tvvf
+/// entry before appending. The root manifest is the commit point, so a crash after
+/// a sidecar segment/local-manifest write but before the root swap must not let a
+/// later append accidentally promote that orphaned segment.
+pub(crate) fn restore_manifest_with_fsync(
+    dir: impl AsRef<Path>,
+    index_key: &str,
+    vf_epoch: u64,
+    manifest: &TvvfManifestEntry,
+    fsync: bool,
+) -> TvvfResult<()> {
+    validate_manifest_identity(manifest, index_key, vf_epoch)?;
+    write_manifest(&manifest_path(dir, index_key, vf_epoch), manifest, fsync)
+}
+
+/// Loads only the newest delta's ID and tombstone index. This deliberately does
+/// not open the base or older delta segments, so a resident reader can advance
+/// on the append path in O(the new segment).
+pub(crate) fn load_latest_delta_segment(
+    dir: impl AsRef<Path>,
+    index_key: &str,
+    vf_epoch: u64,
+    manifest: &TvvfManifestEntry,
+) -> TvvfResult<TvvfDeltaSegment> {
+    validate_manifest_identity(manifest, index_key, vf_epoch)?;
+    let entry = json_object(manifest, "tvvf manifest")?
+        .get("deltas")
+        .and_then(Value::as_array)
+        .and_then(|deltas| deltas.last())
+        .ok_or_else(|| corrupt("tvvf manifest has no delta segment to load"))?;
+    let entry = json_object(entry, "tvvf delta manifest entry")?;
+    let sequence = entry
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt("tvvf delta entry is missing seq"))?;
+    let name = entry
+        .get("file_name")
+        .and_then(Value::as_str)
+        .filter(|name| Path::new(name).file_name() == Some(std::ffi::OsStr::new(name)))
+        .ok_or_else(|| corrupt("tvvf delta entry has invalid file_name"))?;
+    let expected = entry
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| corrupt("tvvf delta entry is missing sha256"))?;
+    let base = base_path(dir, index_key, vf_epoch);
+    let path = delta_dir(&base).join(name);
+    if sha256_file_hex(&path).map_err(core_error)? != expected {
+        return Err(corrupt(format!(
+            "tvvf delta segment failed checksum: {name}"
+        )));
+    }
+    Ok(TvvfDeltaSegment {
+        sequence,
+        name: name.to_string(),
+        index: read_index(&path, TVVF_DELTA_MAGIC, true)?,
+    })
+}
+
 pub fn fold(
     dir: impl AsRef<Path>,
     index_key: &str,
@@ -285,6 +456,7 @@ pub fn fold_with_fsync(
     )
 }
 
+#[derive(Debug)]
 pub struct TvvfReader {
     index_key: String,
     vf_epoch: u64,
@@ -292,9 +464,32 @@ pub struct TvvfReader {
     dim: usize,
     base: SegmentIndex,
     deltas: Vec<SegmentIndex>,
+    last_delta_sequence: Option<u64>,
+    /// Latest live/tombstoned state for ids touched by delta segments. Keeping
+    /// this alongside the segment indexes lets an appended segment update
+    /// coverage without revisiting the base or older deltas.
+    delta_states: HashMap<u64, bool>,
     live_rows: u64,
     tombstones: u64,
     corrupt_rows_seen: AtomicU64,
+}
+
+impl Clone for TvvfReader {
+    fn clone(&self) -> Self {
+        Self {
+            index_key: self.index_key.clone(),
+            vf_epoch: self.vf_epoch,
+            dtype: self.dtype,
+            dim: self.dim,
+            base: self.base.clone(),
+            deltas: self.deltas.clone(),
+            last_delta_sequence: self.last_delta_sequence,
+            delta_states: self.delta_states.clone(),
+            live_rows: self.live_rows,
+            tombstones: self.tombstones,
+            corrupt_rows_seen: AtomicU64::new(self.corrupt_rows_seen()),
+        }
+    }
 }
 
 impl TvvfReader {
@@ -337,14 +532,10 @@ impl TvvfReader {
                 )));
             }
             let segment = read_index(&path, TVVF_DELTA_MAGIC, true)?;
-            if segment.dtype != base.dtype || segment.dim != base.dim {
-                return Err(corrupt(format!(
-                    "tvvf delta segment has incompatible dtype or dim: {name}"
-                )));
-            }
+            validate_delta_segment(&segment, &base, name)?;
             deltas.push(segment);
         }
-        let (live_rows, tombstones) = coverage(&base, &deltas);
+        let (live_rows, tombstones, delta_states) = coverage(&base, &deltas);
         Ok(Self {
             index_key,
             vf_epoch,
@@ -352,6 +543,8 @@ impl TvvfReader {
             dim: base.dim,
             base,
             deltas,
+            last_delta_sequence: previous,
+            delta_states,
             live_rows,
             tombstones,
             corrupt_rows_seen: AtomicU64::new(0),
@@ -380,6 +573,26 @@ impl TvvfReader {
 
     pub fn corrupt_rows_seen(&self) -> u64 {
         self.corrupt_rows_seen.load(Ordering::Relaxed)
+    }
+
+    /// Installs the just-appended delta segment without reopening and indexing
+    /// the base or older delta files. The caller supplies the newest manifest
+    /// entry, so sequence order remains part of the resident-reader invariant.
+    pub(crate) fn append_delta_segment(
+        &mut self,
+        segment: TvvfDeltaSegment,
+    ) -> TvvfResult<()> {
+        if self
+            .last_delta_sequence
+            .is_some_and(|previous| segment.sequence <= previous)
+        {
+            return Err(corrupt("tvvf resident reader received an out-of-order segment"));
+        }
+        validate_delta_segment(&segment.index, &self.base, &segment.name)?;
+        self.apply_delta_coverage(&segment.index);
+        self.last_delta_sequence = Some(segment.sequence);
+        self.deltas.push(segment.index);
+        Ok(())
     }
 
     pub fn fetch_rows(&self, ids: &[u64]) -> Vec<Option<Vec<f32>>> {
@@ -426,6 +639,31 @@ impl TvvfReader {
             }
         }
         self.base.row_for(id).map(|row| (0, row))
+    }
+
+    fn apply_delta_coverage(&mut self, segment: &SegmentIndex) {
+        for id in &segment.deleted_ids {
+            let prior = self.delta_states.get(id).copied();
+            let was_live = prior.unwrap_or_else(|| self.base.row_for(*id).is_some());
+            if was_live {
+                self.live_rows = self.live_rows.saturating_sub(1);
+            }
+            if prior != Some(false) {
+                self.tombstones = self.tombstones.saturating_add(1);
+            }
+            self.delta_states.insert(*id, false);
+        }
+        for id in &segment.ids {
+            let prior = self.delta_states.get(id).copied();
+            let was_live = prior.unwrap_or_else(|| self.base.row_for(*id).is_some());
+            if !was_live {
+                self.live_rows = self.live_rows.saturating_add(1);
+            }
+            if prior == Some(false) {
+                self.tombstones = self.tombstones.saturating_sub(1);
+            }
+            self.delta_states.insert(*id, true);
+        }
     }
 
     fn fetch_segment(
@@ -528,6 +766,7 @@ impl TvvfReader {
     }
 }
 
+#[derive(Debug, Clone)]
 struct SegmentIndex {
     path: PathBuf,
     dtype: TvvfDtype,
@@ -538,6 +777,16 @@ struct SegmentIndex {
     deleted_ids: Vec<u64>,
     checksums_offset: u64,
     rows_offset: u64,
+}
+
+/// An indexed delta segment ready to attach to a resident [`TvvfReader`].
+/// Kept crate-visible so the engine can move it directly from the append path
+/// into the reader without exposing the raw segment representation publicly.
+#[derive(Debug)]
+pub(crate) struct TvvfDeltaSegment {
+    sequence: u64,
+    name: String,
+    index: SegmentIndex,
 }
 
 impl SegmentIndex {
@@ -610,8 +859,33 @@ fn validate_rows(dtype: TvvfDtype, dim: usize, rows: &[(u64, &[f32])]) -> TvvfRe
     Ok(())
 }
 
-fn validate_deleted(deleted: &[u64], upserts: &[(u64, &[f32])]) -> TvvfResult<Vec<u64>> {
-    let upserts = upserts.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+fn validate_encoded_rows(dtype: TvvfDtype, dim: usize, rows: &[(u64, &[u8])]) -> TvvfResult<()> {
+    if dim == 0 {
+        return Err(invalid("tvvf dim must be positive"));
+    }
+    if rows.len() > u32::MAX as usize {
+        return Err(invalid("tvvf row count exceeds the u32 lookup index limit"));
+    }
+    let stride = row_stride(dtype, dim)?;
+    let mut ids = HashSet::with_capacity(rows.len());
+    for (id, row) in rows {
+        if row.len() != stride {
+            return Err(invalid(format!("tvvf encoded row {id} has unexpected width")));
+        }
+        if !ids.insert(*id) {
+            return Err(invalid(format!(
+                "tvvf input contains duplicate stable id {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_deleted(
+    deleted: &[u64],
+    upserts: impl IntoIterator<Item = u64>,
+) -> TvvfResult<Vec<u64>> {
+    let upserts = upserts.into_iter().collect::<HashSet<_>>();
     let mut deleted = deleted.to_vec();
     deleted.sort_unstable();
     if deleted.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -632,7 +906,7 @@ fn row_stride(dtype: TvvfDtype, dim: usize) -> TvvfResult<usize> {
     .ok_or_else(|| invalid("tvvf row stride overflow"))
 }
 
-fn encode_row(dtype: TvvfDtype, dim: usize, row: &[f32]) -> TvvfResult<Vec<u8>> {
+pub(crate) fn encode_row(dtype: TvvfDtype, dim: usize, row: &[f32]) -> TvvfResult<Vec<u8>> {
     let mut output = Vec::with_capacity(row_stride(dtype, dim)?);
     match dtype {
         TvvfDtype::Float16 => {
@@ -883,7 +1157,7 @@ fn read_manifest(path: &Path) -> TvvfResult<Value> {
         .map_err(|error| corrupt(format!("tvvf manifest is corrupt: {error}")))
 }
 
-fn validate_manifest_identity(
+pub(crate) fn validate_manifest_identity(
     manifest: &Value,
     expected_key: &str,
     expected_epoch: u64,
@@ -1085,7 +1359,20 @@ fn read_index(path: &Path, magic: &[u8; 8], delta: bool) -> TvvfResult<SegmentIn
     })
 }
 
-fn coverage(base: &SegmentIndex, deltas: &[SegmentIndex]) -> (u64, u64) {
+fn validate_delta_segment(
+    segment: &SegmentIndex,
+    base: &SegmentIndex,
+    name: &str,
+) -> TvvfResult<()> {
+    if segment.dtype != base.dtype || segment.dim != base.dim {
+        return Err(corrupt(format!(
+            "tvvf delta segment has incompatible dtype or dim: {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn coverage(base: &SegmentIndex, deltas: &[SegmentIndex]) -> (u64, u64, HashMap<u64, bool>) {
     let mut live = base.ids.len() as i64;
     let mut changed = HashMap::<u64, bool>::new();
     for segment in deltas {
@@ -1113,6 +1400,7 @@ fn coverage(base: &SegmentIndex, deltas: &[SegmentIndex]) -> (u64, u64) {
     (
         live.max(0) as u64,
         changed.values().filter(|value| !**value).count() as u64,
+        changed,
     )
 }
 
@@ -1340,6 +1628,40 @@ mod tests {
             vec![Some(vec![9.0, 9.0]), None, Some(vec![3.0, 3.0]), None]
         );
         assert_eq!(reader.coverage(), (2, 1));
+    }
+
+    #[test]
+    fn resident_reader_appends_only_the_new_delta_index() {
+        let dir = temp_dir("resident_append");
+        let base = vec![(1, vec![1.0, 1.0]), (2, vec![2.0, 2.0])];
+        let manifest =
+            record_base(&dir, "index", 0, TvvfDtype::Float32, 2, &borrowed(&base)).unwrap();
+        let mut reader = TvvfReader::open(&dir, &manifest).unwrap();
+        let upserts = vec![(1, vec![9.0, 9.0]), (3, vec![3.0, 3.0])];
+        let manifest = append_delta(&dir, "index", 0, &borrowed(&upserts), &[2]).unwrap();
+        let delta = load_latest_delta_segment(&dir, "index", 0, &manifest).unwrap();
+        reader.append_delta_segment(delta).unwrap();
+
+        assert_eq!(
+            reader.fetch_rows(&[1, 2, 3]),
+            vec![Some(vec![9.0, 9.0]), None, Some(vec![3.0, 3.0])]
+        );
+        assert_eq!(reader.coverage(), (2, 1));
+
+        let next = vec![(2, vec![20.0, 20.0]), (4, vec![4.0, 4.0])];
+        let manifest = append_delta(&dir, "index", 0, &borrowed(&next), &[3]).unwrap();
+        let delta = load_latest_delta_segment(&dir, "index", 0, &manifest).unwrap();
+        reader.append_delta_segment(delta).unwrap();
+        assert_eq!(
+            reader.fetch_rows(&[1, 2, 3, 4]),
+            vec![
+                Some(vec![9.0, 9.0]),
+                Some(vec![20.0, 20.0]),
+                None,
+                Some(vec![4.0, 4.0]),
+            ]
+        );
+        assert_eq!(reader.coverage(), (3, 1));
     }
 
     #[test]

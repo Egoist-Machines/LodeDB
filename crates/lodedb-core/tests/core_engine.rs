@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
 use lodedb_core::stable_uint64_ids_for_chunk_ids;
 use lodedb_core::types::{
-    CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
-    CoreVectorDocument,
+    CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreRescoreOptions,
+    CoreSearchResults, CoreVectorDocument,
 };
 use lodedb_core::vector::index::CoreVectorChunk;
 use lodedb_core::vector::turbovec::TurboVecNativeIndex;
@@ -708,6 +708,7 @@ fn persistent_engine_writes_python_compatible_vector_metadata() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine
@@ -947,6 +948,7 @@ fn native_wal_vector_records_replay_and_checkpoint() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1011,6 +1013,7 @@ fn native_wal_replay_advances_to_a_fresh_generation() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1096,6 +1099,7 @@ fn native_wal_text_apply_records_replay_and_checkpoint() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1867,6 +1871,7 @@ fn concurrent_appenders_are_folded_by_the_next_writer() {
                 vector_dim: 8,
                 bit_width: 4,
                 ann: None,
+                rescore: None,
             })
             .unwrap();
         engine.persist().unwrap();
@@ -1926,6 +1931,7 @@ fn create_vector_only_index(engine: &mut CoreEngine) {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
 }
@@ -4153,5 +4159,445 @@ fn exact_store_writes_no_tvann_sidecar() {
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     assert!(!reopened.ann_cluster_resident("default").unwrap());
     drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+// --- Opt-in original-precision tvvf capture (rescore query stage follows later) ---
+
+fn rescore_options(dtype: &str) -> CoreIndexCreateOptions {
+    let mut options = CoreIndexCreateOptions::native_default("default", 8, 4);
+    options.rescore = Some(CoreRescoreOptions {
+        mode: CoreRescoreOptions::ORIGINAL.to_string(),
+        dtype: Some(dtype.to_string()),
+        oversample: None,
+    });
+    options
+}
+
+fn rescore_vector(id: &str, offset: f32) -> CoreVectorDocument {
+    CoreVectorDocument {
+        document_id: id.to_string(),
+        vector: vec![
+            0.113 + offset,
+            -0.237 + offset * 0.5,
+            0.419 - offset * 0.25,
+            -0.571 + offset * 0.125,
+            0.683 - offset * 0.0625,
+            -0.797 + offset * 0.03125,
+            0.887 - offset * 0.015625,
+            -0.941 + offset * 0.0078125,
+        ],
+        metadata: BTreeMap::new(),
+        text: None,
+        patch_matrix: None,
+    }
+}
+
+fn tvvf_rows(path: &Path, ids: &[&str]) -> (serde_json::Value, Vec<Option<Vec<f32>>>) {
+    let loaded = lodedb_core::storage::load_store(
+        path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let manifest = loaded.tvvf_manifest.clone().expect("tvvf manifest");
+    let stable_ids = ids
+        .iter()
+        .map(|id| lodedb_core::stable_uint64_for_text(id))
+        .collect::<Vec<_>>();
+    let rows = loaded
+        .tvvf_reader
+        .as_ref()
+        .expect("installed tvvf reader")
+        .fetch_rows(&stable_ids);
+    (manifest, rows)
+}
+
+fn assert_rows_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual}, tolerance {tolerance}"
+        );
+    }
+}
+
+#[test]
+fn rescore_float16_preserves_originals_across_reopen() {
+    let path = unique_temp_dir("rescore_float16");
+    let original = rescore_vector("fine", 0.0);
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine.create_index_with_options(rescore_options("float16")).unwrap();
+        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine.persist().unwrap();
+    }
+    let (manifest, rows) = tvvf_rows(&path, &["fine"]);
+    assert_eq!(manifest["base"]["dtype"], "float16");
+    let preserved = rows[0].as_ref().expect("captured vector");
+    assert_rows_close(preserved, &original.vector, 0.001);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let stable_id = lodedb_core::stable_uint64_for_text("fine");
+    let reconstructed = IdMapIndex::load(loaded.tvim_path.as_ref().expect("tvim base"))
+        .unwrap()
+        .reconstruct_rows(&[stable_id])
+        .unwrap();
+    assert!(
+        preserved
+            .iter()
+            .zip(reconstructed)
+            .any(|(original, reconstructed)| (original - reconstructed).abs() > 0.01),
+        "tvvf must hold caller precision rather than the 4-bit reconstruction"
+    );
+    drop(loaded);
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_float32_and_int8_round_trip() {
+    for (dtype, tolerance) in [("float32", 0.0), ("int8", 0.009)] {
+        let path = unique_temp_dir(&format!("rescore_{dtype}"));
+        let original = rescore_vector("fine", 0.02);
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine.create_index_with_options(rescore_options(dtype)).unwrap();
+        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+        let (manifest, rows) = tvvf_rows(&path, &["fine"]);
+        assert_eq!(manifest["base"]["dtype"], dtype);
+        let captured = rows[0].as_ref().expect("captured vector");
+        assert_rows_close(captured, &original.vector, tolerance);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn rescore_delta_replays_latest_rows_and_tombstones() {
+    let path = unique_temp_dir("rescore_delta");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..12)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+    let replacement = rescore_vector("doc-0", 0.08);
+    engine
+        .upsert_vectors("default", std::slice::from_ref(&replacement))
+        .unwrap();
+    engine
+        .delete_documents("default", &["doc-1".to_string()])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let (manifest, rows) = tvvf_rows(&path, &["doc-0", "doc-1", "doc-2"]);
+    assert_eq!(manifest["deltas"].as_array().unwrap().len(), 1);
+    assert_rows_close(rows[0].as_ref().unwrap(), &replacement.vector, 0.0);
+    assert!(rows[1].is_none(), "deleted stable id must be tombstoned");
+    assert_rows_close(rows[2].as_ref().unwrap(), &initial[2].vector, 0.0);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_fold_limits_tiny_delta_segments() {
+    let path = unique_temp_dir("rescore_segment_limit");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..512)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+
+    // Each update changes one captured row. The base is deliberately large
+    // enough that the 25% row-ratio threshold cannot fire before the fixed
+    // segment bound; the 65th delta must fold the sidecar.
+    for cycle in 1..=65 {
+        engine
+            .upsert_vectors(
+                "default",
+                &[rescore_vector("doc-0", cycle as f32 * 0.01)],
+            )
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    drop(engine);
+
+    let (manifest, _) = tvvf_rows(&path, &["doc-0"]);
+    assert_eq!(manifest["vf_epoch"], 2);
+    assert!(manifest["deltas"].as_array().unwrap().is_empty());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_fold_keeps_live_and_previous_vf_epochs() {
+    let path = unique_temp_dir("rescore_fold");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..8)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+    for cycle in 1..=2 {
+        let first = rescore_vector("doc-0", cycle as f32 * 0.1);
+        let second = rescore_vector("doc-1", cycle as f32 * 0.1 + 0.01);
+        engine.upsert_vectors("default", &[first, second]).unwrap();
+        engine.persist().unwrap();
+    }
+    drop(engine);
+    let (manifest, rows) = tvvf_rows(&path, &["doc-0", "doc-1"]);
+    assert_eq!(manifest["vf_epoch"], 3);
+    assert_rows_close(rows[0].as_ref().unwrap(), &rescore_vector("doc-0", 0.2).vector, 0.0);
+    assert!(
+        !lodedb_core::storage::tvvf_base_path(&path, "default", 1).exists(),
+        "older folded tvvf epoch should be collected"
+    );
+    assert!(lodedb_core::storage::tvvf_base_path(&path, "default", 2).exists());
+    assert!(lodedb_core::storage::tvvf_base_path(&path, "default", 3).exists());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_wal_replay_captures_caller_originals() {
+    let path = unique_temp_dir("rescore_wal");
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        engine.create_index_with_options(rescore_options("float32")).unwrap();
+        engine.persist().unwrap();
+    }
+    let original = rescore_vector("wal-row", 0.03);
+    let appender = CoreAppender::open(open_options(&path, false, "wal")).unwrap();
+    appender
+        .append_vectors(std::slice::from_ref(&original))
+        .unwrap();
+    drop(appender);
+    let mut writer = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+    let (_, rows) = tvvf_rows(&path, &["wal-row"]);
+    assert_rows_close(rows[0].as_ref().unwrap(), &original.vector, 0.0);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_metadata_only_delta_carries_manifest_forward() {
+    let path = unique_temp_dir("rescore_metadata");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let mut original = rescore_vector("row", 0.0);
+    engine
+        .upsert_vectors("default", std::slice::from_ref(&original))
+        .unwrap();
+    engine.persist().unwrap();
+    let (before, _) = tvvf_rows(&path, &["row"]);
+    original.metadata.insert("tag".to_string(), "updated".to_string());
+    engine.upsert_vectors("default", &[original]).unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let (after, _) = tvvf_rows(&path, &["row"]);
+    assert_eq!(after, before, "metadata-only commit must carry tvvf forward");
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_off_manifests_and_state_headers_remain_byte_identical() {
+    let write = |path: &Path| {
+        let mut engine = CoreEngine::open(open_options(path, false, "generation")).unwrap();
+        engine.create_index("default", 8, 4).unwrap();
+        engine.upsert_vectors("default", &[rescore_vector("row", 0.0)]).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+        (
+            fs::read(path.join("default.commit.json")).unwrap(),
+            fs::read(path.join("default.gen/g1.json")).unwrap(),
+        )
+    };
+    let first = unique_temp_dir("rescore_off_one");
+    let second = unique_temp_dir("rescore_off_two");
+    let first_bytes = write(&first);
+    let second_bytes = write(&second);
+    assert_eq!(first_bytes, second_bytes);
+    for bytes in [&first_bytes.0, &first_bytes.1] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("tvvf"));
+        assert!(!text.contains("rescore"));
+    }
+    fs::remove_dir_all(first).unwrap();
+    fs::remove_dir_all(second).unwrap();
+}
+
+#[test]
+fn tvvf_orphan_delta_and_corruption_fail_open_without_deletion() {
+    let path = unique_temp_dir("rescore_fail_open");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let base = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    let delta_dir = base.with_file_name(format!(
+        "{}{}",
+        base.file_name().unwrap().to_string_lossy(),
+        lodedb_core::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+    ));
+    fs::write(delta_dir.join("orphan.tvfd"), b"unsealed").unwrap();
+    let (_, rows) = tvvf_rows(&path, &["row"]);
+    assert!(rows[0].is_some(), "unreferenced delta must be ignored");
+
+    // Simulate the more realistic torn window: a sidecar delta and its local
+    // manifest were written, but the generation root was never sealed. A later
+    // append must reset to the root's manifest rather than promote this orphan.
+    let orphan = rescore_vector("orphan", 0.04);
+    let orphan_id = lodedb_core::stable_uint64_for_text("orphan");
+    lodedb_core::storage::append_delta(
+        &path,
+        "default",
+        1,
+        &[(orphan_id, orphan.vector.as_slice())],
+        &[],
+    )
+    .unwrap();
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .upsert_vectors("default", &[rescore_vector("row", 0.06)])
+        .unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+    let (manifest, rows) = tvvf_rows(&path, &["row", "orphan"]);
+    assert!(rows[0].is_some());
+    assert!(rows[1].is_none(), "unsealed local delta must stay orphaned");
+
+    let current_base = lodedb_core::storage::tvvf_base_path(
+        &path,
+        "default",
+        manifest["vf_epoch"].as_u64().unwrap(),
+    );
+    fs::write(&current_base, b"bad magic").unwrap();
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_reader.is_none(), "corrupt sidecar disables only rescore");
+    assert!(current_base.exists(), "fail-open must leave corrupt tvvf on disk");
+    drop(loaded);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn corrupt_tvvf_is_dropped_before_a_vector_delta_advances_tvim() {
+    let path = unique_temp_dir("rescore_stale_manifest_drop");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    fs::write(&sidecar, b"bad magic").unwrap();
+
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .upsert_vectors("default", &[rescore_vector("row", 0.1)])
+        .unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_manifest.is_none(), "new root must omit stale tvvf");
+    assert!(loaded.tvvf_reader.is_none());
+    assert!(sidecar.exists(), "fail-open leaves old sidecar files untouched");
+    drop(loaded);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn swapped_tvvf_manifest_identity_fails_open_without_touching_files() {
+    let path = unique_temp_dir("rescore_manifest_identity");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    // Give the swapped key a structurally compatible sidecar. Without the
+    // load-time identity check, the reader would install this foreign index.
+    let foreign = rescore_vector("foreign", 0.2);
+    let foreign_id = lodedb_core::stable_uint64_for_text("foreign");
+    lodedb_core::storage::record_tvvf_base(
+        &path,
+        "another-index",
+        1,
+        "float32",
+        8,
+        &[(foreign_id, foreign.vector.as_slice())],
+    )
+    .unwrap();
+    let root = lodedb_core::storage::commit_manifest::commit_manifest_path(&path, "default");
+    let mut body = lodedb_core::storage::commit_manifest::read_commit_manifest(&root)
+        .unwrap()
+        .unwrap()
+        .body;
+    body["tvvf"]["index_key"] = Value::String("another-index".to_string());
+    lodedb_core::storage::commit_manifest::write_commit_manifest(&root, &body, false).unwrap();
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_reader.is_none());
+    assert!(sidecar.exists(), "identity failure must not delete sidecar files");
+    drop(loaded);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn tvim_gc_does_not_remove_tvvf_epochs() {
+    let path = unique_temp_dir("rescore_gc_boundary");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let tvvf = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    lodedb_core::storage::gc_after_base_rewrite(&path, "default", 2, 1).unwrap();
+    assert!(tvvf.exists(), "generation GC must not own tvvf files");
     fs::remove_dir_all(path).unwrap();
 }

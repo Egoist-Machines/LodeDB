@@ -19,7 +19,8 @@ use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult,
-    CoreOpenOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument, VectorBatchArrays,
+    CoreOpenOptions, CoreRescoreOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument,
+    VectorBatchArrays,
 };
 use crate::vector::ann::ClusterIndex;
 use crate::vector::index::{CoreVectorChunk, VectorSearchHit};
@@ -3377,6 +3378,21 @@ fn index_from_loaded_store(
         .as_ref()
         .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
     let base_epoch = loaded.base_epoch;
+    let rescore_options = state
+        .get("rescore")
+        .and_then(|value| serde_json::from_value::<CoreRescoreOptions>(value.clone()).ok())
+        // An invalid persisted config never makes the store unreadable. Leave its
+        // sidecar files untouched and disable only this session's future rescore.
+        .filter(|rescore| validate_rescore_options(rescore).is_ok());
+    let tvvf_manifest = loaded.tvvf_manifest.clone();
+    let tvvf_sidecar_unavailable = rescore_options.is_some()
+        && tvvf_manifest.is_some()
+        && loaded.tvvf_reader.is_none();
+    let tvvf_reader = if rescore_options.is_some() {
+        loaded.tvvf_reader
+    } else {
+        None
+    };
     let index = VectorOnlyIndex {
         index_id,
         index_key,
@@ -3444,6 +3460,12 @@ fn index_from_loaded_store(
             // or invalid tuning) so it never runs the wrong algorithm; the index
             // then serves exact, which is always correct.
             .filter(|ann| validate_ann_options(ann).is_ok()),
+        rescore_options,
+        pending_rescore_upserts: BTreeMap::new(),
+        tvvf_reader: RefCell::new(tvvf_reader),
+        tvvf_manifest,
+        tvvf_sidecar_unavailable,
+        drop_tvvf_manifest: false,
         cluster_index: RefCell::new(None),
         field_indexes,
         all_docs,
@@ -3458,6 +3480,9 @@ fn index_from_loaded_store(
         pending_removed_stable_ids: BTreeSet::new(),
         pending_vectors_changed: false,
     };
+    // This reopen seeds `documents` directly from persisted (lossy) TurboVec rows;
+    // it never routes those rows through `sync_vector_index_upsert`, so no
+    // reconstructed vector can overwrite the original-precision tvvf sidecar.
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
     // first ANN query rebuilds it. This skips the k-means rebuild after a clean
     // reopen without ever trusting a stale sidecar.
@@ -3719,6 +3744,11 @@ fn state_header_for_index(index: &VectorOnlyIndex) -> serde_json::Map<String, Va
             header.insert("ann".to_string(), value);
         }
     }
+    if let Some(rescore) = &index.rescore_options {
+        if let Ok(value) = serde_json::to_value(rescore) {
+            header.insert("rescore".to_string(), value);
+        }
+    }
     header
 }
 
@@ -3830,7 +3860,8 @@ fn persist_index_generation(
         && index.pending_lexical_clears.is_empty()
         && index.pending_raw_text_clears.is_empty()
         && index.pending_multivec_clears.is_empty()
-        && index.pending_removed_stable_ids.is_empty();
+        && index.pending_removed_stable_ids.is_empty()
+        && index.pending_rescore_upserts.is_empty();
     // A fold can advance the durable applied-LSN watermark without changing any
     // document (an idempotent re-add / missing-id delete). That still must be
     // committed, or truncating the WAL would strand the acknowledged LSN and a
@@ -3924,6 +3955,9 @@ fn persist_index_generation(
     index.pending_raw_text_clears.clear();
     index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
+    index.pending_rescore_upserts.clear();
+    index.drop_tvvf_manifest = false;
+    index.tvvf_sidecar_unavailable = false;
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
     // writable handle's `applied_lsn()` reports the committed generation (the
@@ -3991,9 +4025,228 @@ fn generation_should_compact(
     Ok(delta_documents * 4 >= document_count.max(1))
 }
 
+/// Flushes the original-precision sidecar before its root commit manifest is
+/// swapped. An interrupted write can therefore leave only an unreferenced segment,
+/// which `TvvfReader` intentionally ignores on the next open.
+fn flush_tvvf(
+    index: &mut VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    generation: u64,
+) -> Result<Option<crate::storage::TvvfManifestEntry>, CoreError> {
+    let changed =
+        !index.pending_rescore_upserts.is_empty() || !index.pending_removed_stable_ids.is_empty();
+    let Some(dtype) = index.rescore_dtype() else {
+        // Preserve a sidecar referenced by a now-invalid persisted config. The
+        // session cannot use it, but a fail-open load must not delete or orphan it.
+        return Ok(index.tvvf_manifest.clone());
+    };
+    if index.tvvf_sidecar_unavailable && index.tvvf_manifest.is_some() {
+        if changed {
+            // The `.tvim` delta is about to advance without a corresponding
+            // original-precision update. Do not carry stale originals into the
+            // next root manifest. The old files remain untouched for diagnosis.
+            eprintln!(
+                "lodedb: dropping unavailable tvvf sidecar for index {}; rescore disabled. \
+                 Run doctor/rebuild to create a new sidecar lineage.",
+                index.index_key
+            );
+            index.tvvf_manifest = None;
+            index.rescore_options = None;
+            index.drop_tvvf_manifest = true;
+            return Ok(None);
+        }
+        return Ok(index.tvvf_manifest.clone());
+    }
+    if index.tvvf_manifest.is_some() && !changed {
+        return Ok(index.tvvf_manifest.clone());
+    }
+
+    let rows = index
+        .pending_rescore_upserts
+        .iter()
+        .map(|(stable_id, bytes)| (*stable_id, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let mut folded = None;
+    let mut manifest = match index.tvvf_manifest.as_ref() {
+        Some(previous) => {
+            let vf_epoch = previous
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorCode::CorruptStore,
+                        "tvvf manifest is missing vf_epoch",
+                    )
+                })?;
+            crate::storage::tvvf_store::restore_manifest_with_fsync(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                previous,
+                fsync,
+            )
+            .map_err(tvvf_error)?;
+            crate::storage::tvvf_store::append_encoded_delta_with_fsync(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                &rows,
+                &index
+                    .pending_removed_stable_ids
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                fsync,
+            )
+            .map_err(tvvf_error)?
+        }
+        None => crate::storage::tvvf_store::record_encoded_base_with_fsync(
+            dir,
+            &index.index_key,
+            generation,
+            dtype,
+            index.vector_dim,
+            &rows,
+            fsync,
+        )
+        .map_err(tvvf_error)?,
+    };
+    if index.tvvf_manifest.is_some() {
+        if let Some(reader) = index.tvvf_reader.get_mut().as_mut() {
+            let vf_epoch = manifest
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorCode::CorruptStore,
+                        "tvvf manifest is missing vf_epoch",
+                    )
+                })?;
+            let segment = crate::storage::tvvf_store::load_latest_delta_segment(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                &manifest,
+            )
+            .map_err(tvvf_error)?;
+            reader.append_delta_segment(segment).map_err(tvvf_error)?;
+        }
+    }
+    let should_fold = {
+        let reader = index.tvvf_reader.borrow();
+        tvvf_should_fold(&manifest, reader.as_ref())
+    };
+    if should_fold {
+        let vf_epoch = manifest
+            .get("vf_epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "tvvf manifest is missing vf_epoch",
+                )
+            })?;
+        manifest = crate::storage::fold_with_fsync(dir, &index.index_key, vf_epoch, fsync)
+            .map_err(tvvf_error)?;
+        let reader = crate::storage::TvvfReader::open(dir, &manifest).map_err(tvvf_error)?;
+        folded = Some(reader.vf_epoch());
+        *index.tvvf_reader.get_mut() = Some(reader);
+    }
+    if let Some(vf_epoch) = folded {
+        gc_tvvf_epochs(dir, &index.index_key, vf_epoch);
+    }
+    index.tvvf_manifest = Some(manifest.clone());
+    Ok(Some(manifest))
+}
+
+fn tvvf_should_fold(manifest: &Value, reader: Option<&crate::storage::TvvfReader>) -> bool {
+    let base_rows = manifest
+        .get("base")
+        .and_then(Value::as_object)
+        .and_then(|base| base.get("row_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let deltas = manifest
+        .get("deltas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .collect::<Vec<_>>();
+    // Keep at most 64 committed delta segments. The 65th is folded before its
+    // root manifest is published, bounding both lookup fan-out and root size.
+    if deltas.len() > MAX_GENERATION_DELTA_SEGMENTS {
+        return true;
+    }
+    let journal_upserts = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .get("upsert_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let journal_tombstones = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .get("deleted_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let tombstones = reader
+        .map(|reader| reader.coverage().1)
+        // A nonresident reader must not be opened on the commit path. This
+        // conservative count can only fold early when repeated tombstones occur.
+        .unwrap_or(journal_tombstones);
+    journal_upserts.saturating_mul(4) >= base_rows.max(1)
+        || tombstones.saturating_mul(4) >= base_rows.max(1)
+}
+
+/// tvvf epochs do not share the state-generation lifecycle: a `.tvim` base
+/// rewrite must never sweep this only copy of original precision. Keep the live
+/// folded epoch and its immediate predecessor for recovery, then remove older
+/// independent tvvf epochs.
+fn gc_tvvf_epochs(dir: &Path, index_key: &str, live_epoch: u64) {
+    let generation_dir = crate::storage::commit_manifest::generation_dir(dir, index_key);
+    let Ok(entries) = fs::read_dir(&generation_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(epoch) = name
+            .strip_prefix("vf")
+            .and_then(|name| name.strip_suffix(".tvvf"))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if epoch.saturating_add(1) >= live_epoch {
+            continue;
+        }
+        let base = crate::storage::tvvf_base_path(dir, index_key, epoch);
+        let _ = fs::remove_file(&base);
+        let _ = fs::remove_dir_all(base.with_file_name(format!(
+            "{}{}",
+            base.file_name().unwrap_or_default().to_string_lossy(),
+            crate::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+        )));
+    }
+}
+
+fn tvvf_error(error: crate::storage::TvvfError) -> CoreError {
+    CoreError::new(CoreErrorCode::CorruptStore, error.to_string())
+}
+
 /// Writes a full base for one index (the cold-build / compaction path).
 fn write_index_base(
-    index: &VectorOnlyIndex,
+    index: &mut VectorOnlyIndex,
     dir: &Path,
     fsync: bool,
     store_text: bool,
@@ -4001,6 +4254,7 @@ fn write_index_base(
     compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
+    let tvvf_manifest = flush_tvvf(index, dir, fsync, generation)?;
     let tvim_base = tvim_base_for_index(index)?;
     let state = state_payload_for_index(index);
     let raw_text = if store_text {
@@ -4063,6 +4317,7 @@ fn write_index_base(
             lexical_tokens: Some(&lexical_tokens),
             multivec: Some(&multivec),
             ann,
+            tvvf_manifest,
             compress_text,
         },
         crate::storage::GenerationWriteOptions {
@@ -4095,7 +4350,7 @@ fn write_index_watermark(
 }
 
 fn write_index_delta(
-    index: &VectorOnlyIndex,
+    index: &mut VectorOnlyIndex,
     dir: &Path,
     fsync: bool,
     store_text: bool,
@@ -4103,6 +4358,7 @@ fn write_index_delta(
     compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
+    let tvvf_manifest = flush_tvvf(index, dir, fsync, generation)?;
     let upserted_documents = index
         .pending_upserts
         .iter()
@@ -4167,6 +4423,8 @@ fn write_index_delta(
             chunk_count_after: index.chunk_count(),
             tvim: build_tvim_delta(index)?,
             vectors_changed: index.pending_vectors_changed,
+            tvvf_manifest,
+            drop_tvvf_manifest: index.drop_tvvf_manifest,
             raw_text_upserts,
             raw_text_clears: index.pending_raw_text_clears.iter().cloned().collect(),
             lexical_upserts,
@@ -4494,6 +4752,25 @@ struct VectorOnlyIndex {
     vector_index: RefCell<Option<TurboVecNativeIndex>>,
     /// Opt-in ANN tuning; `None` keeps the index exact-scan only.
     ann_options: Option<CoreAnnOptions>,
+    /// Opt-in original-precision capture for a later rescore stage. The query
+    /// path deliberately does not consume this in this work package.
+    rescore_options: Option<CoreRescoreOptions>,
+    /// Caller-supplied rows, encoded at ingest before the live TurboVec index
+    /// quantizes them. A BTreeMap makes WAL replay and multi-producer folding
+    /// idempotent: a repeated stable id overwrites its pending payload.
+    pending_rescore_upserts: BTreeMap<u64, Vec<u8>>,
+    /// Installed sidecar reader from the committed manifest. This is separate
+    /// from TurboVec's reconstructed chunks, which must never seed tvvf.
+    tvvf_reader: RefCell<Option<crate::storage::TvvfReader>>,
+    /// Last committed (or just-flushed) tvvf manifest, including its independent
+    /// vf epoch. A generation base rewrite carries it forward unchanged.
+    tvvf_manifest: Option<crate::storage::TvvfManifestEntry>,
+    /// Set only when a committed sidecar could not be opened. This is distinct
+    /// from the normal lazy-reader state used by a newly created sidecar.
+    tvvf_sidecar_unavailable: bool,
+    /// Makes the next generation root omit `tvvf` instead of carrying a known
+    /// stale sidecar manifest forward.
+    drop_tvvf_manifest: bool,
     /// Lazily-built cluster index for ANN candidate generation; `None` means
     /// "dirty, rebuild on the next ANN query". Interior mutability keeps the
     /// query path read-only, mirroring `vector_index`.
@@ -4543,6 +4820,48 @@ struct VectorOnlyIndex {
 }
 
 impl VectorOnlyIndex {
+    fn rescore_dtype(&self) -> Option<crate::storage::TvvfDtype> {
+        self.rescore_options.as_ref().map(|options| {
+            match options.dtype.as_deref().unwrap_or("float16") {
+                "float16" => crate::storage::TvvfDtype::Float16,
+                "float32" => crate::storage::TvvfDtype::Float32,
+                "int8" => crate::storage::TvvfDtype::Int8,
+                // `validate_rescore_options` rejects all other values at create
+                // and drops malformed persisted options before construction.
+                _ => unreachable!("validated rescore dtype"),
+            }
+        })
+    }
+
+    /// Opens the original-precision sidecar only for a query stage that needs
+    /// it. Ingest leaves an absent reader absent, so a newly created sidecar
+    /// never pays a base-wide ID scan on its commit path.
+    #[allow(dead_code)]
+    fn ensure_tvvf_reader(&self, dir: &Path) -> Result<bool, CoreError> {
+        if self.tvvf_reader.borrow().is_some() {
+            return Ok(true);
+        }
+        if self.tvvf_sidecar_unavailable {
+            return Ok(false);
+        }
+        let Some(manifest) = self.tvvf_manifest.as_ref() else {
+            return Ok(false);
+        };
+        match crate::storage::TvvfReader::open(dir, manifest) {
+            Ok(reader) => {
+                *self.tvvf_reader.borrow_mut() = Some(reader);
+                Ok(true)
+            }
+            Err(error) => {
+                eprintln!(
+                    "lodedb: unavailable tvvf sidecar for index {}; rescore disabled: {error}",
+                    self.index_key
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn new(options: CoreIndexCreateOptions) -> Self {
         Self {
             index_id: options.index_id,
@@ -4567,6 +4886,12 @@ impl VectorOnlyIndex {
             lexical_index: Bm25Index::empty(),
             vector_index: RefCell::new(None),
             ann_options: options.ann,
+            rescore_options: options.rescore,
+            pending_rescore_upserts: BTreeMap::new(),
+            tvvf_reader: RefCell::new(None),
+            tvvf_manifest: None,
+            tvvf_sidecar_unavailable: false,
+            drop_tvvf_manifest: false,
             cluster_index: RefCell::new(None),
             field_indexes: BTreeMap::new(),
             all_docs: DocSet::new(),
@@ -4630,8 +4955,8 @@ impl VectorOnlyIndex {
             index.stable_ids_for_chunks(&chunk_ids)
         };
         // Rows written this cycle are no longer "removed" relative to the base.
-        for stable_id in readded {
-            self.pending_removed_stable_ids.remove(&stable_id);
+        for stable_id in &readded {
+            self.pending_removed_stable_ids.remove(stable_id);
         }
         // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
         // metadata-only change, whose caller still routes through here) alters no
@@ -4641,6 +4966,17 @@ impl VectorOnlyIndex {
         // cluster index is stale and the next ANN query rebuilds it from the
         // current documents, keeping a newly-added vector clustered and findable.
         if !chunks.is_empty() {
+            if let Some(dtype) = self.rescore_dtype() {
+                for (chunk, stable_id) in chunks.iter().zip(&readded) {
+                    let encoded = crate::storage::tvvf_store::encode_row(
+                        dtype,
+                        self.vector_dim,
+                        &chunk.embedding,
+                    )
+                    .map_err(tvvf_error)?;
+                    self.pending_rescore_upserts.insert(*stable_id, encoded);
+                }
+            }
             self.pending_vectors_changed = true;
             self.cluster_index.get_mut().take();
         }
@@ -4665,6 +5001,9 @@ impl VectorOnlyIndex {
             return;
         }
         self.pending_removed_stable_ids.extend(removed);
+        for stable_id in &self.pending_removed_stable_ids {
+            self.pending_rescore_upserts.remove(stable_id);
+        }
         // The vector set changed: record the shared signal (drives the `.tvann`
         // drop at commit) and drop the cluster index so a removed vector cannot
         // linger in a stale posting; the next ANN query rebuilds from live rows.
@@ -5556,6 +5895,9 @@ fn validate_index_options(options: &CoreIndexCreateOptions) -> Result<(), CoreEr
     if let Some(ann) = &options.ann {
         validate_ann_options(ann)?;
     }
+    if let Some(rescore) = &options.rescore {
+        validate_rescore_options(rescore)?;
+    }
     Ok(())
 }
 
@@ -5576,6 +5918,32 @@ fn validate_ann_options(ann: &CoreAnnOptions) -> Result<(), CoreError> {
     }
     if ann.nprobe == Some(0) {
         return invalid("ann.nprobe must be positive");
+    }
+    Ok(())
+}
+
+/// Validates original-precision capture configuration. Shared by creation and
+/// reopen: create rejects unsupported settings, while a malformed persisted value
+/// is filtered out during load so the base vector store remains available.
+fn validate_rescore_options(rescore: &CoreRescoreOptions) -> Result<(), CoreError> {
+    if rescore.mode != CoreRescoreOptions::ORIGINAL {
+        return invalid(format!(
+            "unsupported rescore mode: {} (expected {})",
+            rescore.mode,
+            CoreRescoreOptions::ORIGINAL
+        ));
+    }
+    match rescore.dtype.as_deref().unwrap_or("float16") {
+        "float16" | "float32" | "int8" => {}
+        dtype => {
+            return invalid(format!(
+                "unsupported rescore dtype: {dtype} (expected float16, float32, or int8)"
+            ));
+        }
+    }
+    let oversample = rescore.oversample.unwrap_or(4.0);
+    if !oversample.is_finite() || oversample < 1.0 {
+        return invalid("rescore.oversample must be finite and at least 1.0");
     }
     Ok(())
 }
