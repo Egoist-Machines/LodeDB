@@ -48,6 +48,19 @@ Encoded rows are only portable between indexes with equal
 `add_encoded` (the delta store records the fingerprint per segment and
 fails closed on mismatch).
 
+## Cluster-contiguous physical layout
+
+Added for LodeDB's cluster-pruned SIMD scan path:
+
+- `turbovec/src/lib.rs`: `TurboQuantIndex::permute_rows` (`pub(crate)`), an
+  in-place cycle-following row permutation with one row-sized scratch buffer;
+  `perm[new_slot] = old_slot` and every permutation invalidates the derived
+  blocked SIMD cache.
+- `turbovec/src/error.rs`: `TurboVecError` for validated ID-order requests.
+- `turbovec/src/id_map.rs`: `IdMapIndex::reorder_to_ids`, which validates an
+  exact stable-id permutation before reordering quantized rows and rebuilding
+  the slot/id maps.
+
 ## Row reconstruction surface (GPU-resident exact serving)
 
 Added for LodeDB's GPU-resident exact batch path:

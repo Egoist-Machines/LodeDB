@@ -3889,6 +3889,7 @@ fn persist_index_generation(
         )?;
 
     if needs_base {
+        index.reorder_for_cluster_layout();
         write_index_base(
             index,
             dir,
@@ -5082,6 +5083,24 @@ impl VectorOnlyIndex {
             clusters.push(chunk_ids);
         }
         Ok(Some(clusters))
+    }
+
+    fn reorder_for_cluster_layout(&mut self) {
+        if !self.ann_prunes() {
+            return;
+        }
+        let ids = {
+            let cluster = self.cluster_index.borrow();
+            let Some(cluster) = cluster.as_ref() else {
+                return;
+            };
+            cluster.postings().iter().flatten().copied().collect::<Vec<_>>()
+        };
+        let mut live = self.vector_index.borrow_mut();
+        let Some(live) = live.as_mut() else {
+            return;
+        };
+        let _ = live.reorder_slots(&ids);
     }
 
     /// Number of clusters to build: the configured override, else a `sqrt(n)`

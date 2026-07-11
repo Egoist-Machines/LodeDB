@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
+use lodedb_core::stable_uint64_ids_for_chunk_ids;
 use lodedb_core::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
     CoreVectorDocument,
@@ -12,6 +13,7 @@ use lodedb_core::types::{
 use lodedb_core::vector::index::CoreVectorChunk;
 use lodedb_core::vector::turbovec::TurboVecNativeIndex;
 use serde_json::{json, Value};
+use turbovec::IdMapIndex;
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3860,6 +3862,117 @@ fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
     assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn warm_ann_base_uses_cluster_contiguous_slots_and_reopens() {
+    let path = unique_temp_dir("core_ann_cluster_layout");
+    let before = {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let hits = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        assert!(engine.ann_cluster_resident("default").unwrap());
+        engine.persist().unwrap();
+
+        let loaded = lodedb_core::storage::load_store(
+            &path,
+            INDEX_KEY,
+            lodedb_core::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )
+        .unwrap();
+        let posting_ids: Vec<String> = loaded
+            .ann
+            .as_ref()
+            .expect("warm ANN base must persist the cluster assignment")
+            .postings
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let expected_slots = stable_uint64_ids_for_chunk_ids(&posting_ids);
+        let persisted = IdMapIndex::load(loaded.tvim_path.unwrap()).unwrap();
+        assert_eq!(persisted.reconstruct_all().0, expected_slots);
+        hits.hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.chunk_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(reopened.ann_cluster_resident("default").unwrap());
+    let after = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap()
+        .hits
+        .iter()
+        .map(|hit| (hit.document_id.clone(), hit.chunk_id.clone(), hit.score.to_bits()))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn cluster_reordered_base_replays_stable_id_delta() {
+    let path = unique_temp_dir("core_ann_cluster_delta");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        engine
+            .upsert_vectors("default", &[vector_doc("delta", axis_query(6))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let hits = reopened
+        .query_vector(
+            "default",
+            &axis_query(6),
+            1,
+            Some(&json!({"document_ids": ["delta"]})),
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "delta");
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn ann_disabled_base_writes_are_byte_identical() {
+    let first = unique_temp_dir("core_exact_tvim_first");
+    let second = unique_temp_dir("core_exact_tvim_second");
+    for path in [&first, &second] {
+        let mut engine = CoreEngine::open(open_options(path, false, "wal")).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        engine.persist().unwrap();
+    }
+    let read_tvim = |path: &Path| {
+        let loaded = lodedb_core::storage::load_store(
+            path,
+            INDEX_KEY,
+            lodedb_core::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )
+        .unwrap();
+        fs::read(loaded.tvim_path.unwrap()).unwrap()
+    };
+    assert_eq!(read_tvim(&first), read_tvim(&second));
+    assert!(!has_file_with_ext(&first, "tvann"));
+    assert!(!has_file_with_ext(&second, "tvann"));
+    fs::remove_dir_all(first).unwrap();
+    fs::remove_dir_all(second).unwrap();
 }
 
 #[test]
