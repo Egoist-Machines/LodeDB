@@ -4324,6 +4324,65 @@ fn apply_wal_records_refuses_invalid_batches_and_handles() {
 }
 
 #[test]
+fn apply_wal_records_refuses_malformed_payloads() {
+    // The replay boundary ingests externally produced segments: a payload with
+    // a missing key, a non-string id, or a non-numeric embedding coordinate
+    // must fail closed -- never silently no-op as "applied" or coerce garbage
+    // into the index -- and must not advance the watermark.
+    let path = generation_store("core_segment_malformed_payloads");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let record = |op: &str, payload: serde_json::Value| WalRecord {
+        op: op.to_string(),
+        payload,
+        lsn: Some(floor + 1),
+    };
+    let cases = vec![
+        (record("delete_documents", json!({})), "missing document_ids"),
+        (
+            record("delete_documents", json!({"document_ids": ["a", 7]})),
+            "must be strings",
+        ),
+        (record("upsert_vectors", json!({})), "missing vectors"),
+        (
+            record(
+                "upsert_vectors",
+                json!({"vectors": [{
+                    "document_id": "v",
+                    "vector": [1.0, "garbage", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }]}),
+            ),
+            "non-numeric coordinate",
+        ),
+        (
+            record(
+                "apply_embedded_documents",
+                json!({"documents": [], "added_chunks": [{
+                    "chunk_id": "c",
+                    "embedding": [null, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }]}),
+            ),
+            "non-numeric coordinate",
+        ),
+    ];
+    for (poisoned, needle) in cases {
+        let error = engine.apply_wal_records("default", &[poisoned]).unwrap_err();
+        assert!(error.to_string().contains(needle), "{error}");
+        assert_eq!(
+            engine.applied_lsn("default").unwrap(),
+            floor,
+            "a refused payload must not advance the watermark"
+        );
+    }
+    // A well-formed empty delete stays a valid no-op: refusing it could wedge
+    // replay of a legacy local WAL tail.
+    let empty = record("delete_documents", json!({"document_ids": []}));
+    assert_eq!(engine.apply_wal_records("default", &[empty]).unwrap(), 1);
+    drop(engine);
+    fs::remove_dir_all(&path).unwrap();
+}
+
+#[test]
 fn discard_drops_unpersisted_folds_and_releases_the_writer_lock() {
     // The fold abort path: a batch applied in memory but never persisted must
     // vanish on discard() -- a graceful close() would persist it -- and the

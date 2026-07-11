@@ -1717,32 +1717,42 @@ impl CoreEngine {
     ) -> Result<(), CoreError> {
         match record.op.as_str() {
             "upsert_vectors" => {
-                let documents = record
+                // Strict shape: `apply_wal_records` replays externally produced
+                // segments, so a payload without the expected key fails closed
+                // instead of silently counting a no-op record as applied.
+                let vectors = record
                     .payload
                     .get("vectors")
                     .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
+                    .ok_or_else(|| invalid_err("wal upsert_vectors missing vectors"))?;
+                let documents = vectors
+                    .iter()
                     .map(vector_document_from_wal)
                     .collect::<Result<Vec<_>, _>>()?;
                 self.upsert_vectors(index_id, &documents)?;
                 // Restore lexical caption tokens captured in the WAL. Needed when
                 // store_text was off (so raw text was not written and upsert_vectors
                 // re-derived no tokens) but index_text retained the caption tokens.
-                if let Some(vectors) = record.payload.get("vectors").and_then(Value::as_array) {
-                    self.restore_wal_vector_tokens(index_id, vectors)?;
-                }
+                self.restore_wal_vector_tokens(index_id, vectors)?;
             }
             "delete_documents" => {
+                // Same strictness as upsert_vectors, per element too: silently
+                // dropping a non-string id would count the record as applied
+                // while deleting nothing. An empty (but well-formed) list stays
+                // a valid no-op — refusing it could wedge replay of a legacy
+                // local WAL tail.
                 let document_ids = record
                     .payload
                     .get("document_ids")
                     .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
+                    .ok_or_else(|| invalid_err("wal delete_documents missing document_ids"))?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(ToString::to_string).ok_or_else(|| {
+                            invalid_err("wal delete_documents document_ids must be strings")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.delete_documents(index_id, &document_ids)?;
             }
             "apply_embedded_documents" => {
@@ -1908,8 +1918,17 @@ impl CoreEngine {
                     .and_then(Value::as_array)
                     .ok_or_else(|| invalid_err("WAL added chunk missing embedding"))?
                     .iter()
-                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
-                    .collect::<Vec<_>>();
+                    .map(|value| {
+                        // Fail closed, not 0.0: `apply_wal_records` replays
+                        // externally produced segments, and a coerced coordinate
+                        // silently corrupts the folded vector. (serde_json also
+                        // renders a non-finite float as null; sanctioned builders
+                        // validate finiteness before encoding.)
+                        value.as_f64().map(|coord| coord as f32).ok_or_else(|| {
+                            invalid_err("WAL added chunk embedding has a non-numeric coordinate")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if vector.len() != index.vector_dim {
                     return invalid("WAL added chunk embedding dimension does not match index");
                 }
@@ -4320,8 +4339,18 @@ fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreErr
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_err("WAL vector payload missing vector"))?
         .iter()
-        .map(|value| value.as_f64().unwrap_or(0.0) as f32)
-        .collect::<Vec<_>>();
+        .map(|value| {
+            // Fail closed: `apply_wal_records` replays externally produced
+            // segments, and coercing a non-numeric coordinate to 0.0 would
+            // silently corrupt the folded vector. (serde_json also renders a
+            // non-finite float as null; sanctioned builders validate
+            // finiteness before encoding, so this only fires on garbage.)
+            value
+                .as_f64()
+                .map(|coord| coord as f32)
+                .ok_or_else(|| invalid_err("WAL vector payload has a non-numeric coordinate"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let metadata = metadata_from_value(value.get("metadata").unwrap_or(&Value::Null));
     let text = value
         .get("text")
