@@ -1,6 +1,6 @@
 //! Native core engine.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -1074,6 +1074,7 @@ impl CoreEngine {
                 total_considered: 0,
             });
         }
+        self.ensure_rescore_reader_for_query(index)?;
         match index.query_vector_turbovec(query_vector, top_k, filter) {
             Ok(results) => Ok(results),
             Err(error) if error.code() == CoreErrorCode::Unsupported => {
@@ -1242,6 +1243,7 @@ impl CoreEngine {
                 })
                 .collect());
         }
+        self.ensure_rescore_reader_for_query(index)?;
         match index.query_vectors_batch_turbovec(query_vectors, top_k, filter) {
             Ok(results) => Ok(results),
             Err(error) if error.code() == CoreErrorCode::Unsupported => query_vectors
@@ -1288,7 +1290,21 @@ impl CoreEngine {
                 metadata: Vec::new(),
             });
         }
+        self.ensure_rescore_reader_for_query(index)?;
         index.query_vectors_batch_arrays_turbovec(queries, nq, top_k, filter)
+    }
+
+    /// Opens a just-committed sidecar lazily, only when this create-time opt-in
+    /// has a manifest but no resident reader. Fresh writes retain their cheap
+    /// commit path; the first query pays the index read if it can use originals.
+    fn ensure_rescore_reader_for_query(&self, index: &VectorOnlyIndex) -> Result<(), CoreError> {
+        if !index.rescore_reader_needs_open() {
+            return Ok(());
+        }
+        if let Some(persistence) = &self.persistence {
+            index.ensure_tvvf_reader(&persistence.path)?;
+        }
+        Ok(())
     }
 
     /// Returns metrics-only stats for an index.
@@ -3385,9 +3401,9 @@ fn index_from_loaded_store(
         // sidecar files untouched and disable only this session's future rescore.
         .filter(|rescore| validate_rescore_options(rescore).is_ok());
     let tvvf_manifest = loaded.tvvf_manifest.clone();
-    let tvvf_sidecar_unavailable = rescore_options.is_some()
-        && tvvf_manifest.is_some()
-        && loaded.tvvf_reader.is_none();
+    let tvvf_sidecar_unavailable = Cell::new(
+        rescore_options.is_some() && tvvf_manifest.is_some() && loaded.tvvf_reader.is_none(),
+    );
     let tvvf_reader = if rescore_options.is_some() {
         loaded.tvvf_reader
     } else {
@@ -3957,7 +3973,7 @@ fn persist_index_generation(
     index.pending_removed_stable_ids.clear();
     index.pending_rescore_upserts.clear();
     index.drop_tvvf_manifest = false;
-    index.tvvf_sidecar_unavailable = false;
+    index.tvvf_sidecar_unavailable.set(false);
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
     // writable handle's `applied_lsn()` reports the committed generation (the
@@ -4041,7 +4057,7 @@ fn flush_tvvf(
         // session cannot use it, but a fail-open load must not delete or orphan it.
         return Ok(index.tvvf_manifest.clone());
     };
-    if index.tvvf_sidecar_unavailable && index.tvvf_manifest.is_some() {
+    if index.tvvf_sidecar_unavailable.get() && index.tvvf_manifest.is_some() {
         if changed {
             // The `.tvim` delta is about to advance without a corresponding
             // original-precision update. Do not carry stale originals into the
@@ -4767,7 +4783,7 @@ struct VectorOnlyIndex {
     tvvf_manifest: Option<crate::storage::TvvfManifestEntry>,
     /// Set only when a committed sidecar could not be opened. This is distinct
     /// from the normal lazy-reader state used by a newly created sidecar.
-    tvvf_sidecar_unavailable: bool,
+    tvvf_sidecar_unavailable: Cell<bool>,
     /// Makes the next generation root omit `tvvf` instead of carrying a known
     /// stale sidecar manifest forward.
     drop_tvvf_manifest: bool,
@@ -4836,12 +4852,11 @@ impl VectorOnlyIndex {
     /// Opens the original-precision sidecar only for a query stage that needs
     /// it. Ingest leaves an absent reader absent, so a newly created sidecar
     /// never pays a base-wide ID scan on its commit path.
-    #[allow(dead_code)]
     fn ensure_tvvf_reader(&self, dir: &Path) -> Result<bool, CoreError> {
         if self.tvvf_reader.borrow().is_some() {
             return Ok(true);
         }
-        if self.tvvf_sidecar_unavailable {
+        if self.tvvf_sidecar_unavailable.get() {
             return Ok(false);
         }
         let Some(manifest) = self.tvvf_manifest.as_ref() else {
@@ -4853,6 +4868,10 @@ impl VectorOnlyIndex {
                 Ok(true)
             }
             Err(error) => {
+                // Latch the failure: later queries skip the retry (and its log),
+                // and the next vector-changing commit sees the unavailable state
+                // and stops carrying the stale manifest forward.
+                self.tvvf_sidecar_unavailable.set(true);
                 eprintln!(
                     "lodedb: unavailable tvvf sidecar for index {}; rescore disabled: {error}",
                     self.index_key
@@ -4860,6 +4879,16 @@ impl VectorOnlyIndex {
                 Ok(false)
             }
         }
+    }
+
+    /// The persisted sidecar exists but has not been indexed in this process.
+    /// Keeping this separate from `rescore_applies` makes a corrupt-sidecar
+    /// fail-open indistinguishable from the legacy plain path after one attempt.
+    fn rescore_reader_needs_open(&self) -> bool {
+        self.rescore_options.is_some()
+            && self.tvvf_reader.borrow().is_none()
+            && self.tvvf_manifest.is_some()
+            && !self.tvvf_sidecar_unavailable.get()
     }
 
     fn new(options: CoreIndexCreateOptions) -> Self {
@@ -4890,7 +4919,7 @@ impl VectorOnlyIndex {
             pending_rescore_upserts: BTreeMap::new(),
             tvvf_reader: RefCell::new(None),
             tvvf_manifest: None,
-            tvvf_sidecar_unavailable: false,
+            tvvf_sidecar_unavailable: Cell::new(false),
             drop_tvvf_manifest: false,
             cluster_index: RefCell::new(None),
             field_indexes: BTreeMap::new(),
@@ -5183,6 +5212,10 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
+        let rescore = self.rescore_applies();
+        if rescore {
+            return self.query_vector_turbovec_rescored(query_vector, top_k, filter);
+        }
         let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
         if empty_filter {
             return Ok(CoreSearchResults {
@@ -5213,6 +5246,123 @@ impl VectorOnlyIndex {
             hits: self.assemble_vector_hits(raw_hits),
             total_considered,
         })
+    }
+
+    /// Runs the opt-in two-stage vector path. The first-stage scan remains the
+    /// TurboVec authority for candidate generation; original rows only replace a
+    /// candidate score when they are available and checksum-valid.
+    fn query_vector_turbovec_rescored(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
+            return Ok(CoreSearchResults {
+                hits: Vec::new(),
+                total_considered,
+            });
+        }
+        let ann = self.ann_should_prune(filter);
+        let scan_capacity = if ann || filter.is_none() {
+            self.live_chunk_count()
+        } else {
+            allowlist.len()
+        };
+        let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
+        let ann_allowlist = if ann {
+            self.ann_candidate_stable_ids(query_vector, candidate_k)?
+        } else {
+            None
+        };
+        let index = self.turbovec_index()?;
+        let raw_hits = match &ann_allowlist {
+            Some(stable_ids) => {
+                index.search_with_stable_allowlist(query_vector, candidate_k, stable_ids)?
+            }
+            None => index.search(query_vector, candidate_k, &allowlist)?,
+        };
+        Ok(CoreSearchResults {
+            hits: self.assemble_vector_hits(self.rescore_raw_hits(query_vector, raw_hits, top_k)),
+            total_considered,
+        })
+    }
+
+    /// True only when the create-time opt-in has rows that could improve a query.
+    /// This is intentionally a narrow query-entry gate: without persisted rescore
+    /// options, the exact scan path cannot reach any two-stage work.
+    fn rescore_applies(&self) -> bool {
+        self.rescore_options.is_some()
+            && (!self.pending_rescore_upserts.is_empty() || self.tvvf_reader.borrow().is_some())
+    }
+
+    /// Candidate count for the first stage. Validation guarantees a finite factor
+    /// of at least one, and the scan still owns its normal final clamp.
+    fn rescore_candidate_count(&self, top_k: usize, scan_capacity: usize) -> usize {
+        let oversample = self
+            .rescore_options
+            .as_ref()
+            .expect("rescore candidate count requires rescore options")
+            .oversample
+            .unwrap_or(4.0) as f64;
+        ((oversample * top_k as f64).ceil() as usize).min(scan_capacity)
+    }
+
+    /// Replaces candidate scores from pending captures first, then one batched
+    /// sidecar read. A missing or corrupt row deliberately retains its TurboVec
+    /// score so partial sidecar coverage never removes a candidate.
+    fn rescore_raw_hits(
+        &self,
+        query_vector: &[f32],
+        mut hits: Vec<VectorSearchHit>,
+        top_k: usize,
+    ) -> Vec<VectorSearchHit> {
+        let dtype = self
+            .rescore_dtype()
+            .expect("rescore path requires rescore options");
+        let mut missing_ids = Vec::new();
+        let mut missing_positions = Vec::new();
+        for (position, hit) in hits.iter_mut().enumerate() {
+            if let Some(bytes) = self.pending_rescore_upserts.get(&hit.stable_id) {
+                let row = crate::storage::tvvf_store::decode_row(dtype, self.vector_dim, bytes);
+                let exact = dot(query_vector, &row);
+                // A float16 overflow decodes to infinity; a non-finite dot would
+                // collapse the ranking to tie-breaks, so keep the quantized score.
+                if exact.is_finite() {
+                    hit.score = exact;
+                }
+            } else {
+                missing_ids.push(hit.stable_id);
+                missing_positions.push(position);
+            }
+        }
+        if !missing_ids.is_empty() {
+            if let Some(reader) = self.tvvf_reader.borrow().as_ref() {
+                for (position, row) in missing_positions
+                    .into_iter()
+                    .zip(reader.fetch_rows(&missing_ids))
+                {
+                    if let Some(row) = row {
+                        let exact = dot(query_vector, &row);
+                        if exact.is_finite() {
+                            hits[position].score = exact;
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+                .then_with(|| left.stable_id.cmp(&right.stable_id))
+        });
+        hits.truncate(top_k);
+        hits
     }
 
     /// Maps raw TurboVec hits to search hits, attaching each document's metadata
@@ -5496,6 +5646,10 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        let rescore = self.rescore_applies();
+        if rescore {
+            return self.query_vectors_batch_turbovec_rescored(query_vectors, top_k, filter);
+        }
         // ANN candidate selection is per-query (each query probes different
         // clusters), so a batch cannot share one candidate allowlist. When ANN
         // would prune, resolve each query's candidates first: if at least one
@@ -5550,6 +5704,72 @@ impl VectorOnlyIndex {
             .collect())
     }
 
+    fn query_vectors_batch_turbovec_rescored(
+        &self,
+        query_vectors: &[Vec<f32>],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        let ann = self.ann_should_prune(filter);
+        if ann {
+            let candidate_k = self.rescore_candidate_count(top_k, self.live_chunk_count());
+            let allowlists = query_vectors
+                .iter()
+                .map(|query| self.ann_candidate_stable_ids(query, candidate_k))
+                .collect::<Result<Vec<_>, _>>()?;
+            if allowlists.iter().any(Option::is_some) {
+                let total_considered = self.all_docs.len();
+                let index = self.turbovec_index()?;
+                return query_vectors
+                    .iter()
+                    .zip(&allowlists)
+                    .map(|(query, allowlist)| {
+                        let raw_hits = match allowlist {
+                            Some(stable_ids) => index.search_with_stable_allowlist(
+                                query,
+                                candidate_k,
+                                stable_ids,
+                            )?,
+                            None => index.search(query, candidate_k, &[])?,
+                        };
+                        Ok(CoreSearchResults {
+                            hits: self.assemble_vector_hits(
+                                self.rescore_raw_hits(query, raw_hits, top_k),
+                            ),
+                            total_considered,
+                        })
+                    })
+                    .collect();
+            }
+        }
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
+            return Ok(query_vectors
+                .iter()
+                .map(|_| CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered,
+                })
+                .collect());
+        }
+        let scan_capacity = if filter.is_none() {
+            self.live_chunk_count()
+        } else {
+            allowlist.len()
+        };
+        let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
+        let index = self.turbovec_index()?;
+        Ok(index
+            .search_batch(query_vectors, candidate_k, &allowlist)?
+            .into_iter()
+            .zip(query_vectors)
+            .map(|(raw_hits, query)| CoreSearchResults {
+                hits: self.assemble_vector_hits(self.rescore_raw_hits(query, raw_hits, top_k)),
+                total_considered,
+            })
+            .collect())
+    }
+
     /// Arrays-output counterpart of [`Self::query_vectors_batch_turbovec`]: runs the
     /// flat batch scan and attaches metadata per document id, returning flat
     /// `[nq * k]` arrays rather than per-hit structs. Metadata is looked up the same
@@ -5567,12 +5787,13 @@ impl VectorOnlyIndex {
         // results into the flat arrays, rather than duplicating the routing
         // decision and a bespoke packer. A non-pruning config keeps the optimized
         // flat shared/GPU batch scan below.
-        if self.ann_should_prune(filter) {
+        let rescore = self.rescore_applies();
+        if rescore || self.ann_should_prune(filter) {
             let dim = self.vector_dim;
             let query_vectors: Vec<Vec<f32>> = (0..nq)
                 .map(|i| queries[i * dim..(i + 1) * dim].to_vec())
                 .collect();
-            let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, None)?;
+            let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, filter)?;
             return Ok(pack_results_to_arrays(&results, nq));
         }
         let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;

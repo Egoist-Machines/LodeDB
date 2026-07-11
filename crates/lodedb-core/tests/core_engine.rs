@@ -10,6 +10,7 @@ use lodedb_core::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreRescoreOptions,
     CoreSearchResults, CoreVectorDocument,
 };
+use lodedb_core::vector::ann::ClusterIndex;
 use lodedb_core::vector::index::CoreVectorChunk;
 use lodedb_core::vector::turbovec::TurboVecNativeIndex;
 use serde_json::{json, Value};
@@ -4165,13 +4166,91 @@ fn exact_store_writes_no_tvann_sidecar() {
 // --- Opt-in original-precision tvvf capture (rescore query stage follows later) ---
 
 fn rescore_options(dtype: &str) -> CoreIndexCreateOptions {
+    rescore_options_with_oversample(dtype, None)
+}
+
+fn rescore_options_with_oversample(
+    dtype: &str,
+    oversample: Option<f32>,
+) -> CoreIndexCreateOptions {
     let mut options = CoreIndexCreateOptions::native_default("default", 8, 4);
     options.rescore = Some(CoreRescoreOptions {
         mode: CoreRescoreOptions::ORIGINAL.to_string(),
         dtype: Some(dtype.to_string()),
-        oversample: None,
+        oversample,
     });
     options
+}
+
+fn fp32_dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(left, right)| left * right).sum()
+}
+
+fn exact_fp32_hits(
+    documents: &[CoreVectorDocument],
+    query: &[f32],
+    allowed: Option<&BTreeMap<String, ()>>,
+    top_k: usize,
+) -> Vec<(String, f32)> {
+    let mut hits = documents
+        .iter()
+        .filter(|document| {
+            allowed.is_none_or(|allowed| allowed.contains_key(&document.document_id))
+        })
+        .map(|document| (document.document_id.clone(), fp32_dot(query, &document.vector)))
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap()
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    hits.truncate(top_k);
+    hits
+}
+
+/// Rows with tightly spaced exact scores and varied components orthogonal to the
+/// query. Four-bit reconstruction reliably changes their order while fp32 dots
+/// retain the deliberately assigned score ladder.
+fn rescore_boundary_docs() -> (Vec<CoreVectorDocument>, Vec<f32>) {
+    let query = vec![0.43, -0.37, 0.29, -0.23, 0.19, -0.17, 0.13, -0.11];
+    let query_norm_sq = fp32_dot(&query, &query);
+    let documents = (0..16)
+        .map(|index| {
+            let mut vector = (0..8)
+                .map(|dimension| {
+                    let code = (index * 17 + dimension * 11 + 3) % 29;
+                    (code as f32 - 14.0) * 0.13
+                })
+                .collect::<Vec<_>>();
+            let projection = fp32_dot(&query, &vector) / query_norm_sq;
+            for (value, query_value) in vector.iter_mut().zip(&query) {
+                *value -= projection * query_value;
+            }
+            let score = 0.7 + index as f32 * 0.0001;
+            for (value, query_value) in vector.iter_mut().zip(&query) {
+                *value += score * query_value / query_norm_sq;
+            }
+            vector_doc(&format!("boundary-{index:02}"), vector)
+        })
+        .collect();
+    (documents, query)
+}
+
+fn rescore_engine(
+    documents: &[CoreVectorDocument],
+    oversample: f32,
+) -> CoreEngine {
+    let mut engine = CoreEngine::new_in_memory();
+    engine
+        .create_index_with_options(rescore_options_with_oversample(
+            "float32",
+            Some(oversample),
+        ))
+        .unwrap();
+    engine.upsert_vectors("default", documents).unwrap();
+    engine
 }
 
 fn rescore_vector(id: &str, offset: f32) -> CoreVectorDocument {
@@ -4279,6 +4358,362 @@ fn rescore_float32_and_int8_round_trip() {
         assert_rows_close(captured, &original.vector, tolerance);
         fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[test]
+fn rescore_lifts_four_bit_recall_for_full_and_filtered_queries() {
+    let (documents, query) = rescore_boundary_docs();
+    let expected = exact_fp32_hits(&documents, &query, None, 3);
+    let plain = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let plain_ids = plain
+        .hits
+        .iter()
+        .map(|hit| hit.document_id.clone())
+        .collect::<Vec<_>>();
+    let expected_ids = expected
+        .iter()
+        .map(|(document_id, _)| document_id.clone())
+        .collect::<Vec<_>>();
+    assert_ne!(
+        plain_ids, expected_ids,
+        "the boundary fixture must prove four-bit stage-one misordering"
+    );
+
+    let engine = rescore_engine(&documents, 32.0);
+    let rescored = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        rescored
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    for (hit, (_, score)) in rescored.hits.iter().zip(&expected) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+
+    let allowed = ["boundary-03", "boundary-07", "boundary-11", "boundary-15"]
+        .into_iter()
+        .map(|document_id| (document_id.to_string(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let expected_filtered = exact_fp32_hits(&documents, &query, Some(&allowed), 3);
+    let filter = json!({"document_ids": allowed.keys().collect::<Vec<_>>()});
+    let filtered = engine
+        .query_vector("default", &query, 3, Some(&filter))
+        .unwrap();
+    assert_eq!(
+        filtered
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected_filtered
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect::<Vec<_>>()
+    );
+    for (hit, (_, score)) in filtered.hits.iter().zip(&expected_filtered) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+}
+
+#[test]
+fn rescore_uses_pending_captures_before_persist() {
+    let (documents, query) = rescore_boundary_docs();
+    let engine = rescore_engine(&documents, 32.0);
+    let expected = exact_fp32_hits(&documents, &query, None, 3);
+    let hits = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(document_id, score)| (document_id.clone(), score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rescore_ann_candidates_are_rescored_before_truncation() {
+    let path = unique_temp_dir("rescore_ann");
+    let documents = blob_docs();
+    let query = axis_query(0);
+    // This matching no-rescore index gives us the exact stage-one R hits. Four
+    // balanced blobs and one probe mean the five-row nearest cluster is a true
+    // prune, so these are the candidates available to the rescore stage.
+    let plain_ann = ann_engine(&documents, 4, 1);
+    let stage_one = plain_ann.query_vector("default", &query, 3, None).unwrap();
+    assert!(plain_ann.ann_cluster_resident("default").unwrap());
+    let allowed = stage_one
+        .hits
+        .iter()
+        .map(|hit| (hit.document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = exact_fp32_hits(&documents, &query, Some(&allowed), 3);
+
+    let mut options = rescore_options_with_oversample("float32", Some(1.0));
+    options.ann = Some(CoreAnnOptions {
+        algorithm: CoreAnnOptions::CLUSTER.to_string(),
+        clusters: Some(4),
+        nprobe: Some(1),
+    });
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(options).unwrap();
+    engine.upsert_vectors("default", &documents).unwrap();
+    assert!(!engine.ann_cluster_resident("default").unwrap());
+    let _ = engine.query_vector("default", &query, 3, None).unwrap();
+    assert!(
+        engine.ann_cluster_resident("default").unwrap(),
+        "the true-prune configuration must build the ANN candidate index"
+    );
+    engine.persist().unwrap();
+
+    let chunks = documents
+        .iter()
+        .map(|document| {
+            CoreVectorChunk::new(
+                document.document_id.clone(),
+                document.document_id.clone(),
+                document.vector.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let native = TurboVecNativeIndex::load(
+        loaded.tvim_path.as_ref().unwrap(),
+        &chunks,
+        loaded.generation,
+    )
+    .unwrap();
+    let (chunk_ids, stable_ids, rows) = native.reconstruct_all_chunks();
+    let mut entries = chunk_ids
+        .iter()
+        .zip(&stable_ids)
+        .enumerate()
+        .map(|(position, (chunk_id, stable_id))| (chunk_id.as_str(), *stable_id, position))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    let cluster_entries = entries
+        .iter()
+        .map(|(chunk_id, stable_id, position)| {
+            (*chunk_id, *stable_id, &rows[position * 8..(position + 1) * 8])
+        })
+        .collect::<Vec<_>>();
+    let assignment = loaded.ann.as_ref().unwrap();
+    let cluster = ClusterIndex::from_assignment(
+        &cluster_entries,
+        assignment.dim,
+        assignment.postings.clone(),
+        native.rotation_matrix(),
+    )
+    .unwrap();
+    assert!(
+        cluster.candidate_stable_ids(&query, 1, 3).len() * 2 < documents.len(),
+        "the persisted one-probe candidate set proves this query takes ANN, not exact fallback"
+    );
+    drop(loaded);
+
+    let hits = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect::<Vec<_>>()
+    );
+    for (hit, (_, score)) in hits.hits.iter().zip(&expected) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_missing_row_falls_back_to_the_quantized_score() {
+    let path = unique_temp_dir("rescore_missing_row");
+    let (documents, query) = rescore_boundary_docs();
+    let expected = exact_fp32_hits(&documents, &query, None, documents.len());
+    let plain = exact_engine(&documents)
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine
+            .create_index_with_options(rescore_options_with_oversample("float32", Some(32.0)))
+            .unwrap();
+        engine.upsert_vectors("default", &documents).unwrap();
+        engine.persist().unwrap();
+    }
+    let corrupted_id = documents
+        .iter()
+        .max_by_key(|document| lodedb_core::stable_uint64_for_text(&document.document_id))
+        .unwrap()
+        .document_id
+        .clone();
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    let mut bytes = fs::read(&sidecar).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    fs::write(&sidecar, bytes).unwrap();
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let hits = reopened
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    let plain_scores = plain
+        .hits
+        .iter()
+        .map(|hit| (hit.document_id.as_str(), hit.score))
+        .collect::<BTreeMap<_, _>>();
+    let expected_scores = expected
+        .iter()
+        .map(|(document_id, score)| (document_id.as_str(), *score))
+        .collect::<BTreeMap<_, _>>();
+    for hit in &hits.hits {
+        if hit.document_id == corrupted_id {
+            assert_eq!(
+                hit.score.to_bits(),
+                plain_scores[hit.document_id.as_str()].to_bits(),
+                "a checksum-failed row must retain the stage-one score"
+            );
+        } else {
+            assert_eq!(
+                hit.score.to_bits(),
+                expected_scores[hit.document_id.as_str()].to_bits()
+            );
+        }
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_batch_and_arrays_match_single_queries() {
+    let (documents, first) = rescore_boundary_docs();
+    let second = vec![-0.31, 0.29, -0.23, 0.17, -0.13, 0.11, -0.07, 0.05];
+    let engine = rescore_engine(&documents, 32.0);
+    let queries = vec![first, second];
+    let batch = engine
+        .query_vectors_batch("default", &queries, 3, None)
+        .unwrap();
+    let flat = queries.iter().flatten().copied().collect::<Vec<_>>();
+    let arrays = engine
+        .query_vectors_batch_arrays("default", &flat, 8, 3, None)
+        .unwrap();
+    assert_eq!(arrays.k, 3);
+    for (query_index, query) in queries.iter().enumerate() {
+        let single = engine.query_vector("default", query, 3, None).unwrap();
+        assert_eq!(batch[query_index], single);
+        for (offset, hit) in single.hits.iter().enumerate() {
+            let position = query_index * arrays.k + offset;
+            assert_eq!(arrays.document_ids[position], hit.document_id);
+            assert_eq!(arrays.scores[position].to_bits(), hit.score.to_bits());
+            assert_eq!(arrays.metadata[position], hit.metadata);
+        }
+    }
+}
+
+#[test]
+fn rescore_off_queries_keep_plain_scores_and_huge_oversample_clamps() {
+    let (documents, query) = rescore_boundary_docs();
+    let first = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let second = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    assert_eq!(first, second, "a store without rescore keeps the plain scan path");
+
+    let tiny = &documents[..2];
+    let rescored = rescore_engine(tiny, 1_000_000.0)
+        .query_vector("default", &query, 99, None)
+        .unwrap();
+    assert_eq!(rescored.hits.len(), tiny.len());
+}
+
+#[test]
+fn rescore_float16_overflow_keeps_finite_quantized_scores() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine
+        .create_index_with_options(rescore_options("float16"))
+        .unwrap();
+    // Coordinates beyond the float16 range (65504) encode to infinity in the
+    // sidecar capture; the rescore must fall back to the finite quantized score.
+    let documents = vec![
+        CoreVectorDocument {
+            document_id: "overflow".to_string(),
+            vector: vec![70_000.0, -80_000.0, 70_000.0, -70_000.0, 1.0, -1.0, 1.0, -1.0],
+            metadata: BTreeMap::new(),
+            text: None,
+            patch_matrix: None,
+        },
+        rescore_vector("plain", 0.0),
+    ];
+    engine.upsert_vectors("default", &documents).unwrap();
+    let results = engine
+        .query_vector("default", &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 2, None)
+        .unwrap();
+    assert_eq!(results.hits.len(), 2);
+    for hit in &results.hits {
+        assert!(hit.score.is_finite(), "score for {} is not finite", hit.document_id);
+    }
+}
+
+#[test]
+fn failed_lazy_sidecar_open_latches_and_drops_the_stale_manifest() {
+    let path = unique_temp_dir("rescore_lazy_latch");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+
+    // The commit path leaves the reader unopened; break the sidecar before the
+    // first query forces the lazy open.
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    assert!(sidecar.exists());
+    fs::remove_file(&sidecar).unwrap();
+    let first = engine
+        .query_vector("default", &rescore_vector("row", 0.0).vector, 1, None)
+        .unwrap();
+    assert_eq!(first.hits.len(), 1);
+
+    // The latched failure must stop the stale manifest at the next vector commit.
+    engine
+        .upsert_vectors("default", &[rescore_vector("later", 0.1)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_manifest.is_none(), "stale tvvf manifest must not be carried");
+    drop(loaded);
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let results = reopened
+        .query_vector("default", &rescore_vector("row", 0.0).vector, 2, None)
+        .unwrap();
+    assert_eq!(results.hits.len(), 2);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]

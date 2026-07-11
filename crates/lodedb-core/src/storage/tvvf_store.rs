@@ -932,7 +932,9 @@ pub(crate) fn encode_row(dtype: TvvfDtype, dim: usize, row: &[f32]) -> TvvfResul
     Ok(output)
 }
 
-fn decode_row(dtype: TvvfDtype, dim: usize, bytes: &[u8]) -> Vec<f32> {
+/// Decodes an engine-held row captured by [`encode_row`]. Persisted rows are
+/// checksum-verified by [`TvvfReader::fetch_rows`] before reaching this helper.
+pub(crate) fn decode_row(dtype: TvvfDtype, dim: usize, bytes: &[u8]) -> Vec<f32> {
     match dtype {
         TvvfDtype::Float16 => bytes
             .chunks_exact(2)
