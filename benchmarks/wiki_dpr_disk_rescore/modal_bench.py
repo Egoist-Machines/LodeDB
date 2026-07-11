@@ -172,11 +172,10 @@ def ground_truth(target_rows: int = 21_015_300, block_rows: int = 100_000) -> di
     return {"ground_truth": True, "indices": str(indices), "scores": str(scores)}
 
 
-@app.function(cpu=32.0, memory=131072, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
-def build_store(
+def _build_store_impl(
     store_label: str,
-    target_rows: int = 21_015_300,
-    git_sha: str | None = None,
+    target_rows: int,
+    git_sha: str | None,
 ) -> dict[str, Any]:
     """Builds one named reusable store directly on the volume, without serving."""
 
@@ -212,6 +211,37 @@ def build_store(
     VOLUME.commit()
     _log_result(result)
     return result
+
+
+@app.function(cpu=32.0, memory=131072, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
+def build_store(
+    store_label: str,
+    target_rows: int = 21_015_300,
+    git_sha: str | None = None,
+) -> dict[str, Any]:
+    """Builds one named reusable store directly on the volume, without serving."""
+
+    return _build_store_impl(store_label, target_rows, git_sha)
+
+
+@app.function(cpu=32.0, memory=131072, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
+def build_many(
+    store_labels: list[str],
+    target_rows: int = 21_015_300,
+    git_sha: str | None = None,
+) -> list[dict[str, Any]]:
+    """Builds several stores sequentially inside one remote container.
+
+    Running the loop server-side makes the whole batch survive a lost local
+    client: with a spawned call, nothing after the submission depends on the
+    submitting machine's connectivity.
+    """
+
+    results = []
+    for label in store_labels:
+        print(f"[wiki-dpr] building {label} rows={target_rows}", flush=True)
+        results.append(_build_store_impl(label, target_rows, git_sha))
+    return results
 
 
 def _serve_from_local_copy(
@@ -325,11 +355,15 @@ def build(
     git_sha = _local_git_sha()
     if parallel:
         results = list(build_store.starmap((label, target_rows, git_sha) for label in wanted))
-    else:
-        results = [build_store.remote(label, target_rows, git_sha) for label in wanted]
-    for label, result in zip(wanted, results, strict=False):
-        build_seconds = (result.get("store") or {}).get("build")
-        print(f"built {label} rows={target_rows}: {build_seconds}")
+        for label, result in zip(wanted, results, strict=False):
+            build_seconds = (result.get("store") or {}).get("build")
+            print(f"built {label} rows={target_rows}: {build_seconds}")
+        return
+    # Fire-and-forget: the sequential loop runs inside one remote container, so
+    # a dropped local connection cannot interrupt the batch. Progress lands on
+    # the volume (benchmark_store_config.json per completed store).
+    call = build_many.spawn(wanted, target_rows, git_sha)
+    print(f"spawned build_many {wanted} rows={target_rows}: {call.object_id}")
 
 
 @app.local_entrypoint()
