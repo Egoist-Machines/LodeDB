@@ -228,14 +228,22 @@ the local-bridge step first.
   a kotaemon 0.11 environment ran the real `deserialize(KH_VECTORSTORE)` path, real
   `DocumentWithEmbedding` / `MetadataFilters` objects, and top-1 parity with the Chroma
   default on normalized vectors (14/14 checks).
-- **Benchmark (kotaemon interface, 20k × 384-dim normalized vectors, batches of 100, M-series
-  CPU):** vs the default `ChromaVectorStore` — ingest 1.9s vs 16.8s (~9×); one incremental
-  100-chunk add 8.7ms vs 86ms (~10×); query p50 0.17ms vs 64ms; 500-chunk scoped query p50
-  0.32ms vs 63ms; disk 10.5MB vs 424MB (~40×); top-1 accuracy vs a brute-force oracle 1.000
-  vs 0.505 (near-tie random vectors are adversarial for HNSW; real-embedding gaps are
-  smaller, but exact scan cannot miss the true neighbor). Chroma's cold reopen is faster
-  (0.06s vs 0.42s). Score scale differs by design: LodeDB returns cosine similarity, Chroma's
-  default collection ranks by L2 (identical ordering on normalized embeddings).
+- **Benchmark (kotaemon interface, 20k × 384-dim normalized vectors, batches of 100, one
+  process per backend, M-series CPU):** vs the default `ChromaVectorStore`, byte-identical
+  vectors/ids/metadata/top-k on both sides — ingest 1.8s vs 16.9s (~9×); per-100-chunk add
+  (= durable commit at this seam) p50 8.6ms / p95 8.9ms / p99 9.0ms vs p50 83.9ms / p95
+  111ms / p99 126ms (the O(changed) tail story); query p50 0.17ms / p95 0.22ms vs 64.2ms /
+  65.1ms; 500-chunk scoped query p50 0.31ms vs 64.5ms; disk 10.5MB vs 424MB (~40×); peak RSS
+  ~even (592MB vs 577MB, both dominated by the benchmark fixture); top-1 accuracy vs a
+  brute-force oracle 1.000 vs 0.440 (near-tie random vectors are adversarial for HNSW;
+  real-embedding gaps are smaller, but exact scan cannot miss the true neighbor). Chroma's
+  cold reopen is faster (0.07s vs 0.43s). Batch-query latency is N/A at this seam —
+  kotaemon's `BaseVectorStore` has no batch-query API (retrieval issues single queries);
+  LodeDB's batch path is covered by the repo's own benchmarks. Score scale differs by
+  design: LodeDB returns cosine similarity, Chroma's default collection ranks by L2
+  (identical ordering on normalized embeddings). Kotaemon has no retrieval test set, so
+  quality checks use the brute-force oracle; artifacts are metrics-only (counts, latencies,
+  sizes).
 - **Scope:** vector store only; kotaemon's docstore (LanceDB/Elasticsearch/SimpleFile) and
   graph indices are separate seams and unchanged. Upstream, kotaemon bundles store choices in
   `libs/kotaemon/kotaemon/storages/vectorstores/`; a PR there would add a thin subclass plus
