@@ -223,6 +223,19 @@ def test_record_builder_failure_modes():
     # Non-native op fails at encode, before any upload could happen.
     with pytest.raises(Exception, match="does not support"):
         encode_segment([{"op": "upsert_documents", "payload": {"documents": []}}])
+    # A root-level payload "lsn" key shares the stamp's namespace: decode would
+    # lift it out as the record's LSN (numeric) or silently drop it (anything
+    # else), so encode refuses it up front -- numeric or not.
+    for payload_lsn in (7, "not-a-number"):
+        with pytest.raises(Exception, match="root-level `lsn` key"):
+            encode_segment(
+                [
+                    {
+                        "op": "delete_documents",
+                        "payload": {"document_ids": ["a"], "lsn": payload_lsn},
+                    }
+                ]
+            )
     # Input validation.
     with pytest.raises(ValueError):
         plan_documents([])

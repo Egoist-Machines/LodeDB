@@ -372,8 +372,20 @@ fn encode_body(op: &str, mut payload: Value, lsn: Option<u64>) -> CoreResult<Vec
     // `Some`, the cloud segment path passes `None`. The payload is taken by
     // value and mutated in place: append callers own the payload they pass, so
     // this avoids cloning the whole value tree on the write hot path.
+    //
+    // Because the stamp shares the payload's namespace, an unstamped record
+    // whose payload carries its own root-level `lsn` key must be refused here:
+    // encoding it would succeed, but `decode_body` would lift that key out --
+    // a numeric value reads back as a stamped record (so a fold rejects the
+    // whole segment only after upload), a non-numeric one is silently dropped
+    // from the payload. Fail closed at encode time instead.
     if let Some(lsn) = lsn {
         object.insert("lsn".to_string(), Value::from(lsn));
+    } else if object.contains_key("lsn") {
+        return Err(corrupt(
+            "unstamped WAL record payload must not carry a root-level `lsn` key; \
+             decode would misread it as the record's stamp",
+        ));
     }
     let mut body = Vec::new();
     body.extend_from_slice(op.as_bytes());
@@ -949,6 +961,18 @@ mod tests {
             lsn: None,
         };
         assert!(encode_wal_segment(&[non_object]).is_err());
+        // A root-level payload `lsn` key collides with the stamp's namespace:
+        // decode would lift it out as the record's LSN (numeric) or silently
+        // drop it (non-numeric), so an unstamped record refuses it at encode.
+        for lsn_value in [json!(7), json!("not-a-number")] {
+            let payload_lsn = WalRecord {
+                op: "delete_documents".to_string(),
+                payload: json!({"document_ids": ["alpha"], "lsn": lsn_value}),
+                lsn: None,
+            };
+            let error = encode_wal_segment(&[payload_lsn]).expect_err("payload lsn refused");
+            assert!(error.to_string().contains("root-level `lsn` key"));
+        }
     }
 
     #[test]
