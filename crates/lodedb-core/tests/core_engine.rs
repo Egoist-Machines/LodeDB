@@ -4042,3 +4042,386 @@ fn exact_store_writes_no_tvann_sidecar() {
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
 }
+
+// ---- WAL segment primitives: store-free planning + external-records fold ----
+//
+// These pin the enabling primitives for out-of-band segment ingest (cloud
+// multi-writer): a store-free planner and payload builder that match the
+// appender byte-for-byte, and CoreEngine::apply_wal_records folding
+// caller-stamped records onto a warm generation-mode handle.
+
+use lodedb_core::engine::{build_embedded_documents_payload, plan_documents};
+use lodedb_core::storage::wal::{decode_wal_segment, encode_wal_segment, WalRecord};
+
+// Stamps decoded (unstamped) segment records with consecutive LSNs starting at
+// `first_lsn`, the fold orchestrator's job in production.
+fn stamp_records(records: &mut [WalRecord], first_lsn: u64) {
+    for (offset, record) in records.iter_mut().enumerate() {
+        record.lsn = Some(first_lsn + offset as u64);
+    }
+}
+
+// A committed generation-mode store with the vector-only index, ready to fold
+// external records onto.
+fn generation_store(label: &str) -> PathBuf {
+    let path = unique_temp_dir(label);
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    create_vector_only_index(&mut engine);
+    engine.persist().unwrap();
+    path
+}
+
+#[test]
+fn store_free_plan_documents_matches_appender_prepare() {
+    // One planner, zero drift: the store-free plan differs from the appender's
+    // only in the writer-bookkeeping index_id.
+    let path = unique_temp_dir("core_segment_plan_parity");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let documents = [
+        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc("b", "a second appended document", metadata(&[])),
+    ];
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let appender = CoreAppender::open(appender_opts).expect("open appender");
+    let appender_plan = appender.prepare_documents(&documents).expect("prepare");
+    let free_plan = plan_documents(&documents, true, true, 900).expect("plan");
+    assert_eq!(free_plan.index_id, "");
+    assert_eq!(free_plan.plan_id, 0);
+    assert_eq!(free_plan.base_generation, 0);
+    assert_eq!(free_plan.documents, appender_plan.documents);
+    assert_eq!(free_plan.chunks_to_embed, appender_plan.chunks_to_embed);
+    assert_eq!(free_plan.store_text, appender_plan.store_text);
+    assert_eq!(free_plan.index_text, appender_plan.index_text);
+    assert!(plan_documents(&[], true, true, 900).is_err(), "empty plan refused");
+    drop(appender);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn payload_builder_matches_appender_wal_record() {
+    // The extracted builder must produce exactly the payload the appender logs,
+    // so segment records and WAL-file records can never drift.
+    let path = unique_temp_dir("core_segment_payload_parity");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.persist().unwrap();
+    }
+    let documents = [
+        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc("b", "a second appended document", metadata(&[])),
+    ];
+    let mut appender_opts = open_options(&path, false, "wal");
+    appender_opts.acquire_writer_lock = true;
+    let appender = CoreAppender::open(appender_opts).expect("open appender");
+    let plan = appender.prepare_documents(&documents).expect("prepare");
+    let embeddings = plan_embeddings(&plan);
+    let lsn = appender
+        .append_embedded_documents(&plan, &embeddings)
+        .expect("append");
+    let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
+    let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].op, "apply_embedded_documents");
+    assert_eq!(records[0].lsn, Some(lsn));
+    let built = build_embedded_documents_payload(&plan, &embeddings, 8).expect("build payload");
+    assert_eq!(records[0].payload, built);
+    // The stamped segment encoding of the built record is byte-identical to the
+    // frame the appender wrote.
+    let segment = encode_wal_segment(&[WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload: built,
+        lsn: Some(lsn),
+    }])
+    .expect("encode");
+    assert_eq!(segment, fs::read(&wal).expect("wal bytes"));
+    drop(appender);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn payload_builder_validates_embeddings() {
+    let documents = [text_doc("a", "hello world", metadata(&[]))];
+    let plan = plan_documents(&documents, true, true, 900).unwrap();
+    // Count mismatch.
+    assert!(build_embedded_documents_payload(&plan, &[], 8).is_err());
+    // Dimension mismatch.
+    let short = vec![vec![1.0_f32; 4]; plan.chunks_to_embed.len()];
+    assert!(build_embedded_documents_payload(&plan, &short, 8).is_err());
+    // Non-finite embedding.
+    let mut poisoned = plan_embeddings(&plan);
+    poisoned[0][0] = f32::NAN;
+    assert!(build_embedded_documents_payload(&plan, &poisoned, 8).is_err());
+}
+
+#[test]
+fn apply_wal_records_folds_a_segment_end_to_end() {
+    // The full segment flow: plan -> payload -> encode -> decode -> stamp ->
+    // apply -> persist -> reopen -> query, then a refold applies nothing.
+    let path = generation_store("core_segment_fold_e2e");
+    let documents = [
+        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc("b", "a second appended document", metadata(&[])),
+    ];
+    let plan = plan_documents(&documents, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+    let segment = encode_wal_segment(&[WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload,
+        lsn: None,
+    }])
+    .unwrap();
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let applied_before = engine.applied_lsn("default").unwrap();
+    let mut records = decode_wal_segment(&segment).unwrap();
+    stamp_records(&mut records, applied_before + 1);
+    let applied = engine.apply_wal_records("default", &records).unwrap();
+    assert_eq!(applied, 1);
+    assert_eq!(engine.applied_lsn("default").unwrap(), applied_before + 1);
+    engine.persist().unwrap();
+    // Refold on the same handle: everything at or below the watermark skips.
+    assert_eq!(engine.apply_wal_records("default", &records).unwrap(), 0);
+    drop(engine);
+
+    let mut reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert!(reopened.applied_lsn("default").unwrap() >= applied_before + 1);
+    let stats = reopened.stats("default").unwrap();
+    assert_eq!(stats.document_count, 2, "folded documents did not survive reopen");
+    let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let hits = reopened.query_vector("default", &query, 5, None).unwrap().hits;
+    assert!(!hits.is_empty(), "folded documents are not searchable");
+    // Refold after reopen is equally idempotent.
+    assert_eq!(reopened.apply_wal_records("default", &records).unwrap(), 0);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn apply_wal_records_folds_deletes_and_later_batches() {
+    let path = generation_store("core_segment_fold_delete");
+    let documents = [
+        text_doc("a", "hello world from lodedb", metadata(&[])),
+        text_doc("b", "a second appended document", metadata(&[])),
+    ];
+    let plan = plan_documents(&documents, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut add_records = vec![WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload,
+        lsn: None,
+    }];
+    stamp_records(&mut add_records, floor + 1);
+    assert_eq!(engine.apply_wal_records("default", &add_records).unwrap(), 1);
+    engine.persist().unwrap();
+
+    // A later batch must stamp above the committed watermark, which the
+    // generation-inflating commit may have advanced past the last stamped LSN.
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut delete_records = vec![WalRecord {
+        op: "delete_documents".to_string(),
+        payload: json!({"document_ids": ["a"]}),
+        lsn: None,
+    }];
+    stamp_records(&mut delete_records, floor + 1);
+    assert_eq!(engine.apply_wal_records("default", &delete_records).unwrap(), 1);
+    engine.persist().unwrap();
+    drop(engine);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let stats = reopened.stats("default").unwrap();
+    assert_eq!(stats.document_count, 1, "the delete record did not fold");
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn apply_wal_records_refuses_invalid_batches_and_handles() {
+    let path = generation_store("core_segment_fold_guards");
+    let stamped = |lsn: u64| WalRecord {
+        op: "delete_documents".to_string(),
+        payload: json!({"document_ids": ["missing"]}),
+        lsn: Some(lsn),
+    };
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    // Unstamped record.
+    let unstamped = vec![WalRecord {
+        op: "delete_documents".to_string(),
+        payload: json!({"document_ids": ["missing"]}),
+        lsn: None,
+    }];
+    let error = engine.apply_wal_records("default", &unstamped).unwrap_err();
+    assert!(error.to_string().contains("explicit LSNs"), "{error}");
+    // Duplicate and descending LSNs.
+    for batch in [
+        vec![stamped(floor + 1), stamped(floor + 1)],
+        vec![stamped(floor + 2), stamped(floor + 1)],
+    ] {
+        let error = engine.apply_wal_records("default", &batch).unwrap_err();
+        assert!(error.to_string().contains("strictly ascending"), "{error}");
+    }
+    // Non-native op refuses before anything applies.
+    let stats_before = engine.stats("default").unwrap();
+    let mixed = vec![
+        stamped(floor + 1),
+        WalRecord {
+            op: "upsert_documents".to_string(),
+            payload: json!({"documents": []}),
+            lsn: Some(floor + 2),
+        },
+    ];
+    let error = engine.apply_wal_records("default", &mixed).unwrap_err();
+    assert!(error.to_string().contains("does not support"), "{error}");
+    assert_eq!(
+        engine.applied_lsn("default").unwrap(),
+        floor,
+        "a refused batch must not advance the watermark"
+    );
+    assert_eq!(engine.stats("default").unwrap().document_count, stats_before.document_count);
+    // Unknown index.
+    assert!(engine.apply_wal_records("missing", &[stamped(floor + 1)]).is_err());
+    drop(engine);
+
+    // Read-only handle.
+    let mut read_only =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    let error = read_only.apply_wal_records("default", &[stamped(1)]).unwrap_err();
+    assert!(error.to_string().contains("read-only"), "{error}");
+    drop(read_only);
+    fs::remove_dir_all(&path).unwrap();
+
+    // WAL-mode handle: external folds could strand unfolded local WAL records.
+    let wal_mode_path = unique_temp_dir("core_segment_fold_walmode");
+    let mut wal_engine = CoreEngine::open(open_options(&wal_mode_path, false, "wal")).unwrap();
+    create_vector_only_index(&mut wal_engine);
+    wal_engine.persist().unwrap();
+    let error = wal_engine.apply_wal_records("default", &[stamped(1)]).unwrap_err();
+    assert!(error.to_string().contains("generation commit mode"), "{error}");
+    drop(wal_engine);
+    fs::remove_dir_all(&wal_mode_path).unwrap();
+
+    // In-memory engine has no durable watermark to fold against.
+    let mut in_memory = CoreEngine::new_in_memory();
+    in_memory.create_index("default", 8, 4).unwrap();
+    let error = in_memory.apply_wal_records("default", &[stamped(1)]).unwrap_err();
+    assert!(error.to_string().contains("in-memory"), "{error}");
+}
+
+#[test]
+fn apply_wal_records_refuses_malformed_payloads() {
+    // The replay boundary ingests externally produced segments: a payload with
+    // a missing key, a non-string id, or a non-numeric embedding coordinate
+    // must fail closed -- never silently no-op as "applied" or coerce garbage
+    // into the index -- and must not advance the watermark.
+    let path = generation_store("core_segment_malformed_payloads");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let record = |op: &str, payload: serde_json::Value| WalRecord {
+        op: op.to_string(),
+        payload,
+        lsn: Some(floor + 1),
+    };
+    let cases = vec![
+        (record("delete_documents", json!({})), "missing document_ids"),
+        (
+            record("delete_documents", json!({"document_ids": ["a", 7]})),
+            "must be strings",
+        ),
+        (record("upsert_vectors", json!({})), "missing vectors"),
+        (
+            record(
+                "upsert_vectors",
+                json!({"vectors": [{
+                    "document_id": "v",
+                    "vector": [1.0, "garbage", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }]}),
+            ),
+            "non-numeric coordinate",
+        ),
+        (
+            record(
+                "apply_embedded_documents",
+                json!({"documents": [], "added_chunks": [{
+                    "chunk_id": "c",
+                    "embedding": [null, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }]}),
+            ),
+            "non-numeric coordinate",
+        ),
+    ];
+    for (poisoned, needle) in cases {
+        let error = engine.apply_wal_records("default", &[poisoned]).unwrap_err();
+        assert!(error.to_string().contains(needle), "{error}");
+        assert_eq!(
+            engine.applied_lsn("default").unwrap(),
+            floor,
+            "a refused payload must not advance the watermark"
+        );
+    }
+    // A well-formed empty delete stays a valid no-op: refusing it could wedge
+    // replay of a legacy local WAL tail.
+    let empty = record("delete_documents", json!({"document_ids": []}));
+    assert_eq!(engine.apply_wal_records("default", &[empty]).unwrap(), 1);
+    drop(engine);
+    fs::remove_dir_all(&path).unwrap();
+}
+
+#[test]
+fn discard_drops_unpersisted_folds_and_releases_the_writer_lock() {
+    // The fold abort path: a batch applied in memory but never persisted must
+    // vanish on discard() -- a graceful close() would persist it -- and the
+    // writer lock must release immediately so a fresh handle can take over.
+    let path = generation_store("core_engine_discard");
+    let documents = [text_doc("committed", "the committed document", metadata(&[]))];
+    let plan = plan_documents(&documents, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut records = vec![WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload,
+        lsn: None,
+    }];
+    stamp_records(&mut records, floor + 1);
+    assert_eq!(engine.apply_wal_records("default", &records).unwrap(), 1);
+    assert_eq!(engine.stats("default").unwrap().document_count, 1);
+    engine.discard();
+
+    // The lock is free while the discarded handle is still alive: a second
+    // writable open succeeds and sees only the committed (empty) state.
+    let mut reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(
+        reopened.stats("default").unwrap().document_count,
+        0,
+        "discard() must not persist the un-persisted fold"
+    );
+    assert_eq!(reopened.applied_lsn("default").unwrap(), floor);
+    // The abandoned batch re-applies cleanly on the fresh handle.
+    assert_eq!(reopened.apply_wal_records("default", &records).unwrap(), 1);
+    reopened.persist().unwrap();
+    drop(reopened);
+    drop(engine);
+
+    let survivor = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(survivor.stats("default").unwrap().document_count, 1);
+    drop(survivor);
+    fs::remove_dir_all(&path).unwrap();
+}
