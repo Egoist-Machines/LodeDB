@@ -331,6 +331,55 @@ def serve(
     return result
 
 
+@app.function(cpu=2.0, memory=4096, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
+def serve_many(
+    labels: list[str],
+    target_rows: int = 21_015_300,
+    git_sha: str | None = None,
+) -> list[str]:
+    """Serves configurations sequentially and persists each result to the volume.
+
+    A remote driver keeps a long sweep alive independent of the submitting
+    machine; results land under /vol/results so they survive any client.
+    """
+
+    from sweep import SERVE_CONFIGS
+
+    by_label = {config["label"]: config for config in SERVE_CONFIGS}
+    results_dir = Path(_VOLUME_PATH) / "results" / f"rows_{target_rows}"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for label in labels:
+        out = results_dir / f"{label}.json"
+        if out.exists():
+            print(f"[wiki-dpr] resume: keeping {out}", flush=True)
+            written.append(str(out))
+            continue
+        result = serve.remote(by_label[label], target_rows, git_sha)
+        out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        VOLUME.commit()
+        print(f"[wiki-dpr] served {label}", flush=True)
+        written.append(str(out))
+    return written
+
+
+@app.local_entrypoint()
+def sweep_serve(target_rows: int = 21_015_300, labels: str = "") -> None:
+    """Spawns the remote serve sweep for the given (or all runnable) configs."""
+
+    from sweep import SERVE_CONFIGS
+
+    if labels:
+        wanted = [label.strip() for label in labels.split(",") if label.strip()]
+        unknown = sorted(set(wanted) - {config["label"] for config in SERVE_CONFIGS})
+        if unknown:
+            raise ValueError(f"unknown labels: {unknown}")
+    else:
+        wanted = [config["label"] for config in SERVE_CONFIGS]
+    call = serve_many.spawn(wanted, target_rows, _local_git_sha())
+    print(f"spawned serve_many ({len(wanted)} configs) rows={target_rows}: {call.object_id}")
+
+
 def _local_git_sha() -> str | None:
     """Returns the local checkout revision for a remote container result."""
 
