@@ -226,7 +226,7 @@ def _build_store_impl(
     return result
 
 
-@app.function(cpu=32.0, memory=196608, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
+@app.function(cpu=32.0, memory=262144, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
 def build_store(
     store_label: str,
     target_rows: int = 21_015_300,
@@ -237,7 +237,7 @@ def build_store(
     return _build_store_impl(store_label, target_rows, git_sha)
 
 
-@app.function(cpu=32.0, memory=196608, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
+@app.function(cpu=32.0, memory=262144, timeout=86_400, volumes={_VOLUME_PATH: VOLUME})
 def build_many(
     store_labels: list[str],
     target_rows: int = 21_015_300,
