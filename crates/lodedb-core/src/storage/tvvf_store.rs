@@ -1029,7 +1029,10 @@ where
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
     let written = (|| {
-        let mut file = File::create(&temporary)?;
+        // The per-row emit pattern would otherwise issue one write syscall per
+        // id, checksum, and row: tens of millions at production scale, which
+        // pathologically slow filesystems (network mounts, FUSE) cannot absorb.
+        let mut file = io::BufWriter::with_capacity(4 << 20, File::create(&temporary)?);
         let mut sha = Sha256::new();
         let mut bytes = 0;
         hashed_write(&mut file, &mut sha, &mut bytes, magic)?;
@@ -1076,6 +1079,10 @@ where
         if count != rows {
             return Err(corrupt("tvvf writer payload stream changed row count"));
         }
+        let file = match file.into_inner() {
+            Ok(file) => file,
+            Err(error) => return Err(TvvfError::Io(error.into_error())),
+        };
         if fsync {
             file.sync_all()?;
         }
@@ -1101,7 +1108,12 @@ where
     Ok(written)
 }
 
-fn hashed_write(file: &mut File, sha: &mut Sha256, bytes: &mut u64, data: &[u8]) -> TvvfResult<()> {
+fn hashed_write<W: Write>(
+    file: &mut W,
+    sha: &mut Sha256,
+    bytes: &mut u64,
+    data: &[u8],
+) -> TvvfResult<()> {
     file.write_all(data)?;
     sha.update(data);
     *bytes = bytes
