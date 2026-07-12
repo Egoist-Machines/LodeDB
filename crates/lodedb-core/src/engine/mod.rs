@@ -3452,6 +3452,7 @@ fn index_from_loaded_store(
         pending_raw_text_clears: BTreeSet::new(),
         pending_multivec_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
+        pending_new_stable_ids: BTreeSet::new(),
         pending_vectors_changed: false,
     };
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
@@ -3919,6 +3920,7 @@ fn persist_index_generation(
     index.pending_raw_text_clears.clear();
     index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
+    index.pending_new_stable_ids.clear();
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
     // writable handle's `applied_lsn()` reports the committed generation (the
@@ -4548,6 +4550,12 @@ struct VectorOnlyIndex {
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
     pending_removed_stable_ids: BTreeSet<u64>,
+    /// Stable ids first written since the last persist -- rows no reader of the
+    /// base + committed deltas has ever seen. A remove of one of these must NOT
+    /// enter the delta's removed set: the strict replay (`remove_many` count
+    /// check) would reject the delta as corrupt on the next open. The dual of
+    /// the `pending_removed_stable_ids.remove(readded)` rule above.
+    pending_new_stable_ids: BTreeSet<u64>,
     /// Whether a vector value actually changed (a real add/move/remove, not a
     /// metadata-only re-emit) since the last commit. Set at the vector-sync choke
     /// points alongside the cluster-cache drop, so one engine signal drives both
@@ -4592,6 +4600,7 @@ impl VectorOnlyIndex {
             pending_raw_text_clears: BTreeSet::new(),
             pending_multivec_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
+            pending_new_stable_ids: BTreeSet::new(),
             pending_vectors_changed: false,
         }
     }
@@ -4628,23 +4637,38 @@ impl VectorOnlyIndex {
         } else {
             false
         };
-        let readded = {
+        let (pre_existing, readded) = {
             let mut guard = self.vector_index.borrow_mut();
             let Some(index) = guard.as_mut() else {
                 return Ok(());
             };
+            let chunk_ids: Vec<String> =
+                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
+            // Liveness before the upsert distinguishes a replaced row (its
+            // stable id predates this cycle unless tracked as new below) from
+            // a first write.
+            let pre_existing: BTreeSet<u64> =
+                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect();
             // A just-built index already contains every current chunk; only an
             // existing index needs the incremental upsert.
             if !built_now {
                 index.upsert_chunks(chunks)?;
             }
-            let chunk_ids: Vec<String> =
-                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
-            index.stable_ids_for_chunks(&chunk_ids)
+            (pre_existing, index.stable_ids_for_chunks(&chunk_ids))
         };
-        // Rows written this cycle are no longer "removed" relative to the base.
+        // Rows written this cycle are no longer "removed" relative to the base;
+        // rows FIRST written this cycle are invisible to every reader of the
+        // committed state, so a later same-cycle remove must skip the delta's
+        // removed set (see `sync_vector_index_remove`). A row that was live
+        // before this upsert, or that this cycle removed earlier (a committed
+        // row by definition -- new rows leave `pending_removed` untouched), is
+        // NOT new: misclassifying it would drop its eventual removal from the
+        // delta and resurrect the committed row on replay.
         for stable_id in readded {
-            self.pending_removed_stable_ids.remove(&stable_id);
+            let removed_this_cycle = self.pending_removed_stable_ids.remove(&stable_id);
+            if !pre_existing.contains(&stable_id) && !removed_this_cycle {
+                self.pending_new_stable_ids.insert(stable_id);
+            }
         }
         // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
         // metadata-only change, whose caller still routes through here) alters no
@@ -4677,7 +4701,16 @@ impl VectorOnlyIndex {
             // and the cluster index (and any `.tvann` base) stays valid.
             return;
         }
-        self.pending_removed_stable_ids.extend(removed);
+        // A row first written since the last persist was never committed: no
+        // reader of the base + deltas has its stable id, so recording its
+        // removal would make the next delta fail strict replay ("removed-id
+        // count mismatch") and brick the store for every fresh open. Its
+        // add+remove simply cancel out of the delta.
+        for stable_id in removed {
+            if !self.pending_new_stable_ids.remove(&stable_id) {
+                self.pending_removed_stable_ids.insert(stable_id);
+            }
+        }
         // The vector set changed: record the shared signal (drives the `.tvann`
         // drop at commit) and drop the cluster index so a removed vector cannot
         // linger in a stale posting; the next ANN query rebuilds from live rows.

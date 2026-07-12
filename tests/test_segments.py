@@ -207,6 +207,36 @@ def test_discard_abandons_a_partially_applied_fold(tmp_path):
         reopened.close()
 
 
+def test_add_then_remove_in_one_fold_batch_stays_reopenable(tmp_path):
+    """Regression: a document added and removed within one fold batch (one
+    persist) wrote its never-committed row into the delta's removed set, and
+    the strict replay rejected the store on every fresh open ("removed-id
+    count mismatch") — the warm handle kept serving while every new reader,
+    hydration, or pull failed. Found by OreCloud's randomized op soup."""
+
+    _writer(tmp_path).close()
+    add_x = _add_segment([{"text": "an ephemeral document", "id": "x"}])
+    remove_x = encode_segment([delete_documents_record("x")])
+    keep = _add_segment([{"text": "a surviving document", "id": "keep"}])
+
+    db = _writer(tmp_path)
+    try:
+        # One persist covers the whole batch: add x, remove x, add keep.
+        for segment in (add_x, remove_x, keep):
+            fold_segment(db, segment, first_lsn=db.applied_lsn() + 1)
+        db.persist()
+    finally:
+        db.close()
+
+    reader = LodeDB.open_readonly(tmp_path, model="minilm", _embedding_backend=_be())
+    try:
+        assert reader.count() == 1
+        assert reader.get("keep") == "a surviving document"
+        assert reader.get("x") is None
+    finally:
+        reader.close()
+
+
 def test_record_builder_failure_modes():
     plan = plan_documents([{"text": "validation fixture", "id": "a"}], store_text=True)
     chunk_count = len(plan["chunks_to_embed"])
