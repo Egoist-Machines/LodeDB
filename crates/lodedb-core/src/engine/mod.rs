@@ -1939,6 +1939,23 @@ impl CoreEngine {
             .get("documents")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_err("WAL embedded payload missing documents"))?;
+        // Refuse duplicate document ids up front, before any state mutates. The
+        // per-document loop below overwrites the owner map per occurrence while
+        // `active_chunk_ids` accumulates across the whole record, so a repeated
+        // id would spare an earlier occurrence's chunk from removal with no
+        // owner left -- an orphan TurboVec row that fails every query touching
+        // it after reopen ("unknown stable id"). Sanctioned builders already
+        // refuse the shape; this is the replay trust boundary's own check.
+        let mut seen_document_ids = BTreeSet::new();
+        for document in documents {
+            let document_id = document
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL embedded document missing document_id"))?;
+            if !seen_document_ids.insert(document_id.to_string()) {
+                return invalid("WAL embedded payload repeats document id");
+            }
+        }
         // Reuse vectors only for the chunks these documents reference that are not
         // in this record's added_chunks, via the O(1) owner map, rather than
         // cloning the whole corpus on every replayed record.
@@ -5445,6 +5462,17 @@ pub fn plan_documents(
     if documents.is_empty() {
         return invalid("plan_documents requires at least one document");
     }
+    // A repeated id within one batch is ambiguous (which occurrence wins?) and,
+    // worse, one `apply_embedded_documents` record carrying both orphans the
+    // earlier occurrence's TurboVec row at fold time. Refuse it here, before
+    // anything is chunked or embedded; callers that mean "replace" should
+    // last-wins upstream or split the batch.
+    let mut seen_ids = BTreeSet::new();
+    for document in documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("plan_documents requires unique document ids within one batch");
+        }
+    }
     let (prepared_documents, chunks_to_embed) = plan_document_chunks(
         documents,
         store_text,
@@ -5479,6 +5507,16 @@ pub fn build_embedded_documents_payload(
 ) -> Result<Value, CoreError> {
     if plan.documents.is_empty() {
         return invalid("the ingest plan holds no documents");
+    }
+    // A plan can cross the FFI as JSON, so re-check id uniqueness here even
+    // though `plan_documents` refuses the shape: a repeated id in one
+    // `apply_embedded_documents` record orphans the earlier occurrence's
+    // TurboVec row at fold time (see `apply_embedded_documents_wal`).
+    let mut seen_ids = BTreeSet::new();
+    for document in &plan.documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("the ingest plan repeats document id");
+        }
     }
     if embeddings.len() != plan.chunks_to_embed.len() {
         return invalid("embedding count does not match the prepared plan");

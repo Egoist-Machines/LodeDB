@@ -273,6 +273,11 @@ def test_record_builder_failure_modes():
         plan_documents([{"text": "no id"}])
     with pytest.raises(ValueError):
         plan_documents([{"text": "  ", "id": "a"}])
+    # A repeated id in one plan would orphan the earlier occurrence's vector
+    # row at fold time (the replay's owner map keeps only the last occurrence
+    # while its batch-wide active-chunk set spares the first one's chunk).
+    with pytest.raises(ValueError, match="duplicate document id"):
+        plan_documents([{"text": "one", "id": "dup"}, {"text": "two", "id": "dup"}])
     with pytest.raises(ValueError):
         delete_documents_record([])
     with pytest.raises(ValueError):

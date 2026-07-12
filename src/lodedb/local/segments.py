@@ -46,12 +46,15 @@ def plan_documents(
     ``chunk_character_limit`` and the text flags MUST match the target store's
     writer (:class:`~lodedb.LodeDB` defaults: 900, ``store_text=True``) or chunk
     ids and text retention diverge at fold time. Both text flags default **off**
-    for privacy, matching :meth:`Appender.open`. Ids are required and non-empty:
-    auto-generated ids would collide across concurrent writers. Metadata is
-    coerced to the engine's string->string model.
+    for privacy, matching :meth:`Appender.open`. Ids are required, non-empty,
+    and unique within one plan: auto-generated ids would collide across
+    concurrent writers, and a repeated id in one batch would orphan the earlier
+    occurrence's vector row at fold time. Metadata is coerced to the engine's
+    string->string model.
     """
 
     prepared: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for item in documents:
         text = item.get("text")
         if text is None or not str(text).strip():
@@ -59,9 +62,17 @@ def plan_documents(
         document_id = item.get("id")
         if document_id is None or not str(document_id).strip():
             raise ValueError("each document needs a non-empty 'id'")
+        document_id = str(document_id)
+        # A repeated id folds both occurrences into one apply_embedded_documents
+        # record, which orphans the earlier occurrence's vector row at fold
+        # time; the native planner refuses it too, but fail here with the
+        # clearer error. Callers that mean "replace" should last-wins upstream.
+        if document_id in seen_ids:
+            raise ValueError(f"duplicate document id in one plan: {document_id!r}")
+        seen_ids.add(document_id)
         prepared.append(
             {
-                "document_id": str(document_id),
+                "document_id": document_id,
                 "text": str(text),
                 "metadata": _coerce_metadata(item.get("metadata")),
             }
