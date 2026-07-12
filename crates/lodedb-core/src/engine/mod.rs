@@ -4663,9 +4663,17 @@ impl VectorOnlyIndex {
                 chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
             // Liveness before the upsert distinguishes a replaced row (its
             // stable id predates this cycle unless tracked as new below) from
-            // a first write.
-            let pre_existing: BTreeSet<u64> =
-                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect();
+            // a first write. A just-built index cannot witness pre-upsert
+            // liveness (it was built from rows that already include this
+            // call's chunks) and does not need to: a lazy build only happens
+            // when no committed `.tvim` exists (a committed vector base is
+            // materialized at open and the live index never drops
+            // mid-session), so no incoming row predates this cycle.
+            let pre_existing: BTreeSet<u64> = if built_now {
+                BTreeSet::new()
+            } else {
+                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect()
+            };
             // A just-built index already contains every current chunk; only an
             // existing index needs the incremental upsert.
             if !built_now {
