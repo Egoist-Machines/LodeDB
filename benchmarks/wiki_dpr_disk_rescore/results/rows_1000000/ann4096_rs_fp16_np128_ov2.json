@@ -1,0 +1,90 @@
+{
+  "dataset": {
+    "dim": 768,
+    "gt": "fp32-exact-top100",
+    "n_queries": 1000,
+    "rows": 1000000,
+    "seed": 42
+  },
+  "env": {
+    "cpu_count": 20,
+    "git_sha": "326ca67a44bc3fec4a88a8ebb90a70cad54e8489",
+    "host": "modal",
+    "lodedb_version": "1.3.1",
+    "numpy": "2.4.6",
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.35",
+    "requested_cpu": 4.0,
+    "requested_memory_mb": 131072
+  },
+  "label": "ann4096_rs_fp16_np128_ov2",
+  "serve": {
+    "batched": [
+      {
+        "batch_size": 64,
+        "qps": 29.25776271377586
+      },
+      {
+        "batch_size": 256,
+        "qps": 28.51200019161876
+      },
+      {
+        "batch_size": 1000,
+        "qps": 27.682660122991784
+      }
+    ],
+    "block_skip": null,
+    "closed_loop": {
+      "concurrency": 4,
+      "latency_ms": {
+        "p50_ms": 142.8234859999975,
+        "p95_ms": 177.86836400000539
+      },
+      "qps": 27.79515254469968,
+      "seconds": 20.183375467999667
+    },
+    "effective_nprobe": 128,
+    "effective_oversample": 2.0,
+    "recall_at_100": 0.9701100000000047,
+    "sequential_latency_ms": {
+      "count": 1000,
+      "mean_ms": 36.103851911001584,
+      "p50_ms": 35.10743899960289,
+      "p95_ms": 54.0131080001629
+    }
+  },
+  "store": {
+    "ann": {
+      "algorithm": "cluster",
+      "clusters": 4096,
+      "nprobe": 64
+    },
+    "bit_width": 4,
+    "build": null,
+    "footprint": {
+      "by_extension_bytes": {
+        ".json": 246338636,
+        ".lock": 0,
+        ".tvann": 9897316,
+        ".tvfd": 1548000148,
+        ".tvim": 396006162,
+        ".tvvf": 1548000252
+      },
+      "total_bytes": 3748242514
+    },
+    "layout": {
+      "compacted": false
+    },
+    "open": {
+      "open_plus_first_query_seconds": 105.32354476800037
+    },
+    "rescore": {
+      "dtype": "fp16",
+      "oversample": 4.0
+    },
+    "serve_overrides": {
+      "ann_nprobe": 128,
+      "oversample": 2.0
+    }
+  },
+  "volume_copy_seconds": 0.8935142289997202
+}
