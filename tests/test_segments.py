@@ -212,9 +212,22 @@ def test_add_then_remove_in_one_fold_batch_stays_reopenable(tmp_path):
     persist) wrote its never-committed row into the delta's removed set, and
     the strict replay rejected the store on every fresh open ("removed-id
     count mismatch") — the warm handle kept serving while every new reader,
-    hydration, or pull failed. Found by OreCloud's randomized op soup."""
+    hydration, or pull failed. Found by OreCloud's randomized op soup.
 
-    _writer(tmp_path).close()
+    The bug lives on the delta path, which only exists over a committed vector
+    base: an empty store's base carries no ``.tvim``, so its next persist
+    rewrites a base (discarding the poisoned removed set) and would mask the
+    regression. Seed and persist a committed row first so the add+remove
+    window commits a delta."""
+
+    db = _writer(tmp_path)
+    try:
+        seed = _add_segment([{"text": "the committed seed document", "id": "seed"}])
+        fold_segment(db, seed, first_lsn=db.applied_lsn() + 1)
+        db.persist()
+    finally:
+        db.close()
+
     add_x = _add_segment([{"text": "an ephemeral document", "id": "x"}])
     remove_x = encode_segment([delete_documents_record("x")])
     keep = _add_segment([{"text": "a surviving document", "id": "keep"}])
@@ -230,7 +243,8 @@ def test_add_then_remove_in_one_fold_batch_stays_reopenable(tmp_path):
 
     reader = LodeDB.open_readonly(tmp_path, model="minilm", _embedding_backend=_be())
     try:
-        assert reader.count() == 1
+        assert reader.count() == 2
+        assert reader.get("seed") == "the committed seed document"
         assert reader.get("keep") == "a surviving document"
         assert reader.get("x") is None
     finally:
