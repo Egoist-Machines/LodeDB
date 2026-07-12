@@ -4161,6 +4161,19 @@ fn payload_builder_validates_embeddings() {
     let mut poisoned = plan_embeddings(&plan);
     poisoned[0][0] = f32::NAN;
     assert!(build_embedded_documents_payload(&plan, &poisoned, 8).is_err());
+    // A repeated document id -- refused by the planner up front, and re-checked
+    // by the builder because a plan can cross the FFI as JSON.
+    let duplicated = [
+        text_doc("dup", "first occurrence", metadata(&[])),
+        text_doc("dup", "second occurrence", metadata(&[])),
+    ];
+    let error = plan_documents(&duplicated, true, true, 900).unwrap_err();
+    assert!(error.to_string().contains("unique document ids"), "{error}");
+    let mut forged = plan.clone();
+    forged.documents.push(forged.documents[0].clone());
+    let embeddings = plan_embeddings(&forged);
+    let error = build_embedded_documents_payload(&forged, &embeddings, 8).unwrap_err();
+    assert!(error.to_string().contains("repeats document id"), "{error}");
 }
 
 #[test]
@@ -4364,6 +4377,24 @@ fn apply_wal_records_refuses_malformed_payloads() {
             ),
             "non-numeric coordinate",
         ),
+        // A repeated document id in one record would orphan the earlier
+        // occurrence's TurboVec row: the owner map keeps only the last
+        // occurrence while the batch-wide active-chunk set spares the first
+        // one's chunk from removal. Replay refuses it before anything applies.
+        (
+            record(
+                "apply_embedded_documents",
+                json!({
+                    "documents": [
+                        {"document_id": "dup", "chunk_ids": [], "tokens": []},
+                        {"document_id": "dup", "chunk_ids": [], "tokens": []},
+                    ],
+                    "added_chunks": [],
+                    "removed_chunk_ids": [],
+                }),
+            ),
+            "repeats document id",
+        ),
     ];
     for (poisoned, needle) in cases {
         let error = engine.apply_wal_records("default", &[poisoned]).unwrap_err();
@@ -4379,6 +4410,80 @@ fn apply_wal_records_refuses_malformed_payloads() {
     let empty = record("delete_documents", json!({"document_ids": []}));
     assert_eq!(engine.apply_wal_records("default", &[empty]).unwrap(), 1);
     drop(engine);
+    fs::remove_dir_all(&path).unwrap();
+}
+
+#[test]
+fn add_then_remove_within_one_persist_stays_reopenable() {
+    // Regression: a document added AND removed between two persists left its
+    // never-committed stable id in the tvim delta's removed set; the strict
+    // replay ("removed-id count mismatch") then rejected the store on every
+    // fresh open. The add+remove must cancel out of the delta entirely --
+    // while a COMMITTED row that is replaced or removed in the same window
+    // must still record its removal (the resurrection guard).
+    let path = generation_store("core_add_remove_one_persist");
+    let seed = [text_doc("seed", "the committed seed document", metadata(&[]))];
+    let plan = plan_documents(&seed, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut records = vec![WalRecord {
+        op: "apply_embedded_documents".to_string(),
+        payload,
+        lsn: None,
+    }];
+    stamp_records(&mut records, floor + 1);
+    engine.apply_wal_records("default", &records).unwrap();
+    engine.persist().unwrap();
+
+    // One persist window: add x, remove x (never committed); and replace the
+    // COMMITTED seed then remove it (its removal must survive the filter).
+    let ephemeral = [text_doc("x", "an ephemeral document", metadata(&[]))];
+    let plan = plan_documents(&ephemeral, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let add_x = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+    let reseed = [text_doc("seed", "the replaced seed document", metadata(&[]))];
+    let plan = plan_documents(&reseed, true, true, 900).unwrap();
+    let embeddings = plan_embeddings(&plan);
+    let replace_seed = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
+    let floor = engine.applied_lsn("default").unwrap();
+    let mut records = vec![
+        WalRecord {
+            op: "apply_embedded_documents".to_string(),
+            payload: add_x,
+            lsn: None,
+        },
+        WalRecord {
+            op: "delete_documents".to_string(),
+            payload: json!({"document_ids": ["x"]}),
+            lsn: None,
+        },
+        WalRecord {
+            op: "apply_embedded_documents".to_string(),
+            payload: replace_seed,
+            lsn: None,
+        },
+        WalRecord {
+            op: "delete_documents".to_string(),
+            payload: json!({"document_ids": ["seed"]}),
+            lsn: None,
+        },
+    ];
+    stamp_records(&mut records, floor + 1);
+    assert_eq!(engine.apply_wal_records("default", &records).unwrap(), 4);
+    engine.persist().unwrap();
+    drop(engine);
+
+    // The bug made this open fail with CorruptStore.
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(
+        reopened.stats("default").unwrap().document_count,
+        0,
+        "the committed seed's removal must survive the never-committed filter"
+    );
+    drop(reopened);
     fs::remove_dir_all(&path).unwrap();
 }
 

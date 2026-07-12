@@ -1939,6 +1939,23 @@ impl CoreEngine {
             .get("documents")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_err("WAL embedded payload missing documents"))?;
+        // Refuse duplicate document ids up front, before any state mutates. The
+        // per-document loop below overwrites the owner map per occurrence while
+        // `active_chunk_ids` accumulates across the whole record, so a repeated
+        // id would spare an earlier occurrence's chunk from removal with no
+        // owner left -- an orphan TurboVec row that fails every query touching
+        // it after reopen ("unknown stable id"). Sanctioned builders already
+        // refuse the shape; this is the replay trust boundary's own check.
+        let mut seen_document_ids = BTreeSet::new();
+        for document in documents {
+            let document_id = document
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL embedded document missing document_id"))?;
+            if !seen_document_ids.insert(document_id.to_string()) {
+                return invalid("WAL embedded payload repeats document id");
+            }
+        }
         // Reuse vectors only for the chunks these documents reference that are not
         // in this record's added_chunks, via the O(1) owner map, rather than
         // cloning the whole corpus on every replayed record.
@@ -3452,6 +3469,7 @@ fn index_from_loaded_store(
         pending_raw_text_clears: BTreeSet::new(),
         pending_multivec_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
+        pending_new_stable_ids: BTreeSet::new(),
         pending_vectors_changed: false,
     };
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
@@ -3919,6 +3937,7 @@ fn persist_index_generation(
     index.pending_raw_text_clears.clear();
     index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
+    index.pending_new_stable_ids.clear();
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
     // writable handle's `applied_lsn()` reports the committed generation (the
@@ -4548,6 +4567,12 @@ struct VectorOnlyIndex {
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
     pending_removed_stable_ids: BTreeSet<u64>,
+    /// Stable ids first written since the last persist -- rows no reader of the
+    /// base + committed deltas has ever seen. A remove of one of these must NOT
+    /// enter the delta's removed set: the strict replay (`remove_many` count
+    /// check) would reject the delta as corrupt on the next open. The dual of
+    /// the `pending_removed_stable_ids.remove(readded)` rule above.
+    pending_new_stable_ids: BTreeSet<u64>,
     /// Whether a vector value actually changed (a real add/move/remove, not a
     /// metadata-only re-emit) since the last commit. Set at the vector-sync choke
     /// points alongside the cluster-cache drop, so one engine signal drives both
@@ -4592,6 +4617,7 @@ impl VectorOnlyIndex {
             pending_raw_text_clears: BTreeSet::new(),
             pending_multivec_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
+            pending_new_stable_ids: BTreeSet::new(),
             pending_vectors_changed: false,
         }
     }
@@ -4628,23 +4654,46 @@ impl VectorOnlyIndex {
         } else {
             false
         };
-        let readded = {
+        let (pre_existing, readded) = {
             let mut guard = self.vector_index.borrow_mut();
             let Some(index) = guard.as_mut() else {
                 return Ok(());
+            };
+            let chunk_ids: Vec<String> =
+                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
+            // Liveness before the upsert distinguishes a replaced row (its
+            // stable id predates this cycle unless tracked as new below) from
+            // a first write. A just-built index cannot witness pre-upsert
+            // liveness (it was built from rows that already include this
+            // call's chunks) and does not need to: a lazy build only happens
+            // when no committed `.tvim` exists (a committed vector base is
+            // materialized at open and the live index never drops
+            // mid-session), so no incoming row predates this cycle.
+            let pre_existing: BTreeSet<u64> = if built_now {
+                BTreeSet::new()
+            } else {
+                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect()
             };
             // A just-built index already contains every current chunk; only an
             // existing index needs the incremental upsert.
             if !built_now {
                 index.upsert_chunks(chunks)?;
             }
-            let chunk_ids: Vec<String> =
-                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
-            index.stable_ids_for_chunks(&chunk_ids)
+            (pre_existing, index.stable_ids_for_chunks(&chunk_ids))
         };
-        // Rows written this cycle are no longer "removed" relative to the base.
+        // Rows written this cycle are no longer "removed" relative to the base;
+        // rows FIRST written this cycle are invisible to every reader of the
+        // committed state, so a later same-cycle remove must skip the delta's
+        // removed set (see `sync_vector_index_remove`). A row that was live
+        // before this upsert, or that this cycle removed earlier (a committed
+        // row by definition -- new rows leave `pending_removed` untouched), is
+        // NOT new: misclassifying it would drop its eventual removal from the
+        // delta and resurrect the committed row on replay.
         for stable_id in readded {
-            self.pending_removed_stable_ids.remove(&stable_id);
+            let removed_this_cycle = self.pending_removed_stable_ids.remove(&stable_id);
+            if !pre_existing.contains(&stable_id) && !removed_this_cycle {
+                self.pending_new_stable_ids.insert(stable_id);
+            }
         }
         // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
         // metadata-only change, whose caller still routes through here) alters no
@@ -4677,7 +4726,16 @@ impl VectorOnlyIndex {
             // and the cluster index (and any `.tvann` base) stays valid.
             return;
         }
-        self.pending_removed_stable_ids.extend(removed);
+        // A row first written since the last persist was never committed: no
+        // reader of the base + deltas has its stable id, so recording its
+        // removal would make the next delta fail strict replay ("removed-id
+        // count mismatch") and brick the store for every fresh open. Its
+        // add+remove simply cancel out of the delta.
+        for stable_id in removed {
+            if !self.pending_new_stable_ids.remove(&stable_id) {
+                self.pending_removed_stable_ids.insert(stable_id);
+            }
+        }
         // The vector set changed: record the shared signal (drives the `.tvann`
         // drop at commit) and drop the cluster index so a removed vector cannot
         // linger in a stale posting; the next ANN query rebuilds from live rows.
@@ -5412,6 +5470,17 @@ pub fn plan_documents(
     if documents.is_empty() {
         return invalid("plan_documents requires at least one document");
     }
+    // A repeated id within one batch is ambiguous (which occurrence wins?) and,
+    // worse, one `apply_embedded_documents` record carrying both orphans the
+    // earlier occurrence's TurboVec row at fold time. Refuse it here, before
+    // anything is chunked or embedded; callers that mean "replace" should
+    // last-wins upstream or split the batch.
+    let mut seen_ids = BTreeSet::new();
+    for document in documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("plan_documents requires unique document ids within one batch");
+        }
+    }
     let (prepared_documents, chunks_to_embed) = plan_document_chunks(
         documents,
         store_text,
@@ -5446,6 +5515,16 @@ pub fn build_embedded_documents_payload(
 ) -> Result<Value, CoreError> {
     if plan.documents.is_empty() {
         return invalid("the ingest plan holds no documents");
+    }
+    // A plan can cross the FFI as JSON, so re-check id uniqueness here even
+    // though `plan_documents` refuses the shape: a repeated id in one
+    // `apply_embedded_documents` record orphans the earlier occurrence's
+    // TurboVec row at fold time (see `apply_embedded_documents_wal`).
+    let mut seen_ids = BTreeSet::new();
+    for document in &plan.documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("the ingest plan repeats document id");
+        }
     }
     if embeddings.len() != plan.chunks_to_embed.len() {
         return invalid("embedding count does not match the prepared plan");
