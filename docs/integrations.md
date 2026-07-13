@@ -113,7 +113,7 @@ lodedb migrate validate --manifest ./data/lodedb/migration.json
 | [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) | Local RAG app (JS) | 62k | Provider layer + local bridge | 📋 Backlog |
 | [Open WebUI](https://github.com/open-webui/open-webui) | Local RAG app (Py) | 140k | `VECTOR_DB` provider | 📋 Backlog |
 | [Flowise](https://github.com/FlowiseAI/Flowise) | Agent app (TS) | 53k | LangChain vector-store node / bridge | 📋 Backlog |
-| [kotaemon](https://github.com/Cinnamon/kotaemon) | Local RAG app | 26k | Swappable backend (`flowsettings.py`) | 📋 Backlog |
+| [kotaemon](https://github.com/Cinnamon/kotaemon) | Local RAG app | 26k | `BaseVectorStore` via `KH_VECTORSTORE` (no extra needed) | ✅ Shipped |
 | [LocalGPT](https://github.com/PromtEngineer/localGPT) | Local RAG app | 22k | Replace bundled LanceDB | 📋 Backlog |
 | [Msty](https://msty.app/) | Local AI workspace | n/a | Knowledge Stack storage/index bridge | 🔬 Evaluating |
 | [GPT4All](https://github.com/nomic-ai/gpt4all) | Local LLM app | n/a | LocalDocs storage backend | 🔬 Evaluating |
@@ -146,8 +146,9 @@ Overlap with current work:
 
 Recommended order from this pass:
 
-1. **kotaemon.** It is Python, local-RAG focused, and already exposes `KH_VECTORSTORE` in
-   `flowsettings.py`. This is the cleanest app demo after the framework adapters.
+1. **kotaemon.** ✅ Done (see Recently shipped): the `KH_VECTORSTORE` seam took a
+   dependency-free adapter and a settings change, benchmarked ~9× ingest / ~10× incremental
+   add / ~40× disk vs the Chroma default. Next step is the upstream conversation.
 2. **Haystack and txtai.** These are still the best ecosystem multipliers. They should precede
    most one-off app integrations unless an app partner is ready to test.
 3. **Open WebUI and DocsGPT.** Both are Python-heavy private AI apps with user-visible document
@@ -176,15 +177,78 @@ foundation is in place and every app built on those abstractions is reachable wi
 adapter. **PrivateGPT** ships on top of it as a provider shim plus one config key: its store
 layer *is* LlamaIndex's `BasePydanticVectorStore`, so no new adapter was needed.
 
-**Now.** Framework breadth: **Haystack** and **txtai**, both low-effort drop-in adapters. In
-parallel, build the first local-RAG app demo against **kotaemon**, where the provider seam is
-already explicit and Python-native.
+**Now.** Framework breadth: **Haystack** and **txtai**, both low-effort drop-in adapters. The
+first local-RAG app demo, **kotaemon**, has shipped (see Recently shipped); its remaining work
+is the upstream PR/usage-note conversation with Cinnamon/kotaemon.
 
 **Later.** High-visibility local apps. Lead with permissively licensed Python apps (Open WebUI,
 DocsGPT, LocalGPT); the JS/TS or desktop apps (AnythingLLM, Flowise, Msty, GPT4All, Dify) need
 the local-bridge step first.
 
 ## Recently shipped
+
+### kotaemon
+- **Repo:** Cinnamon/kotaemon (~26k★, Apache-2.0). Local, open-source RAG UI for chatting
+  with documents. **Install:** none — the adapter is dependency-free (it duck-types
+  kotaemon's `DocumentWithEmbedding` and LlamaIndex's `MetadataFilters` rather than
+  importing either package), so plain `lodedb` inside kotaemon's environment is enough.
+- **Pattern:** `lodedb.local.integrations.kotaemon.LodeDBVectorStore` implements kotaemon's
+  `BaseVectorStore` contract (`add` / `delete` / `query` / `drop`, plus `count` and
+  `__persist_flow__`). kotaemon resolves its vector store from a dotted `__type__` path via
+  theflow's `deserialize`, so selection is a settings change only — no kotaemon fork, no
+  registration call:
+
+  ```python
+  # flowsettings.py
+  KH_VECTORSTORE = {
+      "__type__": "lodedb.local.integrations.kotaemon.LodeDBVectorStore",
+      "path": str(KH_USER_DATA_DIR / "vectorstore"),
+  }
+  ```
+
+  kotaemon's `get_vectorstore` injects `collection_name` per index; each collection is one
+  LodeDB store under `<path>/<collection_name>`. See
+  [`examples/kotaemon_store.py`](../examples/kotaemon_store.py).
+- **Why it fits:** kotaemon's default is a Chroma collection per file index, rebuilt chunk
+  batch by chunk batch as users upload files — exactly the incremental-write workload
+  LodeDB's O(changed) delta persistence targets, and the app is local-first so a zero-server
+  embedded store is a category match.
+- **Embeddings:** kotaemon owns embedding (its pipelines pass precomputed vectors), so the
+  adapter uses LodeDB's vector-in path. kotaemon never configures an embedding dimension —
+  the store meets whatever model the user selected — so the LodeDB index is created lazily on
+  first `add` and its shape is recorded in a `kotaemon_store.json` sidecar for reopens.
+  Dimensions that are not a multiple of 8 (a LodeDB index requirement) are zero-padded up,
+  which changes neither norms nor dot products before LodeDB's configured quantization. Chunk
+  text and documents stay in kotaemon's docstore (retrieval re-reads them by id); the adapter keeps
+  only vectors, ids, and scalar filter metadata (e.g. `file_id`), with each row's id mirrored
+  into a reserved `kh::id` metadata key so kotaemon's chunk-id `scope` (`doc_ids`) and the
+  `file_id IN [...]` `MetadataFilters` push down into LodeDB's metadata planner.
+- **Validated:** kotaemon's own vector-store test shapes pass against the adapter (mirrored
+  in `tests/test_kotaemon_adapter.py`, which needs no kotaemon install), and a live check in
+  a kotaemon 0.11 environment ran the real `deserialize(KH_VECTORSTORE)` path, real
+  `DocumentWithEmbedding` / `MetadataFilters` objects, and top-1 parity with the Chroma
+  default on normalized vectors (14/14 checks).
+- **Benchmark (kotaemon interface, 20k × 384-dim normalized vectors, batches of 100, one
+  process per backend, M-series CPU):** vs the default `ChromaVectorStore`, byte-identical
+  vectors/ids/metadata/top-k on both sides — ingest 1.8s vs 16.9s (~9×); per-100-chunk add
+  (= durable commit at this seam) p50 8.6ms / p95 8.9ms / p99 9.0ms vs p50 83.9ms / p95
+  111ms / p99 126ms (the O(changed) tail story); query p50 0.17ms / p95 0.22ms vs 64.2ms /
+  65.1ms; 500-chunk scoped query p50 0.31ms vs 64.5ms; disk 10.5MB vs 424MB (~40×); peak RSS
+  ~even (592MB vs 577MB, both dominated by the benchmark fixture); top-1 accuracy vs a
+  brute-force oracle 1.000 vs 0.440 (near-tie random vectors are adversarial for HNSW;
+  real-embedding gaps are smaller, but exact scan cannot miss the true neighbor). Chroma's
+  cold reopen is faster (0.07s vs 0.43s). Batch-query latency is N/A at this seam —
+  kotaemon's `BaseVectorStore` has no batch-query API (retrieval issues single queries);
+  LodeDB's batch path is covered by the repo's own benchmarks. Score scale differs by
+  design: LodeDB returns cosine similarity, Chroma's default collection ranks by L2
+  (identical ordering on normalized embeddings). Kotaemon has no retrieval test set, so
+  quality checks use the brute-force oracle; artifacts are metrics-only (counts, latencies,
+  sizes).
+- **Scope:** vector store only; kotaemon's docstore (LanceDB/Elasticsearch/SimpleFile) and
+  graph indices are separate seams and unchanged. Upstream, kotaemon bundles store choices in
+  `libs/kotaemon/kotaemon/storages/vectorstores/`; a PR there would add a thin subclass plus
+  a `pip install lodedb` extra in their docs — the settings-path integration above works
+  today without it.
 
 ### cognee ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74), in review)
 - **Repo:** topoteretes/cognee (~7k★, Apache-2.0). AI memory that builds a knowledge graph
@@ -283,8 +347,6 @@ the local-bridge step first.
   backend.)
 
 ### Local RAG apps (visibility demos)
-- **kotaemon** (~26k★, Apache-2.0): swappable vector stores including an InMemory option via
-  `flowsettings.py`; LodeDB is a strict upgrade (persistent, exact, fast).
 - **LocalGPT** (~22k★, MIT): bundles LanceDB (`lancedb_uri`), a contained code swap.
 - **Open WebUI** (~140k★): `VECTOR_DB` selector; its docs warn the default Chroma/SQLite path
   is unsafe under multiple workers or replicas, so LodeDB is both a performance and a *simpler

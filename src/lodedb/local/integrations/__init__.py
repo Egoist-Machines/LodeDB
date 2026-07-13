@@ -13,6 +13,9 @@ package imports cleanly without those heavy deps installed:
   PrivateGPT vector-store provider (needs the ``llama-index`` extra inside a PrivateGPT
   environment). It is a provider shim, not a new adapter: PrivateGPT's store layer *is*
   LlamaIndex's ``BasePydanticVectorStore``, which the LlamaIndex adapter already implements.
+- ``kotaemon`` — ``kotaemon.LodeDBVectorStore`` implements kotaemon's ``BaseVectorStore``
+  contract by duck typing (no extra needed; the module imports neither kotaemon nor
+  llama-index). Selected from kotaemon via ``KH_VECTORSTORE`` in ``flowsettings.py``.
 
 All wrap a LodeDB handle. The LangChain and LlamaIndex adapters are text-path — LodeDB embeds
 text internally (``is_embedding_query=False``) and the framework's own embedding model is not
@@ -25,5 +28,7 @@ scalar presence keys so cognee's ``node_name`` filtering pushes into the metadat
 ``LodeDBPropertyGraphStore`` wraps :class:`lodedb.graph.KnowledgeGraph` instead
 of the flat :class:`LodeDB` SDK, exposing the graph layer to LlamaIndex's ``PropertyGraphIndex``.
 The PrivateGPT provider reuses the text-path LlamaIndex adapter and creates one local LodeDB
-index per PrivateGPT collection.
+index per PrivateGPT collection. The kotaemon adapter is vector-in (kotaemon owns the
+embeddings) with one lazily-shaped LodeDB collection per kotaemon index under the configured
+``path``; chunk text stays in kotaemon's docstore.
 """

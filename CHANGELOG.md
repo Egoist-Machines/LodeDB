@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dependency-free kotaemon vector-store adapter.** Configure
+  `lodedb.local.integrations.kotaemon.LodeDBVectorStore` through kotaemon's
+  `KH_VECTORSTORE` setting to use one local LodeDB collection per index, with
+  chunk scopes and metadata/table predicates pushed into the metadata planner.
+- `LodeDB.remove_many(ids)` batches document removal into one native mutation
+  and durable commit.
 - **WAL segment primitives for out-of-band ingest (`lodedb.local.segments`).** Store-free
   planning (`plan_documents`), record building (`build_embedded_documents_record`,
   `delete_documents_record`), immutable WAL-format segment encode/decode
