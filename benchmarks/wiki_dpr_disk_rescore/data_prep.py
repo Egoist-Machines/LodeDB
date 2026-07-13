@@ -11,6 +11,8 @@ is materialized in memory.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -19,18 +21,24 @@ import numpy as np
 try:
     from .common import (
         BASE_NAME,
+        MANIFEST_VERSION,
         QUERIES_NAME,
+        _atomic_save_npy,
         compute_exact_ground_truth,
         load_manifest,
+        sha256_file,
         validate_dataset,
         write_manifest,
     )
 except ImportError:  # Direct execution from this directory.
     from common import (  # type: ignore[no-redef]
         BASE_NAME,
+        MANIFEST_VERSION,
         QUERIES_NAME,
+        _atomic_save_npy,
         compute_exact_ground_truth,
         load_manifest,
+        sha256_file,
         validate_dataset,
         write_manifest,
     )
@@ -96,8 +104,10 @@ def _batch_matrix(column: Any, dim: int) -> np.ndarray:
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     """Normalizes a batch in fp32 and rejects zero vectors."""
 
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("embedding input contains NaN or infinite coordinates")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    if np.any(norms == 0.0):
+    if not np.all(np.isfinite(norms)) or np.any(norms == 0.0):
         raise ValueError("embedding input contains a zero vector")
     return np.ascontiguousarray(matrix / norms, dtype=np.float32)
 
@@ -110,6 +120,7 @@ def prepare_dataset(
     n_queries: int = 1000,
     seed: int = 42,
     skip_gt: bool = False,
+    source_revision: str,
 ) -> dict[str, Any]:
     """Streams parquet shards into a normalized raw-f32 corpus and query file."""
 
@@ -117,6 +128,11 @@ def prepare_dataset(
         raise ValueError("target_rows must be at least 100 for top-100 ground truth")
     if not 1 <= n_queries <= target_rows:
         raise ValueError("n_queries must be in [1, target_rows]")
+    if (
+        len(source_revision) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in source_revision)
+    ):
+        raise ValueError("source_revision must be a 40- or 64-character immutable commit digest")
     shards = sorted(Path(shards_dir).glob("*.parquet"))
     if not shards:
         raise FileNotFoundError(f"no parquet shards found below {shards_dir}")
@@ -127,7 +143,13 @@ def prepare_dataset(
     )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = np.memmap(out_dir / BASE_NAME, dtype=np.float32, mode="w+", shape=(target_rows, dim))
+    generation = secrets.token_hex(8)
+    base_name = f"{Path(BASE_NAME).stem}-{generation}.f32"
+    query_name = f"{Path(QUERIES_NAME).stem}-{generation}.npy"
+    base_path = out_dir / base_name
+    base_temporary = out_dir / f".{base_name}.tmp"
+    base = np.memmap(base_temporary, dtype="<f4", mode="w+", shape=(target_rows, dim))
+    base_sha = hashlib.sha256()
     _, pq = _pyarrow()
     written = 0
     for shard in shards:
@@ -139,7 +161,9 @@ def prepare_dataset(
                 break
             matrix = _batch_matrix(batch.column(0), dim)
             take = min(target_rows - written, matrix.shape[0])
-            base[written : written + take] = _normalize_rows(matrix[:take])
+            normalized = _normalize_rows(matrix[:take])
+            base[written : written + take] = normalized
+            base_sha.update(np.ascontiguousarray(normalized, dtype="<f4").tobytes(order="C"))
             written += take
             print(f"[wiki-dpr] wrote {written}/{target_rows} rows", flush=True)
     if written != target_rows:
@@ -147,22 +171,36 @@ def prepare_dataset(
     base.flush()
     rng = np.random.default_rng(seed)
     query_indices = rng.choice(target_rows, size=n_queries, replace=False).astype(np.int64)
-    np.save(out_dir / QUERIES_NAME, np.asarray(base[query_indices], dtype=np.float32))
+    queries = np.asarray(base[query_indices], dtype=np.float32)
+    del base
+    base_temporary.replace(base_path)
+    query_path = out_dir / query_name
+    _atomic_save_npy(query_path, queries)
     manifest: dict[str, Any] = {
-        "version": 1,
+        "version": MANIFEST_VERSION,
         "rows": int(target_rows),
         "dim": int(dim),
         "n_queries": int(n_queries),
         "seed": int(seed),
         "query_row_indices": [int(index) for index in query_indices],
         "normalized": True,
-        "shards_fingerprint": [
-            {"name": shard.name, "size": int(shard.stat().st_size)} for shard in shards
-        ],
+        "source": {
+            "dataset": "kenhktsui/wiki_dpr_e5",
+            "revision": source_revision,
+            "shards": [
+                {"name": shard.name, "size": int(shard.stat().st_size)} for shard in shards
+            ],
+        },
         "files": {
-            "base": BASE_NAME,
-            "queries": QUERIES_NAME,
+            "base": base_name,
+            "queries": query_name,
             # compute_exact_ground_truth installs these names after writing both files.
+            "gt_indices": None,
+            "gt_scores": None,
+        },
+        "sha256": {
+            "base": base_sha.hexdigest(),
+            "queries": sha256_file(query_path),
             "gt_indices": None,
             "gt_scores": None,
         },
@@ -185,6 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-rows", type=int, help="number of corpus rows to retain")
     parser.add_argument("--n-queries", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--source-revision",
+        help="immutable source dataset revision (for example a Hugging Face commit SHA)",
+    )
     parser.add_argument("--skip-gt", action="store_true", help="write corpus and queries only")
     parser.add_argument(
         "--gt-only", action="store_true", help="compute ground truth from --out only"
@@ -202,8 +244,11 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("--gt-only and --skip-gt cannot be used together")
         compute_exact_ground_truth(args.out, block_rows=args.gt_block_rows)
         return
-    if args.shards_dir is None or args.target_rows is None:
-        raise SystemExit("--shards-dir and --target-rows are required unless --gt-only is used")
+    if args.shards_dir is None or args.target_rows is None or args.source_revision is None:
+        raise SystemExit(
+            "--shards-dir, --target-rows, and --source-revision are required "
+            "unless --gt-only is used"
+        )
     prepare_dataset(
         args.shards_dir,
         args.out,
@@ -211,6 +256,7 @@ def main(argv: list[str] | None = None) -> None:
         n_queries=args.n_queries,
         seed=args.seed,
         skip_gt=args.skip_gt,
+        source_revision=args.source_revision,
     )
 
 

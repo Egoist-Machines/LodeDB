@@ -94,51 +94,72 @@ def _log_result(result: dict[str, Any]) -> None:
 
 
 @app.function(cpu=4.0, memory=16384, timeout=14_400, volumes={_VOLUME_PATH: VOLUME})
-def download() -> dict[str, Any]:
+def download(revision: str = "") -> dict[str, Any]:
     """Downloads parquet shards once into the persistent volume."""
 
     from huggingface_hub import snapshot_download
 
     shards_dir = Path(_VOLUME_PATH) / "shards" / "data"
-    marker = Path(_VOLUME_PATH) / "shards" / ".download_complete"
+    if (
+        len(revision) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        raise ValueError("download revision must be an immutable commit digest")
+    marker = Path(_VOLUME_PATH) / "shards" / ".download_complete.json"
     existing = sorted(shards_dir.glob("*.parquet"))
     try:
-        completed_shards = int(marker.read_text().strip())
-    except (FileNotFoundError, ValueError):
-        completed_shards = None
-    if completed_shards == len(existing) and completed_shards > 0:
+        completed = json.loads(marker.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        completed = None
+    if (
+        isinstance(completed, dict)
+        and completed.get("revision") == revision
+        and completed.get("shards") == len(existing)
+        and len(existing) > 0
+    ):
         return {"downloaded": False, "shards": len(existing), "path": str(shards_dir)}
+    if shards_dir.exists():
+        shutil.rmtree(shards_dir)
     snapshot_download(
         repo_id="kenhktsui/wiki_dpr_e5",
         repo_type="dataset",
+        revision=revision,
         allow_patterns=["data/*.parquet"],
         local_dir=f"{_VOLUME_PATH}/shards",
     )
     shards = sorted(shards_dir.glob("*.parquet"))
     if not shards:
         raise RuntimeError("Hugging Face snapshot completed without data/*.parquet")
-    marker.write_text(f"{len(shards)}\n")
+    marker.write_text(json.dumps({"revision": revision, "shards": len(shards)}) + "\n")
     VOLUME.commit()
     return {"downloaded": True, "shards": len(shards), "path": str(shards_dir)}
 
 
 @app.function(cpu=16.0, memory=65536, timeout=21_600, volumes={_VOLUME_PATH: VOLUME})
-def prepare(target_rows: int = 21_015_300, n_queries: int = 1000, seed: int = 42) -> dict[str, Any]:
+def prepare(
+    target_rows: int = 21_015_300,
+    n_queries: int = 1000,
+    seed: int = 42,
+    source_revision: str = "",
+) -> dict[str, Any]:
     """Streams source shards to the normalized corpus and query files, without GT."""
 
-    from common import load_manifest
+    from common import validate_dataset
     from data_prep import prepare_dataset
 
     out = Path(_prepared_dir(target_rows))
+    if not source_revision:
+        raise ValueError("prepare requires the immutable source revision used by download")
     try:
-        existing = load_manifest(out)
+        existing = validate_dataset(out, require_gt=False)
         if (
             int(existing["rows"]) == target_rows
             and int(existing["n_queries"]) == n_queries
             and existing.get("seed") == seed
+            and existing["source"]["revision"] == source_revision
         ):
             return {"prepared": False, "path": str(out), "rows": target_rows}
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         pass
     manifest = prepare_dataset(
         Path(_VOLUME_PATH) / "shards" / "data",
@@ -147,6 +168,7 @@ def prepare(target_rows: int = 21_015_300, n_queries: int = 1000, seed: int = 42
         n_queries=n_queries,
         seed=seed,
         skip_gt=True,
+        source_revision=source_revision,
     )
     VOLUME.commit()
     return {"prepared": True, "path": str(out), "rows": manifest["rows"], "dim": manifest["dim"]}
@@ -179,7 +201,12 @@ def _build_store_impl(
 ) -> dict[str, Any]:
     """Builds one named reusable store directly on the volume, without serving."""
 
-    from lodedb_bench import run_benchmark
+    from common import load_manifest
+    from lodedb_bench import (
+        _guard_existing_store_config,
+        _requested_store_create,
+        run_benchmark,
+    )
     from sweep import STORES
 
     try:
@@ -188,8 +215,35 @@ def _build_store_impl(
         raise ValueError(f"unknown store label: {store_label}") from exc
     store_dir = Path(_store_dir(target_rows, store_label))
     config_path = store_dir / "benchmark_store_config.json"
+    manifest = load_manifest(_prepared_dir(target_rows))
     if config_path.exists():
+        kwargs = dict(store)
+        kwargs.pop("requires_engine", None)
+        expected_builder = kwargs.pop("expected_builder_git_sha", None)
+        kwargs.pop("buildable", None)
+        layout_id = kwargs.pop("layout_id")
+        _guard_existing_store_config(
+            store_dir,
+            _requested_store_create(
+                bit_width=int(kwargs.get("bit_width", 4)),
+                ann_clusters=kwargs.get("ann_clusters"),
+                ann_nprobe=kwargs.get("ann_nprobe"),
+                rescore=str(kwargs.get("rescore", "none")),
+                oversample=float(kwargs.get("oversample", 4.0)),
+                rows=int(manifest["rows"]),
+                dim=int(manifest["dim"]),
+            ),
+            corpus_id=str(manifest["corpus_id"]),
+            serve_nprobe=None,
+            serve_oversample=None,
+            expected_layout_id=layout_id,
+            expected_builder_git_sha=expected_builder,
+        )
         return {"label": store_label, "resumed": True, "store": {"build": None}}
+    if store.get("buildable") is False:
+        raise ValueError(
+            f"{store_label} is a pinned historical store and cannot be built by current code"
+        )
     if store_dir.exists() and any(store_dir.iterdir()):
         # A store directory without its config file is a crashed earlier build;
         # it cannot be trusted or served, so rebuild it from scratch.
@@ -211,6 +265,7 @@ def _build_store_impl(
             label=store_label,
             build=True,
             serve=False,
+            builder_git_sha=git_sha,
             **kwargs,
         )
         print(f"[wiki-dpr] {store_label}: copying store to volume", flush=True)
@@ -343,20 +398,42 @@ def serve_many(
     machine; results land under /vol/results so they survive any client.
     """
 
+    from common import load_manifest
+    from lodedb_bench import _load_store_config, load_result_for_resume, write_result_atomic
     from sweep import SERVE_CONFIGS
 
     by_label = {config["label"]: config for config in SERVE_CONFIGS}
     results_dir = Path(_VOLUME_PATH) / "results" / f"rows_{target_rows}"
     results_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
+    manifest = load_manifest(_prepared_dir(target_rows))
     for label in labels:
         out = results_dir / f"{label}.json"
         if out.exists():
-            print(f"[wiki-dpr] resume: keeping {out}", flush=True)
+            spec = by_label[label]
+            store_config = _load_store_config(Path(_store_dir(target_rows, spec["store"])))
+            overrides = dict(spec.get("serve_overrides", {}))
+            load_result_for_resume(
+                out,
+                label=label,
+                evaluation_id=str(manifest["evaluation_id"]),
+                store_id=str(store_config["store_id"]),
+                measurement={
+                    "k": 100,
+                    "loop_seconds_requested": 20.0,
+                    "loop_concurrency": 4,
+                    "query_count": int(manifest["n_queries"]),
+                },
+                serve_overrides={
+                    "ann_nprobe": overrides.get("ann_nprobe"),
+                    "oversample": overrides.get("oversample"),
+                },
+            )
+            print(f"[wiki-dpr] resume: validated {out}", flush=True)
             written.append(str(out))
             continue
         result = serve.remote(by_label[label], target_rows, git_sha)
-        out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        write_result_atomic(out, result)
         VOLUME.commit()
         print(f"[wiki-dpr] served {label}", flush=True)
         written.append(str(out))
@@ -450,13 +527,15 @@ def main(target_rows: int = 21_015_300, labels: str = "exact_bw4,ann1000_np16") 
 
 
 @app.function(cpu=4.0, memory=16384, timeout=14_400, volumes={_VOLUME_PATH: VOLUME})
-def smoke() -> dict[str, Any]:
+def smoke(git_sha: str = "") -> dict[str, Any]:
     """Runs a download-free 50k x 256d exact and ANN pipeline check for cost control."""
 
     from common import make_synthetic_dataset
     from lodedb_bench import run_benchmark
 
     data = Path(_VOLUME_PATH) / "prepared" / "smoke_50k"
+    if not git_sha:
+        raise ValueError("smoke requires the exact source git SHA baked into the image")
     make_synthetic_dataset(data, rows=50_000, dim=256, n_queries=50, seed=42)
     specs = (
         {
@@ -475,6 +554,7 @@ def smoke() -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for spec in specs:
         store = Path(_store_dir(50_000, str(spec["label"])))
+        shutil.rmtree(store, ignore_errors=True)
         kwargs = dict(spec["store_kwargs"])
         label = str(spec["label"])
         built = run_benchmark(
@@ -484,6 +564,7 @@ def smoke() -> dict[str, Any]:
             loop_seconds=2.0,
             build=True,
             serve=False,
+            builder_git_sha=git_sha,
             **kwargs,
         )
         _log_result(built)

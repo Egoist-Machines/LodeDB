@@ -24,9 +24,9 @@ from typing import Any
 import numpy as np
 
 try:
-    from .common import GT_K, dataset_arrays
+    from .common import GT_K, canonical_sha256, dataset_arrays
 except ImportError:  # Direct execution from this directory.
-    from common import GT_K, dataset_arrays  # type: ignore[no-redef]
+    from common import GT_K, canonical_sha256, dataset_arrays  # type: ignore[no-redef]
 
 
 class EngineFeatureRequired(RuntimeError):
@@ -34,13 +34,14 @@ class EngineFeatureRequired(RuntimeError):
 
 
 def _requires_engine(feature: str) -> EngineFeatureRequired:
-    return EngineFeatureRequired(
-        "requires engine branch feat/cluster-layout-rescore: " + feature
-    )
+    return EngineFeatureRequired("installed LodeDB build does not provide: " + feature)
 
 
 _STORE_CONFIG_NAME = "benchmark_store_config.json"
+_STORE_CONFIG_VERSION = 2
 _RESCORE_DTYPES = {"fp16": "float16", "fp32": "float32"}
+_EXACT_LAYOUT_ID = "turbovec-exact-v1"
+_CLUSTER_LAYOUT_ID = "cluster-contiguous-v1"
 
 
 def _summary_ms(samples_ms: list[float]) -> dict[str, float | int]:
@@ -86,9 +87,45 @@ def _store_config(
     oversample: float,
     rows: int,
     dim: int,
-) -> dict[str, int | float | str | None]:
+    corpus_id: str,
+    builder_git_sha: str,
+    builder_lodedb_version: str,
+    layout_id: str,
+) -> dict[str, Any]:
     """Returns the benchmark-level configuration persisted alongside a store."""
 
+    config: dict[str, Any] = {
+        "schema_version": _STORE_CONFIG_VERSION,
+        "corpus_id": corpus_id,
+        "create": {
+            "bit_width": bit_width,
+            "ann_clusters": ann_clusters,
+            "ann_nprobe": ann_nprobe,
+            "rescore": rescore,
+            "oversample": oversample,
+            "rows": rows,
+            "dim": dim,
+        },
+        "builder": {
+            "git_sha": builder_git_sha,
+            "lodedb_version": builder_lodedb_version,
+            "layout_id": layout_id,
+        },
+    }
+    config["store_id"] = canonical_sha256(config)
+    return config
+
+
+def _requested_store_create(
+    *,
+    bit_width: int,
+    ann_clusters: int | None,
+    ann_nprobe: int | None,
+    rescore: str,
+    oversample: float,
+    rows: int,
+    dim: int,
+) -> dict[str, Any]:
     return {
         "bit_width": bit_width,
         "ann_clusters": ann_clusters,
@@ -114,22 +151,20 @@ def _load_store_config(store_dir: Path) -> dict[str, Any]:
         raise ValueError(f"invalid benchmark store configuration: {config_path}") from exc
     if not isinstance(loaded, dict):
         raise ValueError(f"benchmark store configuration must be an object: {config_path}")
-    expected_fields = set(
-        _store_config(
-            bit_width=0,
-            ann_clusters=None,
-            ann_nprobe=None,
-            rescore="none",
-            oversample=0.0,
-            rows=0,
-            dim=0,
-        )
-    )
-    missing = sorted(expected_fields - set(loaded))
-    if missing:
-        raise ValueError(
-            f"benchmark store configuration is missing {missing}: {config_path}; rebuild the store"
-        )
+    if loaded.get("schema_version") != _STORE_CONFIG_VERSION:
+        raise ValueError(f"unsupported benchmark store config at {config_path}; rebuild the store")
+    if not isinstance(loaded.get("create"), dict) or not isinstance(loaded.get("builder"), dict):
+        raise ValueError(f"benchmark store provenance is incomplete: {config_path}")
+    stored_id = loaded.get("store_id")
+    without_id = {key: value for key, value in loaded.items() if key != "store_id"}
+    if not isinstance(stored_id, str) or stored_id != canonical_sha256(without_id):
+        raise ValueError(f"benchmark store config identity is invalid: {config_path}")
+    if not isinstance(loaded.get("corpus_id"), str):
+        raise ValueError(f"benchmark store corpus identity is missing: {config_path}")
+    builder = loaded["builder"]
+    for field in ("git_sha", "lodedb_version", "layout_id"):
+        if not isinstance(builder.get(field), str) or not builder[field]:
+            raise ValueError(f"benchmark store builder.{field} is missing: {config_path}")
     return loaded
 
 
@@ -147,40 +182,50 @@ def _supports_session_overrides() -> bool:
 
 def _guard_existing_store_config(
     store_dir: Path,
-    requested: dict[str, Any],
+    requested_create: dict[str, Any],
     *,
+    corpus_id: str,
     serve_nprobe: int | None,
     serve_oversample: float | None,
-) -> None:
+    expected_layout_id: str | None = None,
+    expected_builder_git_sha: str | None = None,
+) -> dict[str, Any]:
     """Rejects a store built for a different corpus or create-time configuration."""
 
     persisted = _load_store_config(store_dir)
 
-    def matches(field: str) -> bool:
-        return (
-            type(persisted[field]) is type(requested[field])
-            and persisted[field] == requested[field]
+    if persisted["corpus_id"] != corpus_id:
+        raise ValueError(
+            f"existing store {store_dir} belongs to corpus {persisted['corpus_id']!r}, "
+            f"requested {corpus_id!r}; rebuild the store"
         )
-
-    create_time_fields = ("bit_width", "ann_clusters", "rescore", "rows", "dim")
-    for field in create_time_fields:
-        if not matches(field):
+    create = persisted["create"]
+    for field, requested in requested_create.items():
+        if type(create.get(field)) is not type(requested) or create.get(field) != requested:
             raise ValueError(
-                f"existing store {store_dir} has {field}={persisted[field]!r}, "
-                f"requested {requested[field]!r}; rebuild the store"
+                f"existing store {store_dir} has {field}={create.get(field)!r}, "
+                f"requested {requested!r}; rebuild the store"
             )
-    if not matches("ann_nprobe"):
-        raise _requires_engine("open-time ann_nprobe override")
-    if not matches("oversample"):
-        raise _requires_engine("open-time rescore oversample override")
-    effective_nprobe = requested["ann_nprobe"] if serve_nprobe is None else serve_nprobe
-    if effective_nprobe != persisted["ann_nprobe"] and not _supports_session_overrides():
+    builder = persisted["builder"]
+    if expected_layout_id is not None and builder["layout_id"] != expected_layout_id:
+        raise ValueError(
+            f"existing store {store_dir} has layout {builder['layout_id']!r}, "
+            f"expected {expected_layout_id!r}"
+        )
+    if expected_builder_git_sha is not None and builder["git_sha"] != expected_builder_git_sha:
+        raise ValueError(
+            f"existing store {store_dir} was built by {builder['git_sha']!r}, "
+            f"expected {expected_builder_git_sha!r}"
+        )
+    effective_nprobe = create["ann_nprobe"] if serve_nprobe is None else serve_nprobe
+    if effective_nprobe != create["ann_nprobe"] and not _supports_session_overrides():
         raise _requires_engine("open-time ann_nprobe override")
     effective_oversample = (
-        requested["oversample"] if serve_oversample is None else serve_oversample
+        create["oversample"] if serve_oversample is None else serve_oversample
     )
-    if effective_oversample != persisted["oversample"] and not _supports_session_overrides():
+    if effective_oversample != create["oversample"] and not _supports_session_overrides():
         raise _requires_engine("open-time rescore oversample override")
+    return persisted
 
 
 def _write_store_config(store_dir: Path, config: dict[str, Any]) -> None:
@@ -232,8 +277,11 @@ def _open_store(
     rescore: str,
     oversample: float,
     rows: int,
+    corpus_id: str,
     serve_nprobe: int | None = None,
     serve_oversample: float | None = None,
+    expected_layout_id: str | None = None,
+    expected_builder_git_sha: str | None = None,
 ) -> Any:
     """Opens a pure vector LodeDB store, guarding future rescore keywords."""
 
@@ -262,7 +310,7 @@ def _open_store(
         kwargs["rescore_dtype"] = _RESCORE_DTYPES[rescore]
         kwargs["rescore_oversample"] = oversample
     existing_store = path.exists() and any(path.iterdir())
-    requested_config = _store_config(
+    requested_create = _requested_store_create(
         bit_width=bit_width,
         ann_clusters=ann_clusters,
         ann_nprobe=ann_nprobe,
@@ -274,9 +322,12 @@ def _open_store(
     if existing_store:
         _guard_existing_store_config(
             path,
-            requested_config,
+            requested_create,
+            corpus_id=corpus_id,
             serve_nprobe=serve_nprobe,
             serve_oversample=serve_oversample,
+            expected_layout_id=expected_layout_id,
+            expected_builder_git_sha=expected_builder_git_sha,
         )
         if serve_nprobe is not None:
             kwargs["ann_nprobe"] = serve_nprobe
@@ -291,20 +342,25 @@ def _open_store(
     return db
 
 
-def _ingest_vectors(db: Any, vectors: np.ndarray, *, batch: int) -> float:
+def _ingest_vectors(db: Any, vectors: np.ndarray, *, batch: int) -> tuple[float, str]:
     """Ingests normalized memmap rows without converting vectors to Python lists."""
 
     if batch < 1:
         raise ValueError("ingest batch must be positive")
+    import hashlib
+
+    digest = hashlib.sha256()
     started = time.perf_counter()
     for start in range(0, vectors.shape[0], batch):
         stop = min(start + batch, vectors.shape[0])
+        matrix = np.ascontiguousarray(vectors[start:stop], dtype="<f4")
+        digest.update(matrix.tobytes(order="C"))
         payload = [
-            {"id": str(index), "vector": vectors[index]}
+            {"id": str(index), "vector": matrix[index - start]}
             for index in range(start, stop)
         ]
         db.add_vectors_many(payload, normalize=False)
-    return time.perf_counter() - started
+    return time.perf_counter() - started, digest.hexdigest()
 
 
 def _hit_indices(hits: list[Any]) -> set[int]:
@@ -439,12 +495,21 @@ def _block_skip_api() -> tuple[Any, Any]:
 def validate_result_schema(result: dict[str, Any]) -> None:
     """Performs a dependency-free check of this benchmark's result JSON contract."""
 
-    for key in ("label", "env", "dataset", "store", "serve"):
+    if result.get("schema_version") != 2:
+        raise ValueError("result uses an unsupported or legacy-unverified schema")
+    for key in ("label", "env", "dataset", "store", "measurement", "run_id", "serve"):
         if key not in result:
             raise ValueError(f"result is missing {key!r}")
     dataset = result["dataset"]
-    if dataset.get("gt") != "fp32-exact-top100":
-        raise ValueError("result dataset must identify the fp32 exact top-100 reference")
+    for key in ("corpus_id", "source_revision"):
+        if not isinstance(dataset.get(key), str) or not dataset[key]:
+            raise ValueError(f"result dataset is missing {key!r}")
+    evaluation_id = dataset.get("evaluation_id")
+    if evaluation_id is None:
+        if dataset.get("gt") is not None:
+            raise ValueError("build-only result ground truth and evaluation_id must agree")
+    elif not isinstance(evaluation_id, str) or dataset.get("gt") != "fp32-exact-top100":
+        raise ValueError("result evaluation_id must identify the fp32 exact top-100 reference")
     store = result["store"]
     for key in (
         "bit_width",
@@ -455,11 +520,16 @@ def validate_result_schema(result: dict[str, Any]) -> None:
         "build",
         "footprint",
         "open",
+        "provenance",
     ):
         if key not in store:
             raise ValueError(f"result store is missing {key!r}")
     serve = result["serve"]
     if serve is not None:
+        if dataset.get("gt") != "fp32-exact-top100" or not isinstance(
+            dataset.get("evaluation_id"), str
+        ):
+            raise ValueError("serve results require a committed fp32 exact top-100 evaluation")
         for key in (
             "effective_nprobe",
             "effective_oversample",
@@ -471,6 +541,62 @@ def validate_result_schema(result: dict[str, Any]) -> None:
         ):
             if key not in serve:
                 raise ValueError(f"result serve is missing {key!r}")
+    provenance = store["provenance"]
+    if not isinstance(provenance, dict) or not isinstance(provenance.get("store_id"), str):
+        raise ValueError("result store provenance is missing its store_id")
+    run_spec = {
+        "label": result["label"],
+        "evaluation_id": dataset["evaluation_id"],
+        "store_id": provenance["store_id"],
+        "measurement": result["measurement"],
+        "serve_overrides": store["serve_overrides"],
+    }
+    if result["run_id"] != canonical_sha256(run_spec):
+        raise ValueError("result run_id does not match its dataset, store, and measurement")
+
+
+def load_result_for_resume(
+    path: str | Path,
+    *,
+    label: str,
+    evaluation_id: str,
+    store_id: str,
+    measurement: dict[str, Any],
+    serve_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Loads one result only when it exactly matches the requested run."""
+
+    path = Path(path)
+    try:
+        result = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError(f"result cannot be resumed: {path}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"result root must be an object: {path}")
+    validate_result_schema(result)
+    expected = canonical_sha256(
+        {
+            "label": label,
+            "evaluation_id": evaluation_id,
+            "store_id": store_id,
+            "measurement": measurement,
+            "serve_overrides": serve_overrides,
+        }
+    )
+    if result["run_id"] != expected:
+        raise ValueError(f"result provenance does not match the requested run: {path}")
+    return result
+
+
+def write_result_atomic(path: str | Path, result: dict[str, Any]) -> None:
+    """Validates and atomically publishes one complete benchmark result."""
+
+    validate_result_schema(result)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
 
 
 def run_benchmark(
@@ -493,6 +619,10 @@ def run_benchmark(
     serve_nprobe: int | None = None,
     serve_oversample: float | None = None,
     report_block_skips: bool = False,
+    builder_git_sha: str | None = None,
+    layout_id: str | None = None,
+    buildable: bool = True,
+    expected_builder_git_sha: str | None = None,
 ) -> dict[str, Any]:
     """Builds and/or serves one exact or cluster-pruned vector store configuration."""
 
@@ -514,10 +644,22 @@ def run_benchmark(
             raise ValueError("serve_oversample must be positive")
     if compact and not build:
         raise _requires_engine("compact() is a build-time operation")
+    if build and not buildable:
+        raise ValueError(
+            f"store {label!r} is a historical artifact and cannot be built by the current engine"
+        )
     manifest, base, queries, gt_indices, _ = dataset_arrays(data_dir, require_gt=serve)
     if serve and gt_indices is None:
         raise ValueError("serve measurements need exact ground truth")
     store_dir = Path(store_dir)
+    corpus_id = str(manifest["corpus_id"])
+    evaluation_id = manifest.get("evaluation_id")
+    if serve and not isinstance(evaluation_id, str):
+        raise ValueError("serve measurements require a committed evaluation_id")
+    layout_id = layout_id or (
+        _EXACT_LAYOUT_ID if ann_clusters is None else _CLUSTER_LAYOUT_ID
+    )
+    environment = _environment()
     ann = (
         None
         if ann_clusters is None
@@ -531,15 +673,26 @@ def run_benchmark(
     else:
         effective_oversample = oversample
     result: dict[str, Any] = {
+        "schema_version": 2,
         "label": label,
-        "env": _environment(),
+        "env": environment,
         "dataset": {
             "rows": int(manifest["rows"]),
             "dim": int(manifest["dim"]),
             "n_queries": int(manifest["n_queries"]),
             "seed": int(manifest["seed"]),
-            "gt": "fp32-exact-top100",
+            "gt": "fp32-exact-top100" if evaluation_id is not None else None,
+            "corpus_id": corpus_id,
+            "evaluation_id": evaluation_id,
+            "source_revision": manifest["source"]["revision"],
         },
+        "measurement": {
+            "k": k,
+            "loop_seconds_requested": loop_seconds,
+            "loop_concurrency": loop_concurrency,
+            "query_count": int(manifest["n_queries"]),
+        },
+        "run_id": None,
         "store": {
             "bit_width": bit_width,
             "ann": ann,
@@ -550,7 +703,8 @@ def run_benchmark(
                 "ann_nprobe": serve_nprobe,
                 "oversample": serve_oversample,
             },
-            "layout": {"compacted": bool(compact)},
+            "layout": {"compacted": bool(compact), "id": layout_id},
+            "provenance": None,
             "build": None,
             "footprint": None,
             "open": {"open_plus_first_query_seconds": None},
@@ -558,6 +712,17 @@ def run_benchmark(
         "serve": None,
     }
     if build:
+        if store_dir.exists() and any(store_dir.iterdir()):
+            raise ValueError(
+                f"build target {store_dir} is not empty; validate it for resume or use a new path"
+            )
+        actual_builder_sha = builder_git_sha or environment.get("git_sha")
+        if (
+            not isinstance(actual_builder_sha, str)
+            or len(actual_builder_sha) != 40
+            or any(character not in "0123456789abcdef" for character in actual_builder_sha)
+        ):
+            raise ValueError("store builds require an explicit 40-character builder_git_sha")
         store_dir.mkdir(parents=True, exist_ok=True)
         db = _open_store(
             store_dir,
@@ -568,9 +733,14 @@ def run_benchmark(
             rescore=rescore,
             oversample=oversample,
             rows=int(manifest["rows"]),
+            corpus_id=corpus_id,
         )
         try:
-            ingest_seconds = _ingest_vectors(db, base, batch=ingest_batch)
+            ingest_seconds, ingested_sha256 = _ingest_vectors(db, base, batch=ingest_batch)
+            if ingested_sha256 != manifest["sha256"]["base"]:
+                raise ValueError(
+                    "ingested corpus SHA-256 does not match the committed dataset manifest"
+                )
             print(f"[wiki-dpr] {label}: ingest done in {ingest_seconds:.1f}s", flush=True)
             cluster_build_seconds: float | None = None
             if ann is not None:
@@ -603,9 +773,25 @@ def run_benchmark(
             db.close()
         print(f"[wiki-dpr] {label}: store closed", flush=True)
         result["store"]["footprint"] = _dir_footprint(store_dir)
-        _write_store_config(
+        persisted_config = _store_config(
+            bit_width=bit_width,
+            ann_clusters=ann_clusters,
+            ann_nprobe=ann_nprobe,
+            rescore=rescore,
+            oversample=oversample,
+            rows=int(manifest["rows"]),
+            dim=int(manifest["dim"]),
+            corpus_id=corpus_id,
+            builder_git_sha=actual_builder_sha,
+            builder_lodedb_version=str(environment["lodedb_version"]),
+            layout_id=layout_id,
+        )
+        _write_store_config(store_dir, persisted_config)
+        result["store"]["provenance"] = persisted_config
+    if serve:
+        persisted_config = _guard_existing_store_config(
             store_dir,
-            _store_config(
+            _requested_store_create(
                 bit_width=bit_width,
                 ann_clusters=ann_clusters,
                 ann_nprobe=ann_nprobe,
@@ -614,8 +800,13 @@ def run_benchmark(
                 rows=int(manifest["rows"]),
                 dim=int(manifest["dim"]),
             ),
+            corpus_id=corpus_id,
+            serve_nprobe=serve_nprobe,
+            serve_oversample=serve_oversample,
+            expected_layout_id=layout_id,
+            expected_builder_git_sha=expected_builder_git_sha,
         )
-    if serve:
+        result["store"]["provenance"] = persisted_config
         started = time.perf_counter()
         db = _open_store(
             store_dir,
@@ -626,8 +817,11 @@ def run_benchmark(
             rescore=rescore,
             oversample=oversample,
             rows=int(manifest["rows"]),
+            corpus_id=corpus_id,
             serve_nprobe=serve_nprobe,
             serve_oversample=serve_oversample,
+            expected_layout_id=layout_id,
+            expected_builder_git_sha=expected_builder_git_sha,
         )
         try:
             db.search_by_vector(queries[0], k=k, normalize=False)
@@ -671,6 +865,18 @@ def run_benchmark(
             }
         finally:
             db.close()
+    provenance = result["store"]["provenance"]
+    if not isinstance(provenance, dict):
+        raise ValueError("benchmark did not establish store provenance")
+    result["run_id"] = canonical_sha256(
+        {
+            "label": label,
+            "evaluation_id": evaluation_id,
+            "store_id": provenance["store_id"],
+            "measurement": result["measurement"],
+            "serve_overrides": result["store"]["serve_overrides"],
+        }
+    )
     validate_result_schema(result)
     return result
 
@@ -696,6 +902,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve-nprobe", type=int)
     parser.add_argument("--serve-oversample", type=float)
     parser.add_argument("--report-block-skips", action="store_true")
+    parser.add_argument(
+        "--builder-git-sha",
+        help="exact source commit used to build the store (defaults to the checkout HEAD)",
+    )
     parser.add_argument("--out", type=Path, default=Path("results/wiki_dpr.json"))
     return parser
 
@@ -726,11 +936,11 @@ def main(argv: list[str] | None = None) -> None:
             serve_nprobe=args.serve_nprobe,
             serve_oversample=args.serve_oversample,
             report_block_skips=args.report_block_skips,
+            builder_git_sha=args.builder_git_sha,
         )
     except EngineFeatureRequired as exc:
         raise SystemExit(str(exc)) from exc
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    write_result_atomic(args.out, result)
     print(json.dumps(result, sort_keys=True), flush=True)
 
 

@@ -7,19 +7,20 @@ about 80 GB of parquet input: 21,015,300 rows of normalized 768-dimensional fp32
 
 The benchmark reports index-fidelity recall@100 against prepared exact fp32 top-100 ground truth,
 sequential single-query latency, closed-loop concurrency-4 QPS and request latency, batched QPS,
-and store footprint. It has exact 4-bit scan and cluster-prune ANN configurations today. The
-rescore dtype, oversample, compact-layout, open-time nprobe, and block-skip measurements have
-CLI support for `feat/cluster-layout-rescore`; selecting an unavailable feature exits with a clear
-engine-branch requirement.
+and store footprint. It has exact 4-bit scan, cluster-prune ANN, original-precision rescore,
+compact-layout, open-time nprobe, and block-skip configurations.
 
 ## Dataset convention
 
 `data_prep.py` streams Parquet batches into a `base.f32` memmap. It samples queries as corpus row
 indices. A sampled vector stays in the corpus, so its own row is present in its exact top-100
 ground truth. This self-retrieval convention is intentional and applies to every configuration.
-The preparation manifest captures row count, dimension, seed, selected row indices, source shard
-names and sizes, and artifact file names. No document text, query text, or embeddings are written
-to result JSON.
+Preparation requires an immutable source commit digest. The version-2 manifest commits the source
+revision, row count, dimension, seed, selected row indices, artifact SHA-256 values, a corpus ID,
+and an evaluation ID covering queries plus ground truth. Corpus, query, and ground-truth payloads
+use generation-addressed names; `manifest.json` is atomically replaced only after every new payload
+is complete, so a crash cannot make a prior manifest point at a truncated replacement. No document
+text, query text, or embeddings are written to result JSON.
 
 The top-100 reference uses a blocked fp32 matrix multiply over the persisted memmap. It is created
 once during preparation, then the serving harness only reads it. This keeps recall independent of
@@ -29,9 +30,16 @@ the engine being measured.
 
 Install the normal development environment, obtain the dataset shards separately, then run:
 
+Benchmark-only preparation/remote dependencies are intentionally not base runtime dependencies:
+
+```sh
+uv pip install pyarrow huggingface-hub modal
+```
+
 ```sh
 .venv/bin/python benchmarks/wiki_dpr_disk_rescore/data_prep.py \
   --shards-dir /path/to/wiki_dpr_e5/data \
+  --source-revision <40-character-dataset-commit> \
   --out /tmp/wiki-dpr-1m --target-rows 1000000 --n-queries 1000 --seed 42
 
 .venv/bin/python benchmarks/wiki_dpr_disk_rescore/lodedb_bench.py \
@@ -47,10 +55,8 @@ Install the normal development environment, obtain the dataset shards separately
   --results benchmarks/wiki_dpr_disk_rescore/results
 ```
 
-The issue's Apple M5 baseline for later parity work was 1M rows, 4-bit exact scan: recall 0.9401,
-22 ms sequential latency, 45.9 closed-loop concurrency-4 QPS, and 329 batch QPS. Its
-`clusters=1000, nprobe=16` ANN point was recall 0.877, 12.5 ms sequential latency, and 76.9 QPS.
-Those numbers are historical issue context, not output from this reconstructed harness.
+Historical issue numbers and results created before the version-2 provenance contract are context,
+not output accepted by this harness. They are intentionally excluded from generated parity tables.
 
 ## Modal repro, full 21M rows
 
@@ -60,8 +66,10 @@ Linux TurboVec build requirement. It stores source shards, prepared arrays, and 
 copy time separately in the returned JSON.
 
 ```sh
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::download
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::prepare --target-rows 21015300
+modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::download \
+  --revision <40-character-dataset-commit>
+modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::prepare \
+  --target-rows 21015300 --source-revision <same-dataset-commit>
 modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::ground_truth --target-rows 21015300
 
 modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::build \
@@ -73,12 +81,14 @@ modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::main \
 For a cheap end-to-end check that does not download from Hugging Face, use:
 
 ```sh
-modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::smoke
+modal run benchmarks/wiki_dpr_disk_rescore/modal_bench.py::smoke \
+  --git-sha "$(git rev-parse HEAD)"
 ```
 
 The 21M serving path currently needs about 128 GB RAM because opening the store materializes the
-vectors. The Modal serving function uses 4 CPUs for parity with the published Qdrant nodes; its
-memory allocation is intentionally larger than that CPU count suggests.
+vectors. The Modal serving function fixes serving at 4 CPUs for repeatability; its memory allocation
+is intentionally larger than that CPU count suggests. CPU count alone does not make an external
+system result comparable.
 
 ## Measurement notes
 
@@ -93,12 +103,18 @@ choice. Reopen-time nprobe and rescore oversample values are session overrides, 
 configurations reuse that durable store. The first ANN query is separately timed as cluster-index
 construction, not included in sequential latency.
 
-`report.py` includes two fixed published comparison references, labeled not rerun: Qdrant at 111.9
-aggregate QPS, 37.3 per node, and 0.9596 recall on three 4vCPU/16GB nodes; Elastic DiskBBQ at 32.4
-aggregate QPS, 10.8 per node, and 0.96 recall on three 7vCPU/26GB nodes.
+The pre-change physical-layout control is marked historical and cannot be built by current code.
+It is served only when its store config proves builder commit
+`5e54fa53f51986268eee8b77712ac488e7b9aa97` and layout ID
+`cluster-insertion-order-v0`; otherwise the sweep skips it. `report.py` shows corpus rows, query
+count, evaluation ID, requested concurrency, and actual measurement duration. It refuses legacy
+JSON and warns rather than presenting a parity table when populations or evaluation IDs differ.
+External published systems are omitted unless rerun on the exact same corpus and query set.
 
 ## Results policy
 
-Commit only metrics-only JSON to `results/`: counts, timings, rates, recall, store bytes, and
-environment provenance. Do not commit prepared vectors, Parquet shards, stores, document text,
-query vectors, or raw query data.
+Commit only schema-version-2 metrics JSON to `results/`: identities, counts, timings, rates, recall,
+store bytes, and environment/build provenance. Resume validates dataset ID, store ID, builder/layout
+identity, serve overrides, query count, loop duration, and concurrency; a mismatched file fails
+closed instead of being kept. Results are atomically published. Do not commit prepared vectors,
+Parquet shards, stores, document text, query vectors, or raw query data.

@@ -8,36 +8,70 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .lodedb_bench import EngineFeatureRequired, run_benchmark
+    from .common import load_manifest
+    from .lodedb_bench import (
+        EngineFeatureRequired,
+        _guard_existing_store_config,
+        _load_store_config,
+        _requested_store_create,
+        load_result_for_resume,
+        run_benchmark,
+        write_result_atomic,
+    )
 except ImportError:  # Direct execution from this directory.
-    from lodedb_bench import EngineFeatureRequired, run_benchmark  # type: ignore[no-redef]
+    from common import load_manifest  # type: ignore[no-redef]
+    from lodedb_bench import (  # type: ignore[no-redef]
+        EngineFeatureRequired,
+        _guard_existing_store_config,
+        _load_store_config,
+        _requested_store_create,
+        load_result_for_resume,
+        run_benchmark,
+        write_result_atomic,
+    )
 
 
 STORES: dict[str, dict[str, Any]] = {
-    "exact_bw4": {"bit_width": 4},
+    "exact_bw4": {"bit_width": 4, "layout_id": "turbovec-exact-v1"},
     "exact_rs_fp16": {
         "rescore": "fp16",
         "oversample": 4.0,
         "requires_engine": True,
+        "layout_id": "turbovec-exact-v1",
     },
     "exact_rs_fp32": {
         "rescore": "fp32",
         "oversample": 4.0,
         "requires_engine": True,
+        "layout_id": "turbovec-exact-v1",
     },
-    "ann1000": {"ann_clusters": 1000, "ann_nprobe": 16},
-    # Reuses the store directory built before the cluster-contiguous layout
-    # change (same create parameters as ann1000). Serving it isolates the
-    # physical-layout effect: identical engine, clustering, and codes, but
-    # insertion-ordered rows.
-    "ann1000_np16": {"ann_clusters": 1000, "ann_nprobe": 16},
-    "ann4096": {"ann_clusters": 4096, "ann_nprobe": 64},
+    "ann1000": {
+        "ann_clusters": 1000,
+        "ann_nprobe": 16,
+        "layout_id": "cluster-contiguous-v1",
+    },
+    # Historical control: never build this with current code. It is usable only
+    # when an imported store config proves the exact pre-layout builder and the
+    # insertion-ordered physical layout.
+    "ann1000_prechange": {
+        "ann_clusters": 1000,
+        "ann_nprobe": 16,
+        "layout_id": "cluster-insertion-order-v0",
+        "buildable": False,
+        "expected_builder_git_sha": "5e54fa53f51986268eee8b77712ac488e7b9aa97",
+    },
+    "ann4096": {
+        "ann_clusters": 4096,
+        "ann_nprobe": 64,
+        "layout_id": "cluster-contiguous-v1",
+    },
     "ann4096_rs_fp16": {
         "ann_clusters": 4096,
         "ann_nprobe": 64,
         "rescore": "fp16",
         "oversample": 4.0,
         "requires_engine": True,
+        "layout_id": "cluster-contiguous-v1",
     },
 }
 
@@ -95,24 +129,24 @@ SERVE_CONFIGS: list[dict[str, Any]] = [
     },
     {
         "label": "prechange_layout_np16",
-        "store": "ann1000_np16",
+        "store": "ann1000_prechange",
         "serve_overrides": {},
     },
     {
         "label": "prechange_layout_np32",
-        "store": "ann1000_np16",
+        "store": "ann1000_prechange",
         "serve_overrides": {"ann_nprobe": 32},
         "requires_engine": True,
     },
     {
         "label": "prechange_layout_np64",
-        "store": "ann1000_np16",
+        "store": "ann1000_prechange",
         "serve_overrides": {"ann_nprobe": 64},
         "requires_engine": True,
     },
     {
         "label": "prechange_layout_np128",
-        "store": "ann1000_np16",
+        "store": "ann1000_prechange",
         "serve_overrides": {"ann_nprobe": 128},
         "requires_engine": True,
     },
@@ -162,9 +196,6 @@ SERVE_CONFIGS: list[dict[str, Any]] = [
 ]
 
 _STORE_CONFIG_NAME = "benchmark_store_config.json"
-_ENGINE_NOTICE = "requires engine branch feat/cluster-layout-rescore"
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Builds the sweep command parser."""
 
@@ -196,6 +227,10 @@ def run_sweep(
     stores_dir = work_dir / "stores"
     result_dir.mkdir(parents=True, exist_ok=True)
     stores_dir.mkdir(parents=True, exist_ok=True)
+    manifest = load_manifest(data_dir)
+    evaluation_id = manifest.get("evaluation_id")
+    if not isinstance(evaluation_id, str):
+        raise ValueError("sweep requires a prepared dataset with committed ground truth")
     known = {str(config["label"]) for config in SERVE_CONFIGS}
     if only is not None and only not in known:
         raise ValueError(f"unknown config {only!r}; choose one of {sorted(known)}")
@@ -211,10 +246,35 @@ def run_sweep(
         store_dir = stores_dir / store_label
         config_path = store_dir / _STORE_CONFIG_NAME
         if config_path.exists():
-            print(f"[wiki-dpr] resume: keeping {config_path}", flush=True)
+            kwargs = dict(store)
+            kwargs.pop("requires_engine", None)
+            expected_builder = kwargs.pop("expected_builder_git_sha", None)
+            kwargs.pop("buildable", None)
+            layout_id = kwargs.pop("layout_id")
+            _guard_existing_store_config(
+                store_dir,
+                _requested_store_create(
+                    bit_width=int(kwargs.get("bit_width", 4)),
+                    ann_clusters=kwargs.get("ann_clusters"),
+                    ann_nprobe=kwargs.get("ann_nprobe"),
+                    rescore=str(kwargs.get("rescore", "none")),
+                    oversample=float(kwargs.get("oversample", 4.0)),
+                    rows=int(manifest["rows"]),
+                    dim=int(manifest["dim"]),
+                ),
+                corpus_id=str(manifest["corpus_id"]),
+                serve_nprobe=None,
+                serve_oversample=None,
+                expected_layout_id=layout_id,
+                expected_builder_git_sha=expected_builder,
+            )
+            print(f"[wiki-dpr] resume: validated {config_path}", flush=True)
             continue
-        if store.get("requires_engine") and not include_unsupported:
-            unavailable_stores[store_label] = _ENGINE_NOTICE
+        if store.get("buildable") is False:
+            unavailable_stores[store_label] = (
+                "historical pre-layout store is absent; import one with the pinned builder/layout "
+                "provenance instead of rebuilding it with current code"
+            )
             continue
         kwargs = dict(store)
         kwargs.pop("requires_engine", None)
@@ -236,20 +296,34 @@ def run_sweep(
             unavailable_stores[store_label] = str(exc)
     for config in selected:
         label = str(config["label"])
-        output = result_dir / f"{label}.json"
-        if output.exists():
-            print(f"[wiki-dpr] resume: keeping {output}", flush=True)
-            completed.append(label)
-            continue
         store_label = str(config["store"])
         if store_label in unavailable_stores:
             notice = unavailable_stores[store_label]
             print(f"[wiki-dpr] skip {label}: {notice}", flush=True)
             skipped.append({"label": label, "reason": notice})
             continue
-        if config.get("requires_engine") and not include_unsupported:
-            print(f"[wiki-dpr] skip {label}: {_ENGINE_NOTICE}", flush=True)
-            skipped.append({"label": label, "reason": _ENGINE_NOTICE})
+        output = result_dir / f"{label}.json"
+        if output.exists():
+            store_config = _load_store_config(stores_dir / str(config["store"]))
+            overrides = dict(config["serve_overrides"])
+            load_result_for_resume(
+                output,
+                label=label,
+                evaluation_id=evaluation_id,
+                store_id=str(store_config["store_id"]),
+                measurement={
+                    "k": 100,
+                    "loop_seconds_requested": loop_seconds,
+                    "loop_concurrency": loop_concurrency,
+                    "query_count": int(manifest["n_queries"]),
+                },
+                serve_overrides={
+                    "ann_nprobe": overrides.get("ann_nprobe"),
+                    "oversample": overrides.get("oversample"),
+                },
+            )
+            print(f"[wiki-dpr] resume: validated {output}", flush=True)
+            completed.append(label)
             continue
         kwargs = dict(STORES[store_label])
         kwargs.pop("requires_engine", None)
@@ -274,11 +348,13 @@ def run_sweep(
             print(f"[wiki-dpr] skip {label}: {exc}", flush=True)
             skipped.append({"label": label, "reason": str(exc)})
             continue
-        output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        write_result_atomic(output, result)
         completed.append(label)
     summary = {"completed": completed, "skipped": skipped, "work": str(work_dir)}
     summary_path = result_dir / "sweep_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    temporary = summary_path.with_name(f".{summary_path.name}.tmp")
+    temporary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    temporary.replace(summary_path)
     return summary
 
 

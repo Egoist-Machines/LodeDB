@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+try:
+    from .lodedb_bench import validate_result_schema
+except ImportError:  # Direct execution from this directory.
+    from lodedb_bench import validate_result_schema  # type: ignore[no-redef]
+
 
 def _number(value: Any, digits: int = 3) -> str:
     """Formats an optional numeric field for a compact Markdown cell."""
@@ -33,61 +38,67 @@ def render_report(results_dir: str | Path) -> str:
             continue
         try:
             result = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid result JSON: {path}") from exc
         if isinstance(result, dict) and "store" in result:
+            validate_result_schema(result)
             rows.append(result)
     lines = [
-        "| config | layout | rescore | override np | override ov | effective np | effective ov | "
-        "recall@100 | seq p50 ms | CL-4 QPS | batch-256 QPS | blocks skipped | f |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| config | rows | queries | eval id | layout | rescore | effective np | effective ov | "
+        "recall@100 | seq p50 ms | closed-loop QPS | concurrency | measured sec | batch-256 QPS |",
+        "|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in rows:
         store = result["store"]
         serve = result.get("serve") or {}
         ann = store.get("ann")
-        layout = "compact" if store.get("layout", {}).get("compacted") else "base"
+        layout = str(store.get("layout", {}).get("id", "unknown"))
+        if store.get("layout", {}).get("compacted"):
+            layout += ", compacted"
         if ann:
             layout += f", ann{ann.get('clusters')}/np{ann.get('nprobe')}"
         rescore = store.get("rescore")
         rescore_cell = (
             "none" if not rescore else f"{rescore.get('dtype')} x{rescore.get('oversample')}"
         )
-        overrides = store.get("serve_overrides") or {}
         sequential = serve.get("sequential_latency_ms", {})
         closed_loop = serve.get("closed_loop", {})
-        block_skip = serve.get("block_skip") or {}
+        dataset = result["dataset"]
         lines.append(
-            "| {label} | {layout} | {rescore} | {override_nprobe} | {override_oversample} | "
-            "{effective_nprobe} | {effective_oversample} | {recall} | {seq} | {cl} | {batch} | "
-            "{skip} | {fraction} |".format(
+            "| {label} | {rows} | {queries} | {evaluation} | {layout} | {rescore} | "
+            "{effective_nprobe} | {effective_oversample} | {recall} | {seq} | {cl} | "
+            "{concurrency} | {seconds} | {batch} |".format(
                 label=result.get("label", "unknown"),
+                rows=dataset["rows"],
+                queries=dataset["n_queries"],
+                evaluation=(dataset["evaluation_id"] or "-")[:12],
                 layout=layout,
                 rescore=rescore_cell,
-                override_nprobe=_number(overrides.get("ann_nprobe"), 0),
-                override_oversample=_number(overrides.get("oversample"), 1),
                 effective_nprobe=_number(serve.get("effective_nprobe"), 0),
                 effective_oversample=_number(serve.get("effective_oversample"), 1),
                 recall=_number(serve.get("recall_at_100"), 4),
                 seq=_number(sequential.get("p50_ms"), 3),
                 cl=_number(closed_loop.get("qps"), 2),
+                concurrency=_number(closed_loop.get("concurrency"), 0),
+                seconds=_number(closed_loop.get("seconds"), 2),
                 batch=_number(_batch_qps(result), 2),
-                skip=_number(block_skip.get("fraction"), 4),
-                fraction=_number(block_skip.get("candidate_fraction_f"), 4),
             )
         )
-    lines.extend(
-        [
-            "",
-            "Published per-node parity reference, not rerun:",
-            "",
-            "| system | aggregate QPS | per-node QPS | recall@100 | deployment | status |",
-            "|---|---:|---:|---:|---|---|",
-            "| Qdrant | 111.9 | 37.3 | 0.9596 | 3 x 4vCPU/16GB | published, not rerun |",
-            "| Elastic DiskBBQ | 32.4 | 10.8 | 0.9600 | 3 x 7vCPU/26GB | published, not rerun |",
-            "",
-        ]
-    )
+    identities = {result["dataset"]["evaluation_id"] for result in rows}
+    populations = {
+        (result["dataset"]["rows"], result["dataset"]["n_queries"]) for result in rows
+    }
+    lines.append("")
+    if len(identities) > 1 or len(populations) > 1:
+        lines.append(
+            "**Not a parity table:** rows span different corpus/query populations or evaluation "
+            "identities. Compare only rows with the same eval id, row count, and query count."
+        )
+    else:
+        lines.append(
+            "All rows above share one corpus/query population and evaluation identity. External "
+            "published systems are intentionally omitted unless rerun on that exact query set."
+        )
     return "\n".join(lines)
 
 
