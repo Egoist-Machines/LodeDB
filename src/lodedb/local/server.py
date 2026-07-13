@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from lodedb.engine.core import is_private_bind_host
-from lodedb.local.db import LodeDB
+from lodedb.local.db import LodeDB, VectorOnlyIndexError
 
 # Cap request bodies on the loopback dev server (defensive). Oversized bodies
 # get a 400 instead of an unbounded read.
@@ -71,6 +71,53 @@ def build_local_handler(db: LodeDB) -> type[BaseHTTPRequestHandler]:
                         metadata=payload.get("metadata"),
                     )
                     self._send(200, {"id": doc_id, "count": db.count()})
+                elif self.path in {"/embeddings", "/v1/embeddings"}:
+                    if not isinstance(payload, dict):
+                        raise ValueError("JSON body must be an object")
+                    if payload.get("encoding_format", "float") != "float":
+                        raise ValueError('encoding_format must be "float"')
+                    raw_input = payload["input"]
+                    if isinstance(raw_input, str):
+                        texts = [raw_input]
+                    elif isinstance(raw_input, list):
+                        texts = raw_input
+                    else:
+                        raise ValueError("input must be a string or a non-empty list of strings")
+                    if not texts:
+                        raise ValueError("input must be a non-empty list of strings")
+                    for text in texts:
+                        if not isinstance(text, str) or not text.strip():
+                            raise ValueError("each input item must be a non-empty string")
+                    model = payload["model"]
+                    if not isinstance(model, str):
+                        raise ValueError("model must be a string")
+                    if "dimensions" in payload:
+                        requested_dim = payload["dimensions"]
+                        if isinstance(requested_dim, bool) or not isinstance(requested_dim, int):
+                            raise ValueError("dimensions must be an integer")
+                        active_dim = db._vector_dim
+                        if requested_dim != active_dim:
+                            raise ValueError(
+                                f"dimensions {requested_dim} does not match active model "
+                                f"dimension {active_dim}"
+                            )
+                    embeddings = db.embed_texts(texts)
+                    estimated_tokens = sum(len(text) for text in texts) // 4
+                    self._send(
+                        200,
+                        {
+                            "object": "list",
+                            "data": [
+                                {"object": "embedding", "index": index, "embedding": embedding}
+                                for index, embedding in enumerate(embeddings)
+                            ],
+                            "model": model,
+                            "usage": {
+                                "prompt_tokens": estimated_tokens,
+                                "total_tokens": estimated_tokens,
+                            },
+                        },
+                    )
                 elif self.path == "/search":
                     hits = db.search(
                         payload["query"],
@@ -98,6 +145,10 @@ def build_local_handler(db: LodeDB) -> type[BaseHTTPRequestHandler]:
                     self._send(404, {"error": "not found"})
             except KeyError as exc:
                 self._send(400, {"error": f"missing field: {exc}"})
+            except ModuleNotFoundError as exc:
+                self._send(501, {"error": str(exc)})
+            except VectorOnlyIndexError as exc:
+                self._send(400, {"error": str(exc)})
             except ValueError as exc:
                 self._send(400, {"error": str(exc)})
 

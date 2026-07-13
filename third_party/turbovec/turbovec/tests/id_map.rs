@@ -433,3 +433,136 @@ fn empty_index_round_trip() {
     assert_eq!(restored.bit_width(), 4);
     std::fs::remove_file(&tmp).ok();
 }
+
+fn sorted_pairs(scores: Vec<f32>, ids: Vec<u64>) -> Vec<(u64, u32)> {
+    let mut pairs: Vec<_> = ids
+        .into_iter()
+        .zip(scores)
+        .map(|(id, score)| (id, score.to_bits()))
+        .collect();
+    pairs.sort_unstable_by_key(|(id, _)| *id);
+    pairs
+}
+
+#[test]
+fn reorder_to_ids_preserves_searches_round_trip_and_fingerprint() {
+    let dim = 64;
+    let n = 48;
+    let data = gaussian_normalized(n, dim, 0xA11D_7001);
+    let ids: Vec<u64> = (0..n).map(|row| 10_000 + row as u64 * 17).collect();
+    let mut index = IdMapIndex::new(dim, 4).unwrap();
+    index.add_with_ids(&data, &ids).unwrap();
+
+    let mut queries = data[..2 * dim].to_vec();
+    queries.extend_from_slice(&data[17 * dim..18 * dim]);
+    let allowlist: Vec<u64> = ids.iter().copied().step_by(3).collect();
+    let full_before = index.search(&queries, 12);
+    let masked_before = index.search_with_allowlist(&queries, 12, Some(&allowlist));
+    let fingerprint = index.calibration_fingerprint();
+
+    let mut reordered_ids = ids.clone();
+    let mut state = 0xD1CE_CAFE_u64;
+    for slot in (1..reordered_ids.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        reordered_ids.swap(slot, (state as usize) % (slot + 1));
+    }
+    index.reorder_to_ids(&reordered_ids).unwrap();
+
+    assert_eq!(index.reconstruct_all().0, reordered_ids);
+    assert_eq!(index.calibration_fingerprint(), fingerprint);
+    let full_after = index.search(&queries, 12);
+    let masked_after = index.search_with_allowlist(&queries, 12, Some(&allowlist));
+    let full_after_pairs = sorted_pairs(full_after.0, full_after.1);
+    assert_eq!(
+        sorted_pairs(full_before.0, full_before.1),
+        full_after_pairs
+    );
+    assert_eq!(
+        sorted_pairs(masked_before.0, masked_before.1),
+        sorted_pairs(masked_after.0, masked_after.1)
+    );
+
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_reorder_{}_{}.tvim",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    index.write(&tmp).unwrap();
+    let restored = IdMapIndex::load(&tmp).unwrap();
+    assert_eq!(restored.reconstruct_all().0, reordered_ids);
+    assert_eq!(restored.calibration_fingerprint(), fingerprint);
+    let restored_results = restored.search(&queries, 12);
+    assert_eq!(
+        full_after_pairs,
+        sorted_pairs(restored_results.0, restored_results.1)
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn reorder_to_ids_identity_and_invalid_orders_leave_index_usable() {
+    let dim = 64;
+    let data = gaussian_normalized(8, dim, 0xA11D_7002);
+    let ids: Vec<u64> = (1..=8).collect();
+    let mut index = IdMapIndex::new(dim, 4).unwrap();
+    index.add_with_ids(&data, &ids).unwrap();
+    let query = &data[..dim];
+    let expected = index.search(query, 4);
+    let order = index.reconstruct_all().0;
+
+    index.reorder_to_ids(&order).unwrap();
+    assert_eq!(index.reconstruct_all().0, order);
+
+    let wrong_length = index.reorder_to_ids(&order[..order.len() - 1]).unwrap_err();
+    assert_eq!(
+        wrong_length,
+        turbovec::TurboVecError::IdsCountMismatch {
+            expected: order.len(),
+            got: order.len() - 1,
+        }
+    );
+    let mut unknown = order.clone();
+    unknown[0] = 999;
+    assert_eq!(
+        index.reorder_to_ids(&unknown).unwrap_err(),
+        turbovec::TurboVecError::UnknownId(999)
+    );
+    let mut duplicate = order.clone();
+    duplicate[1] = duplicate[0];
+    assert_eq!(
+        index.reorder_to_ids(&duplicate).unwrap_err(),
+        turbovec::TurboVecError::DuplicateId(duplicate[0])
+    );
+    assert_eq!(index.reconstruct_all().0, order);
+    assert_eq!(index.search(query, 4), expected);
+}
+
+#[test]
+fn reorder_to_ids_stays_consistent_with_swap_removes() {
+    let dim = 64;
+    let data = gaussian_normalized(12, dim, 0xA11D_7003);
+    let ids: Vec<u64> = (100..112).collect();
+    let mut index = IdMapIndex::new(dim, 4).unwrap();
+    index.add_with_ids(&data, &ids).unwrap();
+
+    assert!(index.remove(103));
+    assert!(index.remove(109));
+    let mut order = index.reconstruct_all().0;
+    order.reverse();
+    index.reorder_to_ids(&order).unwrap();
+    assert!(index.remove(order[2]));
+
+    let live = index.reconstruct_all().0;
+    for (row, id) in ids.iter().enumerate() {
+        if !live.contains(id) {
+            continue;
+        }
+        let query = &data[row * dim..(row + 1) * dim];
+        assert_eq!(index.search(query, 1).1, vec![*id]);
+    }
+}

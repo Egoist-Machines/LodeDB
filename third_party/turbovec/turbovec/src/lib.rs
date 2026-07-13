@@ -53,7 +53,7 @@ pub mod pack;
 pub mod rotation;
 pub mod search;
 
-pub use error::{AddError, ConstructError, EncodedRowsError};
+pub use error::{AddError, ConstructError, EncodedRowsError, TurboVecError};
 pub use id_map::IdMapIndex;
 pub use maxsim::maxsim_scores;
 
@@ -734,6 +734,69 @@ impl TurboQuantIndex {
         self.blocked = OnceLock::new();
 
         last
+    }
+
+    /// Reorders rows in place, where `perm[new_slot] = old_slot`.
+    ///
+    /// The permutation is validated before mutation. The packed-code buffer is
+    /// moved cycle by cycle with one row-sized scratch buffer, rather than cloned.
+    pub(crate) fn permute_rows(&mut self, perm: &[usize]) {
+        assert_eq!(
+            perm.len(),
+            self.n_vectors,
+            "permutation length {} does not match index size {}",
+            perm.len(),
+            self.n_vectors,
+        );
+        let mut visited = vec![false; self.n_vectors];
+        for &slot in perm {
+            assert!(
+                slot < self.n_vectors,
+                "permutation slot {slot} out of bounds for index size {}",
+                self.n_vectors,
+            );
+            assert!(!visited[slot], "permutation repeats slot {slot}");
+            visited[slot] = true;
+        }
+        if self.n_vectors == 0 {
+            self.blocked = OnceLock::new();
+            return;
+        }
+        visited.fill(false);
+        let bytes_per_vec = self
+            .bytes_per_vector()
+            .expect("non-empty index has a committed dim");
+        let mut scratch = vec![0u8; bytes_per_vec];
+
+        for start in 0..self.n_vectors {
+            if visited[start] {
+                continue;
+            }
+            let start_offset = start * bytes_per_vec;
+            scratch.copy_from_slice(&self.packed_codes[start_offset..start_offset + bytes_per_vec]);
+            let scratch_scale = self.scales[start];
+            let mut destination = start;
+            loop {
+                let source = perm[destination];
+                if source == start {
+                    let offset = destination * bytes_per_vec;
+                    self.packed_codes[offset..offset + bytes_per_vec].copy_from_slice(&scratch);
+                    self.scales[destination] = scratch_scale;
+                    visited[destination] = true;
+                    break;
+                }
+                let source_offset = source * bytes_per_vec;
+                let destination_offset = destination * bytes_per_vec;
+                self.packed_codes.copy_within(
+                    source_offset..source_offset + bytes_per_vec,
+                    destination_offset,
+                );
+                self.scales[destination] = self.scales[source];
+                visited[destination] = true;
+                destination = source;
+            }
+        }
+        self.blocked = OnceLock::new();
     }
 
     /// Packed code bytes per vector, or `None` before the dim commits.

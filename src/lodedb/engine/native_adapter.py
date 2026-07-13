@@ -403,6 +403,26 @@ class NativeCoreEngineHandle:
     def create_index_with_options(self, options: Mapping[str, Any]) -> None:
         self._engine.create_index_with_options(_dumps(dict(options)))
 
+    def index_options(self, index_id: str) -> dict[str, Any]:
+        """Returns durable native create options, excluding session overrides."""
+
+        return self._loads(self._engine.index_options(str(index_id)))
+
+    def set_session_overrides(
+        self,
+        index_id: str,
+        *,
+        ann_nprobe: int | None = None,
+        rescore_oversample: float | None = None,
+    ) -> None:
+        """Applies non-persistent query tuning to this engine handle only."""
+
+        self._engine.set_session_overrides(
+            str(index_id),
+            None if ann_nprobe is None else int(ann_nprobe),
+            None if rescore_oversample is None else float(rescore_oversample),
+        )
+
     def upsert_vectors(
         self,
         index_id: str,
@@ -918,14 +938,36 @@ class NativeCoreEngineHandle:
     def persist(self) -> None:
         self._engine.persist()
 
+    def ann_warm(self, index_id: str) -> bool:
+        """Builds an index's ANN cluster cache without issuing a query."""
+
+        return bool(self._engine.ann_warm(str(index_id)))
+
+    def compact(self, index_id: str) -> None:
+        """Schedules a full base rewrite for the next native persist."""
+
+        self._engine.compact(str(index_id))
+
     def refresh(self) -> None:
         self._engine.refresh()
 
     def applied_lsn(self, index_id: str) -> int:
         return int(self._engine.applied_lsn(str(index_id)))
 
+    def fold_wal_segment(self, index_id: str, segment: bytes, first_lsn: int) -> int:
+        """Decodes an unstamped WAL segment, stamps LSNs from ``first_lsn``, and
+        applies it in memory; returns the number of records applied (records at
+        or below the applied watermark skip). Does not persist."""
+        return int(self._engine.fold_wal_segment(str(index_id), bytes(segment), int(first_lsn)))
+
     def close(self) -> None:
         self._engine.close()
+
+    def discard(self) -> None:
+        """Releases the store without persisting: un-persisted in-memory state is
+        dropped (the store stays at its last committed generation) and the writer
+        lock is released. The abort path after a failed fold."""
+        self._engine.discard()
 
     @staticmethod
     def _loads(payload: str) -> dict[str, Any]:

@@ -48,6 +48,7 @@ from lodedb.engine.core import (
     EngineDocument,
     EngineVectorDocument,
     _state_from_payload,
+    chunk_text,
     index_state_key_for_client_hash,
     sha256_text,
 )
@@ -241,6 +242,9 @@ class LodeDB:
         ann: str | AnnOptions | None = None,
         ann_clusters: int | None = None,
         ann_nprobe: int | None = None,
+        rescore: str | RescoreOptions | None = None,
+        rescore_dtype: str | None = None,
+        rescore_oversample: float | None = None,
         compression: bool = True,
         read_only: bool = False,
         durability: str | None = None,
@@ -342,8 +346,23 @@ class LodeDB:
         bottleneck; small and mid-size corpora should keep the exact default. Like ``compression``,
         ``ann`` is a create-time choice: on reopen of an existing store the
         persisted config wins and these arguments are ignored, so an exact store
-        stays exact and an ANN store keeps its clustering (and tuning) regardless
-        of what a reopen passes.
+        stays exact and an ANN store keeps its clustering regardless of what a
+        reopen passes. ``ann_nprobe`` is the query-time exception: on reopen it
+        applies only to this engine session, is clamped to the current cluster
+        count at use, and is never written back. ``ann`` and ``ann_clusters``
+        remain persisted-config-wins choices.
+        ``rescore`` opts into two-stage search. At ingest it captures each original
+        vector in a sidecar (``float16`` by default, or ``float32``/``int8`` via
+        ``rescore_dtype``); at query time it re-scores the first-stage candidates
+        with fp32 dots from that sidecar. Re-scored candidate scores are exact,
+        although a restricted candidate set can still miss a true neighbor. Use
+        ``rescore="original"`` (or :class:`RescoreOptions`) at creation, with an
+        optional ``rescore_oversample`` candidate multiplier. Original vectors are
+        discarded when a non-rescore store first ingests data, so rescore cannot be
+        retro-enabled later: rebuild instead. On reopen, any supplied ``rescore``
+        mode and ``rescore_dtype`` must match the persisted sidecar; a supplied
+        ``rescore_oversample`` is an engine-lifetime session override and is never
+        persisted.
         ``compression`` controls whether the retained raw-text store (the
         ``.tvtext`` base and ``.txd`` segments) is zstd-compressed and defaults to
         ``True``; it has no effect when ``store_text=False``. The setting is
@@ -372,7 +391,40 @@ class LodeDB:
         self.index_text = self.store_text if index_text is None else bool(index_text)
         # Opt-in ANN config (None => exact scan). Validated here for a friendly
         # error; the native core is the authority and re-validates the algorithm.
-        self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)
+        self._requested_ann_nprobe = (
+            ann_nprobe
+            if ann_nprobe is not None
+            else ann.nprobe if isinstance(ann, AnnOptions) else None
+        )
+        # A bare nprobe is meaningful only while reopening an ANN store, where it
+        # becomes a session override. Defer that create-vs-reopen distinction to
+        # the native identity check below; all other loose ANN forms retain the
+        # ordinary resolver's friendly early error.
+        if ann is None and ann_clusters is None and ann_nprobe is not None:
+            if int(ann_nprobe) < 1:
+                raise ValueError("ann_nprobe must be a positive integer")
+            self.ann = None
+        else:
+            self.ann = _resolve_ann_options(ann, ann_clusters, ann_nprobe)
+        self._requested_rescore = rescore
+        self._requested_rescore_dtype = rescore_dtype
+        self._requested_rescore_oversample = (
+            rescore_oversample
+            if rescore_oversample is not None
+            else rescore.oversample if isinstance(rescore, RescoreOptions) else None
+        )
+        # Loose rescore settings without ``rescore=`` can be valid reopen
+        # requests: dtype verifies a durable sidecar and oversample changes this
+        # handle's candidate pool. A fresh store still rejects them before it
+        # creates an index.
+        if rescore is None and (rescore_dtype is not None or rescore_oversample is not None):
+            if rescore_oversample is not None:
+                _validate_rescore_oversample(rescore_oversample)
+            self.rescore = None
+        else:
+            self.rescore = _resolve_rescore_options(
+                rescore, rescore_dtype, rescore_oversample
+            )
         self.compression = bool(compression)
         self.read_only = bool(read_only)
         # The native core is the sole reader/writer for this handle. It is an
@@ -525,6 +577,7 @@ class LodeDB:
             provider=route_policy.provider,
             task=route_policy.task,
             ann=self.ann,
+            rescore=self.rescore,
         )
         # Redacted, per-handle image-embedding counters (no paths/captions), surfaced
         # under stats()["image_embedding"] so operators can see CLIP encode cost.
@@ -565,10 +618,15 @@ class LodeDB:
         """Opens (or creates) a bring-your-own-vectors index at a chosen dimension.
 
         Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
-        The index has **no internal embedding model**: only ``add_vectors`` /
-        ``add_vectors_many`` / ``search_by_vector`` / ``search_many_by_vector``
-        work, and the text-in verbs (``add``/``search``) raise
-        :class:`VectorOnlyIndexError`. Vectors must have dimension ``vector_dim``
+        The index has **no internal embedding model**: the vector-in verbs
+        (``add_vectors`` / ``add_vectors_many`` / ``search_by_vector`` /
+        ``search_many_by_vector``) work, and so does keyword search —
+        ``search(query, mode="lexical")`` (and ``search_many``) runs BM25 over the
+        text carried on the stored vectors, since lexical ranking needs no
+        embedder (requires ``store_text=True``, the default, or ``index_text=True``).
+        The embedding verbs — ``add`` / ``add_many`` and vector/hybrid ``search`` —
+        raise :class:`VectorOnlyIndexError` because they would need to embed text.
+        Vectors must have dimension ``vector_dim``
         (any value your own embedder produces, e.g. 1536 or 3072), so this is the
         path for plugging LodeDB in as the vector backend behind a system that owns
         its embedder. The dimension and a redacted ``model="external"`` identity are
@@ -636,6 +694,51 @@ class LodeDB:
             with self._op_lock:
                 self._native_upsert_text_documents(tuple(payload))
         return ids
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embeds a batch of texts with the index's document embedding model.
+
+        Uses the same document-side embedding path as :meth:`add` without
+        storing anything. Texts longer than the index chunk limit are embedded
+        as chunks, mean-pooled, and L2-normalized. Returns one vector per input
+        text, in input order.
+        """
+
+        self._require_text_capable()
+        if not isinstance(texts, list) or not texts:
+            raise ValueError("texts must be a non-empty list of strings")
+        for text in texts:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("each text must be a non-empty string")
+        backend = self._embedding_backend
+        if backend is None:
+            raise RuntimeError("text embedding requires an embedding backend")
+
+        chunks_by_text = [chunk_text(text, self._chunk_character_limit) for text in texts]
+        chunks: list[str] = []
+        offsets: list[tuple[int, int]] = []
+        for text, text_chunks in zip(texts, chunks_by_text, strict=True):
+            start = len(chunks)
+            # Preserve the existing one-text embedding behavior exactly. chunk_text
+            # strips its input, while a one-chunk endpoint request previously reached
+            # the backend unchanged.
+            chunks.extend((text,) if len(text_chunks) == 1 else text_chunks)
+            offsets.append((start, len(chunks)))
+
+        with self._op_lock:
+            vectors = backend.embed_documents(tuple(chunks))
+
+        embeddings: list[list[float]] = []
+        for start, end in offsets:
+            if end - start == 1:
+                embeddings.append(list(vectors[start]))
+                continue
+            pooled = np.asarray(vectors[start:end], dtype=np.float64).mean(axis=0)
+            norm = float(np.linalg.norm(pooled))
+            if norm == 0.0:
+                raise ValueError("mean-pooled embedding has zero norm")
+            embeddings.append((pooled / norm).tolist())
+        return embeddings
 
     def add_vectors(
         self,
@@ -754,7 +857,12 @@ class LodeDB:
           ``ABC-123``, dates like ``2024-01-15``) are surfaced when they appear in
           the document body. The default for local RAG, where a missed exact match
           is the difference between a usable and a useless answer.
-        - ``"lexical"`` — the BM25 ranking alone (no vector scan).
+        - ``"lexical"`` — the BM25 ranking alone (no vector scan). Because it embeds
+          nothing, ``mode="lexical"`` also works on a **vector-only** index
+          (:meth:`open_vector_store`) that retains text: it ranks the text carried on
+          the stored vectors. On such an index ``vector``/``hybrid`` still raise
+          :class:`VectorOnlyIndexError` (no embedder), and an unset ``mode`` resolves
+          to ``"lexical"`` rather than ``"hybrid"``.
 
         ``"hybrid"`` and ``"lexical"`` build an in-memory BM25 index from a
         lexical source, so they require opening LodeDB with either
@@ -762,7 +870,8 @@ class LodeDB:
         without raw text) or ``store_text=True`` (the index rebuilt from the
         retained raw text, the default); requesting either *explicitly* with
         neither source raises :class:`ValueError`, whereas the unset default
-        falls back to ``"vector"`` instead of raising. The serving index lives in
+        falls back to ``"vector"`` instead of raising (except on a vector-only
+        index, where it resolves to ``"lexical"``). The serving index lives in
         memory, is maintained
         incrementally across mutations (a small change folds in only the changed
         chunks), and never changes the on-disk format.
@@ -799,11 +908,13 @@ class LodeDB:
         never leaves the process and never appears in telemetry.
         """
 
-        self._require_text_capable()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # Gates on the resolved mode, not on text-capability alone: a vector-only
+        # handle can still run mode="lexical" (BM25 over retained text) — only
+        # vector/hybrid, which embed the query, raise VectorOnlyIndexError here.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -831,17 +942,16 @@ class LodeDB:
         the same exact-match-or-predicate grammar as :meth:`search` and is applied
         identically to every query in the batch.
 
-        ``mode`` matches :meth:`search` (unset resolves to ``"hybrid"`` when a
-        lexical source is available, else ``"vector"``) and applies to every
-        query in the batch; ``search_many(mode="hybrid")`` returns the same result
-        as the corresponding repeated single :meth:`search` call. ``"hybrid"`` and
-        ``"lexical"`` require a lexical source (``index_text=True`` or
-        ``store_text=True``). A batch of hybrid queries batches its vector half on
-        the shared scan (the GPU serves it where available) and fuses each query's
-        BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
+        ``mode`` matches :meth:`search` and applies to every query in the batch.
+        Unset resolves to ``"hybrid"`` when a lexical source is available and to
+        ``"vector"`` otherwise; on a vector-only index it resolves to ``"lexical"``
+        because no query embedder exists. ``"hybrid"`` and ``"lexical"`` require
+        a lexical source (``index_text=True`` or ``store_text=True``). A batch of
+        hybrid queries batches its vector half on the shared scan (the GPU serves
+        it where available) and fuses each query's BM25 ranking on the CPU;
+        lexical queries run BM25 on the CPU.
         """
 
-        self._require_text_capable()
         if not isinstance(queries, list) or not queries:
             raise ValueError("queries must be a non-empty list of strings")
         for query in queries:
@@ -849,6 +959,7 @@ class LodeDB:
                 raise ValueError("each query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # See :meth:`search`: lexical mode runs on a vector-only handle; vector/hybrid raise.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -1091,12 +1202,28 @@ class LodeDB:
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
+        return self.remove_many((id,)) > 0
+
+    def remove_many(self, ids: Sequence[str]) -> int:
+        """Removes documents by id in one mutation and returns the number deleted.
+
+        The ids are sent to the native core as one batch, so an auto-persisting
+        handle publishes one commit regardless of batch size. An empty batch is
+        a no-op.
+        """
+
         self._require_writable()
-        if not isinstance(id, str) or not id.strip():
-            raise ValueError("id must be a non-empty string")
+        document_ids = tuple(ids)
+        if any(
+            not isinstance(document_id, str) or not document_id.strip()
+            for document_id in document_ids
+        ):
+            raise ValueError("ids must contain only non-empty strings")
+        if not document_ids:
+            return 0
         with self._op_lock:
-            native_response = self._native_delete_documents((id,))
-            return int(native_response.get("documents_deleted", 0) or 0) > 0
+            native_response = self._native_delete_documents(document_ids)
+            return int(native_response.get("documents_deleted", 0) or 0)
 
     def _update_document_payload(
         self,
@@ -1254,6 +1381,23 @@ class LodeDB:
                 self._native_persist()
             return self._native_stats()
 
+    def compact(self) -> dict[str, bool]:
+        """Writes a fresh serving base for deployment.
+
+        Use this on a build box after ingest: ``ingest, compact, ship the store
+        directory``. When ANN is enabled it builds the cluster index before the
+        rewrite, so serving nodes adopt the persisted cluster-contiguous layout and
+        cluster sidecar without waiting for their first query. This call persists
+        the new base before returning.
+        """
+
+        self._require_writable()
+        with self._op_lock:
+            ann_warmed = bool(self._native_vector_engine.ann_warm(_LOCAL_INDEX_ID))
+            self._native_vector_engine.compact(_LOCAL_INDEX_ID)
+            self._native_persist()
+        return {"ann_warmed": ann_warmed, "base_rewritten": True}
+
     def refresh(self) -> None:
         """Overlays the current write-ahead log tail into this handle's in-memory
         view without checkpointing.
@@ -1320,6 +1464,27 @@ class LodeDB:
     def close(self) -> None:
         """Closes the native core (folding writes durably); state stays on disk."""
 
+        self._shutdown_native(persist=True)
+
+    def discard(self) -> None:
+        """Closes the handle WITHOUT persisting; the writer lock is released.
+
+        Un-persisted in-memory state is dropped and the store stays at its last
+        committed state on disk. This is the abort path for a writable handle
+        whose in-memory batch failed mid-apply (e.g. a partially applied fold
+        segment): a graceful :meth:`close` would persist the poisoned state.
+        WAL-mode writes are unaffected -- each was already durably logged at
+        write time and replays on the next open. Idempotent, and equivalent to
+        :meth:`close` for read-only handles.
+        """
+
+        self._shutdown_native(persist=False)
+
+    def _shutdown_native(self, *, persist: bool) -> None:
+        """Tears down the native engine on its home worker thread and stops the
+        executor. ``persist=True`` closes the store (folding writes durably);
+        ``persist=False`` discards un-persisted state. Idempotent."""
+
         with self._op_lock:
             executor = self._native_executor
             if executor is None:
@@ -1344,12 +1509,15 @@ class LodeDB:
             on_worker = home_thread_id is not None and threading.get_ident() == home_thread_id
 
             def _close_on_worker() -> None:
-                # Runs on the home worker: pop and close the engine so its final
-                # decref lands here, on the thread that created it.
+                # Runs on the home worker: pop and close (or discard) the engine so
+                # its final decref lands here, on the thread that created it.
                 if holder:
                     engine = holder.pop()
                     try:
-                        engine.close()
+                        if persist:
+                            engine.close()
+                        else:
+                            engine.discard()
                     finally:
                         # Drop the unsendable native handle here on the home
                         # worker even if close() raised: otherwise it stays
@@ -1368,7 +1536,8 @@ class LodeDB:
                 native_close_error = exc
             executor.shutdown(wait=not on_worker)
         if native_close_error is not None:
-            raise RuntimeError("native core close failed") from native_close_error
+            action = "close" if persist else "discard"
+            raise RuntimeError(f"native core {action} failed") from native_close_error
 
     def __enter__(self) -> LodeDB:
         """Enters a context manager; state is already loaded on open."""
@@ -1394,6 +1563,7 @@ class LodeDB:
         provider: str,
         task: str,
         ann: dict[str, Any] | None = None,
+        rescore: dict[str, Any] | None = None,
     ) -> None:
         """Opens the native core engine on a dedicated worker thread.
 
@@ -1425,6 +1595,7 @@ class LodeDB:
             vector_dim=self._vector_dim,
             bit_width=bit_width,
             ann=ann,
+            rescore=rescore,
         )
         read_only = self.read_only
 
@@ -1440,16 +1611,46 @@ class LodeDB:
                     # committed store on disk has an identity contradicting this
                     # handle (a missing index is an empty store and serves nothing).
                     _validate_native_index_identity(self.path, index_options)
+                    try:
+                        persisted_options = handle.index_options(_LOCAL_INDEX_ID)
+                    except Exception:
+                        return handle
+                    _validate_reopen_rescore_options(
+                        persisted_options.get("rescore"),
+                        self._requested_rescore,
+                        self._requested_rescore_dtype,
+                        self._requested_rescore_oversample,
+                    )
+                    _apply_session_overrides(
+                        handle,
+                        ann_nprobe=self._requested_ann_nprobe,
+                        rescore_oversample=self._requested_rescore_oversample,
+                    )
                     return handle
                 try:
                     handle.stats(_LOCAL_INDEX_ID)
-                except Exception:
+                except Exception as error:
                     # Fresh store: create the index and commit an initial generation
                     # so a root manifest exists on disk. In WAL mode the native
                     # recovery path only replays a `<key>.wal` that sits alongside a
                     # committed `<key>.commit.json`; without this seed commit, a
                     # crash before the first checkpoint would leave an orphan WAL the
                     # next open could not discover.
+                    if self._requested_ann_nprobe is not None and ann is None:
+                        raise ValueError(
+                            "ann_nprobe requires ann= when creating a store"
+                        ) from error
+                    if (
+                        self._requested_rescore is None
+                        and (
+                            self._requested_rescore_dtype is not None
+                            or self._requested_rescore_oversample is not None
+                        )
+                    ):
+                        raise ValueError(
+                            "rescore_dtype/rescore_oversample require rescore= "
+                            "when creating a store"
+                        ) from error
                     handle.create_index_with_options(index_options)
                     handle.persist()
                 else:
@@ -1458,6 +1659,18 @@ class LodeDB:
                     # mutating, so a reopen at a different model / dim / bit width
                     # fails fast.
                     _validate_native_index_identity(self.path, index_options)
+                    persisted_options = handle.index_options(_LOCAL_INDEX_ID)
+                    _validate_reopen_rescore_options(
+                        persisted_options.get("rescore"),
+                        self._requested_rescore,
+                        self._requested_rescore_dtype,
+                        self._requested_rescore_oversample,
+                    )
+                    _apply_session_overrides(
+                        handle,
+                        ann_nprobe=self._requested_ann_nprobe,
+                        rescore_oversample=self._requested_rescore_oversample,
+                    )
                 return handle
             except Exception:
                 # The engine is open on this worker. Close it (releasing the writer
@@ -1543,6 +1756,12 @@ class LodeDB:
                     "(LodeDB is single-writer per path); close the other handle, or "
                     "raise LODEDB_PERSIST_LOCK_TIMEOUT to wait longer."
                 ) from exc
+            # Reopen option guards intentionally raise ValueError so callers can
+            # correct their arguments without having to unwrap init plumbing. The
+            # contention check runs first: the native lock error also surfaces as
+            # a ValueError and must stay ConcurrentWriterError.
+            if isinstance(exc, ValueError):
+                raise
             self._native_core_fallback_reason = "native_core_init_failed"
             raise RuntimeError(f"failed to initialize native core: {exc!r}") from exc
         self._native_executor = executor
@@ -2000,29 +2219,53 @@ class LodeDB:
             )
 
     def _resolve_mode(self, mode: str | None) -> str:
-        """Validates a search mode and enforces the lexical-source requirement.
+        """Validates a search mode and gates it against the handle's capabilities.
 
         ``None`` (the search default) resolves to ``"hybrid"`` when a lexical
         source is available (``index_text=True`` or ``store_text=True``) and to
         ``"vector"`` otherwise, so the fused ranking is the default wherever it
-        can run and a vector-only store never raises on an unset mode.
+        can run. On a **vector-only** handle (no embedding model) an unset mode
+        resolves to ``"lexical"`` instead: such a handle cannot embed the query
+        text, so a text query can only be a keyword (BM25) query — and the
+        lexical-source check below then applies.
 
-        Returns the canonical lowercase mode. Raises :class:`ValueError` for an
-        unknown mode, or when a lexical/hybrid mode is requested *explicitly* on a
-        handle that has no lexical source — neither ``index_text=True`` (a
-        persisted BM25 postings store) nor ``store_text=True`` (the BM25 index
-        rebuilt from the retained raw text), so there is nothing to build the
-        index from.
+        Returns the canonical lowercase mode. Raises:
+
+        - :class:`ValueError` for an unknown mode.
+        - :class:`VectorOnlyIndexError` when ``"vector"`` or ``"hybrid"`` is used
+          on a vector-only handle: both embed the query text, which a vector-only
+          index cannot do (use :meth:`search_by_vector` for vector similarity, or
+          ``mode="lexical"`` for keyword search).
+        - :class:`ValueError` when a lexical/hybrid mode is requested on a handle
+          with no lexical source — neither ``index_text=True`` (a persisted BM25
+          postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
+          retained raw text), so there is nothing to build the index from.
         """
 
         if mode is None:
-            return "hybrid" if (self.index_text or self.store_text) else "vector"
-        if not isinstance(mode, str):
-            raise ValueError("mode must be a string")
-        value = mode.strip().lower() or "vector"
-        if value not in _SEARCH_MODES:
-            allowed = ", ".join(sorted(_SEARCH_MODES))
-            raise ValueError(f"mode must be one of: {allowed}")
+            if self.vector_only:
+                # No embedder: a text query can only be lexical. Falls through to
+                # the lexical-source check, which raises if there is no source.
+                value = "lexical"
+            elif self.index_text or self.store_text:
+                return "hybrid"
+            else:
+                return "vector"
+        else:
+            if not isinstance(mode, str):
+                raise ValueError("mode must be a string")
+            value = mode.strip().lower() or "vector"
+            if value not in _SEARCH_MODES:
+                allowed = ", ".join(sorted(_SEARCH_MODES))
+                raise ValueError(f"mode must be one of: {allowed}")
+        # Vector and hybrid embed the query text; a vector-only handle cannot, so only
+        # lexical search (BM25 over retained/indexed text) is available on it.
+        if self.vector_only and value in {"vector", "hybrid"}:
+            raise VectorOnlyIndexError(
+                f"mode={value!r} needs to embed the query text, which a vector-only index "
+                "cannot do; use search_by_vector(...) for vector similarity, or "
+                'mode="lexical" for keyword search over retained text'
+            )
         if value in _LEXICAL_SEARCH_MODES and not (self.index_text or self.store_text):
             raise ValueError(
                 f"mode={value!r} requires a lexical source: open LodeDB with "
@@ -2362,6 +2605,139 @@ def _resolve_ann_options(
     return options
 
 
+@dataclass(frozen=True)
+class RescoreOptions:
+    """Structured two-stage rescore tuning for a newly created index.
+
+    Pass to ``LodeDB(rescore=...)`` (or ``open_vector_store(rescore=...)``) as
+    an alternative to the loose ``rescore=``/``rescore_dtype=``/
+    ``rescore_oversample=`` keywords::
+
+        LodeDB(path, rescore=RescoreOptions(dtype="float32", oversample=4))
+
+    Rescore captures the original vector before TurboVec's compact encoding and
+    uses it to re-score the first-stage candidate pool. The core validates the
+    supported mode and exact dtype strings, keeping this type a small transport
+    object rather than a second validation authority.
+    """
+
+    mode: str = "original"
+    dtype: str | None = None
+    oversample: float | None = None
+
+    def to_core_dict(self) -> dict[str, Any]:
+        """Renders the native-core ``rescore`` option dict, omitting unset knobs."""
+
+        options: dict[str, Any] = {"mode": str(self.mode)}
+        if self.dtype is not None:
+            options["dtype"] = str(self.dtype)
+        if self.oversample is not None:
+            options["oversample"] = float(self.oversample)
+        return options
+
+
+def _validate_rescore_oversample(oversample: float) -> float:
+    """Checks the loose query candidate multiplier before crossing the FFI."""
+
+    value = float(oversample)
+    if not math.isfinite(value) or value < 1.0:
+        raise ValueError("rescore_oversample must be finite and at least 1.0")
+    return value
+
+
+def _resolve_rescore_options(
+    rescore: str | RescoreOptions | None,
+    dtype: str | None,
+    oversample: float | None,
+) -> dict[str, Any] | None:
+    """Builds the native-core ``rescore`` create payload, or ``None`` when off.
+
+    Structured values carry their own settings and defer value validation to the
+    core. The loose form requires ``rescore=`` so a new store cannot silently
+    discard requested originals; its numeric oversample gets a friendly boundary
+    check before native creation.
+    """
+
+    if isinstance(rescore, RescoreOptions):
+        if dtype is not None or oversample is not None:
+            raise ValueError(
+                "pass rescore tuning via RescoreOptions(...) or "
+                "rescore_dtype/rescore_oversample, not both"
+            )
+        return rescore.to_core_dict()
+    if rescore is None:
+        if dtype is not None or oversample is not None:
+            raise ValueError("rescore_dtype/rescore_oversample require rescore= to be set")
+        return None
+    options: dict[str, Any] = {"mode": str(rescore)}
+    if dtype is not None:
+        # Keep the native core as the single dtype authority. In particular, no
+        # fp16/fp32 aliases are accepted at this Python boundary.
+        options["dtype"] = str(dtype)
+    if oversample is not None:
+        options["oversample"] = _validate_rescore_oversample(oversample)
+    return options
+
+
+def _validate_reopen_rescore_options(
+    persisted: Mapping[str, Any] | None,
+    requested_rescore: str | RescoreOptions | None,
+    requested_dtype: str | None,
+    requested_oversample: float | None,
+) -> None:
+    """Enforces rescore's create-time identity on an existing native index."""
+
+    supplied = (
+        requested_rescore is not None
+        or requested_dtype is not None
+        or requested_oversample is not None
+    )
+    if persisted is None:
+        if supplied:
+            raise ValueError(
+                "this store was created without rescore; original vectors were discarded "
+                "at first ingest, so rescore cannot be retro-enabled. Rebuild the store "
+                "with rescore='original'."
+            )
+        return
+
+    expected_mode: str | None = None
+    expected_dtype = requested_dtype
+    if isinstance(requested_rescore, RescoreOptions):
+        expected_mode = str(requested_rescore.mode)
+        if requested_rescore.dtype is not None:
+            expected_dtype = str(requested_rescore.dtype)
+    elif requested_rescore is not None:
+        expected_mode = str(requested_rescore)
+    if expected_mode is not None and expected_mode != str(persisted.get("mode", "original")):
+        raise ValueError(
+            "rescore mode does not match the persisted store; rebuild the store to change it"
+        )
+    if expected_dtype is not None:
+        persisted_dtype = str(persisted.get("dtype") or "float16")
+        if str(expected_dtype) != persisted_dtype:
+            raise ValueError(
+                "rescore_dtype does not match the persisted store; rebuild the store to change it"
+            )
+
+
+def _apply_session_overrides(
+    handle: NativeCoreEngineHandle,
+    *,
+    ann_nprobe: int | None,
+    rescore_oversample: float | None,
+) -> None:
+    """Installs non-persistent query knobs after a successful existing-store open."""
+
+    if ann_nprobe is None and rescore_oversample is None:
+        return
+    handle.set_session_overrides(
+        _LOCAL_INDEX_ID,
+        ann_nprobe=ann_nprobe,
+        rescore_oversample=rescore_oversample,
+    )
+
+
 def _native_vector_index_options(
     *,
     index_id: str,
@@ -2376,6 +2752,7 @@ def _native_vector_index_options(
     vector_dim: int,
     bit_width: int,
     ann: dict[str, Any] | None = None,
+    rescore: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Builds the native-core index creation payload for the local vector store."""
 
@@ -2396,6 +2773,10 @@ def _native_vector_index_options(
     # state header) stays byte-for-byte unchanged for non-ANN indexes.
     if ann is not None:
         options["ann"] = ann
+    # Original-precision capture is also opt-in. Omitting it preserves the
+    # exact-only header shape for stores that do not need two-stage rescore.
+    if rescore is not None:
+        options["rescore"] = rescore
     return options
 
 

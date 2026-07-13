@@ -131,7 +131,7 @@ impl CoreIndexConfig {
 }
 
 /// Native index creation options including persisted storage identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreIndexCreateOptions {
     pub index_id: String,
     pub index_key: String,
@@ -150,6 +150,10 @@ pub struct CoreIndexCreateOptions {
     /// exact TurboVec scan re-scores them as the authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ann: Option<CoreAnnOptions>,
+    /// Opt-in original-precision capture for a later rescore stage. This is a
+    /// create-time choice: the persisted config wins on reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescore: Option<CoreRescoreOptions>,
 }
 
 /// Approximate-nearest-neighbor tuning for an index.
@@ -175,6 +179,28 @@ impl CoreAnnOptions {
     pub const CLUSTER: &'static str = "cluster";
 }
 
+/// Original-precision sidecar tuning for a later vector-rescore stage.
+///
+/// Only `mode = "original"` is supported. `dtype` defaults to `"float16"`
+/// when omitted and `oversample` defaults to `4.0` when omitted. The sidecar is
+/// configured at index creation and its persisted configuration wins on reopen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreRescoreOptions {
+    /// Rescore source; the only supported value is `"original"`.
+    pub mode: String,
+    /// Original-vector capture dtype: `float16` by default, `float32`, or `int8`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    /// Candidate oversampling factor for the later rescore stage; defaults to 4.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversample: Option<f32>,
+}
+
+impl CoreRescoreOptions {
+    /// Supported original-precision rescore mode.
+    pub const ORIGINAL: &'static str = "original";
+}
+
 impl CoreIndexCreateOptions {
     /// Returns the native-core default metadata used by the simple create path.
     pub fn native_default(
@@ -196,6 +222,7 @@ impl CoreIndexCreateOptions {
             vector_dim,
             bit_width,
             ann: None,
+            rescore: None,
         }
     }
 }
@@ -227,6 +254,9 @@ pub struct CoreIndexCreateRequest {
     /// Optional opt-in ANN tuning; omitted keeps the index exact-scan only.
     #[serde(default)]
     pub ann: Option<CoreAnnOptions>,
+    /// Optional original-precision capture for a later rescore stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescore: Option<CoreRescoreOptions>,
 }
 
 impl CoreIndexCreateRequest {
@@ -239,6 +269,7 @@ impl CoreIndexCreateRequest {
             options.model = model;
         }
         options.ann = self.ann;
+        options.rescore = self.rescore;
         options
     }
 }

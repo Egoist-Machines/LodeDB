@@ -46,11 +46,7 @@ pub fn append_record(
     payload: Value,
     fsync: bool,
 ) -> CoreResult<WalAppend> {
-    let body = encode_body(op, payload, lsn)?;
-    let mut frame = Vec::with_capacity(4 + body.len() + 4);
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
-    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    let frame = encode_frame(op, payload, Some(lsn))?;
     let first_write = !path.exists();
     if first_write {
         if let Some(parent) = path.parent() {
@@ -159,11 +155,25 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
         Err(error) => return Err(corrupt(format!("WAL could not be read: {error}"))),
     };
     if data.len() < WAL_HEADER_LEN {
+        // A file shorter than its own header is what a crash during WAL creation
+        // leaves behind; the file reader treats it as empty rather than corrupt.
         return Ok(WalScan {
             records: Vec::new(),
             valid_len: 0,
             total_len: data.len() as u64,
         });
+    }
+    scan_records(&data)
+}
+
+/// Scans a complete WAL byte image (header plus CRC-framed records) into its
+/// records and the byte length of the valid frame prefix. Crash-tolerant on the
+/// tail: a torn or CRC-failing *trailing* frame stops the scan (leaving
+/// `valid_len < total_len`) while interior corruption errors. Callers that
+/// require completeness (segments) compare `valid_len` to `total_len`.
+fn scan_records(data: &[u8]) -> CoreResult<WalScan> {
+    if data.len() < WAL_HEADER_LEN {
+        return Err(corrupt("WAL data is shorter than the file header"));
     }
     if &data[..WAL_MAGIC.len()] != WAL_MAGIC {
         return Err(corrupt("not a LodeDB WAL file (bad magic)"));
@@ -209,6 +219,45 @@ pub fn read_records_with_valid_len(path: &Path) -> CoreResult<WalScan> {
         valid_len: offset as u64,
         total_len: total as u64,
     })
+}
+
+/// Encodes records into an immutable WAL-format segment: the standard file
+/// header followed by one CRC-framed record per entry. Segments reuse the
+/// on-disk WAL byte format byte-for-byte so one decode path serves both;
+/// writers upload the returned bytes verbatim. Records may carry `lsn: None`
+/// (segments are stamped at fold time) or `Some` (tests pin byte-compat
+/// against `append_record`). Refuses an empty record list — a segment with no
+/// records is a writer bug, not a no-op.
+pub fn encode_wal_segment(records: &[WalRecord]) -> CoreResult<Vec<u8>> {
+    if records.is_empty() {
+        return Err(corrupt("a WAL segment requires at least one record"));
+    }
+    let mut data = Vec::new();
+    data.extend_from_slice(WAL_MAGIC);
+    data.extend_from_slice(&WAL_SCHEMA_VERSION.to_be_bytes());
+    for record in records {
+        let frame = encode_frame(&record.op, record.payload.clone(), record.lsn)?;
+        data.extend_from_slice(&frame);
+    }
+    Ok(data)
+}
+
+/// Strictly decodes a WAL segment produced by `encode_wal_segment`. Unlike the
+/// crash-tolerant file reader, a segment is a complete immutable blob, so a
+/// short header, torn tail, trailing CRC failure, or empty record list all
+/// mean a corrupt upload/download and fail closed.
+pub fn decode_wal_segment(data: &[u8]) -> CoreResult<Vec<WalRecord>> {
+    if data.len() < WAL_HEADER_LEN {
+        return Err(corrupt("WAL segment is shorter than the file header"));
+    }
+    let scan = scan_records(data)?;
+    if scan.valid_len != scan.total_len {
+        return Err(corrupt("WAL segment has a torn or corrupt trailing frame"));
+    }
+    if scan.records.is_empty() {
+        return Err(corrupt("WAL segment holds no records"));
+    }
+    Ok(scan.records)
 }
 
 /// Truncates the WAL to `valid_len`, dropping a torn trailing frame left by a
@@ -275,6 +324,7 @@ pub fn checkpoint_store(
             calibration_fingerprint: ann.calibration_fingerprint,
             postings: &ann.postings,
         }),
+        tvvf_manifest: store.tvvf_manifest.clone(),
         compress_text,
     };
     crate::storage::write_generation_commit(
@@ -309,7 +359,7 @@ fn decode_body(body: &[u8]) -> CoreResult<WalRecord> {
     Ok(WalRecord { op, payload, lsn })
 }
 
-fn encode_body(op: &str, mut payload: Value, lsn: u64) -> CoreResult<Vec<u8>> {
+fn encode_body(op: &str, mut payload: Value, lsn: Option<u64>) -> CoreResult<Vec<u8>> {
     if op.is_empty() || op.contains('\n') {
         return Err(corrupt("WAL record op must be non-empty and newline-free"));
     }
@@ -318,10 +368,26 @@ fn encode_body(op: &str, mut payload: Value, lsn: u64) -> CoreResult<Vec<u8>> {
     };
     // Stamp the log sequence number into the JSON body rather than the binary
     // frame, so the frame layout (and the committed cross-version WAL fixtures)
-    // stays byte-compatible. `decode_body` lifts it back out on read. The payload
-    // is taken by value and mutated in place: both append callers own the payload
-    // they pass, so this avoids cloning the whole value tree on the write hot path.
-    object.insert("lsn".to_string(), Value::from(lsn));
+    // stays byte-compatible. `decode_body` lifts it back out on read. `Some`
+    // writes the `lsn` key; `None` writes none -- the local append path passes
+    // `Some`, the cloud segment path passes `None`. The payload is taken by
+    // value and mutated in place: append callers own the payload they pass, so
+    // this avoids cloning the whole value tree on the write hot path.
+    //
+    // Because the stamp shares the payload's namespace, an unstamped record
+    // whose payload carries its own root-level `lsn` key must be refused here:
+    // encoding it would succeed, but `decode_body` would lift that key out --
+    // a numeric value reads back as a stamped record (so a fold rejects the
+    // whole segment only after upload), a non-numeric one is silently dropped
+    // from the payload. Fail closed at encode time instead.
+    if let Some(lsn) = lsn {
+        object.insert("lsn".to_string(), Value::from(lsn));
+    } else if object.contains_key("lsn") {
+        return Err(corrupt(
+            "unstamped WAL record payload must not carry a root-level `lsn` key; \
+             decode would misread it as the record's stamp",
+        ));
+    }
     let mut body = Vec::new();
     body.extend_from_slice(op.as_bytes());
     body.push(b'\n');
@@ -329,6 +395,18 @@ fn encode_body(op: &str, mut payload: Value, lsn: u64) -> CoreResult<Vec<u8>> {
         .map_err(|error| corrupt(format!("WAL payload could not be encoded: {error}")))?;
     body.extend_from_slice(&payload);
     Ok(body)
+}
+
+/// Encodes one complete WAL frame — `[u32 BE body_len][body][u32 BE crc]` —
+/// for `append_record` and `encode_wal_segment` to share, so file appends and
+/// segment bytes can never drift.
+fn encode_frame(op: &str, payload: Value, lsn: Option<u64>) -> CoreResult<Vec<u8>> {
+    let body = encode_body(op, payload, lsn)?;
+    let mut frame = Vec::with_capacity(4 + body.len() + 4);
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    Ok(frame)
 }
 
 fn apply_record(
@@ -810,6 +888,134 @@ mod tests {
     }
 
     #[test]
+    fn segment_encode_decode_round_trip() {
+        let records = vec![
+            WalRecord {
+                op: "apply_embedded_documents".to_string(),
+                payload: json!({"documents": [], "added_chunks": [], "removed_chunk_ids": []}),
+                lsn: None,
+            },
+            WalRecord {
+                op: "delete_documents".to_string(),
+                payload: json!({"document_ids": ["alpha", "beta"]}),
+                lsn: None,
+            },
+        ];
+        let data = encode_wal_segment(&records).expect("encode segment");
+        let decoded = decode_wal_segment(&data).expect("decode segment");
+        assert_eq!(decoded, records);
+        assert!(decoded.iter().all(|record| record.lsn.is_none()));
+    }
+
+    #[test]
+    fn segment_bytes_match_append_record_for_stamped_records() {
+        // A segment of stamped records must be byte-identical to the file the
+        // append path writes for the same sequence — one frame format, no drift.
+        let dir = temp_dir("segment-byte-compat");
+        let path = dir.join("default.wal");
+        let records = vec![
+            WalRecord {
+                op: "upsert_documents".to_string(),
+                payload: json!({"documents": []}),
+                lsn: Some(1),
+            },
+            WalRecord {
+                op: "delete_documents".to_string(),
+                payload: json!({"document_ids": ["alpha"]}),
+                lsn: Some(2),
+            },
+        ];
+        for record in &records {
+            append_record(
+                &path,
+                record.lsn.expect("stamped"),
+                &record.op,
+                record.payload.clone(),
+                false,
+            )
+            .expect("append");
+        }
+        let file_bytes = std::fs::read(&path).expect("read wal file");
+        let segment_bytes = encode_wal_segment(&records).expect("encode segment");
+        assert_eq!(segment_bytes, file_bytes);
+    }
+
+    #[test]
+    fn segment_encode_refuses_bad_input() {
+        let error = encode_wal_segment(&[]).expect_err("empty list refused");
+        assert!(error.to_string().contains("at least one record"));
+        let bad_op = WalRecord {
+            op: "bad\nop".to_string(),
+            payload: json!({}),
+            lsn: None,
+        };
+        assert!(encode_wal_segment(&[bad_op]).is_err());
+        let empty_op = WalRecord {
+            op: String::new(),
+            payload: json!({}),
+            lsn: None,
+        };
+        assert!(encode_wal_segment(&[empty_op]).is_err());
+        let non_object = WalRecord {
+            op: "delete_documents".to_string(),
+            payload: json!([1, 2]),
+            lsn: None,
+        };
+        assert!(encode_wal_segment(&[non_object]).is_err());
+        // A root-level payload `lsn` key collides with the stamp's namespace:
+        // decode would lift it out as the record's LSN (numeric) or silently
+        // drop it (non-numeric), so an unstamped record refuses it at encode.
+        for lsn_value in [json!(7), json!("not-a-number")] {
+            let payload_lsn = WalRecord {
+                op: "delete_documents".to_string(),
+                payload: json!({"document_ids": ["alpha"], "lsn": lsn_value}),
+                lsn: None,
+            };
+            let error = encode_wal_segment(&[payload_lsn]).expect_err("payload lsn refused");
+            assert!(error.to_string().contains("root-level `lsn` key"));
+        }
+    }
+
+    #[test]
+    fn segment_decode_is_strict() {
+        let records = vec![WalRecord {
+            op: "delete_documents".to_string(),
+            payload: json!({"document_ids": ["alpha"]}),
+            lsn: None,
+        }];
+        let data = encode_wal_segment(&records).expect("encode segment");
+
+        // Torn/junk tail: the file reader would tolerate this; segments refuse.
+        let mut torn = data.clone();
+        torn.extend_from_slice(&[0, 0, 1]);
+        let error = decode_wal_segment(&torn).expect_err("junk tail refused");
+        assert!(error.to_string().contains("torn or corrupt trailing frame"));
+
+        // A truncated final frame is equally a torn tail.
+        let truncated = &data[..data.len() - 2];
+        assert!(decode_wal_segment(truncated).is_err());
+
+        // Interior corruption fails in the shared scan.
+        let mut flipped = data.clone();
+        flipped[WAL_HEADER_LEN + 5] ^= 0xFF;
+        assert!(decode_wal_segment(&flipped).is_err());
+
+        // Header-only blob holds no records.
+        let header_only = &data[..WAL_HEADER_LEN];
+        let error = decode_wal_segment(header_only).expect_err("header-only refused");
+        assert!(error.to_string().contains("holds no records"));
+
+        // Shorter than the header, bad magic, wrong schema version.
+        assert!(decode_wal_segment(&data[..4]).is_err());
+        let mut bad_magic = data.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(decode_wal_segment(&bad_magic).is_err());
+        let mut bad_version = data;
+        bad_version[WAL_MAGIC.len()] ^= 0xFF;
+        assert!(decode_wal_segment(&bad_version).is_err());
+    }
+
+    #[test]
     fn mixed_text_wal_replay_replaces_embedded_chunk_rows() {
         let index_key = "mixed-text-key";
         let chunk_id = chunk_id_for_hash("alpha", &normalized_chunk_hash("Alpha text."), 0);
@@ -879,6 +1085,8 @@ mod tests {
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
             ann: None,
+            tvvf_manifest: None,
+            tvvf_reader: None,
             wal_records: Vec::new(),
         };
 
@@ -930,6 +1138,8 @@ mod tests {
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
             ann: None,
+            tvvf_manifest: None,
+            tvvf_reader: None,
             wal_records: Vec::new(),
         };
 

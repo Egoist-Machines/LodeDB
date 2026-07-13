@@ -292,6 +292,26 @@ def test_remove_returns_true_only_when_document_existed(tmp_path):
     db.close()
 
 
+def test_remove_many_deletes_one_batch_and_reports_count(tmp_path, monkeypatch):
+    """remove_many routes every id through one native delete/commit call."""
+
+    db = _open(tmp_path)
+    calls = []
+
+    def delete_batch(document_ids):
+        calls.append(document_ids)
+        return {"documents_deleted": 2}
+
+    monkeypatch.setattr(db, "_native_delete_documents", delete_batch)
+    assert db.remove_many(("a", "b", "missing")) == 2
+    assert calls == [("a", "b", "missing")]
+    assert db.remove_many(()) == 0
+    assert calls == [("a", "b", "missing")]
+    with pytest.raises(ValueError, match="non-empty strings"):
+        db.remove_many(("a", ""))
+    db.close()
+
+
 def test_persist_and_reopen_round_trip(tmp_path):
     """State persists on disk and reloads on reopen (fail-closed sidecar replay)."""
 
