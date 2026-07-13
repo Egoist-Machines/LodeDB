@@ -135,6 +135,36 @@ def test_lexical_search_survives_reopen(tmp_path):
     reopened.close()
 
 
+@pytest.mark.parametrize(
+    ("store_text", "index_text"),
+    [(True, False), (False, True)],
+    ids=["retained-text", "persisted-tokens"],
+)
+def test_lexical_search_with_each_source_live_and_reopened(
+    tmp_path, store_text, index_text
+):
+    """Either lexical source must work immediately and after a reopen."""
+
+    options = {"store_text": store_text, "index_text": index_text}
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM, **options)
+    db.add_vectors(_onehot(0), id="a", text="the quick brown fox")
+
+    assert [hit.id for hit in db.search("quick", mode="lexical")] == ["a"]
+    assert [hit.id for hit in db.search("quick")] == ["a"]
+    assert [hit.id for hit in db.search_many(["quick"], mode="lexical")[0]] == ["a"]
+
+    # Payload-only caption updates use the same live lexical-source policy.
+    db._update_document_payload("a", text="a slow green turtle")
+    assert db.search("quick", mode="lexical") == []
+    assert [hit.id for hit in db.search("turtle", mode="lexical")] == ["a"]
+    db.close()
+
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=DIM, **options)
+    assert reopened.search("quick", mode="lexical") == []
+    assert [hit.id for hit in reopened.search("turtle", mode="lexical")] == ["a"]
+    reopened.close()
+
+
 def test_dim_validation(tmp_path):
     db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
     with pytest.raises(ValueError, match="dimension"):

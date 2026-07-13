@@ -890,14 +890,14 @@ class LodeDB:
         the same exact-match-or-predicate grammar as :meth:`search` and is applied
         identically to every query in the batch.
 
-        ``mode`` matches :meth:`search` (unset resolves to ``"hybrid"`` when a
-        lexical source is available, else ``"vector"``) and applies to every
-        query in the batch; ``search_many(mode="hybrid")`` returns the same result
-        as the corresponding repeated single :meth:`search` call. ``"hybrid"`` and
-        ``"lexical"`` require a lexical source (``index_text=True`` or
-        ``store_text=True``). A batch of hybrid queries batches its vector half on
-        the shared scan (the GPU serves it where available) and fuses each query's
-        BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
+        ``mode`` matches :meth:`search` and applies to every query in the batch.
+        Unset resolves to ``"hybrid"`` when a lexical source is available and to
+        ``"vector"`` otherwise; on a vector-only index it resolves to ``"lexical"``
+        because no query embedder exists. ``"hybrid"`` and ``"lexical"`` require
+        a lexical source (``index_text=True`` or ``store_text=True``). A batch of
+        hybrid queries batches its vector half on the shared scan (the GPU serves
+        it where available) and fuses each query's BM25 ranking on the CPU;
+        lexical queries run BM25 on the CPU.
         """
 
         if not isinstance(queries, list) or not queries:

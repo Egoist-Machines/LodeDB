@@ -198,16 +198,16 @@ impl CoreEngine {
         let mut removed_chunk_ids: Vec<String> = Vec::new();
         for document in documents {
             let content_hash = crate::text::hash::sha256_f32_le(&document.vector);
-            // Mirror Python's vector-in text policy: retain raw text only when
-            // store_text is on, and tokenize the optional caption into the lexical
-            // index only when index_text is on (a vector document is a single
-            // chunk keyed by its document id, so its caption is one token list).
+            // Mirror the text path's lexical-source policy: retain raw text only
+            // when store_text is on, and keep live caption tokens whenever either
+            // source is available. index_text controls durable `.tvlex` output;
+            // store_text-only handles rebuild the same tokens from `.tvtext`.
             let retained_text = if store_text {
                 document.text.clone()
             } else {
                 None
             };
-            let caption_tokens: Vec<String> = if index_text {
+            let caption_tokens: Vec<String> = if index_text || store_text {
                 document.text.as_deref().map(tokenize).unwrap_or_default()
             } else {
                 Vec::new()
@@ -538,9 +538,10 @@ impl CoreEngine {
                 // the base's old text resurrects on reload.
                 index.pending_raw_text_clears.insert(document_id.to_string());
             }
-            // The caption changed, so refresh its lexical postings: tokenize the
-            // new caption when index_text is on, otherwise clear stale postings.
-            let caption_tokens: Vec<String> = if index_text {
+            // The caption changed, so refresh its live lexical postings whenever
+            // either lexical source is enabled. Only index_text persists tokens;
+            // store_text-only handles rebuild them from retained raw text.
+            let caption_tokens: Vec<String> = if index_text || store_text {
                 text.as_deref().map(tokenize).unwrap_or_default()
             } else {
                 Vec::new()
