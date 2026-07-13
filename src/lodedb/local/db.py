@@ -1150,12 +1150,28 @@ class LodeDB:
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
+        return self.remove_many((id,)) > 0
+
+    def remove_many(self, ids: Sequence[str]) -> int:
+        """Removes documents by id in one mutation and returns the number deleted.
+
+        The ids are sent to the native core as one batch, so an auto-persisting
+        handle publishes one commit regardless of batch size. An empty batch is
+        a no-op.
+        """
+
         self._require_writable()
-        if not isinstance(id, str) or not id.strip():
-            raise ValueError("id must be a non-empty string")
+        document_ids = tuple(ids)
+        if any(
+            not isinstance(document_id, str) or not document_id.strip()
+            for document_id in document_ids
+        ):
+            raise ValueError("ids must contain only non-empty strings")
+        if not document_ids:
+            return 0
         with self._op_lock:
-            native_response = self._native_delete_documents((id,))
-            return int(native_response.get("documents_deleted", 0) or 0) > 0
+            native_response = self._native_delete_documents(document_ids)
+            return int(native_response.get("documents_deleted", 0) or 0)
 
     def _update_document_payload(
         self,

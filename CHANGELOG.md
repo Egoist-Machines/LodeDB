@@ -34,7 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an unset `mode` resolves to `"lexical"` there instead of `"hybrid"`. This lets
   vector-in integrations (mem0, Haystack, any external embedder) offer keyword search through
   the public API instead of reaching into engine internals. No on-disk format change.
-
+- **Dependency-free kotaemon vector-store adapter.** Configure
+  `lodedb.local.integrations.kotaemon.LodeDBVectorStore` through kotaemon's
+  `KH_VECTORSTORE` setting to use one local LodeDB collection per index, with
+  chunk scopes and metadata/table predicates pushed into the metadata planner.
+- `LodeDB.remove_many(ids)` batches document removal into one native mutation
+  and durable commit.
 - **WAL segment primitives for out-of-band ingest (`lodedb.local.segments`).** Store-free
   planning (`plan_documents`), record building (`build_embedded_documents_record`,
   `delete_documents_record`), immutable WAL-format segment encode/decode
