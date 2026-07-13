@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lexical (BM25) search on vector-only stores.** `search(mode="lexical")` and
+  `search_many(mode="lexical")` now run on a bring-your-own-vectors index
+  (`open_vector_store` / `LodeDB(vector_dim=...)`) that retains text (`store_text=True`,
+  the default, or `index_text=True`): they rank the text carried on the stored vectors with
+  LodeDB's Okapi BM25, no embedder needed. `mode="vector"`/`"hybrid"` still raise
+  `VectorOnlyIndexError` on such a store (they must embed the query — use `search_by_vector`),
+  and an unset `mode` resolves to `"lexical"` there instead of `"hybrid"`. This lets
+  vector-in integrations (mem0, Haystack, any external embedder) offer keyword search through
+  the public API instead of reaching into engine internals. No on-disk format change.
 - **Dependency-free kotaemon vector-store adapter.** Configure
   `lodedb.local.integrations.kotaemon.LodeDBVectorStore` through kotaemon's
   `KH_VECTORSTORE` setting to use one local LodeDB collection per index, with

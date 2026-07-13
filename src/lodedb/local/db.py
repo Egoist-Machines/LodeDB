@@ -566,10 +566,15 @@ class LodeDB:
         """Opens (or creates) a bring-your-own-vectors index at a chosen dimension.
 
         Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
-        The index has **no internal embedding model**: only ``add_vectors`` /
-        ``add_vectors_many`` / ``search_by_vector`` / ``search_many_by_vector``
-        work, and the text-in verbs (``add``/``search``) raise
-        :class:`VectorOnlyIndexError`. Vectors must have dimension ``vector_dim``
+        The index has **no internal embedding model**: the vector-in verbs
+        (``add_vectors`` / ``add_vectors_many`` / ``search_by_vector`` /
+        ``search_many_by_vector``) work, and so does keyword search —
+        ``search(query, mode="lexical")`` (and ``search_many``) runs BM25 over the
+        text carried on the stored vectors, since lexical ranking needs no
+        embedder (requires ``store_text=True``, the default, or ``index_text=True``).
+        The embedding verbs — ``add`` / ``add_many`` and vector/hybrid ``search`` —
+        raise :class:`VectorOnlyIndexError` because they would need to embed text.
+        Vectors must have dimension ``vector_dim``
         (any value your own embedder produces, e.g. 1536 or 3072), so this is the
         path for plugging LodeDB in as the vector backend behind a system that owns
         its embedder. The dimension and a redacted ``model="external"`` identity are
@@ -800,7 +805,12 @@ class LodeDB:
           ``ABC-123``, dates like ``2024-01-15``) are surfaced when they appear in
           the document body. The default for local RAG, where a missed exact match
           is the difference between a usable and a useless answer.
-        - ``"lexical"`` — the BM25 ranking alone (no vector scan).
+        - ``"lexical"`` — the BM25 ranking alone (no vector scan). Because it embeds
+          nothing, ``mode="lexical"`` also works on a **vector-only** index
+          (:meth:`open_vector_store`) that retains text: it ranks the text carried on
+          the stored vectors. On such an index ``vector``/``hybrid`` still raise
+          :class:`VectorOnlyIndexError` (no embedder), and an unset ``mode`` resolves
+          to ``"lexical"`` rather than ``"hybrid"``.
 
         ``"hybrid"`` and ``"lexical"`` build an in-memory BM25 index from a
         lexical source, so they require opening LodeDB with either
@@ -808,7 +818,8 @@ class LodeDB:
         without raw text) or ``store_text=True`` (the index rebuilt from the
         retained raw text, the default); requesting either *explicitly* with
         neither source raises :class:`ValueError`, whereas the unset default
-        falls back to ``"vector"`` instead of raising. The serving index lives in
+        falls back to ``"vector"`` instead of raising (except on a vector-only
+        index, where it resolves to ``"lexical"``). The serving index lives in
         memory, is maintained
         incrementally across mutations (a small change folds in only the changed
         chunks), and never changes the on-disk format.
@@ -845,11 +856,13 @@ class LodeDB:
         never leaves the process and never appears in telemetry.
         """
 
-        self._require_text_capable()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # Gates on the resolved mode, not on text-capability alone: a vector-only
+        # handle can still run mode="lexical" (BM25 over retained text) — only
+        # vector/hybrid, which embed the query, raise VectorOnlyIndexError here.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -877,17 +890,16 @@ class LodeDB:
         the same exact-match-or-predicate grammar as :meth:`search` and is applied
         identically to every query in the batch.
 
-        ``mode`` matches :meth:`search` (unset resolves to ``"hybrid"`` when a
-        lexical source is available, else ``"vector"``) and applies to every
-        query in the batch; ``search_many(mode="hybrid")`` returns the same result
-        as the corresponding repeated single :meth:`search` call. ``"hybrid"`` and
-        ``"lexical"`` require a lexical source (``index_text=True`` or
-        ``store_text=True``). A batch of hybrid queries batches its vector half on
-        the shared scan (the GPU serves it where available) and fuses each query's
-        BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
+        ``mode`` matches :meth:`search` and applies to every query in the batch.
+        Unset resolves to ``"hybrid"`` when a lexical source is available and to
+        ``"vector"`` otherwise; on a vector-only index it resolves to ``"lexical"``
+        because no query embedder exists. ``"hybrid"`` and ``"lexical"`` require
+        a lexical source (``index_text=True`` or ``store_text=True``). A batch of
+        hybrid queries batches its vector half on the shared scan (the GPU serves
+        it where available) and fuses each query's BM25 ranking on the CPU;
+        lexical queries run BM25 on the CPU.
         """
 
-        self._require_text_capable()
         if not isinstance(queries, list) or not queries:
             raise ValueError("queries must be a non-empty list of strings")
         for query in queries:
@@ -895,6 +907,7 @@ class LodeDB:
                 raise ValueError("each query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # See :meth:`search`: lexical mode runs on a vector-only handle; vector/hybrid raise.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -2087,29 +2100,53 @@ class LodeDB:
             )
 
     def _resolve_mode(self, mode: str | None) -> str:
-        """Validates a search mode and enforces the lexical-source requirement.
+        """Validates a search mode and gates it against the handle's capabilities.
 
         ``None`` (the search default) resolves to ``"hybrid"`` when a lexical
         source is available (``index_text=True`` or ``store_text=True``) and to
         ``"vector"`` otherwise, so the fused ranking is the default wherever it
-        can run and a vector-only store never raises on an unset mode.
+        can run. On a **vector-only** handle (no embedding model) an unset mode
+        resolves to ``"lexical"`` instead: such a handle cannot embed the query
+        text, so a text query can only be a keyword (BM25) query — and the
+        lexical-source check below then applies.
 
-        Returns the canonical lowercase mode. Raises :class:`ValueError` for an
-        unknown mode, or when a lexical/hybrid mode is requested *explicitly* on a
-        handle that has no lexical source — neither ``index_text=True`` (a
-        persisted BM25 postings store) nor ``store_text=True`` (the BM25 index
-        rebuilt from the retained raw text), so there is nothing to build the
-        index from.
+        Returns the canonical lowercase mode. Raises:
+
+        - :class:`ValueError` for an unknown mode.
+        - :class:`VectorOnlyIndexError` when ``"vector"`` or ``"hybrid"`` is used
+          on a vector-only handle: both embed the query text, which a vector-only
+          index cannot do (use :meth:`search_by_vector` for vector similarity, or
+          ``mode="lexical"`` for keyword search).
+        - :class:`ValueError` when a lexical/hybrid mode is requested on a handle
+          with no lexical source — neither ``index_text=True`` (a persisted BM25
+          postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
+          retained raw text), so there is nothing to build the index from.
         """
 
         if mode is None:
-            return "hybrid" if (self.index_text or self.store_text) else "vector"
-        if not isinstance(mode, str):
-            raise ValueError("mode must be a string")
-        value = mode.strip().lower() or "vector"
-        if value not in _SEARCH_MODES:
-            allowed = ", ".join(sorted(_SEARCH_MODES))
-            raise ValueError(f"mode must be one of: {allowed}")
+            if self.vector_only:
+                # No embedder: a text query can only be lexical. Falls through to
+                # the lexical-source check, which raises if there is no source.
+                value = "lexical"
+            elif self.index_text or self.store_text:
+                return "hybrid"
+            else:
+                return "vector"
+        else:
+            if not isinstance(mode, str):
+                raise ValueError("mode must be a string")
+            value = mode.strip().lower() or "vector"
+            if value not in _SEARCH_MODES:
+                allowed = ", ".join(sorted(_SEARCH_MODES))
+                raise ValueError(f"mode must be one of: {allowed}")
+        # Vector and hybrid embed the query text; a vector-only handle cannot, so only
+        # lexical search (BM25 over retained/indexed text) is available on it.
+        if self.vector_only and value in {"vector", "hybrid"}:
+            raise VectorOnlyIndexError(
+                f"mode={value!r} needs to embed the query text, which a vector-only index "
+                "cannot do; use search_by_vector(...) for vector similarity, or "
+                'mode="lexical" for keyword search over retained text'
+            )
         if value in _LEXICAL_SEARCH_MODES and not (self.index_text or self.store_text):
             raise ValueError(
                 f"mode={value!r} requires a lexical source: open LodeDB with "
