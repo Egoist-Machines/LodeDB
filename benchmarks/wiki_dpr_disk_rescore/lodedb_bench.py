@@ -743,21 +743,34 @@ def run_benchmark(
                 )
             print(f"[wiki-dpr] {label}: ingest done in {ingest_seconds:.1f}s", flush=True)
             cluster_build_seconds: float | None = None
-            if ann is not None:
-                started = time.perf_counter()
-                db.search_by_vector(queries[0], k=k, normalize=False)
-                cluster_build_seconds = time.perf_counter() - started
-            else:
-                db.search_by_vector(queries[0], k=k, normalize=False)
             compact_seconds: float | None = None
-            if compact:
+            warm_path = "query"
+            if ann is not None:
+                compact_fn = getattr(db, "compact", None)
+                started = time.perf_counter()
+                if callable(compact_fn):
+                    # compact() warms the cluster, rewrites the base, and
+                    # persists; its duration is compaction, not k-means alone,
+                    # so it must not masquerade as cluster_build_seconds.
+                    print(f"[wiki-dpr] {label}: warming via compact", flush=True)
+                    compact_fn()
+                    warm_path = "compact"
+                    compact_seconds = time.perf_counter() - started
+                else:
+                    print(f"[wiki-dpr] {label}: warm query", flush=True)
+                    db.search_by_vector(queries[0], k=k, normalize=False)
+                    cluster_build_seconds = time.perf_counter() - started
+            else:
+                print(f"[wiki-dpr] {label}: warm query", flush=True)
+                db.search_by_vector(queries[0], k=k, normalize=False)
+            if compact and warm_path != "compact":
                 compact_fn = getattr(db, "compact", None)
                 if not callable(compact_fn):
                     raise _requires_engine("compact()")
                 started = time.perf_counter()
                 compact_fn()
                 compact_seconds = time.perf_counter() - started
-            print(f"[wiki-dpr] {label}: warm query done, persisting", flush=True)
+            print(f"[wiki-dpr] {label}: {warm_path} warm done, persisting", flush=True)
             started = time.perf_counter()
             db.persist()
             persist_seconds = time.perf_counter() - started
@@ -766,6 +779,7 @@ def run_benchmark(
                 "ingest_seconds": ingest_seconds,
                 "ingest_rows_per_s": base.shape[0] / ingest_seconds if ingest_seconds else 0.0,
                 "cluster_build_seconds": cluster_build_seconds,
+                "warm_path": warm_path,
                 "compact_seconds": compact_seconds,
                 "persist_seconds": persist_seconds,
             }
