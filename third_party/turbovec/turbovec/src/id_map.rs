@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::io;
-use crate::{AddError, ConstructError, EncodedRowsError, TurboQuantIndex};
+use crate::{AddError, ConstructError, EncodedRowsError, TurboQuantIndex, TurboVecError};
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 pub struct IdMapIndex {
@@ -193,6 +193,45 @@ impl IdMapIndex {
             }
         }
         removed
+    }
+
+    /// Reorders physical slots so `ids_in_order[new_slot]` identifies the row at
+    /// that slot. The requested ids must be an exact permutation of the live set.
+    ///
+    /// Local appliance extension on top of upstream v0.9.0, see
+    /// `LOCAL_PATCHES.md` at the repository root.
+    pub fn reorder_to_ids(&mut self, ids_in_order: &[u64]) -> Result<(), TurboVecError> {
+        if ids_in_order == self.slot_to_id {
+            return Ok(());
+        }
+        if ids_in_order.len() != self.slot_to_id.len() {
+            return Err(TurboVecError::IdsCountMismatch {
+                expected: self.slot_to_id.len(),
+                got: ids_in_order.len(),
+            });
+        }
+        let mut seen_slots = vec![false; self.slot_to_id.len()];
+        let mut permutation = Vec::with_capacity(ids_in_order.len());
+        for &id in ids_in_order {
+            let slot = *self
+                .id_to_slot
+                .get(&id)
+                .ok_or(TurboVecError::UnknownId(id))?;
+            if seen_slots[slot] {
+                return Err(TurboVecError::DuplicateId(id));
+            }
+            seen_slots[slot] = true;
+            permutation.push(slot);
+        }
+
+        self.inner.permute_rows(&permutation);
+        self.slot_to_id.clear();
+        self.slot_to_id.extend_from_slice(ids_in_order);
+        self.id_to_slot.clear();
+        for (slot, &id) in self.slot_to_id.iter().enumerate() {
+            self.id_to_slot.insert(id, slot);
+        }
+        Ok(())
     }
 
     /// Packed code bytes per vector, or `None` before the dim commits.

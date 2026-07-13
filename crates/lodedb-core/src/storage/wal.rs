@@ -324,6 +324,7 @@ pub fn checkpoint_store(
             calibration_fingerprint: ann.calibration_fingerprint,
             postings: &ann.postings,
         }),
+        tvvf_manifest: store.tvvf_manifest.clone(),
         compress_text,
     };
     crate::storage::write_generation_commit(
@@ -1084,6 +1085,8 @@ mod tests {
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
             ann: None,
+            tvvf_manifest: None,
+            tvvf_reader: None,
             wal_records: Vec::new(),
         };
 
@@ -1135,6 +1138,8 @@ mod tests {
             lexical_tokens: BTreeMap::new(),
             multivec: Default::default(),
             ann: None,
+            tvvf_manifest: None,
+            tvvf_reader: None,
             wal_records: Vec::new(),
         };
 

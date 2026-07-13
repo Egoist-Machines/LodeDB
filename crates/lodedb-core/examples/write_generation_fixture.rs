@@ -57,6 +57,7 @@ fn main() {
             lexical_tokens: None,
             multivec: None,
             ann: None,
+            tvvf_manifest: None,
             compress_text: true,
         },
         GenerationWriteOptions::default(),

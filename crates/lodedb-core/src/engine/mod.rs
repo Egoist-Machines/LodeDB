@@ -1,6 +1,6 @@
 //! Native core engine.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,8 @@ use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult,
-    CoreOpenOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument, VectorBatchArrays,
+    CoreOpenOptions, CoreRescoreOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument,
+    VectorBatchArrays,
 };
 use crate::vector::ann::ClusterIndex;
 use crate::vector::index::{CoreVectorChunk, VectorSearchHit};
@@ -141,6 +142,41 @@ impl CoreEngine {
         }
         self.indexes
             .insert(options.index_id.clone(), VectorOnlyIndex::new(options));
+        Ok(())
+    }
+
+    /// Returns the persisted creation options for an index.
+    ///
+    /// Session-only query overrides intentionally do not appear here: bindings
+    /// use this read-only view to distinguish an index's durable identity from
+    /// knobs applied only to the current engine lifetime.
+    pub fn index_options(&self, index_id: &str) -> Result<CoreIndexCreateOptions, CoreError> {
+        Ok(self.index(index_id)?.create_options())
+    }
+
+    /// Applies query-time tuning for this engine lifetime only.
+    ///
+    /// Neither setting changes state headers, manifests, or sidecars. `nprobe`
+    /// is clamped against the current cluster count at query time just like its
+    /// persisted counterpart, so a value suitable for one corpus size remains
+    /// safe after later writes in the same session.
+    pub fn set_session_overrides(
+        &mut self,
+        index_id: &str,
+        ann_nprobe: Option<usize>,
+        rescore_oversample: Option<f32>,
+    ) -> Result<(), CoreError> {
+        if ann_nprobe == Some(0) {
+            return invalid("ann_nprobe must be positive");
+        }
+        if let Some(oversample) = rescore_oversample {
+            if !oversample.is_finite() || oversample < 1.0 {
+                return invalid("rescore_oversample must be finite and at least 1.0");
+            }
+        }
+        let index = self.index_mut(index_id)?;
+        index.session_ann_nprobe = ann_nprobe;
+        index.session_rescore_oversample = rescore_oversample;
         Ok(())
     }
 
@@ -965,7 +1001,9 @@ impl CoreEngine {
             let embeddings = query_embeddings
                 .ok_or_else(|| invalid_err("query embeddings are required for this mode"))?;
             if embeddings.len() != query_plans.len() {
-                return Err(invalid_err("query embeddings count does not match query plans"));
+                return Err(invalid_err(
+                    "query embeddings count does not match query plans",
+                ));
             }
             Ok(embeddings)
         };
@@ -1074,6 +1112,7 @@ impl CoreEngine {
                 total_considered: 0,
             });
         }
+        self.ensure_rescore_reader_for_query(index)?;
         match index.query_vector_turbovec(query_vector, top_k, filter) {
             Ok(results) => Ok(results),
             Err(error) if error.code() == CoreErrorCode::Unsupported => {
@@ -1090,6 +1129,35 @@ impl CoreEngine {
     pub fn ann_cluster_resident(&self, index_id: &str) -> Result<bool, CoreError> {
         let index = self.index(index_id)?;
         Ok(index.cluster_index.borrow().is_some())
+    }
+
+    /// Builds the ANN cluster index now, without issuing a vector query.
+    ///
+    /// Returns `true` when an ANN cluster index is resident after the call. Exact
+    /// indexes, and ANN indexes too small to form more than one cluster, return
+    /// `false` without doing any work.
+    pub fn ann_warm(&self, index_id: &str) -> Result<bool, CoreError> {
+        let index = self.index(index_id)?;
+        // Warming is the deployment/compaction path: build only when the durable
+        // configuration can prune and therefore persist a useful cluster layout.
+        // Probe-all and single-cluster configurations are exact scans; building
+        // k-means for them can cost minutes at scale and produces no `.tvann`.
+        if !index.ann_prunes_durable() {
+            return Ok(false);
+        }
+        index.ensure_cluster_index()?;
+        Ok(index.cluster_index.borrow().is_some())
+    }
+
+    /// Marks an index for a full base rewrite on its next [`Self::persist`].
+    ///
+    /// This is intentionally only a scheduling operation: callers can warm ANN,
+    /// force a cluster-contiguous base and sidecar fold opportunity, then choose
+    /// when to publish the resulting generation with `persist`.
+    pub fn compact(&mut self, index_id: &str) -> Result<(), CoreError> {
+        self.require_writable()?;
+        self.index_mut(index_id)?.force_base_rewrite = true;
+        Ok(())
     }
 
     fn query_vector_scalar(
@@ -1242,6 +1310,7 @@ impl CoreEngine {
                 })
                 .collect());
         }
+        self.ensure_rescore_reader_for_query(index)?;
         match index.query_vectors_batch_turbovec(query_vectors, top_k, filter) {
             Ok(results) => Ok(results),
             Err(error) if error.code() == CoreErrorCode::Unsupported => query_vectors
@@ -1288,7 +1357,21 @@ impl CoreEngine {
                 metadata: Vec::new(),
             });
         }
+        self.ensure_rescore_reader_for_query(index)?;
         index.query_vectors_batch_arrays_turbovec(queries, nq, top_k, filter)
+    }
+
+    /// Opens a just-committed sidecar lazily, only when this create-time opt-in
+    /// has a manifest but no resident reader. Fresh writes retain their cheap
+    /// commit path; the first query pays the index read if it can use originals.
+    fn ensure_rescore_reader_for_query(&self, index: &VectorOnlyIndex) -> Result<(), CoreError> {
+        if !index.rescore_reader_needs_open() {
+            return Ok(());
+        }
+        if let Some(persistence) = &self.persistence {
+            index.ensure_tvvf_reader(&persistence.path)?;
+        }
+        Ok(())
     }
 
     /// Returns metrics-only stats for an index.
@@ -1309,6 +1392,8 @@ impl CoreEngine {
             vector_dim: index.vector_dim,
             bit_width: index.bit_width,
             raw_payload_text_present: false,
+            rescore: index.rescore_stats(),
+            ann: index.ann_stats(),
         })
     }
 
@@ -2345,6 +2430,18 @@ impl CoreEngine {
         // an error always restores the last-good view, never a half-built or
         // seqlock-rejected one.
         let saved = std::mem::take(&mut self.indexes);
+        // The indexes rebuilt below contain only durable state. Preserve the
+        // reader handle's query-only tuning separately so it can be restored onto
+        // each successful replacement by index id.
+        let session_overrides = saved
+            .iter()
+            .map(|(index_id, index)| {
+                (
+                    index_id.clone(),
+                    (index.session_ann_nprobe, index.session_rescore_oversample),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut outcome = Ok(());
         for _ in 0..8 {
             self.indexes.clear();
@@ -2355,10 +2452,15 @@ impl CoreEngine {
                     break;
                 }
             };
-            if let Err(error) = self
-                .load_persisted_indexes(false)
-                .and_then(|()| self.overlay_wal_tails())
-            {
+            if let Err(error) = self.load_persisted_indexes(false).and_then(|()| {
+                for (index_id, (ann_nprobe, rescore_oversample)) in &session_overrides {
+                    if let Some(index) = self.indexes.get_mut(index_id) {
+                        index.session_ann_nprobe = *ann_nprobe;
+                        index.session_rescore_oversample = *rescore_oversample;
+                    }
+                }
+                self.overlay_wal_tails()
+            }) {
                 outcome = Err(error);
                 break;
             }
@@ -2407,9 +2509,7 @@ impl CoreEngine {
     /// when a counter cannot be read this pass -- a concurrent appender holds it with
     /// an exclusive share mode on Windows -- so the caller skips the fast path and
     /// does a normal reload rather than surfacing a spurious error.
-    fn refresh_signature(
-        &self,
-    ) -> Result<Option<BTreeMap<String, (String, u64, u64)>>, CoreError> {
+    fn refresh_signature(&self) -> Result<Option<BTreeMap<String, (String, u64, u64)>>, CoreError> {
         let Some(persistence) = &self.persistence else {
             return Ok(Some(BTreeMap::new()));
         };
@@ -2520,7 +2620,13 @@ impl CoreEngine {
         let targets: Vec<(String, String, u64)> = self
             .indexes
             .values()
-            .map(|index| (index.index_id.clone(), index.index_key.clone(), index.generation))
+            .map(|index| {
+                (
+                    index.index_id.clone(),
+                    index.index_key.clone(),
+                    index.generation,
+                )
+            })
             .collect();
         for (index_id, index_key, base_generation) in targets {
             let wal = crate::storage::wal::wal_path(&path, &index_key);
@@ -2813,7 +2919,9 @@ impl CoreAppender {
         let metadata = crate::storage::load_store_metadata(&path, &index_key)?;
         let vector_dim = metadata.native_dim;
         if vector_dim == 0 {
-            return Err(invalid_err("index has no vector dimension to append against"));
+            return Err(invalid_err(
+                "index has no vector dimension to append against",
+            ));
         }
         // Under the counter lock (so no concurrent appender is mid-write), scan the
         // WAL to seed the LSN floor and repair any torn tail a crash left behind.
@@ -2909,12 +3017,18 @@ impl CoreAppender {
             // Same finiteness guard the writer's upsert_vectors applies, so a
             // NaN/Inf vector cannot enter the log and fail a later replay.
             if turbovec::first_invalid_coord(&document.vector, self.vector_dim).is_some() {
-                return Err(invalid_err("vector contains a non-finite or out-of-range value"));
+                return Err(invalid_err(
+                    "vector contains a non-finite or out-of-range value",
+                ));
             }
             // Byte-identical to the engine's writer-authored record via the shared
             // builder: raw text only under store_text (privacy), caption tokens
             // under index_text, and the late-interaction patch matrix carried along.
-            vectors.push(wal_vector_document(document, self.store_text, self.index_text));
+            vectors.push(wal_vector_document(
+                document,
+                self.store_text,
+                self.index_text,
+            ));
         }
         self.append_one("upsert_vectors", serde_json::json!({ "vectors": vectors }))
     }
@@ -2922,7 +3036,9 @@ impl CoreAppender {
     /// Durably appends one `delete_documents` record, returning its LSN.
     pub fn append_deletes(&self, document_ids: &[String]) -> Result<u64, CoreError> {
         if document_ids.is_empty() {
-            return Err(invalid_err("append_deletes requires at least one document id"));
+            return Err(invalid_err(
+                "append_deletes requires at least one document id",
+            ));
         }
         if document_ids.iter().any(|id| id.trim().is_empty()) {
             return Err(invalid_err("document_id is required"));
@@ -2942,7 +3058,9 @@ impl CoreAppender {
     /// uses, so a replayed appended record folds to the same chunks a writer would.
     pub fn prepare_documents(&self, documents: &[CoreDocument]) -> Result<IngestPlan, CoreError> {
         if documents.is_empty() {
-            return Err(invalid_err("prepare_documents requires at least one document"));
+            return Err(invalid_err(
+                "prepare_documents requires at least one document",
+            ));
         }
         // One planner, zero drift: the store-free planner chunks identically; the
         // appender only stamps its own index key onto the plan.
@@ -3087,9 +3205,7 @@ impl CoreAppender {
             // counter's LSN is the last frame's LSN. The steady-state hot path --
             // once this appender acks a frame the watermark equals the file length,
             // so every later append in the session lands here in O(1) with no scan.
-            Some(mark) if physical == mark && mark > 0 => {
-                Ok((counter_lsn.max(generation), mark))
-            }
+            Some(mark) if physical == mark && mark > 0 => Ok((counter_lsn.max(generation), mark)),
             // Anything else: a torn trailing frame, a zero-length WAL, a watermark
             // past the file, or -- now that an appender no longer holds the writer
             // lock for its lifetime -- committed frames a concurrent writer appended
@@ -3391,6 +3507,21 @@ fn index_from_loaded_store(
         .as_ref()
         .map_or(0, TurboVecNativeIndex::calibration_fingerprint);
     let base_epoch = loaded.base_epoch;
+    let rescore_options = state
+        .get("rescore")
+        .and_then(|value| serde_json::from_value::<CoreRescoreOptions>(value.clone()).ok())
+        // An invalid persisted config never makes the store unreadable. Leave its
+        // sidecar files untouched and disable only this session's future rescore.
+        .filter(|rescore| validate_rescore_options(rescore).is_ok());
+    let tvvf_manifest = loaded.tvvf_manifest.clone();
+    let tvvf_sidecar_unavailable = Cell::new(
+        rescore_options.is_some() && tvvf_manifest.is_some() && loaded.tvvf_reader.is_none(),
+    );
+    let tvvf_reader = if rescore_options.is_some() {
+        loaded.tvvf_reader
+    } else {
+        None
+    };
     let index = VectorOnlyIndex {
         index_id,
         index_key,
@@ -3458,6 +3589,15 @@ fn index_from_loaded_store(
             // or invalid tuning) so it never runs the wrong algorithm; the index
             // then serves exact, which is always correct.
             .filter(|ann| validate_ann_options(ann).is_ok()),
+        session_ann_nprobe: None,
+        rescore_options,
+        session_rescore_oversample: None,
+        pending_rescore_upserts: BTreeMap::new(),
+        tvvf_reader: RefCell::new(tvvf_reader),
+        tvvf_manifest,
+        tvvf_sidecar_unavailable,
+        drop_tvvf_manifest: false,
+        force_base_rewrite: false,
         cluster_index: RefCell::new(None),
         field_indexes,
         all_docs,
@@ -3473,6 +3613,9 @@ fn index_from_loaded_store(
         pending_new_stable_ids: BTreeSet::new(),
         pending_vectors_changed: false,
     };
+    // This reopen seeds `documents` directly from persisted (lossy) TurboVec rows;
+    // it never routes those rows through `sync_vector_index_upsert`, so no
+    // reconstructed vector can overwrite the original-precision tvvf sidecar.
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
     // first ANN query rebuilds it. This skips the k-means rebuild after a clean
     // reopen without ever trusting a stale sidecar.
@@ -3734,6 +3877,11 @@ fn state_header_for_index(index: &VectorOnlyIndex) -> serde_json::Map<String, Va
             header.insert("ann".to_string(), value);
         }
     }
+    if let Some(rescore) = &index.rescore_options {
+        if let Ok(value) = serde_json::to_value(rescore) {
+            header.insert("rescore".to_string(), value);
+        }
+    }
     header
 }
 
@@ -3845,19 +3993,21 @@ fn persist_index_generation(
         && index.pending_lexical_clears.is_empty()
         && index.pending_raw_text_clears.is_empty()
         && index.pending_multivec_clears.is_empty()
-        && index.pending_removed_stable_ids.is_empty();
+        && index.pending_removed_stable_ids.is_empty()
+        && index.pending_rescore_upserts.is_empty();
     // A fold can advance the durable applied-LSN watermark without changing any
     // document (an idempotent re-add / missing-id delete). That still must be
     // committed, or truncating the WAL would strand the acknowledged LSN and a
     // reader waiting on it could never catch up.
     let watermark_only = nothing_pending && index.applied_lsn > index.persisted_applied_lsn;
     // A committed base with nothing pending and no watermark to flush is durable.
-    if index.base_epoch != 0 && nothing_pending && !watermark_only {
+    if index.base_epoch != 0 && nothing_pending && !watermark_only && !index.force_base_rewrite {
         return Ok(());
     }
-    // A watermark-only commit did not advance the mutation counter, so bump the
-    // generation to a fresh epoch or the delta would target the committed base.
-    if watermark_only && index.generation <= index.base_epoch {
+    // A watermark-only or operator-forced base rewrite may not have advanced the
+    // mutation counter. Bump to a fresh epoch so it cannot overwrite the committed
+    // base generation it is meant to replace.
+    if (watermark_only || index.force_base_rewrite) && index.generation <= index.base_epoch {
         index.generation = index.base_epoch + 1;
     }
     let generation = index.generation.max(1);
@@ -3886,7 +4036,8 @@ fn persist_index_generation(
                     .get(id)
                     .is_some_and(|r| !r.token_lists.is_empty())
             }));
-    let needs_base = index.base_epoch == 0
+    let needs_base = index.force_base_rewrite
+        || index.base_epoch == 0
         || !index.vectors_seeded
         || live_fingerprint != index.base_calibration_fingerprint
         || !native_base_appendable(
@@ -3904,6 +4055,7 @@ fn persist_index_generation(
         )?;
 
     if needs_base {
+        index.reorder_for_cluster_layout();
         write_index_base(
             index,
             dir,
@@ -3915,6 +4067,7 @@ fn persist_index_generation(
         )?;
         index.base_epoch = generation;
         index.base_calibration_fingerprint = live_fingerprint;
+        index.force_base_rewrite = false;
     } else if watermark_only {
         // No document state changed -- only the applied-LSN watermark advanced. Carry
         // the committed base and all its store manifests forward and re-seal just the
@@ -3938,6 +4091,9 @@ fn persist_index_generation(
     index.pending_raw_text_clears.clear();
     index.pending_multivec_clears.clear();
     index.pending_removed_stable_ids.clear();
+    index.pending_rescore_upserts.clear();
+    index.drop_tvvf_manifest = false;
+    index.tvvf_sidecar_unavailable.set(false);
     index.pending_new_stable_ids.clear();
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
@@ -4006,9 +4162,251 @@ fn generation_should_compact(
     Ok(delta_documents * 4 >= document_count.max(1))
 }
 
+/// Flushes the original-precision sidecar before its root commit manifest is
+/// swapped. An interrupted write can therefore leave only an unreferenced segment,
+/// which `TvvfReader` intentionally ignores on the next open.
+fn flush_tvvf(
+    index: &mut VectorOnlyIndex,
+    dir: &Path,
+    fsync: bool,
+    generation: u64,
+) -> Result<Option<crate::storage::TvvfManifestEntry>, CoreError> {
+    let changed =
+        !index.pending_rescore_upserts.is_empty() || !index.pending_removed_stable_ids.is_empty();
+    let Some(dtype) = index.rescore_dtype() else {
+        // Preserve a sidecar referenced by a now-invalid persisted config. The
+        // session cannot use it, but a fail-open load must not delete or orphan it.
+        return Ok(index.tvvf_manifest.clone());
+    };
+    if index.tvvf_sidecar_unavailable.get() && index.tvvf_manifest.is_some() {
+        if changed {
+            // The `.tvim` delta is about to advance without a corresponding
+            // original-precision update. Do not carry stale originals into the
+            // next root manifest. The old files remain untouched for diagnosis.
+            eprintln!(
+                "lodedb: dropping unavailable tvvf sidecar for index {}; rescore disabled. \
+                 Run doctor/rebuild to create a new sidecar lineage.",
+                index.index_key
+            );
+            index.tvvf_manifest = None;
+            index.rescore_options = None;
+            index.drop_tvvf_manifest = true;
+            return Ok(None);
+        }
+        return Ok(index.tvvf_manifest.clone());
+    }
+    if index.tvvf_manifest.is_some() && !changed {
+        return Ok(index.tvvf_manifest.clone());
+    }
+
+    let rows = index
+        .pending_rescore_upserts
+        .iter()
+        .map(|(stable_id, bytes)| (*stable_id, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let mut manifest = match index.tvvf_manifest.as_ref() {
+        Some(previous) => {
+            let vf_epoch = previous
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorCode::CorruptStore,
+                        "tvvf manifest is missing vf_epoch",
+                    )
+                })?;
+            crate::storage::tvvf_store::restore_manifest_with_fsync(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                previous,
+                fsync,
+            )
+            .map_err(tvvf_error)?;
+            crate::storage::tvvf_store::append_encoded_delta_with_fsync(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                &rows,
+                &index
+                    .pending_removed_stable_ids
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                fsync,
+            )
+            .map_err(tvvf_error)?
+        }
+        None => crate::storage::tvvf_store::record_encoded_base_with_fsync(
+            dir,
+            &index.index_key,
+            generation,
+            dtype,
+            index.vector_dim,
+            &rows,
+            fsync,
+        )
+        .map_err(tvvf_error)?,
+    };
+    if index.tvvf_manifest.is_some() {
+        if let Some(reader) = index.tvvf_reader.get_mut().as_mut() {
+            let vf_epoch = manifest
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorCode::CorruptStore,
+                        "tvvf manifest is missing vf_epoch",
+                    )
+                })?;
+            let segment = crate::storage::tvvf_store::load_latest_delta_segment(
+                dir,
+                &index.index_key,
+                vf_epoch,
+                &manifest,
+            )
+            .map_err(tvvf_error)?;
+            reader.append_delta_segment(segment).map_err(tvvf_error)?;
+        }
+    }
+    let should_fold = {
+        let reader = index.tvvf_reader.borrow();
+        tvvf_should_fold(&manifest, reader.as_ref())
+    };
+    if should_fold {
+        let vf_epoch = manifest
+            .get("vf_epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "tvvf manifest is missing vf_epoch",
+                )
+            })?;
+        manifest = crate::storage::fold_with_fsync(dir, &index.index_key, vf_epoch, fsync)
+            .map_err(tvvf_error)?;
+        let reader = crate::storage::TvvfReader::open(dir, &manifest).map_err(tvvf_error)?;
+        *index.tvvf_reader.get_mut() = Some(reader);
+    }
+    index.tvvf_manifest = Some(manifest.clone());
+    Ok(Some(manifest))
+}
+
+fn tvvf_should_fold(manifest: &Value, reader: Option<&crate::storage::TvvfReader>) -> bool {
+    let base_rows = manifest
+        .get("base")
+        .and_then(Value::as_object)
+        .and_then(|base| base.get("row_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let deltas = manifest
+        .get("deltas")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .collect::<Vec<_>>();
+    // Keep at most 64 committed delta segments. The 65th is folded before its
+    // root manifest is published, bounding both lookup fan-out and root size.
+    if deltas.len() > MAX_GENERATION_DELTA_SEGMENTS {
+        return true;
+    }
+    let journal_upserts = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .get("upsert_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let journal_tombstones = deltas
+        .iter()
+        .map(|delta| {
+            delta
+                .get("deleted_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let tombstones = reader
+        .map(|reader| reader.coverage().1)
+        // A nonresident reader must not be opened on the commit path. This
+        // conservative count can only fold early when repeated tombstones occur.
+        .unwrap_or(journal_tombstones);
+    journal_upserts.saturating_mul(4) >= base_rows.max(1)
+        || tombstones.saturating_mul(4) >= base_rows.max(1)
+}
+
+/// tvvf epochs do not share the state-generation lifecycle: a `.tvim` base
+/// rewrite must never sweep this only copy of original precision. Read the
+/// durable root after its swap, keep its live epoch and immediate predecessor for
+/// recovery, then remove only strictly older independent tvvf epochs. A failed
+/// unlink retains the whole epoch for a later GC pass, which keeps Windows open
+/// handles non-fatal and Unix snapshot readers safe through their held handles.
+fn gc_tvvf_epochs(dir: &Path, index_key: &str) {
+    let Ok(Some(root)) = crate::storage::commit_manifest::read_commit_manifest(
+        &crate::storage::commit_manifest::commit_manifest_path(dir, index_key),
+    ) else {
+        return;
+    };
+    let Some(live_epoch) = root
+        .store_manifest("tvvf")
+        .and_then(|manifest| manifest.get("vf_epoch"))
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
+    let generation_dir = crate::storage::commit_manifest::generation_dir(dir, index_key);
+    let Ok(entries) = fs::read_dir(&generation_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // A prior pass can unlink the base but leave its delta directory behind.
+        // Recognize either entry so that orphaned directories get another cleanup
+        // attempt instead of disappearing from the GC scan with the base file.
+        let sidecar_name = name
+            .strip_suffix(crate::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX)
+            .unwrap_or(name);
+        let Some(epoch) = sidecar_name
+            .strip_prefix("vf")
+            .and_then(|name| name.strip_suffix(".tvvf"))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if epoch.saturating_add(1) >= live_epoch {
+            continue;
+        }
+        let base = crate::storage::tvvf_base_path(dir, index_key, epoch);
+        // Windows rejects an unlink while a read-only snapshot still holds the
+        // segment. Retain both the base and its deltas in that case, then retry on
+        // a later successful post-commit GC. A missing base has already been
+        // collected, so its delta directory is still eligible for cleanup.
+        match fs::remove_file(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        let _ = fs::remove_dir_all(base.with_file_name(format!(
+            "{}{}",
+            base.file_name().unwrap_or_default().to_string_lossy(),
+            crate::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+        )));
+    }
+}
+
+fn tvvf_error(error: crate::storage::TvvfError) -> CoreError {
+    CoreError::new(CoreErrorCode::CorruptStore, error.to_string())
+}
+
 /// Writes a full base for one index (the cold-build / compaction path).
 fn write_index_base(
-    index: &VectorOnlyIndex,
+    index: &mut VectorOnlyIndex,
     dir: &Path,
     fsync: bool,
     store_text: bool,
@@ -4016,6 +4414,7 @@ fn write_index_base(
     compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
+    let tvvf_manifest = flush_tvvf(index, dir, fsync, generation)?;
     let tvim_base = tvim_base_for_index(index)?;
     let state = state_payload_for_index(index);
     let raw_text = if store_text {
@@ -4040,7 +4439,7 @@ fn write_index_base(
     // are stable ids; they are mapped back to chunk-id strings for the sidecar
     // (the payload boundary the other sidecars hold to). A probe-all or too-small
     // configuration writes no `.tvann`.
-    let persist_ann = index.ann_prunes() && tvim_base.is_some();
+    let persist_ann = index.ann_prunes_durable() && tvim_base.is_some();
     let ann_postings = if persist_ann {
         index.ann_persisted_postings()?
     } else {
@@ -4078,6 +4477,7 @@ fn write_index_base(
             lexical_tokens: Some(&lexical_tokens),
             multivec: Some(&multivec),
             ann,
+            tvvf_manifest,
             compress_text,
         },
         crate::storage::GenerationWriteOptions {
@@ -4085,6 +4485,10 @@ fn write_index_base(
             retained_epochs: 4,
         },
     )?;
+    // The root swap above is the only publication point. Deriving retention from
+    // it rather than this invocation's fold result also collects old epochs when
+    // a failed folded attempt is later published by a small delta retry.
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
@@ -4106,11 +4510,12 @@ fn write_index_watermark(
         index.applied_lsn.max(generation),
         fsync,
     )?;
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
 fn write_index_delta(
-    index: &VectorOnlyIndex,
+    index: &mut VectorOnlyIndex,
     dir: &Path,
     fsync: bool,
     store_text: bool,
@@ -4118,6 +4523,7 @@ fn write_index_delta(
     compress_text: bool,
     generation: u64,
 ) -> Result<(), CoreError> {
+    let tvvf_manifest = flush_tvvf(index, dir, fsync, generation)?;
     let upserted_documents = index
         .pending_upserts
         .iter()
@@ -4182,6 +4588,8 @@ fn write_index_delta(
             chunk_count_after: index.chunk_count(),
             tvim: build_tvim_delta(index)?,
             vectors_changed: index.pending_vectors_changed,
+            tvvf_manifest,
+            drop_tvvf_manifest: index.drop_tvvf_manifest,
             raw_text_upserts,
             raw_text_clears: index.pending_raw_text_clears.iter().cloned().collect(),
             lexical_upserts,
@@ -4196,6 +4604,9 @@ fn write_index_delta(
         },
         fsync,
     )?;
+    // See write_index_base: this is deliberately unconditional after a root
+    // publication and becomes a cheap no-op for indexes without a tvvf manifest.
+    gc_tvvf_epochs(dir, &index.index_key);
     Ok(())
 }
 
@@ -4527,6 +4938,33 @@ struct VectorOnlyIndex {
     vector_index: RefCell<Option<TurboVecNativeIndex>>,
     /// Opt-in ANN tuning; `None` keeps the index exact-scan only.
     ann_options: Option<CoreAnnOptions>,
+    /// Query-time ANN probe override. This belongs to the live engine only and
+    /// deliberately never reaches the state header or commit manifest.
+    session_ann_nprobe: Option<usize>,
+    /// Opt-in original-precision capture for the two-stage rescore query path.
+    rescore_options: Option<CoreRescoreOptions>,
+    /// Query-time candidate oversampling override. Like `session_ann_nprobe`,
+    /// this is engine-lifetime state only.
+    session_rescore_oversample: Option<f32>,
+    /// Caller-supplied rows, encoded at ingest before the live TurboVec index
+    /// quantizes them. A BTreeMap makes WAL replay and multi-producer folding
+    /// idempotent: a repeated stable id overwrites its pending payload.
+    pending_rescore_upserts: BTreeMap<u64, Vec<u8>>,
+    /// Installed sidecar reader from the committed manifest. This is separate
+    /// from TurboVec's reconstructed chunks, which must never seed tvvf.
+    tvvf_reader: RefCell<Option<crate::storage::TvvfReader>>,
+    /// Last committed (or just-flushed) tvvf manifest, including its independent
+    /// vf epoch. A generation base rewrite carries it forward unchanged.
+    tvvf_manifest: Option<crate::storage::TvvfManifestEntry>,
+    /// Set only when a committed sidecar could not be opened. This is distinct
+    /// from the normal lazy-reader state used by a newly created sidecar.
+    tvvf_sidecar_unavailable: Cell<bool>,
+    /// Makes the next generation root omit `tvvf` instead of carrying a known
+    /// stale sidecar manifest forward.
+    drop_tvvf_manifest: bool,
+    /// Operator-requested full-base rewrite. `compact()` sets this flag and the
+    /// next successful persist consumes it, so the operator controls publication.
+    force_base_rewrite: bool,
     /// Lazily-built cluster index for ANN candidate generation; `None` means
     /// "dirty, rebuild on the next ANN query". Interior mutability keeps the
     /// query path read-only, mirroring `vector_index`.
@@ -4582,6 +5020,80 @@ struct VectorOnlyIndex {
 }
 
 impl VectorOnlyIndex {
+    /// Reconstructs the durable creation payload without any session overrides.
+    fn create_options(&self) -> CoreIndexCreateOptions {
+        CoreIndexCreateOptions {
+            index_id: self.index_id.clone(),
+            index_key: self.index_key.clone(),
+            client_id_hash: self.client_id_hash.clone(),
+            name: self.name.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            task: self.task.clone(),
+            route_profile: self.route_profile.clone(),
+            storage_profile: self.storage_profile.clone(),
+            vector_dim: self.vector_dim,
+            bit_width: self.bit_width,
+            ann: self.ann_options.clone(),
+            rescore: self.rescore_options.clone(),
+        }
+    }
+
+    fn rescore_dtype(&self) -> Option<crate::storage::TvvfDtype> {
+        self.rescore_options.as_ref().map(|options| {
+            match options.dtype.as_deref().unwrap_or("float16") {
+                "float16" => crate::storage::TvvfDtype::Float16,
+                "float32" => crate::storage::TvvfDtype::Float32,
+                "int8" => crate::storage::TvvfDtype::Int8,
+                // `validate_rescore_options` rejects all other values at create
+                // and drops malformed persisted options before construction.
+                _ => unreachable!("validated rescore dtype"),
+            }
+        })
+    }
+
+    /// Opens the original-precision sidecar only for a query stage that needs
+    /// it. Ingest leaves an absent reader absent, so a newly created sidecar
+    /// never pays a base-wide ID scan on its commit path.
+    fn ensure_tvvf_reader(&self, dir: &Path) -> Result<bool, CoreError> {
+        if self.tvvf_reader.borrow().is_some() {
+            return Ok(true);
+        }
+        if self.tvvf_sidecar_unavailable.get() {
+            return Ok(false);
+        }
+        let Some(manifest) = self.tvvf_manifest.as_ref() else {
+            return Ok(false);
+        };
+        match crate::storage::TvvfReader::open(dir, manifest) {
+            Ok(reader) => {
+                *self.tvvf_reader.borrow_mut() = Some(reader);
+                Ok(true)
+            }
+            Err(error) => {
+                // Latch the failure: later queries skip the retry (and its log),
+                // and the next vector-changing commit sees the unavailable state
+                // and stops carrying the stale manifest forward.
+                self.tvvf_sidecar_unavailable.set(true);
+                eprintln!(
+                    "lodedb: unavailable tvvf sidecar for index {}; rescore disabled: {error}",
+                    self.index_key
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// The persisted sidecar exists but has not been indexed in this process.
+    /// Keeping this separate from `rescore_applies` makes a corrupt-sidecar
+    /// fail-open indistinguishable from the legacy plain path after one attempt.
+    fn rescore_reader_needs_open(&self) -> bool {
+        self.rescore_options.is_some()
+            && self.tvvf_reader.borrow().is_none()
+            && self.tvvf_manifest.is_some()
+            && !self.tvvf_sidecar_unavailable.get()
+    }
+
     fn new(options: CoreIndexCreateOptions) -> Self {
         Self {
             index_id: options.index_id,
@@ -4606,6 +5118,15 @@ impl VectorOnlyIndex {
             lexical_index: Bm25Index::empty(),
             vector_index: RefCell::new(None),
             ann_options: options.ann,
+            session_ann_nprobe: None,
+            rescore_options: options.rescore,
+            session_rescore_oversample: None,
+            pending_rescore_upserts: BTreeMap::new(),
+            tvvf_reader: RefCell::new(None),
+            tvvf_manifest: None,
+            tvvf_sidecar_unavailable: Cell::new(false),
+            drop_tvvf_manifest: false,
+            force_base_rewrite: false,
             cluster_index: RefCell::new(None),
             field_indexes: BTreeMap::new(),
             all_docs: DocSet::new(),
@@ -4690,10 +5211,10 @@ impl VectorOnlyIndex {
         // row by definition -- new rows leave `pending_removed` untouched), is
         // NOT new: misclassifying it would drop its eventual removal from the
         // delta and resurrect the committed row on replay.
-        for stable_id in readded {
-            let removed_this_cycle = self.pending_removed_stable_ids.remove(&stable_id);
-            if !pre_existing.contains(&stable_id) && !removed_this_cycle {
-                self.pending_new_stable_ids.insert(stable_id);
+        for stable_id in &readded {
+            let removed_this_cycle = self.pending_removed_stable_ids.remove(stable_id);
+            if !pre_existing.contains(stable_id) && !removed_this_cycle {
+                self.pending_new_stable_ids.insert(*stable_id);
             }
         }
         // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
@@ -4704,6 +5225,17 @@ impl VectorOnlyIndex {
         // cluster index is stale and the next ANN query rebuilds it from the
         // current documents, keeping a newly-added vector clustered and findable.
         if !chunks.is_empty() {
+            if let Some(dtype) = self.rescore_dtype() {
+                for (chunk, stable_id) in chunks.iter().zip(&readded) {
+                    let encoded = crate::storage::tvvf_store::encode_row(
+                        dtype,
+                        self.vector_dim,
+                        &chunk.embedding,
+                    )
+                    .map_err(tvvf_error)?;
+                    self.pending_rescore_upserts.insert(*stable_id, encoded);
+                }
+            }
             self.pending_vectors_changed = true;
             self.cluster_index.get_mut().take();
         }
@@ -4733,6 +5265,7 @@ impl VectorOnlyIndex {
         // count mismatch") and brick the store for every fresh open. Its
         // add+remove simply cancel out of the delta.
         for stable_id in removed {
+            self.pending_rescore_upserts.remove(&stable_id);
             if !self.pending_new_stable_ids.remove(&stable_id) {
                 self.pending_removed_stable_ids.insert(stable_id);
             }
@@ -4916,6 +5449,10 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
+        let rescore = self.rescore_applies();
+        if rescore {
+            return self.query_vector_turbovec_rescored(query_vector, top_k, filter);
+        }
         let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
         if empty_filter {
             return Ok(CoreSearchResults {
@@ -4946,6 +5483,172 @@ impl VectorOnlyIndex {
             hits: self.assemble_vector_hits(raw_hits),
             total_considered,
         })
+    }
+
+    /// Runs the opt-in two-stage vector path. The first-stage scan remains the
+    /// TurboVec authority for candidate generation; original rows only replace a
+    /// candidate score when they are available and checksum-valid.
+    fn query_vector_turbovec_rescored(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<CoreSearchResults, CoreError> {
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
+            return Ok(CoreSearchResults {
+                hits: Vec::new(),
+                total_considered,
+            });
+        }
+        let ann = self.ann_should_prune(filter);
+        let scan_capacity = if ann || filter.is_none() {
+            self.live_chunk_count()
+        } else {
+            allowlist.len()
+        };
+        let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
+        let ann_allowlist = if ann {
+            self.ann_candidate_stable_ids(query_vector, candidate_k)?
+        } else {
+            None
+        };
+        let index = self.turbovec_index()?;
+        let raw_hits = match &ann_allowlist {
+            Some(stable_ids) => {
+                index.search_with_stable_allowlist(query_vector, candidate_k, stable_ids)?
+            }
+            None => index.search(query_vector, candidate_k, &allowlist)?,
+        };
+        Ok(CoreSearchResults {
+            hits: self.assemble_vector_hits(self.rescore_raw_hits(query_vector, raw_hits, top_k)),
+            total_considered,
+        })
+    }
+
+    /// True only when the create-time opt-in has rows that could improve a query.
+    /// This is intentionally a narrow query-entry gate: without persisted rescore
+    /// options, the exact scan path cannot reach any two-stage work.
+    fn rescore_applies(&self) -> bool {
+        self.rescore_options.is_some()
+            && (!self.pending_rescore_upserts.is_empty() || self.tvvf_reader.borrow().is_some())
+    }
+
+    /// Metrics-only rescore state. This intentionally never opens a cold sidecar:
+    /// stats must remain O(1) with respect to the corpus. A resident reader has
+    /// already indexed coverage, so its counts are cheap to report.
+    fn rescore_stats(&self) -> Option<CoreRescoreStats> {
+        let options = self.rescore_options.as_ref()?;
+        let reader = self.tvvf_reader.borrow();
+        let (sidecar_rows, tombstones, corrupt_rows_seen) = match reader.as_ref() {
+            Some(reader) => {
+                let (sidecar_rows, tombstones) = reader.coverage();
+                (
+                    Some(sidecar_rows),
+                    Some(tombstones),
+                    reader.corrupt_rows_seen(),
+                )
+            }
+            None => (None, None, 0),
+        };
+        Some(CoreRescoreStats {
+            dtype: options
+                .dtype
+                .clone()
+                .unwrap_or_else(|| "float16".to_string()),
+            oversample: self
+                .session_rescore_oversample
+                .or(options.oversample)
+                .unwrap_or(4.0),
+            sidecar_rows,
+            tombstones,
+            pending_rows: self.pending_rescore_upserts.len(),
+            corrupt_rows_seen,
+            reader_resident: reader.is_some(),
+        })
+    }
+
+    /// Metrics-only ANN state. The configured cluster count and effective probe
+    /// count are derived without constructing the cluster index, so stats also
+    /// exposes a session override without paying the warm-up cost.
+    fn ann_stats(&self) -> Option<CoreAnnStats> {
+        self.ann_options.as_ref()?;
+        let clusters = self.ann_cluster_count(self.live_chunk_count());
+        Some(CoreAnnStats {
+            clusters,
+            nprobe_effective: self.ann_nprobe_effective(clusters),
+            cluster_resident: self.cluster_index.borrow().is_some(),
+        })
+    }
+
+    /// Candidate count for the first stage. Validation guarantees a finite factor
+    /// of at least one, and the scan still owns its normal final clamp.
+    fn rescore_candidate_count(&self, top_k: usize, scan_capacity: usize) -> usize {
+        let oversample = self
+            .session_rescore_oversample
+            .or_else(|| {
+                self.rescore_options
+                    .as_ref()
+                    .and_then(|options| options.oversample)
+            })
+            .unwrap_or(4.0) as f64;
+        ((oversample * top_k as f64).ceil() as usize).min(scan_capacity)
+    }
+
+    /// Replaces candidate scores from pending captures first, then one batched
+    /// sidecar read. A missing or corrupt row deliberately retains its TurboVec
+    /// score so partial sidecar coverage never removes a candidate.
+    fn rescore_raw_hits(
+        &self,
+        query_vector: &[f32],
+        mut hits: Vec<VectorSearchHit>,
+        top_k: usize,
+    ) -> Vec<VectorSearchHit> {
+        let dtype = self
+            .rescore_dtype()
+            .expect("rescore path requires rescore options");
+        let mut missing_ids = Vec::new();
+        let mut missing_positions = Vec::new();
+        for (position, hit) in hits.iter_mut().enumerate() {
+            if let Some(bytes) = self.pending_rescore_upserts.get(&hit.stable_id) {
+                let row = crate::storage::tvvf_store::decode_row(dtype, self.vector_dim, bytes);
+                let exact = dot(query_vector, &row);
+                // A float16 overflow decodes to infinity; a non-finite dot would
+                // collapse the ranking to tie-breaks, so keep the quantized score.
+                if exact.is_finite() {
+                    hit.score = exact;
+                }
+            } else {
+                missing_ids.push(hit.stable_id);
+                missing_positions.push(position);
+            }
+        }
+        if !missing_ids.is_empty() {
+            if let Some(reader) = self.tvvf_reader.borrow().as_ref() {
+                for (position, row) in missing_positions
+                    .into_iter()
+                    .zip(reader.fetch_rows(&missing_ids))
+                {
+                    if let Some(row) = row {
+                        let exact = dot(query_vector, &row);
+                        if exact.is_finite() {
+                            hits[position].score = exact;
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+                .then_with(|| left.stable_id.cmp(&right.stable_id))
+        });
+        hits.truncate(top_k);
+        hits
     }
 
     /// Maps raw TurboVec hits to search hits, attaching each document's metadata
@@ -4994,7 +5697,7 @@ impl VectorOnlyIndex {
             // A single cluster holds the whole corpus; probing it is the exact scan.
             return Ok(None);
         }
-        let nprobe = self.ann_nprobe(num_clusters);
+        let nprobe = self.ann_nprobe_effective(num_clusters);
         if nprobe >= num_clusters {
             // Probing every cluster reproduces the exact top-k, so skip the union
             // work and let the exact full scan run.
@@ -5157,16 +5860,49 @@ impl VectorOnlyIndex {
         Ok(Some(clusters))
     }
 
+    fn reorder_for_cluster_layout(&mut self) {
+        if !self.ann_prunes_durable() {
+            return;
+        }
+        let ids = {
+            let cluster = self.cluster_index.borrow();
+            let Some(cluster) = cluster.as_ref() else {
+                return;
+            };
+            cluster.postings().iter().flatten().copied().collect::<Vec<_>>()
+        };
+        let mut live = self.vector_index.borrow_mut();
+        let Some(live) = live.as_mut() else {
+            return;
+        };
+        let _ = live.reorder_slots(&ids);
+    }
+
     /// Number of clusters to build: the configured override, else a `sqrt(n)`
     /// heuristic capped so the build cost and centroid memory stay bounded.
     fn ann_cluster_count(&self, n: usize) -> usize {
-        let configured = self.ann_options.as_ref().and_then(|options| options.clusters);
+        let configured = self
+            .ann_options
+            .as_ref()
+            .and_then(|options| options.clusters);
         let clusters = configured.unwrap_or_else(|| (n as f64).sqrt().round() as usize);
         clusters.clamp(1, n.max(1)).min(4096)
     }
 
-    /// Clusters probed per query: the configured override, else `ceil(sqrt(k))`.
-    fn ann_nprobe(&self, num_clusters: usize) -> usize {
+    /// Clusters probed by the current handle: a session override, durable
+    /// configuration, or `ceil(sqrt(k))`.
+    fn ann_nprobe_effective(&self, num_clusters: usize) -> usize {
+        let configured = self
+            .session_ann_nprobe
+            .or_else(|| self.ann_options.as_ref().and_then(|options| options.nprobe));
+        let nprobe = configured.unwrap_or_else(|| (num_clusters as f64).sqrt().ceil() as usize);
+        nprobe.clamp(1, num_clusters)
+    }
+
+    /// Clusters represented by the durable base layout and sidecars. Session
+    /// overrides are intentionally excluded so one handle cannot change what a
+    /// later handle inherits from disk.
+    fn ann_nprobe_durable(&self, num_clusters: usize) -> usize {
         let configured = self.ann_options.as_ref().and_then(|options| options.nprobe);
         let nprobe = configured.unwrap_or_else(|| (num_clusters as f64).sqrt().ceil() as usize);
         nprobe.clamp(1, num_clusters)
@@ -5177,15 +5913,25 @@ impl VectorOnlyIndex {
     /// is already bounded by its allowlist), and only when the config would prune.
     /// Centralized so lifting the unfiltered-only restriction is a one-site change.
     fn ann_should_prune(&self, filter: Option<&Value>) -> bool {
-        filter.is_none() && self.ann_prunes()
+        filter.is_none() && self.ann_prunes_effective()
     }
 
-    /// Whether ANN is enabled and would actually prune for the current corpus:
-    /// more than one cluster and fewer probes than clusters. This is derived from
-    /// config and corpus size with no cluster build, so the query and batch paths
-    /// can stay exact (and keep their optimized scans) for probe-all or too-small
-    /// configurations without paying to build a cluster index that goes unused.
-    fn ann_prunes(&self) -> bool {
+    /// Whether the durable ANN configuration would prune for the current corpus.
+    /// Base-layout and `.tvann` persistence use this form exclusively.
+    fn ann_prunes_durable(&self) -> bool {
+        self.ann_prunes_with(|clusters| self.ann_nprobe_durable(clusters))
+    }
+
+    /// Whether this handle's effective ANN configuration would prune for the
+    /// current corpus. Query paths use this form so their session override can
+    /// select the exact scan without constructing a cluster index.
+    fn ann_prunes_effective(&self) -> bool {
+        self.ann_prunes_with(|clusters| self.ann_nprobe_effective(clusters))
+    }
+
+    /// Evaluates the common corpus/config gate with either durable or effective
+    /// probe selection. It does not construct a cluster index.
+    fn ann_prunes_with(&self, nprobe_for_clusters: impl FnOnce(usize) -> usize) -> bool {
         if self.ann_options.is_none() {
             return false;
         }
@@ -5194,7 +5940,7 @@ impl VectorOnlyIndex {
             return false;
         }
         let clusters = self.ann_cluster_count(n);
-        clusters > 1 && self.ann_nprobe(clusters) < clusters
+        clusters > 1 && nprobe_for_clusters(clusters) < clusters
     }
 
     /// Live chunk (vector row) count in O(1): the chunk-owner map holds exactly one
@@ -5211,6 +5957,10 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        let rescore = self.rescore_applies();
+        if rescore {
+            return self.query_vectors_batch_turbovec_rescored(query_vectors, top_k, filter);
+        }
         // ANN candidate selection is per-query (each query probes different
         // clusters), so a batch cannot share one candidate allowlist. When ANN
         // would prune, resolve each query's candidates first: if at least one
@@ -5265,6 +6015,72 @@ impl VectorOnlyIndex {
             .collect())
     }
 
+    fn query_vectors_batch_turbovec_rescored(
+        &self,
+        query_vectors: &[Vec<f32>],
+        top_k: usize,
+        filter: Option<&Value>,
+    ) -> Result<Vec<CoreSearchResults>, CoreError> {
+        let ann = self.ann_should_prune(filter);
+        if ann {
+            let candidate_k = self.rescore_candidate_count(top_k, self.live_chunk_count());
+            let allowlists = query_vectors
+                .iter()
+                .map(|query| self.ann_candidate_stable_ids(query, candidate_k))
+                .collect::<Result<Vec<_>, _>>()?;
+            if allowlists.iter().any(Option::is_some) {
+                let total_considered = self.all_docs.len();
+                let index = self.turbovec_index()?;
+                return query_vectors
+                    .iter()
+                    .zip(&allowlists)
+                    .map(|(query, allowlist)| {
+                        let raw_hits = match allowlist {
+                            Some(stable_ids) => index.search_with_stable_allowlist(
+                                query,
+                                candidate_k,
+                                stable_ids,
+                            )?,
+                            None => index.search(query, candidate_k, &[])?,
+                        };
+                        Ok(CoreSearchResults {
+                            hits: self.assemble_vector_hits(
+                                self.rescore_raw_hits(query, raw_hits, top_k),
+                            ),
+                            total_considered,
+                        })
+                    })
+                    .collect();
+            }
+        }
+        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
+        if empty_filter {
+            return Ok(query_vectors
+                .iter()
+                .map(|_| CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered,
+                })
+                .collect());
+        }
+        let scan_capacity = if filter.is_none() {
+            self.live_chunk_count()
+        } else {
+            allowlist.len()
+        };
+        let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
+        let index = self.turbovec_index()?;
+        Ok(index
+            .search_batch(query_vectors, candidate_k, &allowlist)?
+            .into_iter()
+            .zip(query_vectors)
+            .map(|(raw_hits, query)| CoreSearchResults {
+                hits: self.assemble_vector_hits(self.rescore_raw_hits(query, raw_hits, top_k)),
+                total_considered,
+            })
+            .collect())
+    }
+
     /// Arrays-output counterpart of [`Self::query_vectors_batch_turbovec`]: runs the
     /// flat batch scan and attaches metadata per document id, returning flat
     /// `[nq * k]` arrays rather than per-hit structs. Metadata is looked up the same
@@ -5282,12 +6098,13 @@ impl VectorOnlyIndex {
         // results into the flat arrays, rather than duplicating the routing
         // decision and a bespoke packer. A non-pruning config keeps the optimized
         // flat shared/GPU batch scan below.
-        if self.ann_should_prune(filter) {
+        let rescore = self.rescore_applies();
+        if rescore || self.ann_should_prune(filter) {
             let dim = self.vector_dim;
             let query_vectors: Vec<Vec<f32>> = (0..nq)
                 .map(|i| queries[i * dim..(i + 1) * dim].to_vec())
                 .collect();
-            let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, None)?;
+            let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, filter)?;
             return Ok(pack_results_to_arrays(&results, nq));
         }
         let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
@@ -5664,7 +6481,7 @@ struct ChunkRecord {
 }
 
 /// Metrics-only stats for the in-memory engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreEngineStats {
     pub index_id: String,
     /// The persisted model identity the index was created with (bindings use this to
@@ -5682,6 +6499,35 @@ pub struct CoreEngineStats {
     pub vector_dim: usize,
     pub bit_width: usize,
     pub raw_payload_text_present: bool,
+    /// Original-precision sidecar observability. `None` means rescore is disabled.
+    pub rescore: Option<CoreRescoreStats>,
+    /// ANN cluster observability. `None` means ANN is disabled.
+    pub ann: Option<CoreAnnStats>,
+}
+
+/// Metrics-only original-precision rescore state for one vector index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreRescoreStats {
+    pub dtype: String,
+    pub oversample: f32,
+    /// Live rows known by a resident sidecar reader. `None` avoids opening a
+    /// cold sidecar merely to report stats.
+    pub sidecar_rows: Option<u64>,
+    /// Sidecar tombstones known by a resident reader, or `None` when cold.
+    pub tombstones: Option<u64>,
+    /// Captured rows not yet committed into the sidecar.
+    pub pending_rows: usize,
+    /// Candidate rows whose checksum failed during this reader's lifetime.
+    pub corrupt_rows_seen: u64,
+    pub reader_resident: bool,
+}
+
+/// Metrics-only ANN cluster state for one vector index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreAnnStats {
+    pub clusters: usize,
+    pub nprobe_effective: usize,
+    pub cluster_resident: bool,
 }
 
 /// Text ingest plan returned to a binding before embeddings are computed.
@@ -5773,6 +6619,9 @@ fn validate_index_options(options: &CoreIndexCreateOptions) -> Result<(), CoreEr
     if let Some(ann) = &options.ann {
         validate_ann_options(ann)?;
     }
+    if let Some(rescore) = &options.rescore {
+        validate_rescore_options(rescore)?;
+    }
     Ok(())
 }
 
@@ -5793,6 +6642,32 @@ fn validate_ann_options(ann: &CoreAnnOptions) -> Result<(), CoreError> {
     }
     if ann.nprobe == Some(0) {
         return invalid("ann.nprobe must be positive");
+    }
+    Ok(())
+}
+
+/// Validates original-precision capture configuration. Shared by creation and
+/// reopen: create rejects unsupported settings, while a malformed persisted value
+/// is filtered out during load so the base vector store remains available.
+fn validate_rescore_options(rescore: &CoreRescoreOptions) -> Result<(), CoreError> {
+    if rescore.mode != CoreRescoreOptions::ORIGINAL {
+        return invalid(format!(
+            "unsupported rescore mode: {} (expected {})",
+            rescore.mode,
+            CoreRescoreOptions::ORIGINAL
+        ));
+    }
+    match rescore.dtype.as_deref().unwrap_or("float16") {
+        "float16" | "float32" | "int8" => {}
+        dtype => {
+            return invalid(format!(
+                "unsupported rescore dtype: {dtype} (expected float16, float32, or int8)"
+            ));
+        }
+    }
+    let oversample = rescore.oversample.unwrap_or(4.0);
+    if !oversample.is_finite() || oversample < 1.0 {
+        return invalid("rescore.oversample must be finite and at least 1.0");
     }
     Ok(())
 }
@@ -5862,6 +6737,244 @@ fn invalid_err(message: impl Into<String>) -> CoreError {
 
 fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::new(CoreErrorCode::Internal, error.to_string())
+}
+
+#[cfg(test)]
+mod tvvf_gc_tests {
+    use super::{flush_tvvf, gc_tvvf_epochs, CoreEngine};
+    use crate::storage;
+    use crate::storage::commit_manifest::{
+        build_commit_body, commit_manifest_path, generation_dir, write_commit_manifest,
+        CommitBodyInput,
+    };
+    use crate::types::{
+        CoreIndexCreateOptions, CoreMetadata, CoreOpenOptions, CoreRescoreOptions,
+        CoreVectorDocument,
+    };
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lodedb-tvvf-gc-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn publish_tvvf_root(dir: &Path, manifest: Value) {
+        let body = build_commit_body(CommitBodyInput {
+            index_key: "index",
+            generation: 1,
+            applied_lsn: 1,
+            base_epoch: 1,
+            native_dim: Some(8),
+            document_count: 0,
+            chunk_count: 0,
+            json_manifest: None,
+            tvim_manifest: None,
+            tvtext_manifest: None,
+            tvlex_manifest: None,
+            tvmv_manifest: None,
+            tvann_manifest: None,
+            tvvf_manifest: Some(manifest),
+        });
+        write_commit_manifest(&commit_manifest_path(dir, "index"), &body, false)
+            .expect("publish durable root");
+    }
+
+    fn open_options(dir: &Path) -> CoreOpenOptions {
+        CoreOpenOptions {
+            path: dir.to_string_lossy().to_string(),
+            read_only: false,
+            durability: "relaxed".to_string(),
+            commit_mode: "generation".to_string(),
+            store_text: false,
+            index_text: false,
+            compress_text: true,
+            chunk_character_limit: 900,
+            acquire_writer_lock: false,
+        }
+    }
+
+    fn rescore_options() -> CoreIndexCreateOptions {
+        let mut options = CoreIndexCreateOptions::native_default("index", 8, 4);
+        options.rescore = Some(CoreRescoreOptions {
+            mode: CoreRescoreOptions::ORIGINAL.to_string(),
+            dtype: Some("float32".to_string()),
+            oversample: None,
+        });
+        options
+    }
+
+    fn vector(id: &str, offset: f32) -> CoreVectorDocument {
+        CoreVectorDocument {
+            document_id: id.to_string(),
+            vector: vec![
+                0.113 + offset,
+                -0.237 + offset * 0.5,
+                0.419 - offset * 0.25,
+                -0.571 + offset * 0.125,
+                0.683 - offset * 0.0625,
+                -0.797 + offset * 0.03125,
+                0.887 - offset * 0.015625,
+                -0.941 + offset * 0.0078125,
+            ],
+            metadata: CoreMetadata::new(),
+            text: None,
+            patch_matrix: None,
+        }
+    }
+
+    #[test]
+    fn gc_keeps_durable_root_epoch_when_unpublished_folds_advance() {
+        let dir = temp_dir("unpublished-folds");
+        let row = [1.0_f32; 8];
+        let manifest = storage::record_tvvf_base(
+            &dir,
+            "index",
+            1,
+            "float32",
+            8,
+            &[(7, row.as_slice())],
+        )
+        .expect("record epoch one");
+        publish_tvvf_root(&dir, manifest);
+
+        // Simulate two retries after the root-manifest write failed: both folds
+        // exist on disk, but the only durable root still references epoch one.
+        storage::fold(&dir, "index", 1).expect("unpublished epoch two");
+        storage::fold(&dir, "index", 2).expect("unpublished epoch three");
+        gc_tvvf_epochs(&dir, "index");
+
+        for epoch in 1..=3 {
+            assert!(
+                storage::tvvf_base_path(&dir, "index", epoch).exists(),
+                "GC must retain epoch {epoch} until a root publishes a newer epoch"
+            );
+        }
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn gc_retains_an_epoch_when_unlink_fails() {
+        let dir = temp_dir("unlink-failure");
+        fs::create_dir_all(generation_dir(&dir, "index"))
+            .expect("create generation directory");
+        publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
+        let retained = storage::tvvf_base_path(&dir, "index", 1);
+        // A directory at the base-file path makes remove_file fail on every
+        // platform, exercising the same retain-and-retry branch as a Windows
+        // sharing violation without making this test platform-specific.
+        fs::create_dir_all(&retained).expect("create unlink-resistant entry");
+
+        gc_tvvf_epochs(&dir, "index");
+
+        assert!(retained.is_dir(), "failed unlink must retain the epoch");
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn gc_removes_orphaned_delta_dir_when_the_base_is_already_missing() {
+        let dir = temp_dir("orphan-delta-dir");
+        fs::create_dir_all(generation_dir(&dir, "index"))
+            .expect("create generation directory");
+        publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
+        let orphan_base = storage::tvvf_base_path(&dir, "index", 1);
+        let orphan_delta = orphan_base.with_file_name(format!(
+            "{}{}",
+            orphan_base.file_name().unwrap_or_default().to_string_lossy(),
+            storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+        ));
+        fs::create_dir_all(&orphan_delta).expect("create orphan delta directory");
+        fs::write(orphan_delta.join("orphan.tvfd"), b"orphan")
+            .expect("write orphan delta segment");
+
+        gc_tvvf_epochs(&dir, "index");
+
+        assert!(
+            !orphan_delta.exists(),
+            "an old delta directory must be removed even when its base is gone"
+        );
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn small_delta_retry_collects_old_epochs_after_an_unpublished_fold() {
+        let dir = temp_dir("small-delta-retry");
+        let mut engine = CoreEngine::open(open_options(&dir)).expect("open engine");
+        engine
+            .create_index_with_options(rescore_options())
+            .expect("create rescore index");
+        let initial = (0..8)
+            .map(|row| vector(&format!("doc-{row}"), row as f32 * 0.01))
+            .collect::<Vec<_>>();
+        engine
+            .upsert_vectors("index", &initial)
+            .expect("seed vectors");
+        engine.persist().expect("publish epoch one");
+
+        // Epoch zero is an old sidecar that must be collected after the retry
+        // publishes epoch two. It is deliberately not referenced by the root.
+        let orphan_row = [1.0_f32; 8];
+        storage::record_tvvf_base(
+            &dir,
+            "index",
+            0,
+            "float32",
+            8,
+            &[(99, orphan_row.as_slice())],
+        )
+        .expect("record old epoch");
+
+        // Simulate a failed persist after flush_tvvf folded epoch one into epoch
+        // two, but before write_generation_delta swapped the root manifest.
+        engine
+            .upsert_vectors("index", &[vector("doc-0", 0.2), vector("doc-1", 0.3)])
+            .expect("prepare folding mutation");
+        {
+            let index = engine.indexes.get_mut("index").expect("live index");
+            let generation = index.generation;
+            let manifest = flush_tvvf(index, &dir, false, generation)
+                .expect("prepare unpublished fold")
+                .expect("tvvf manifest");
+            assert_eq!(manifest["vf_epoch"], 2);
+            index.pending_rescore_upserts.clear();
+            index.pending_removed_stable_ids.clear();
+        }
+
+        // The retry has only one new sidecar row, so it attaches a delta to epoch
+        // two and publishes it without another fold. GC must still run after this
+        // successful root swap and discard only epochs older than its predecessor.
+        engine
+            .upsert_vectors("index", &[vector("doc-2", 0.4)])
+            .expect("prepare small retry delta");
+        engine.persist().expect("publish small retry delta");
+
+        let root = storage::commit_manifest::read_commit_manifest(
+            &storage::commit_manifest::commit_manifest_path(&dir, "index"),
+        )
+        .expect("read root")
+        .expect("published root");
+        let manifest = root.store_manifest("tvvf").expect("tvvf root entry");
+        assert_eq!(manifest["vf_epoch"], 2);
+        assert_eq!(manifest["deltas"].as_array().map(Vec::len), Some(1));
+        assert!(
+            !storage::tvvf_base_path(&dir, "index", 0).exists(),
+            "old epoch must be collected on the non-folding retry publication"
+        );
+        assert!(storage::tvvf_base_path(&dir, "index", 1).exists());
+        assert!(storage::tvvf_base_path(&dir, "index", 2).exists());
+
+        drop(engine);
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
 }
 
 // Unix-only: it asserts that two shared holds coexist, which is the true `flock`

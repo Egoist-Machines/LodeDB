@@ -198,7 +198,18 @@ for an index, an unfiltered query scores an in-memory IVF cluster index, unions 
 allowlist; the exact scan re-scores the candidates. Scores are therefore exact but the result is
 approximate (a true neighbor in an unprobed cluster can be missed). It is off by default, the
 exact scan remains the authority, and probing every cluster reproduces the exact top-k. The
-cluster index is in-memory and rebuilt on open; only the opt-in config is persisted.
+cluster index is in-memory and rebuilt on open; only the opt-in config is persisted. Base builds
+lay each cluster's vector rows contiguously, so an ANN allowlist can skip more SIMD blocks without
+changing scores or candidate membership. `ann_nprobe` is persisted at creation but may be replaced
+for one open handle as a non-persistent session override.
+
+An optional `rescore="original"` sidecar captures the vector supplied at ingest before TurboVec
+quantizes it. `float16`, the default, costs about 2 bytes per dimension per vector; `float32` costs
+4 and `int8` costs 1. A query first runs the compact scan for `ceil(k * oversample)` candidates,
+then loads those sidecar rows and ranks them by exact fp32 dot product. That can repair close-result
+ordering above the practical 4-bit ranking ceiling, but it cannot restore a neighbor absent from an
+ANN candidate set. Capture is create-time only because an ordinary store does not retain originals;
+on reopen mode and dtype remain durable identity while oversample may be a session-only override.
 
 Vector-scan routing (what the launch sweep in `benchmarks/direct_gpu_sweep/` asserts):
 

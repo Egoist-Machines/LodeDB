@@ -5,13 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
+use lodedb_core::stable_uint64_ids_for_chunk_ids;
 use lodedb_core::types::{
-    CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreSearchResults,
-    CoreVectorDocument,
+    CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreRescoreOptions,
+    CoreSearchResults, CoreVectorDocument,
 };
+use lodedb_core::vector::ann::ClusterIndex;
 use lodedb_core::vector::index::CoreVectorChunk;
 use lodedb_core::vector::turbovec::TurboVecNativeIndex;
 use serde_json::{json, Value};
+use turbovec::IdMapIndex;
 
 const INDEX_KEY: &str = "6f78dec251fa5e544784ac1af95b0ae6530cad714a2d34f8c4615740ecbf8205";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -445,7 +448,12 @@ fn text_prepare_apply_keeps_embeddings_in_binding_layer() {
     assert!(!record["content_hash"].as_str().unwrap().is_empty());
     assert!(!record.as_object().unwrap().contains_key("text"));
     let listed = engine
-        .list_documents("text", Some(&json!({"metadata": {"topic": "ops"}})), None, None)
+        .list_documents(
+            "text",
+            Some(&json!({"metadata": {"topic": "ops"}})),
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["document_id"], "doc-a");
@@ -514,8 +522,16 @@ fn search_embedded_text_batch_matches_looped_single() {
             "text",
             &[
                 text_doc("doc-a", "fault code E1234", metadata(&[("topic", "ops")])),
-                text_doc("doc-b", "quarterly revenue report", metadata(&[("topic", "finance")])),
-                text_doc("doc-c", "revenue forecast E1234", metadata(&[("topic", "ops")])),
+                text_doc(
+                    "doc-b",
+                    "quarterly revenue report",
+                    metadata(&[("topic", "finance")]),
+                ),
+                text_doc(
+                    "doc-c",
+                    "revenue forecast E1234",
+                    metadata(&[("topic", "ops")]),
+                ),
             ],
             true,
             true,
@@ -681,7 +697,13 @@ fn wal_replay_preserves_multivector_patches() {
     drop(engine);
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     let hits = reopened
-        .query_multivector("default", &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, 1, None)
+        .query_multivector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            1,
+            1,
+            None,
+        )
         .unwrap();
     assert_eq!(hits.hits.len(), 1);
     assert_eq!(hits.hits[0].document_id, "mv");
@@ -706,6 +728,7 @@ fn persistent_engine_writes_python_compatible_vector_metadata() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine
@@ -945,6 +968,7 @@ fn native_wal_vector_records_replay_and_checkpoint() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1009,6 +1033,7 @@ fn native_wal_replay_advances_to_a_fresh_generation() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1094,6 +1119,7 @@ fn native_wal_text_apply_records_replay_and_checkpoint() {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
     engine.persist().unwrap();
@@ -1441,9 +1467,17 @@ fn text_reupsert_clears_a_prior_patch_matrix_on_reload() {
     {
         let mut engine = CoreEngine::open(options.clone()).unwrap();
         let plan = engine
-            .prepare_text_upsert("default", &[text_doc("a", "hello world", metadata(&[]))], true, true, 900)
+            .prepare_text_upsert(
+                "default",
+                &[text_doc("a", "hello world", metadata(&[]))],
+                true,
+                true,
+                900,
+            )
             .unwrap();
-        engine.apply_text_upsert(&plan, &[unit(0).to_vec()], 1.0).unwrap();
+        engine
+            .apply_text_upsert(&plan, &[unit(0).to_vec()], 1.0)
+            .unwrap();
         engine.persist().unwrap();
     }
     // 3. Reopen: the base matrix must not resurrect (query_multivector skips
@@ -1865,6 +1899,7 @@ fn concurrent_appenders_are_folded_by_the_next_writer() {
                 vector_dim: 8,
                 bit_width: 4,
                 ann: None,
+                rescore: None,
             })
             .unwrap();
         engine.persist().unwrap();
@@ -1924,6 +1959,7 @@ fn create_vector_only_index(engine: &mut CoreEngine) {
             vector_dim: 8,
             bit_width: 4,
             ann: None,
+            rescore: None,
         })
         .unwrap();
 }
@@ -1962,7 +1998,11 @@ fn appended_text_documents_fold_into_the_next_writer() {
         let appender = CoreAppender::open(appender_opts).expect("open appender");
         let plan = appender
             .prepare_documents(&[
-                text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+                text_doc(
+                    "a",
+                    "hello world from lodedb",
+                    metadata(&[("kind", "note")]),
+                ),
                 text_doc("b", "a second appended document", metadata(&[])),
             ])
             .expect("prepare documents");
@@ -2009,7 +2049,10 @@ fn appended_text_replacement_retires_old_chunks() {
     appender_opts.acquire_writer_lock = true;
     {
         let appender = CoreAppender::open(appender_opts).expect("open appender");
-        for (text, axis) in [("original alpha text", 0_usize), ("replacement beta words", 1_usize)] {
+        for (text, axis) in [
+            ("original alpha text", 0_usize),
+            ("replacement beta words", 1_usize),
+        ] {
             let plan = appender
                 .prepare_documents(&[text_doc("a", text, metadata(&[]))])
                 .expect("prepare");
@@ -2047,8 +2090,16 @@ fn appended_text_matches_writer_authored_ingest() {
     // (prepare_documents + append_embedded_documents, then a fold) yields the same
     // committed store as the exclusive writer's prepare_text_upsert/apply_text_upsert.
     let documents = [
-        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
-        text_doc("b", "a second appended document", metadata(&[("kind", "note")])),
+        text_doc(
+            "a",
+            "hello world from lodedb",
+            metadata(&[("kind", "note")]),
+        ),
+        text_doc(
+            "b",
+            "a second appended document",
+            metadata(&[("kind", "note")]),
+        ),
     ];
 
     // Writer path.
@@ -2709,8 +2760,14 @@ fn appender_rejects_non_native_wal() {
     // writer cannot replay. Appending native records behind it would strand them,
     // so the appender must refuse to open until a writer recovers the store.
     let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
-    lodedb_core::storage::wal::append_record(&wal, 1, "upsert_documents", json!({ "documents": [] }), false)
-        .expect("write non-native record");
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        1,
+        "upsert_documents",
+        json!({ "documents": [] }),
+        false,
+    )
+    .expect("write non-native record");
     assert!(CoreAppender::open(base).is_err());
     fs::remove_dir_all(path).unwrap();
 }
@@ -3488,6 +3545,19 @@ fn blob_docs() -> Vec<CoreVectorDocument> {
     docs
 }
 
+/// The same four separated blobs, but with rows interleaved across blobs. A
+/// durable cluster-layout reorder is therefore observable in the persisted tvim.
+fn interleaved_blob_docs() -> Vec<CoreVectorDocument> {
+    let by_blob = blob_docs();
+    let mut docs = Vec::with_capacity(by_blob.len());
+    for row in 0..5 {
+        for blob in 0..4 {
+            docs.push(by_blob[blob * 5 + row].clone());
+        }
+    }
+    docs
+}
+
 fn hit_keys(results: &CoreSearchResults) -> Vec<(String, u32)> {
     results
         .hits
@@ -3535,6 +3605,102 @@ fn ann_probe_all_matches_exact() {
             "probe-all must equal exact for axis {axis}"
         );
     }
+}
+
+#[test]
+fn session_overrides_take_precedence_without_changing_create_options() {
+    let docs = blob_docs();
+    let exact = exact_engine(&docs);
+    let mut ann = ann_engine(&docs, 4, 1);
+    let query = axis_query(0);
+    ann.set_session_overrides("default", Some(4), None).unwrap();
+    assert_eq!(
+        hit_keys(&exact.query_vector("default", &query, 5, None).unwrap()),
+        hit_keys(&ann.query_vector("default", &query, 5, None).unwrap()),
+        "a session probe-all override must reproduce exact scan"
+    );
+    assert_eq!(
+        ann.index_options("default")
+            .unwrap()
+            .ann
+            .and_then(|options| options.nprobe),
+        Some(1),
+        "session tuning must not change durable create options"
+    );
+    assert!(ann.set_session_overrides("default", Some(0), None).is_err());
+
+    let (documents, query) = rescore_boundary_docs();
+    let mut rescored = rescore_engine(&documents, 1.0);
+    rescored
+        .set_session_overrides("default", None, Some(32.0))
+        .unwrap();
+    let expected = exact_fp32_hits(&documents, &query, None, 3)
+        .into_iter()
+        .map(|(document_id, _)| document_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rescored
+            .query_vector("default", &query, 3, None)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| hit.document_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        rescored
+            .index_options("default")
+            .unwrap()
+            .rescore
+            .and_then(|options| options.oversample),
+        Some(1.0)
+    );
+    assert!(rescored
+        .set_session_overrides("default", None, Some(f32::NAN))
+        .is_err());
+}
+
+#[test]
+fn readonly_refresh_preserves_session_ann_override() {
+    let path = unique_temp_dir("core_refresh_session_ann");
+    let (documents, query) = rescore_boundary_docs();
+    let exact = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let mut writer = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let mut options = ann_options(4, 1);
+    options.index_key = INDEX_KEY.to_string();
+    options.client_id_hash = INDEX_KEY.to_string();
+    writer.create_index_with_options(options).unwrap();
+    writer.upsert_vectors("default", &documents).unwrap();
+    writer.persist().unwrap();
+
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    reader
+        .set_session_overrides("default", Some(4), None)
+        .unwrap();
+
+    // Commit a metadata-only update so refresh replaces the reader's loaded
+    // index while the durable nprobe remains one.
+    let mut updated = documents[0].clone();
+    updated
+        .metadata
+        .insert("refresh".to_string(), "new-generation".to_string());
+    writer.upsert_vectors("default", &[updated]).unwrap();
+    writer.persist().unwrap();
+
+    reader.refresh().unwrap();
+    let refreshed = reader.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(hit_keys(&refreshed), hit_keys(&exact));
+    assert!(
+        !reader.ann_cluster_resident("default").unwrap(),
+        "the retained probe-all override must take the exact path after refresh"
+    );
+
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -3825,13 +3991,132 @@ fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
     })
 }
 
-fn ann_durable(path: &Path) -> CoreEngine {
+fn ann_durable_with_nprobe(path: &Path, nprobe: usize) -> CoreEngine {
     let mut engine = CoreEngine::open(open_options(path, false, "wal")).unwrap();
-    let mut options = ann_options(4, 1);
+    let mut options = ann_options(4, nprobe);
     options.index_key = INDEX_KEY.to_string();
     options.client_id_hash = INDEX_KEY.to_string();
     engine.create_index_with_options(options).unwrap();
     engine
+}
+
+fn ann_durable(path: &Path) -> CoreEngine {
+    ann_durable_with_nprobe(path, 1)
+}
+
+#[test]
+fn durable_probe_all_ignores_session_pruning_when_persisting() {
+    let path = unique_temp_dir("core_ann_durable_probe_all");
+    let documents = interleaved_blob_docs();
+    let mut engine = ann_durable_with_nprobe(&path, 4);
+    engine.upsert_vectors("default", &documents).unwrap();
+    engine
+        .set_session_overrides("default", Some(1), None)
+        .unwrap();
+    let _ = engine
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(
+        engine.ann_cluster_resident("default").unwrap(),
+        "the smaller session nprobe should warm an in-memory cluster index"
+    );
+    engine.persist().unwrap();
+
+    assert!(
+        !has_file_with_ext(&path, "tvann"),
+        "a durable probe-all store must not persist a session-only ANN sidecar"
+    );
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        INDEX_KEY,
+        lodedb_core::storage::LoadOptions {
+            read_only: true,
+            read_wal: false,
+        },
+    )
+    .unwrap();
+    let persisted = IdMapIndex::load(loaded.tvim_path.as_ref().unwrap()).unwrap();
+    let mut durable_chunk_ids = documents
+        .iter()
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    // The document map canonically writes chunks in id order before any optional
+    // cluster-layout reorder runs.
+    durable_chunk_ids.sort();
+    let original_slots = stable_uint64_ids_for_chunk_ids(&durable_chunk_ids);
+    assert_eq!(
+        persisted.reconstruct_all().0,
+        original_slots,
+        "a session-only ANN setting must not reorder the durable base layout"
+    );
+
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn durable_pruning_persists_ann_after_a_session_probe_all_query() {
+    let path = unique_temp_dir("core_ann_durable_pruning");
+    let documents = interleaved_blob_docs();
+    let exact = exact_engine(&documents);
+    let mut engine = ann_durable(&path);
+    engine.upsert_vectors("default", &documents).unwrap();
+    // Warm the sidecar payload under the durable pruning setting, then switch the
+    // session to probe-all. The query must use the exact scan, but persistence
+    // must still honor the durable setting that created this store.
+    let _ = engine
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(engine.ann_cluster_resident("default").unwrap());
+    engine
+        .set_session_overrides("default", Some(4), None)
+        .unwrap();
+    assert_eq!(
+        hit_keys(
+            &engine
+                .query_vector("default", &axis_query(0), 5, None)
+                .unwrap()
+        ),
+        hit_keys(
+            &exact
+                .query_vector("default", &axis_query(0), 5, None)
+                .unwrap()
+        ),
+        "a session probe-all override must take the exact query path"
+    );
+    engine.persist().unwrap();
+
+    assert!(
+        has_file_with_ext(&path, "tvann"),
+        "a durable pruning store must persist its warmed ANN sidecar"
+    );
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        INDEX_KEY,
+        lodedb_core::storage::LoadOptions {
+            read_only: true,
+            read_wal: false,
+        },
+    )
+    .unwrap();
+    let posting_ids = loaded
+        .ann
+        .as_ref()
+        .expect("durable pruning must write ANN postings")
+        .postings
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let persisted = IdMapIndex::load(loaded.tvim_path.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        persisted.reconstruct_all().0,
+        stable_uint64_ids_for_chunk_ids(&posting_ids),
+        "a durable pruning store must retain its cluster-contiguous base layout"
+    );
+
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -3860,6 +4145,129 @@ fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
     assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn warm_ann_base_uses_cluster_contiguous_slots_and_reopens() {
+    let path = unique_temp_dir("core_ann_cluster_layout");
+    let before = {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let hits = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        assert!(engine.ann_cluster_resident("default").unwrap());
+        engine.persist().unwrap();
+
+        let loaded = lodedb_core::storage::load_store(
+            &path,
+            INDEX_KEY,
+            lodedb_core::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )
+        .unwrap();
+        let posting_ids: Vec<String> = loaded
+            .ann
+            .as_ref()
+            .expect("warm ANN base must persist the cluster assignment")
+            .postings
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let expected_slots = stable_uint64_ids_for_chunk_ids(&posting_ids);
+        let persisted = IdMapIndex::load(loaded.tvim_path.unwrap()).unwrap();
+        assert_eq!(persisted.reconstruct_all().0, expected_slots);
+        hits.hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.document_id.clone(),
+                    hit.chunk_id.clone(),
+                    hit.score.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(reopened.ann_cluster_resident("default").unwrap());
+    let after = reopened
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap()
+        .hits
+        .iter()
+        .map(|hit| {
+            (
+                hit.document_id.clone(),
+                hit.chunk_id.clone(),
+                hit.score.to_bits(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn cluster_reordered_base_replays_stable_id_delta() {
+    let path = unique_temp_dir("core_ann_cluster_delta");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
+        engine.persist().unwrap();
+        engine
+            .upsert_vectors("default", &[vector_doc("delta", axis_query(6))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    let hits = reopened
+        .query_vector(
+            "default",
+            &axis_query(6),
+            1,
+            Some(&json!({"document_ids": ["delta"]})),
+        )
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "delta");
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn ann_disabled_base_writes_are_byte_identical() {
+    let first = unique_temp_dir("core_exact_tvim_first");
+    let second = unique_temp_dir("core_exact_tvim_second");
+    for path in [&first, &second] {
+        let mut engine = CoreEngine::open(open_options(path, false, "wal")).unwrap();
+        create_vector_only_index(&mut engine);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        engine.persist().unwrap();
+    }
+    let read_tvim = |path: &Path| {
+        let loaded = lodedb_core::storage::load_store(
+            path,
+            INDEX_KEY,
+            lodedb_core::storage::LoadOptions {
+                read_only: true,
+                read_wal: false,
+            },
+        )
+        .unwrap();
+        fs::read(loaded.tvim_path.unwrap()).unwrap()
+    };
+    assert_eq!(read_tvim(&first), read_tvim(&second));
+    assert!(!has_file_with_ext(&first, "tvann"));
+    assert!(!has_file_with_ext(&second, "tvann"));
+    fs::remove_dir_all(first).unwrap();
+    fs::remove_dir_all(second).unwrap();
 }
 
 #[test]
@@ -4040,6 +4448,976 @@ fn exact_store_writes_no_tvann_sidecar() {
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     assert!(!reopened.ann_cluster_resident("default").unwrap());
     drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+// --- Opt-in original-precision tvvf capture (rescore query stage follows later) ---
+
+fn rescore_options(dtype: &str) -> CoreIndexCreateOptions {
+    rescore_options_with_oversample(dtype, None)
+}
+
+fn rescore_options_with_oversample(dtype: &str, oversample: Option<f32>) -> CoreIndexCreateOptions {
+    let mut options = CoreIndexCreateOptions::native_default("default", 8, 4);
+    options.rescore = Some(CoreRescoreOptions {
+        mode: CoreRescoreOptions::ORIGINAL.to_string(),
+        dtype: Some(dtype.to_string()),
+        oversample,
+    });
+    options
+}
+
+fn fp32_dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(left, right)| left * right).sum()
+}
+
+fn exact_fp32_hits(
+    documents: &[CoreVectorDocument],
+    query: &[f32],
+    allowed: Option<&BTreeMap<String, ()>>,
+    top_k: usize,
+) -> Vec<(String, f32)> {
+    let mut hits = documents
+        .iter()
+        .filter(|document| {
+            allowed.is_none_or(|allowed| allowed.contains_key(&document.document_id))
+        })
+        .map(|document| {
+            (
+                document.document_id.clone(),
+                fp32_dot(query, &document.vector),
+            )
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap()
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    hits.truncate(top_k);
+    hits
+}
+
+/// Rows with tightly spaced exact scores and varied components orthogonal to the
+/// query. Four-bit reconstruction reliably changes their order while fp32 dots
+/// retain the deliberately assigned score ladder.
+fn rescore_boundary_docs() -> (Vec<CoreVectorDocument>, Vec<f32>) {
+    let query = vec![0.43, -0.37, 0.29, -0.23, 0.19, -0.17, 0.13, -0.11];
+    let query_norm_sq = fp32_dot(&query, &query);
+    let documents = (0..16)
+        .map(|index| {
+            let mut vector = (0..8)
+                .map(|dimension| {
+                    let code = (index * 17 + dimension * 11 + 3) % 29;
+                    (code as f32 - 14.0) * 0.13
+                })
+                .collect::<Vec<_>>();
+            let projection = fp32_dot(&query, &vector) / query_norm_sq;
+            for (value, query_value) in vector.iter_mut().zip(&query) {
+                *value -= projection * query_value;
+            }
+            let score = 0.7 + index as f32 * 0.0001;
+            for (value, query_value) in vector.iter_mut().zip(&query) {
+                *value += score * query_value / query_norm_sq;
+            }
+            vector_doc(&format!("boundary-{index:02}"), vector)
+        })
+        .collect();
+    (documents, query)
+}
+
+fn rescore_engine(documents: &[CoreVectorDocument], oversample: f32) -> CoreEngine {
+    let mut engine = CoreEngine::new_in_memory();
+    engine
+        .create_index_with_options(rescore_options_with_oversample("float32", Some(oversample)))
+        .unwrap();
+    engine.upsert_vectors("default", documents).unwrap();
+    engine
+}
+
+fn rescore_vector(id: &str, offset: f32) -> CoreVectorDocument {
+    CoreVectorDocument {
+        document_id: id.to_string(),
+        vector: vec![
+            0.113 + offset,
+            -0.237 + offset * 0.5,
+            0.419 - offset * 0.25,
+            -0.571 + offset * 0.125,
+            0.683 - offset * 0.0625,
+            -0.797 + offset * 0.03125,
+            0.887 - offset * 0.015625,
+            -0.941 + offset * 0.0078125,
+        ],
+        metadata: BTreeMap::new(),
+        text: None,
+        patch_matrix: None,
+    }
+}
+
+fn tvvf_rows(path: &Path, ids: &[&str]) -> (serde_json::Value, Vec<Option<Vec<f32>>>) {
+    let loaded = lodedb_core::storage::load_store(
+        path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let manifest = loaded.tvvf_manifest.clone().expect("tvvf manifest");
+    let stable_ids = ids
+        .iter()
+        .map(|id| lodedb_core::stable_uint64_for_text(id))
+        .collect::<Vec<_>>();
+    let rows = loaded
+        .tvvf_reader
+        .as_ref()
+        .expect("installed tvvf reader")
+        .fetch_rows(&stable_ids);
+    (manifest, rows)
+}
+
+fn assert_rows_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual}, tolerance {tolerance}"
+        );
+    }
+}
+
+#[test]
+fn rescore_float16_preserves_originals_across_reopen() {
+    let path = unique_temp_dir("rescore_float16");
+    let original = rescore_vector("fine", 0.0);
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine.create_index_with_options(rescore_options("float16")).unwrap();
+        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine.persist().unwrap();
+    }
+    let (manifest, rows) = tvvf_rows(&path, &["fine"]);
+    assert_eq!(manifest["base"]["dtype"], "float16");
+    let preserved = rows[0].as_ref().expect("captured vector");
+    assert_rows_close(preserved, &original.vector, 0.001);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let stable_id = lodedb_core::stable_uint64_for_text("fine");
+    let reconstructed = IdMapIndex::load(loaded.tvim_path.as_ref().expect("tvim base"))
+        .unwrap()
+        .reconstruct_rows(&[stable_id])
+        .unwrap();
+    assert!(
+        preserved
+            .iter()
+            .zip(reconstructed)
+            .any(|(original, reconstructed)| (original - reconstructed).abs() > 0.01),
+        "tvvf must hold caller precision rather than the 4-bit reconstruction"
+    );
+    drop(loaded);
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_float32_and_int8_round_trip() {
+    for (dtype, tolerance) in [("float32", 0.0), ("int8", 0.009)] {
+        let path = unique_temp_dir(&format!("rescore_{dtype}"));
+        let original = rescore_vector("fine", 0.02);
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine.create_index_with_options(rescore_options(dtype)).unwrap();
+        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+        let (manifest, rows) = tvvf_rows(&path, &["fine"]);
+        assert_eq!(manifest["base"]["dtype"], dtype);
+        let captured = rows[0].as_ref().expect("captured vector");
+        assert_rows_close(captured, &original.vector, tolerance);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn rescore_lifts_four_bit_recall_for_full_and_filtered_queries() {
+    let (documents, query) = rescore_boundary_docs();
+    let expected = exact_fp32_hits(&documents, &query, None, 3);
+    let plain = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let plain_ids = plain
+        .hits
+        .iter()
+        .map(|hit| hit.document_id.clone())
+        .collect::<Vec<_>>();
+    let expected_ids = expected
+        .iter()
+        .map(|(document_id, _)| document_id.clone())
+        .collect::<Vec<_>>();
+    assert_ne!(
+        plain_ids, expected_ids,
+        "the boundary fixture must prove four-bit stage-one misordering"
+    );
+
+    let engine = rescore_engine(&documents, 32.0);
+    let rescored = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        rescored
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    for (hit, (_, score)) in rescored.hits.iter().zip(&expected) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+
+    let allowed = ["boundary-03", "boundary-07", "boundary-11", "boundary-15"]
+        .into_iter()
+        .map(|document_id| (document_id.to_string(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let expected_filtered = exact_fp32_hits(&documents, &query, Some(&allowed), 3);
+    let filter = json!({"document_ids": allowed.keys().collect::<Vec<_>>()});
+    let filtered = engine
+        .query_vector("default", &query, 3, Some(&filter))
+        .unwrap();
+    assert_eq!(
+        filtered
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected_filtered
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect::<Vec<_>>()
+    );
+    for (hit, (_, score)) in filtered.hits.iter().zip(&expected_filtered) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+}
+
+#[test]
+fn rescore_uses_pending_captures_before_persist() {
+    let (documents, query) = rescore_boundary_docs();
+    let engine = rescore_engine(&documents, 32.0);
+    let expected = exact_fp32_hits(&documents, &query, None, 3);
+    let hits = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(document_id, score)| (document_id.clone(), score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rescore_ann_candidates_are_rescored_before_truncation() {
+    let path = unique_temp_dir("rescore_ann");
+    let documents = blob_docs();
+    let query = axis_query(0);
+    // This matching no-rescore index gives us the exact stage-one R hits. Four
+    // balanced blobs and one probe mean the five-row nearest cluster is a true
+    // prune, so these are the candidates available to the rescore stage.
+    let plain_ann = ann_engine(&documents, 4, 1);
+    let stage_one = plain_ann.query_vector("default", &query, 3, None).unwrap();
+    assert!(plain_ann.ann_cluster_resident("default").unwrap());
+    let allowed = stage_one
+        .hits
+        .iter()
+        .map(|hit| (hit.document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = exact_fp32_hits(&documents, &query, Some(&allowed), 3);
+
+    let mut options = rescore_options_with_oversample("float32", Some(1.0));
+    options.ann = Some(CoreAnnOptions {
+        algorithm: CoreAnnOptions::CLUSTER.to_string(),
+        clusters: Some(4),
+        nprobe: Some(1),
+    });
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(options).unwrap();
+    engine.upsert_vectors("default", &documents).unwrap();
+    assert!(!engine.ann_cluster_resident("default").unwrap());
+    let _ = engine.query_vector("default", &query, 3, None).unwrap();
+    assert!(
+        engine.ann_cluster_resident("default").unwrap(),
+        "the true-prune configuration must build the ANN candidate index"
+    );
+    engine.persist().unwrap();
+
+    let chunks = documents
+        .iter()
+        .map(|document| {
+            CoreVectorChunk::new(
+                document.document_id.clone(),
+                document.document_id.clone(),
+                document.vector.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    let native = TurboVecNativeIndex::load(
+        loaded.tvim_path.as_ref().unwrap(),
+        &chunks,
+        loaded.generation,
+    )
+    .unwrap();
+    let (chunk_ids, stable_ids, rows) = native.reconstruct_all_chunks();
+    let mut entries = chunk_ids
+        .iter()
+        .zip(&stable_ids)
+        .enumerate()
+        .map(|(position, (chunk_id, stable_id))| (chunk_id.as_str(), *stable_id, position))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    let cluster_entries = entries
+        .iter()
+        .map(|(chunk_id, stable_id, position)| {
+            (
+                *chunk_id,
+                *stable_id,
+                &rows[position * 8..(position + 1) * 8],
+            )
+        })
+        .collect::<Vec<_>>();
+    let assignment = loaded.ann.as_ref().unwrap();
+    let cluster = ClusterIndex::from_assignment(
+        &cluster_entries,
+        assignment.dim,
+        assignment.postings.clone(),
+        native.rotation_matrix(),
+    )
+    .unwrap();
+    assert!(
+        cluster.candidate_stable_ids(&query, 1, 3).len() * 2 < documents.len(),
+        "the persisted one-probe candidate set proves this query takes ANN, not exact fallback"
+    );
+    drop(loaded);
+
+    let hits = engine.query_vector("default", &query, 3, None).unwrap();
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect::<Vec<_>>()
+    );
+    for (hit, (_, score)) in hits.hits.iter().zip(&expected) {
+        assert_eq!(hit.score.to_bits(), score.to_bits());
+    }
+    drop(engine);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_missing_row_falls_back_to_the_quantized_score() {
+    let path = unique_temp_dir("rescore_missing_row");
+    let (documents, query) = rescore_boundary_docs();
+    let expected = exact_fp32_hits(&documents, &query, None, documents.len());
+    let plain = exact_engine(&documents)
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        engine
+            .create_index_with_options(rescore_options_with_oversample("float32", Some(32.0)))
+            .unwrap();
+        engine.upsert_vectors("default", &documents).unwrap();
+        engine.persist().unwrap();
+    }
+    let corrupted_id = documents
+        .iter()
+        .max_by_key(|document| lodedb_core::stable_uint64_for_text(&document.document_id))
+        .unwrap()
+        .document_id
+        .clone();
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    let mut bytes = fs::read(&sidecar).unwrap();
+    // The final 72 bytes are the segment's constant-size identity trailer;
+    // corrupt the last row payload so open succeeds and the row-level CRC owns
+    // the intended fail-open fallback.
+    let last_payload_byte = bytes.len() - 72 - 1;
+    bytes[last_payload_byte] ^= 0xff;
+    fs::write(&sidecar, bytes).unwrap();
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let hits = reopened
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    let plain_scores = plain
+        .hits
+        .iter()
+        .map(|hit| (hit.document_id.as_str(), hit.score))
+        .collect::<BTreeMap<_, _>>();
+    let expected_scores = expected
+        .iter()
+        .map(|(document_id, score)| (document_id.as_str(), *score))
+        .collect::<BTreeMap<_, _>>();
+    for hit in &hits.hits {
+        if hit.document_id == corrupted_id {
+            assert_eq!(
+                hit.score.to_bits(),
+                plain_scores[hit.document_id.as_str()].to_bits(),
+                "a checksum-failed row must retain the stage-one score"
+            );
+        } else {
+            assert_eq!(
+                hit.score.to_bits(),
+                expected_scores[hit.document_id.as_str()].to_bits()
+            );
+        }
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_batch_and_arrays_match_single_queries() {
+    let (documents, first) = rescore_boundary_docs();
+    let second = vec![-0.31, 0.29, -0.23, 0.17, -0.13, 0.11, -0.07, 0.05];
+    let engine = rescore_engine(&documents, 32.0);
+    let queries = vec![first, second];
+    let batch = engine
+        .query_vectors_batch("default", &queries, 3, None)
+        .unwrap();
+    let flat = queries.iter().flatten().copied().collect::<Vec<_>>();
+    let arrays = engine
+        .query_vectors_batch_arrays("default", &flat, 8, 3, None)
+        .unwrap();
+    assert_eq!(arrays.k, 3);
+    for (query_index, query) in queries.iter().enumerate() {
+        let single = engine.query_vector("default", query, 3, None).unwrap();
+        assert_eq!(batch[query_index], single);
+        for (offset, hit) in single.hits.iter().enumerate() {
+            let position = query_index * arrays.k + offset;
+            assert_eq!(arrays.document_ids[position], hit.document_id);
+            assert_eq!(arrays.scores[position].to_bits(), hit.score.to_bits());
+            assert_eq!(arrays.metadata[position], hit.metadata);
+        }
+    }
+}
+
+#[test]
+fn rescore_off_queries_keep_plain_scores_and_huge_oversample_clamps() {
+    let (documents, query) = rescore_boundary_docs();
+    let first = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    let second = exact_engine(&documents)
+        .query_vector("default", &query, 3, None)
+        .unwrap();
+    assert_eq!(first, second, "a store without rescore keeps the plain scan path");
+
+    let tiny = &documents[..2];
+    let rescored = rescore_engine(tiny, 1_000_000.0)
+        .query_vector("default", &query, 99, None)
+        .unwrap();
+    assert_eq!(rescored.hits.len(), tiny.len());
+}
+
+#[test]
+fn rescore_float16_overflow_keeps_finite_quantized_scores() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine
+        .create_index_with_options(rescore_options("float16"))
+        .unwrap();
+    // Coordinates beyond the float16 range (65504) encode to infinity in the
+    // sidecar capture; the rescore must fall back to the finite quantized score.
+    let documents = vec![
+        CoreVectorDocument {
+            document_id: "overflow".to_string(),
+            vector: vec![
+                70_000.0, -80_000.0, 70_000.0, -70_000.0, 1.0, -1.0, 1.0, -1.0,
+            ],
+            metadata: BTreeMap::new(),
+            text: None,
+            patch_matrix: None,
+        },
+        rescore_vector("plain", 0.0),
+    ];
+    engine.upsert_vectors("default", &documents).unwrap();
+    let results = engine
+        .query_vector(
+            "default",
+            &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(results.hits.len(), 2);
+    for hit in &results.hits {
+        assert!(
+            hit.score.is_finite(),
+            "score for {} is not finite",
+            hit.document_id
+        );
+    }
+}
+
+#[test]
+fn failed_lazy_sidecar_open_latches_and_drops_the_stale_manifest() {
+    let path = unique_temp_dir("rescore_lazy_latch");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+
+    // The commit path leaves the reader unopened; break the sidecar before the
+    // first query forces the lazy open.
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    assert!(sidecar.exists());
+    fs::remove_file(&sidecar).unwrap();
+    let first = engine
+        .query_vector("default", &rescore_vector("row", 0.0).vector, 1, None)
+        .unwrap();
+    assert_eq!(first.hits.len(), 1);
+
+    // The latched failure must stop the stale manifest at the next vector commit.
+    engine
+        .upsert_vectors("default", &[rescore_vector("later", 0.1)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_manifest.is_none(), "stale tvvf manifest must not be carried");
+    drop(loaded);
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let results = reopened
+        .query_vector("default", &rescore_vector("row", 0.0).vector, 2, None)
+        .unwrap();
+    assert_eq!(results.hits.len(), 2);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_delta_replays_latest_rows_and_tombstones() {
+    let path = unique_temp_dir("rescore_delta");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..12)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+    let replacement = rescore_vector("doc-0", 0.08);
+    engine
+        .upsert_vectors("default", std::slice::from_ref(&replacement))
+        .unwrap();
+    engine
+        .delete_documents("default", &["doc-1".to_string()])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let (manifest, rows) = tvvf_rows(&path, &["doc-0", "doc-1", "doc-2"]);
+    assert_eq!(manifest["deltas"].as_array().unwrap().len(), 1);
+    assert_rows_close(rows[0].as_ref().unwrap(), &replacement.vector, 0.0);
+    assert!(rows[1].is_none(), "deleted stable id must be tombstoned");
+    assert_rows_close(rows[2].as_ref().unwrap(), &initial[2].vector, 0.0);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_fold_limits_tiny_delta_segments() {
+    let path = unique_temp_dir("rescore_segment_limit");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..512)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+
+    // Each update changes one captured row. The base is deliberately large
+    // enough that the 25% row-ratio threshold cannot fire before the fixed
+    // segment bound; the 65th delta must fold the sidecar.
+    for cycle in 1..=65 {
+        engine
+            .upsert_vectors("default", &[rescore_vector("doc-0", cycle as f32 * 0.01)])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    drop(engine);
+
+    let (manifest, _) = tvvf_rows(&path, &["doc-0"]);
+    assert_eq!(manifest["vf_epoch"], 2);
+    assert!(manifest["deltas"].as_array().unwrap().is_empty());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_fold_keeps_live_and_previous_vf_epochs() {
+    let path = unique_temp_dir("rescore_fold");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let initial = (0..8)
+        .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &initial).unwrap();
+    engine.persist().unwrap();
+    for cycle in 1..=2 {
+        let first = rescore_vector("doc-0", cycle as f32 * 0.1);
+        let second = rescore_vector("doc-1", cycle as f32 * 0.1 + 0.01);
+        engine.upsert_vectors("default", &[first, second]).unwrap();
+        engine.persist().unwrap();
+    }
+    drop(engine);
+    let (manifest, rows) = tvvf_rows(&path, &["doc-0", "doc-1"]);
+    assert_eq!(manifest["vf_epoch"], 3);
+    assert_rows_close(
+        rows[0].as_ref().unwrap(),
+        &rescore_vector("doc-0", 0.2).vector,
+        0.0,
+    );
+    assert!(
+        !lodedb_core::storage::tvvf_base_path(&path, "default", 1).exists(),
+        "older folded tvvf epoch should be collected"
+    );
+    assert!(lodedb_core::storage::tvvf_base_path(&path, "default", 2).exists());
+    assert!(lodedb_core::storage::tvvf_base_path(&path, "default", 3).exists());
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn readonly_rescore_snapshot_survives_tvvf_epoch_gc_until_refresh() {
+    let path = unique_temp_dir("rescore_snapshot_gc");
+    let (mut documents, query) = rescore_boundary_docs();
+    let snapshot_documents = documents.clone();
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .create_index_with_options(rescore_options_with_oversample("float32", Some(16.0)))
+        .unwrap();
+    writer.upsert_vectors("default", &documents).unwrap();
+    writer.persist().unwrap();
+
+    // Opening the read-only handle indexes epoch one and retains every segment
+    // handle. Do not refresh it while the writer advances two folded epochs.
+    let mut reader =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    for cycle in 1..=2 {
+        let updates = (0..4)
+            .map(|index| {
+                let id = documents[index].document_id.clone();
+                let updated = rescore_vector(&id, cycle as f32 * 0.1 + index as f32 * 0.01);
+                documents[index].vector = updated.vector;
+                documents[index].clone()
+            })
+            .collect::<Vec<_>>();
+        writer.upsert_vectors("default", &updates).unwrap();
+        writer.persist().unwrap();
+    }
+
+    #[cfg(unix)]
+    assert!(
+        !lodedb_core::storage::tvvf_base_path(&path, "default", 1).exists(),
+        "the second published fold must unlink the reader's old epoch on Unix"
+    );
+
+    let snapshot = reader
+        .query_vector("default", &query, snapshot_documents.len(), None)
+        .unwrap();
+    let expected_snapshot = exact_fp32_hits(
+        &snapshot_documents,
+        &query,
+        None,
+        snapshot_documents.len(),
+    );
+    assert_eq!(
+        snapshot
+            .hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected_snapshot
+            .iter()
+            .map(|(id, score)| (id.clone(), score.to_bits()))
+            .collect::<Vec<_>>(),
+        "an unrefreshed reader must keep exact scores from its old sidecar epoch"
+    );
+
+    reader.refresh().unwrap();
+    let refreshed = reader
+        .query_vector("default", &query, documents.len(), None)
+        .unwrap();
+    let expected_refreshed = exact_fp32_hits(&documents, &query, None, documents.len());
+    assert_eq!(
+        refreshed
+            .hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected_refreshed
+            .iter()
+            .map(|(id, score)| (id.clone(), score.to_bits()))
+            .collect::<Vec<_>>(),
+        "refresh must switch the reader to the newly published sidecar epoch"
+    );
+
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_wal_replay_captures_caller_originals() {
+    let path = unique_temp_dir("rescore_wal");
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        engine.create_index_with_options(rescore_options("float32")).unwrap();
+        engine.persist().unwrap();
+    }
+    let original = rescore_vector("wal-row", 0.03);
+    let appender = CoreAppender::open(open_options(&path, false, "wal")).unwrap();
+    appender
+        .append_vectors(std::slice::from_ref(&original))
+        .unwrap();
+    drop(appender);
+    let mut writer = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+    let (_, rows) = tvvf_rows(&path, &["wal-row"]);
+    assert_rows_close(rows[0].as_ref().unwrap(), &original.vector, 0.0);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_metadata_only_delta_carries_manifest_forward() {
+    let path = unique_temp_dir("rescore_metadata");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    let mut original = rescore_vector("row", 0.0);
+    engine
+        .upsert_vectors("default", std::slice::from_ref(&original))
+        .unwrap();
+    engine.persist().unwrap();
+    let (before, _) = tvvf_rows(&path, &["row"]);
+    original.metadata.insert("tag".to_string(), "updated".to_string());
+    engine.upsert_vectors("default", &[original]).unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let (after, _) = tvvf_rows(&path, &["row"]);
+    assert_eq!(after, before, "metadata-only commit must carry tvvf forward");
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescore_off_manifests_and_state_headers_remain_byte_identical() {
+    let write = |path: &Path| {
+        let mut engine = CoreEngine::open(open_options(path, false, "generation")).unwrap();
+        engine.create_index("default", 8, 4).unwrap();
+        engine.upsert_vectors("default", &[rescore_vector("row", 0.0)]).unwrap();
+        engine.persist().unwrap();
+        drop(engine);
+        (
+            fs::read(path.join("default.commit.json")).unwrap(),
+            fs::read(path.join("default.gen/g1.json")).unwrap(),
+        )
+    };
+    let first = unique_temp_dir("rescore_off_one");
+    let second = unique_temp_dir("rescore_off_two");
+    let first_bytes = write(&first);
+    let second_bytes = write(&second);
+    assert_eq!(first_bytes, second_bytes);
+    for bytes in [&first_bytes.0, &first_bytes.1] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("tvvf"));
+        assert!(!text.contains("rescore"));
+    }
+    fs::remove_dir_all(first).unwrap();
+    fs::remove_dir_all(second).unwrap();
+}
+
+#[test]
+fn tvvf_orphan_delta_and_corruption_fail_open_without_deletion() {
+    let path = unique_temp_dir("rescore_fail_open");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let base = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    let delta_dir = base.with_file_name(format!(
+        "{}{}",
+        base.file_name().unwrap().to_string_lossy(),
+        lodedb_core::storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
+    ));
+    fs::write(delta_dir.join("orphan.tvfd"), b"unsealed").unwrap();
+    let (_, rows) = tvvf_rows(&path, &["row"]);
+    assert!(rows[0].is_some(), "unreferenced delta must be ignored");
+
+    // Simulate the more realistic torn window: a sidecar delta and its local
+    // manifest were written, but the generation root was never sealed. A later
+    // append must reset to the root's manifest rather than promote this orphan.
+    let orphan = rescore_vector("orphan", 0.04);
+    let orphan_id = lodedb_core::stable_uint64_for_text("orphan");
+    lodedb_core::storage::append_delta(
+        &path,
+        "default",
+        1,
+        &[(orphan_id, orphan.vector.as_slice())],
+        &[],
+    )
+    .unwrap();
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .upsert_vectors("default", &[rescore_vector("row", 0.06)])
+        .unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+    let (manifest, rows) = tvvf_rows(&path, &["row", "orphan"]);
+    assert!(rows[0].is_some());
+    assert!(rows[1].is_none(), "unsealed local delta must stay orphaned");
+
+    let current_base = lodedb_core::storage::tvvf_base_path(
+        &path,
+        "default",
+        manifest["vf_epoch"].as_u64().unwrap(),
+    );
+    fs::write(&current_base, b"bad magic").unwrap();
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_reader.is_none(), "corrupt sidecar disables only rescore");
+    assert!(current_base.exists(), "fail-open must leave corrupt tvvf on disk");
+    drop(loaded);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn corrupt_tvvf_is_dropped_before_a_vector_delta_advances_tvim() {
+    let path = unique_temp_dir("rescore_stale_manifest_drop");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    fs::write(&sidecar, b"bad magic").unwrap();
+
+    let mut writer = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    writer
+        .upsert_vectors("default", &[rescore_vector("row", 0.1)])
+        .unwrap();
+    writer.persist().unwrap();
+    drop(writer);
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_manifest.is_none(), "new root must omit stale tvvf");
+    assert!(loaded.tvvf_reader.is_none());
+    assert!(sidecar.exists(), "fail-open leaves old sidecar files untouched");
+    drop(loaded);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn swapped_tvvf_manifest_identity_fails_open_without_touching_files() {
+    let path = unique_temp_dir("rescore_manifest_identity");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+
+    let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    // Give the swapped key a structurally compatible sidecar. Without the
+    // load-time identity check, the reader would install this foreign index.
+    let foreign = rescore_vector("foreign", 0.2);
+    let foreign_id = lodedb_core::stable_uint64_for_text("foreign");
+    lodedb_core::storage::record_tvvf_base(
+        &path,
+        "another-index",
+        1,
+        "float32",
+        8,
+        &[(foreign_id, foreign.vector.as_slice())],
+    )
+    .unwrap();
+    let root = lodedb_core::storage::commit_manifest::commit_manifest_path(&path, "default");
+    let mut body = lodedb_core::storage::commit_manifest::read_commit_manifest(&root)
+        .unwrap()
+        .unwrap()
+        .body;
+    body["tvvf"]["index_key"] = Value::String("another-index".to_string());
+    lodedb_core::storage::commit_manifest::write_commit_manifest(&root, &body, false).unwrap();
+
+    let loaded = lodedb_core::storage::load_store(
+        &path,
+        "default",
+        lodedb_core::storage::LoadOptions::default(),
+    )
+    .unwrap();
+    assert!(loaded.tvvf_reader.is_none());
+    assert!(sidecar.exists(), "identity failure must not delete sidecar files");
+    drop(loaded);
+
+    let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    assert_eq!(reopened.stats("default").unwrap().document_count, 1);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn tvim_gc_does_not_remove_tvvf_epochs() {
+    let path = unique_temp_dir("rescore_gc_boundary");
+    let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+        .unwrap();
+    engine.persist().unwrap();
+    drop(engine);
+    let tvvf = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
+    lodedb_core::storage::gc_after_base_rewrite(&path, "default", 2, 1).unwrap();
+    assert!(tvvf.exists(), "generation GC must not own tvvf files");
     fs::remove_dir_all(path).unwrap();
 }
 

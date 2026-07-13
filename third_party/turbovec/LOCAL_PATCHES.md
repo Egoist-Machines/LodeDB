@@ -48,6 +48,19 @@ Encoded rows are only portable between indexes with equal
 `add_encoded` (the delta store records the fingerprint per segment and
 fails closed on mismatch).
 
+## Cluster-contiguous physical layout
+
+Added for LodeDB's cluster-pruned SIMD scan path:
+
+- `turbovec/src/lib.rs`: `TurboQuantIndex::permute_rows` (`pub(crate)`), an
+  in-place cycle-following row permutation with one row-sized scratch buffer;
+  `perm[new_slot] = old_slot` and every permutation invalidates the derived
+  blocked SIMD cache.
+- `turbovec/src/error.rs`: `TurboVecError` for validated ID-order requests.
+- `turbovec/src/id_map.rs`: `IdMapIndex::reorder_to_ids`, which validates an
+  exact stable-id permutation before reordering quantized rows and rebuilding
+  the slot/id maps.
+
 ## Row reconstruction surface (GPU-resident exact serving)
 
 Added for LodeDB's GPU-resident exact batch path:
@@ -93,6 +106,15 @@ Added for LodeDB's late-interaction retrieval (multi-vector / MaxSim, issue #25)
 
 This is purely additive (a new module + one exported function + one binding); it
 does not touch the quantized index, its storage format, or any existing API.
+
+## Mask block-skip benchmark counter
+
+- `turbovec/src/search.rs` already exposes the process-global
+  `blocks_skipped_by_mask` counter and reset helper used by the filtering tests.
+- `turbovec-python/src/lib.rs` registers both as module-level
+  `blocks_skipped_by_mask()` and `reset_blocks_skipped_by_mask()` functions for
+  benchmark harnesses. No Rust visibility change was needed because the search
+  helpers are already public.
 
 ## Native-core packaging bridge
 

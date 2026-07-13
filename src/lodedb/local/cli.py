@@ -70,11 +70,18 @@ _COMMIT_MODE_OPTION = typer.Option(
     "single-writer durable writes) | generation (publish a crash-atomic MVCC "
     "generation per commit). Unset reads LODEDB_COMMIT_MODE.",
 )
+_DOCTOR_STORE_PATH_OPTION = typer.Option(
+    None,
+    "--path",
+    "-p",
+    help="Optional native store directory to inspect for committed TVVF sidecars.",
+)
 
 
 @app.command()
 def doctor(
     device: str = typer.Option("auto", "--device", "-d", help="Device to report resolution for."),
+    path: Path | None = _DOCTOR_STORE_PATH_OPTION,
     json_out: bool = typer.Option(False, "--json", help="Emit the raw capability JSON."),
     fix: bool = typer.Option(
         False,
@@ -90,7 +97,7 @@ def doctor(
     it is the one thing the report cannot resolve on its own.
     """
 
-    report = local_capability_report(device=device)
+    report = local_capability_report(device=device, path=path)
     if json_out:
         typer.echo(json.dumps(report, indent=2, sort_keys=True))
     else:

@@ -654,6 +654,31 @@ impl PyCoreEngine {
             .map_err(native_core_error_to_py)
     }
 
+    /// Returns the index's durable create options. Session-only query overrides
+    /// are excluded so bindings can validate reopen arguments against persisted
+    /// identity without reading storage files themselves.
+    fn index_options(&self, index_id: &str) -> PyResult<String> {
+        native_to_json(
+            &self
+                .inner
+                .index_options(index_id)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
+    /// Applies query-time tuning for this engine lifetime only. Neither override
+    /// is persisted into a state header or commit manifest.
+    fn set_session_overrides(
+        &mut self,
+        index_id: &str,
+        ann_nprobe: Option<usize>,
+        rescore_oversample: Option<f32>,
+    ) -> PyResult<()> {
+        self.inner
+            .set_session_overrides(index_id, ann_nprobe, rescore_oversample)
+            .map_err(native_core_error_to_py)
+    }
+
     fn upsert_vectors(&mut self, index_id: &str, documents_json: &str) -> PyResult<String> {
         let documents = native_from_json::<Vec<CoreVectorDocument>>(documents_json)?;
         native_to_json(
@@ -1214,8 +1239,45 @@ impl PyCoreEngine {
         )
     }
 
-    fn persist(&mut self) -> PyResult<()> {
-        self.inner.persist().map_err(native_core_error_to_py)
+    fn persist(&mut self, py: Python<'_>) -> PyResult<()> {
+        // A large store's persist is minutes of pure native work (state
+        // canonicalization, base serialization); holding the GIL that long
+        // starves every other Python thread in the host process (heartbeat
+        // threads, signal delivery), so release it like the batch scan does.
+        let engine_addr = &mut self.inner as *mut RustCoreEngine as usize;
+        py.detach(move || {
+            // SAFETY: `self` outlives this synchronous `detach` call, the closure
+            // runs on the current (engine-owning) thread, and this `&mut self`
+            // method holds the engine exclusively; no Python state is touched
+            // while the GIL is released.
+            let inner: &mut RustCoreEngine = unsafe { &mut *(engine_addr as *mut RustCoreEngine) };
+            inner.persist()
+        })
+        .map_err(native_core_error_to_py)
+    }
+
+    /// Builds this index's ANN cluster cache without issuing a query. Returns
+    /// whether an ANN cluster index is resident after warming.
+    fn ann_warm(&self, py: Python<'_>, index_id: &str) -> PyResult<bool> {
+        // The k-means build runs for minutes at large corpus sizes; release the
+        // GIL for the same reason as `persist`.
+        let engine_addr = &self.inner as *const RustCoreEngine as usize;
+        let index_id = index_id.to_owned();
+        py.detach(move || {
+            // SAFETY: as in `persist`; the shared reference never crosses threads.
+            let inner: &RustCoreEngine = unsafe { &*(engine_addr as *const RustCoreEngine) };
+            inner.ann_warm(&index_id)
+        })
+        .map_err(native_core_error_to_py)
+    }
+
+    /// Schedules a full base rewrite for the next `persist`; does not persist by
+    /// itself. The public Python `LodeDB.compact()` operator combines warming,
+    /// scheduling, and persistence in one call.
+    fn compact(&mut self, index_id: &str) -> PyResult<()> {
+        self.inner
+            .compact(index_id)
+            .map_err(native_core_error_to_py)
     }
 
     fn refresh(&mut self) -> PyResult<()> {
@@ -1293,6 +1355,24 @@ fn native_build_profile() -> &'static str {
     } else {
         "release"
     }
+}
+
+#[pyfunction]
+/// Returns the process-global count of SIMD blocks skipped by the mask path.
+///
+/// This counter is intended for benchmarking. Sample it before and after a
+/// workload because searches from every thread in this process contribute.
+fn blocks_skipped_by_mask() -> u64 {
+    turbovec_core::search::blocks_skipped_by_mask()
+}
+
+#[pyfunction]
+/// Resets the process-global SIMD mask block-skip counter used for benchmarking.
+///
+/// This affects every thread in the current process, so do not use it as a
+/// per-request production metric.
+fn reset_blocks_skipped_by_mask() {
+    turbovec_core::search::reset_blocks_skipped_by_mask();
 }
 
 #[pyfunction]
@@ -1622,6 +1702,8 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCoreEngine>()?;
     m.add_class::<PyCoreAppender>()?;
     m.add_class::<PyCoreCheckpointer>()?;
+    m.add_function(wrap_pyfunction!(blocks_skipped_by_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_blocks_skipped_by_mask, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(native_build_profile, m)?)?;
     m.add_function(wrap_pyfunction!(native_core_abi_version, m)?)?;

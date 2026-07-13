@@ -25,6 +25,7 @@ from lodedb.local.db import (
     LodeDB,
     LodeSearchHit,
     ReadOnlyError,
+    RescoreOptions,
 )
 from lodedb.local.doctor import local_capability_report
 from lodedb.local.late_interaction import (
@@ -48,6 +49,7 @@ __all__ = [
     "LocalEmbeddingResolution",
     "LocalModelPreset",
     "ReadOnlyError",
+    "RescoreOptions",
     "build_local_embedding_backend",
     "local_capability_report",
     "resolve_local_device",

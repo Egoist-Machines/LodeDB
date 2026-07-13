@@ -403,6 +403,26 @@ class NativeCoreEngineHandle:
     def create_index_with_options(self, options: Mapping[str, Any]) -> None:
         self._engine.create_index_with_options(_dumps(dict(options)))
 
+    def index_options(self, index_id: str) -> dict[str, Any]:
+        """Returns durable native create options, excluding session overrides."""
+
+        return self._loads(self._engine.index_options(str(index_id)))
+
+    def set_session_overrides(
+        self,
+        index_id: str,
+        *,
+        ann_nprobe: int | None = None,
+        rescore_oversample: float | None = None,
+    ) -> None:
+        """Applies non-persistent query tuning to this engine handle only."""
+
+        self._engine.set_session_overrides(
+            str(index_id),
+            None if ann_nprobe is None else int(ann_nprobe),
+            None if rescore_oversample is None else float(rescore_oversample),
+        )
+
     def upsert_vectors(
         self,
         index_id: str,
@@ -917,6 +937,16 @@ class NativeCoreEngineHandle:
 
     def persist(self) -> None:
         self._engine.persist()
+
+    def ann_warm(self, index_id: str) -> bool:
+        """Builds an index's ANN cluster cache without issuing a query."""
+
+        return bool(self._engine.ann_warm(str(index_id)))
+
+    def compact(self, index_id: str) -> None:
+        """Schedules a full base rewrite for the next native persist."""
+
+        self._engine.compact(str(index_id))
 
     def refresh(self) -> None:
         self._engine.refresh()
