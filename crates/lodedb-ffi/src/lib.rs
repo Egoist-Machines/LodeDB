@@ -1641,7 +1641,11 @@ mod tests {
 
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
         }
 
         let query = [1.0_f32, 0.0_f32];
@@ -1677,7 +1681,11 @@ mod tests {
         let index_id = string_view("default");
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
         }
         let vector = [1.0_f32, 0.0_f32];
         let document = LodeVectorDocument {
@@ -1769,6 +1777,32 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
+    /// Formats and frees a failed call's `LodeError` so assertions report the
+    /// native error (code and message) instead of a bare status number.
+    unsafe fn take_error_text(error: &mut *mut LodeError) -> String {
+        if error.is_null() || (*error).is_null() {
+            return "status nonzero but no LodeError was set".to_string();
+        }
+        let raw = *error;
+        let message = if (*raw).message.is_null() {
+            "<null message>".to_string()
+        } else {
+            std::ffi::CStr::from_ptr((*raw).message)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let text = format!("code {}: {message}", (*raw).code);
+        lodedb_error_free(raw);
+        *error = ptr::null_mut();
+        text
+    }
+
+    /// Asserts an FFI status is 0; on failure the message carries the actual
+    /// `LodeError` text (a bare `left: 255, right: 0` diagnosis is useless).
+    unsafe fn assert_ffi_ok(status: u32, error: &mut *mut LodeError, context: &str) {
+        assert_eq!(status, 0, "{context} failed: {}", take_error_text(error));
+    }
+
     #[test]
     fn appender_ffi_round_trips_through_a_durable_store() {
         let dir = appender_temp_dir();
@@ -1780,13 +1814,14 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(options_view, &mut engine, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
             assert!(!engine.is_null());
-            assert_eq!(create_default_index(engine, &mut error), 0);
-            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
+            assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
 
@@ -1795,33 +1830,24 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut appender: *mut LodeAppender = ptr::null_mut();
-            assert_eq!(
-                lodedb_appender_open_json(options_view, &mut appender, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_appender_open_json(options_view, &mut appender, &mut error), &mut error, "lodedb_appender_open_json");
             assert!(!appender.is_null());
             let documents = r#"[{"document_id":"doc-a","vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"metadata":{"topic":"ops"},"text":null}]"#;
             let mut lsn: u64 = 0;
-            assert_eq!(
-                lodedb_appender_append_vectors_json(
+            assert_ffi_ok(lodedb_appender_append_vectors_json(
                     appender,
                     string_view(documents),
                     &mut lsn,
                     &mut error
-                ),
-                0
-            );
+                ), &mut error, "lodedb_appender_append_vectors_json");
             assert!(lsn > 0, "expected a positive LSN, got {lsn}");
             let mut delete_lsn: u64 = 0;
-            assert_eq!(
-                lodedb_appender_append_deletes_json(
+            assert_ffi_ok(lodedb_appender_append_deletes_json(
                     appender,
                     string_view(r#"["doc-a"]"#),
                     &mut delete_lsn,
                     &mut error
-                ),
-                0
-            );
+                ), &mut error, "lodedb_appender_append_deletes_json");
             assert!(
                 delete_lsn > lsn,
                 "delete LSN {delete_lsn} not above append {lsn}"
@@ -1847,15 +1873,9 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(options_view, &mut engine, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
             let mut stats: *mut LodeOwnedString = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error), &mut error, "lodedb_engine_stats_json");
             let stats_json = owned_to_string(stats);
             assert!(
                 stats_json.contains("\"document_count\":0"),
@@ -1887,12 +1907,13 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(options_view, &mut engine, &mut error),
-                0
+            assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
             );
-            assert_eq!(create_default_index(engine, &mut error), 0);
-            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
 
@@ -1901,21 +1922,15 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut appender: *mut LodeAppender = ptr::null_mut();
-            assert_eq!(
-                lodedb_appender_open_json(options_view, &mut appender, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_appender_open_json(options_view, &mut appender, &mut error), &mut error, "lodedb_appender_open_json");
             let documents = r#"[{"document_id":"doc-a","text":"hello world","metadata":{}}]"#;
             let mut plan_out: *mut LodeOwnedString = ptr::null_mut();
-            assert_eq!(
-                lodedb_appender_prepare_documents_json(
+            assert_ffi_ok(lodedb_appender_prepare_documents_json(
                     appender,
                     string_view(documents),
                     &mut plan_out,
                     &mut error
-                ),
-                0
-            );
+                ), &mut error, "lodedb_appender_prepare_documents_json");
             let plan_json = owned_to_string(plan_out);
             lodedb_owned_string_free(plan_out);
             // One unit embedding per chunk the plan asks to embed.
@@ -1927,16 +1942,13 @@ mod tests {
                 .collect::<Vec<_>>())
             .to_string();
             let mut lsn: u64 = 0;
-            assert_eq!(
-                lodedb_appender_append_embedded_documents_json(
+            assert_ffi_ok(lodedb_appender_append_embedded_documents_json(
                     appender,
                     borrowed_view(&plan_json),
                     borrowed_view(&embeddings),
                     &mut lsn,
                     &mut error
-                ),
-                0
-            );
+                ), &mut error, "lodedb_appender_append_embedded_documents_json");
             assert!(lsn > 0, "expected a positive LSN, got {lsn}");
             lodedb_appender_free(appender);
         }
@@ -1945,15 +1957,9 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(options_view, &mut engine, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
             let mut stats: *mut LodeOwnedString = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error), &mut error, "lodedb_engine_stats_json");
             let stats_json = owned_to_string(stats);
             assert!(
                 stats_json.contains("\"document_count\":1"),
@@ -1976,12 +1982,13 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(options_view, &mut engine, &mut error),
-                0
+            assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
             );
-            assert_eq!(create_default_index(engine, &mut error), 0);
-            assert_eq!(lodedb_engine_persist(engine, &mut error), 0);
+            assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
 
@@ -1991,30 +1998,21 @@ mod tests {
         let mut error: *mut LodeError = ptr::null_mut();
         let mut checkpointer: *mut LodeCheckpointer = ptr::null_mut();
         unsafe {
-            assert_eq!(
-                lodedb_checkpointer_open_json(options_view, &mut checkpointer, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_checkpointer_open_json(options_view, &mut checkpointer, &mut error), &mut error, "lodedb_checkpointer_open_json");
             assert!(!checkpointer.is_null());
         }
 
         unsafe {
             let mut appender: *mut LodeAppender = ptr::null_mut();
-            assert_eq!(
-                lodedb_appender_open_json(options_view, &mut appender, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_appender_open_json(options_view, &mut appender, &mut error), &mut error, "lodedb_appender_open_json");
             let documents = r#"[{"document_id":"doc-a","vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"metadata":{"topic":"ops"},"text":null}]"#;
             let mut lsn: u64 = 0;
-            assert_eq!(
-                lodedb_appender_append_vectors_json(
+            assert_ffi_ok(lodedb_appender_append_vectors_json(
                     appender,
                     string_view(documents),
                     &mut lsn,
                     &mut error
-                ),
-                0
-            );
+                ), &mut error, "lodedb_appender_append_vectors_json");
             lodedb_appender_free(appender);
         }
 
@@ -2022,16 +2020,10 @@ mod tests {
         // checkpoint finds nothing new.
         unsafe {
             let mut folded: u64 = 0;
-            assert_eq!(
-                lodedb_checkpointer_checkpoint(checkpointer, &mut folded, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_checkpointer_checkpoint(checkpointer, &mut folded, &mut error), &mut error, "lodedb_checkpointer_checkpoint");
             assert!(folded >= 1, "expected at least one record folded, got {folded}");
             let mut again: u64 = 0;
-            assert_eq!(
-                lodedb_checkpointer_checkpoint(checkpointer, &mut again, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_checkpointer_checkpoint(checkpointer, &mut again, &mut error), &mut error, "lodedb_checkpointer_checkpoint");
             assert_eq!(again, 0, "second checkpoint folded {again}, expected 0");
             lodedb_checkpointer_free(checkpointer);
         }
@@ -2043,7 +2035,11 @@ mod tests {
             let status =
                 lodedb_checkpointer_checkpoint(ptr::null_mut(), &mut folded, &mut error);
             assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
-            lodedb_error_free(error);
+            assert_eq!(
+                take_error_text(&mut error),
+                format!("code {status}: checkpointer pointer is null")
+            );
+            assert!(error.is_null(), "take_error_text must clear a freed error");
         }
 
         // A read-only open reads only the committed generation (it never replays the
@@ -2061,15 +2057,9 @@ mod tests {
         unsafe {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_open_json(borrowed_view(&ro_options), &mut engine, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_open_json(borrowed_view(&ro_options), &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
             let mut stats: *mut LodeOwnedString = ptr::null_mut();
-            assert_eq!(
-                lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error),
-                0
-            );
+            assert_ffi_ok(lodedb_engine_stats_json(engine, string_view("default"), &mut stats, &mut error), &mut error, "lodedb_engine_stats_json");
             let stats_json = owned_to_string(stats);
             assert!(
                 stats_json.contains("\"document_count\":1"),
