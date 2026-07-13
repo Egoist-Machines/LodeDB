@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now be overridden for one reopened engine session without rebuilding or changing persisted state.
   Sidecar manifests bind the committed base's row-checksum identity without hashing vector payloads
   on open, and deployment compaction skips ANN construction when the durable probes cannot prune.
+- **Reproducible wiki_dpr disk-rescore benchmark harness.** Prepared corpora, exact fp32 ground
+  truth, reusable stores, and result JSON carry immutable dataset, builder, layout, and run
+  identities. Generation-addressed preparation and atomic result publication make resume fail
+  closed after crashes or configuration changes; reports compare only identical query populations.
 
 ### Fixed
 
