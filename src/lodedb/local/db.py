@@ -48,6 +48,7 @@ from lodedb.engine.core import (
     EngineDocument,
     EngineVectorDocument,
     _state_from_payload,
+    chunk_text,
     index_state_key_for_client_hash,
     sha256_text,
 )
@@ -617,10 +618,15 @@ class LodeDB:
         """Opens (or creates) a bring-your-own-vectors index at a chosen dimension.
 
         Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
-        The index has **no internal embedding model**: only ``add_vectors`` /
-        ``add_vectors_many`` / ``search_by_vector`` / ``search_many_by_vector``
-        work, and the text-in verbs (``add``/``search``) raise
-        :class:`VectorOnlyIndexError`. Vectors must have dimension ``vector_dim``
+        The index has **no internal embedding model**: the vector-in verbs
+        (``add_vectors`` / ``add_vectors_many`` / ``search_by_vector`` /
+        ``search_many_by_vector``) work, and so does keyword search —
+        ``search(query, mode="lexical")`` (and ``search_many``) runs BM25 over the
+        text carried on the stored vectors, since lexical ranking needs no
+        embedder (requires ``store_text=True``, the default, or ``index_text=True``).
+        The embedding verbs — ``add`` / ``add_many`` and vector/hybrid ``search`` —
+        raise :class:`VectorOnlyIndexError` because they would need to embed text.
+        Vectors must have dimension ``vector_dim``
         (any value your own embedder produces, e.g. 1536 or 3072), so this is the
         path for plugging LodeDB in as the vector backend behind a system that owns
         its embedder. The dimension and a redacted ``model="external"`` identity are
@@ -688,6 +694,51 @@ class LodeDB:
             with self._op_lock:
                 self._native_upsert_text_documents(tuple(payload))
         return ids
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embeds a batch of texts with the index's document embedding model.
+
+        Uses the same document-side embedding path as :meth:`add` without
+        storing anything. Texts longer than the index chunk limit are embedded
+        as chunks, mean-pooled, and L2-normalized. Returns one vector per input
+        text, in input order.
+        """
+
+        self._require_text_capable()
+        if not isinstance(texts, list) or not texts:
+            raise ValueError("texts must be a non-empty list of strings")
+        for text in texts:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("each text must be a non-empty string")
+        backend = self._embedding_backend
+        if backend is None:
+            raise RuntimeError("text embedding requires an embedding backend")
+
+        chunks_by_text = [chunk_text(text, self._chunk_character_limit) for text in texts]
+        chunks: list[str] = []
+        offsets: list[tuple[int, int]] = []
+        for text, text_chunks in zip(texts, chunks_by_text, strict=True):
+            start = len(chunks)
+            # Preserve the existing one-text embedding behavior exactly. chunk_text
+            # strips its input, while a one-chunk endpoint request previously reached
+            # the backend unchanged.
+            chunks.extend((text,) if len(text_chunks) == 1 else text_chunks)
+            offsets.append((start, len(chunks)))
+
+        with self._op_lock:
+            vectors = backend.embed_documents(tuple(chunks))
+
+        embeddings: list[list[float]] = []
+        for start, end in offsets:
+            if end - start == 1:
+                embeddings.append(list(vectors[start]))
+                continue
+            pooled = np.asarray(vectors[start:end], dtype=np.float64).mean(axis=0)
+            norm = float(np.linalg.norm(pooled))
+            if norm == 0.0:
+                raise ValueError("mean-pooled embedding has zero norm")
+            embeddings.append((pooled / norm).tolist())
+        return embeddings
 
     def add_vectors(
         self,
@@ -806,7 +857,12 @@ class LodeDB:
           ``ABC-123``, dates like ``2024-01-15``) are surfaced when they appear in
           the document body. The default for local RAG, where a missed exact match
           is the difference between a usable and a useless answer.
-        - ``"lexical"`` — the BM25 ranking alone (no vector scan).
+        - ``"lexical"`` — the BM25 ranking alone (no vector scan). Because it embeds
+          nothing, ``mode="lexical"`` also works on a **vector-only** index
+          (:meth:`open_vector_store`) that retains text: it ranks the text carried on
+          the stored vectors. On such an index ``vector``/``hybrid`` still raise
+          :class:`VectorOnlyIndexError` (no embedder), and an unset ``mode`` resolves
+          to ``"lexical"`` rather than ``"hybrid"``.
 
         ``"hybrid"`` and ``"lexical"`` build an in-memory BM25 index from a
         lexical source, so they require opening LodeDB with either
@@ -814,7 +870,8 @@ class LodeDB:
         without raw text) or ``store_text=True`` (the index rebuilt from the
         retained raw text, the default); requesting either *explicitly* with
         neither source raises :class:`ValueError`, whereas the unset default
-        falls back to ``"vector"`` instead of raising. The serving index lives in
+        falls back to ``"vector"`` instead of raising (except on a vector-only
+        index, where it resolves to ``"lexical"``). The serving index lives in
         memory, is maintained
         incrementally across mutations (a small change folds in only the changed
         chunks), and never changes the on-disk format.
@@ -851,11 +908,13 @@ class LodeDB:
         never leaves the process and never appears in telemetry.
         """
 
-        self._require_text_capable()
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # Gates on the resolved mode, not on text-capability alone: a vector-only
+        # handle can still run mode="lexical" (BM25 over retained text) — only
+        # vector/hybrid, which embed the query, raise VectorOnlyIndexError here.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -883,17 +942,16 @@ class LodeDB:
         the same exact-match-or-predicate grammar as :meth:`search` and is applied
         identically to every query in the batch.
 
-        ``mode`` matches :meth:`search` (unset resolves to ``"hybrid"`` when a
-        lexical source is available, else ``"vector"``) and applies to every
-        query in the batch; ``search_many(mode="hybrid")`` returns the same result
-        as the corresponding repeated single :meth:`search` call. ``"hybrid"`` and
-        ``"lexical"`` require a lexical source (``index_text=True`` or
-        ``store_text=True``). A batch of hybrid queries batches its vector half on
-        the shared scan (the GPU serves it where available) and fuses each query's
-        BM25 ranking on the CPU; lexical queries run BM25 on the CPU.
+        ``mode`` matches :meth:`search` and applies to every query in the batch.
+        Unset resolves to ``"hybrid"`` when a lexical source is available and to
+        ``"vector"`` otherwise; on a vector-only index it resolves to ``"lexical"``
+        because no query embedder exists. ``"hybrid"`` and ``"lexical"`` require
+        a lexical source (``index_text=True`` or ``store_text=True``). A batch of
+        hybrid queries batches its vector half on the shared scan (the GPU serves
+        it where available) and fuses each query's BM25 ranking on the CPU;
+        lexical queries run BM25 on the CPU.
         """
 
-        self._require_text_capable()
         if not isinstance(queries, list) or not queries:
             raise ValueError("queries must be a non-empty list of strings")
         for query in queries:
@@ -901,6 +959,7 @@ class LodeDB:
                 raise ValueError("each query must be a non-empty string")
         if k <= 0:
             raise ValueError("k must be positive")
+        # See :meth:`search`: lexical mode runs on a vector-only handle; vector/hybrid raise.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
         with self._op_lock:
@@ -1143,12 +1202,28 @@ class LodeDB:
     def remove(self, id: str) -> bool:
         """Removes one document by id. Returns True if a document was deleted."""
 
+        return self.remove_many((id,)) > 0
+
+    def remove_many(self, ids: Sequence[str]) -> int:
+        """Removes documents by id in one mutation and returns the number deleted.
+
+        The ids are sent to the native core as one batch, so an auto-persisting
+        handle publishes one commit regardless of batch size. An empty batch is
+        a no-op.
+        """
+
         self._require_writable()
-        if not isinstance(id, str) or not id.strip():
-            raise ValueError("id must be a non-empty string")
+        document_ids = tuple(ids)
+        if any(
+            not isinstance(document_id, str) or not document_id.strip()
+            for document_id in document_ids
+        ):
+            raise ValueError("ids must contain only non-empty strings")
+        if not document_ids:
+            return 0
         with self._op_lock:
-            native_response = self._native_delete_documents((id,))
-            return int(native_response.get("documents_deleted", 0) or 0) > 0
+            native_response = self._native_delete_documents(document_ids)
+            return int(native_response.get("documents_deleted", 0) or 0)
 
     def _update_document_payload(
         self,
@@ -1389,6 +1464,27 @@ class LodeDB:
     def close(self) -> None:
         """Closes the native core (folding writes durably); state stays on disk."""
 
+        self._shutdown_native(persist=True)
+
+    def discard(self) -> None:
+        """Closes the handle WITHOUT persisting; the writer lock is released.
+
+        Un-persisted in-memory state is dropped and the store stays at its last
+        committed state on disk. This is the abort path for a writable handle
+        whose in-memory batch failed mid-apply (e.g. a partially applied fold
+        segment): a graceful :meth:`close` would persist the poisoned state.
+        WAL-mode writes are unaffected -- each was already durably logged at
+        write time and replays on the next open. Idempotent, and equivalent to
+        :meth:`close` for read-only handles.
+        """
+
+        self._shutdown_native(persist=False)
+
+    def _shutdown_native(self, *, persist: bool) -> None:
+        """Tears down the native engine on its home worker thread and stops the
+        executor. ``persist=True`` closes the store (folding writes durably);
+        ``persist=False`` discards un-persisted state. Idempotent."""
+
         with self._op_lock:
             executor = self._native_executor
             if executor is None:
@@ -1413,12 +1509,15 @@ class LodeDB:
             on_worker = home_thread_id is not None and threading.get_ident() == home_thread_id
 
             def _close_on_worker() -> None:
-                # Runs on the home worker: pop and close the engine so its final
-                # decref lands here, on the thread that created it.
+                # Runs on the home worker: pop and close (or discard) the engine so
+                # its final decref lands here, on the thread that created it.
                 if holder:
                     engine = holder.pop()
                     try:
-                        engine.close()
+                        if persist:
+                            engine.close()
+                        else:
+                            engine.discard()
                     finally:
                         # Drop the unsendable native handle here on the home
                         # worker even if close() raised: otherwise it stays
@@ -1437,7 +1536,8 @@ class LodeDB:
                 native_close_error = exc
             executor.shutdown(wait=not on_worker)
         if native_close_error is not None:
-            raise RuntimeError("native core close failed") from native_close_error
+            action = "close" if persist else "discard"
+            raise RuntimeError(f"native core {action} failed") from native_close_error
 
     def __enter__(self) -> LodeDB:
         """Enters a context manager; state is already loaded on open."""
@@ -2119,29 +2219,53 @@ class LodeDB:
             )
 
     def _resolve_mode(self, mode: str | None) -> str:
-        """Validates a search mode and enforces the lexical-source requirement.
+        """Validates a search mode and gates it against the handle's capabilities.
 
         ``None`` (the search default) resolves to ``"hybrid"`` when a lexical
         source is available (``index_text=True`` or ``store_text=True``) and to
         ``"vector"`` otherwise, so the fused ranking is the default wherever it
-        can run and a vector-only store never raises on an unset mode.
+        can run. On a **vector-only** handle (no embedding model) an unset mode
+        resolves to ``"lexical"`` instead: such a handle cannot embed the query
+        text, so a text query can only be a keyword (BM25) query — and the
+        lexical-source check below then applies.
 
-        Returns the canonical lowercase mode. Raises :class:`ValueError` for an
-        unknown mode, or when a lexical/hybrid mode is requested *explicitly* on a
-        handle that has no lexical source — neither ``index_text=True`` (a
-        persisted BM25 postings store) nor ``store_text=True`` (the BM25 index
-        rebuilt from the retained raw text), so there is nothing to build the
-        index from.
+        Returns the canonical lowercase mode. Raises:
+
+        - :class:`ValueError` for an unknown mode.
+        - :class:`VectorOnlyIndexError` when ``"vector"`` or ``"hybrid"`` is used
+          on a vector-only handle: both embed the query text, which a vector-only
+          index cannot do (use :meth:`search_by_vector` for vector similarity, or
+          ``mode="lexical"`` for keyword search).
+        - :class:`ValueError` when a lexical/hybrid mode is requested on a handle
+          with no lexical source — neither ``index_text=True`` (a persisted BM25
+          postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
+          retained raw text), so there is nothing to build the index from.
         """
 
         if mode is None:
-            return "hybrid" if (self.index_text or self.store_text) else "vector"
-        if not isinstance(mode, str):
-            raise ValueError("mode must be a string")
-        value = mode.strip().lower() or "vector"
-        if value not in _SEARCH_MODES:
-            allowed = ", ".join(sorted(_SEARCH_MODES))
-            raise ValueError(f"mode must be one of: {allowed}")
+            if self.vector_only:
+                # No embedder: a text query can only be lexical. Falls through to
+                # the lexical-source check, which raises if there is no source.
+                value = "lexical"
+            elif self.index_text or self.store_text:
+                return "hybrid"
+            else:
+                return "vector"
+        else:
+            if not isinstance(mode, str):
+                raise ValueError("mode must be a string")
+            value = mode.strip().lower() or "vector"
+            if value not in _SEARCH_MODES:
+                allowed = ", ".join(sorted(_SEARCH_MODES))
+                raise ValueError(f"mode must be one of: {allowed}")
+        # Vector and hybrid embed the query text; a vector-only handle cannot, so only
+        # lexical search (BM25 over retained/indexed text) is available on it.
+        if self.vector_only and value in {"vector", "hybrid"}:
+            raise VectorOnlyIndexError(
+                f"mode={value!r} needs to embed the query text, which a vector-only index "
+                "cannot do; use search_by_vector(...) for vector similarity, or "
+                'mode="lexical" for keyword search over retained text'
+            )
         if value in _LEXICAL_SEARCH_MODES and not (self.index_text or self.store_text):
             raise ValueError(
                 f"mode={value!r} requires a lexical source: open LodeDB with "

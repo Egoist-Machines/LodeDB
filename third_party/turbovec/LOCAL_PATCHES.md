@@ -123,5 +123,32 @@ Added while LodeDB migrates toward a shared Rust engine:
 - `turbovec-python/Cargo.toml`: local path dependency on `crates/lodedb-core`.
 - `turbovec-python/src/lib.rs`: registers the private native-core JSON helpers
   and `CoreEngine` handle on the bundled `_turbovec` extension.
+- `turbovec-python/src/lib.rs`: exposes `native_build_profile()` so Python can
+  identify debug extension builds, whose kernels are roughly 100x slower.
 - `src/lodedb/_native_core.py`: re-exports those symbols at the stable private
   import path `lodedb._native_core` without importing them during `import lodedb`.
+
+## WAL segment bindings (out-of-band ingest)
+
+Added for LodeDB's segment-file ingest primitives (`lodedb.local.segments`,
+consumed by cloud multi-writer pipelines):
+
+- `turbovec-python/src/lib.rs`: four module `#[pyfunction]`s —
+  `plan_segment_documents` (store-free ingest planning),
+  `build_embedded_documents_payload` (validated `apply_embedded_documents`
+  payload from a plan plus an `(n, dim)` f32 matrix), `encode_wal_segment`
+  (immutable WAL-format segment bytes from `{op, payload}` records; ops are
+  validated against the native-replayable set and stamped records are refused,
+  both before any upload), and `decode_wal_segment` (strict decode to
+  `{op, payload, lsn}` JSON).
+- `turbovec-python/src/lib.rs`: `PyCoreEngine::fold_wal_segment(index_id,
+  segment, first_lsn)` — strict decode + LSN stamping + in-memory apply via
+  `CoreEngine::apply_wal_records` in one native call (embedding-heavy records
+  never round-trip through Python JSON); refuses pre-stamped segments; does not
+  persist.
+- `turbovec-python/src/lib.rs`: `PyCoreEngine::discard()` — releases the store
+  without persisting (`CoreEngine::discard`): the abort path after a failed
+  fold, where a graceful `close()` would persist partially applied state.
+- `src/lodedb/_native_core.py`: re-exports the four functions.
+
+Purely additive: no existing binding, storage format, or API changes.

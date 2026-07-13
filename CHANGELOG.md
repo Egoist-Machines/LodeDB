@@ -14,6 +14,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original-precision sidecar and re-ranks compact-scan candidates with exact fp32 dots; float16
   sidecars use about 2 bytes per dimension per vector. `ann_nprobe` and `rescore_oversample` can
   now be overridden for one reopened engine session without rebuilding or changing persisted state.
+### Fixed
+
+- **A document added and removed between two persists no longer bricks the store.** The
+  vector delta recorded the never-committed row's removal, and the strict delta replay
+  ("removed-id count mismatch") then rejected the store on every fresh open — the warm
+  handle kept serving while every new reader failed. The add+remove now cancel out of the
+  delta; a *committed* row replaced or removed in the same window still records its
+  removal. Reachable from any multi-record fold (`Checkpointer` over appended WAL records,
+  `fold_segment` batches); found by a randomized concurrency test in the cloud companion.
+- **Duplicate document ids within one ingest batch are refused.** A repeated id in one
+  `plan_documents` batch built a single `apply_embedded_documents` record whose earlier
+  occurrence's vector row survived the fold with no owner — after reopen, any query
+  touching the orphan row failed with "TurboVec returned an unknown stable id". The
+  planner, the payload builder, and the replay boundary now all reject the shape; callers
+  that mean "replace" should keep the last occurrence or split the batch.
+
+### Added
+
+- **Lexical (BM25) search on vector-only stores.** `search(mode="lexical")` and
+  `search_many(mode="lexical")` now run on a bring-your-own-vectors index
+  (`open_vector_store` / `LodeDB(vector_dim=...)`) that retains text (`store_text=True`,
+  the default, or `index_text=True`): they rank the text carried on the stored vectors with
+  LodeDB's Okapi BM25, no embedder needed. `mode="vector"`/`"hybrid"` still raise
+  `VectorOnlyIndexError` on such a store (they must embed the query — use `search_by_vector`),
+  and an unset `mode` resolves to `"lexical"` there instead of `"hybrid"`. This lets
+  vector-in integrations (mem0, Haystack, any external embedder) offer keyword search through
+  the public API instead of reaching into engine internals. No on-disk format change.
+- **Dependency-free kotaemon vector-store adapter.** Configure
+  `lodedb.local.integrations.kotaemon.LodeDBVectorStore` through kotaemon's
+  `KH_VECTORSTORE` setting to use one local LodeDB collection per index, with
+  chunk scopes and metadata/table predicates pushed into the metadata planner.
+- `LodeDB.remove_many(ids)` batches document removal into one native mutation
+  and durable commit.
+- **WAL segment primitives for out-of-band ingest (`lodedb.local.segments`).** Store-free
+  planning (`plan_documents`), record building (`build_embedded_documents_record`,
+  `delete_documents_record`), immutable WAL-format segment encode/decode
+  (`encode_segment`/`decode_segment`, strict), and `fold_segment` — fold a downloaded
+  segment into a warm writable `commit_mode="generation"` handle, stamping LSNs at fold
+  time and publishing one O(changed) generation delta per batch via `LodeDB.persist()`.
+  Enables cloud multi-writer pipelines (writers encode and upload segments lease-free; a
+  single fold orchestrator batches them into one commit). Core: `plan_documents`,
+  `build_embedded_documents_payload`, `is_native_replayable_op`, and
+  `CoreEngine::apply_wal_records` in `lodedb-core`; segments reuse the WAL frame format
+  byte-for-byte and carry raw text only under `store_text=True`. Advanced API — not
+  re-exported from the package root.
+- **`LodeDB.discard()` — close without persisting.** Releases the handle and its writer
+  lock while dropping un-persisted in-memory state, leaving the store at its last
+  committed generation. The abort path after a failed `fold_segment` batch, where the
+  in-memory state may be partially applied and a graceful `close()` would persist it.
+  WAL-mode writes are unaffected (each was already durably logged at write time and
+  replays on the next open); for read-only handles it is equivalent to `close()`.
+  Core: `CoreEngine::discard()`.
 
 ## [1.3.1] - 2026-07-08
 

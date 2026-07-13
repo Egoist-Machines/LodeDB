@@ -123,6 +123,14 @@ print(db.embedding_resolution.to_dict())
 All of these are `LodeDB(...)` constructor arguments. Defaults are tuned for a correct,
 low-latency single-process store; change them when the note applies.
 
+### Native extension build profile
+
+Benchmark and production numbers require the release-profile native extension. Published
+`pip install lodedb` wheels and source builds through `uv sync` or `pip install -e .` use a
+release build by default. Running `maturin develop` without `--release` produces a debug kernel
+that is roughly 100x slower. Run `lodedb doctor` to see the profile of the extension currently
+loaded by Python.
+
 | Argument | Default | What it controls | Change it when |
 | --- | --- | --- | --- |
 | `device` | `"auto"` | Embedding device: `auto` / `cpu` / `mps` / `cuda`. Affects embedding only, not the vector scan. | You have a GPU (see above), or want to pin CPU for reproducibility. |

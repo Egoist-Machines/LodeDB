@@ -234,16 +234,16 @@ impl CoreEngine {
         let mut removed_chunk_ids: Vec<String> = Vec::new();
         for document in documents {
             let content_hash = crate::text::hash::sha256_f32_le(&document.vector);
-            // Mirror Python's vector-in text policy: retain raw text only when
-            // store_text is on, and tokenize the optional caption into the lexical
-            // index only when index_text is on (a vector document is a single
-            // chunk keyed by its document id, so its caption is one token list).
+            // Mirror the text path's lexical-source policy: retain raw text only
+            // when store_text is on, and keep live caption tokens whenever either
+            // source is available. index_text controls durable `.tvlex` output;
+            // store_text-only handles rebuild the same tokens from `.tvtext`.
             let retained_text = if store_text {
                 document.text.clone()
             } else {
                 None
             };
-            let caption_tokens: Vec<String> = if index_text {
+            let caption_tokens: Vec<String> = if index_text || store_text {
                 document.text.as_deref().map(tokenize).unwrap_or_default()
             } else {
                 Vec::new()
@@ -574,9 +574,10 @@ impl CoreEngine {
                 // the base's old text resurrects on reload.
                 index.pending_raw_text_clears.insert(document_id.to_string());
             }
-            // The caption changed, so refresh its lexical postings: tokenize the
-            // new caption when index_text is on, otherwise clear stale postings.
-            let caption_tokens: Vec<String> = if index_text {
+            // The caption changed, so refresh its live lexical postings whenever
+            // either lexical source is enabled. Only index_text persists tokens;
+            // store_text-only handles rebuild them from retained raw text.
+            let caption_tokens: Vec<String> = if index_text || store_text {
                 text.as_deref().map(tokenize).unwrap_or_default()
             } else {
                 Vec::new()
@@ -1536,6 +1537,18 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Releases the engine WITHOUT persisting and releases its writer lock.
+    ///
+    /// The abort path for a caller whose in-memory batch failed mid-apply (e.g. a
+    /// partially applied WAL segment): a graceful `close()` would persist the
+    /// poisoned state, `discard()` drops it and the store stays at its last
+    /// committed generation. WAL-mode appends are unaffected -- they are already
+    /// durable in the WAL and replay on the next writable open. Idempotent, and a
+    /// no-op beyond the lock release for read-only handles.
+    pub fn discard(&mut self) {
+        self.persistence = None;
+    }
+
     /// Folds the appended WAL tail into the warm in-memory index and checkpoints a
     /// fresh generation, then truncates the WAL; returns the number of records folded.
     ///
@@ -1571,16 +1584,15 @@ impl CoreEngine {
             // Records at or below the applied watermark were already folded. In steady
             // state the WAL was truncated after the last fold, so every record is new;
             // the filter keeps the fold idempotent if a stale record ever lingers.
-            let pending = records
+            let pending_records: Vec<&crate::storage::wal::WalRecord> = records
                 .iter()
                 .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
-                .count();
-            if pending == 0 {
+                .collect();
+            if pending_records.is_empty() {
                 continue;
             }
-            if records
+            if pending_records
                 .iter()
-                .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
                 .any(|record| !is_native_replayable_wal_record(record))
             {
                 return Err(CoreError::new(
@@ -1589,30 +1601,101 @@ impl CoreEngine {
                      open it with a writer to recover before checkpointing",
                 ));
             }
-            self.replaying_wal = true;
-            let result = records
-                .iter()
-                .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
-                .try_for_each(|record| {
-                    self.apply_native_wal_record(&index_id, record)?;
-                    if let Some(index) = self.indexes.get_mut(&index_id) {
-                        index.applied_lsn = index.applied_lsn.max(record.lsn.unwrap_or(0));
-                    }
-                    Ok::<(), CoreError>(())
-                });
-            self.replaying_wal = false;
-            result?;
-            folded += pending;
-            // Clamp the generation up to the watermark so a later mutation never mints
-            // an LSN at or below one already applied (mirrors the writable-open replay).
-            if let Some(index) = self.indexes.get_mut(&index_id) {
-                index.generation = index.generation.max(index.applied_lsn);
-            }
+            folded += self.apply_replay_records(&index_id, &pending_records)?;
         }
         if folded > 0 {
             self.persist()?;
         }
         Ok(folded)
+    }
+
+    /// Applies pre-filtered, caller-ordered records under the `replaying_wal`
+    /// guard, advancing the index's applied-LSN watermark per record, then clamps
+    /// the generation up to the watermark (a later mutation must never mint an LSN
+    /// at or below one already applied). The guard is reset on the error path; on
+    /// failure the in-memory index may hold a partial batch while disk is
+    /// untouched, so callers must treat the handle as poisoned -- discard, reopen,
+    /// and refold -- rather than persist. Returns the number of records applied.
+    fn apply_replay_records(
+        &mut self,
+        index_id: &str,
+        records: &[&crate::storage::wal::WalRecord],
+    ) -> Result<usize, CoreError> {
+        self.replaying_wal = true;
+        let result = records.iter().try_for_each(|record| {
+            self.apply_native_wal_record(index_id, record)?;
+            if let Some(index) = self.indexes.get_mut(index_id) {
+                index.applied_lsn = index.applied_lsn.max(record.lsn.unwrap_or(0));
+            }
+            Ok::<(), CoreError>(())
+        });
+        self.replaying_wal = false;
+        result?;
+        if let Some(index) = self.indexes.get_mut(index_id) {
+            index.generation = index.generation.max(index.applied_lsn);
+        }
+        Ok(records.len())
+    }
+
+    /// Applies already-ordered, caller-stamped WAL records (e.g. decoded from an
+    /// uploaded segment) to `index_id` in memory and advances the applied-LSN
+    /// watermark. Does NOT persist: call [`Self::persist`] after the batch to
+    /// publish one O(changed) generation delta covering every record applied --
+    /// nothing durable happens before that root-manifest swap, so a failure here
+    /// means "discard the handle, reopen, refold" with disk untouched.
+    ///
+    /// The whole batch is validated before anything applies: the engine must be a
+    /// writable persistent generation-mode handle (in WAL mode an external fold
+    /// could advance `applied_lsn` past unfolded local WAL records and strand
+    /// them -- fold the store's own tail with [`Self::fold_wal_tail`] instead);
+    /// every record must carry an explicit LSN, strictly ascending within the
+    /// batch (duplicates are an allocator bug -- fail loudly, never skip); and
+    /// every op must be natively replayable. Records at or below the index's
+    /// applied watermark are then skipped for refold idempotence; the returned
+    /// count is the number actually applied, so an orchestrator can distinguish
+    /// an expected refold from an LSN-allocation bug.
+    pub fn apply_wal_records(
+        &mut self,
+        index_id: &str,
+        records: &[crate::storage::wal::WalRecord],
+    ) -> Result<usize, CoreError> {
+        let Some(persistence) = &self.persistence else {
+            return invalid("an in-memory engine has no durable watermark to fold external records against");
+        };
+        if persistence.read_only {
+            return invalid("read-only engine cannot apply external WAL records");
+        }
+        if persistence.commit_mode == "wal" {
+            return invalid(
+                "applying external WAL records requires generation commit mode; \
+                 a wal-mode store folds its own tail via fold_wal_tail",
+            );
+        }
+        let applied = self.index(index_id)?.applied_lsn;
+        let mut previous: Option<u64> = None;
+        for record in records {
+            let Some(lsn) = record.lsn else {
+                return invalid("external WAL records must carry explicit LSNs");
+            };
+            if previous.is_some_and(|prior| lsn <= prior) {
+                return invalid("external WAL record LSNs must be strictly ascending");
+            }
+            previous = Some(lsn);
+            if !is_native_replayable_wal_record(record) {
+                return Err(CoreError::new(
+                    CoreErrorCode::Unsupported,
+                    format!("native WAL replay does not support {}", record.op),
+                ));
+            }
+        }
+        let pending: Vec<&crate::storage::wal::WalRecord> = records
+            .iter()
+            .filter(|record| record.lsn.is_some_and(|lsn| lsn > applied))
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        self.apply_replay_records(index_id, &pending)
     }
 
     /// Total WAL records currently on disk across this engine's indexes. After any
@@ -1716,32 +1799,42 @@ impl CoreEngine {
     ) -> Result<(), CoreError> {
         match record.op.as_str() {
             "upsert_vectors" => {
-                let documents = record
+                // Strict shape: `apply_wal_records` replays externally produced
+                // segments, so a payload without the expected key fails closed
+                // instead of silently counting a no-op record as applied.
+                let vectors = record
                     .payload
                     .get("vectors")
                     .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
+                    .ok_or_else(|| invalid_err("wal upsert_vectors missing vectors"))?;
+                let documents = vectors
+                    .iter()
                     .map(vector_document_from_wal)
                     .collect::<Result<Vec<_>, _>>()?;
                 self.upsert_vectors(index_id, &documents)?;
                 // Restore lexical caption tokens captured in the WAL. Needed when
                 // store_text was off (so raw text was not written and upsert_vectors
                 // re-derived no tokens) but index_text retained the caption tokens.
-                if let Some(vectors) = record.payload.get("vectors").and_then(Value::as_array) {
-                    self.restore_wal_vector_tokens(index_id, vectors)?;
-                }
+                self.restore_wal_vector_tokens(index_id, vectors)?;
             }
             "delete_documents" => {
+                // Same strictness as upsert_vectors, per element too: silently
+                // dropping a non-string id would count the record as applied
+                // while deleting nothing. An empty (but well-formed) list stays
+                // a valid no-op — refusing it could wedge replay of a legacy
+                // local WAL tail.
                 let document_ids = record
                     .payload
                     .get("document_ids")
                     .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
+                    .ok_or_else(|| invalid_err("wal delete_documents missing document_ids"))?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(ToString::to_string).ok_or_else(|| {
+                            invalid_err("wal delete_documents document_ids must be strings")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.delete_documents(index_id, &document_ids)?;
             }
             "apply_embedded_documents" => {
@@ -1907,8 +2000,17 @@ impl CoreEngine {
                     .and_then(Value::as_array)
                     .ok_or_else(|| invalid_err("WAL added chunk missing embedding"))?
                     .iter()
-                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
-                    .collect::<Vec<_>>();
+                    .map(|value| {
+                        // Fail closed, not 0.0: `apply_wal_records` replays
+                        // externally produced segments, and a coerced coordinate
+                        // silently corrupts the folded vector. (serde_json also
+                        // renders a non-finite float as null; sanctioned builders
+                        // validate finiteness before encoding.)
+                        value.as_f64().map(|coord| coord as f32).ok_or_else(|| {
+                            invalid_err("WAL added chunk embedding has a non-numeric coordinate")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if vector.len() != index.vector_dim {
                     return invalid("WAL added chunk embedding dimension does not match index");
                 }
@@ -1919,6 +2021,23 @@ impl CoreEngine {
             .get("documents")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_err("WAL embedded payload missing documents"))?;
+        // Refuse duplicate document ids up front, before any state mutates. The
+        // per-document loop below overwrites the owner map per occurrence while
+        // `active_chunk_ids` accumulates across the whole record, so a repeated
+        // id would spare an earlier occurrence's chunk from removal with no
+        // owner left -- an orphan TurboVec row that fails every query touching
+        // it after reopen ("unknown stable id"). Sanctioned builders already
+        // refuse the shape; this is the replay trust boundary's own check.
+        let mut seen_document_ids = BTreeSet::new();
+        for document in documents {
+            let document_id = document
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_err("WAL embedded document missing document_id"))?;
+            if !seen_document_ids.insert(document_id.to_string()) {
+                return invalid("WAL embedded payload repeats document id");
+            }
+        }
         // Reuse vectors only for the chunks these documents reference that are not
         // in this record's added_chunks, via the O(1) owner map, rather than
         // cloning the whole corpus on every replayed record.
@@ -2939,25 +3058,16 @@ impl CoreAppender {
                 "prepare_documents requires at least one document",
             ));
         }
-        let (prepared_documents, chunks_to_embed) = plan_document_chunks(
+        // One planner, zero drift: the store-free planner chunks identically; the
+        // appender only stamps its own index key onto the plan.
+        let mut plan = plan_documents(
             documents,
             self.store_text,
             self.index_text,
             self.chunk_character_limit,
-            |_| true,
         )?;
-        Ok(IngestPlan {
-            // plan_id and base_generation are writer-only bookkeeping; the appender
-            // neither registers plans nor guards on a base generation, so they are
-            // left at 0 and ignored by append_embedded_documents.
-            plan_id: 0,
-            index_id: self.index_key.clone(),
-            base_generation: 0,
-            documents: prepared_documents,
-            chunks_to_embed,
-            store_text: self.store_text,
-            index_text: self.index_text,
-        })
+        plan.index_id = self.index_key.clone();
+        Ok(plan)
     }
 
     /// Durably appends one `apply_embedded_documents` record for a plan returned by
@@ -2982,113 +3092,20 @@ impl CoreAppender {
         // carry text/tokens this appender would not retain, or lack text it should
         // keep, silently corrupting the store's text/lexical state on fold. A plan from
         // this appender's own prepare_documents always matches.
+        // Enforce this appender's OWN retention policy at the durable boundary,
+        // not the plan's. A plan can cross the FFI as JSON or come from a
+        // different-policy appender, so a mismatched plan could carry raw text a
+        // store_text=false appender must never leak into `<key>.wal`, or lack
+        // tokens an index_text=true appender needs for BM25. After this check the
+        // plan's own flags equal this appender's, so the shared builder (which
+        // follows the plan's flags) applies exactly this appender's policy.
         if plan.store_text != self.store_text || plan.index_text != self.index_text {
             return Err(invalid_err(
                 "prepared plan's store_text/index_text does not match this appender",
             ));
         }
-        if embeddings.len() != plan.chunks_to_embed.len() {
-            return Err(invalid_err(
-                "embedding count does not match the prepared plan",
-            ));
-        }
-        for embedding in embeddings {
-            if embedding.len() != self.vector_dim {
-                return Err(invalid_err("embedding dimension does not match index"));
-            }
-            // Same finiteness guard the writer's apply_text_upsert applies, so a
-            // NaN/Inf embedding cannot enter the log and fail a later replay.
-            if turbovec::first_invalid_coord(embedding, self.vector_dim).is_some() {
-                return Err(invalid_err(
-                    "embedding contains a non-finite or out-of-range value",
-                ));
-            }
-        }
-        // The appender embeds every chunk (no reuse detection), so this map covers
-        // every chunk the documents reference.
-        let embedding_by_chunk: BTreeMap<&str, &Vec<f32>> = plan
-            .chunks_to_embed
-            .iter()
-            .zip(embeddings)
-            .map(|(chunk, embedding)| (chunk.chunk_id.as_str(), embedding))
-            .collect();
-        let mut added_chunks = Vec::new();
-        let mut wal_documents = Vec::with_capacity(plan.documents.len());
-        for document in &plan.documents {
-            // Enforce this appender's OWN retention policy at the durable boundary,
-            // not the plan's. A plan can cross the FFI as JSON or come from a
-            // different-policy appender, so derive text and tokens from
-            // self.store_text/self.index_text (as append_vectors does) rather than
-            // trusting the plan's fields -- otherwise a store_text=false appender could
-            // leak raw text into `<key>.wal`, or an index_text=true appender fed a
-            // plan prepared without indexing could log empty tokens and drop the doc
-            // from BM25. Tokens are re-derived from the chunk text (not copied) so the
-            // policy holds regardless of the plan's origin; a plan produced by this
-            // appender tokenizes identically, so this is a no-op for the intended
-            // prepare/append pairing.
-            let retained_text = if self.store_text {
-                document.text.clone()
-            } else {
-                None
-            };
-            let token_lists = document
-                .chunks
-                .iter()
-                .map(|chunk| {
-                    if self.store_text || self.index_text {
-                        tokenize(&chunk.text)
-                    } else {
-                        Vec::new()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let mut chunk_ids = Vec::with_capacity(document.chunks.len());
-            for chunk in &document.chunks {
-                let embedding = embedding_by_chunk
-                    .get(chunk.chunk_id.as_str())
-                    .ok_or_else(|| invalid_err("prepared plan chunk is missing its embedding"))?;
-                added_chunks.push(serde_json::json!({
-                    "chunk_id": chunk.chunk_id,
-                    "document_id": document.document_id,
-                    "content_hash": crate::text::hash::sha256_text(&chunk.text),
-                    "embedding": embedding,
-                }));
-                chunk_ids.push(chunk.chunk_id.clone());
-            }
-            // Content hash over the retained raw text when kept, else over the joined
-            // chunk texts -- identical to apply_text_upsert.
-            let content_hash = retained_text
-                .as_ref()
-                .map(|text| crate::text::hash::sha256_text(text))
-                .unwrap_or_else(|| {
-                    crate::text::hash::sha256_text(
-                        &document
-                            .chunks
-                            .iter()
-                            .map(|chunk| chunk.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    )
-                });
-            wal_documents.push(serde_json::json!({
-                "document_id": document.document_id,
-                "content_hash": content_hash,
-                "metadata": document.metadata,
-                "text": retained_text,
-                "chunk_ids": chunk_ids,
-                "tokens": token_lists,
-            }));
-        }
-        self.append_one(
-            "apply_embedded_documents",
-            serde_json::json!({
-                "documents": wal_documents,
-                "added_chunks": added_chunks,
-                // Empty: the folding writer derives a replacement's retired chunks
-                // from its own index state (see apply_embedded_documents_wal).
-                "removed_chunk_ids": [],
-            }),
-        )
+        let payload = build_embedded_documents_payload(plan, embeddings, self.vector_dim)?;
+        self.append_one("apply_embedded_documents", payload)
     }
 
     fn append_one(&self, op: &str, payload: Value) -> Result<u64, CoreError> {
@@ -3589,6 +3606,7 @@ fn index_from_loaded_store(
         pending_raw_text_clears: BTreeSet::new(),
         pending_multivec_clears: BTreeSet::new(),
         pending_removed_stable_ids: BTreeSet::new(),
+        pending_new_stable_ids: BTreeSet::new(),
         pending_vectors_changed: false,
     };
     // This reopen seeds `documents` directly from persisted (lossy) TurboVec rows;
@@ -4072,6 +4090,7 @@ fn persist_index_generation(
     index.pending_rescore_upserts.clear();
     index.drop_tvvf_manifest = false;
     index.tvvf_sidecar_unavailable.set(false);
+    index.pending_new_stable_ids.clear();
     // The commit manifest just recorded `applied_lsn.max(generation)` (see
     // `build_commit_body`). Advance the in-memory watermark to match so this live
     // writable handle's `applied_lsn()` reports the committed generation (the
@@ -4679,8 +4698,16 @@ fn core_io_error(error: std::io::Error) -> CoreError {
 }
 
 fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> bool {
+    is_native_replayable_op(&record.op)
+}
+
+/// Whether native WAL replay supports `op` -- the exact op set a WAL segment
+/// may carry. Public so bindings validate ops at encode time (fail closed
+/// before a segment is uploaded) instead of discovering a poison record at
+/// fold time.
+pub fn is_native_replayable_op(op: &str) -> bool {
     matches!(
-        record.op.as_str(),
+        op,
         "upsert_vectors"
             | "delete_documents"
             | "apply_embedded_documents"
@@ -4739,8 +4766,18 @@ fn vector_document_from_wal(value: &Value) -> Result<CoreVectorDocument, CoreErr
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_err("WAL vector payload missing vector"))?
         .iter()
-        .map(|value| value.as_f64().unwrap_or(0.0) as f32)
-        .collect::<Vec<_>>();
+        .map(|value| {
+            // Fail closed: `apply_wal_records` replays externally produced
+            // segments, and coercing a non-numeric coordinate to 0.0 would
+            // silently corrupt the folded vector. (serde_json also renders a
+            // non-finite float as null; sanctioned builders validate
+            // finiteness before encoding, so this only fires on garbage.)
+            value
+                .as_f64()
+                .map(|coord| coord as f32)
+                .ok_or_else(|| invalid_err("WAL vector payload has a non-numeric coordinate"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let metadata = metadata_from_value(value.get("metadata").unwrap_or(&Value::Null));
     let text = value
         .get("text")
@@ -4965,6 +5002,12 @@ struct VectorOnlyIndex {
     /// not re-added (drives the tvim delta removed set). Tracked at the vector-sync
     /// choke points because a removed chunk's stable id leaves the live id map.
     pending_removed_stable_ids: BTreeSet<u64>,
+    /// Stable ids first written since the last persist -- rows no reader of the
+    /// base + committed deltas has ever seen. A remove of one of these must NOT
+    /// enter the delta's removed set: the strict replay (`remove_many` count
+    /// check) would reject the delta as corrupt on the next open. The dual of
+    /// the `pending_removed_stable_ids.remove(readded)` rule above.
+    pending_new_stable_ids: BTreeSet<u64>,
     /// Whether a vector value actually changed (a real add/move/remove, not a
     /// metadata-only re-emit) since the last commit. Set at the vector-sync choke
     /// points alongside the cluster-cache drop, so one engine signal drives both
@@ -5092,6 +5135,7 @@ impl VectorOnlyIndex {
             pending_raw_text_clears: BTreeSet::new(),
             pending_multivec_clears: BTreeSet::new(),
             pending_removed_stable_ids: BTreeSet::new(),
+            pending_new_stable_ids: BTreeSet::new(),
             pending_vectors_changed: false,
         }
     }
@@ -5128,23 +5172,46 @@ impl VectorOnlyIndex {
         } else {
             false
         };
-        let readded = {
+        let (pre_existing, readded) = {
             let mut guard = self.vector_index.borrow_mut();
             let Some(index) = guard.as_mut() else {
                 return Ok(());
+            };
+            let chunk_ids: Vec<String> =
+                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
+            // Liveness before the upsert distinguishes a replaced row (its
+            // stable id predates this cycle unless tracked as new below) from
+            // a first write. A just-built index cannot witness pre-upsert
+            // liveness (it was built from rows that already include this
+            // call's chunks) and does not need to: a lazy build only happens
+            // when no committed `.tvim` exists (a committed vector base is
+            // materialized at open and the live index never drops
+            // mid-session), so no incoming row predates this cycle.
+            let pre_existing: BTreeSet<u64> = if built_now {
+                BTreeSet::new()
+            } else {
+                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect()
             };
             // A just-built index already contains every current chunk; only an
             // existing index needs the incremental upsert.
             if !built_now {
                 index.upsert_chunks(chunks)?;
             }
-            let chunk_ids: Vec<String> =
-                chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect();
-            index.stable_ids_for_chunks(&chunk_ids)
+            (pre_existing, index.stable_ids_for_chunks(&chunk_ids))
         };
-        // Rows written this cycle are no longer "removed" relative to the base.
+        // Rows written this cycle are no longer "removed" relative to the base;
+        // rows FIRST written this cycle are invisible to every reader of the
+        // committed state, so a later same-cycle remove must skip the delta's
+        // removed set (see `sync_vector_index_remove`). A row that was live
+        // before this upsert, or that this cycle removed earlier (a committed
+        // row by definition -- new rows leave `pending_removed` untouched), is
+        // NOT new: misclassifying it would drop its eventual removal from the
+        // delta and resurrect the committed row on replay.
         for stable_id in &readded {
-            self.pending_removed_stable_ids.remove(stable_id);
+            let removed_this_cycle = self.pending_removed_stable_ids.remove(stable_id);
+            if !pre_existing.contains(stable_id) && !removed_this_cycle {
+                self.pending_new_stable_ids.insert(*stable_id);
+            }
         }
         // A no-op sync (empty `chunks`: an all-reused text upsert, e.g. a
         // metadata-only change, whose caller still routes through here) alters no
@@ -5188,9 +5255,16 @@ impl VectorOnlyIndex {
             // and the cluster index (and any `.tvann` base) stays valid.
             return;
         }
-        self.pending_removed_stable_ids.extend(removed);
-        for stable_id in &self.pending_removed_stable_ids {
-            self.pending_rescore_upserts.remove(stable_id);
+        // A row first written since the last persist was never committed: no
+        // reader of the base + deltas has its stable id, so recording its
+        // removal would make the next delta fail strict replay ("removed-id
+        // count mismatch") and brick the store for every fresh open. Its
+        // add+remove simply cancel out of the delta.
+        for stable_id in removed {
+            self.pending_rescore_upserts.remove(&stable_id);
+            if !self.pending_new_stable_ids.remove(&stable_id) {
+                self.pending_removed_stable_ids.insert(stable_id);
+            }
         }
         // The vector set changed: record the shared signal (drives the `.tvann`
         // drop at commit) and drop the cluster index so a removed vector cannot
@@ -6191,6 +6265,169 @@ fn plan_document_chunks(
         });
     }
     Ok((prepared_documents, chunks_to_embed))
+}
+
+/// Chunks documents into the appender-shaped [`IngestPlan`] without an open
+/// store: every chunk is marked for embedding (the mark-all variant of the
+/// shared planner -- a store-free caller holds no index state to detect reuse).
+/// `plan_id`/`base_generation` are left at 0 and `index_id` empty; they are
+/// writer-only bookkeeping a store-free caller has no values for. The text
+/// flags and `chunk_character_limit` MUST match the target store's writer
+/// (LodeDB defaults: 900, `store_text=true`) or chunk ids and text retention
+/// diverge at fold time.
+pub fn plan_documents(
+    documents: &[CoreDocument],
+    store_text: bool,
+    index_text: bool,
+    chunk_character_limit: usize,
+) -> Result<IngestPlan, CoreError> {
+    if documents.is_empty() {
+        return invalid("plan_documents requires at least one document");
+    }
+    // A repeated id within one batch is ambiguous (which occurrence wins?) and,
+    // worse, one `apply_embedded_documents` record carrying both orphans the
+    // earlier occurrence's TurboVec row at fold time. Refuse it here, before
+    // anything is chunked or embedded; callers that mean "replace" should
+    // last-wins upstream or split the batch.
+    let mut seen_ids = BTreeSet::new();
+    for document in documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("plan_documents requires unique document ids within one batch");
+        }
+    }
+    let (prepared_documents, chunks_to_embed) = plan_document_chunks(
+        documents,
+        store_text,
+        index_text,
+        chunk_character_limit,
+        |_| true,
+    )?;
+    Ok(IngestPlan {
+        plan_id: 0,
+        index_id: String::new(),
+        base_generation: 0,
+        documents: prepared_documents,
+        chunks_to_embed,
+        store_text,
+        index_text,
+    })
+}
+
+/// Builds the `apply_embedded_documents` WAL payload for a plan plus its
+/// embeddings (one per `plan.chunks_to_embed`, in order). Validates the
+/// embedding count, dimension against `vector_dim`, and finiteness so a poison
+/// record can never be encoded (and, for cloud writers, never uploaded).
+/// Text/token retention follows the plan's own `store_text`/`index_text`; a
+/// caller enforcing a different policy (the appender) must reject a mismatched
+/// plan before building. The payload carries every chunk as an added chunk and
+/// an empty removed-chunk list: the folding writer resolves a replacement's
+/// retired chunks from its own index state.
+pub fn build_embedded_documents_payload(
+    plan: &IngestPlan,
+    embeddings: &[Vec<f32>],
+    vector_dim: usize,
+) -> Result<Value, CoreError> {
+    if plan.documents.is_empty() {
+        return invalid("the ingest plan holds no documents");
+    }
+    // A plan can cross the FFI as JSON, so re-check id uniqueness here even
+    // though `plan_documents` refuses the shape: a repeated id in one
+    // `apply_embedded_documents` record orphans the earlier occurrence's
+    // TurboVec row at fold time (see `apply_embedded_documents_wal`).
+    let mut seen_ids = BTreeSet::new();
+    for document in &plan.documents {
+        if !seen_ids.insert(document.document_id.as_str()) {
+            return invalid("the ingest plan repeats document id");
+        }
+    }
+    if embeddings.len() != plan.chunks_to_embed.len() {
+        return invalid("embedding count does not match the prepared plan");
+    }
+    for embedding in embeddings {
+        if embedding.len() != vector_dim {
+            return invalid("embedding dimension does not match index");
+        }
+        // Same finiteness guard the writer's apply_text_upsert applies, so a
+        // NaN/Inf embedding cannot enter the log and fail a later replay.
+        if turbovec::first_invalid_coord(embedding, vector_dim).is_some() {
+            return invalid("embedding contains a non-finite or out-of-range value");
+        }
+    }
+    // The plan marks every chunk for embedding (no reuse detection off an open
+    // store), so this map covers every chunk the documents reference.
+    let embedding_by_chunk: BTreeMap<&str, &Vec<f32>> = plan
+        .chunks_to_embed
+        .iter()
+        .zip(embeddings)
+        .map(|(chunk, embedding)| (chunk.chunk_id.as_str(), embedding))
+        .collect();
+    let mut added_chunks = Vec::new();
+    let mut wal_documents = Vec::with_capacity(plan.documents.len());
+    for document in &plan.documents {
+        // Text/tokens follow the plan's flags. Tokens are re-derived from the
+        // chunk text (not copied from the plan) so the retention policy holds
+        // regardless of how the plan crossed a boundary; the planner tokenizes
+        // identically, so this is a no-op for a prepare/build pairing.
+        let retained_text = if plan.store_text {
+            document.text.clone()
+        } else {
+            None
+        };
+        let token_lists = document
+            .chunks
+            .iter()
+            .map(|chunk| {
+                if plan.store_text || plan.index_text {
+                    tokenize(&chunk.text)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut chunk_ids = Vec::with_capacity(document.chunks.len());
+        for chunk in &document.chunks {
+            let embedding = embedding_by_chunk
+                .get(chunk.chunk_id.as_str())
+                .ok_or_else(|| invalid_err("prepared plan chunk is missing its embedding"))?;
+            added_chunks.push(serde_json::json!({
+                "chunk_id": chunk.chunk_id,
+                "document_id": document.document_id,
+                "content_hash": crate::text::hash::sha256_text(&chunk.text),
+                "embedding": embedding,
+            }));
+            chunk_ids.push(chunk.chunk_id.clone());
+        }
+        // Content hash over the retained raw text when kept, else over the joined
+        // chunk texts -- identical to apply_text_upsert.
+        let content_hash = retained_text
+            .as_ref()
+            .map(|text| crate::text::hash::sha256_text(text))
+            .unwrap_or_else(|| {
+                crate::text::hash::sha256_text(
+                    &document
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            });
+        wal_documents.push(serde_json::json!({
+            "document_id": document.document_id,
+            "content_hash": content_hash,
+            "metadata": document.metadata,
+            "text": retained_text,
+            "chunk_ids": chunk_ids,
+            "tokens": token_lists,
+        }));
+    }
+    Ok(serde_json::json!({
+        "documents": wal_documents,
+        "added_chunks": added_chunks,
+        // Empty: the folding writer derives a replacement's retired chunks
+        // from its own index state (see apply_embedded_documents_wal).
+        "removed_chunk_ids": [],
+    }))
 }
 
 /// Collects the current vectors for the given chunk ids that are NOT in `skip`

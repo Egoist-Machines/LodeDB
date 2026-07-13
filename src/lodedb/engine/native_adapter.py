@@ -954,8 +954,20 @@ class NativeCoreEngineHandle:
     def applied_lsn(self, index_id: str) -> int:
         return int(self._engine.applied_lsn(str(index_id)))
 
+    def fold_wal_segment(self, index_id: str, segment: bytes, first_lsn: int) -> int:
+        """Decodes an unstamped WAL segment, stamps LSNs from ``first_lsn``, and
+        applies it in memory; returns the number of records applied (records at
+        or below the applied watermark skip). Does not persist."""
+        return int(self._engine.fold_wal_segment(str(index_id), bytes(segment), int(first_lsn)))
+
     def close(self) -> None:
         self._engine.close()
+
+    def discard(self) -> None:
+        """Releases the store without persisting: un-persisted in-memory state is
+        dropped (the store stays at its last committed generation) and the writer
+        lock is released. The abort path after a failed fold."""
+        self._engine.discard()
 
     @staticmethod
     def _loads(payload: str) -> dict[str, Any]:

@@ -522,6 +522,9 @@ lodedb mcp         # stdio MCP server for agent memory
 lodedb benchmark   # local, metrics-only benchmark
 ```
 
+Use `lodedb serve` as a local OpenAI-compatible embeddings provider; see [LodeDB as a local
+embeddings provider](docs/integrations.md#lodedb-as-a-local-embeddings-provider).
+
 ## Use as an MCP server
 
 LodeDB ships a [Model Context Protocol](https://modelcontextprotocol.io) server, so an agent
