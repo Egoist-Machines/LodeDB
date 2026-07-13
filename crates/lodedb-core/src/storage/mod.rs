@@ -7,8 +7,15 @@ pub mod state_journal;
 pub mod text_store;
 pub mod tvann_store;
 pub mod tvim_delta;
+pub mod tvvf_store;
 pub(crate) mod util;
 pub mod wal;
+
+pub use tvvf_store::{
+    append_delta, append_delta_with_fsync, base_path as tvvf_base_path, fold, fold_with_fsync,
+    manifest_path as tvvf_manifest_path, record_base as record_tvvf_base, record_base_with_fsync,
+    TvvfDtype, TvvfError, TvvfManifestEntry, TvvfReader, TvvfResult,
+};
 
 use crate::error::CoreError;
 use crate::storage::commit_manifest::{
@@ -54,6 +61,11 @@ pub struct LoadedStore {
     /// found. The engine still validates it against the live calibration
     /// fingerprint and chunk set before use, rebuilding on any mismatch.
     pub ann: Option<LoadedAnn>,
+    /// The original-precision sidecar is correctness-neutral until the later
+    /// rescore query stage lands. Corruption therefore disables only rescore and
+    /// leaves the generation store readable.
+    pub tvvf_manifest: Option<TvvfManifestEntry>,
+    pub tvvf_reader: Option<TvvfReader>,
     pub wal_records: Vec<WalRecord>,
 }
 
@@ -115,6 +127,8 @@ pub fn load_store(
             lexical_tokens: BTreeMap::new(),
             multivec: MultiVecMap::new(),
             ann: None,
+            tvvf_manifest: None,
+            tvvf_reader: None,
             wal_records: Vec::new(),
         });
     }
@@ -202,6 +216,28 @@ pub fn load_generation_store(
         }
         _ => None,
     };
+    let tvvf_manifest = manifest.store_manifest("tvvf").cloned();
+    let tvvf_reader = match tvvf_manifest.as_ref() {
+        Some(tvvf_manifest) => match (|| {
+            // The root manifest belongs to this index, so reject a sidecar
+            // manifest copied from another index before its paths are opened.
+            // Reading the embedded epoch first also makes the identity helper
+            // validate that the manifest's key and epoch form a coherent pair.
+            let (_, vf_epoch) = tvvf_store::validate_manifest_identity(tvvf_manifest, "", 0)?;
+            tvvf_store::validate_manifest_identity(tvvf_manifest, &index_key, vf_epoch)?;
+            TvvfReader::open(persistence_dir, tvvf_manifest)
+        })() {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                let kind = if error.is_corrupt() { "corrupt" } else { "unavailable" };
+                eprintln!(
+                    "lodedb: {kind} tvvf sidecar for index {index_key}; rescore disabled: {error}"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let wal_records = if options.read_wal && !options.read_only {
         wal::read_records(&wal::wal_path(persistence_dir, &index_key))?
     } else {
@@ -220,6 +256,8 @@ pub fn load_generation_store(
         lexical_tokens,
         multivec,
         ann,
+        tvvf_manifest,
+        tvvf_reader,
         wal_records,
     })
 }
@@ -316,6 +354,10 @@ pub struct GenerationCommitInput<'a> {
     /// The ANN cluster partition to persist, when the index opts into ANN and the
     /// clustering would actually be used. `None` writes no `.tvann` base.
     pub ann: Option<AnnBaseInput<'a>>,
+    /// Prewritten original-precision sidecar manifest. The engine writes the
+    /// sidecar before this root manifest is sealed, making unreferenced remnants
+    /// harmless after a crash.
+    pub tvvf_manifest: Option<TvvfManifestEntry>,
     /// Whether the retained document-text base is zstd-compressed. Threaded from
     /// the engine's effective (persisted-or-seeded) flag down to
     /// [`text_store::record_base`].
@@ -409,6 +451,7 @@ pub fn write_generation_commit(
         tvlex_manifest: lexical_manifest,
         tvmv_manifest: multivec_manifest,
         tvann_manifest,
+        tvvf_manifest: input.tvvf_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),
@@ -459,6 +502,13 @@ pub struct GenerationDeltaInput<'a> {
     /// ANN sidecar decision so the storage layer no longer re-infers it from the
     /// tvim delta, which cannot tell an unchanged re-emit from a real move.
     pub vectors_changed: bool,
+    /// Newly written original-precision sidecar manifest, if rows changed. A
+    /// `None` carries the preceding sidecar forward for metadata-only commits.
+    pub tvvf_manifest: Option<TvvfManifestEntry>,
+    /// Drops a previously committed original-precision sidecar from this root
+    /// manifest. Used after a fail-open reader loss and a later vector mutation:
+    /// carrying the old capture data alongside new `.tvim` rows would be stale.
+    pub drop_tvvf_manifest: bool,
     /// `Some` only when `store_text` is on; carries the changed documents' text.
     pub raw_text_upserts: Option<BTreeMap<String, String>>,
     /// Live documents whose retained raw text was cleared since the base. A delta
@@ -663,6 +713,13 @@ pub fn write_generation_delta(
     } else {
         previous.store_manifest("tvann").cloned()
     };
+    let tvvf_manifest = if input.drop_tvvf_manifest {
+        None
+    } else {
+        input
+            .tvvf_manifest
+            .or_else(|| previous.store_manifest("tvvf").cloned())
+    };
     let body = build_commit_body(CommitBodyInput {
         index_key: input.index_key,
         generation: input.generation,
@@ -679,6 +736,7 @@ pub fn write_generation_delta(
         tvlex_manifest: lexical_manifest,
         tvmv_manifest: multivec_manifest,
         tvann_manifest,
+        tvvf_manifest,
     });
     write_commit_manifest(
         &commit_manifest_path(persistence_dir, input.index_key),
@@ -727,6 +785,7 @@ pub fn write_generation_watermark(
         tvlex_manifest: previous.store_manifest("tvlex").cloned(),
         tvmv_manifest: previous.store_manifest("tvmv").cloned(),
         tvann_manifest: previous.store_manifest("tvann").cloned(),
+        tvvf_manifest: previous.store_manifest("tvvf").cloned(),
     });
     write_commit_manifest(&commit_manifest_path(persistence_dir, index_key), &body, fsync)?;
     Ok(body)

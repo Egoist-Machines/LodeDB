@@ -21,6 +21,7 @@ from lodedb.local import (
     LodeLateInteractionIndex,
     LodeSearchHit,
     ReadOnlyError,
+    RescoreOptions,
     local_capability_report,
 )
 from lodedb.local.cli import app, main
@@ -41,6 +42,7 @@ __all__ = [
     "LodeLateInteractionIndex",
     "LodeSearchHit",
     "ReadOnlyError",
+    "RescoreOptions",
     "app",
     "local_capability_report",
     "main",

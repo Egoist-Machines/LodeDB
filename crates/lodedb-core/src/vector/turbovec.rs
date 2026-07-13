@@ -530,6 +530,14 @@ impl TurboVecNativeIndex {
         removed
     }
 
+    /// Reorders physical slots by stable id and drops any GPU session built for
+    /// the previous slot layout.
+    pub fn reorder_slots(&mut self, ids: &[u64]) -> Result<(), CoreError> {
+        self.index.reorder_to_ids(ids).map_err(core_error)?;
+        self.invalidate_gpu_session();
+        Ok(())
+    }
+
     /// Persists the `.tvim` payload and returns metrics-only write details.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<VectorIndexWriteMetrics, CoreError> {
         let started = Instant::now();

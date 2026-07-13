@@ -152,6 +152,9 @@ pub struct CommitBodyInput<'a> {
     pub tvlex_manifest: Option<Value>,
     pub tvmv_manifest: Option<Value>,
     pub tvann_manifest: Option<Value>,
+    /// Original-precision vector sidecar manifest. Unlike `tvann`, this key is
+    /// omitted when disabled so existing rescore-off bodies remain byte-identical.
+    pub tvvf_manifest: Option<Value>,
 }
 
 pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
@@ -173,6 +176,9 @@ pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
     // forward from a pre-`native_dim` commit stays byte-for-byte as it was.
     if let Some(native_dim) = input.native_dim {
         body["native_dim"] = serde_json::json!(native_dim);
+    }
+    if let Some(tvvf_manifest) = input.tvvf_manifest {
+        body["tvvf"] = tvvf_manifest;
     }
     body
 }

@@ -16,7 +16,7 @@
 //! store round-trips byte-identically across the two engines.
 
 use crate::storage::util::{
-    corrupt, get_i64, get_str, read_json, sha256_bytes_hex, sha256_file_hex, sidecar_base_block,
+    corrupt, f16_bits_to_f32, get_i64, get_str, read_json, sha256_bytes_hex, sha256_file_hex, sidecar_base_block,
     validate_sidecar_manifest, value_object, write_bytes_atomic, write_pretty_json_atomic,
     CoreResult,
 };
@@ -83,25 +83,6 @@ impl MultiVecRecord {
                 .collect(),
         }
     }
-}
-
-/// IEEE 754 half-precision bits to f32, matching numpy's float16->float32.
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = if (bits >> 15) & 1 == 1 { -1.0_f32 } else { 1.0 };
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = (bits & 0x3ff) as f32;
-    let magnitude = match exponent {
-        0 => mantissa * 2.0_f32.powi(-24),
-        0x1f => {
-            if mantissa == 0.0 {
-                f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        _ => (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent as i32 - 15),
-    };
-    sign * magnitude
 }
 
 fn delta_dir(base_path: &Path) -> PathBuf {

@@ -133,6 +133,37 @@ impl fmt::Display for ConstructError {
 
 impl Error for ConstructError {}
 
+/// Errors from [`IdMapIndex::reorder_to_ids`](crate::IdMapIndex::reorder_to_ids).
+///
+/// Local appliance extension on top of upstream v0.9.0, see
+/// `LOCAL_PATCHES.md` at the repository root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurboVecError {
+    /// The requested slot order has a different number of ids than the index.
+    IdsCountMismatch { expected: usize, got: usize },
+
+    /// An external id in the requested order is not present in the index.
+    UnknownId(u64),
+
+    /// An external id appeared more than once in the requested order.
+    DuplicateId(u64),
+}
+
+impl fmt::Display for TurboVecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdsCountMismatch { expected, got } => {
+                write!(f, "expected {expected} ids, got {got}")
+            }
+            Self::UnknownId(id) => write!(f, "id {id} is not present in the index"),
+            Self::DuplicateId(id) => write!(f, "id {id} appears more than once in this call"),
+        }
+    }
+}
+
+impl Error for TurboVecError {}
+
 /// Errors from the encoded-row export/import surface
 /// ([`IdMapIndex::export_encoded`](crate::IdMapIndex::export_encoded),
 /// [`IdMapIndex::add_encoded`](crate::IdMapIndex::add_encoded)).

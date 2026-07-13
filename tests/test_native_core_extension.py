@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,21 @@ def _onehot(axis: int, dim: int = 8) -> list[float]:
     vector = [0.0] * dim
     vector[axis] = 1.0
     return vector
+
+
+def test_native_build_profile_is_reported() -> None:
+    assert native_core.native_build_profile() in {"debug", "release"}
+
+
+def test_native_build_profile_warning_only_for_debug() -> None:
+    with pytest.warns(RuntimeWarning, match="compiled without optimizations"):
+        native_core._warn_if_debug_build("debug")
+
+    for profile in ("release", "unknown"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            native_core._warn_if_debug_build(profile)
+        assert not caught
 
 
 def _loads(payload: str) -> dict:
