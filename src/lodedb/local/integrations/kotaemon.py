@@ -27,13 +27,13 @@ LodeDB index is created lazily on the first ``add`` and its shape is recorded in
 a small ``kotaemon_store.json`` sidecar for reopens. LodeDB indexes require a
 dimension that is a multiple of 8, so vectors at any other dimension are
 zero-padded up to the next multiple of 8; zero padding changes neither vector
-norms nor dot products, so cosine scores are exactly what the unpadded vectors
-would produce.
+norms nor dot products before LodeDB applies the configured quantization.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import tempfile
 import threading
@@ -193,7 +193,19 @@ class LodeDBVectorStore:
             doc_ids = [str(value) for value in ids]
         resolved_ids = [value if value is not None else str(uuid.uuid4()) for value in doc_ids]
 
-        db = self._ensure_open(vector_dim=len(vectors[0]))
+        vector_dim = len(vectors[0])
+        if vector_dim <= 0:
+            raise ValueError("embeddings must be non-empty vectors")
+        for index, vector in enumerate(vectors):
+            if len(vector) != vector_dim:
+                raise ValueError(
+                    "all embeddings in a batch must have the same dimension; "
+                    f"row 0 has {vector_dim}, row {index} has {len(vector)}"
+                )
+            if not all(math.isfinite(value) for value in vector):
+                raise ValueError(f"embedding row {index} contains a non-finite value")
+
+        db = self._ensure_open(vector_dim=vector_dim)
         documents = []
         for vector, doc_id, metadata, text in zip(
             vectors, resolved_ids, doc_metadatas, texts, strict=True
@@ -219,8 +231,7 @@ class LodeDBVectorStore:
         db = self._get_db()
         if db is None:
             return
-        for doc_id in ids:
-            db.remove(str(doc_id))
+        db.remove_many([str(doc_id) for doc_id in ids])
 
     def query(
         self,
@@ -238,12 +249,15 @@ class LodeDBVectorStore:
         dict, and pushes down into LodeDB's metadata planner. Ranking hints that
         kotaemon's default Chroma backend also ignores (``mode``,
         ``mmr_threshold``, ...) are accepted and ignored; any other keyword
-        raises. Similarities are exact cosine scores, higher is better. The first
-        tuple element is ``[None] * n``: LodeDB does not expose stored vectors,
-        and kotaemon's pipelines discard this element.
+        raises. ``where`` accepts the native LodeDB predicate shape that
+        kotaemon's table-prioritization path forwards. Similarities are
+        quantized cosine scores (higher is better). The first tuple element is
+        ``[None] * n``: LodeDB does not expose stored vectors, and kotaemon's
+        pipelines discard this element.
         """
 
         li_filters = kwargs.pop("filters", None)
+        where = kwargs.pop("where", None)
         allowlist = _combine_allowlists(ids, kwargs.pop("doc_ids", None))
         unexpected = set(kwargs) - _IGNORED_QUERY_KWARGS
         if unexpected:
@@ -264,7 +278,17 @@ class LodeDBVectorStore:
         translated = _translate_li_filters(li_filters)
         if translated:
             clauses.append(translated)
-        lode_filter = clauses[0] if len(clauses) == 1 else ({"$and": clauses} if clauses else None)
+        if where is not None:
+            if not isinstance(where, Mapping):
+                raise TypeError(
+                    "where must be a LodeDB filter dict, "
+                    f"got {type(where).__name__}"
+                )
+            if where:
+                clauses.append(dict(where))
+        lode_filter = (
+            clauses[0] if len(clauses) == 1 else ({"$and": clauses} if clauses else None)
+        )
 
         hits = db.search_by_vector(self._pad(embedding), k=int(top_k), filter=lode_filter)
         # TurboVec's quantized cosine can exceed 1.0 by a small artifact on a
@@ -394,14 +418,41 @@ class LodeDBVectorStore:
             # LodeDB indexes require a multiple-of-8 dimension; zero padding is
             # exactly score-preserving for cosine similarity.
             self._padded_dim = ((self._vector_dim + 7) // 8) * 8
-            self._collection_path.mkdir(parents=True, exist_ok=True)
-            self._db = LodeDB.open_vector_store(
-                self._collection_path,
-                vector_dim=self._padded_dim,
-                bit_width=self._bit_width,
-                store_text=self._store_text,
-            )
-            self._write_meta()
+            self._base_path.mkdir(parents=True, exist_ok=True)
+            try:
+                # The collection directory is the unit drop() removes, so only
+                # claim a path created by this adapter. Reusing a sidecar-less
+                # directory could delete unrelated files on a later drop.
+                self._collection_path.mkdir()
+            except FileExistsError:
+                self._vector_dim = None
+                self._padded_dim = None
+                raise FileExistsError(
+                    f"refusing to initialize collection {self._collection_name!r}: "
+                    f"{self._collection_path} already exists without {_META_FILENAME}"
+                ) from None
+            try:
+                self._db = LodeDB.open_vector_store(
+                    self._collection_path,
+                    vector_dim=self._padded_dim,
+                    bit_width=self._bit_width,
+                    store_text=self._store_text,
+                )
+                self._write_meta()
+            except Exception:
+                # Do not leave a usable in-memory handle whose durable shape
+                # sidecar is missing: later writes would commit data that a new
+                # adapter instance cannot discover. Only this attempt's newly
+                # created collection directory is eligible for cleanup.
+                try:
+                    self._db.close()
+                except Exception:
+                    pass
+                self._db = None
+                self._vector_dim = None
+                self._padded_dim = None
+                shutil.rmtree(self._collection_path, ignore_errors=True)
+                raise
             return self._db
 
     def _write_meta(self) -> None:
@@ -424,9 +475,13 @@ class LodeDBVectorStore:
         fd, tmp = tempfile.mkstemp(
             dir=self._collection_path, prefix=_META_FILENAME, suffix=".tmp"
         )
-        with open(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        durable_replace(tmp, self._meta_path(), fsync=durability_from_env())
+        try:
+            with open(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            durable_replace(tmp, self._meta_path(), fsync=durability_from_env())
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def _pad(self, vector: Sequence[float]) -> list[float]:
         """Validates a vector's dimension and zero-pads it to the index shape."""

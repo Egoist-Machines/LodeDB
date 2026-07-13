@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dependency-free kotaemon vector-store adapter.** Configure
+  `lodedb.local.integrations.kotaemon.LodeDBVectorStore` through kotaemon's
+  `KH_VECTORSTORE` setting to use one local LodeDB collection per index, with
+  chunk scopes and metadata/table predicates pushed into the metadata planner.
+- `LodeDB.remove_many(ids)` batches document removal into one native mutation
+  and durable commit.
+
 ## [1.3.1] - 2026-07-08
 
 ### Added

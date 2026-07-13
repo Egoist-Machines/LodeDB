@@ -179,6 +179,61 @@ def test_query_translates_metadata_filters(tmp_path):
     assert out_ids == ["a"]
 
 
+def test_query_composes_kotaemon_where_with_filters_and_scope(tmp_path):
+    """The retrieval pipeline's native ``where`` predicate must not be rejected."""
+
+    db = _store(tmp_path)
+    db.add(
+        embeddings=EMBEDDINGS,
+        metadatas=[
+            {"file_id": "f1", "file_name": "report.pdf", "page_label": 1},
+            {"file_id": "f1", "file_name": "report.pdf", "page_label": 2},
+            {"file_id": "f2", "file_name": "other.pdf", "page_label": 1},
+        ],
+        ids=IDS,
+    )
+
+    filters = _LIFilters([_LIFilter("file_id", ["f1"], operator="in")])
+    _, _, out_ids = db.query(
+        embedding=EMBEDDINGS[0],
+        top_k=3,
+        doc_ids=["a", "c"],
+        filters=filters,
+        where={
+            "$and": [
+                {"file_name": {"$eq": "report.pdf"}},
+                {"page_label": {"$in": [1]}},
+            ]
+        },
+    )
+    assert out_ids == ["a"]
+
+    _, _, out_ids = db.query(
+        embedding=EMBEDDINGS[0],
+        top_k=3,
+        where={
+            "$or": [
+                {
+                    "$and": [
+                        {"file_name": {"$eq": "report.pdf"}},
+                        {"page_label": {"$in": [1]}},
+                    ]
+                },
+                {
+                    "$and": [
+                        {"file_name": {"$eq": "other.pdf"}},
+                        {"page_label": {"$in": [1]}},
+                    ]
+                },
+            ]
+        },
+    )
+    assert set(out_ids) == {"a", "c"}
+
+    with pytest.raises(TypeError, match="where must be"):
+        db.query(embedding=EMBEDDINGS[0], where=[{"file_name": "report.pdf"}])
+
+
 def test_query_filter_operator_translation(tmp_path):
     db = _store(tmp_path)
     db.add(embeddings=EMBEDDINGS, metadatas=METADATAS, ids=IDS)
@@ -259,6 +314,21 @@ def test_drop_never_deletes_foreign_directories(tmp_path):
     assert (foreign / "keep.txt").read_text(encoding="utf-8") == "precious"
 
 
+def test_add_refuses_foreign_collection_directory(tmp_path):
+    """A later drop must never claim a directory the adapter did not create."""
+
+    foreign = tmp_path / "test"
+    foreign.mkdir()
+    keep = foreign / "keep.txt"
+    keep.write_text("precious", encoding="utf-8")
+
+    db = _store(tmp_path)
+    with pytest.raises(FileExistsError, match="already exists"):
+        db.add(embeddings=[EMBEDDINGS[0]], ids=["a"])
+    db.drop()
+    assert keep.read_text(encoding="utf-8") == "precious"
+
+
 def test_dimension_mismatch_raises(tmp_path):
     db = _store(tmp_path)
     db.add(embeddings=EMBEDDINGS, ids=IDS)
@@ -266,6 +336,23 @@ def test_dimension_mismatch_raises(tmp_path):
         db.add(embeddings=[[0.1] * 8], ids=["z"])
     with pytest.raises(ValueError, match="3-dim"):
         db.query(embedding=[0.1] * 8, top_k=1)
+
+
+def test_invalid_first_batch_does_not_pin_collection_shape(tmp_path):
+    """Validate every row before publishing the first collection's dimension."""
+
+    db = _store(tmp_path)
+    with pytest.raises(ValueError, match="same dimension"):
+        db.add(embeddings=[[1.0, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0]])
+    assert not (tmp_path / "test").exists()
+
+    with pytest.raises(ValueError, match="non-finite"):
+        db.add(embeddings=[[1.0, 2.0, float("nan"), 4.0]])
+    assert not (tmp_path / "test").exists()
+
+    db.add(embeddings=[[1.0, 2.0, 3.0, 4.0]], ids=["valid"])
+    assert db.count() == 1
+    db.close()
 
 
 def test_multiple_of_8_dims_are_not_padded(tmp_path):
@@ -367,6 +454,28 @@ def test_fsync_durability_covers_shape_sidecar(tmp_path, monkeypatch):
     db2 = _store(tmp_path)
     assert db2.count() == 3
     db2.close()
+
+
+def test_shape_sidecar_failure_resets_lazy_handle(tmp_path, monkeypatch):
+    """A failed sidecar publish cannot leave a handle that accepts unreachable writes."""
+
+    db = _store(tmp_path)
+
+    def fail_write():
+        raise OSError("injected sidecar failure")
+
+    monkeypatch.setattr(db, "_write_meta", fail_write)
+    with pytest.raises(OSError, match="injected sidecar failure"):
+        db.add(embeddings=[EMBEDDINGS[0]], ids=["a"])
+    assert db._db is None
+    assert db._vector_dim is None
+    assert db._padded_dim is None
+    assert not (tmp_path / "test" / "kotaemon_store.json").exists()
+
+    monkeypatch.undo()
+    db.add(embeddings=[EMBEDDINGS[0]], ids=["a"])
+    assert db.count() == 1
+    db.close()
 
 
 def test_store_text_retains_doc_text(tmp_path):

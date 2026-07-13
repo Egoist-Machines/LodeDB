@@ -218,8 +218,8 @@ the local-bridge step first.
   the store meets whatever model the user selected — so the LodeDB index is created lazily on
   first `add` and its shape is recorded in a `kotaemon_store.json` sidecar for reopens.
   Dimensions that are not a multiple of 8 (a LodeDB index requirement) are zero-padded up,
-  which changes neither norms nor dot products, so cosine scores are exact. Chunk text and
-  documents stay in kotaemon's docstore (retrieval re-reads them by id); the adapter keeps
+  which changes neither norms nor dot products before LodeDB's configured quantization. Chunk
+  text and documents stay in kotaemon's docstore (retrieval re-reads them by id); the adapter keeps
   only vectors, ids, and scalar filter metadata (e.g. `file_id`), with each row's id mirrored
   into a reserved `kh::id` metadata key so kotaemon's chunk-id `scope` (`doc_ids`) and the
   `file_id IN [...]` `MetadataFilters` push down into LodeDB's metadata planner.
