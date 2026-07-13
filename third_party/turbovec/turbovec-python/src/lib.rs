@@ -611,6 +611,27 @@ struct PyCoreEngine {
     inner: RustCoreEngine,
 }
 
+impl PyCoreEngine {
+    /// Runs a read-path native call with the GIL released. The first query on a
+    /// large store can trigger minutes-to-hours of lazy native work (ANN k-means,
+    /// rescore sidecar open), which must not starve the host's Python threads.
+    fn detached<R: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl FnOnce(&RustCoreEngine) -> Result<R, CoreError> + Send,
+    ) -> PyResult<R> {
+        let engine_addr = &self.inner as *const RustCoreEngine as usize;
+        py.detach(move || {
+            // SAFETY: `self` outlives this synchronous call, the closure runs on
+            // the engine-owning thread, and no Python state is touched while the
+            // GIL is released.
+            let inner: &RustCoreEngine = unsafe { &*(engine_addr as *const RustCoreEngine) };
+            call(inner)
+        })
+        .map_err(native_core_error_to_py)
+    }
+}
+
 #[pymethods]
 impl PyCoreEngine {
     #[new]
@@ -875,6 +896,7 @@ impl PyCoreEngine {
 
     fn query_vector(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_vector_json: &str,
         top_k: usize,
@@ -882,16 +904,16 @@ impl PyCoreEngine {
     ) -> PyResult<String> {
         let query_vector = native_from_json::<Vec<f32>>(query_vector_json)?;
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .query_vector(index_id, &query_vector, top_k, filter.as_ref())
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.query_vector(&index_id, &query_vector, top_k, filter.as_ref())
+        })?;
+        native_to_json(&results)
     }
 
     fn query_vectors_batch(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_vectors_json: &str,
         top_k: usize,
@@ -899,12 +921,11 @@ impl PyCoreEngine {
     ) -> PyResult<String> {
         let query_vectors = native_from_json::<Vec<Vec<f32>>>(query_vectors_json)?;
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .query_vectors_batch(index_id, &query_vectors, top_k, filter.as_ref())
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.query_vectors_batch(&index_id, &query_vectors, top_k, filter.as_ref())
+        })?;
+        native_to_json(&results)
     }
 
     /// Array-input fast path for a single vector query.
@@ -915,14 +936,12 @@ impl PyCoreEngine {
     /// small) so the caller contract is identical to `query_vector`.
     fn query_vector_array(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_vector: PyReadonlyArray1<f32>,
         top_k: usize,
         filter_json: Option<&str>,
     ) -> PyResult<String> {
-        // Borrow the contiguous NumPy buffer directly rather than copying it into
-        // an owned Vec; the core query path takes a `&[f32]` slice, so a single
-        // query reaches the kernel with no boundary copy.
         let array = query_vector.as_array();
         let query = array
             .as_slice()
@@ -931,12 +950,14 @@ impl PyCoreEngine {
             validate_queries(query, query.len())?;
         }
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .query_vector(index_id, query, top_k, filter.as_ref())
-                .map_err(native_core_error_to_py)?,
-        )
+        // NumPy borrows are GIL-bound, so own the query before the native call
+        // releases the GIL.
+        let query = query.to_vec();
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.query_vector(&index_id, &query, top_k, filter.as_ref())
+        })?;
+        native_to_json(&results)
     }
 
     /// Array-input fast path for a batch of vector queries.
@@ -945,6 +966,7 @@ impl PyCoreEngine {
     /// `query_vectors_batch` but skips JSON-encoding the query matrix.
     fn query_vectors_batch_array(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_vectors: PyReadonlyArray2<f32>,
         top_k: usize,
@@ -963,12 +985,11 @@ impl PyCoreEngine {
         validate_queries(slice, dim)?;
         let queries: Vec<Vec<f32>> = slice.chunks(dim).map(|row| row.to_vec()).collect();
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .query_vectors_batch(index_id, &queries, top_k, filter.as_ref())
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.query_vectors_batch(&index_id, &queries, top_k, filter.as_ref())
+        })?;
+        native_to_json(&results)
     }
 
     /// Near-zero-copy batch query: flat query matrix in, arrays out.
@@ -1005,20 +1026,9 @@ impl PyCoreEngine {
         // batch, after which other Python threads make progress while it scans.
         let queries: Vec<f32> = slice.to_vec();
         let index_id = index_id.to_owned();
-        // Pass the engine as an integer address so the closure is `Ungil` without a
-        // custom impl (a raw-pointer wrapper trips coherence's conservative future-
-        // `Send` reasoning); `usize` is `Ungil` via pyo3's blanket impl.
-        let engine_addr = &self.inner as *const RustCoreEngine as usize;
-        let arrays = py
-            .detach(move || {
-                // SAFETY: `self` outlives this synchronous `detach` call and the
-                // closure runs on the current (engine-owning) thread, so the address
-                // is valid and the engine is never shared across threads; the scan is
-                // pure native and touches no Python state while the GIL is released.
-                let inner: &RustCoreEngine = unsafe { &*(engine_addr as *const RustCoreEngine) };
-                inner.query_vectors_batch_arrays(&index_id, &queries, dim, top_k, filter.as_ref())
-            })
-            .map_err(native_core_error_to_py)?;
+        let arrays = self.detached(py, move |inner| {
+            inner.query_vectors_batch_arrays(&index_id, &queries, dim, top_k, filter.as_ref())
+        })?;
         // Metadata is the only part that crosses as JSON; skip serializing it when
         // the caller only needs scores and ids.
         let metadata_json = if want_metadata {
@@ -1097,6 +1107,7 @@ impl PyCoreEngine {
 
     fn search_embedded_text(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_plan_json: &str,
         query_embedding_json: Option<&str>,
@@ -1107,22 +1118,22 @@ impl PyCoreEngine {
         let query_embedding: Option<Vec<f32>> =
             query_embedding_json.map(native_from_json).transpose()?;
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .search_embedded_text(
-                    index_id,
-                    &query_plan,
-                    query_embedding.as_deref(),
-                    top_k,
-                    filter.as_ref(),
-                )
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.search_embedded_text(
+                &index_id,
+                &query_plan,
+                query_embedding.as_deref(),
+                top_k,
+                filter.as_ref(),
+            )
+        })?;
+        native_to_json(&results)
     }
 
     fn search_embedded_text_array(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_plan_json: &str,
         query_embedding: PyReadonlyArray1<f32>,
@@ -1132,22 +1143,22 @@ impl PyCoreEngine {
         let query_plan = native_from_json::<QueryPlan>(query_plan_json)?;
         let query_embedding = query_embedding_from_array(query_embedding)?;
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .search_embedded_text(
-                    index_id,
-                    &query_plan,
-                    Some(&query_embedding),
-                    top_k,
-                    filter.as_ref(),
-                )
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.search_embedded_text(
+                &index_id,
+                &query_plan,
+                Some(&query_embedding),
+                top_k,
+                filter.as_ref(),
+            )
+        })?;
+        native_to_json(&results)
     }
 
     fn search_embedded_text_batch(
         &self,
+        py: Python<'_>,
         index_id: &str,
         query_plans_json: &str,
         query_embeddings: Option<PyReadonlyArray2<f32>>,
@@ -1163,18 +1174,17 @@ impl PyCoreEngine {
                 .collect()
         });
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .search_embedded_text_batch(
-                    index_id,
-                    &query_plans,
-                    embeddings.as_deref(),
-                    top_k,
-                    filter.as_ref(),
-                )
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let results = self.detached(py, move |inner| {
+            inner.search_embedded_text_batch(
+                &index_id,
+                &query_plans,
+                embeddings.as_deref(),
+                top_k,
+                filter.as_ref(),
+            )
+        })?;
+        native_to_json(&results)
     }
 
     fn stats(&self, index_id: &str) -> PyResult<String> {
