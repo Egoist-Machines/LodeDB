@@ -2,9 +2,11 @@
 
 `LodeDB.open_vector_store(path, vector_dim=N)` (or `LodeDB(path, vector_dim=N)`)
 creates an index with no internal embedding model, pinned to a caller-chosen dim
-(any value an external embedder produces, e.g. 256/1536/3072). Only the vector-in
-verbs work; text-in raises. The dim and a redacted identity persist and re-enforce
-on reopen. Uses the real TurboVec (no embedding backend injected).
+(any value an external embedder produces, e.g. 256/1536/3072). The vector-in verbs
+work, and so does keyword search (``search(mode="lexical")`` over retained text);
+the embedding verbs (``add``/``add_many``, vector/hybrid ``search``) raise. The dim
+and a redacted identity persist and re-enforce on reopen. Uses the real TurboVec
+(no embedding backend injected).
 """
 
 from __future__ import annotations
@@ -47,16 +49,90 @@ def test_vector_dim_via_init_is_equivalent(tmp_path):
     assert db.search_by_vector(_onehot(0), k=1)[0].id == "a"
 
 
-def test_text_in_methods_raise(tmp_path):
+def test_embedding_methods_raise(tmp_path):
+    """Verbs that must embed text raise on a vector-only (no-embedder) index.
+
+    ``add`` / ``add_many`` embed documents; ``search`` in vector/hybrid mode embeds
+    the query. Lexical search embeds nothing and is covered separately below.
+    """
+
     db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
     with pytest.raises(VectorOnlyIndexError):
         db.add("hello", id="t")
     with pytest.raises(VectorOnlyIndexError):
         db.add_many([{"text": "hello", "id": "t"}])
     with pytest.raises(VectorOnlyIndexError):
-        db.search("hello")
+        db.search("hello", mode="vector")
     with pytest.raises(VectorOnlyIndexError):
-        db.search_many(["hello"])
+        db.search("hello", mode="hybrid")
+    with pytest.raises(VectorOnlyIndexError):
+        db.search_many(["hello"], mode="hybrid")
+
+
+def test_lexical_search_on_vector_only(tmp_path):
+    """mode="lexical" ranks the text carried on stored vectors (no embedder needed)."""
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)  # store_text=True by default
+    db.add_vectors_many(
+        [
+            {"vector": _onehot(0), "id": "a", "text": "the quick brown fox"},
+            {"vector": _onehot(8), "id": "b", "text": "a slow green turtle"},
+            {"vector": _onehot(16), "id": "c", "text": "the quick blue hare"},
+        ]
+    )
+    hits = db.search("quick", mode="lexical", k=5)
+    assert {h.id for h in hits} == {"a", "c"}
+    assert all(h.score > 0 for h in hits)
+    # An unset mode resolves to lexical on a vector-only index (not hybrid).
+    assert {h.id for h in db.search("quick", k=5)} == {"a", "c"}
+    # Batch lexical works too.
+    batch = db.search_many(["quick", "turtle"], mode="lexical", k=5)
+    assert {h.id for h in batch[0]} == {"a", "c"}
+    assert {h.id for h in batch[1]} == {"b"}
+
+
+def test_lexical_search_with_filter_on_vector_only(tmp_path):
+    """A metadata filter constrains the lexical ranking as an allowlist."""
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
+    db.add_vectors_many(
+        [
+            {"vector": _onehot(0), "id": "a", "text": "quick fox", "metadata": {"lang": "en"}},
+            {"vector": _onehot(8), "id": "c", "text": "quick hare", "metadata": {"lang": "de"}},
+        ]
+    )
+    hits = db.search("quick", mode="lexical", k=5, filter={"lang": "en"})
+    assert [h.id for h in hits] == ["a"]
+
+
+def test_lexical_search_requires_a_lexical_source(tmp_path):
+    """Without retained text (store_text=False) there is nothing to rank; raise clearly."""
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM, store_text=False)
+    db.add_vectors(_onehot(0), id="a")
+    with pytest.raises(ValueError, match="lexical source"):
+        db.search("anything", mode="lexical")
+    # An unset mode is a lexical query on a vector-only index, so it raises the same way.
+    with pytest.raises(ValueError, match="lexical source"):
+        db.search("anything")
+
+
+def test_lexical_search_survives_reopen(tmp_path):
+    """The persisted lexical index answers keyword queries after a close/reopen."""
+
+    db = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
+    db.add_vectors_many(
+        [
+            {"vector": _onehot(0), "id": "a", "text": "the quick brown fox"},
+            {"vector": _onehot(8), "id": "b", "text": "a slow green turtle"},
+        ]
+    )
+    db.close()
+
+    reopened = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
+    hits = reopened.search("quick", mode="lexical", k=5)
+    assert [h.id for h in hits] == ["a"]
+    reopened.close()
 
 
 def test_dim_validation(tmp_path):
