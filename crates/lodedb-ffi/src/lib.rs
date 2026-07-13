@@ -1641,7 +1641,11 @@ mod tests {
 
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
         }
 
         let query = [1.0_f32, 0.0_f32];
@@ -1677,7 +1681,11 @@ mod tests {
         let index_id = string_view("default");
         unsafe {
             assert_eq!(lodedb_engine_new_in_memory(&mut engine, &mut error), 0);
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
         }
         let vector = [1.0_f32, 0.0_f32];
         let document = LodeVectorDocument {
@@ -1808,7 +1816,11 @@ mod tests {
             let mut engine: *mut LodeEngine = ptr::null_mut();
             assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
             assert!(!engine.is_null());
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
             assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
@@ -1896,7 +1908,11 @@ mod tests {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
             assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
             assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
@@ -1967,7 +1983,11 @@ mod tests {
             let mut error: *mut LodeError = ptr::null_mut();
             let mut engine: *mut LodeEngine = ptr::null_mut();
             assert_ffi_ok(lodedb_engine_open_json(options_view, &mut engine, &mut error), &mut error, "lodedb_engine_open_json");
-            assert_eq!(create_default_index(engine, &mut error), 0);
+            assert_ffi_ok(
+                create_default_index(engine, &mut error),
+                &mut error,
+                "lodedb_engine_create_index_json",
+            );
             assert_ffi_ok(lodedb_engine_persist(engine, &mut error), &mut error, "lodedb_engine_persist");
             lodedb_engine_free(engine);
         }
@@ -2015,7 +2035,11 @@ mod tests {
             let status =
                 lodedb_checkpointer_checkpoint(ptr::null_mut(), &mut folded, &mut error);
             assert_eq!(status, CoreErrorCode::InvalidArgument.ffi_status_code());
-            lodedb_error_free(error);
+            assert_eq!(
+                take_error_text(&mut error),
+                format!("code {status}: checkpointer pointer is null")
+            );
+            assert!(error.is_null(), "take_error_text must clear a freed error");
         }
 
         // A read-only open reads only the committed generation (it never replays the
