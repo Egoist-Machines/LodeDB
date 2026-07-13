@@ -131,6 +131,37 @@ fn ann_warm_and_compact_write_a_cluster_contiguous_fresh_base() {
 }
 
 #[test]
+fn ann_warm_skips_configurations_that_cannot_prune() {
+    for (label, clusters, nprobe) in [("probe_all", 4, 4), ("one_cluster", 1, 1)] {
+        let path = temp_dir(label);
+        let mut engine = CoreEngine::open(open_options(&path)).unwrap();
+        let mut create = options(true, false);
+        create.ann = Some(CoreAnnOptions {
+            algorithm: CoreAnnOptions::CLUSTER.to_string(),
+            clusters: Some(clusters),
+            nprobe: Some(nprobe),
+        });
+        engine.create_index_with_options(create).unwrap();
+        engine.upsert_vectors("default", &clustered_documents()).unwrap();
+        engine.persist().unwrap();
+
+        assert!(!engine.ann_warm("default").unwrap());
+        assert!(!engine.ann_cluster_resident("default").unwrap());
+        engine.compact("default").unwrap();
+        engine.persist().unwrap();
+        let loaded = lodedb_core::storage::load_store(
+            &path,
+            "default",
+            lodedb_core::storage::LoadOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.ann.is_none(), "non-pruning compact must not persist .tvann");
+        drop(engine);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
 fn stats_report_rescore_and_ann_states_without_warming_them() {
     let mut exact = CoreEngine::new_in_memory();
     exact

@@ -25,6 +25,8 @@ use std::sync::Arc;
 pub const TVVF_SCHEMA_VERSION: u64 = 1;
 pub const TVVF_BASE_MAGIC: &[u8; 8] = b"EEVFB001";
 pub const TVVF_DELTA_MAGIC: &[u8; 8] = b"EEVFD001";
+const TVVF_INTEGRITY_TRAILER_MAGIC: &[u8; 8] = b"EEVFT001";
+const TVVF_INTEGRITY_TRAILER_BYTES: u64 = 8 + 64;
 pub const TVVF_DELTA_DIR_SUFFIX: &str = ".tvvf-delta";
 pub const TVVF_DELTA_MANIFEST_NAME: &str = "manifest.json";
 
@@ -779,6 +781,9 @@ struct SegmentIndex {
     deleted_ids: Vec<u64>,
     checksums_offset: u64,
     rows_offset: u64,
+    file_bytes: u64,
+    ids_checksum: u64,
+    row_checksums_sha256: String,
 }
 
 /// An indexed delta segment ready to attach to a resident [`TvvfReader`].
@@ -814,12 +819,15 @@ struct Header {
     checksums_offset: u64,
     rows_offset: u64,
     row_stride: usize,
+    file_bytes: u64,
+    row_checksums_sha256: String,
 }
 
 struct Written {
     sha256: String,
     file_bytes: u64,
     ids_checksum: u64,
+    row_checksums_sha256: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1053,21 +1061,20 @@ where
         }
         let stride = row_stride(dtype, dim)?;
         let mut count = 0;
+        let mut row_checksums_sha = Sha256::new();
         payloads(&mut |row| {
             if row.len() != stride {
                 return Err(corrupt("tvvf writer row has unexpected encoded length"));
             }
             count += 1;
-            hashed_write(
-                &mut file,
-                &mut sha,
-                &mut bytes,
-                &row_checksum(row).to_le_bytes(),
-            )
+            let checksum = row_checksum(row).to_le_bytes();
+            row_checksums_sha.update(checksum);
+            hashed_write(&mut file, &mut sha, &mut bytes, &checksum)
         })?;
         if count != rows {
             return Err(corrupt("tvvf writer checksum stream changed row count"));
         }
+        let row_checksums_sha256 = format!("{:x}", row_checksums_sha.finalize());
         let mut count = 0;
         payloads(&mut |row| {
             if row.len() != stride {
@@ -1079,6 +1086,23 @@ where
         if count != rows {
             return Err(corrupt("tvvf writer payload stream changed row count"));
         }
+        // The manifest commits this digest while the segment carries the same
+        // value in a constant-size trailer. Opening a base can therefore reject
+        // a same-shape foreign segment with O(1) extra I/O instead of hashing the
+        // entire original-precision payload. Individual row CRCs still detect a
+        // payload tear at fetch time.
+        hashed_write(
+            &mut file,
+            &mut sha,
+            &mut bytes,
+            TVVF_INTEGRITY_TRAILER_MAGIC,
+        )?;
+        hashed_write(
+            &mut file,
+            &mut sha,
+            &mut bytes,
+            row_checksums_sha256.as_bytes(),
+        )?;
         let file = match file.into_inner() {
             Ok(file) => file,
             Err(error) => return Err(TvvfError::Io(error.into_error())),
@@ -1090,6 +1114,7 @@ where
             sha256: format!("{:x}", sha.finalize()),
             file_bytes: bytes,
             ids_checksum,
+            row_checksums_sha256,
         })
     })();
     let written = match written {
@@ -1154,6 +1179,7 @@ fn write_base_manifest(
             "dim": dim,
             "row_count": rows,
             "ids_checksum": written.ids_checksum,
+            "row_checksums_sha256": written.row_checksums_sha256,
         },
         "deltas": [],
         "next_seq": next_seq,
@@ -1212,8 +1238,14 @@ fn validate_manifest_base(manifest: &Value, path: &Path, base: &SegmentIndex) ->
         || base_block.get("dtype").and_then(Value::as_str) != Some(base.dtype.as_str())
         || base_block.get("dim").and_then(Value::as_u64) != Some(base.dim as u64)
         || base_block.get("row_count").and_then(Value::as_u64) != Some(base.ids.len() as u64)
+        || base_block.get("file_bytes").and_then(Value::as_u64) != Some(base.file_bytes)
+        || base_block.get("ids_checksum").and_then(Value::as_u64) != Some(base.ids_checksum)
+        || base_block
+            .get("row_checksums_sha256")
+            .and_then(Value::as_str)
+            != Some(base.row_checksums_sha256.as_str())
     {
-        return Err(corrupt("tvvf manifest base does not match base header"));
+        return Err(corrupt("tvvf manifest base does not match committed base identity"));
     }
     Ok(())
 }
@@ -1304,16 +1336,30 @@ fn read_header_from_file(file: &File, magic: &[u8; 8], delta: bool) -> TvvfResul
                 .ok_or_else(|| corrupt("tvvf checksum section overflows"))?,
         )
         .ok_or_else(|| corrupt("tvvf checksum section overflows"))?;
-    let expected = rows_offset
+    let rows_stop = rows_offset
         .checked_add(
             (row_count as u64)
                 .checked_mul(row_stride as u64)
                 .ok_or_else(|| corrupt("tvvf rows section overflows"))?,
         )
         .ok_or_else(|| corrupt("tvvf rows section overflows"))?;
+    let expected = rows_stop
+        .checked_add(TVVF_INTEGRITY_TRAILER_BYTES)
+        .ok_or_else(|| corrupt("tvvf integrity trailer overflows"))?;
     if expected != length {
         return Err(corrupt("tvvf segment has invalid length"));
     }
+    let mut trailer = [0_u8; TVVF_INTEGRITY_TRAILER_BYTES as usize];
+    read_exact_at(&file, &mut trailer, rows_stop)
+        .map_err(|error| corrupt(format!("tvvf integrity trailer is truncated: {error}")))?;
+    if &trailer[..8] != TVVF_INTEGRITY_TRAILER_MAGIC {
+        return Err(corrupt("tvvf segment has invalid integrity trailer"));
+    }
+    let row_checksums_sha256 = std::str::from_utf8(&trailer[8..])
+        .ok()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| corrupt("tvvf segment has invalid row-checksum digest"))?
+        .to_string();
     Ok(Header {
         dtype,
         dim,
@@ -1324,6 +1370,8 @@ fn read_header_from_file(file: &File, magic: &[u8; 8], delta: bool) -> TvvfResul
         checksums_offset,
         rows_offset,
         row_stride,
+        file_bytes: length,
+        row_checksums_sha256,
     })
 }
 
@@ -1400,6 +1448,9 @@ fn read_index_from_file(
         deleted_ids: header.deleted_ids,
         checksums_offset: header.checksums_offset,
         rows_offset: header.rows_offset,
+        file_bytes: header.file_bytes,
+        ids_checksum: header.ids_checksum,
+        row_checksums_sha256: header.row_checksums_sha256,
     })
 }
 
@@ -1674,6 +1725,42 @@ mod tests {
             assert_rows(&reader.fetch_rows(&[11, 22]), &expected, 1e-6);
             assert_eq!(reader.coverage(), (2, 0));
             assert_eq!(reader.index_key(), "index");
+        }
+    }
+
+    #[test]
+    fn same_shape_foreign_base_is_rejected_by_committed_identity() {
+        let original = temp_dir("base_identity_original");
+        let foreign = temp_dir("base_identity_foreign");
+        let original_rows = vec![(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])];
+        let foreign_rows = vec![(1, vec![9.0, 8.0]), (2, vec![7.0, 6.0])];
+        let manifest = record_base(
+            &original,
+            "index",
+            0,
+            TvvfDtype::Float32,
+            2,
+            &borrowed(&original_rows),
+        )
+        .unwrap();
+        record_base(
+            &foreign,
+            "index",
+            0,
+            TvvfDtype::Float32,
+            2,
+            &borrowed(&foreign_rows),
+        )
+        .unwrap();
+
+        fs::copy(
+            base_path(&foreign, "index", 0),
+            base_path(&original, "index", 0),
+        )
+        .unwrap();
+        match TvvfReader::open(&original, &manifest) {
+            Err(error) => assert!(error.is_corrupt()),
+            Ok(_) => panic!("same-shape foreign base opened under the committed manifest"),
         }
     }
 

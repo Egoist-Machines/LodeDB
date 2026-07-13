@@ -44,6 +44,8 @@ from lodedb.local.backends import (
 _PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
 _TVVF_BASE_MAGIC = b"EEVFB001"
 _TVVF_DELTA_MAGIC = b"EEVFD001"
+_TVVF_INTEGRITY_TRAILER_MAGIC = b"EEVFT001"
+_TVVF_INTEGRITY_TRAILER_BYTES = 8 + 64
 _TVVF_FNV_OFFSET = 0xCBF2_9CE4_8422_2325
 _TVVF_FNV_PRIME = 0x0000_0100_0000_01B3
 _TVVF_SCHEMA_VERSION = 1
@@ -172,7 +174,12 @@ def _read_tvvf_segment(
             if len(set(deleted_ids)) != len(deleted_ids):
                 raise ValueError(f"TVVF delta {path.name} has duplicate deleted ids")
         stride = _row_stride(dtype, dim)
-        expected_size = 16 + header_size + row_count * (8 + 4 + stride)
+        expected_size = (
+            16
+            + header_size
+            + row_count * (8 + 4 + stride)
+            + _TVVF_INTEGRITY_TRAILER_BYTES
+        )
         if file_size != expected_size:
             raise ValueError(f"TVVF segment {path.name} has an invalid length")
 
@@ -199,7 +206,17 @@ def _read_tvvf_segment(
         if is_delta and set(ids).intersection(deleted_ids):
             raise ValueError(f"TVVF delta {path.name} upserts and deletes the same stable id")
 
-        remaining = file_size - file.tell()
+        row_checksums_sha = hashlib.sha256()
+        remaining = row_count * 4
+        while remaining:
+            chunk = _read_exact(
+                file, min(remaining, _TVVF_READ_BYTES), f"TVVF row checksums {path.name}"
+            )
+            sha.update(chunk)
+            row_checksums_sha.update(chunk)
+            remaining -= len(chunk)
+
+        remaining = row_count * stride
         while remaining:
             chunk = _read_exact(
                 file, min(remaining, _TVVF_READ_BYTES), f"TVVF payload {path.name}"
@@ -207,11 +224,31 @@ def _read_tvvf_segment(
             sha.update(chunk)
             remaining -= len(chunk)
 
+        trailer = _read_exact(
+            file, _TVVF_INTEGRITY_TRAILER_BYTES, f"TVVF integrity trailer {path.name}"
+        )
+        sha.update(trailer)
+        if trailer[:8] != _TVVF_INTEGRITY_TRAILER_MAGIC:
+            raise ValueError(f"TVVF segment {path.name} has an invalid integrity trailer")
+        try:
+            row_checksums_digest = trailer[8:].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"TVVF segment {path.name} has an invalid row-checksum digest"
+            ) from error
+        if (
+            len(row_checksums_digest) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in row_checksums_digest)
+            or row_checksums_digest != row_checksums_sha.hexdigest()
+        ):
+            raise ValueError(f"TVVF segment {path.name} failed row-checksum identity validation")
+
     return {
         "dtype": dtype,
         "dim": dim,
         "row_count": row_count,
         "ids_checksum": ids_checksum,
+        "row_checksums_sha256": row_checksums_digest,
         "ids": ids,
         "deleted_ids": deleted_ids,
         "file_bytes": file_size,
@@ -275,7 +312,7 @@ def _validate_tvvf_sidecar(index_key: str, root: Path, manifest: Any) -> dict[st
         raise ValueError("TVVF base failed full-file SHA-256 validation")
     if base_manifest.get("file_bytes") != base["file_bytes"]:
         raise ValueError("TVVF base file size does not match its manifest")
-    for key in ("dtype", "dim", "row_count", "ids_checksum"):
+    for key in ("dtype", "dim", "row_count", "ids_checksum", "row_checksums_sha256"):
         if base_manifest.get(key) != base[key]:
             raise ValueError(f"TVVF base {key} does not match its header")
 

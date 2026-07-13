@@ -1138,7 +1138,11 @@ impl CoreEngine {
     /// `false` without doing any work.
     pub fn ann_warm(&self, index_id: &str) -> Result<bool, CoreError> {
         let index = self.index(index_id)?;
-        if index.ann_options.is_none() {
+        // Warming is the deployment/compaction path: build only when the durable
+        // configuration can prune and therefore persist a useful cluster layout.
+        // Probe-all and single-cluster configurations are exact scans; building
+        // k-means for them can cost minutes at scale and produces no `.tvann`.
+        if !index.ann_prunes_durable() {
             return Ok(false);
         }
         index.ensure_cluster_index()?;

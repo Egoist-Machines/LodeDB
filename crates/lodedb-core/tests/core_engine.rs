@@ -4853,7 +4853,11 @@ fn rescore_missing_row_falls_back_to_the_quantized_score() {
         .clone();
     let sidecar = lodedb_core::storage::tvvf_base_path(&path, "default", 1);
     let mut bytes = fs::read(&sidecar).unwrap();
-    *bytes.last_mut().unwrap() ^= 0xff;
+    // The final 72 bytes are the segment's constant-size identity trailer;
+    // corrupt the last row payload so open succeeds and the row-level CRC owns
+    // the intended fail-open fallback.
+    let last_payload_byte = bytes.len() - 72 - 1;
+    bytes[last_payload_byte] ^= 0xff;
     fs::write(&sidecar, bytes).unwrap();
 
     let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
