@@ -1239,16 +1239,36 @@ impl PyCoreEngine {
         )
     }
 
-    fn persist(&mut self) -> PyResult<()> {
-        self.inner.persist().map_err(native_core_error_to_py)
+    fn persist(&mut self, py: Python<'_>) -> PyResult<()> {
+        // A large store's persist is minutes of pure native work (state
+        // canonicalization, base serialization); holding the GIL that long
+        // starves every other Python thread in the host process (heartbeat
+        // threads, signal delivery), so release it like the batch scan does.
+        let engine_addr = &mut self.inner as *mut RustCoreEngine as usize;
+        py.detach(move || {
+            // SAFETY: `self` outlives this synchronous `detach` call, the closure
+            // runs on the current (engine-owning) thread, and this `&mut self`
+            // method holds the engine exclusively; no Python state is touched
+            // while the GIL is released.
+            let inner: &mut RustCoreEngine = unsafe { &mut *(engine_addr as *mut RustCoreEngine) };
+            inner.persist()
+        })
+        .map_err(native_core_error_to_py)
     }
 
     /// Builds this index's ANN cluster cache without issuing a query. Returns
     /// whether an ANN cluster index is resident after warming.
-    fn ann_warm(&self, index_id: &str) -> PyResult<bool> {
-        self.inner
-            .ann_warm(index_id)
-            .map_err(native_core_error_to_py)
+    fn ann_warm(&self, py: Python<'_>, index_id: &str) -> PyResult<bool> {
+        // The k-means build runs for minutes at large corpus sizes; release the
+        // GIL for the same reason as `persist`.
+        let engine_addr = &self.inner as *const RustCoreEngine as usize;
+        let index_id = index_id.to_owned();
+        py.detach(move || {
+            // SAFETY: as in `persist`; the shared reference never crosses threads.
+            let inner: &RustCoreEngine = unsafe { &*(engine_addr as *const RustCoreEngine) };
+            inner.ann_warm(&index_id)
+        })
+        .map_err(native_core_error_to_py)
     }
 
     /// Schedules a full base rewrite for the next `persist`; does not persist by
