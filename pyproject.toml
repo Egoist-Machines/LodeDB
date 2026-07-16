@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "lodedb"
 # Static (maturin reads it here); keep in sync with src/lodedb/__init__.py __version__.
-version = "1.3.1"
+version = "1.3.2"
 description = "Local-first, privacy-by-default embedded vector database. Your data never leaves your machine."
 readme = "README.md"
 requires-python = ">=3.11"

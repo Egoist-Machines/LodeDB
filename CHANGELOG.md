@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-07-16
+
 ### Added
 
 - **Cluster-contiguous ANN layout and two-stage rescore.** ANN base builds place each cluster's
@@ -20,25 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truth, reusable stores, and result JSON carry immutable dataset, builder, layout, and run
   identities. Generation-addressed preparation and atomic result publication make resume fail
   closed after crashes or configuration changes; reports compare only identical query populations.
-
-### Fixed
-
-- **A document added and removed between two persists no longer bricks the store.** The
-  vector delta recorded the never-committed row's removal, and the strict delta replay
-  ("removed-id count mismatch") then rejected the store on every fresh open — the warm
-  handle kept serving while every new reader failed. The add+remove now cancel out of the
-  delta; a *committed* row replaced or removed in the same window still records its
-  removal. Reachable from any multi-record fold (`Checkpointer` over appended WAL records,
-  `fold_segment` batches); found by a randomized concurrency test in the cloud companion.
-- **Duplicate document ids within one ingest batch are refused.** A repeated id in one
-  `plan_documents` batch built a single `apply_embedded_documents` record whose earlier
-  occurrence's vector row survived the fold with no owner — after reopen, any query
-  touching the orphan row failed with "TurboVec returned an unknown stable id". The
-  planner, the payload builder, and the replay boundary now all reject the shape; callers
-  that mean "replace" should keep the last occurrence or split the batch.
-
-### Added
-
 - **Lexical (BM25) search on vector-only stores.** `search(mode="lexical")` and
   `search_many(mode="lexical")` now run on a bring-your-own-vectors index
   (`open_vector_store` / `LodeDB(vector_dim=...)`) that retains text (`store_text=True`,
@@ -73,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WAL-mode writes are unaffected (each was already durably logged at write time and
   replays on the next open); for read-only handles it is equivalent to `close()`.
   Core: `CoreEngine::discard()`.
+
+### Fixed
+
+- **A document added and removed between two persists no longer bricks the store.** The
+  vector delta recorded the never-committed row's removal, and the strict delta replay
+  ("removed-id count mismatch") then rejected the store on every fresh open — the warm
+  handle kept serving while every new reader failed. The add+remove now cancel out of the
+  delta; a *committed* row replaced or removed in the same window still records its
+  removal. Reachable from any multi-record fold (`Checkpointer` over appended WAL records,
+  `fold_segment` batches); found by a randomized concurrency test in the cloud companion.
+- **Duplicate document ids within one ingest batch are refused.** A repeated id in one
+  `plan_documents` batch built a single `apply_embedded_documents` record whose earlier
+  occurrence's vector row survived the fold with no owner — after reopen, any query
+  touching the orphan row failed with "TurboVec returned an unknown stable id". The
+  planner, the payload builder, and the replay boundary now all reject the shape; callers
+  that mean "replace" should keep the last occurrence or split the batch.
 
 ## [1.3.1] - 2026-07-08
 

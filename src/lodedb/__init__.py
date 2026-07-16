@@ -27,7 +27,7 @@ from lodedb.local import (
 from lodedb.local.cli import app, main
 
 # Keep in sync with `version` in pyproject.toml (the release workflow asserts they match).
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 __all__ = [
     "LOCAL_MODEL_PRESETS",
