@@ -605,6 +605,24 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
 
 </details>
 
+## Managed cloud (OreCloud)
+
+LodeDB stores can live in [OreCloud](https://db.egoistmachines.com), the managed-cloud
+companion: durable sync for local stores, hosted read serving, and a per-user memory
+data plane for agent applications. The client ships as the `[cloud]` extra:
+
+```sh
+pip install "lodedb[cloud]"
+
+lodedb cloud login                        # one browser approval
+lodedb cloud sync ./my-store cloud main   # mirror a local store to the cloud
+```
+
+Work locally with `lodedb` exactly as before; `lodedb cloud …` forwards to the
+`orecloud` CLI the extra installs, and the cloud Python APIs (per-user stores,
+recall, hosted MCP) live in that same package. The client is proprietary and
+loads only when invoked — a plain `import lodedb` stays network-free.
+
 ## Concurrency & durability
 
 - **Single writer, many readers, per path.** One handle holds the path open for *writing* at

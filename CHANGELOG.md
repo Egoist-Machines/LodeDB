@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[cloud]` extra and a `lodedb cloud` command: the OreCloud managed-cloud
+  companion as an optional add-on. `pip install "lodedb[cloud]"` installs the
+  `orecloud` client; `lodedb cloud …` forwards to its CLI. The client is
+  imported only inside that command — a plain `import lodedb` stays
+  network-free (guarded by `tests/test_import_boundary.py`).
+
 ## [1.3.2] - 2026-07-16
 
 ### Added

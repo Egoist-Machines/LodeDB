@@ -62,6 +62,9 @@ for _m in ("lodedb", "lodedb.local.cli"):
 _FORBIDDEN = (
     "langchain", "langchain_core", "llama_index", "mem0", "cognee",
     "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
+    # The [cloud] extra's proprietary client: `lodedb cloud` imports it inside
+    # the trampoline only — a plain import must stay network-free.
+    "orecloud",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:
