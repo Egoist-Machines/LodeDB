@@ -118,6 +118,16 @@ impl From<CoreError> for ArtifactStoreError {
 
 impl From<std::io::Error> for ArtifactStoreError {
     fn from(error: std::io::Error) -> Self {
+        // The object store's streaming read bridge smuggles its backend error
+        // through `io::Error` to satisfy `Read`; recover the category here so
+        // a mid-download S3/network failure stays a `Backend` error (mapped to
+        // RuntimeError in Python) rather than masquerading as local I/O.
+        if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<object_store::Error>())
+        {
+            return Self::Backend(error.to_string());
+        }
         Self::Io(error)
     }
 }

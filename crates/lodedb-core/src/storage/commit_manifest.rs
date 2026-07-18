@@ -2,7 +2,7 @@ use crate::storage::util::{
     body_sha256, corrupt, get_i64, get_str, py_canonical_json, read_json_object, write_text_atomic,
     CoreResult,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,23 +114,41 @@ pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
         return Ok(None);
     }
     let document = read_json_object(path, "commit manifest")?;
-    if get_i64(&document, "schema_version", -1) != COMMIT_MANIFEST_SCHEMA_VERSION {
+    validate_commit_manifest_document(&document).map(Some)
+}
+
+/// Parses and validates pointer-document bytes exactly as
+/// [`read_commit_manifest`] validates the on-disk file (schema version and
+/// body checksum), without touching the filesystem. For consumers that hold a
+/// pointer document from somewhere other than disk — the transfer plane's
+/// object-store pointer mirror — so validation has one implementation.
+pub fn parse_commit_manifest(bytes: &[u8]) -> CoreResult<CommitManifest> {
+    let document: Value = serde_json::from_slice(bytes)
+        .map_err(|error| corrupt(format!("commit manifest is not valid JSON: {error}")))?;
+    let document = document
+        .as_object()
+        .ok_or_else(|| corrupt("commit manifest is not a JSON object"))?;
+    validate_commit_manifest_document(document)
+}
+
+fn validate_commit_manifest_document(document: &Map<String, Value>) -> CoreResult<CommitManifest> {
+    if get_i64(document, "schema_version", -1) != COMMIT_MANIFEST_SCHEMA_VERSION {
         return Err(corrupt("unsupported commit manifest schema version"));
     }
     let body = document
         .get("body")
         .ok_or_else(|| corrupt("commit manifest is missing its body or checksum"))?;
-    if !body.is_object() || get_str(&document, "body_sha256").is_empty() {
+    if !body.is_object() || get_str(document, "body_sha256").is_empty() {
         return Err(corrupt("commit manifest is missing its body or checksum"));
     }
-    let stored_sha = get_str(&document, "body_sha256").to_string();
+    let stored_sha = get_str(document, "body_sha256").to_string();
     if body_sha256(body)? != stored_sha {
         return Err(corrupt("commit manifest failed body checksum"));
     }
-    Ok(Some(CommitManifest {
+    Ok(CommitManifest {
         body: body.clone(),
         body_sha256: stored_sha,
-    }))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -184,15 +202,35 @@ pub fn build_commit_body(input: CommitBodyInput<'_>) -> Value {
 }
 
 pub fn write_commit_manifest(path: &Path, body: &Value, fsync: bool) -> CoreResult<usize> {
+    let document_json = render_commit_manifest(body)?;
+    write_text_atomic(path, &document_json, fsync)
+}
+
+/// Renders the exact pointer-document text a `<key>.commit.json` carrying
+/// `body` holds on disk — the canonical body JSON, its checksum, and the
+/// schema envelope — without touching the filesystem. [`write_commit_manifest`]
+/// persists exactly this text, so the two can never drift.
+pub fn render_commit_manifest(body: &Value) -> CoreResult<String> {
     if !body.is_object() {
         return Err(corrupt("commit manifest body must be a JSON object"));
     }
     let body_json = py_canonical_json(body)?;
     let body_sha = body_sha256(body)?;
-    let document_json = format!(
+    Ok(format!(
         "{{\"body\":{body_json},\"body_sha256\":\"{body_sha}\",\"schema_version\":{COMMIT_MANIFEST_SCHEMA_VERSION}}}"
-    );
-    write_text_atomic(path, &document_json, fsync)
+    ))
+}
+
+/// The engine-canonical `body_sha256` for `body` — the digest a
+/// `<key>.commit.json` pointer carrying exactly this body records. Exported
+/// for the transfer plane, whose identity and lineage decisions key on it;
+/// the alternative is a scratch-file round trip through
+/// [`write_commit_manifest`]/[`read_commit_manifest`] per digest.
+pub fn commit_body_sha256(body: &Value) -> CoreResult<String> {
+    if !body.is_object() {
+        return Err(corrupt("commit manifest body must be a JSON object"));
+    }
+    body_sha256(body)
 }
 
 pub fn list_base_epochs(persistence_dir: &Path, index_key: &str) -> CoreResult<BTreeSet<u64>> {

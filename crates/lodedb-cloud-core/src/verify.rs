@@ -14,7 +14,6 @@
 //!   load as the engine would read them.
 
 use crate::artifact_store::ArtifactStore;
-use crate::digest::sha256_hex;
 use crate::error::{ArtifactStoreError, Result};
 use crate::generation_inventory::inventory_from_body;
 use lodedb_core::storage::commit_manifest::{commit_manifest_path, write_commit_manifest};
@@ -54,15 +53,17 @@ pub fn verify_generation(store: &dyn ArtifactStore, index_key: &str) -> Result<V
 
     let mut bytes_verified = 0u64;
     for artifact in &inventory.artifacts {
-        let data = store.read_bytes(&artifact.name)?;
-        let digest = sha256_hex(&data);
+        // Stream-hash: verification of a multi-gigabyte base costs one copy
+        // buffer, not the artifact.
+        let mut reader = store.open_read(&artifact.name)?;
+        let (digest, bytes) = crate::digest::sha256_hex_reader(&mut *reader)?;
         if digest != artifact.sha256 {
             return Err(ArtifactStoreError::Integrity(format!(
                 "artifact {:?} failed checksum: manifest records {}, computed {}",
                 artifact.name, artifact.sha256, digest
             )));
         }
-        bytes_verified += data.len() as u64;
+        bytes_verified += bytes;
     }
 
     Ok(VerifyReport {

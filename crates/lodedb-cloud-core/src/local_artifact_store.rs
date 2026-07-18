@@ -7,15 +7,16 @@
 //! milestone, not here.
 
 use crate::artifact_store::{body_generation, ArtifactStore};
-use crate::digest::sha256_hex;
+use crate::digest::{sha256_hex_finish, sha256_hex_reader, COPY_BUFFER_BYTES};
 use crate::error::{ArtifactStoreError, Result};
 use crate::paths::resolve_within;
 use lodedb_core::storage::commit_manifest::{
     commit_manifest_path, read_commit_manifest, write_commit_manifest,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Stores artifacts as files under a directory; the pointer is `<key>.commit.json`.
@@ -38,69 +39,111 @@ impl LocalArtifactStore {
             fsync,
         }
     }
-}
 
-/// Atomic publish: write to a sibling `.tmp`, fsync (gated), rename into place,
-/// then fsync the parent directory so the rename is durable. This is the engine's
-/// `durable_replace` discipline — never write a persisted artifact in place.
-fn atomic_write(path: &Path, data: &[u8], fsync: bool) -> Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    let mut handle = File::create(&tmp)?;
-    handle.write_all(data)?;
-    if fsync {
-        handle.sync_all()?;
-    }
-    drop(handle);
-    fs::rename(&tmp, path)?;
-    if fsync {
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
+    /// The idempotence/immutability answer for an already-present name:
+    /// identical content (compared by a streaming re-hash) is Ok, different
+    /// content refuses — artifacts are immutable.
+    fn refuse_unless_identical(&self, name: &str, path: &Path, sha256: &str) -> Result<()> {
+        let (existing, _bytes) = sha256_hex_reader(&mut File::open(path)?)?;
+        if existing == sha256 {
+            return Ok(());
         }
+        Err(ArtifactStoreError::Integrity(format!(
+            "artifact {name:?} already exists with different content (stored {existing}, \
+             incoming {sha256}); refusing to overwrite an immutable artifact"
+        )))
     }
-    Ok(())
 }
 
 impl ArtifactStore for LocalArtifactStore {
-    fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
+    fn open_read<'a>(&'a self, name: &str) -> Result<Box<dyn Read + 'a>> {
         let path = resolve_within(&self.root, &self.root.join(name))?;
-        fs::read(&path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => ArtifactStoreError::NotFound(name.to_string()),
-            _ => ArtifactStoreError::Io(error),
-        })
+        match File::open(&path) {
+            Ok(handle) => Ok(Box::new(handle)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ArtifactStoreError::NotFound(name.to_string()))
+            }
+            Err(error) => Err(ArtifactStoreError::Io(error)),
+        }
     }
 
-    fn write_bytes_if_absent(&self, name: &str, data: &[u8], sha256: &str) -> Result<()> {
-        // Verify the incoming bytes before any write, so corruption can never be
-        // stored.
-        let digest = sha256_hex(data);
-        if digest != sha256 {
-            return Err(ArtifactStoreError::Integrity(format!(
-                "artifact {name:?} failed checksum: expected {sha256}, computed {digest}"
-            )));
-        }
+    fn write_stream_if_absent(
+        &self,
+        name: &str,
+        data: &mut dyn Read,
+        sha256: &str,
+        _size_hint: u64,
+    ) -> Result<()> {
         let path = resolve_within(&self.root, &self.root.join(name))?;
         if path.exists() {
             // Names are epoch-addressed, not sha-derived, so two independent
             // lineages can collide on a name. Identical bytes are an idempotent
             // no-op; different bytes are a genuine conflict we refuse rather than
-            // clobber (the immutability invariant).
-            let existing = sha256_hex(&fs::read(&path)?);
-            if existing == sha256 {
-                return Ok(());
-            }
-            return Err(ArtifactStoreError::Integrity(format!(
-                "artifact {name:?} already exists with different content (stored {existing}, \
-                 incoming {sha256}); refusing to overwrite an immutable artifact"
-            )));
+            // clobber (the immutability invariant). Hash the existing file
+            // streaming — it can be as large as any transferred base.
+            return self.refuse_unless_identical(name, &path, sha256);
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(&path, data, self.fsync)
+        // Stream into a UNIQUELY-NAMED sibling scratch (two concurrent writers
+        // of one name must never share a scratch), hashing as we copy, and
+        // verify the digest BEFORE publication. The publish is
+        // `persist_noclobber` — an atomic no-replace claim, so the losing
+        // writer of a name race falls into the identical-bytes check instead
+        // of overwriting bytes a committed pointer may already reference.
+        // Peak memory is one copy buffer regardless of artifact size.
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or("artifact");
+        let mut scratch = tempfile::Builder::new()
+            .prefix(&format!(".{file_name}."))
+            .suffix(".tmp")
+            .tempfile_in(parent)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+        loop {
+            let read = data.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            scratch.write_all(&buffer[..read])?;
+        }
+        let digest = sha256_hex_finish(hasher);
+        if digest != sha256 {
+            // Dropping the NamedTempFile unlinks the scratch.
+            return Err(ArtifactStoreError::Integrity(format!(
+                "artifact {name:?} failed checksum: expected {sha256}, computed {digest}"
+            )));
+        }
+        if self.fsync {
+            scratch.as_file().sync_all()?;
+        }
+        let scratch_path = scratch.path().to_path_buf();
+        match scratch.persist_noclobber(&path) {
+            Ok(_) => {
+                // On most filesystems the no-clobber persist is an atomic
+                // rename and the scratch name is gone; the hard-link+unlink
+                // fallback some filesystems take can leave the scratch link
+                // behind on unlink failure, so sweep it (litter, not
+                // correctness — the published bytes are already in place).
+                if scratch_path.exists() {
+                    let _ = fs::remove_file(&scratch_path);
+                }
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lost a same-name race: never replace — compare instead.
+                return self.refuse_unless_identical(name, &path, sha256);
+            }
+            Err(error) => return Err(ArtifactStoreError::Io(error.error)),
+        }
+        if self.fsync {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn contains(&self, name: &str) -> Result<bool> {

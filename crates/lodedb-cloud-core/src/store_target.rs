@@ -9,7 +9,10 @@
 //!   from the standard `AWS_*` environment variables (`AWS_ACCESS_KEY_ID`,
 //!   `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP`),
 //!   read by `AmazonS3Builder::from_env`. The URL path becomes the per-tenant key
-//!   prefix.
+//!   prefix. Setting `AWS_COPY_IF_NOT_EXISTS` (e.g.
+//!   `header: cf-copy-destination-if-none-match: *` on R2) additionally makes the
+//!   large-artifact multipart claim atomic — without it, that one step falls back
+//!   to a probe-then-copy on providers with no conditional copy.
 //! - anything without a `://` scheme → [`LocalArtifactStore`] on that directory.
 //!
 //! Other object-store schemes (`gs://`, `az://`) are rejected until there is a

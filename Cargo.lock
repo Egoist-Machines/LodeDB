@@ -1082,6 +1082,8 @@ dependencies = [
 name = "lodedb-cloud-core"
 version = "1.3.2"
 dependencies = [
+ "bytes",
+ "futures",
  "lodedb-core",
  "object_store",
  "serde_json",

@@ -292,17 +292,26 @@ impl StagingBlobStore {
 }
 
 impl ArtifactStore for StagingBlobStore {
-    fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
+    fn open_read<'a>(&'a self, name: &str) -> Result<Box<dyn std::io::Read + 'a>> {
         let path = self.staged_path(name)?;
-        std::fs::read(&path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => ArtifactStoreError::NotFound(format!(
-                "blob for artifact {name:?} was not downloaded into the staging directory"
-            )),
-            _ => ArtifactStoreError::Io(error),
-        })
+        match std::fs::File::open(&path) {
+            Ok(handle) => Ok(Box::new(handle)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ArtifactStoreError::NotFound(format!(
+                    "blob for artifact {name:?} was not downloaded into the staging directory"
+                )))
+            }
+            Err(error) => Err(ArtifactStoreError::Io(error)),
+        }
     }
 
-    fn write_bytes_if_absent(&self, name: &str, _data: &[u8], _sha256: &str) -> Result<()> {
+    fn write_stream_if_absent(
+        &self,
+        name: &str,
+        _data: &mut dyn std::io::Read,
+        _sha256: &str,
+        _size_hint: u64,
+    ) -> Result<()> {
         Err(ArtifactStoreError::Backend(format!(
             "staging blob store is read-only (attempted write of {name:?})"
         )))
