@@ -107,3 +107,12 @@ def test_bare_store_with_an_unbound_multi_org_token_refuses_with_choices():
         connect(
             "user-42", token="pat", host="https://api.test", warm=False, transport=transport
         )
+
+
+def test_empty_segments_are_malformed_not_reinterpreted():
+    """`orecloud://org//store` must refuse: silently dropping the empty
+    segment would reparse it as the two-segment org/environment form and aim
+    the handle at the wrong tenancy."""
+    for target in ("orecloud://acme//user-42", "acme//user-42"):
+        with pytest.raises(CloudError):
+            _parse_target(target)

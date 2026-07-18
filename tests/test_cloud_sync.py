@@ -91,9 +91,11 @@ def test_diverged_requires_force_and_force_resolves(committed_store, tmp_path):
     add_documents(source, docs("source-side-a"))
     add_documents(source, docs("source-side-b"))
 
-    # Diverged: sync refuses, names the classification and both force flags.
+    # Diverged: sync refuses, names the classification and both force flags,
+    # and exits with the documented "refused" class (5) — the same class the
+    # managed sync's 409 maps to, not the generic 1.
     result = runner.invoke(app, ["sync", str(source), str(remote), key])
-    assert result.exit_code == 1
+    assert result.exit_code == 5
     assert "diverged" in result.output
     assert "--force-push" in result.output and "--force-pull" in result.output
 
@@ -172,3 +174,63 @@ def test_status_lineage_fields_without_a_sidecar(committed_store, tmp_path):
     report = cloud.status(str(source), str(remote), key)
     assert report["sidecar_present"]
     assert report["classification"] == "in_sync"
+
+
+def test_rescore_tvvf_store_round_trips(tmp_path):
+    """A rescore-enabled store's committed generation pins the tvvf sidecar
+    under the engine's own naming (`vf<vf_epoch>.tvvf`, an epoch counter
+    independent of the generation's base_epoch). Push must ship it, pull must
+    restore a copy the engine reopens (it refuses a rescore store without its
+    sidecar), and searches must work on the restored copy."""
+    from conftest import read_pointer_body
+
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    restored = tmp_path / "restored"
+    db = LodeDB.open_vector_store(
+        source, vector_dim=8, commit_mode="generation", rescore="original"
+    )
+    try:
+        db.add_vectors_many(
+            [
+                {
+                    "vector": [1.0 if j == i else 0.1 for j in range(8)],
+                    "id": f"doc-{i}",
+                    "text": f"document {i}",
+                }
+                for i in range(4)
+            ]
+        )
+    finally:
+        db.close()
+    (key,) = cloud.keys(str(source))
+    assert read_pointer_body(source, key)["tvvf"], "a rescore store must pin its sidecar"
+
+    result = cloud.push(str(source), str(remote), key)
+    assert result["pointer_published"]
+    shipped = {p.name for p in (remote / f"{key}.gen").iterdir()}
+    assert any(name.startswith("vf") and name.endswith(".tvvf") for name in shipped), shipped
+
+    outcome = cloud.pull(str(remote), str(restored), key)
+    assert outcome["document_count"] == 4
+
+    db = LodeDB.open_vector_store(restored, vector_dim=8)
+    try:
+        hits = db.search_by_vector([1.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], k=2)
+        assert hits and hits[0].id == "doc-0"
+    finally:
+        db.close()
+
+
+def test_engine_kind_wire_map_covers_every_pushable_kind():
+    """The managed wire contract labels every blob by kind; an engine kind the
+    map does not know must fail loudly (never silently ship as \"state\"), and
+    every kind the local inventory can emit must be mapped."""
+    from lodedb.cloud.transfer import _ENGINE_KIND_TO_WIRE, CloudError, _wire_kind
+
+    for kind in ("json", "tvim", "tvtext", "tvlex", "tvmv", "tvann", "tvvf"):
+        assert kind in _ENGINE_KIND_TO_WIRE, kind
+    for vector_kind in ("tvim", "tvann", "tvvf"):
+        assert _ENGINE_KIND_TO_WIRE[vector_kind] == "vector"
+    with pytest.raises(CloudError, match="tvfuture"):
+        _wire_kind("tvfuture")

@@ -14,8 +14,10 @@ that connects with a production key and code that connects with a testing
 key are the same code. Personal tokens (`ore_pat_`) span environments, so
 they resolve to the account's only org and default to the ``testing``
 environment (production is the explicit go-live choice, never a guess);
-passing ``org=``/``environment=`` always wins (and is checked against a
-bound token rather than silently ignored).
+passing ``org=``/``environment=`` always wins. Passing exactly one of the
+pair is checked against a bound token rather than silently ignored; passing
+both skips introspection entirely (zero HTTP calls) and relies on the
+server rejecting a mismatched binding at the first request.
 
 Credentials resolve like the CLI's: explicit ``token=``/``host=`` arguments,
 then the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST`` environment pair, then the

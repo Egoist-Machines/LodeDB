@@ -18,10 +18,14 @@
 //! here: it constructs its stores once and calls the typed primitives directly,
 //! rather than re-resolving target strings per operation.
 
+use crate::artifact_store::ArtifactStore;
 use crate::error::{ArtifactStoreError, Result};
-use crate::generation_inventory::{inventory_from_body, list_index_keys};
+use crate::generation_inventory::{
+    inventory_from_body, list_index_keys, write_restored_journal_manifests,
+};
 use crate::manifest_transfer::{
-    export_generation_pinned, export_generation_with_body, TransferResult,
+    export_generation_pinned, export_generation_with_body, publish_staged,
+    stage_generation_pinned, TransferResult,
 };
 use crate::snapshot_identity::{logical_id, snapshot_id};
 use crate::status::{compare_generations, StatusReport};
@@ -29,8 +33,9 @@ use crate::store_target::artifact_store_from_target;
 use crate::sync_plan::{classify, SnapRef, SyncClassification};
 use crate::sync_state::{read_sync_state, write_sync_state, SidecarRead, SyncState};
 use crate::transfer_policy::TransferPolicy;
-use crate::verify::{verify_generation, verify_local_generation_opens, OpenReport, VerifyReport};
+use crate::verify::{verify_candidate_opens, verify_generation, OpenReport, VerifyReport};
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -114,21 +119,134 @@ pub fn push(
 /// way back. A successful pull records the restored generation in the sync
 /// sidecar (see [`push`]).
 pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
+    if !is_local_dir(dir) {
+        return Err(ArtifactStoreError::Backend(format!(
+            "pull's local end must be a directory path, got {dir:?}"
+        )));
+    }
     let source = artifact_store_from_target(remote)?;
     let dest = artifact_store_from_target(dir)?;
-    let (transfer, restored) =
-        export_generation_with_body(&*source, &*dest, index_key, TransferPolicy::full())?;
-    // Rebuild the engine's per-store delta-journal manifests (working state
-    // the body doesn't pin): without them a restored copy opens read-only
-    // fine but fails closed on its first O(changed) mutation.
-    crate::generation_inventory::write_restored_journal_manifests(
-        Path::new(dir),
+    // Restores mutate the database directory, so they contend on the engine's
+    // own single-writer lock: a live writer's in-memory state is based on the
+    // pointer we are about to replace, and letting both proceed loses one
+    // side's commit. The guard drops at the end of the restore.
+    fs::create_dir_all(dir)?;
+    let _writer_lock = acquire_writer_lock(dir)?;
+    ensure_no_pending_wal(
+        dir,
         index_key,
-        &restored,
+        "checkpoint them by opening the store once (or discard them with \
+         `sync --force-pull`) before restoring over this directory",
     )?;
-    let open = verify_local_generation_opens(Path::new(dir), index_key)?;
+    let source_raw = source.read_pointer(index_key)?.ok_or_else(|| {
+        ArtifactStoreError::NotFound(format!(
+            "no committed generation to export for index key {index_key:?}"
+        ))
+    })?;
+    let dest_body = dest.read_pointer(index_key)?;
+    let (transfer, open, restored) = restore_staged(
+        &*source,
+        &*dest,
+        dir,
+        index_key,
+        source_raw,
+        dest_body,
+        false,
+    )?;
     record_base(dir, remote, index_key, &restored)?;
     Ok(PullOutcome { transfer, open })
+}
+
+/// The shared local-restore tail: stage the artifacts, prove the candidate
+/// opens through the engine (from a scratch layout), and only then publish
+/// the pointer — so every acceptance failure leaves the destination on its
+/// previous committed generation. `discard_wal` truncates the destination
+/// WAL right after the swap (force-pull semantics); callers must have
+/// refused a pending WAL beforehand when not forcing. The journal manifests
+/// are rebuilt strictly last (see the inline comment).
+///
+/// Known crash windows, both narrow and loud rather than corrupting: a crash
+/// between the swap and the WAL truncation can leave discarded records
+/// beside the new lineage (force-pull only), and a failure between the swap
+/// and the journal rebuild leaves the restored copy readable but
+/// fail-closed on its first O(changed) mutation. Closing them fully needs a
+/// recoverable restore transaction (engine-side recovery on open) — a
+/// follow-up, not this milestone.
+///
+/// Caller holds the directory writer lock.
+fn restore_staged(
+    source: &dyn ArtifactStore,
+    dest: &dyn ArtifactStore,
+    dir: &str,
+    index_key: &str,
+    source_raw: Value,
+    dest_body: Option<Value>,
+    discard_wal: bool,
+) -> Result<(TransferResult, OpenReport, Value)> {
+    let staged = stage_generation_pinned(
+        source,
+        dest,
+        index_key,
+        TransferPolicy::full(),
+        source_raw,
+        dest_body,
+    )
+    .map_err(explain_fork_collision)?;
+    // Acceptance checks run against a scratch candidate BEFORE the pointer
+    // moves: a checksum-consistent but semantically unopenable generation must
+    // never become the committed destination. (The scratch carries its own
+    // journal manifests, so the real destination stays untouched.)
+    let open = verify_candidate_opens(Path::new(dir), index_key, &staged.source_body)?;
+    let (transfer, restored) = publish_staged(dest, index_key, staged)?;
+    if discard_wal {
+        lodedb_core::storage::wal::truncate(&contained_wal_path(dir, index_key)?, false)?;
+    }
+    // Rebuild the engine's per-store delta-journal manifests (working state
+    // the body doesn't pin): without them a restored copy opens read-only
+    // fine but fails closed on its first O(changed) mutation. Strictly AFTER
+    // the pointer swap: writing them first would, on a failed CAS, leave the
+    // candidate's journals attached to some other writer's committed body.
+    write_restored_journal_manifests(Path::new(dir), index_key, &restored)?;
+    Ok((transfer, open, restored))
+}
+
+/// Takes the engine's exclusive single-writer lock on `dir` for the duration
+/// of a local restore.
+fn acquire_writer_lock(dir: &str) -> Result<lodedb_core::engine::DirWriterLock> {
+    lodedb_core::engine::acquire_dir_writer_lock(Path::new(dir)).map_err(ArtifactStoreError::Core)
+}
+
+/// Refuses a restore when the destination WAL still holds acknowledged
+/// operations: replaying them onto the pulled lineage — or silently dropping
+/// them — would corrupt or lose acknowledged writes. `hint` names the caller's
+/// resolution path.
+pub(crate) fn ensure_no_pending_wal(dir: &str, index_key: &str, hint: &str) -> Result<()> {
+    let ops = pending_wal_ops(dir, index_key)?;
+    if ops > 0 {
+        return Err(ArtifactStoreError::PendingWal {
+            ops,
+            hint: hint.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The WAL path for `index_key` under `dir`, confined to `dir`: the key can
+/// arrive from CLI/remote input, so a `../` or absolute spelling must fail
+/// closed here rather than name a WAL-shaped file outside the store root.
+pub(crate) fn contained_wal_path(dir: &str, index_key: &str) -> Result<std::path::PathBuf> {
+    crate::paths::resolve_within(
+        Path::new(dir),
+        &lodedb_core::storage::wal::wal_path(Path::new(dir), index_key),
+    )
+}
+
+/// The number of valid, replayable records in `dir`'s WAL for `index_key`
+/// (0 when the WAL is absent or empty). Public for the client edge: a
+/// pull-direction sync consults it before downloading a single blob.
+pub fn pending_wal_ops(dir: &str, index_key: &str) -> Result<usize> {
+    let wal = contained_wal_path(dir, index_key)?;
+    Ok(lodedb_core::storage::wal::scan_stats(&wal)?.op_count)
 }
 
 /// Compares the local `dir` against `remote` for a push of `index_key` under
@@ -315,30 +433,37 @@ pub fn sync(
         record_base(dir, remote, index_key, &published)?;
         Ok(outcome("push", forced, Some(transfer), None))
     } else {
-        // Pull mirrors `pull`: ship the classified remote body verbatim,
-        // prove it opens, then record the base. The CAS preconditions on the
-        // raw local body read above — a concurrent engine commit fails as a
-        // PointerConflict rather than being clobbered.
+        // Pull mirrors `pull`: take the writer lock (a live engine writer and
+        // a restore must never interleave), refuse or discard a pending WAL,
+        // stage + candidate-verify + publish, then record the base. The CAS
+        // preconditions on the raw local body read above — a concurrent
+        // engine commit fails as a PointerConflict rather than being
+        // clobbered.
         let source_raw = remote_body.ok_or_else(|| {
             ArtifactStoreError::NotFound(format!(
                 "no committed generation to pull for index key {index_key:?}"
             ))
         })?;
-        let (transfer, restored) = export_generation_pinned(
+        fs::create_dir_all(dir)?;
+        let _writer_lock = acquire_writer_lock(dir)?;
+        let discard_wal = forced;
+        if !discard_wal {
+            ensure_no_pending_wal(
+                dir,
+                index_key,
+                "checkpoint them by opening the store once, or re-run with --force-pull \
+                 to discard them along with the local lineage",
+            )?;
+        }
+        let (transfer, open, restored) = restore_staged(
             &*remote_store,
             &*local_store,
+            dir,
             index_key,
-            TransferPolicy::full(),
             source_raw,
             local_raw,
-        )
-        .map_err(explain_fork_collision)?;
-        crate::generation_inventory::write_restored_journal_manifests(
-            Path::new(dir),
-            index_key,
-            &restored,
+            discard_wal,
         )?;
-        let open = verify_local_generation_opens(Path::new(dir), index_key)?;
         record_base(dir, remote, index_key, &restored)?;
         Ok(outcome("pull", forced, Some(transfer), Some(open)))
     }

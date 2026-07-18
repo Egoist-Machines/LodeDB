@@ -49,6 +49,14 @@ pub enum ArtifactStoreError {
         classification: String,
         hint: String,
     },
+    /// A restore refused to replace the destination pointer because the
+    /// destination's WAL still holds acknowledged-but-uncheckpointed
+    /// operations. Replaying those records onto a pulled lineage (or silently
+    /// dropping them) would corrupt or lose acknowledged writes, so the caller
+    /// must checkpoint the store first — or explicitly discard the records
+    /// with a force-pull. Like [`SyncConflict`](Self::SyncConflict), this is a
+    /// *decision*, not a race.
+    PendingWal { ops: usize, hint: String },
     /// A storage backend (e.g. an object store) failed for a reason that is not a
     /// missing object or a pointer precondition — a network error, a permission
     /// denial, or any other transport-level failure. The message carries the
@@ -77,6 +85,10 @@ impl Display for ArtifactStoreError {
             } => write!(
                 formatter,
                 "sync refused: local and remote are {classification}; {hint}"
+            ),
+            Self::PendingWal { ops, hint } => write!(
+                formatter,
+                "the destination database holds {ops} uncheckpointed WAL operation(s); {hint}"
             ),
             Self::Integrity(message) => write!(formatter, "{message}"),
             Self::Core(error) => write!(formatter, "{error}"),

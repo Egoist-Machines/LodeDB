@@ -22,9 +22,11 @@ _IGNORE_PATTERNS = ("{name}", "/{name}", "*.env", ".env*", "**/{name}")
 
 
 def write_env_values(path: str | Path, values: dict[str, str]) -> Path:
-    """Set `KEY=value` lines in the dotenv file at `path`, creating it (0600)
-    if missing. Managed keys replace their existing line in place; every other
-    line — comments, other keys, blanks — is preserved. Returns the path."""
+    """Set `KEY=value` lines in the dotenv file at `path`, creating it if
+    missing. Managed keys replace their existing line in place; every other
+    line — comments, other keys, blanks — is preserved. The result is always
+    owner-only (0600): secrets land here, and a pre-existing 0644 `.env` must
+    not keep the minted token group/world-readable. Returns the path."""
     target = Path(path)
     try:
         lines = target.read_text(encoding="utf-8").splitlines()
@@ -40,13 +42,29 @@ def write_env_values(path: str | Path, values: dict[str, str]) -> Path:
             updated.append(line)
     updated.extend(f"{key}={value}" for key, value in remaining.items())
     content = "\n".join(updated) + "\n"
-    if target.exists():
-        target.write_text(content, encoding="utf-8")
-    else:
-        # Secrets land here: never world-readable, even briefly.
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Atomic replace with the final mode already set: the secret never exists
+    # on disk readable to anyone but the owner, even briefly, and an existing
+    # permissive file's mode is not inherited. mkstemp (unique name, O_EXCL,
+    # 0600) rather than a fixed sibling name: a predictable scratch path in a
+    # shared directory could be pre-planted as a symlink, aiming the secret at
+    # an attacker-chosen file.
+    import tempfile
+
+    fd, scratch = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
+        # The rename carries mkstemp's owner-only mode onto the target; no
+        # post-publication chmod (a path-based chmod on the published name
+        # would reintroduce the symlink race this scratch file exists to
+        # avoid, and has no exact-mode meaning on Windows anyway).
+        os.replace(scratch, target)
+    except BaseException:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass
+        raise
     return target
 
 

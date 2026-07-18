@@ -56,3 +56,20 @@ def test_remove_many_rejects_an_empty_batch():
     store = _store(_StubClient())
     with pytest.raises(ValueError, match="nothing to remove"):
         store.remove_many([])
+
+
+class _UnprovisionedClient:
+    """Answers every search with the 404 a not-yet-provisioned store gives."""
+
+    def search_many(self, org: str, environment: str, payload: dict) -> dict:
+        from lodedb.cloud.transfer import CloudError
+
+        raise CloudError(404, "no such store")
+
+
+def test_unprovisioned_batch_verbs_keep_query_cardinality():
+    """Both batched search verbs answer an unprovisioned store with one empty
+    hit list PER query — callers zip queries to results."""
+    store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
+    assert store.search_many(["a", "b", "c"]) == [[], [], []]
+    assert store.search_many_by_vector([[0.1, 0.2], [0.3, 0.4]]) == [[], []]

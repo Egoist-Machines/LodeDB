@@ -305,13 +305,29 @@ fn refs_for_store(
     };
 
     let gen_dir = format!("{index_key}{GEN_DIR_SUFFIX}");
-    // The engine derives the base path from base_epoch + store kind
-    // (`base_json_path` etc. yield `g<epoch>.<kind>`), NOT from the recorded
-    // file_name. Use the derived name as authoritative so the inventory names
-    // exactly the file the engine will open, and reject a manifest whose recorded
-    // base file_name disagrees (a tampered or inconsistent pointer) rather than
-    // copying the wrong file under a name the engine cannot find.
-    let base_name = format!("g{base_epoch}.{kind}");
+    // The engine derives the base path from an epoch + store kind, NOT from the
+    // recorded file_name. Use the derived name as authoritative so the inventory
+    // names exactly the file the engine will open, and reject a manifest whose
+    // recorded base file_name disagrees (a tampered or inconsistent pointer)
+    // rather than copying the wrong file under a name the engine cannot find.
+    // Most stores live at `g<base_epoch>.<kind>`; `tvvf` keeps its own epoch
+    // counter in the sub-manifest and lives at `vf<vf_epoch>.tvvf`
+    // (`tvvf_store::base_path`), so its refs must derive from that epoch — the
+    // generation's base_epoch names a file the engine never writes.
+    let (store_epoch, base_name) = if kind == "tvvf" {
+        let vf_epoch = sub_manifest
+            .get("vf_epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ArtifactStoreError::Integrity(
+                    "tvvf sub-manifest carries no vf_epoch; cannot derive its base path"
+                        .to_string(),
+                )
+            })?;
+        (vf_epoch, format!("vf{vf_epoch}.tvvf"))
+    } else {
+        (base_epoch, format!("g{base_epoch}.{kind}"))
+    };
     let recorded = str_field(base, "file_name");
     if !recorded.is_empty() && recorded != base_name {
         return Err(ArtifactStoreError::Integrity(format!(
@@ -321,10 +337,10 @@ fn refs_for_store(
     }
     let mut refs = vec![ArtifactRef {
         name: format!("{gen_dir}/{base_name}"),
-        sha256: str_field(base, "sha256"),
+        sha256: checked_sha256(kind, base)?,
         size_bytes: u64_field(base, "file_bytes"),
         kind: kind.to_string(),
-        epoch: base_epoch,
+        epoch: store_epoch,
         is_base: true,
     }];
 
@@ -344,10 +360,10 @@ fn refs_for_store(
             ensure_plain_file_name(kind, &delta_name)?;
             refs.push(ArtifactRef {
                 name: format!("{gen_dir}/{delta_dir}/{delta_name}"),
-                sha256: str_field(delta, "sha256"),
+                sha256: checked_sha256(kind, delta)?,
                 size_bytes: u64_field(delta, "file_bytes"),
                 kind: kind.to_string(),
-                epoch: base_epoch,
+                epoch: store_epoch,
                 is_base: false,
             });
         }
@@ -382,7 +398,24 @@ pub(crate) fn write_restored_journal_manifests(
         let Some(sub_manifest) = body.get(*kind).filter(|value| !value.is_null()) else {
             continue;
         };
-        let base_name = format!("g{base_epoch}.{kind}");
+        // Mirror `refs_for_store`'s naming: `tvvf` journals live under the
+        // sidecar's own epoch (`vf<vf_epoch>.tvvf.tvvf-delta/`), not the
+        // generation's base epoch.
+        let base_name = if *kind == "tvvf" {
+            let vf_epoch = sub_manifest
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ArtifactStoreError::Integrity(
+                        "tvvf sub-manifest carries no vf_epoch; cannot place its journal \
+                         manifest"
+                            .to_string(),
+                    )
+                })?;
+            format!("vf{vf_epoch}.tvvf")
+        } else {
+            format!("g{base_epoch}.{kind}")
+        };
         let journal_dir = persistence_dir
             .join(format!("{index_key}{GEN_DIR_SUFFIX}"))
             .join(format!("{base_name}{dir_suffix}"));
@@ -401,6 +434,24 @@ pub(crate) fn write_restored_journal_manifests(
     Ok(())
 }
 
+
+/// Reads and validates an artifact digest from a manifest entry.
+///
+/// Inventory digests cross the trust boundary twice: a managed pull uses them
+/// as staging *file names* (`<staging>/<sha256>`) and the managed layout as
+/// object-key segments, so a value that is not exactly 64 lowercase hex
+/// characters — an absolute path, a `../` traversal, an empty string — must
+/// fail closed here, before it can name a path anywhere downstream.
+fn checked_sha256(kind: &str, entry: &Map<String, Value>) -> Result<String> {
+    let digest = str_field(entry, "sha256");
+    crate::blob_layout::validate_sha256(&digest).map_err(|_| {
+        ArtifactStoreError::Integrity(format!(
+            "{kind} sub-manifest records a malformed artifact sha256 {digest:?}; \
+             expected 64 lowercase hex characters"
+        ))
+    })?;
+    Ok(digest)
+}
 
 /// Rejects a manifest `file_name` that is not a plain path component.
 ///

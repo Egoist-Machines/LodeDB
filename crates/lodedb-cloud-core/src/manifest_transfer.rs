@@ -138,6 +138,41 @@ pub(crate) fn export_generation_pinned(
     raw_body: serde_json::Value,
     dest_body: Option<serde_json::Value>,
 ) -> Result<(TransferResult, serde_json::Value)> {
+    let staged = stage_generation_pinned(source, dest, index_key, policy, raw_body, dest_body)?;
+    publish_staged(dest, index_key, staged)
+}
+
+/// Everything a staged (artifacts-uploaded, pointer-untouched) transfer knows:
+/// the body a publish would commit, the destination body the publish must
+/// precondition on, and the upload metrics.
+///
+/// Splitting staging from publication lets local restores insert their
+/// acceptance checks (candidate verify-open, journal reconstruction) between
+/// the two, so a failed check leaves the destination on its previous committed
+/// generation — the pointer swap stays the single commit point.
+pub(crate) struct StagedExport {
+    pub source_body: serde_json::Value,
+    pub dest_body: Option<serde_json::Value>,
+    pub generation: u64,
+    pub artifacts_total: usize,
+    pub artifacts_written: usize,
+    pub bytes_written: u64,
+}
+
+/// Uploads the missing artifact set for a pinned transfer WITHOUT touching the
+/// destination pointer.
+///
+/// The destination re-hashes each artifact on write, so a corrupt source
+/// artifact fails here — before any pointer moves. Redaction happens before
+/// inventorying, exactly as in [`export_generation_pinned`].
+pub(crate) fn stage_generation_pinned(
+    source: &dyn ArtifactStore,
+    dest: &dyn ArtifactStore,
+    index_key: &str,
+    policy: TransferPolicy,
+    raw_body: serde_json::Value,
+    dest_body: Option<serde_json::Value>,
+) -> Result<StagedExport> {
     // Redact before inventorying so excluded artifacts are neither listed nor
     // uploaded, and the published body matches exactly what shipped.
     let source_body = policy.redact_body(&raw_body);
@@ -147,19 +182,42 @@ pub(crate) fn export_generation_pinned(
     let dest_inventory = inventory_from_body(index_key, dest_body.as_ref())?;
     let diff = diff_inventories(&source_inventory, dest_inventory.as_ref());
 
-    // Upload the missing artifacts first; the destination re-hashes each one, so a
-    // corrupt source artifact fails the transfer before any pointer moves.
     for artifact in &diff.to_upload {
         let data = source.read_bytes(&artifact.name)?;
         dest.write_bytes_if_absent(&artifact.name, &data, &artifact.sha256)?;
     }
 
-    // Publish the pointer last. Skip the swap only when the destination already
-    // holds this exact committed *body* — comparing the full body, not just the
-    // generation integer, because two independent lineages can share a generation
-    // number with different content. The swap preconditions on the exact body we
-    // just read (`dest_body`), so a concurrent change between read and swap is
-    // caught as a PointerConflict.
+    Ok(StagedExport {
+        source_body,
+        dest_body,
+        generation: source_inventory.generation,
+        artifacts_total: source_inventory.artifacts.len(),
+        artifacts_written: diff.to_upload.len(),
+        bytes_written: diff.upload_bytes,
+    })
+}
+
+/// Publishes a staged transfer's pointer — the single commit point.
+///
+/// Skips the swap only when the destination already holds this exact committed
+/// *body* — comparing the full body, not just the generation integer, because
+/// two independent lineages can share a generation number with different
+/// content. The swap preconditions on the exact body staging read
+/// (`dest_body`), so a concurrent change between read and swap is caught as a
+/// PointerConflict.
+pub(crate) fn publish_staged(
+    dest: &dyn ArtifactStore,
+    index_key: &str,
+    staged: StagedExport,
+) -> Result<(TransferResult, serde_json::Value)> {
+    let StagedExport {
+        source_body,
+        dest_body,
+        generation,
+        artifacts_total,
+        artifacts_written,
+        bytes_written,
+    } = staged;
     let pointer_published = dest_body.as_ref() != Some(&source_body);
     if pointer_published {
         dest.compare_and_swap_pointer(index_key, dest_body.as_ref(), &source_body)?;
@@ -167,10 +225,10 @@ pub(crate) fn export_generation_pinned(
 
     let result = TransferResult {
         index_key: index_key.to_string(),
-        generation: source_inventory.generation,
-        artifacts_written: diff.to_upload.len(),
-        artifacts_skipped: source_inventory.artifacts.len() - diff.to_upload.len(),
-        bytes_written: diff.upload_bytes,
+        generation,
+        artifacts_written,
+        artifacts_skipped: artifacts_total - artifacts_written,
+        bytes_written,
         pointer_published,
     };
     Ok((result, source_body))

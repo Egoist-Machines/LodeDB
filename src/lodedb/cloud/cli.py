@@ -115,9 +115,14 @@ IncludeLexical = Annotated[
 
 
 def _run(operation: Callable[[], T]) -> T:
-    """Runs one binding operation, mapping its exceptions onto stderr + exit 1."""
+    """Runs one binding operation, mapping its exceptions onto stderr + exit 1
+    (sync refusals onto the documented "refused" class, like their managed
+    twins — the message itself carries the force-flag/checkpoint hint)."""
     try:
         return operation()
+    except _core.SyncConflictError as error:
+        typer.secho(f"error: {error}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EXIT_REFUSED) from error
     except (FileNotFoundError, OSError, RuntimeError) as error:
         typer.secho(f"error: {error}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from error
@@ -429,6 +434,10 @@ def _cloud(operation: Callable[[], T]) -> T:
     except CloudError as error:
         code, hint = _classify(error)
         raise _fail(str(error), code=code, hint=hint) from error
+    except _core.SyncConflictError as error:
+        # The native core's refusals (diverged lineage, pending WAL) are the
+        # same "resolve with force or checkpoint" class as the managed 409s.
+        raise _fail(str(error), code=EXIT_REFUSED) from error
     except (FileNotFoundError, OSError, RuntimeError) as error:
         raise _fail(str(error)) from error
 

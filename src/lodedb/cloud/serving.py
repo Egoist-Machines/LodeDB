@@ -407,7 +407,10 @@ class CloudStore:
         }
         result = self._empty_if_unprovisioned(
             lambda: self._searched(self._client.search_many, payload),
-            {"results": []},
+            # One empty hit list PER query (mirroring search_many): callers
+            # zip queries to results, so the unprovisioned answer must keep
+            # the cardinality.
+            {"results": [[] for _ in vectors]},
         )
         return [[_hit(row) for row in hits] for hits in result["results"]]
 
@@ -665,10 +668,13 @@ def _parse_target(target: str) -> ManagedRemote | _BareStore:
     is_url = target.startswith(ManagedRemote.SCHEME)
     if is_url:
         body = target[len(ManagedRemote.SCHEME) :]
-    segments = [part for part in body.strip("/").split("/") if part]
-    if len(segments) == 1:
+    # Empty segments are malformed, never silently collapsed: filtering them
+    # would reinterpret `orecloud://org//store` as the two-segment
+    # org/environment form and aim the handle at the wrong tenancy.
+    segments = body.strip("/").split("/")
+    if len(segments) == 1 and segments[0]:
         return _BareStore(segments[0])
-    if len(segments) == 3 or (len(segments) == 2 and is_url):
+    if (len(segments) == 3 or (len(segments) == 2 and is_url)) and all(segments):
         return ManagedRemote(*segments)
     raise CloudError(
         422,
@@ -754,6 +760,11 @@ def connect(
             if not connectable:
                 client.close()
                 raise
+        except BaseException:
+            # Transport failures (DNS, refused connection, timeout) must not
+            # leak the freshly opened pool either.
+            client.close()
+            raise
     return store
 
 

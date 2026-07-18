@@ -10,6 +10,13 @@ use lodedb_cloud_core::{
 use serde_json::json;
 use std::fs;
 
+/// A syntactically valid (64 lowercase hex chars) placeholder digest: the
+/// inventory validates every digest at the trust boundary, so handcrafted
+/// bodies must spell theirs correctly even when the bytes never exist.
+fn hex64(nibble: u8) -> String {
+    format!("{nibble:x}").repeat(64)
+}
+
 #[test]
 fn inventory_lists_base_and_delta_segments() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,12 +104,12 @@ fn inventory_covers_the_ann_tvann_store() {
         "base_epoch": 1,
         "document_count": 0,
         "chunk_count": 0,
-        "json": { "base": { "file_name": "g1.json", "sha256": "a", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g1.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
         "tvim": null,
         "tvtext": null,
         "tvlex": null,
         "tvmv": null,
-        "tvann": { "base": { "file_name": "g1.tvann", "sha256": "b", "file_bytes": 3 } },
+        "tvann": { "base": { "file_name": "g1.tvann", "sha256": hex64(0xb), "file_bytes": 3 } },
     });
     let inv = inventory_from_body("idx", Some(&body)).unwrap().unwrap();
     assert!(inv.artifacts.iter().any(|artifact| artifact.kind == "tvann"
@@ -116,32 +123,77 @@ fn inventory_covers_the_rescore_tvvf_store() {
     // {base, deltas} store: the engine refuses to open a rescore store without
     // its sidecar, so a push must ship the base AND any delta segments — a
     // pulled copy missing either would be unopenable, not merely degraded.
+    // Its base is NOT `g<base_epoch>.tvvf`: the sidecar keeps its own epoch
+    // counter (`vf_epoch`, here deliberately different from base_epoch) and
+    // lives at `vf<vf_epoch>.tvvf` (`tvvf_store::base_path`) — this body
+    // mirrors exactly what `write_base_manifest` records.
     let body = json!({
         "index_key": "idx",
         "generation": 2,
         "base_epoch": 1,
         "document_count": 0,
         "chunk_count": 0,
-        "json": { "base": { "file_name": "g1.json", "sha256": "a", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g1.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
         "tvim": null,
         "tvtext": null,
         "tvlex": null,
         "tvmv": null,
         "tvann": null,
         "tvvf": {
-            "base": { "file_name": "g1.tvvf", "sha256": "b", "file_bytes": 8 },
+            "schema_version": 1,
+            "index_key": "idx",
+            "vf_epoch": 3,
+            "base": { "file_name": "vf3.tvvf", "sha256": hex64(0xb), "file_bytes": 8 },
             "deltas": [
-                { "file_name": "delta-00000000.vfd", "sha256": "c", "file_bytes": 4 },
+                { "file_name": "delta-00000000.vfd", "sha256": hex64(0xc), "file_bytes": 4 },
             ],
+            "next_seq": 1,
         },
     });
     let inv = inventory_from_body("idx", Some(&body)).unwrap().unwrap();
     assert!(inv.artifacts.iter().any(|artifact| artifact.kind == "tvvf"
         && artifact.is_base
-        && artifact.name == "idx.gen/g1.tvvf"));
+        && artifact.epoch == 3
+        && artifact.name == "idx.gen/vf3.tvvf"));
     assert!(inv.artifacts.iter().any(|artifact| artifact.kind == "tvvf"
         && !artifact.is_base
-        && artifact.name == "idx.gen/g1.tvvf.tvvf-delta/delta-00000000.vfd"));
+        && artifact.name == "idx.gen/vf3.tvvf.tvvf-delta/delta-00000000.vfd"));
+}
+
+#[test]
+fn inventory_rejects_a_tvvf_manifest_without_vf_epoch() {
+    // Without the sidecar's own epoch the base path cannot be derived; guessing
+    // `g<base_epoch>.tvvf` would name a file the engine never writes.
+    let body = json!({
+        "index_key": "idx",
+        "generation": 2,
+        "base_epoch": 1,
+        "json": { "base": { "file_name": "g1.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "tvvf": {
+            "base": { "file_name": "vf3.tvvf", "sha256": hex64(0xb), "file_bytes": 8 },
+            "deltas": [],
+        },
+    });
+    let err = inventory_from_body("idx", Some(&body)).unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+    assert!(err.to_string().contains("vf_epoch"), "{err}");
+}
+
+#[test]
+fn inventory_rejects_a_malformed_artifact_digest() {
+    // Digests become staging file names and object keys downstream, so a
+    // "digest" carrying a path (or anything that is not 64 lowercase hex
+    // chars) must fail closed at the inventory — before it can name a path.
+    for bad in ["", "abc", "../../../etc/passwd", "/tmp/evil"] {
+        let sub = json!({
+            "base": { "file_name": "g0.json", "sha256": bad, "file_bytes": 0 },
+            "deltas": [],
+        });
+        let body = commit_body("idx", 1, 0, sub);
+        let err = inventory_from_body("idx", Some(&body)).unwrap_err();
+        assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+        assert!(err.to_string().contains("sha256"), "{err}");
+    }
 }
 
 #[test]
@@ -153,8 +205,8 @@ fn inventory_rejects_an_unknown_store_sub_manifest() {
         "index_key": "idx",
         "generation": 1,
         "base_epoch": 0,
-        "json": { "base": { "file_name": "g0.json", "sha256": "a", "file_bytes": 0 }, "deltas": [] },
-        "tvfuture": { "base": { "file_name": "g0.tvfuture", "sha256": "b", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "tvfuture": { "base": { "file_name": "g0.tvfuture", "sha256": hex64(0xb), "file_bytes": 0 }, "deltas": [] },
     });
     let err = inventory_from_body("idx", Some(&body)).unwrap_err();
     assert!(matches!(err, ArtifactStoreError::Integrity(_)));
@@ -244,8 +296,8 @@ fn inventory_rejects_a_traversing_delta_file_name() {
     // rejected before any artifact path is built, so a restore cannot plant a file
     // under another index's key.
     let sub = json!({
-        "base": { "file_name": "g0.json", "sha256": "x", "file_bytes": 0 },
-        "deltas": [{ "file_name": "../../victim.commit.json", "sha256": "y", "file_bytes": 0, "seq": 0 }],
+        "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 },
+        "deltas": [{ "file_name": "../../victim.commit.json", "sha256": hex64(0xe), "file_bytes": 0, "seq": 0 }],
     });
     let body = commit_body("idx", 1, 0, sub);
     let err = inventory_from_body("idx", Some(&body)).unwrap_err();
@@ -255,7 +307,7 @@ fn inventory_rejects_a_traversing_delta_file_name() {
 #[test]
 fn inventory_rejects_a_traversing_base_file_name() {
     let sub = json!({
-        "base": { "file_name": "../escape", "sha256": "x", "file_bytes": 0 },
+        "base": { "file_name": "../escape", "sha256": hex64(0xd), "file_bytes": 0 },
         "deltas": [],
     });
     let body = commit_body("idx", 1, 0, sub);
@@ -275,7 +327,7 @@ fn inventory_rejects_a_baseless_store_manifest() {
 #[test]
 fn inventory_rejects_a_non_object_delta_entry() {
     let sub = json!({
-        "base": { "file_name": "g0.json", "sha256": "x", "file_bytes": 0 },
+        "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 },
         "deltas": [null],
     });
     let body = commit_body("idx", 1, 0, sub);
@@ -293,8 +345,8 @@ fn inventory_includes_non_null_tvim_regardless_of_present_flag() {
         "base_epoch": 1,
         "document_count": 0,
         "chunk_count": 0,
-        "json": { "base": { "file_name": "g1.json", "sha256": "a", "file_bytes": 0 }, "deltas": [] },
-        "tvim": { "base": { "file_name": "g1.tvim", "sha256": "b", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g1.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "tvim": { "base": { "file_name": "g1.tvim", "sha256": hex64(0xb), "file_bytes": 0 }, "deltas": [] },
         "tvim_present": false,
         "tvtext": null,
         "tvlex": null,
@@ -311,7 +363,7 @@ fn inventory_rejects_a_base_file_name_that_disagrees_with_the_epoch() {
     // A valid basename that is not `g<base_epoch>.<kind>` is a tampered/inconsistent
     // pointer: the engine would open `g1.json` while the manifest names `g2.json`.
     let sub = json!({
-        "base": { "file_name": "g2.json", "sha256": "x", "file_bytes": 0 },
+        "base": { "file_name": "g2.json", "sha256": hex64(0xd), "file_bytes": 0 },
         "deltas": [],
     });
     let body = commit_body("idx", 1, 1, sub);
@@ -326,7 +378,7 @@ fn inventory_rejects_a_missing_body_index_key() {
     let body = json!({
         "generation": 1,
         "base_epoch": 0,
-        "json": { "base": { "file_name": "g0.json", "sha256": "x", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 }, "deltas": [] },
     });
     let err = inventory_from_body("idx", Some(&body)).unwrap_err();
     assert!(matches!(err, ArtifactStoreError::Integrity(_)));
@@ -340,7 +392,7 @@ fn inventory_rejects_a_non_object_store_manifest() {
         "index_key": "idx",
         "generation": 1,
         "base_epoch": 0,
-        "json": { "base": { "file_name": "g0.json", "sha256": "x", "file_bytes": 0 }, "deltas": [] },
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 }, "deltas": [] },
         "tvtext": "bad",
     });
     let err = inventory_from_body("idx", Some(&body)).unwrap_err();
@@ -352,7 +404,7 @@ fn inventory_rejects_a_body_key_mismatch() {
     // The pointer file-name key ("idx") disagrees with the body's own index_key
     // ("other") — only possible via tampering, since the body checksum is valid.
     let sub = json!({
-        "base": { "file_name": "g0.json", "sha256": "x", "file_bytes": 0 },
+        "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 },
         "deltas": [],
     });
     let body = commit_body("other", 1, 0, sub);

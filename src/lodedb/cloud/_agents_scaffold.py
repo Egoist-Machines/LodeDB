@@ -62,10 +62,14 @@ personal tokens pass `org=`/`environment=`. Never hard-code or print a token.
 
 ## Write semantics (important)
 
-Writes are asynchronous: `add`/`add_many` return an accepted `seq` BEFORE
-the write is searchable (it becomes so within seconds). For
-read-your-writes, pass that seq to search as `min_seq`; an HTTP 425 means
-"not folded yet" — retry after a moment. Do not treat 425 as failure.
+Writes are asynchronous: `add`/`add_many` return once the write is durably
+ACCEPTED (returning the document ids), BEFORE it is searchable — visibility
+follows within seconds. The SDK handles read-your-writes automatically: a
+search on the same handle waits briefly for that handle's own writes, and
+`store.wait_for(store.last_write_id)` blocks until a write is fully applied.
+Only when calling the raw HTTP API directly: pass the acceptance's `seq` to
+search as `min_seq`, and treat HTTP 425 as "not folded yet — retry after a
+moment", never as failure.
 
 ## CLI
 
@@ -119,9 +123,11 @@ lodedb cloud store list --environment {environment}   # registered stores
   `lodedb cloud login --host {host}` once. Never commit tokens.
 - The CLI prints JSON when piped; errors carry a `hint:` line and per-class
   exit codes (3 auth, 4 not found, 5 refused, 6 transient).
-- SDK writes are asynchronous: `add_many` returns a `seq`; pass it to
-  `search` as `min_seq` for read-your-writes, and treat HTTP 425 as
-  "retry shortly".
+- SDK writes are asynchronous: `add_many` returns the document ids once the
+  write is accepted, before it is searchable. The SDK handle does
+  read-your-writes automatically; `store.wait_for(store.last_write_id)`
+  blocks until the write applies. (Raw HTTP callers pass the acceptance's
+  `seq` as `min_seq` and treat HTTP 425 as "retry shortly".)
 - Full guide: `.claude/skills/orecloud/SKILL.md` (or {host}/llms.txt).
 """
 

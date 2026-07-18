@@ -17,6 +17,7 @@ use crate::artifact_store::ArtifactStore;
 use crate::digest::sha256_hex;
 use crate::error::{ArtifactStoreError, Result};
 use crate::generation_inventory::inventory_from_body;
+use lodedb_core::storage::commit_manifest::{commit_manifest_path, write_commit_manifest};
 use lodedb_core::storage::{load_store, LoadOptions};
 use std::path::Path;
 
@@ -105,4 +106,54 @@ pub fn verify_local_generation_opens(
         document_count: store.document_count(),
         chunk_count: store.chunk_count(),
     })
+}
+
+/// Proves a not-yet-committed candidate body opens through the engine WITHOUT
+/// touching the destination's committed pointer.
+///
+/// The restore flow stages the candidate's artifacts into `dir` first (they
+/// are immutable and additive, so this is safe), then calls this: every
+/// artifact the candidate pins is hardlinked (copied where linking fails)
+/// into a scratch directory alongside reconstructed journal manifests and the
+/// candidate pointer, and the scratch copy is verify-opened read-only. A
+/// checksum-consistent but semantically invalid artifact therefore fails the
+/// restore while the destination still points at its previous generation —
+/// without this, the pointer swap would publish the broken generation before
+/// the open check could reject it.
+pub(crate) fn verify_candidate_opens(
+    dir: &Path,
+    index_key: &str,
+    body: &serde_json::Value,
+) -> Result<OpenReport> {
+    let inventory = inventory_from_body(index_key, Some(body))?
+        .expect("inventory is Some when the body is Some");
+    // The scratch lives inside the destination so hardlinks stay on one
+    // filesystem; the dotted prefix keeps it invisible to the engine's
+    // top-level `*.json` legacy-snapshot glob, and TempDir removes it on drop.
+    let scratch = tempfile::Builder::new()
+        .prefix(".orecloud-verify-")
+        .tempdir_in(dir)?;
+    for artifact in &inventory.artifacts {
+        let source = crate::paths::resolve_within(dir, &dir.join(&artifact.name))?;
+        let target = scratch.path().join(&artifact.name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::hard_link(&source, &target).is_err() {
+            // Filesystems without hardlinks (or cross-device edge cases):
+            // fall back to a byte copy — correctness over speed.
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    crate::generation_inventory::write_restored_journal_manifests(
+        scratch.path(),
+        index_key,
+        body,
+    )?;
+    write_commit_manifest(
+        &commit_manifest_path(scratch.path(), index_key),
+        body,
+        false,
+    )?;
+    verify_local_generation_opens(scratch.path(), index_key)
 }

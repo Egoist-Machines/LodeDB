@@ -615,7 +615,9 @@ data plane for agent applications. The client ships as the `[cloud]` extra:
 pip install "lodedb[cloud]"
 
 lodedb cloud login                        # one browser approval
-lodedb cloud sync ./my-store cloud main   # mirror a local store to the cloud
+lodedb cloud init ./my-store              # link the directory to a managed remote
+lodedb cloud keys ./my-store              # list the directory's index keys
+lodedb cloud sync ./my-store cloud <key>  # mirror the local store to the cloud
 ```
 
 A cloud store opens through the same class as a local one, via the

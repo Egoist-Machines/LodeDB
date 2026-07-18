@@ -50,8 +50,11 @@ pub fn parse_blob_name(name: &str) -> Result<String> {
     Ok(sha256.to_string())
 }
 
-/// Requires exactly 64 lowercase hex characters.
-fn validate_sha256(sha256: &str) -> Result<()> {
+/// Requires exactly 64 lowercase hex characters. Also used by the generation
+/// inventory to validate every manifest digest at the trust boundary: digests
+/// become staging file names and object keys, so a non-hex "digest" must fail
+/// closed before it can name a path.
+pub(crate) fn validate_sha256(sha256: &str) -> Result<()> {
     let valid = sha256.len() == 64
         && sha256
             .bytes()

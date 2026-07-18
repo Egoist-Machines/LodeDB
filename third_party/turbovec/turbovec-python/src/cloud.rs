@@ -25,11 +25,29 @@ use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyRuntimeError, PyValueEr
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+pyo3::create_exception!(
+    cloud,
+    SyncConflictError,
+    PyRuntimeError,
+    "A sync/restore refused because resolving it needs an explicit decision \
+     (diverged/unknown lineage, or a destination WAL holding acknowledged \
+     writes) — re-run with a force flag or checkpoint first. Subclasses \
+     RuntimeError, so pre-existing handlers keep working."
+);
+
 /// Maps a library error onto the matching stdlib Python exception.
+///
+/// `SyncConflict` and `PendingWal` get the dedicated `SyncConflictError` (a
+/// RuntimeError subclass): both are refusals the caller resolves with a force
+/// flag or a checkpoint, and the CLI maps them to its "refused" exit class
+/// instead of "unexpected".
 fn to_py_err(error: ArtifactStoreError) -> PyErr {
     match &error {
         ArtifactStoreError::NotFound(_) => PyFileNotFoundError::new_err(error.to_string()),
         ArtifactStoreError::Io(_) => PyOSError::new_err(error.to_string()),
+        ArtifactStoreError::SyncConflict { .. } | ArtifactStoreError::PendingWal { .. } => {
+            SyncConflictError::new_err(error.to_string())
+        }
         _ => PyRuntimeError::new_err(error.to_string()),
     }
 }
@@ -315,7 +333,21 @@ fn managed_plan<'py>(
         None => dict.set_item("base", py.None())?,
     }
     dict.set_item("base_is_current", plan.base_is_current)?;
+    dict.set_item(
+        "local_raw_snapshot_id",
+        plan.local_raw_snapshot_id.as_deref(),
+    )?;
     Ok(dict)
+}
+
+/// The number of valid, replayable records in `dir`'s WAL for `key` (0 when
+/// the WAL is absent or empty). A pull-direction sync consults this BEFORE
+/// downloading blobs; deliberately not part of `managed_plan`, so push/status
+/// planning never pays an O(WAL bytes) scan.
+#[pyfunction]
+fn local_wal_ops(py: Python<'_>, dir: &str, key: &str) -> PyResult<usize> {
+    py.detach(|| client_ops::pending_wal_ops(dir, key))
+        .map_err(to_py_err)
 }
 
 /// Records `body_json` as the sidecar base for `remote_id` (stored verbatim)
@@ -350,10 +382,22 @@ fn managed_pull_requirements<'py>(
 }
 
 /// Restores a managed pull from `staging_dir` (holding `<sha256>` blob files)
-/// into `dir`, verifies the restored copy opens through the engine, and
-/// records the sidecar base against `remote_id`. Returns the transfer report
-/// plus the opened document/chunk counts.
+/// into `dir`, verifies the candidate opens through the engine BEFORE the
+/// pointer moves, and records the sidecar base against `remote_id`. Runs
+/// under the engine's single-writer lock; refuses when the destination WAL
+/// holds acknowledged operations unless `discard_pending_wal` (the
+/// force-pull semantics) truncates them. `expected_local_snapshot_id` pins
+/// the local state the caller classified (`""` = classified as absent;
+/// `None` = no pin, the plain-pull semantics): a local commit landing after
+/// classification refuses with `SyncConflictError` instead of being
+/// overwritten. Returns the transfer report plus the opened document/chunk
+/// counts.
 #[pyfunction]
+#[pyo3(signature = (
+    dir, key, remote_id, body_json, staging_dir,
+    discard_pending_wal = false, expected_local_snapshot_id = None
+))]
+#[allow(clippy::too_many_arguments)]
 fn managed_materialize<'py>(
     py: Python<'py>,
     dir: &str,
@@ -361,10 +405,22 @@ fn managed_materialize<'py>(
     remote_id: &str,
     body_json: &str,
     staging_dir: &str,
+    discard_pending_wal: bool,
+    expected_local_snapshot_id: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let body = parse_body("body", body_json)?;
     let outcome = py
-        .detach(|| managed::managed_materialize(dir, key, remote_id, body, staging_dir))
+        .detach(|| {
+            managed::managed_materialize(
+                dir,
+                key,
+                remote_id,
+                body,
+                staging_dir,
+                discard_pending_wal,
+                expected_local_snapshot_id,
+            )
+        })
         .map_err(to_py_err)?;
     let dict = transfer_dict(py, &outcome.transfer)?;
     dict.set_item("document_count", outcome.open.document_count)?;
@@ -379,12 +435,17 @@ fn managed_materialize<'py>(
 /// submodules are not importable through the module finder.
 pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let module = PyModule::new(parent.py(), "cloud")?;
+    module.add(
+        "SyncConflictError",
+        parent.py().get_type::<SyncConflictError>(),
+    )?;
     module.add_function(wrap_pyfunction!(keys, &module)?)?;
     module.add_function(wrap_pyfunction!(status, &module)?)?;
     module.add_function(wrap_pyfunction!(push, &module)?)?;
     module.add_function(wrap_pyfunction!(pull, &module)?)?;
     module.add_function(wrap_pyfunction!(sync, &module)?)?;
     module.add_function(wrap_pyfunction!(verify, &module)?)?;
+    module.add_function(wrap_pyfunction!(local_wal_ops, &module)?)?;
     module.add_function(wrap_pyfunction!(managed_plan, &module)?)?;
     module.add_function(wrap_pyfunction!(managed_record_base, &module)?)?;
     module.add_function(wrap_pyfunction!(managed_pull_requirements, &module)?)?;

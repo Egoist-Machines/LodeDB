@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use lodedb_cloud_core::{
     managed_materialize, managed_plan, managed_pull_requirements, managed_record_base, snapshot_id,
-    ArtifactStoreError, TransferPolicy,
+    ArtifactStore, ArtifactStoreError, TransferPolicy,
 };
 use std::fs;
 use std::path::Path;
@@ -141,6 +141,8 @@ fn pull_requirements_shrink_to_nothing_after_materialise() {
         REMOTE,
         body.clone(),
         dir_str(staging.path()),
+        false,
+        None,
     )
     .unwrap();
     assert!(outcome.transfer.pointer_published);
@@ -176,6 +178,8 @@ fn materialise_with_a_missing_staged_blob_fails_before_any_pointer_moves() {
         REMOTE,
         body,
         dir_str(staging.path()),
+        false,
+        None,
     )
     .unwrap_err();
     assert!(matches!(err, ArtifactStoreError::NotFound(_)));
@@ -204,8 +208,61 @@ fn materialise_with_a_corrupt_staged_blob_fails_closed() {
         REMOTE,
         body,
         dir_str(staging.path()),
+        false,
+        None,
     )
     .unwrap_err();
     assert!(matches!(err, ArtifactStoreError::Integrity(_)));
     assert!(!fresh.path().join(format!("{KEY}.commit.json")).exists());
+}
+
+#[test]
+fn materialise_refuses_when_the_local_store_moved_after_classification() {
+    // The sync caller pins the local snapshot it classified: a commit landing
+    // between classification and materialization must refuse (re-run the
+    // sync) instead of being silently overwritten by the pull.
+    let source = tempfile::tempdir().unwrap();
+    let body = commit_engine_generation(source.path(), KEY, 2, 2, "remote-v2", None);
+
+    let local = tempfile::tempdir().unwrap();
+    let classified = commit_engine_generation(local.path(), KEY, 1, 1, "local-v1", None);
+    let classified_id = lodedb_cloud_core::snapshot_id(&classified).unwrap();
+    // The local store commits again after "classification".
+    let newer = commit_engine_generation(local.path(), KEY, 3, 3, "local-v3", None);
+
+    let staging = tempfile::tempdir().unwrap();
+    stage_generation(source.path(), &body, staging.path());
+    let err = managed_materialize(
+        dir_str(local.path()),
+        KEY,
+        REMOTE,
+        body.clone(),
+        dir_str(staging.path()),
+        false,
+        Some(&classified_id),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ArtifactStoreError::SyncConflict { .. }),
+        "expected the stale-classification refusal, got: {err}"
+    );
+    // The newer local commit survives untouched.
+    let current = lodedb_cloud_core::LocalArtifactStore::new(local.path(), false)
+        .read_pointer(KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, newer);
+
+    // Pinning to "classified as absent" ("") refuses over any commit too.
+    let err = managed_materialize(
+        dir_str(local.path()),
+        KEY,
+        REMOTE,
+        body,
+        dir_str(staging.path()),
+        false,
+        Some(""),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::SyncConflict { .. }));
 }

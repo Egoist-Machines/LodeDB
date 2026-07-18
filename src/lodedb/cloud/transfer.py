@@ -12,9 +12,11 @@ this module moves bytes over HTTP (begin/commit sessions, presigned or
 proxied blob transfers), while everything that touches the commit format —
 identities, inventories, classification, the pointer document, sidecar
 trust, the verified restore — happens in the Rust core via
-``lodedb._turbovec.cloud.managed_*``. Python never parses a manifest and never
-re-serialises a body it hands back to Rust: bodies travel as the JSON
-strings the server returned.
+``lodedb._turbovec.cloud.managed_*``. Python never interprets a manifest: a
+head body is parsed only as opaque JSON and re-serialised for the Rust core,
+which recomputes every identity through the engine's own canonical writer
+(key-order- and formatting-insensitive), so no digest ever depends on
+Python's serialisation.
 """
 
 from __future__ import annotations
@@ -502,7 +504,10 @@ class LoginHandoff:
 # ---------------------------------------------------------------- managed
 
 # Engine store kinds → the wire contract's blob kinds. `tvann` (persisted ANN
-# clusters) is vector-derived acceleration data, payload-free like `tvim`.
+# clusters) and `tvvf` (the rescore original-vector sidecar) are vector-derived,
+# payload-free like `tvim`. Deliberately no default: an engine kind this table
+# does not know must fail loudly at `_wire_kind` rather than ship mislabelled —
+# the Rust inventory fails closed on unknown sub-manifests for the same reason.
 _ENGINE_KIND_TO_WIRE = {
     "json": "state",
     "tvim": "vector",
@@ -510,7 +515,19 @@ _ENGINE_KIND_TO_WIRE = {
     "tvtext": "text",
     "tvlex": "lexical",
     "tvann": "vector",
+    "tvvf": "vector",
 }
+
+
+def _wire_kind(engine_kind: str) -> str:
+    try:
+        return _ENGINE_KIND_TO_WIRE[engine_kind]
+    except KeyError:
+        raise CloudError(
+            422,
+            f"this client cannot classify engine store kind {engine_kind!r} for the "
+            "wire contract — upgrade lodedb before pushing this generation",
+        ) from None
 
 
 class SyncConflictError(CloudError):
@@ -652,24 +669,34 @@ def _push_with_plan(
                 {
                     "sha256": artifact["sha256"],
                     "size_bytes": artifact["size_bytes"],
-                    "kind": _ENGINE_KIND_TO_WIRE.get(artifact["kind"], "state"),
+                    "kind": _wire_kind(artifact["kind"]),
                 }
                 for artifact in local["artifacts"]
             ],
         },
     )
-    bytes_written = _upload_blobs(client, dir, local, begin["need_upload"])
-    base = plan.get("base")
-    client.commit_push(
-        remote.org,
-        remote.environment,
-        begin["session_id"],
-        {
-            "body": json.loads(local["body_json"]),
-            "pointer_document": local["pointer_document"],
-            "parent_snapshot_id": base["snapshot_id"] if base else None,
-        },
-    )
+    try:
+        bytes_written = _upload_blobs(client, dir, local, begin["need_upload"])
+        base = plan.get("base")
+        client.commit_push(
+            remote.org,
+            remote.environment,
+            begin["session_id"],
+            {
+                "body": json.loads(local["body_json"]),
+                "pointer_document": local["pointer_document"],
+                "parent_snapshot_id": base["snapshot_id"] if base else None,
+            },
+        )
+    except BaseException:
+        # Best-effort: release the server-side session instead of leaving it
+        # to expire on its own. The original failure is what matters — an
+        # abort that itself fails (network already gone) must not mask it.
+        try:
+            client.abort_push(remote.org, remote.environment, begin["session_id"])
+        except Exception:
+            pass
+        raise
     _core.managed_record_base(dir, key, identity, local["body_json"])
     return {
         "index_key": key,
@@ -709,6 +736,8 @@ def _pull_with_body(
     remote: ManagedRemote,
     host: str,
     expected_snapshot_id: str | None,
+    discard_pending_wal: bool = False,
+    expected_local_snapshot_id: str | None = None,
 ) -> dict:
     """The pull protocol: plan, download the missing blob set into staging,
     then let the Rust core materialise + verify-open + record the sidecar.
@@ -757,7 +786,13 @@ def _pull_with_body(
             if not fetched:
                 client.download_blob_proxy(blob["proxy_path"], dest)
         return _core.managed_materialize(
-            dir, key, remote.identity(host), body_json, staging
+            dir,
+            key,
+            remote.identity(host),
+            body_json,
+            staging,
+            discard_pending_wal=discard_pending_wal,
+            expected_local_snapshot_id=expected_local_snapshot_id,
         )
 
 
@@ -793,7 +828,8 @@ def managed_status(
     return {
         field: value
         for field, value in plan.items()
-        if field not in ("local", "remote", "base", "base_is_current")
+        if field
+        not in ("local", "remote", "base", "base_is_current", "local_raw_snapshot_id")
     }
 
 
@@ -843,6 +879,28 @@ def managed_sync(
                 ) from error
             raise
 
+    # The local state this classification saw, as the materialization pin:
+    # a local commit landing after this point refuses instead of being
+    # overwritten ("" pins to classified-as-absent).
+    classified_local = plan.get("local_raw_snapshot_id") or ""
+
+    def _refuse_pending_wal() -> None:
+        """A pull-direction transfer must not run over a local WAL still
+        holding acknowledged writes (replaying them onto the pulled lineage
+        would corrupt it; dropping them silently loses acked data). Refusing
+        HERE — before a single blob downloads — mirrors the Rust verbs; the
+        materialize step re-checks authoritatively under the writer lock. The
+        scan runs only on this pull branch, so push/status planning never
+        pays for it."""
+        ops = _core.local_wal_ops(dir, key)
+        if ops:
+            raise SyncConflictError(
+                409,
+                f"the local database holds {ops} uncheckpointed WAL operation(s); "
+                "checkpoint them by opening the store once, or re-run with "
+                "--force-pull to discard them along with the local lineage",
+            )
+
     if force_push:
         return outcome("push", True, _push_translating_conflict())
     if force_pull:
@@ -850,7 +908,18 @@ def managed_sync(
         if head_sha is None:
             raise CloudError(404, f"no committed generation to pull for index key {key!r}")
         return outcome(
-            "pull", True, _pull_with_body(client, dir, key, remote, host, head_sha)
+            "pull",
+            True,
+            _pull_with_body(
+                client,
+                dir,
+                key,
+                remote,
+                host,
+                head_sha,
+                discard_pending_wal=True,
+                expected_local_snapshot_id=classified_local,
+            ),
         )
 
     if classification == "in_sync":
@@ -865,8 +934,19 @@ def managed_sync(
         head_sha = head["head"]["snapshot_id"] if head.get("head") else None
         if head_sha is None:
             raise CloudError(404, f"no committed generation to pull for index key {key!r}")
+        _refuse_pending_wal()
         return outcome(
-            "pull", False, _pull_with_body(client, dir, key, remote, host, head_sha)
+            "pull",
+            False,
+            _pull_with_body(
+                client,
+                dir,
+                key,
+                remote,
+                host,
+                head_sha,
+                expected_local_snapshot_id=classified_local,
+            ),
         )
 
     # diverged/unknown: refuse with the same wording as the Rust verb.

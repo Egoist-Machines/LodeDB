@@ -132,3 +132,152 @@ fn restore_missing_source_generation_is_not_found() {
     let err = export_generation(&source, &dest, "idx", TransferPolicy::full()).unwrap_err();
     assert!(matches!(err, ArtifactStoreError::NotFound(_)));
 }
+
+#[test]
+fn pull_refuses_while_an_engine_writer_holds_the_directory_lock() {
+    // A restore is a writer of the database directory: it must contend on the
+    // engine's own single-writer lock rather than interleave with a live
+    // writer (whose in-memory state is based on the pointer the restore
+    // replaces). The env var keeps the contention check immediate.
+    const KEY: &str = "cc33dd44ee55ff6600112233445566778899aabbccddeeff0011223344556677";
+    std::env::set_var("LODEDB_PERSIST_LOCK_TIMEOUT", "0");
+    let remote = tempfile::tempdir().unwrap();
+    commit_engine_generation(remote.path(), KEY, 1, 1, "locked", None);
+    let local = tempfile::tempdir().unwrap();
+
+    let held = lodedb_core::engine::acquire_dir_writer_lock(local.path()).unwrap();
+    let err = lodedb_cloud_core::client_ops::pull(
+        remote.path().to_str().unwrap(),
+        local.path().to_str().unwrap(),
+        KEY,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("lodedb lock"),
+        "expected writer-lock contention, got: {err}"
+    );
+    drop(held);
+
+    // With the writer gone the same pull succeeds.
+    lodedb_cloud_core::client_ops::pull(
+        remote.path().to_str().unwrap(),
+        local.path().to_str().unwrap(),
+        KEY,
+    )
+    .unwrap();
+    std::env::remove_var("LODEDB_PERSIST_LOCK_TIMEOUT");
+}
+
+#[test]
+fn pull_refuses_over_a_destination_wal_with_pending_records() {
+    // The destination WAL's records were acknowledged against the OLD lineage;
+    // replaying them onto a pulled snapshot (or silently truncating them)
+    // corrupts or loses acked writes. Pull must refuse until the caller
+    // checkpoints — force-pull (a sync flag) is the explicit discard.
+    const KEY: &str = "cc33dd44ee55ff6600112233445566778899aabbccddeeff0011223344556677";
+    let remote = tempfile::tempdir().unwrap();
+    commit_engine_generation(remote.path(), KEY, 2, 1, "remote-side", None);
+
+    let local = tempfile::tempdir().unwrap();
+    commit_engine_generation(local.path(), KEY, 1, 1, "local-side", None);
+    let wal = lodedb_core::storage::wal::wal_path(local.path(), KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        2,
+        "add",
+        serde_json::json!({"id": "pending-doc"}),
+        false,
+    )
+    .unwrap();
+
+    let before = LocalArtifactStore::new(local.path(), false)
+        .read_pointer(KEY)
+        .unwrap();
+    let err = lodedb_cloud_core::client_ops::pull(
+        remote.path().to_str().unwrap(),
+        local.path().to_str().unwrap(),
+        KEY,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ArtifactStoreError::PendingWal { .. }),
+        "expected the pending-WAL refusal, got: {err}"
+    );
+    // Nothing moved: pointer unchanged, WAL records intact.
+    let after = LocalArtifactStore::new(local.path(), false)
+        .read_pointer(KEY)
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        lodedb_core::storage::wal::scan_stats(&wal).unwrap().op_count,
+        1
+    );
+}
+
+#[test]
+fn semantically_invalid_generation_never_replaces_the_destination_pointer() {
+    // Byte checksums can be internally consistent while the artifact is
+    // gibberish to the engine (a forged or corrupted-at-source remote): the
+    // recorded digest MATCHES the broken bytes. The restore must verify the
+    // candidate opens BEFORE the pointer swap, so the destination keeps its
+    // previous, valid generation when the check fails.
+    const KEY: &str = "cc33dd44ee55ff6600112233445566778899aabbccddeeff0011223344556677";
+    let remote = tempfile::tempdir().unwrap();
+    commit_engine_generation(remote.path(), KEY, 2, 2, "poisoned", None);
+    // Corrupt the remote's state artifact and re-sign the manifest so every
+    // byte checksum still validates.
+    let base = remote.path().join(format!("{KEY}.gen/g2.json"));
+    let garbage = b"not-a-state-journal";
+    fs::write(&base, garbage).unwrap();
+    let store = LocalArtifactStore::new(remote.path(), false);
+    let mut body = store.read_pointer(KEY).unwrap().unwrap();
+    body["json"]["base"]["sha256"] = serde_json::Value::String(sha_hex(garbage));
+    body["json"]["base"]["file_bytes"] = serde_json::Value::from(garbage.len() as u64);
+    lodedb_core::storage::commit_manifest::write_commit_manifest(
+        &lodedb_core::storage::commit_manifest::commit_manifest_path(remote.path(), KEY),
+        &body,
+        false,
+    )
+    .unwrap();
+
+    // The destination already holds a valid generation of its own.
+    let local = tempfile::tempdir().unwrap();
+    let valid = commit_engine_generation(local.path(), KEY, 1, 1, "still-good", None);
+
+    let err = lodedb_cloud_core::client_ops::pull(
+        remote.path().to_str().unwrap(),
+        local.path().to_str().unwrap(),
+        KEY,
+    )
+    .unwrap_err();
+    assert!(
+        !matches!(err, ArtifactStoreError::NotFound(_)),
+        "the failure must come from the acceptance check, got: {err}"
+    );
+    // The destination still points at its previous generation and still opens.
+    let current = LocalArtifactStore::new(local.path(), false)
+        .read_pointer(KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, valid);
+    verify_local_generation_opens(local.path(), KEY).unwrap();
+}
+
+#[test]
+fn pull_confines_the_wal_probe_to_the_destination() {
+    // The index key can arrive from CLI/remote input; a traversing spelling
+    // must fail closed before the WAL check (or anything else) touches a
+    // path outside the destination directory.
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let err = lodedb_cloud_core::client_ops::pull(
+        remote.path().to_str().unwrap(),
+        local.path().to_str().unwrap(),
+        "../escape",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ArtifactStoreError::Integrity(_)),
+        "expected path containment to reject the key, got: {err}"
+    );
+}

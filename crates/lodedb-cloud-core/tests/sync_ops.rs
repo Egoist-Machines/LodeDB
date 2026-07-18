@@ -608,3 +608,56 @@ fn contains_on_both_backends() {
     assert!(object.contains("blob").unwrap());
     assert!(!object.contains("missing").unwrap());
 }
+
+#[test]
+fn sync_pull_refuses_a_pending_wal_and_force_pull_discards_it() {
+    // dir2 is behind the remote AND holds acknowledged-but-uncheckpointed WAL
+    // records: a plain sync must refuse (those records were acked against the
+    // old lineage), and --force-pull — the explicit "keep the remote copy"
+    // decision — discards them along with the local lineage.
+    let dir1 = tempfile::tempdir().unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+
+    commit_engine_generation(dir1.path(), KEY, 1, 1, "v1", None);
+    run_sync(dir1.path(), remote.path(), SyncForce::None);
+    run_sync(dir2.path(), remote.path(), SyncForce::None); // dir2 clones v1
+    commit_engine_generation(dir1.path(), KEY, 2, 2, "v2", None);
+    run_sync(dir1.path(), remote.path(), SyncForce::None); // remote moves ahead
+
+    let wal = lodedb_core::storage::wal::wal_path(dir2.path(), KEY);
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        2,
+        "add",
+        serde_json::json!({"id": "acked-but-uncheckpointed"}),
+        false,
+    )
+    .unwrap();
+
+    let err = sync(
+        dir2.path().to_str().unwrap(),
+        remote.path().to_str().unwrap(),
+        KEY,
+        TransferPolicy::redacted(),
+        SyncForce::None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ArtifactStoreError::PendingWal { .. }),
+        "expected the pending-WAL refusal, got: {err}"
+    );
+    assert_eq!(
+        lodedb_core::storage::wal::scan_stats(&wal).unwrap().op_count,
+        1,
+        "a refusal must not touch the WAL"
+    );
+
+    let outcome = run_sync(dir2.path(), remote.path(), SyncForce::Pull);
+    assert_eq!((outcome.action.as_str(), outcome.forced), ("pull", true));
+    assert_eq!(
+        lodedb_core::storage::wal::scan_stats(&wal).unwrap().op_count,
+        0,
+        "force-pull discards the pending records with the local lineage"
+    );
+}

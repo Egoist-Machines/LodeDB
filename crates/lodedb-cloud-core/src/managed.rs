@@ -22,20 +22,23 @@
 //! Python layer owns the spelling of managed remotes, and the sidecar records
 //! and compares exactly that string.
 
-use crate::client_ops::snap_ref;
+use crate::client_ops::{ensure_no_pending_wal, snap_ref};
 use crate::error::{ArtifactStoreError, Result};
-use crate::generation_inventory::{diff_inventories, inventory_from_body, ArtifactRef};
+use crate::generation_inventory::{
+    diff_inventories, inventory_from_body, write_restored_journal_manifests, ArtifactRef,
+};
 use crate::local_artifact_store::LocalArtifactStore;
-use crate::manifest_transfer::{export_generation_pinned, TransferResult};
+use crate::manifest_transfer::{publish_staged, stage_generation_pinned, TransferResult};
 use crate::snapshot_identity::{identity_from_document, pointer_document};
 use crate::status::{compare_generations, StatusReport};
 use crate::sync_plan::{classify, SnapRef};
 use crate::sync_state::{read_sync_state, write_sync_state, SyncState};
 use crate::transfer_policy::TransferPolicy;
-use crate::verify::{verify_local_generation_opens, OpenReport};
+use crate::verify::{verify_candidate_opens, OpenReport};
 use crate::ArtifactStore;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,6 +80,13 @@ pub struct ManagedPlan {
     /// — when false after an `in_sync` classification, the caller should
     /// refresh the sidecar (mirrors `client_ops::sync`'s stale-base repair).
     pub base_is_current: bool,
+    /// The RAW (unredacted) local pointer's snapshot id at classification
+    /// time; `None` when the directory holds no committed generation. A
+    /// pull-direction materialization pins on this so a local commit landing
+    /// between classification and materialization refuses instead of being
+    /// silently overwritten — the managed twin of the dumb sync carrying its
+    /// classified `local_raw` into the pointer CAS.
+    pub local_raw_snapshot_id: Option<String>,
 }
 
 /// What one managed pull produced (mirrors [`crate::PullOutcome`]).
@@ -122,9 +132,12 @@ pub fn managed_plan(
     require_local_dir(dir)?;
     let local_store = LocalArtifactStore::new(dir, false);
 
-    let local_body = local_store
-        .read_pointer(index_key)?
-        .map(|body| policy.redact_body(&body));
+    let local_raw = local_store.read_pointer(index_key)?;
+    let local_raw_snapshot_id = local_raw
+        .as_ref()
+        .map(crate::snapshot_identity::snapshot_id)
+        .transpose()?;
+    let local_body = local_raw.map(|body| policy.redact_body(&body));
     let local_inventory = inventory_from_body(index_key, local_body.as_ref())?;
     let remote_inventory = inventory_from_body(index_key, remote_body.as_ref())?;
     let mut report = compare_generations(
@@ -194,6 +207,7 @@ pub fn managed_plan(
         remote,
         base,
         base_is_current,
+        local_raw_snapshot_id,
     })
 }
 
@@ -268,6 +282,11 @@ impl StagingBlobStore {
                 "artifact {name:?} is not referenced by the pull body"
             ))
         })?;
+        // The inventory already validated every digest as 64 lowercase hex
+        // characters; re-assert here (defense in depth) so a digest can never
+        // traverse out of the staging root even if a future inventory change
+        // loosens that guarantee.
+        crate::blob_layout::validate_sha256(sha)?;
         Ok(self.root.join(sha))
     }
 }
@@ -312,31 +331,76 @@ impl ArtifactStore for StagingBlobStore {
 /// Materialises a managed pull: restores `body`'s generation into `dir` from
 /// content-addressed blobs previously downloaded into `staging_dir`
 /// (`<staging_dir>/<sha256>` per blob), proves the restored copy opens
-/// through the engine, and records the sidecar base against `remote_id`.
+/// through the engine BEFORE the pointer moves, and records the sidecar base
+/// against `remote_id`.
 ///
-/// The restore reuses the pinned transfer path, so every blob is re-hashed
-/// against the manifest checksum on write (a corrupt download fails the pull
-/// before any pointer moves) and the local pointer swap preconditions on the
-/// committed body read at the start (a concurrent engine commit surfaces as
-/// a `PointerConflict` instead of being clobbered).
+/// The restore runs under the engine's single-writer lock (a live writer and
+/// a restore must never interleave) and refuses when the destination WAL
+/// still holds acknowledged operations — pass `discard_pending_wal` (the
+/// force-pull semantics) to truncate them along with the local lineage. Every
+/// blob is re-hashed against the manifest checksum on write (a corrupt
+/// download fails the pull before any pointer moves), the candidate is
+/// verify-opened from a scratch layout before publication, and the local
+/// pointer swap preconditions on the committed body read at the start (a
+/// concurrent engine commit surfaces as a `PointerConflict` instead of being
+/// clobbered).
 pub fn managed_materialize(
     dir: &str,
     index_key: &str,
     remote_id: &str,
     body: Value,
     staging_dir: &str,
+    discard_pending_wal: bool,
+    expected_local_snapshot_id: Option<&str>,
 ) -> Result<ManagedPullOutcome> {
     require_local_dir(dir)?;
     let staging = StagingBlobStore::new(Path::new(staging_dir), index_key, body.clone())?;
     let local_store = LocalArtifactStore::new(dir, false);
+    fs::create_dir_all(dir)?;
+    let _writer_lock = lodedb_core::engine::acquire_dir_writer_lock(Path::new(dir))
+        .map_err(ArtifactStoreError::Core)?;
+    if !discard_pending_wal {
+        ensure_no_pending_wal(
+            dir,
+            index_key,
+            "checkpoint them by opening the store once, or re-run the sync with \
+             --force-pull to discard them along with the local lineage",
+        )?;
+    }
     let local_raw = local_store.read_pointer(index_key)?;
+    // Pin the materialization to the local state the caller CLASSIFIED, not
+    // the state found now: a commit landing between classification and this
+    // lock acquisition must refuse (re-run the sync to re-classify) rather
+    // than be silently overwritten. `None` skips the pin (a plain pull's
+    // decision IS the state read under this lock); the empty string pins to
+    // "classified as absent" (a fresh clone), any other value to that exact
+    // raw snapshot id.
+    if let Some(expected) = expected_local_snapshot_id {
+        let current = local_raw
+            .as_ref()
+            .map(crate::snapshot_identity::snapshot_id)
+            .transpose()?;
+        let unchanged = if expected.is_empty() {
+            current.is_none()
+        } else {
+            current.as_deref() == Some(expected)
+        };
+        if !unchanged {
+            return Err(ArtifactStoreError::SyncConflict {
+                classification: "stale".to_string(),
+                hint: "the local store committed a new generation after this sync \
+                       classified it; re-run the sync to reconcile"
+                    .to_string(),
+            });
+        }
+    }
     // The managed remote absorbs same-name forks (blobs are content-
     // addressed there), but the LOCAL directory still stores artifacts by
     // engine name: force-pulling a diverged lineage that reuses a name with
     // different bytes fails closed on the immutability invariant, exactly
     // like the dumb-target verbs — recover by pulling into a fresh
     // directory. The wrapper attaches that recovery hint.
-    let (transfer, restored) = export_generation_pinned(
+    let staged = stage_generation_pinned(
         &staging,
         &local_store,
         index_key,
@@ -345,15 +409,23 @@ pub fn managed_materialize(
         local_raw,
     )
     .map_err(crate::client_ops::explain_fork_collision)?;
-    // Rebuild the engine's delta-journal manifests (working state the body
-    // doesn't pin) so the restored copy is writable, not just readable —
-    // the cloud writer opens hydrated copies through this path.
-    crate::generation_inventory::write_restored_journal_manifests(
-        Path::new(dir),
-        index_key,
-        &restored,
-    )?;
-    let open = verify_local_generation_opens(Path::new(dir), index_key)?;
+    // Acceptance checks run against a scratch candidate BEFORE the pointer
+    // moves (the scratch carries its own journal manifests, so the real
+    // destination stays untouched until the swap).
+    let open = verify_candidate_opens(Path::new(dir), index_key, &staged.source_body)?;
+    let (transfer, restored) = publish_staged(&local_store, index_key, staged)?;
+    if discard_pending_wal {
+        lodedb_core::storage::wal::truncate(
+            &crate::client_ops::contained_wal_path(dir, index_key)?,
+            false,
+        )?;
+    }
+    // Rebuild the journal manifests (working state the body doesn't pin) so
+    // the restored copy is writable, not just readable — the cloud writer
+    // opens hydrated copies through this path. Strictly AFTER the swap:
+    // writing them first would, on a failed CAS, leave the candidate's
+    // journals attached to some other writer's committed body.
+    write_restored_journal_manifests(Path::new(dir), index_key, &restored)?;
     managed_record_base(dir, index_key, remote_id, &restored)?;
     Ok(ManagedPullOutcome { transfer, open })
 }
