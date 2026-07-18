@@ -62,10 +62,11 @@ for _m in ("lodedb", "lodedb.local.cli", "lodedb.cloud"):
 _FORBIDDEN = (
     "langchain", "langchain_core", "llama_index", "mem0", "cognee",
     "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
-    # The [cloud] extra's proprietary client: the CLI trampoline, the
-    # LodeDB.cloud()/orecloud:// funnel, and the lodedb.cloud proxy all import
-    # it lazily inside the call — a plain import must stay network-free.
-    "orecloud",
+    # The [cloud] extra's dependencies (httpx; pynacl imports as `nacl`): the
+    # first-party cloud client (lodedb.cloud) reaches them only through its
+    # lazy PEP 562 exports and the CLI trampoline, so a plain import — even of
+    # lodedb.cloud itself — must stay network-free.
+    "httpx", "nacl",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:

@@ -2076,7 +2076,8 @@ all = [
     { name = "transformers" },
 ]
 cloud = [
-    { name = "orecloud" },
+    { name = "httpx" },
+    { name = "pynacl" },
 ]
 cognee = [
     { name = "cognee", marker = "python_full_version < '3.15'" },
@@ -2119,6 +2120,7 @@ torch = [
 requires-dist = [
     { name = "cognee", marker = "python_full_version < '3.15' and extra == 'cognee'", specifier = ">=1.1.0,<2" },
     { name = "cupy-cuda12x", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=13.0.0" },
+    { name = "httpx", marker = "extra == 'cloud'", specifier = ">=0.27" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=0.3.0" },
     { name = "llama-index-core", marker = "extra == 'llama-index'", specifier = ">=0.11.0" },
     { name = "lodedb", extras = ["embeddings", "torch", "image", "mcp", "langchain", "llama-index", "mem0"], marker = "extra == 'all'" },
@@ -2128,8 +2130,8 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0.0,<3" },
     { name = "onnxruntime", marker = "extra == 'embeddings'", specifier = ">=1.20.0,<2" },
     { name = "optimum", extras = ["exporters"], marker = "extra == 'onnx-export'", specifier = ">=1.23.0,<2.0.0" },
-    { name = "orecloud", marker = "extra == 'cloud'", specifier = ">=0.1" },
     { name = "pillow", marker = "extra == 'image'", specifier = ">=10.0.0" },
+    { name = "pynacl", marker = "extra == 'cloud'", specifier = ">=1.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.17" },
@@ -2952,23 +2954,6 @@ exporters = [
     { name = "onnxruntime" },
     { name = "protobuf" },
     { name = "transformers" },
-]
-
-[[package]]
-name = "orecloud"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "pynacl" },
-    { name = "typer" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c1/e3/b062d439e311c46c5ffa71c15e9a5cf41553840ad3a7ba6c86f1d6bc396c/orecloud-0.1.0.tar.gz", hash = "sha256:4b0a021cfbe8f6ca58da65326858d8498e98fcb5d962212e76fdabbc26db8e0d", size = 129576, upload-time = "2026-07-17T23:42:52.643Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/01/db8d91e88837dd23aea23e84df708817ff1d63798488d25046476c7f243e/orecloud-0.1.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:367669ff233d0e2e3f5a98739322ee878cdcb2586de2fb50d7169a15d5634d82", size = 3160410, upload-time = "2026-07-17T23:42:45.405Z" },
-    { url = "https://files.pythonhosted.org/packages/60/7f/8aedcc7151a12eae968f527c87bc4392de8cc73da8b21012148547fec462/orecloud-0.1.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:ad8e354dd1c24071291eabbaccf9e3541991d8e28f38836b5f69af819d759f78", size = 3003967, upload-time = "2026-07-17T23:42:47.319Z" },
-    { url = "https://files.pythonhosted.org/packages/73/47/84300383639d65c46fcfa44bf772c40ea3bda34a8bcaad38c59109a7eafa/orecloud-0.1.0-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:efbe06eb5478488ccdf2aa275ce344f2c5d6ef5650d2e1e7a2d89834765543f3", size = 3432839, upload-time = "2026-07-17T23:42:49.383Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/22/326ee298f307d517a77d70f11be21f15858e585b619c6f3eb22d24ef9863/orecloud-0.1.0-cp311-abi3-win_amd64.whl", hash = "sha256:3fda11fe34ec2f39f6c4368f186237a61c193dd30e268608816dc4454b62a119", size = 2843305, upload-time = "2026-07-17T23:42:50.93Z" },
 ]
 
 [[package]]

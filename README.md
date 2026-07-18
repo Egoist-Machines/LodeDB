@@ -642,11 +642,11 @@ per-user handles from it (`Client().store(user_id)` — one credential
 resolution, one shared HTTP pool); `from lodedb.cloud import Client` works as
 the import root.
 
-Work locally with `lodedb` exactly as before; `lodedb cloud …` forwards to
-the `orecloud` CLI the extra installs, and the rest of the cloud Python APIs
-(per-user stores, recall, hosted MCP) live in that same package. The client
-is proprietary and loads only when invoked — a plain `import lodedb` stays
-network-free.
+Work locally with `lodedb` exactly as before. The client is first-party code
+in this package — `lodedb.cloud` and the `lodedb cloud` CLI, with push/pull/
+sync running on the same bundled native core as the engine — and the extra
+installs only its dependencies (`httpx`, `pynacl`). Everything cloud loads
+lazily, so a plain `import lodedb` stays network-free.
 
 ## Concurrency & durability
 

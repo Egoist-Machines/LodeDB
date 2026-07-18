@@ -10,6 +10,11 @@ use lodedb_core::{
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyType};
+
+// The managed-cloud transfer plane (push/pull/sync over the open commit
+// format), exposed as the `cloud` submodule so the [cloud] extra's Python
+// client rides the same bundled extension as the engine.
+mod cloud;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1725,5 +1730,6 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_embedded_documents_payload, m)?)?;
     m.add_function(wrap_pyfunction!(encode_wal_segment, m)?)?;
     m.add_function(wrap_pyfunction!(decode_wal_segment, m)?)?;
+    cloud::register(m)?;
     Ok(())
 }

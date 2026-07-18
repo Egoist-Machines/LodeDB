@@ -1,0 +1,36 @@
+[package]
+name = "lodedb-cloud-core"
+description = "Native transfer core for the LodeDB managed cloud — durable push/pull/sync over the open commit format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The engine core. The cloud transfer plane links its `storage` module directly
+# so the managed cloud and the embedded product share ONE commit-format
+# implementation (schema, layout, checksum, sub-manifests incl. `tvmv`). A path
+# dep now that both live in this workspace — engine changes and the transfer
+# plane move together under one suite.
+lodedb-core = { path = "../lodedb-core" }
+# Object-storage backend (S3/GCS/Azure) behind the same ArtifactStore trait. The
+# `aws` feature adds the S3 builder; the crate's conditional-put API (Create /
+# Update{e_tag}) is what makes the root-pointer compare-and-swap strongly
+# consistent on object storage. Its InMemory backend also drives the tests.
+object_store = { version = "0.12.5", features = ["aws"] }
+serde_json = "1.0"
+sha2 = "0.10"
+# The object_store backends are async; the runtime is enabled with net + time so a
+# real S3 client works (not just the in-memory test backend). ObjectArtifactStore
+# keeps the sync ArtifactStore trait by owning a current-thread runtime.
+tokio = { version = "1.47.5", default-features = false, features = ["rt", "net", "time"] }
+# The pointer serialize/validate round-trip reuses lodedb-core's own
+# write/read_commit_manifest (which operate on file paths) via a scratch file, so
+# object-store pointer documents are byte-identical to on-disk ones. Also used by
+# the test fixtures to build committed generations in throwaway directories.
+tempfile = "3"
+
+[lints]
+workspace = true

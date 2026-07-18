@@ -86,11 +86,12 @@ mem0 = ["mem0ai>=2.0.0"]
 # cognee supports python <3.15, so the marker keeps this extra out of the resolution above
 # that (LodeDB's own requires-python has no upper bound).
 cognee = ["cognee>=1.1.0,<2; python_version < '3.15'"]
-# The managed-cloud companion (OreCloud): sync/serve LodeDB stores in the managed cloud and
-# use the hosted per-user data plane. The `orecloud` client is proprietary (not part of this
-# Apache-2.0 package); it is imported only inside the `lodedb cloud` trampoline, never on a
-# plain `import lodedb` (tests/test_import_boundary.py).
-cloud = ["orecloud>=0.1"]
+# The managed cloud (OreCloud): sync/serve LodeDB stores in the managed cloud and use the
+# hosted per-user data plane. The client is first-party (`lodedb.cloud` + the `lodedb cloud`
+# CLI, over the bundled native transfer core); this extra adds only its third-party deps —
+# httpx (the HTTP client) and pynacl (the sealed-box browser-approval login). Both are
+# imported lazily, never on a plain `import lodedb` (tests/test_import_boundary.py).
+cloud = ["httpx>=0.27", "pynacl>=1.5"]
 # Optional image + text (CLIP) embedding via the "clip" preset / add_image. CLIP runs on the
 # sentence-transformers stack (the [torch] tier) and adds Pillow for decoding image files. Both
 # are imported lazily, so a plain `import lodedb` pulls neither (tests/test_import_boundary.py).
@@ -140,6 +141,12 @@ extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Generated-content templates (SKILL.md / AGENTS.md scaffolds): YAML frontmatter
+# and prose must stay on one physical line inside the template strings, so the
+# line-length rule cannot apply without corrupting the generated output.
+"src/lodedb/cloud/_agents_scaffold.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["lodedb"]

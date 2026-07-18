@@ -360,15 +360,16 @@ app.add_typer(migrate_app, name="migrate")
 def cloud(ctx: typer.Context) -> None:
     """Sync, serve, and manage LodeDB stores in the managed cloud (OreCloud).
 
-    A trampoline into the `orecloud` CLI from the [cloud] extra. The import
-    is deliberately lazy: the client is optional and proprietary, and a plain
-    `import lodedb` must never load it (tests/test_import_boundary.py).
+    A trampoline into the first-party cloud CLI (`lodedb.cloud.cli`). The
+    import is deliberately lazy: the client modules pull the [cloud] extra's
+    dependencies (httpx), and a plain `import lodedb` must never load those
+    (tests/test_import_boundary.py).
     """
     try:
-        from orecloud.cli import app as cloud_app
+        from lodedb.cloud.cli import app as cloud_app
     except ImportError:
         typer.echo(
-            'the cloud companion is not installed — run: pip install "lodedb[cloud]"',
+            'the cloud client dependencies are not installed — run: pip install "lodedb[cloud]"',
             err=True,
         )
         # from None: the hint IS the diagnosis; the ImportError adds noise.
