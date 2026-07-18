@@ -160,3 +160,77 @@ fn read_pointer_on_nonexistent_root_is_none() {
     let store = LocalArtifactStore::new(&root, false);
     assert!(store.read_pointer("idx").unwrap().is_none());
 }
+
+#[test]
+fn failed_stream_leaves_no_scratch_file_behind() {
+    // A digest mismatch mid-stream must neither store the artifact nor
+    // litter the generation directory with the `.tmp` scratch.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalArtifactStore::new(dir.path(), false);
+    let mut reader: &[u8] = b"streamed-bytes";
+    let err = store
+        .write_stream_if_absent("idx.gen/g0.json", &mut reader, &sha_hex(b"other"), 0)
+        .unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+    let gen_dir = dir.path().join("idx.gen");
+    let leftovers: Vec<_> = std::fs::read_dir(&gen_dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "expected an empty generation directory, found {leftovers:?}"
+    );
+}
+
+#[test]
+fn racing_local_writers_never_corrupt_a_published_artifact() {
+    // Two writers streaming DIFFERENT bytes under one name: unique scratches
+    // plus a no-replace publish mean exactly one lineage's bytes land, every
+    // Ok return attests bytes that match one writer's digest in full, and a
+    // loser sees the immutability refusal — never a torn interleaving.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let payload_a: Vec<u8> = std::iter::repeat_with(|| b'a').take(4 * 1024 * 1024).collect();
+    let payload_b: Vec<u8> = std::iter::repeat_with(|| b'b').take(4 * 1024 * 1024).collect();
+    let digest_a = sha_hex(&payload_a);
+    let digest_b = sha_hex(&payload_b);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let spawn = |payload: Vec<u8>, digest: String, root: std::path::PathBuf, barrier: std::sync::Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            let store = LocalArtifactStore::new(root, false);
+            barrier.wait();
+            let mut reader: &[u8] = &payload;
+            store.write_stream_if_absent("idx.gen/g0.json", &mut reader, &digest, 0)
+        })
+    };
+    let a = spawn(payload_a.clone(), digest_a.clone(), root.clone(), barrier.clone());
+    let b = spawn(payload_b.clone(), digest_b.clone(), root.clone(), barrier);
+    let result_a = a.join().unwrap();
+    let result_b = b.join().unwrap();
+
+    let stored = std::fs::read(root.join("idx.gen/g0.json")).unwrap();
+    let stored_digest = sha_hex(&stored);
+    assert!(
+        stored_digest == digest_a || stored_digest == digest_b,
+        "stored bytes must belong wholly to one writer"
+    );
+    // A writer that returned Ok must have its digest stored, or have lost to
+    // identical bytes; a loser with different bytes must have been refused.
+    for (result, digest) in [(result_a, digest_a), (result_b, digest_b)] {
+        match result {
+            Ok(()) => assert_eq!(stored_digest, digest, "Ok must attest the stored bytes"),
+            Err(error) => assert!(
+                matches!(error, ArtifactStoreError::Integrity(_)),
+                "a loser must see the immutability refusal, got: {error}"
+            ),
+        }
+    }
+    // No scratch litter either way.
+    let leftovers: Vec<_> = std::fs::read_dir(root.join("idx.gen"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name() != "g0.json")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}

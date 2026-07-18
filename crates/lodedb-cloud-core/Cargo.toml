@@ -22,6 +22,11 @@ lodedb-core = { path = "../lodedb-core" }
 object_store = { version = "0.12.5", features = ["aws"] }
 serde_json = "1.0"
 sha2 = "0.10"
+# Streaming transfer plumbing: `bytes` for the object-store chunk type and
+# `futures` for driving its download streams chunk-by-chunk from the sync
+# ArtifactStore surface. Both are already in the tree via object_store.
+bytes = "1"
+futures = "0.3"
 # The object_store backends are async; the runtime is enabled with net + time so a
 # real S3 client works (not just the in-memory test backend). ObjectArtifactStore
 # keeps the sync ArtifactStore trait by owning a current-thread runtime.

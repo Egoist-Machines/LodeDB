@@ -18,37 +18,73 @@
 
 use crate::error::Result;
 use serde_json::Value;
+use std::io::Read;
 
 /// Reads/writes immutable artifacts and swaps a root pointer atomically.
 ///
-/// The interface is deliberately small: byte-level artifact I/O plus a pointer
+/// The interface is deliberately small: streaming artifact I/O plus a pointer
 /// compare-and-swap. That is everything the generation-addressed commit format
-/// needs as a cloud substrate.
+/// needs as a cloud substrate. Streaming is the primitive — vector bases run
+/// to gigabytes, so a transfer's peak memory must be a fixed buffer, never a
+/// function of artifact size; the buffered methods are conveniences for the
+/// small payloads (pointer documents) built on top.
 pub trait ArtifactStore {
-    /// Returns one artifact's bytes; [`ArtifactStoreError::NotFound`] if the name
-    /// is absent.
+    /// Opens one artifact for streaming reads;
+    /// [`ArtifactStoreError::NotFound`] if the name is absent.
     ///
     /// [`ArtifactStoreError::NotFound`]: crate::ArtifactStoreError::NotFound
-    fn read_bytes(&self, name: &str) -> Result<Vec<u8>>;
+    fn open_read<'a>(&'a self, name: &str) -> Result<Box<dyn Read + 'a>>;
 
-    /// Writes one immutable artifact unless it already exists.
+    /// Returns one artifact's bytes, fully buffered — for small payloads
+    /// only; transfers and verification stream via [`open_read`](Self::open_read).
+    fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.open_read(name)?.read_to_end(&mut data)?;
+        Ok(data)
+    }
+
+    /// Streams one immutable artifact into the store unless it already
+    /// exists, hashing incrementally as it copies.
     ///
-    /// `sha256` is the expected lowercase-hex digest of `data`; a mismatch is an
-    /// integrity error so corruption is never stored. A name already present
-    /// with identical bytes is a no-op (idempotent re-push); present with
-    /// *different* bytes is a conflict — artifacts are immutable and are never
-    /// overwritten in place.
-    fn write_bytes_if_absent(&self, name: &str, data: &[u8], sha256: &str) -> Result<()>;
+    /// `sha256` is the expected lowercase-hex digest of the streamed bytes; a
+    /// mismatch is an integrity error and nothing is stored — corruption can
+    /// never land, even when the source is another store's live stream. A
+    /// name already present with identical bytes is a no-op (idempotent
+    /// re-push); present with *different* bytes is a conflict — artifacts are
+    /// immutable and are never overwritten in place. On the already-present
+    /// no-op path the incoming stream may be left partially (or wholly)
+    /// unread and unvalidated: success then attests that the STORED bytes
+    /// match `sha256`, not that the stream did.
+    ///
+    /// `size_hint` is the expected byte count (0 = unknown) — advisory only:
+    /// backends use it to pick an upload strategy (the object store's
+    /// conditional-claim path has a provider copy-size ceiling), never to
+    /// trust the stream's length. Transfers pass the manifest-recorded size.
+    fn write_stream_if_absent(
+        &self,
+        name: &str,
+        data: &mut dyn Read,
+        sha256: &str,
+        size_hint: u64,
+    ) -> Result<()>;
+
+    /// Buffered convenience over
+    /// [`write_stream_if_absent`](Self::write_stream_if_absent), for small
+    /// payloads a caller already holds in memory.
+    fn write_bytes_if_absent(&self, name: &str, data: &[u8], sha256: &str) -> Result<()> {
+        let mut cursor = data;
+        self.write_stream_if_absent(name, &mut cursor, sha256, data.len() as u64)
+    }
 
     /// Whether an artifact named `name` is present, without asserting anything
     /// about its content.
     ///
-    /// The default reads the artifact and maps
+    /// The default opens the artifact and maps
     /// [`NotFound`](crate::ArtifactStoreError::NotFound) to `false`; backends
     /// with a cheap existence primitive (a filesystem stat, an object-store
-    /// HEAD) should override it to avoid fetching the bytes.
+    /// HEAD) should override it to avoid opening a stream.
     fn contains(&self, name: &str) -> Result<bool> {
-        match self.read_bytes(name) {
+        match self.open_read(name) {
             Ok(_) => Ok(true),
             Err(crate::ArtifactStoreError::NotFound(_)) => Ok(false),
             Err(error) => Err(error),

@@ -183,8 +183,18 @@ pub(crate) fn stage_generation_pinned(
     let diff = diff_inventories(&source_inventory, dest_inventory.as_ref());
 
     for artifact in &diff.to_upload {
-        let data = source.read_bytes(&artifact.name)?;
-        dest.write_bytes_if_absent(&artifact.name, &data, &artifact.sha256)?;
+        // Streamed end to end: the destination hashes while it copies, so the
+        // transfer's peak memory is a fixed buffer (or one multipart chunk on
+        // object storage) — never the artifact, which for a vector base can
+        // be gigabytes. The manifest-recorded size rides along as the
+        // strategy hint (it is advisory; the digest gate stays authoritative).
+        let mut reader = source.open_read(&artifact.name)?;
+        dest.write_stream_if_absent(
+            &artifact.name,
+            &mut *reader,
+            &artifact.sha256,
+            artifact.size_bytes,
+        )?;
     }
 
     Ok(StagedExport {

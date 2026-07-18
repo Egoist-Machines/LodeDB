@@ -200,3 +200,86 @@ fn exports_and_restores_through_an_object_store() {
     let report = verify_local_generation_opens(restored.path(), KEY).unwrap();
     assert_eq!(report.index_key, KEY);
 }
+
+/// Deterministic pseudo-random bytes big enough to cross the multipart
+/// threshold (8 MiB) with a non-chunk-aligned tail.
+fn large_payload() -> Vec<u8> {
+    let len = 9 * 1024 * 1024 + 12345;
+    (0..len).map(|i| (i * 31 + i / 251) as u8).collect()
+}
+
+#[test]
+fn large_artifacts_stream_through_multipart_byte_identically() {
+    let backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = ObjectArtifactStore::new(backend, "tenant").unwrap();
+    let data = large_payload();
+    let digest = sha_hex(&data);
+
+    let mut reader: &[u8] = &data;
+    store
+        .write_stream_if_absent("idx.gen/g0.tvim", &mut reader, &digest, 0)
+        .unwrap();
+
+    // Read back through the streaming bridge and compare byte for byte.
+    let mut restored = Vec::new();
+    std::io::Read::read_to_end(
+        &mut *store.open_read("idx.gen/g0.tvim").unwrap(),
+        &mut restored,
+    )
+    .unwrap();
+    assert_eq!(restored, data);
+
+    // Idempotent large re-push: same name, same bytes is a no-op.
+    let mut reader: &[u8] = &data;
+    store
+        .write_stream_if_absent("idx.gen/g0.tvim", &mut reader, &digest, 0)
+        .unwrap();
+
+    // Same name, different large bytes refuses (immutability).
+    let mut other = data.clone();
+    other[0] ^= 0xff;
+    let mut reader: &[u8] = &other;
+    let err = store
+        .write_stream_if_absent("idx.gen/g0.tvim", &mut reader, &sha_hex(&other), 0)
+        .unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+}
+
+#[test]
+fn large_upload_with_a_wrong_digest_stores_nothing() {
+    // The digest is computed while streaming and checked before the multipart
+    // completes, so a corrupt stream aborts without publishing the object.
+    let backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = ObjectArtifactStore::new(backend, "tenant").unwrap();
+    let data = large_payload();
+
+    let mut reader: &[u8] = &data;
+    let err = store
+        .write_stream_if_absent("idx.gen/g0.tvim", &mut reader, &sha_hex(b"other"), 0)
+        .unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+    assert!(!store.contains("idx.gen/g0.tvim").unwrap());
+}
+
+#[test]
+fn large_upload_claims_atomically_and_leaves_no_scratch_object() {
+    // The multipart path streams to a unique scratch key and claims the final
+    // name with a conditional copy; after success the scratch is deleted and
+    // only the tenant-prefixed artifact remains.
+    let backend = Arc::new(InMemory::new());
+    let store = ObjectArtifactStore::new(backend.clone(), "tenant").unwrap();
+    let data = large_payload();
+    let mut reader: &[u8] = &data;
+    store
+        .write_stream_if_absent("idx.gen/g0.tvim", &mut reader, &sha_hex(&data), 0)
+        .unwrap();
+
+    use futures::TryStreamExt;
+    let listed: Vec<_> =
+        futures::executor::block_on(backend.list(None).try_collect::<Vec<_>>()).unwrap();
+    let keys: Vec<String> = listed
+        .iter()
+        .map(|meta| meta.location.to_string())
+        .collect();
+    assert_eq!(keys, vec!["tenant/idx.gen/g0.tvim".to_string()], "{keys:?}");
+}
