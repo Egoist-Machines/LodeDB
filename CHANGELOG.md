@@ -14,15 +14,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `orecloud` client; `lodedb cloud …` forwards to its CLI. The client is
   imported only inside that command — a plain `import lodedb` stays
   network-free (guarded by `tests/test_import_boundary.py`).
-- `LodeDB("orecloud://org/environment/store")` opens a managed-cloud store
-  through the same constructor as a local path: the call returns the
-  companion's store handle (same `add`/`search`/`get`/`remove` verbs over
-  HTTPS), with credentials from `token=`, `ORECLOUD_TOKEN`/`ORECLOUD_HOST`,
-  or `lodedb cloud login`. Local-only construction options (`model=`,
-  `read_only=`, ...) are rejected on cloud targets with a targeted error, and
-  a cloud target without the `[cloud]` extra raises the install hint. The
-  companion import stays inside the cloud branch, so a plain `import lodedb`
-  is unchanged.
+- `LodeDB.cloud("user-42")` opens a managed-cloud store through the same
+  class as a local path, joining the `open_readonly`/`open_vector_store`
+  alternate-constructor family: a bare store id resolves its
+  org/environment from the credential (`token=`,
+  `ORECLOUD_TOKEN`/`ORECLOUD_HOST`, or `lodedb cloud login`), and the
+  `"org/environment/store"` triple and full `orecloud://` URLs are accepted
+  too. The call returns the companion's store handle (same
+  `add`/`search`/`get`/`remove` verbs over HTTPS). For config-driven code,
+  the plain constructor also dispatches the explicit URL form —
+  `LodeDB("orecloud://org/environment/store")` — through the same funnel.
+  Local-only construction options (`model=`, `read_only=`, ...) are rejected
+  on cloud targets with a targeted error, and a cloud target without the
+  `[cloud]` extra raises the install hint.
+- `lodedb.cloud` import root: `from lodedb.cloud import Client` (or
+  `connect`, `CloudStore`, ...) lazily forwards to the companion with the
+  same install hint, so docs teach a single import root;
+  `from orecloud import ...` keeps working. None of the cloud seams load the
+  companion on a plain `import lodedb` (guarded by
+  `tests/test_import_boundary.py`).
 
 ## [1.3.2] - 2026-07-16
 

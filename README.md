@@ -618,24 +618,35 @@ lodedb cloud login                        # one browser approval
 lodedb cloud sync ./my-store cloud main   # mirror a local store to the cloud
 ```
 
-A cloud store opens through the same class as a local one — pass an
-`orecloud://` target instead of a path:
+A cloud store opens through the same class as a local one, via the
+`LodeDB.cloud` alternate constructor:
 
 ```python
 from lodedb import LodeDB
 
-db = LodeDB("./notes")                          # local, as always
-db = LodeDB("orecloud://acme/prod/user-42")     # managed cloud, same verbs
-db.add("the quick brown fox")                   # embedded server-side
+db = LodeDB("./notes")          # local, as always
+db = LodeDB.cloud("user-42")    # managed cloud, same verbs
+db.add("the quick brown fox")   # embedded server-side
 db.search("fox", k=5)
 ```
 
-Credentials come from `token=`, the `ORECLOUD_TOKEN`/`ORECLOUD_HOST`
-environment pair, or `lodedb cloud login`. Work locally with `lodedb` exactly
-as before; `lodedb cloud …` forwards to the `orecloud` CLI the extra installs,
-and the rest of the cloud Python APIs (per-user stores, recall, hosted MCP)
-live in that same package. The client is proprietary and loads only when
-invoked — a plain `import lodedb` stays network-free.
+A bare store id is enough — the org/environment half resolves from the
+credential (`token=`, the `ORECLOUD_TOKEN`/`ORECLOUD_HOST` environment pair,
+or `lodedb cloud login`); pass the full `"org/environment/store"` triple in
+cross-environment scripts. For config-driven code, where one string field (an
+env var, a YAML value) must express either a local path or a cloud store, the
+plain constructor accepts the explicit URL form —
+`LodeDB("orecloud://org/environment/store")` — and returns the same handle.
+An application serving many end users should hold one `Client` and open
+per-user handles from it (`Client().store(user_id)` — one credential
+resolution, one shared HTTP pool); `from lodedb.cloud import Client` works as
+the import root.
+
+Work locally with `lodedb` exactly as before; `lodedb cloud …` forwards to
+the `orecloud` CLI the extra installs, and the rest of the cloud Python APIs
+(per-user stores, recall, hosted MCP) live in that same package. The client
+is proprietary and loads only when invoked — a plain `import lodedb` stays
+network-free.
 
 ## Concurrency & durability
 
