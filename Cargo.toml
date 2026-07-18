@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/lodedb-cloud-core",
   "crates/lodedb-core",
   "crates/lodedb-ffi",
   "crates/lodedb-gpu",

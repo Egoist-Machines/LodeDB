@@ -347,6 +347,40 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(migrate_app, name="migrate")
 
 
+@app.command(
+    "cloud",
+    context_settings={
+        # Everything after `lodedb cloud` belongs to the cloud CLI, including
+        # --help and unknown options — forward it all untouched.
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "help_option_names": [],
+    },
+)
+def cloud(ctx: typer.Context) -> None:
+    """Sync, serve, and manage LodeDB stores in the managed cloud (OreCloud).
+
+    A trampoline into the first-party cloud CLI (`lodedb.cloud.cli`). The
+    import is deliberately lazy: the client modules pull the [cloud] extra's
+    dependencies (httpx), and a plain `import lodedb` must never load those
+    (tests/test_import_boundary.py).
+    """
+    try:
+        from lodedb.cloud.cli import app as cloud_app
+    except ImportError:
+        typer.echo(
+            'the cloud client dependencies are not installed — run: pip install "lodedb[cloud]"',
+            err=True,
+        )
+        # from None: the hint IS the diagnosis; the ImportError adds noise.
+        raise typer.Exit(code=1) from None
+    from typer.main import get_command
+
+    get_command(cloud_app).main(
+        args=list(ctx.args), prog_name="lodedb cloud", standalone_mode=True
+    )
+
+
 @mcp_app.callback(invoke_without_command=True)
 def mcp(
     ctx: typer.Context,

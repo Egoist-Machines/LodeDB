@@ -4,6 +4,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 try:
     import lodedb._turbovec  # noqa: F401
@@ -164,3 +165,49 @@ except ImportError:
             return np.array(rows, dtype=np.float32)
 
     mock_turbovec.IdMapIndex = MockIdMapIndex
+
+
+# --------------------------------------------------------------------------
+# Cloud-transfer fixtures: real committed generations in throwaway
+# directories, authored through the actual engine (the same commit path a
+# user's database goes through) with the deterministic hash embedding
+# backend, so the `lodedb.cloud` transfer suites stay fast and network-free.
+
+# Small but non-trivial corpus: enough documents for real base + text artifacts.
+DOCUMENTS = [{"text": f"the quick brown document number {i}", "id": f"doc-{i}"} for i in range(6)]
+
+
+def write_committed_store(path) -> str:
+    """Writes one committed generation (with raw text) into `path`; returns its index key."""
+    from lodedb import cloud
+    from lodedb.engine.embedding_backends import HashEmbeddingBackend
+    from lodedb.local.db import LodeDB
+
+    db = LodeDB(
+        path=path,
+        model="minilm",
+        commit_mode="generation",
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+    )
+    try:
+        db.add_many(DOCUMENTS)
+    finally:
+        db.close()
+    (key,) = cloud.keys(str(path))
+    return key
+
+
+@pytest.fixture()
+def committed_store(tmp_path):
+    """A LodeDB directory holding one committed generation, as `(dir_path, index_key)`."""
+    source = tmp_path / "source"
+    source.mkdir()
+    return source, write_committed_store(source)
+
+
+def read_pointer_body(path, key: str) -> dict:
+    """Reads the committed root body from `<path>/<key>.commit.json` (raw JSON, no engine)."""
+    import json
+
+    with open(path / f"{key}.commit.json", encoding="utf-8") as pointer:
+        return json.load(pointer)["body"]

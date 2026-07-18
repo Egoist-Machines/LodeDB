@@ -57,11 +57,16 @@ for _root in _FORBIDDEN:
 # imports function-local; none of these may load on a plain import.
 _OPTIONAL_INTEGRATION_PROBE = """
 import importlib, sys
-for _m in ("lodedb", "lodedb.local.cli"):
+for _m in ("lodedb", "lodedb.local.cli", "lodedb.cloud"):
     importlib.import_module(_m)
 _FORBIDDEN = (
     "langchain", "langchain_core", "llama_index", "mem0", "cognee",
     "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
+    # The [cloud] extra's dependencies (httpx; pynacl imports as `nacl`): the
+    # first-party cloud client (lodedb.cloud) reaches them only through its
+    # lazy PEP 562 exports and the CLI trampoline, so a plain import — even of
+    # lodedb.cloud itself — must stay network-free.
+    "httpx", "nacl",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:

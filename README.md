@@ -605,6 +605,51 @@ See [`examples/mcp_config.json`](examples/mcp_config.json) for a copy-paste star
 
 </details>
 
+## Managed cloud (OreCloud)
+
+LodeDB stores can live in [OreCloud](https://db.egoistmachines.com), the managed-cloud
+companion: durable sync for local stores, hosted read serving, and a per-user memory
+data plane for agent applications. The client ships as the `[cloud]` extra:
+
+```sh
+pip install "lodedb[cloud]"
+
+lodedb cloud login                        # one browser approval
+lodedb cloud init ./my-store              # link the directory to a managed remote
+lodedb cloud keys ./my-store              # list the directory's index keys
+lodedb cloud sync ./my-store cloud <key>  # mirror the local store to the cloud
+```
+
+A cloud store opens through the same class as a local one, via the
+`LodeDB.cloud` alternate constructor:
+
+```python
+from lodedb import LodeDB
+
+db = LodeDB("./notes")          # local, as always
+db = LodeDB.cloud("user-42")    # managed cloud, same verbs
+db.add("the quick brown fox")   # embedded server-side
+db.search("fox", k=5)
+```
+
+A bare store id is enough — the org/environment half resolves from the
+credential (`token=`, the `ORECLOUD_TOKEN`/`ORECLOUD_HOST` environment pair,
+or `lodedb cloud login`); pass the full `"org/environment/store"` triple in
+cross-environment scripts. For config-driven code, where one string field (an
+env var, a YAML value) must express either a local path or a cloud store, the
+plain constructor accepts the explicit URL form —
+`LodeDB("orecloud://org/environment/store")` — and returns the same handle.
+An application serving many end users should hold one `Client` and open
+per-user handles from it (`Client().store(user_id)` — one credential
+resolution, one shared HTTP pool); `from lodedb.cloud import Client` works as
+the import root.
+
+Work locally with `lodedb` exactly as before. The client is first-party code
+in this package — `lodedb.cloud` and the `lodedb cloud` CLI, with push/pull/
+sync running on the same bundled native core as the engine — and the extra
+installs only its dependencies (`httpx`, `pynacl`). Everything cloud loads
+lazily, so a plain `import lodedb` stays network-free.
+
 ## Concurrency & durability
 
 - **Single writer, many readers, per path.** One handle holds the path open for *writing* at

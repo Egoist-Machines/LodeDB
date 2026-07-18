@@ -86,13 +86,20 @@ mem0 = ["mem0ai>=2.0.0"]
 # cognee supports python <3.15, so the marker keeps this extra out of the resolution above
 # that (LodeDB's own requires-python has no upper bound).
 cognee = ["cognee>=1.1.0,<2; python_version < '3.15'"]
+# The managed cloud (OreCloud): sync/serve LodeDB stores in the managed cloud and use the
+# hosted per-user data plane. The client is first-party (`lodedb.cloud` + the `lodedb cloud`
+# CLI, over the bundled native transfer core); this extra adds only its third-party deps —
+# httpx (the HTTP client) and pynacl (the sealed-box browser-approval login). Both are
+# imported lazily, never on a plain `import lodedb` (tests/test_import_boundary.py).
+cloud = ["httpx>=0.27", "pynacl>=1.5"]
 # Optional image + text (CLIP) embedding via the "clip" preset / add_image. CLIP runs on the
 # sentence-transformers stack (the [torch] tier) and adds Pillow for decoding image files. Both
 # are imported lazily, so a plain `import lodedb` pulls neither (tests/test_import_boundary.py).
 image = ["pillow>=10.0.0", "lodedb[torch]"]
 # Everything a user would reach for: built-in embedding (ONNX + PyTorch), image search, the MCP
 # server, and the framework adapters. Excludes the niche [onnx-export]/[gpu] and the [dev] set,
-# and [cognee] (its large transitive stack — litellm/lancedb/sqlalchemy/fastapi — is opt-in).
+# [cognee] (its large transitive stack — litellm/lancedb/sqlalchemy/fastapi — is opt-in), and
+# [cloud] (the proprietary managed-cloud client is an explicit choice, never a side effect).
 all = ["lodedb[embeddings,torch,image,mcp,langchain,llama-index,mem0]"]
 # ruff is pinned (not floored) so `ruff format`/`ruff check` are reproducible across
 # contributors and CI — the formatter's output can change between ruff releases.
@@ -134,6 +141,12 @@ extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Generated-content templates (SKILL.md / AGENTS.md scaffolds): YAML frontmatter
+# and prose must stay on one physical line inside the template strings, so the
+# line-length rule cannot apply without corrupting the generated output.
+"src/lodedb/cloud/_agents_scaffold.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["lodedb"]

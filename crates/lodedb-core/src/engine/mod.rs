@@ -2698,6 +2698,23 @@ struct PersistentLock {
     _file: File,
 }
 
+/// RAII exclusive hold on a store directory's single-writer lock
+/// (`<dir>/.lodedb.lock`), for out-of-band tools that mutate a database
+/// directory without opening an engine — the cloud transfer plane's
+/// pull/restore path. Contends with every engine writer (native, Python,
+/// Swift) across processes; dropping the guard releases the hold.
+pub struct DirWriterLock {
+    _lock: PersistentLock,
+}
+
+/// Takes the exclusive single-writer lock on `dir` for an out-of-band mutation
+/// of the database directory (see [`DirWriterLock`]). Fails with the standard
+/// writer-contention error when an engine writer (or another guard) holds it;
+/// honours `LODEDB_PERSIST_LOCK_TIMEOUT` like the engine's own acquisition.
+pub fn acquire_dir_writer_lock(dir: &Path) -> Result<DirWriterLock, CoreError> {
+    PersistentLock::acquire(dir).map(|lock| DirWriterLock { _lock: lock })
+}
+
 /// Outcome of one non-blocking attempt to take the writer lock.
 enum TryLock {
     /// Another holder blocks this mode; retry until the timeout elapses.

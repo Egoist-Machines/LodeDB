@@ -36,6 +36,7 @@ from typing import Any
 
 import numpy as np
 
+from lodedb.cloud import CLOUD_TARGET_SCHEME, open_cloud_target
 from lodedb.engine._atomic_io import durability_from_env, normalize_durability
 from lodedb.engine._commit_manifest import (
     COMMIT_MANIFEST_SUFFIX,
@@ -221,7 +222,62 @@ class LodeDB:
         fox = db.add("the quick brown fox")
         db.get(fox)                   # -> "the quick brown fox"
         db.get_texts([fox])           # -> {fox: "the quick brown fox"}
+
+    A managed `OreCloud <https://db.egoistmachines.com>`_ store opens through
+    the same verbs via :meth:`cloud` (requires the ``lodedb[cloud]`` extra;
+    credentials come from ``token=``, the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST``
+    environment pair, or ``lodedb cloud login``)::
+
+        db = LodeDB.cloud("user-42")          # org/environment from the credential
+        db.add("the quick brown fox")         # embedded server-side
+        db.search("fox", k=5)
+
+    For config-driven code, where one string field (an env var, a YAML value)
+    must express either a local path or a cloud store, the constructor itself
+    accepts the explicit URL form — ``LodeDB("orecloud://org/environment/store")``
+    — and returns the same handle. Either way the handle duck-types this
+    class's read/write surface (``add``, ``search``, ``get``, ``remove``, ...)
+    but runs over HTTPS, so local-only construction options (``model=``,
+    ``store_text=``, ...) don't apply and local-only verbs (``persist``,
+    ``open_readonly``) don't exist on it.
     """
+
+    def __new__(cls, path: str | Path | None = None, **kwargs: Any) -> Any:
+        """Routes ``orecloud://`` config strings to the managed-cloud companion.
+
+        This dispatch exists for config-driven cases where one string field
+        must express either a local path or a cloud store; humans should
+        reach for :meth:`cloud` instead. Everything else falls through to
+        normal construction, keeping ``LodeDB(...)`` the single front door.
+        The returned cloud handle is not a ``LodeDB`` instance (so
+        ``__init__`` never runs on it); it duck-types the same verb surface.
+        """
+        target = path if path is not None else kwargs.get("path")
+        if isinstance(target, str) and target.startswith(CLOUD_TARGET_SCHEME):
+            options = {name: value for name, value in kwargs.items() if name != "path"}
+            return open_cloud_target(target, options)
+        return super().__new__(cls)
+
+    @classmethod
+    def cloud(cls, target: str, **options: Any) -> Any:
+        """Opens a managed OreCloud store — the cloud counterpart of
+        ``LodeDB(path)``, joining :meth:`open_readonly` /
+        :meth:`open_vector_store` in the alternate-constructor family.
+
+        ``target`` is a bare store id (``"user-42"`` — org/environment
+        resolve from the environment-scoped credential, exactly like
+        ``orecloud.Client().store()``), an ``"org/environment/store"``
+        triple for cross-environment scripts, or a full ``orecloud://`` URL.
+        Keyword options are ``orecloud.connect``'s (``token=``, ``host=``,
+        ``key=``, ``warm=``, ``timeout=``, ``read_your_writes=``,
+        ``transport=``). Returns the companion's store handle — duck-typed
+        to this class's verb surface, not a ``LodeDB`` instance — through
+        the same funnel as the ``LodeDB("orecloud://…")`` config-string
+        dispatch. Without the ``lodedb[cloud]`` extra installed this raises
+        an ``ImportError`` carrying the install hint; the companion is
+        imported only inside this call, never on a plain ``import lodedb``.
+        """
+        return open_cloud_target(target, options)
 
     def __init__(
         self,

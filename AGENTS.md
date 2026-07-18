@@ -31,7 +31,10 @@ tests/                   local SDK suite + import-boundary guard
   or pass `embedder=`). Built-in text embedding is opt-in: `[embeddings]` (`onnxruntime` +
   `transformers`, torch-free) and `[torch]` (`sentence-transformers` — the PyTorch fallback, the
   `clip` preset, and `device="mps"`); other extras are `[image]`, `[onnx-export]`, `[mcp]`,
-  `[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`, and `[all]`. The patched TurboVec core is
+  `[langchain]`, `[llama-index]`, `[mem0]`, `[gpu]`, `[cloud]` (the first-party managed-cloud
+  client `lodedb.cloud` + the `lodedb cloud` CLI, over the bundled native transfer core; the
+  extra adds only `httpx` + `pynacl`, both reached lazily and never on a plain import — the
+  extra is deliberately NOT part of `[all]`), and `[all]`. The patched TurboVec core is
   vendored under `third_party/turbovec/` and bundled into the wheel as `lodedb._turbovec` — not a
   PyPI dependency. The embedding runtimes load lazily (only when a preset/CLIP backend is built),
   so a plain `import lodedb` must not import `onnxruntime` / `transformers` /
@@ -84,7 +87,7 @@ tests/                   local SDK suite + import-boundary guard
 ## Develop
 
 ```bash
-uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0  # build venv (compiles TurboVec)
+uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0 --extra cloud  # build venv (compiles TurboVec)
 uv run pytest -q                                                # run the suite
 uv run ruff check .                                             # lint (line-length 100)
 ```
