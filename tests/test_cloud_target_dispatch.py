@@ -14,6 +14,11 @@ import sys
 
 import pytest
 
+# The tests below import (or monkeypatch into) the client modules, which
+# pull httpx/pynacl — skip cleanly without the [cloud] extra installed.
+pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
+pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
+
 from lodedb import LodeDB
 
 CLOUD_TARGET = "orecloud://acme/prod/user-42"

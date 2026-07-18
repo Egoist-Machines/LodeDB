@@ -87,7 +87,7 @@ tests/                   local SDK suite + import-boundary guard
 ## Develop
 
 ```bash
-uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0  # build venv (compiles TurboVec)
+uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0 --extra cloud  # build venv (compiles TurboVec)
 uv run pytest -q                                                # run the suite
 uv run ruff check .                                             # lint (line-length 100)
 ```

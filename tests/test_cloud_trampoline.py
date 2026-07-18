@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import sys
 
+import pytest
 import typer
 from typer.testing import CliRunner
 
 from lodedb.local.cli import app
+
+# The forwarding test monkeypatches into `lodedb.cloud.cli`, which pulls
+# httpx/pynacl — skip cleanly without the [cloud] extra installed (the hint
+# path blocks the module itself, so it needs no deps either way).
+pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
+pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
 
 runner = CliRunner()
 

@@ -9,9 +9,15 @@ import pytest
 from typer.testing import CliRunner
 
 from lodedb import cloud
-from lodedb.cloud.cli import app
-from lodedb.engine.embedding_backends import HashEmbeddingBackend
-from lodedb.local.db import LodeDB
+
+# Collection must skip, not error, without the [cloud] extra installed
+# (the modules below import httpx / pynacl at module level).
+pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
+pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
+
+from lodedb.cloud.cli import app  # noqa: E402
+from lodedb.engine.embedding_backends import HashEmbeddingBackend  # noqa: E402
+from lodedb.local.db import LodeDB  # noqa: E402
 
 runner = CliRunner()
 

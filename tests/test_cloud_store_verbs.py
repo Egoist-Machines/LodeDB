@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import pytest
 
-from lodedb.cloud.serving import CloudStore
+# Collection must skip, not error, without the [cloud] extra installed
+# (the modules below import httpx / pynacl at module level).
+pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
+pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
+
+from lodedb.cloud.serving import CloudStore  # noqa: E402
 
 
 class _StubClient:

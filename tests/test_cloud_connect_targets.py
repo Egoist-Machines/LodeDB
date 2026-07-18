@@ -7,11 +7,17 @@ the introspection contract itself is covered in `server/tests`."""
 
 from __future__ import annotations
 
-import httpx
 import pytest
 
-from lodedb.cloud.serving import _BareStore, _parse_target, connect
-from lodedb.cloud.transfer import CloudError
+# Collection must skip, not error, without the [cloud] extra installed
+# (httpx and the modules below are the extra's dependencies).
+pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
+pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
+
+import httpx  # noqa: E402
+
+from lodedb.cloud.serving import _BareStore, _parse_target, connect  # noqa: E402
+from lodedb.cloud.transfer import CloudError  # noqa: E402
 
 
 def _transport(handled: dict[str, dict]) -> httpx.MockTransport:
