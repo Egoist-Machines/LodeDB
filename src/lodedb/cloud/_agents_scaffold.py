@@ -146,7 +146,9 @@ def scaffold_agent_artifacts(
 ) -> tuple[list[str], list[str]]:
     """Writes the three artifacts into `local_dir`. Returns (written, notes):
     repo-relative paths that were created/updated, and human-readable notes
-    for anything deliberately left alone."""
+    for anything deliberately left alone. Paths use forward slashes on every
+    platform — they land in the CLI's JSON output, so the shape is a contract,
+    not a display choice."""
     root = Path(local_dir)
     written: list[str] = []
     notes: list[str] = []
@@ -154,7 +156,7 @@ def scaffold_agent_artifacts(
     skill_path = root / ".claude" / "skills" / "orecloud" / "SKILL.md"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     skill_path.write_text(skill_markdown(host, org, environment, store), encoding="utf-8")
-    written.append(str(skill_path.relative_to(root)))
+    written.append(skill_path.relative_to(root).as_posix())
 
     agents_path = root / "AGENTS.md"
     if agents_path.exists():
