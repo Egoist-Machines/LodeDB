@@ -199,10 +199,7 @@ impl Read for BlockingRead<'_> {
             match self.runtime.block_on(self.stream.next()) {
                 None => return Ok(0),
                 Some(Ok(chunk)) => self.current = chunk,
-                // io::Error::other is 1.74+; the workspace MSRV is 1.70.
-                Some(Err(error)) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, error))
-                }
+                Some(Err(error)) => return Err(std::io::Error::other(error)),
             }
         }
         let take = buf.len().min(self.current.len());
@@ -312,9 +309,10 @@ impl ArtifactStore for ObjectArtifactStore {
         // of growing parts mid-stream.
         let part_size = if size_hint > 0 {
             let for_part_limit = (size_hint / 9_000).max(1) as usize;
-            // usize::div_ceil is 1.73+; the workspace MSRV is 1.70.
-            let chunks = (for_part_limit + MULTIPART_CHUNK_BYTES - 1) / MULTIPART_CHUNK_BYTES;
-            chunks.max(1).saturating_mul(MULTIPART_CHUNK_BYTES)
+            for_part_limit
+                .div_ceil(MULTIPART_CHUNK_BYTES)
+                .max(1)
+                .saturating_mul(MULTIPART_CHUNK_BYTES)
         } else {
             MULTIPART_CHUNK_BYTES
         };
