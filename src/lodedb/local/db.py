@@ -21,6 +21,7 @@ fallback. Embedding can run on MPS/CUDA/CPU depending on the requested device.
 from __future__ import annotations
 
 import atexit
+import inspect
 import json
 import math
 import secrets
@@ -194,6 +195,46 @@ class _ThreadConfinedNativeEngine:
         return lambda *args, **kwargs: self._run(lambda: attr(*args, **kwargs))
 
 
+# Managed-cloud target scheme: `LodeDB("orecloud://org/environment[/store]")`
+# opens the store through the optional cloud companion instead of a local path.
+_CLOUD_TARGET_SCHEME = "orecloud://"
+
+
+def _open_cloud_store(target: str, options: dict[str, Any]) -> Any:
+    """Opens an ``orecloud://`` target via the optional cloud companion
+    (the ``lodedb[cloud]`` extra) and returns its store handle.
+
+    The companion is imported lazily, only on a cloud target, so a plain
+    ``import lodedb`` never loads it (guarded by
+    ``tests/test_import_boundary.py``); when it is absent this raises an
+    ``ImportError`` carrying the install hint instead of a bare traceback.
+    ``options`` must be keywords of ``orecloud.connect`` (``token``, ``host``,
+    ...) — local-only construction options (``model=``, ``read_only=``, ...)
+    are rejected up front, because embedding and storage for a cloud store are
+    configured server-side, not per handle.
+    """
+    try:
+        from orecloud import connect
+    except ImportError:
+        raise ImportError(
+            f"{target!r} is a managed-cloud target, but the cloud companion is "
+            'not installed — run: pip install "lodedb[cloud]"'
+        ) from None
+    # Derive the accepted option set from connect's own signature so the two
+    # never drift; anything else is a local-only option that has no cloud
+    # meaning and deserves a targeted error, not a confusing TypeError from
+    # deep inside the companion.
+    allowed = set(inspect.signature(connect).parameters) - {"target"}
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise TypeError(
+            f"cloud targets do not accept {', '.join(unknown)}; available "
+            f"options: {', '.join(sorted(allowed))} (embedding and storage "
+            "are configured server-side, per store)"
+        )
+    return connect(target, **options)
+
+
 class LodeDB:
     """Embedded, local-first vector database. Data stays on your machine.
 
@@ -221,7 +262,36 @@ class LodeDB:
         fox = db.add("the quick brown fox")
         db.get(fox)                   # -> "the quick brown fox"
         db.get_texts([fox])           # -> {fox: "the quick brown fox"}
+
+    A managed-cloud target opens the same verbs against an
+    `OreCloud <https://db.egoistmachines.com>`_ store instead of a local path
+    (requires the ``lodedb[cloud]`` extra; credentials come from ``token=``,
+    the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST`` environment pair, or
+    ``lodedb cloud login``)::
+
+        db = LodeDB("orecloud://acme/prod/user-42")
+        db.add("the quick brown fox")         # embedded server-side
+        db.search("fox", k=5)
+
+    The handle duck-types this class's read/write surface (``add``, ``search``,
+    ``get``, ``remove``, ...) but runs over HTTPS, so local-only construction
+    options (``model=``, ``store_text=``, ...) don't apply and local-only
+    verbs (``persist``, ``open_readonly``) don't exist on it.
     """
+
+    def __new__(cls, path: str | Path | None = None, **kwargs: Any) -> Any:
+        """Routes ``orecloud://`` targets to the managed-cloud companion.
+
+        Everything else falls through to normal construction, keeping
+        ``LodeDB(...)`` the single front door for local and cloud stores. The
+        returned cloud handle is not a ``LodeDB`` instance (so ``__init__``
+        never runs on it); it duck-types the same verb surface.
+        """
+        target = path if path is not None else kwargs.get("path")
+        if isinstance(target, str) and target.startswith(_CLOUD_TARGET_SCHEME):
+            options = {name: value for name, value in kwargs.items() if name != "path"}
+            return _open_cloud_store(target, options)
+        return super().__new__(cls)
 
     def __init__(
         self,

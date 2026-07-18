@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `orecloud` client; `lodedb cloud …` forwards to its CLI. The client is
   imported only inside that command — a plain `import lodedb` stays
   network-free (guarded by `tests/test_import_boundary.py`).
+- `LodeDB("orecloud://org/environment/store")` opens a managed-cloud store
+  through the same constructor as a local path: the call returns the
+  companion's store handle (same `add`/`search`/`get`/`remove` verbs over
+  HTTPS), with credentials from `token=`, `ORECLOUD_TOKEN`/`ORECLOUD_HOST`,
+  or `lodedb cloud login`. Local-only construction options (`model=`,
+  `read_only=`, ...) are rejected on cloud targets with a targeted error, and
+  a cloud target without the `[cloud]` extra raises the install hint. The
+  companion import stays inside the cloud branch, so a plain `import lodedb`
+  is unchanged.
 
 ## [1.3.2] - 2026-07-16
 
