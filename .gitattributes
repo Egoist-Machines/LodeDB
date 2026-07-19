@@ -12,8 +12,7 @@
 # and the integration shims stay vendored so they do not pad the numbers.
 #
 # Note: there is no C/C++ in this repo. The Python binding is maturin/PyO3
-# (pure Rust). The C++ pybind11 extensions live in the upstream research repo,
-# not in this spin-out.
+# (pure Rust), so Linguist reports no C/C++.
 
 third_party/turbovec/turbovec/src/**           linguist-vendored=false
 third_party/turbovec/turbovec-python/src/**    linguist-vendored=false

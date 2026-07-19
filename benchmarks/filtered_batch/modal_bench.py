@@ -7,11 +7,11 @@ top_k to the corpus size, trips the resident 4096 cap, and bypasses to CPU.
 The image is built from the local ``src/`` tree, so it tests whatever branch
 is checked out (run from a worktree with the fix to measure the fix).
 
-Launch from the repo root (modal lives in the efficient-embeddings venv):
+Launch from the repo root:
 
-    ~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::smoke
-    ~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::a10
-    ~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::l40s
+    modal run benchmarks/filtered_batch/modal_bench.py::smoke
+    modal run benchmarks/filtered_batch/modal_bench.py::a10
+    modal run benchmarks/filtered_batch/modal_bench.py::l40s
 
 Image recipe mirrors benchmarks/gpu_patch/modal_bench.py (CUDA torch base +
 cupy + maturin-built vendored TurboVec + LodeDB from local src).
