@@ -48,10 +48,14 @@ class CloudError(RuntimeError):
 def _store_hint(org: str, environment: str, store: object) -> str | None:
     """The `X-Ore-Store` value for a data-plane call, or None when the store
     isn't identifiable in the payload (the ingress then falls back to plain
-    balancing, which is always correct — stickiness is cache locality only)."""
+    balancing, which is always correct — stickiness is cache locality only).
+    Percent-encoded: store names are end-user identifiers, and a non-ASCII
+    (or control-character) id must never turn a valid request into a header
+    encoding error. Quoting is deterministic, so the same store always maps
+    to the same hash bucket."""
     if not isinstance(store, str) or not store:
         return None
-    return f"{org}/{environment}/{store}"
+    return quote(f"{org}/{environment}/{store}", safe="/")
 
 
 def _raise_for(response: httpx.Response) -> None:
@@ -460,8 +464,13 @@ class CloudClient:
             params["key"] = key
         if warm:
             params["warm"] = "true"
+        # The hint matters MOST here: `warm=True` is the pre-hydration call,
+        # and it must land on the same pod the hinted queries will.
         return self._request(
-            "GET", f"/v1/orgs/{org}/environments/{environment}/stores/serving-stats", params=params
+            "GET",
+            f"/v1/orgs/{org}/environments/{environment}/stores/serving-stats",
+            params=params,
+            store_hint=_store_hint(org, environment, store),
         )
 
     def upload_blob_proxy(self, proxy_path: str, handle: BinaryIO) -> None:

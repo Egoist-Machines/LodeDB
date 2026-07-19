@@ -45,6 +45,25 @@ def test_data_plane_verbs_carry_the_store_hint(capture):
     assert [r.headers.get("x-ore-store") for r in seen] == ["acme/prod/user-42"] * 4
 
 
+def test_warm_stats_carries_the_hint(capture):
+    """The pre-hydration call must land on the same pod the hinted queries
+    will — a warm on one pod followed by queries on another would defeat it."""
+    client, seen = capture
+    client.serving_stats("acme", "prod", "user-42", warm=True)
+    assert seen[0].headers["x-ore-store"] == "acme/prod/user-42"
+
+
+def test_non_ascii_store_ids_stay_sendable(capture):
+    """Store names are end-user identifiers; a unicode id must percent-encode
+    into a valid header (deterministically), never crash the request."""
+    client, seen = capture
+    client.search("acme", "prod", {"store": "münchen/42", "query": "q", "k": 3})
+    client.search("acme", "prod", {"store": "münchen/42", "query": "q", "k": 3})
+    first, second = (r.headers["x-ore-store"] for r in seen)
+    assert first == second == "acme/prod/m%C3%BCnchen/42"
+    assert first.isascii()
+
+
 def test_store_less_payloads_send_no_hint(capture):
     client, seen = capture
     client.search("acme", "prod", {"query": "q", "k": 3})  # server will 422; wire-only here
