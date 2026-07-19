@@ -588,14 +588,15 @@ class CloudStore:
         stable id order (the default), most-recent-first pages
         (`order="recent"` — same last-id cursor, but it only holds within
         one served snapshot; a 422 asks the caller to restart when the
-        store changed under the enumeration), or a by-id fetch
-        (`ids=[...]` — exactly the named documents that exist, no paging;
-        the server refuses `after`/`order` beside it). Like search, the
-        enumeration honors session read-your-writes: after a write on this
-        handle it waits briefly for that write's fold. `ids`/`order`/the
-        read-your-writes token need a control plane that knows them —
-        an older server ignores unknown browse fields and answers a plain
-        id-ordered page."""
+        store changed under the enumeration, and a match set past the
+        server's scan cap also 422s — narrow the filter or use id order),
+        or a by-id fetch (`ids=[...]` — exactly the named documents that
+        exist, no paging; the server refuses `after`/`order` beside it).
+        Like search, the enumeration honors session read-your-writes: after
+        a write on this handle it waits briefly for that write's fold.
+        `ids`/`order`/the read-your-writes token need a control plane that
+        knows them — an older server ignores unknown browse fields and
+        answers a plain id-ordered page."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
