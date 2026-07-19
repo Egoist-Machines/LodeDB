@@ -194,3 +194,52 @@ def test_doctor_report_is_honest_about_patched_core():
         assert "patched core" in text
         both = backend["delta_persistence_available"] and backend["reconstruction_available"]
         assert ("present" in text) if both else ("MISSING" in text)
+
+
+def test_concurrent_first_embeds_build_one_model(monkeypatch):
+    """Concurrent first embeds on one shared backend build the model exactly once.
+
+    Serving tiers share one backend per preset across threads; without the
+    load lock, racing first queries would each construct (and briefly hold)
+    their own model. The fake module makes construction slow and countable.
+    """
+
+    import sys
+    import threading
+    import time
+    import types
+
+    import numpy as np
+
+    from lodedb.engine.embedding_backends import SentenceTransformerEmbeddingBackend
+
+    built = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, device=None):
+            time.sleep(0.05)  # widen the race window
+            built.append(self)
+
+        def encode(self, texts, **kwargs):
+            return np.zeros((len(texts), 8), dtype=np.float32)
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+
+    backend = SentenceTransformerEmbeddingBackend(
+        model_name="fake-model",
+        native_dim=8,
+    )
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(backend.embed_query("hello")))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(built) == 1, "racing first embeds must not build duplicate models"
+    assert len(results) == 8
