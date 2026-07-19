@@ -1310,7 +1310,7 @@ impl PyCoreEngine {
     /// of records actually applied (records at or below the store's applied
     /// watermark skip for refold idempotence). Refuses a segment that already
     /// carries LSNs -- stamping is this binding's job, and a pre-stamped blob
-    /// signals a re-upload of an already-folded file. Does NOT persist: the caller
+    /// signals a re-fold of an already-folded segment. Does NOT persist: the caller
     /// publishes one generation delta per fold batch via `persist()`. Decode +
     /// stamp + apply run in one native call so embedding-heavy records never
     /// round-trip through Python JSON.
@@ -1464,7 +1464,7 @@ fn plan_segment_documents(
 /// Builds the `apply_embedded_documents` WAL payload (as JSON) for an
 /// `IngestPlan` JSON plus a contiguous `(n, dim)` f32 embedding matrix, one row
 /// per `plan.chunks_to_embed` in order. Count, dimension, and finiteness are
-/// validated natively so a poison record can never be encoded and uploaded.
+/// validated natively so a poison record can never be encoded.
 #[pyfunction]
 fn build_embedded_documents_payload(
     plan_json: &str,
@@ -1482,7 +1482,7 @@ fn build_embedded_documents_payload(
 /// Encodes a JSON array of `{op, payload}` records into an immutable
 /// LodeDB WAL-format segment (file header + CRC-framed records, LSNs
 /// unassigned). Ops are validated against the native-replayable set and
-/// records must be unstamped -- both fail closed here, before an upload.
+/// records must be unstamped -- both fail closed here, at encode time.
 #[pyfunction]
 fn encode_wal_segment<'py>(py: Python<'py>, records_json: &str) -> PyResult<Bound<'py, PyBytes>> {
     #[derive(serde::Deserialize)]

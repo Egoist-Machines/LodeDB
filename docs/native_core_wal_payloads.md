@@ -23,16 +23,16 @@ root manifest has been published, so replay after a crash is idempotent.
 
 A WAL *segment* is an immutable standalone blob in exactly the file format
 above (header plus CRC-framed records), produced by `encode_wal_segment` with
-no store open — the building block for out-of-band ingest (e.g. a managed
-cloud's multi-writer pipeline; see `lodedb.local.segments`). Two deliberate
-differences from the on-disk `<key>.wal`:
+no store open — the building block for out-of-band ingest (see
+`lodedb.local.segments`). Two deliberate differences from the on-disk
+`<key>.wal`:
 
 - **LSNs are stamped at fold time, not at encode time.** Segment records carry
   no `lsn` key on the wire; the folding side stamps consecutive LSNs from a
   floor above the store's committed `applied_lsn` and applies them in memory
   (`apply_wal_records`), publishing one O(changed) generation delta per fold
-  batch. A segment that already carries LSNs is refused (it signals a re-upload
-  of an already-folded file).
+  batch. A segment that already carries LSNs is refused (it signals a re-fold
+  of an already-folded segment).
 - **Decoding is strict.** A segment is complete by construction, so a short
   header, torn tail, or trailing CRC failure means a corrupt transfer and fails
   closed — unlike the crash-tolerant `<key>.wal` reader, which drops a torn

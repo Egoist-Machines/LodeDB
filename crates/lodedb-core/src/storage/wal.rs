@@ -224,7 +224,7 @@ fn scan_records(data: &[u8]) -> CoreResult<WalScan> {
 /// Encodes records into an immutable WAL-format segment: the standard file
 /// header followed by one CRC-framed record per entry. Segments reuse the
 /// on-disk WAL byte format byte-for-byte so one decode path serves both;
-/// writers upload the returned bytes verbatim. Records may carry `lsn: None`
+/// callers ship the returned bytes verbatim. Records may carry `lsn: None`
 /// (segments are stamped at fold time) or `Some` (tests pin byte-compat
 /// against `append_record`). Refuses an empty record list — a segment with no
 /// records is a writer bug, not a no-op.
@@ -245,7 +245,7 @@ pub fn encode_wal_segment(records: &[WalRecord]) -> CoreResult<Vec<u8>> {
 /// Strictly decodes a WAL segment produced by `encode_wal_segment`. Unlike the
 /// crash-tolerant file reader, a segment is a complete immutable blob, so a
 /// short header, torn tail, trailing CRC failure, or empty record list all
-/// mean a corrupt upload/download and fail closed.
+/// mean a corrupt copy and fail closed.
 pub fn decode_wal_segment(data: &[u8]) -> CoreResult<Vec<WalRecord>> {
     if data.len() < WAL_HEADER_LEN {
         return Err(corrupt("WAL segment is shorter than the file header"));
@@ -370,15 +370,15 @@ fn encode_body(op: &str, mut payload: Value, lsn: Option<u64>) -> CoreResult<Vec
     // frame, so the frame layout (and the committed cross-version WAL fixtures)
     // stays byte-compatible. `decode_body` lifts it back out on read. `Some`
     // writes the `lsn` key; `None` writes none -- the local append path passes
-    // `Some`, the cloud segment path passes `None`. The payload is taken by
+    // `Some`, the segment path passes `None`. The payload is taken by
     // value and mutated in place: append callers own the payload they pass, so
     // this avoids cloning the whole value tree on the write hot path.
     //
     // Because the stamp shares the payload's namespace, an unstamped record
     // whose payload carries its own root-level `lsn` key must be refused here:
     // encoding it would succeed, but `decode_body` would lift that key out --
-    // a numeric value reads back as a stamped record (so a fold rejects the
-    // whole segment only after upload), a non-numeric one is silently dropped
+    // a numeric value reads back as a stamped record (so the segment is
+    // rejected only later, at fold time), a non-numeric one is silently dropped
     // from the payload. Fail closed at encode time instead.
     if let Some(lsn) = lsn {
         object.insert("lsn".to_string(), Value::from(lsn));

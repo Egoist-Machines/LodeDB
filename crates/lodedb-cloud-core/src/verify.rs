@@ -87,7 +87,7 @@ pub struct OpenReport {
 /// This reuses `lodedb-core`'s `load_store` with `read_only` (which takes no writer
 /// lock and reads the exact committed manifest, never the `.wal` tail), so it
 /// proves a restored directory is loadable exactly as the embedded engine would
-/// read it — the acceptance check the roadmap calls for after a restore. Returns
+/// read it — the acceptance check after a restore. Returns
 /// the loaded document/chunk counts. `persistence_dir` is the local directory the
 /// generation was restored into.
 pub fn verify_local_generation_opens(

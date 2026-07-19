@@ -1,15 +1,14 @@
 //! Content-addressed blob naming for the managed remote layout.
 //!
-//! From Phase 2 on, the managed service stores artifacts content-addressed —
+//! A managed remote can store artifacts content-addressed —
 //! `blobs/sha256/aa/<sha256>` under a per-tenant prefix — instead of under
 //! their engine path names. Content addressing is what absorbs the
 //! fork-collision case (two branches committing different artifacts under the
 //! same engine name, e.g. `idx.gen/g7.json`, coexist as two blobs), and the
 //! two-level `aa/` fan-out keeps listings and prefix operations tractable.
 //!
-//! Nothing in Phase 0 stores blobs this way yet; these helpers exist now, pure
-//! and tested, to pin the naming contract every later phase (transfer plane,
-//! share redaction, GC) builds on. The digest is always the lowercase-hex
+//! These helpers are pure and tested; they pin the naming contract the
+//! transfer plane builds on. The digest is always the lowercase-hex
 //! SHA-256 of the blob's bytes — the same digest the engine records per
 //! artifact and [`ArtifactStore::write_bytes_if_absent`] verifies.
 //!

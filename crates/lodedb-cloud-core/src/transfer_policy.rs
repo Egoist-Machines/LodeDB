@@ -20,8 +20,8 @@ use serde_json::Value;
 
 /// Whether a transfer ships the payload-bearing text and lexical stores.
 ///
-/// [`Default`] is the redacted posture (both off), matching the roadmap's default
-/// that only redacted artifacts leave the machine. Every transfer states its
+/// [`Default`] is the redacted posture (both off), so by default only redacted
+/// artifacts leave the machine. Every transfer states its
 /// policy explicitly at the call site; pass [`TransferPolicy::full`] to ship a
 /// generation verbatim (e.g. when restoring a backup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
