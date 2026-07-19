@@ -4,8 +4,10 @@ One JSON file, `~/.orecloud/credentials.json`, chmod 0600, holding the
 control-plane host and the personal access token from `lodedb cloud login`.
 A plain file (not the OS keychain) is deliberate for now: it works headless
 — CI boxes, containers, SSH sessions — with the same permission story as
-`~/.aws/credentials`. ORECLOUD_TOKEN / ORECLOUD_HOST env vars override the
-file entirely, so ephemeral environments never need to write it.
+`~/.aws/credentials`. ORECLOUD_TOKEN overrides the file entirely, so
+ephemeral environments never need to write it; the host defaults to the
+hosted control plane, with ORECLOUD_HOST (or `--host`) overriding it for
+staging and self-hosted deployments.
 """
 
 from __future__ import annotations
@@ -15,6 +17,11 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+
+# The hosted control plane. Baked in so nobody has to know the URL (the same
+# way `gh` knows github.com); `--host` / ORECLOUD_HOST remain the override
+# for staging and self-hosted control planes.
+DEFAULT_HOST = "https://api.egoistmachines.com"
 
 
 def config_dir() -> Path:
@@ -42,17 +49,22 @@ class CredentialsError(RuntimeError):
 def load_credentials() -> Credentials | None:
     env_token = os.environ.get("ORECLOUD_TOKEN")
     env_host = os.environ.get("ORECLOUD_HOST")
-    if env_token and env_host:
-        return Credentials(host=env_host.rstrip("/"), token=env_token, source="env")
-    if env_token or env_host:
-        # Half an override must fail closed: silently mixing an env token
-        # with a file host (or vice versa) would aim mutating commands at the
-        # wrong account or control plane.
-        missing = "ORECLOUD_HOST" if env_token else "ORECLOUD_TOKEN"
-        present = "ORECLOUD_TOKEN" if env_token else "ORECLOUD_HOST"
+    if env_token:
+        # An env token never combines with the file's host: falling back to
+        # the file could aim a CI job's mutating commands at whatever control
+        # plane a developer last logged in to. Without ORECLOUD_HOST the
+        # token targets the hosted default.
+        return Credentials(
+            host=(env_host or DEFAULT_HOST).rstrip("/"), token=env_token, source="env"
+        )
+    if env_host:
+        # A host override with no matching token must fail closed: silently
+        # pairing it with the file's token would aim that stored credential
+        # at a control plane the login never targeted.
         raise CredentialsError(
-            f"{present} is set but {missing} is not — set both to use environment "
-            "credentials, or unset both to use the stored credentials file"
+            "ORECLOUD_HOST is set but ORECLOUD_TOKEN is not — set ORECLOUD_TOKEN "
+            "to use environment credentials, or unset ORECLOUD_HOST to use the "
+            "stored credentials file"
         )
     try:
         raw = json.loads(credentials_file().read_text())

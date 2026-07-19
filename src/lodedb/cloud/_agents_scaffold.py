@@ -119,8 +119,9 @@ lodedb cloud sync <local-dir> cloud <key>     # converge local and cloud
 lodedb cloud store list --environment {environment}   # registered stores
 ```
 
-- Credentials: set both `ORECLOUD_HOST` and `ORECLOUD_TOKEN`, or run
-  `lodedb cloud login --host {host}` once. Never commit tokens.
+- Credentials: set `ORECLOUD_TOKEN` (plus `ORECLOUD_HOST` when the control
+  plane is not the hosted default), or run `lodedb cloud login --host {host}`
+  once. Never commit tokens.
 - The CLI prints JSON when piped; errors carry a `hint:` line and per-class
   exit codes (3 auth, 4 not found, 5 refused, 6 transient).
 - SDK writes are asynchronous: `add_many` returns the document ids once the
