@@ -26,14 +26,13 @@ python benchmarks/filtered_batch/filtered_batch.py
 
 ## Modal (real CUDA)
 
-`modal` lives in the efficient-embeddings venv; the image is built from the
-local `src/` tree, so run it from the checkout you want to measure (before vs
-after the fix):
+The image is built from the local `src/` tree, so run it from the checkout you
+want to measure (before vs after the fix):
 
 ```bash
-~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::smoke   # quick A10
-~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::a10     # full A10
-~/git/efficient-embeddings/.venv/bin/modal run benchmarks/filtered_batch/modal_bench.py::l40s    # full L40S
+modal run benchmarks/filtered_batch/modal_bench.py::smoke   # quick A10
+modal run benchmarks/filtered_batch/modal_bench.py::a10     # full A10
+modal run benchmarks/filtered_batch/modal_bench.py::l40s    # full L40S
 ```
 
 Read the `gpu_stage_one_status` column: unfiltered rows report `used`; before
