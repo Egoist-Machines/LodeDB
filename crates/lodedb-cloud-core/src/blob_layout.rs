@@ -1,7 +1,7 @@
 //! Content-addressed blob naming for the managed remote layout.
 //!
-//! A managed remote can store artifacts content-addressed —
-//! `blobs/sha256/aa/<sha256>` under a per-tenant prefix — instead of under
+//! A managed remote can store artifacts content-addressed
+//! (`blobs/sha256/aa/<sha256>` under a per-tenant prefix) instead of under
 //! their engine path names. Content addressing is what absorbs the
 //! fork-collision case (two branches committing different artifacts under the
 //! same engine name, e.g. `idx.gen/g7.json`, coexist as two blobs), and the

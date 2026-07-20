@@ -110,7 +110,7 @@ pub fn push(
 }
 
 /// Restores `index_key`'s committed generation from `remote` into the local
-/// `dir`, then proves the engine can open the restored copy read-only —
+/// `dir`, then proves the engine can open the restored copy read-only:
 /// restore-verifies-before-accepting as one operation, so no
 /// frontend can offer a pull that skips the check.
 ///

@@ -1124,9 +1124,9 @@ impl CoreEngine {
 
     /// Whether the ANN cluster index is currently resident in memory for an index
     /// (adopted from a persisted `.tvann` sidecar on a writable/eager open, or
-    /// built by a prior query). Returns `false` when it is not resident — a later
+    /// built by a prior query). Returns `false` when it is not resident (a later
     /// ANN query builds it, adopting a lazy open's deferred sidecar assignment
-    /// first — or when the index is exact. Observability; does not trigger a build.
+    /// first) or when the index is exact. Observability; does not trigger a build.
     pub fn ann_cluster_resident(&self, index_id: &str) -> Result<bool, CoreError> {
         let index = self.index(index_id)?;
         Ok(index.cluster_index.borrow().is_some())
