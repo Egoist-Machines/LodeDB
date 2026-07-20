@@ -2,16 +2,16 @@
 control-plane API, the sealed-box login handoff, and the managed
 (`orecloud://`) transfer verbs.
 
-Synchronous httpx by design — the CLI is a sequential tool, and the SDK's
+Synchronous httpx by design: the CLI is a sequential tool, and the SDK's
 cloud methods (Phase 3) will wrap this client in executors where needed.
 `transport` is injectable so tests drive the real client against an
 in-process ASGI app without a socket.
 
 The managed transfer functions compose two layers with a deliberate seam:
 this module moves bytes over HTTP (begin/commit sessions, presigned or
-proxied blob transfers), while everything that touches the commit format —
-identities, inventories, classification, the pointer document, sidecar
-trust, the verified restore — happens in the Rust core via
+proxied blob transfers), while everything that touches the commit format
+(identities, inventories, classification, the pointer document, sidecar
+trust, the verified restore) happens in the Rust core via
 ``lodedb._turbovec.cloud.managed_*``. Python never interprets a manifest: a
 head body is parsed only as opaque JSON and re-serialised for the Rust core,
 which recomputes every identity through the engine's own canonical writer
@@ -48,7 +48,7 @@ class CloudError(RuntimeError):
 def _store_hint(org: str, environment: str, store: object) -> str | None:
     """The `X-Ore-Store` value for a data-plane call, or None when the store
     isn't identifiable in the payload (the ingress then falls back to plain
-    balancing, which is always correct — stickiness is cache locality only).
+    balancing, which is always correct: stickiness is cache locality only).
     Percent-encoded: store names are end-user identifiers, and a non-ASCII
     (or control-character) id must never turn a valid request into a header
     encoding error. Quoting is deterministic, so the same store always maps
@@ -97,7 +97,7 @@ class CloudClient:
         """One API call. `store_hint` stamps `X-Ore-Store` (org/env/store) on
         data-plane requests so a store-sticky ingress can hash-route them to
         the pod holding that store warm; the server never reads it, and any
-        pod answers correctly without it — routing hint, not contract."""
+        pod answers correctly without it: routing hint, not contract."""
         if store_hint is not None:
             headers = dict(kwargs.pop("headers", None) or {})
             headers["x-ore-store"] = store_hint
@@ -114,8 +114,8 @@ class CloudClient:
         return self._request("GET", "/v1/auth/me")
 
     def token_self(self) -> dict:
-        """The presented token's own identity: kind, scopes, and — for
-        environment tokens — the org/environment slugs it is bound to
+        """The presented token's own identity: kind, scopes, and (for
+        environment tokens) the org/environment slugs it is bound to
         (both None for personal tokens)."""
         return self._request("GET", "/v1/tokens/self")
 
@@ -239,7 +239,7 @@ class CloudClient:
         restore refuses from that moment, and the next lifecycle sweep
         hard-deletes the store's rows and objects.
 
-        Store names are end-user ids — free-form up to '/' — so the path
+        Store names are end-user ids (free-form up to '/'), so the path
         segment is percent-encoded: a raw `?` or `#` would truncate the URL
         and address a DIFFERENT store."""
         return self._request(
@@ -278,7 +278,7 @@ class CloudClient:
 
     def export_org(self, org: str) -> dict:
         """The offboarding manifest: every live environment and store with its
-        head snapshot identity (metadata only — bytes move via pull)."""
+        head snapshot identity (metadata only: bytes move via pull)."""
         return self._request("GET", f"/v1/orgs/{org}/export")
 
     # ------------------------------------------------------------ transfer
@@ -308,7 +308,7 @@ class CloudClient:
     def rollback_store(
         self, org: str, environment: str, store: str, snapshot_id: str, key: str | None = None
     ) -> dict:
-        """Moves the branch head back to a retained snapshot (reversible —
+        """Moves the branch head back to a retained snapshot (reversible:
         the displaced head stays in the window for the retention period)."""
         return self._request(
             "POST",
@@ -433,8 +433,8 @@ class CloudClient:
         )
 
     def delete_memories(self, org: str, environment: str, payload: dict) -> dict:
-        """Delete a store's memories in place (async, remove segments) —
-        the store row stays; `delete_store` forgets the user entirely."""
+        """Delete a store's memories in place (async, remove segments).
+        The store row stays; `delete_store` forgets the user entirely."""
         return self._request(
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/memories/delete",
@@ -558,8 +558,8 @@ class LoginHandoff:
 # Engine store kinds → the wire contract's blob kinds. `tvann` (persisted ANN
 # clusters) and `tvvf` (the rescore original-vector sidecar) are vector-derived,
 # payload-free like `tvim`. Deliberately no default: an engine kind this table
-# does not know must fail loudly at `_wire_kind` rather than ship mislabelled —
-# the Rust inventory fails closed on unknown sub-manifests for the same reason.
+# does not know must fail loudly at `_wire_kind` rather than ship mislabelled.
+# The Rust inventory fails closed on unknown sub-manifests for the same reason.
 _ENGINE_KIND_TO_WIRE = {
     "json": "state",
     "tvim": "vector",
@@ -742,7 +742,7 @@ def _push_with_plan(
         )
     except BaseException:
         # Best-effort: release the server-side session instead of leaving it
-        # to expire on its own. The original failure is what matters — an
+        # to expire on its own. The original failure is what matters: an
         # abort that itself fails (network already gone) must not mask it.
         try:
             client.abort_push(remote.org, remote.environment, begin["session_id"])
@@ -770,7 +770,7 @@ def managed_push(
     include_text: bool = False,
     include_lexical: bool = False,
 ) -> dict:
-    """Publish the local committed generation, raced through the head CAS —
+    """Publish the local committed generation, raced through the head CAS:
     the managed analogue of the dumb `push` verb (last writer wins; a
     concurrent advance surfaces as a 409, and divergence *protection* is
     `managed_sync`'s job)."""
@@ -856,7 +856,7 @@ def managed_pull(
     *,
     host: str,
 ) -> dict:
-    """Restore the branch head into `dir` and verify it opens — the managed
+    """Restore the branch head into `dir` and verify it opens: the managed
     analogue of the dumb `pull` verb."""
     return _pull_with_body(client, dir, key, remote, host, expected_snapshot_id=None)
 
@@ -871,7 +871,7 @@ def managed_status(
     include_text: bool = False,
     include_lexical: bool = False,
 ) -> dict:
-    """The status report for a managed remote — same fields as the dumb
+    """The status report for a managed remote: same fields as the dumb
     `status` verb, lineage included."""
     _head, plan = _plan(
         client, dir, key, remote, host,
@@ -898,7 +898,7 @@ def managed_sync(
     force_pull: bool = False,
 ) -> dict:
     """Three-pointer sync against a managed remote: classify (local, sidecar
-    base, branch head), then run at most one fast-forward — the same decision
+    base, branch head), then run at most one fast-forward: the same decision
     table as the Rust `sync` verb, with the head CAS closing the race window.
     """
     if force_push and force_pull:
@@ -940,7 +940,7 @@ def managed_sync(
         """A pull-direction transfer must not run over a local WAL still
         holding acknowledged writes (replaying them onto the pulled lineage
         would corrupt it; dropping them silently loses acked data). Refusing
-        HERE — before a single blob downloads — mirrors the Rust verbs; the
+        HERE, before a single blob downloads, mirrors the Rust verbs; the
         materialize step re-checks authoritatively under the writer lock. The
         scan runs only on this pull branch, so push/status planning never
         pays for it."""

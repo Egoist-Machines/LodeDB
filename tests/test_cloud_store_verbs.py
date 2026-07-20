@@ -1,6 +1,6 @@
 """CloudStore verb wiring against a stub transport: what payload each verb
 puts on the wire and how it folds the acceptance back into session state
-(read-your-writes floor, `last_write_id`). No server involved — the accepted
+(read-your-writes floor, `last_write_id`). No server involved: the accepted
 write contract itself is covered end-to-end in `server/tests`."""
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class _UnprovisionedClient:
 
 def test_unprovisioned_batch_verbs_keep_query_cardinality():
     """Both batched search verbs answer an unprovisioned store with one empty
-    hit list PER query — callers zip queries to results."""
+    hit list PER query: callers zip queries to results."""
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.search_many(["a", "b", "c"]) == [[], [], []]
     assert store.search_many_by_vector([[0.1, 0.2], [0.3, 0.4]]) == [[], []]
@@ -117,7 +117,7 @@ class _BrowseClient:
 def test_browse_carries_the_session_floor_and_retries_425():
     """Browse is a read like search: after a write on this handle it sends
     the session's read-your-writes floor as min_seq and briefly retries a
-    425 instead of surfacing it — the write is durable, only its visibility
+    425 instead of surfacing it: the write is durable, only its visibility
     trails by a fold cycle."""
     client = _BrowseClient(too_early_first=True)
     store = _store(client)
@@ -147,7 +147,7 @@ class _AddClient:
 def test_add_coerces_metadata_like_the_local_handle():
     """Code written against the local `db.add` ergonomics may pass int/
     float/bool metadata values; the wire contract is strict str->str, so the
-    handle stringifies exactly like the local `_coerce_metadata` — and
+    handle stringifies exactly like the local `_coerce_metadata`, and
     refuses the value types the local handle refuses. Absent metadata stays
     None on the wire, not an empty map."""
     client = _AddClient()
@@ -279,7 +279,7 @@ def test_get_texts_falls_back_to_the_text_endpoint_for_text_only_keys():
 
 
 def test_delete_store_erase_rides_the_query_string():
-    """erase=True must reach the wire as ?erase=true — a silently dropped
+    """erase=True must reach the wire as ?erase=true: a silently dropped
     flag would downgrade a data-subject erasure to a grace-window delete."""
     import httpx
 
@@ -326,7 +326,7 @@ def test_browse_passes_ids_and_order_on_the_wire():
 
 class _PagingBrowseClient:
     """Answers filtered browse pages from a fixed id-ordered corpus, honoring
-    after/limit and recording each payload — enough server for the
+    after/limit and recording each payload: enough server for the
     list_documents enumeration loop."""
 
     def __init__(self, count: int) -> None:
@@ -386,7 +386,7 @@ def test_list_documents_forwards_filter_and_pages_like_the_local_cursor():
 def test_list_documents_bounds_the_walk():
     """The keyword-only bounds fail closed before another page is fetched: a
     match set past max_documents raises ValueError, an outlived timeout raises
-    TimeoutError — enumeration never mutates, so both are safe to retry with
+    TimeoutError. Enumeration never mutates, so both are safe to retry with
     a narrower filter or explicit paging."""
     client = _PagingBrowseClient(250)
     store = CloudStore(client, "acme", "prod", "user-42", owns_client=False)
@@ -399,6 +399,6 @@ def test_list_documents_bounds_the_walk():
 
 def test_unprovisioned_list_documents_answers_empty():
     """Enumerating a user who hasn't written yet is the normal zero-setup
-    flow, not an error — same rule as browse."""
+    flow, not an error (same rule as browse)."""
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.list_documents() == []

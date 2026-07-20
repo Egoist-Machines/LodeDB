@@ -1,4 +1,4 @@
-"""`lodedb.cloud.Client` — the developer-facing handle, bound to one tenancy.
+"""`lodedb.cloud.Client`: the developer-facing handle, bound to one tenancy.
 
     from lodedb.cloud import Client
 
@@ -9,7 +9,7 @@
 The org and environment are properties of the *credential*, not of every
 call site: `ore_sk_`/`ore_pk_` tokens are minted bound to one environment,
 and the server rejects any other. So the client asks the control plane what
-the token is (`GET /v1/tokens/self`) and binds itself accordingly — code
+the token is (`GET /v1/tokens/self`) and binds itself accordingly: code
 that connects with a production key and code that connects with a testing
 key are the same code. Personal tokens (`ore_pat_`) span environments, so
 they resolve to the account's only org and default to the ``testing``
@@ -67,7 +67,7 @@ def resolve_tenancy(
     """The (org, environment) this credential addresses.
 
     Explicit values win. An environment-scoped token supplies its own
-    binding and *refuses* a conflicting explicit value — silently ignoring
+    binding and *refuses* a conflicting explicit value: silently ignoring
     one would aim writes somewhere the caller didn't name. A personal token
     falls back to the account's only org, then to the org's only live
     environment or the seeded ``testing`` default; anything else raises
@@ -80,7 +80,7 @@ def resolve_tenancy(
     except CloudError as error:
         if error.status_code == 404:
             # A control plane too old to introspect tokens: don't guess what
-            # the credential is — name both escape hatches.
+            # the credential is: name both escape hatches.
             raise CloudError(
                 404,
                 "this control plane does not support token introspection — "
@@ -132,7 +132,7 @@ class Client:
     """One credential, one control plane, one bound (org, environment).
 
     Construction resolves credentials and tenancy (see the module
-    docstring) and performs at most two HTTP calls — zero when both
+    docstring) and performs at most two HTTP calls, zero when both
     ``org=`` and ``environment=`` are passed. The client owns one HTTP
     connection pool that every handle it creates shares; close it with
     :meth:`close` or a ``with`` block when done.
@@ -167,7 +167,7 @@ class Client:
         warm: bool = False,
         read_your_writes: bool = True,
     ):
-        """A read/write handle over one store — one end user's LodeDB
+        """A read/write handle over one store: one end user's LodeDB
         instance, auto-provisioned by its first write, so this makes no
         HTTP call by default. `warm=True` additionally asks the serving
         tier to hydrate it now (first query skips the cold start). `key`
@@ -202,7 +202,7 @@ class Client:
 
     def create_store(self, store: str, key: str | None = None, **options: Any) -> dict:
         """Register a store explicitly (first writes auto-provision, so this
-        is for choosing `mode=`/`preset=`/`expose_text=` up front — or
+        is for choosing `mode=`/`preset=`/`expose_text=` up front, or
         `vector_dim=` for a bring-your-own-vectors store, which accepts
         `add_vectors`/`search_by_vector` and never embeds server-side)."""
         return self._client.create_store(self.org, self.environment, store, key, **options)
@@ -212,7 +212,7 @@ class Client:
         return self._client.update_store(self.org, self.environment, store, key, **changes)
 
     def delete_store(self, store: str, *, erase: bool = False) -> dict:
-        """Soft-delete a whole store — forget this end user (restorable for
+        """Soft-delete a whole store: forget this end user (restorable for
         the grace period; the entitlement slot frees immediately).
         `erase=True` is data-subject erasure: no grace window, restore
         refuses immediately, and the next lifecycle sweep hard-deletes."""
@@ -243,7 +243,7 @@ class Client:
 
     def list_environments(self) -> list[dict]:
         """The bound org's environments (an environment token sees only its
-        own). The pair is fixed — production and testing, seeded at signup;
+        own). The pair is fixed: production and testing, seeded at signup;
         there is no creation surface."""
         return self._client.list_environments(self.org)
 
@@ -278,7 +278,7 @@ class Client:
     # ------------------------------------------------------------- tokens
 
     def me(self) -> dict:
-        """The signed-in account (personal tokens only — an environment
+        """The signed-in account (personal tokens only: an environment
         token is not a person and gets a 403)."""
         return self._client.me()
 

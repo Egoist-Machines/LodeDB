@@ -1,4 +1,4 @@
-"""`CloudStore` — the cloud handle that duck-types a local LodeDB.
+"""`CloudStore`: the cloud handle that duck-types a local LodeDB.
 
     from lodedb.cloud import Client
 
@@ -8,7 +8,7 @@
     hits = memories.recall("how should I contact them about the invoice?")
 
 A store is one end user's own LodeDB instance (the user's id in the
-agentic-memory product), auto-provisioned by its first write — open a user
+agentic-memory product), auto-provisioned by its first write: open a user
 that doesn't exist yet and reads answer empty until the first `add`.
 Isolation is physical: this handle cannot reach any other user's instance.
 
@@ -16,9 +16,9 @@ Isolation is physical: this handle cannot reach any other user's instance.
 over the same handle for one-off scripts and console copy-paste.
 
 The returned :class:`CloudStore` implements the read subset of the local
-`lodedb.LodeDB` handle — `search` / `search_many` / `get` / `get_texts` /
+`lodedb.LodeDB` handle: `search` / `search_many` / `get` / `get_texts` /
 `stats` / `count`, with hits shaped exactly like the local `LodeSearchHit`
-(`hit.score` / `hit.id` / `hit.metadata`, and tuple unpacking) — so RAG
+(`hit.score` / `hit.id` / `hit.metadata`, and tuple unpacking), so RAG
 adapters and MCP tool bodies written against a local handle work unmodified
 against the cloud. On top of that come the memory verbs: `add` (with TTL),
 `recall`, `context_block`, `browse`, and `delete_memories`.
@@ -47,7 +47,7 @@ from lodedb.cloud.transfer import CloudClient, CloudError, ManagedRemote
 
 
 class CloudSearchHit:
-    """One scored hit — attribute access and tuple unpacking, mirroring the
+    """One scored hit: attribute access and tuple unpacking, mirroring the
     local `LodeSearchHit`. `text` is set when the search asked for it;
     `matched` (recall only) names the sub-queries that surfaced the hit."""
 
@@ -98,7 +98,7 @@ def _coerced_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
     other value types refused with the same error), applied before the wire.
     The server's contract is strict str->str; code written against the local
     ``db.add`` ergonomics must not 422 on ``{"year": 2020}``. ``None`` stays
-    ``None`` — absent metadata, not an empty map."""
+    ``None``: absent metadata, not an empty map."""
     if metadata is None:
         return None
     from lodedb.local.db import _coerce_metadata
@@ -137,14 +137,14 @@ class CloudStore:
         self._read_your_writes = bool(read_your_writes)
         self._write_visibility_timeout = float(write_visibility_timeout)
         self._last_seq = 0
-        # The most recent accepted write's id — the `wait_for` handle.
+        # The most recent accepted write's id: the `wait_for` handle.
         self.last_write_id: str | None = None
 
     # ------------------------------------------------------------- queries
 
     def _empty_if_unprovisioned(self, call, empty):
         """Runs one read, answering `empty` when this user's store simply
-        doesn't exist yet — a store is one end user and materializes on its
+        doesn't exist yet: a store is one end user and materializes on its
         first write, so reading a fresh user before their first memory is
         the normal zero-setup flow (the hosted MCP tools behave the same).
         Every other error stays loud."""
@@ -158,7 +158,7 @@ class CloudStore:
     def _searched(self, call, payload: dict[str, Any]) -> dict:
         """Runs one search call with session read-your-writes: `min_seq` is
         this handle's last acked write, and a 425 (fold not caught up yet) is
-        retried briefly instead of surfacing — the write is durable, only its
+        retried briefly instead of surfacing: the write is durable, only its
         visibility is trailing by a fold cycle."""
         if self._read_your_writes and self._last_seq > 0:
             payload["min_seq"] = self._last_seq
@@ -183,8 +183,8 @@ class CloudStore:
         """Top-`k` hits, engine-scored. `include_text=True` returns each
         hit's stored text inline (requires a `read:text`-scoped key and the
         store's `expose_text` flag). After a write on this handle, the search
-        waits (briefly) for the write to become visible — session
-        read-your-writes; disable with `connect(..., read_your_writes=False)`."""
+        waits (briefly) for the write to become visible (session
+        read-your-writes); disable with `connect(..., read_your_writes=False)`."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -208,7 +208,7 @@ class CloudStore:
         mode: str | None = None,
         include_text: bool = False,
     ) -> list[list[CloudSearchHit]]:
-        """Top-`k` hits per query, order-preserving — the batched search."""
+        """Top-`k` hits per query, order-preserving: the batched search."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -245,7 +245,7 @@ class CloudStore:
 
         The failure this exists for: the server accepts the write but the
         response is lost (timeout, dropped connection). A naive resend would
-        register a second segment — duplicate documents under fresh ids. The
+        register a second segment: duplicate documents under fresh ids. The
         key pins the request, so the retry (same key, byte-identical body)
         gets the original acceptance replayed instead. Only transport-level
         failures are retried; an HTTP error is a real answer.
@@ -271,7 +271,7 @@ class CloudStore:
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Add (or replace) one document — the cloud `db.add`. The text is
+        """Add (or replace) one document: the cloud `db.add`. The text is
         embedded server-side and the write is ACCEPTED (durable + ordered)
         when this returns; visibility follows within seconds, and a search on
         this handle waits for it (session read-your-writes). The first write
@@ -300,7 +300,7 @@ class CloudStore:
         accepted write (one segment; the fold batches concurrent writes into
         one commit). Metadata values are stringified exactly like the local
         handle's (the wire contract is strict str->str). Returns the ids, in
-        order — assigned at acceptance."""
+        order, assigned at acceptance."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -333,7 +333,7 @@ class CloudStore:
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Add (or replace) one pre-embedded document — the cloud
+        """Add (or replace) one pre-embedded document: the cloud
         `db.add_vectors`, for stores created with `vector_dim` (the server
         never embeds; the vector must be exactly the store's dims and is
         unit-normalized server-side, the local default). `text` is optional
@@ -388,7 +388,7 @@ class CloudStore:
         filter: dict[str, Any] | None = None,
         include_text: bool = False,
     ) -> list[CloudSearchHit]:
-        """Top-`k` hits for a pre-embedded query — the cloud
+        """Top-`k` hits for a pre-embedded query: the cloud
         `db.search_by_vector`, for vector stores (which have no server-side
         embedder; the vector must be exactly the store's dims)."""
         payload: dict[str, Any] = {
@@ -412,7 +412,7 @@ class CloudStore:
         filter: dict[str, Any] | None = None,
         include_text: bool = False,
     ) -> list[list[CloudSearchHit]]:
-        """One engine batch of pre-embedded queries — the cloud
+        """One engine batch of pre-embedded queries: the cloud
         `db.search_many_by_vector`."""
         payload: dict[str, Any] = {
             "store": self.store,
@@ -432,18 +432,18 @@ class CloudStore:
         return [[_hit(row) for row in hits] for hits in result["results"]]
 
     def remove(self, id: str) -> str:
-        """Remove one document by id — the cloud `db.remove`, async-first:
+        """Remove one document by id (the cloud `db.remove`), async-first:
         returns the accepted write's id once the removal is durably queued.
         Whether the document existed is decided when the fold applies the
-        delete — ``wait_for(write_id)["result"]["removed"][0]`` answers it."""
+        delete: ``wait_for(write_id)["result"]["removed"][0]`` answers it."""
         return self.remove_many([id])
 
     def remove_many(self, ids: Sequence[str]) -> str:
-        """Remove a batch of documents by id as one accepted write — the
-        cloud `db.remove_many`, async-first like :meth:`remove`: returns the
+        """Remove a batch of documents by id as one accepted write (the
+        cloud `db.remove_many`), async-first like :meth:`remove`: returns the
         write's id once the removals are durably queued (one segment, one
-        fold). Per-id outcomes are decided when the fold applies the deletes
-        — ``wait_for(write_id)["result"]["removed"]`` is the parallel bool
+        fold). Per-id outcomes are decided when the fold applies the deletes:
+        ``wait_for(write_id)["result"]["removed"]`` is the parallel bool
         list. An empty batch raises: with no accepted write there is no id to
         return (the local handle's ``remove_many([])`` no-op returns 0
         instead)."""
@@ -483,7 +483,7 @@ class CloudStore:
     # ---------------------------------------------------------------- text
 
     def get(self, id: str) -> str | None:
-        """One document's stored raw text by id (None when absent) — the
+        """One document's stored raw text by id (None when absent): the
         cloud `db.get(id)`. Requires `read:text` and the store's
         `expose_text` flag."""
         result = self._empty_if_unprovisioned(
@@ -500,12 +500,12 @@ class CloudStore:
     def get_texts(self, ids: list[str]) -> dict[str, str]:
         """Stored text for several ids (missing ids are omitted), with the
         text endpoint's exact per-id semantics at batch cost. By-id browse
-        pages of 100 do the bulk work — one request per hundred ids — and
+        pages of 100 do the bulk work (one request per hundred ids), and
         anything a page could not answer authoritatively falls back to the
         single-id text endpoint (the pre-batching shape): an id absent from
         its page (genuinely gone, TTL-hidden, or an older control plane
         that ignored the by-id fields and answered a plain page), a stray
-        document nobody asked for (definitely such a control plane — none
+        document nobody asked for (definitely such a control plane: none
         of its answers are trustworthy), or a 403 (a least-privilege
         `read:text`-only key; browse is search-scoped)."""
         requested = list(dict.fromkeys(str(id) for id in ids))
@@ -519,7 +519,7 @@ class CloudStore:
                 if error.status_code != 403:
                     raise
                 # The key can't browse (no search scope). The per-id text
-                # endpoint is exactly what `read:text` grants — and if the
+                # endpoint is exactly what `read:text` grants, and if the
                 # 403 was about text access itself, the fallback's first
                 # request surfaces the same actionable refusal.
                 return self._get_texts_by_id(requested)
@@ -532,7 +532,7 @@ class CloudStore:
                     texts[doc["id"]] = doc["text"]
         # Exactness: confirm every unanswered id through the text endpoint.
         # On a current control plane this costs one request per id that is
-        # genuinely absent (or TTL-hidden — which the endpoint, like the old
+        # genuinely absent (or TTL-hidden, which the endpoint, like the old
         # per-id path, still answers); on an older one it recovers the ids
         # its truncated page left out.
         for id in requested:
@@ -555,7 +555,7 @@ class CloudStore:
 
     def stats(self, *, warm: bool = False) -> dict[str, Any]:
         """Metrics-only serving stats (counts, snapshot identity, payload
-        flags) — the cloud `db.stats()` subset."""
+        flags): the cloud `db.stats()` subset."""
         return self._client.serving_stats(
             self.org, self.environment, self.store, self.key, warm=warm
         )
@@ -576,7 +576,7 @@ class CloudStore:
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> list[CloudSearchHit]:
-        """Non-exact retrieval from RAW text — pass a whole user message;
+        """Non-exact retrieval from RAW text: pass a whole user message;
         the server derives sub-queries and fuses the rankings. Each hit's
         `matched` attribute (set on the returned objects) names the
         sub-queries that surfaced it. `agent_id`/`run_id` narrow to one
@@ -647,16 +647,16 @@ class CloudStore:
         """This store's memories (ids + metadata, text when asked and
         allowed), in one of three shapes: keyset pages in the engine's
         stable id order (the default), most-recent-first pages
-        (`order="recent"` — same last-id cursor, but it only holds within
+        (`order="recent"`: same last-id cursor, but it only holds within
         one served snapshot; a 422 asks the caller to restart when the
         store changed under the enumeration, and a match set past the
-        server's scan cap also 422s — narrow the filter or use id order),
-        or a by-id fetch (`ids=[...]` — exactly the named documents that
+        server's scan cap also 422s: narrow the filter or use id order),
+        or a by-id fetch (`ids=[...]`: exactly the named documents that
         exist, no paging; the server refuses `after`/`order` beside it).
         Like search, the enumeration honors session read-your-writes: after
         a write on this handle it waits briefly for that write's fold.
         `ids`/`order`/the read-your-writes token need a control plane that
-        knows them — an older server ignores unknown browse fields and
+        knows them: an older server ignores unknown browse fields and
         answers a plain id-ordered page."""
         payload: dict[str, Any] = {
             "store": self.store,
@@ -689,7 +689,7 @@ class CloudStore:
         max_documents: int | None = None,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Document records, optionally filtered and paged — the cloud
+        """Document records, optionally filtered and paged: the cloud
         `db.list_documents`. Enumeration, not ranking, mirroring the local
         handle: each record is ``{"id", "metadata", "chunk_count"}`` (the
         local handle's extra ``content_hash`` is an on-disk artifact detail
@@ -698,11 +698,11 @@ class CloudStore:
         id-ordered match set with the same keyset cursor.
 
         With ``limit=None`` this walks the WHOLE match set in 100-document
-        browse pages — one request per hundred matches. Two keyword-only
+        browse pages (one request per hundred matches). Two keyword-only
         bounds guard that loop against a store that has outgrown the
         caller: ``max_documents`` raises ValueError once more records than
         that match, and ``timeout`` (seconds) raises TimeoutError when the
-        walk outlives it — each checked before another page is fetched, and
+        walk outlives it: each is checked before another page is fetched, and
         enumeration is read-only, so both leave the store untouched. Like
         every read, each page honors the session's read-your-writes floor.
         """
@@ -744,7 +744,7 @@ class CloudStore:
         self, *, agent_id: str | None = None, run_id: str | None = None
     ) -> dict[str, Any]:
         """Delete this store's memories in place (expired ones included),
-        narrowable to one agent/run. The store stays registered — to forget
+        narrowable to one agent/run. The store stays registered: to forget
         the user entirely (and free their entitlement slot), delete the
         store itself (`CloudClient.delete_store` / `lodedb cloud store delete`).
         Returns the acceptance (`write_ids`, `document_count`, `max_seq`);
@@ -760,7 +760,7 @@ class CloudStore:
         for write_id in result.get("write_ids", []):
             self.last_write_id = str(write_id)
         # The deletion is a write like any other: raise the session's
-        # read-your-writes floor so a search on this handle waits for it —
+        # read-your-writes floor so a search on this handle waits for it:
         # otherwise deleted memories can resurface until the fold lands.
         max_seq = result.get("max_seq")
         if max_seq is not None and int(max_seq) > self._last_seq:
@@ -790,18 +790,18 @@ class CloudStore:
 class _BareStore:
     """A single-segment target: just the store id. The org/environment half
     comes from the credential (`resolve_tenancy`), the same way
-    `Client().store(...)` resolves it — so a user never retypes what their
+    `Client().store(...)` resolves it, so a user never retypes what their
     environment-scoped token already pins down."""
 
     store: str
 
 
 def _parse_target(target: str) -> ManagedRemote | _BareStore:
-    """Accepts a bare store id (`user-42` — org/environment resolve from the
+    """Accepts a bare store id (`user-42`: org/environment resolve from the
     credential), `org/environment/store`, and the explicit `orecloud://`
     spellings of all of these (the URL form also allows `org/environment`,
     defaulting the store). The store segment is the end-user id in the
-    agentic-memory product — a store auto-provisions on its first write, so
+    agentic-memory product: a store auto-provisions on its first write, so
     nothing needs creating first."""
     body = target
     is_url = target.startswith(ManagedRemote.SCHEME)
@@ -840,12 +840,12 @@ def connect(
     repeats what an environment-scoped token already pins down, and
     ``Client().store("user-42")`` resolves it from the credential instead.
     This stays as sugar for one-off scripts and console copy-paste. It is
-    also the seam behind ``lodedb``'s constructor front doors —
+    also the seam behind ``lodedb``'s constructor front doors:
     ``LodeDB.cloud("user-42")`` and the ``LodeDB("orecloud://…")``
     config-string dispatch both land here (lodedb releases that ship the
     `[cloud]` extra), so the two must keep accepting the same keywords.
 
-    `target` is a bare store id (`"user-42"` — the org/environment half
+    `target` is a bare store id (`"user-42"`: the org/environment half
     resolves from the credential via `resolve_tenancy`, exactly like
     `Client().store()`), `"org/environment/store"`, or an `orecloud://` URL
     of either (the URL form also allows `org/environment`, defaulting the
@@ -855,7 +855,7 @@ def connect(
     (default) asks the serving tier
     to hydrate and open the store now, so the first query is warm; it also
     verifies the target exists and the credential can read it. `key` names
-    the index key when the store holds more than one (rare — a pushed LodeDB
+    the index key when the store holds more than one (rare: a pushed LodeDB
     directory can carry several). `read_your_writes=True` (default) makes a
     search after a write on this handle wait briefly for that write's fold,
     so the session always sees its own writes.
@@ -889,7 +889,7 @@ def connect(
         except CloudError as error:
             # Two fine-to-connect 404s: a store that exists but holds
             # nothing yet (first `add()` creates its first snapshot), and a
-            # store that doesn't exist at all — a store is one end user,
+            # store that doesn't exist at all. A store is one end user,
             # and users materialize on their first write, so connecting to
             # a new user before their first memory is the normal flow. A
             # bad org/environment still fails loudly (different detail).
