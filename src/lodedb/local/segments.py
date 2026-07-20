@@ -1,12 +1,12 @@
 """WAL segment files: store-free planning, encoding, and folding.
 
-Advanced building blocks for out-of-band ingest (e.g. a managed cloud's
-multi-writer pipeline): a *writer* chunks and embeds documents with no open
-store, encodes them into an immutable segment file in LodeDB's WAL frame
-format, and ships the bytes; a *fold orchestrator* later stamps log sequence
-numbers and folds each segment into a warm writable :class:`~lodedb.LodeDB`
-handle opened in ``commit_mode="generation"``, publishing one O(changed)
-generation delta per fold batch via :meth:`LodeDB.persist`.
+Advanced building blocks for out-of-band ingest: a *producer* chunks and
+embeds documents with no open store and encodes them into an immutable
+segment file in LodeDB's WAL frame format; a *folding writer* later stamps
+log sequence numbers and folds each segment into a warm writable
+:class:`~lodedb.LodeDB` handle opened in ``commit_mode="generation"``,
+publishing one O(changed) generation delta per fold batch via
+:meth:`LodeDB.persist`.
 
 This module is deliberately not re-exported from ``lodedb``'s root: local
 applications should use :class:`~lodedb.LodeDB` / :class:`~lodedb.Appender`.
@@ -101,7 +101,7 @@ def build_embedded_documents_record(
     for a plan plus one embedding per ``plan["chunks_to_embed"]``, in order.
 
     The embedding count, ``vector_dim``, and finiteness are validated natively,
-    so a bad record can never be encoded (and never uploaded). The payload is
+    so a bad record can never be encoded. The payload is
     byte-identical to the WAL record :meth:`Appender.append_text_many` logs for
     the same input.
     """
@@ -140,7 +140,7 @@ def encode_segment(records: Sequence[Mapping[str, Any]]) -> bytes:
     segment (``EELWAL01`` header plus CRC-framed records, LSNs unassigned).
 
     At least one record is required, ops must be natively replayable, and
-    records must be unstamped -- all fail closed here, before any upload.
+    records must be unstamped -- all fail closed here, at encode time.
     """
 
     rows = [dict(record) for record in records]
@@ -162,7 +162,7 @@ def decode_segment(data: bytes) -> list[dict[str, Any]]:
 
 
 def fold_segment(db: LodeDB, data: bytes, *, first_lsn: int) -> int:
-    """Folds one downloaded segment into a warm writable ``db`` opened with
+    """Folds one segment into a warm writable ``db`` opened with
     ``commit_mode="generation"``, returning the number of records applied.
 
     Decodes strictly, stamps LSNs ``first_lsn .. first_lsn + n - 1`` (a segment

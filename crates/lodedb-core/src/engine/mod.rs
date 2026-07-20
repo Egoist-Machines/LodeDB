@@ -1646,7 +1646,7 @@ impl CoreEngine {
     }
 
     /// Applies already-ordered, caller-stamped WAL records (e.g. decoded from an
-    /// uploaded segment) to `index_id` in memory and advances the applied-LSN
+    /// externally encoded segment) to `index_id` in memory and advances the applied-LSN
     /// watermark. Does NOT persist: call [`Self::persist`] after the batch to
     /// publish one O(changed) generation delta covering every record applied --
     /// nothing durable happens before that root-manifest swap, so a failure here
@@ -1660,7 +1660,7 @@ impl CoreEngine {
     /// batch (duplicates are an allocator bug -- fail loudly, never skip); and
     /// every op must be natively replayable. Records at or below the index's
     /// applied watermark are then skipped for refold idempotence; the returned
-    /// count is the number actually applied, so an orchestrator can distinguish
+    /// count is the number actually applied, so the caller can distinguish
     /// an expected refold from an LSN-allocation bug.
     pub fn apply_wal_records(
         &mut self,
@@ -4755,9 +4755,8 @@ fn is_native_replayable_wal_record(record: &crate::storage::wal::WalRecord) -> b
 }
 
 /// Whether native WAL replay supports `op` -- the exact op set a WAL segment
-/// may carry. Public so bindings validate ops at encode time (fail closed
-/// before a segment is uploaded) instead of discovering a poison record at
-/// fold time.
+/// may carry. Public so bindings validate ops at encode time instead of
+/// discovering a poison record at fold time.
 pub fn is_native_replayable_op(op: &str) -> bool {
     matches!(
         op,
@@ -6439,7 +6438,7 @@ pub fn plan_documents(
 /// Builds the `apply_embedded_documents` WAL payload for a plan plus its
 /// embeddings (one per `plan.chunks_to_embed`, in order). Validates the
 /// embedding count, dimension against `vector_dim`, and finiteness so a poison
-/// record can never be encoded (and, for cloud writers, never uploaded).
+/// record can never be encoded.
 /// Text/token retention follows the plan's own `store_text`/`index_text`; a
 /// caller enforcing a different policy (the appender) must reject a mismatched
 /// plan before building. The payload carries every chunk as an added chunk and

@@ -1,7 +1,7 @@
 """WAL segment files: store-free planning, encode/decode, and external folds.
 
 `lodedb.local.segments` is the advanced building-block API for out-of-band
-ingest (a cloud multi-writer pipeline): plan + embed + encode a segment with no
+ingest: plan + embed + encode a segment with no
 open store, then fold the bytes into a warm writable generation-mode handle and
 publish one delta per fold batch. These tests drive the full flow through the
 real engine with the deterministic hash embedding backend.
@@ -51,7 +51,7 @@ def _add_segment(documents, *, store_text: bool = True, index_text: bool = True)
 def test_segment_fold_end_to_end(tmp_path):
     """plan -> embed -> encode -> fold -> persist -> search/get, watermark advanced."""
 
-    # Create the target store, then reopen warm (the orchestrator's shape).
+    # Create the target store, then reopen warm (a folding writer's shape).
     _writer(tmp_path).close()
     segment = _add_segment(
         [
@@ -125,8 +125,7 @@ def test_delete_segment_folds(tmp_path):
         fold_segment(db, add, first_lsn=db.applied_lsn() + 1)
         db.persist()
         # The commit inflates the watermark past the last stamped LSN, so a later
-        # batch must re-floor from the committed applied_lsn -- exactly what the
-        # fold orchestrator does.
+        # batch must re-floor from the committed applied_lsn.
         assert fold_segment(db, remove, first_lsn=db.applied_lsn() + 1) == 1
         db.persist()
         assert db.get("drop") is None
@@ -212,7 +211,7 @@ def test_add_then_remove_in_one_fold_batch_stays_reopenable(tmp_path):
     persist) wrote its never-committed row into the delta's removed set, and
     the strict replay rejected the store on every fresh open ("removed-id
     count mismatch") — the warm handle kept serving while every new reader,
-    hydration, or pull failed. Found by OreCloud's randomized op soup.
+    hydration, or pull failed. Found by randomized concurrency testing.
 
     The bug lives on the delta path, which only exists over a committed vector
     base: an empty store's base carries no ``.tvim``, so its next persist
@@ -264,7 +263,7 @@ def test_record_builder_failure_modes():
     poisoned = [[float("nan")] * DIM] * chunk_count
     with pytest.raises(Exception, match="non-finite"):
         build_embedded_documents_record(plan, poisoned, vector_dim=DIM)
-    # Non-native op fails at encode, before any upload could happen.
+    # Non-native op fails at encode time.
     with pytest.raises(Exception, match="does not support"):
         encode_segment([{"op": "upsert_documents", "payload": {"documents": []}}])
     # A root-level payload "lsn" key shares the stamp's namespace: decode would

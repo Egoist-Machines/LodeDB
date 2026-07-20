@@ -130,8 +130,7 @@ Added while LodeDB migrates toward a shared Rust engine:
 
 ## WAL segment bindings (out-of-band ingest)
 
-Added for LodeDB's segment-file ingest primitives (`lodedb.local.segments`,
-consumed by cloud multi-writer pipelines):
+Added for LodeDB's segment-file ingest primitives (`lodedb.local.segments`):
 
 - `turbovec-python/src/lib.rs`: four module `#[pyfunction]`s —
   `plan_segment_documents` (store-free ingest planning),
@@ -139,7 +138,7 @@ consumed by cloud multi-writer pipelines):
   payload from a plan plus an `(n, dim)` f32 matrix), `encode_wal_segment`
   (immutable WAL-format segment bytes from `{op, payload}` records; ops are
   validated against the native-replayable set and stamped records are refused,
-  both before any upload), and `decode_wal_segment` (strict decode to
+  both at encode time), and `decode_wal_segment` (strict decode to
   `{op, payload, lsn}` JSON).
 - `turbovec-python/src/lib.rs`: `PyCoreEngine::fold_wal_segment(index_id,
   segment, first_lsn)` — strict decode + LSN stamping + in-memory apply via
