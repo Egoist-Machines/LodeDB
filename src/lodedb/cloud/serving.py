@@ -499,21 +499,41 @@ class CloudStore:
 
     def get_texts(self, ids: list[str]) -> dict[str, str]:
         """Stored text for several ids (missing ids are omitted), fetched as
-        by-id browse pages of 100 (the by-id bound) — a batch costs one
-        request per hundred ids, not one per id. Needs `read:text`, the
-        store's `expose_text` flag, AND a key that can search: browse is a
-        search-scoped read, where the single-id `get` needs text access
-        only. Answers are filtered to the requested ids, so an older control
-        plane (which ignores the by-id fields and answers a plain page) can
-        only under-answer, never mis-answer."""
+        by-id browse pages of 100 (the by-id bound) — one request per
+        hundred ids, not one per id. Browse is a search-scoped read, so a
+        least-privilege key holding only `read:text` falls back to the
+        single-id text endpoint (one request per id, the pre-batching
+        behavior) instead of failing a previously valid call. Answers are
+        filtered to the requested ids, so an older control plane (which
+        ignores the by-id fields and answers a plain page) can only
+        under-answer, never mis-answer."""
         texts: dict[str, str] = {}
         for start in range(0, len(ids), 100):
             batch = [str(id) for id in ids[start : start + 100]]
             wanted = set(batch)
-            for doc in self.browse(ids=batch, include_text=True):
+            try:
+                page = self.browse(ids=batch, include_text=True)
+            except CloudError as error:
+                if error.status_code != 403:
+                    raise
+                # The key can't browse (no search scope). The per-id text
+                # endpoint is exactly what `read:text` grants — and if the
+                # 403 was about text access itself, the fallback's first
+                # request surfaces the same actionable refusal.
+                return self._get_texts_by_id(ids)
+            for doc in page:
                 text = doc.get("text")
                 if doc.get("id") in wanted and text is not None:
                     texts[doc["id"]] = text
+        return texts
+
+    def _get_texts_by_id(self, ids: list[str]) -> dict[str, str]:
+        """The pre-batching shape: one text-endpoint request per id."""
+        texts: dict[str, str] = {}
+        for id in ids:
+            text = self.get(id)
+            if text is not None:
+                texts[id] = text
         return texts
 
     # --------------------------------------------------------------- stats

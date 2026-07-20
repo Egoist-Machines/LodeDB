@@ -201,6 +201,40 @@ def test_get_texts_batches_over_the_by_id_browse():
     assert len(client.calls) == 2  # the empty batch made no request
 
 
+class _TextOnlyClient:
+    """A least-privilege `read:text` credential's view: browse (search-
+    scoped) refuses with 403, the per-id text endpoint answers."""
+
+    def __init__(self) -> None:
+        self.browse_calls = 0
+        self.text_calls: list[str] = []
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self.browse_calls += 1
+        from lodedb.cloud.transfer import CloudError
+
+        raise CloudError(403, "returning stored text requires the 'read:search' scope")
+
+    def store_text(self, org: str, environment: str, store: str, id: str, key=None) -> dict:
+        self.text_calls.append(id)
+        found = id != "missing"
+        return {"id": id, "found": found, "text": f"text-{id}" if found else None}
+
+
+def test_get_texts_falls_back_to_the_text_endpoint_for_text_only_keys():
+    """A key holding only read:text cannot browse; get_texts then answers
+    through the single-id text endpoint (the pre-batching shape) instead of
+    failing a previously valid least-privilege call."""
+    client = _TextOnlyClient()
+    store = _store(client)
+
+    texts = store.get_texts(["a", "missing", "b"])
+
+    assert texts == {"a": "text-a", "b": "text-b"}
+    assert client.browse_calls == 1
+    assert client.text_calls == ["a", "missing", "b"]
+
+
 def test_delete_store_erase_rides_the_query_string():
     """erase=True must reach the wire as ?erase=true — a silently dropped
     flag would downgrade a data-subject erasure to a grace-window delete."""
