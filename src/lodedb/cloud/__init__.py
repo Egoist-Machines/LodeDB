@@ -22,6 +22,11 @@ import importlib
 import inspect
 from typing import Any
 
+# The hosted control plane every credential path defaults to (stdlib-only
+# module, so this eager import keeps the plain-import boundary intact);
+# --host / ORECLOUD_HOST / host= override it.
+from lodedb.cloud._config import DEFAULT_HOST as DEFAULT_HOST
+
 # Managed-cloud target scheme recognized by the LodeDB(...) config-string
 # dispatch. LodeDB.cloud() additionally accepts scheme-less short forms
 # ("user-42", "org/environment/store"); the plain constructor must not,
@@ -50,7 +55,9 @@ _HTTP_EXPORTS = {
     "SyncConflictError": "transfer",
 }
 
-__all__ = sorted({"CLOUD_TARGET_SCHEME", "open_cloud_target", *_NATIVE_EXPORTS, *_HTTP_EXPORTS})
+__all__ = sorted(
+    {"CLOUD_TARGET_SCHEME", "DEFAULT_HOST", "open_cloud_target", *_NATIVE_EXPORTS, *_HTTP_EXPORTS}
+)
 
 
 def open_cloud_target(target: str, options: dict[str, Any]) -> Any:

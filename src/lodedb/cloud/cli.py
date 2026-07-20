@@ -366,8 +366,8 @@ def _classify(error: CloudError) -> tuple[int, str | None]:
     status = error.status_code
     if status == 401:
         return EXIT_AUTH, (
-            "the credential was rejected — run `lodedb cloud login --host <control-plane-url>`, "
-            "or set both ORECLOUD_HOST and ORECLOUD_TOKEN"
+            "the credential was rejected — run `lodedb cloud login` "
+            "or set ORECLOUD_TOKEN"
         )
     if status == 403:
         return EXIT_AUTH, (
@@ -419,7 +419,7 @@ def _load_credentials() -> "_config.Credentials | None":
 def _client() -> CloudClient:
     creds = _load_credentials()
     if creds is None:
-        raise _fail("not logged in — run `lodedb cloud login --host <control-plane-url>`")
+        raise _fail("not logged in — run `lodedb cloud login`")
     return CloudClient(creds.host, creds.token)
 
 
@@ -505,7 +505,7 @@ def _managed(local_dir: str, remote: str) -> tuple[CloudClient, ManagedRemote, s
             )
         creds = _load_credentials()
         if creds is None:
-            raise _fail("not logged in — run `lodedb cloud login --host <control-plane-url>`")
+            raise _fail("not logged in — run `lodedb cloud login`")
         if creds.host.rstrip("/") != config.host:
             raise _fail(
                 f"this directory is linked to {config.host} but you are logged in to "
@@ -518,7 +518,7 @@ def _managed(local_dir: str, remote: str) -> tuple[CloudClient, ManagedRemote, s
         return None
     creds = _load_credentials()
     if creds is None:
-        raise _fail("not logged in — run `lodedb cloud login --host <control-plane-url>`")
+        raise _fail("not logged in — run `lodedb cloud login`")
     return CloudClient(creds.host, creds.token), target, creds.host
 
 
@@ -526,7 +526,11 @@ def _managed(local_dir: str, remote: str) -> tuple[CloudClient, ManagedRemote, s
 def login(
     host: Annotated[
         str | None,
-        typer.Option("--host", help="Control-plane URL, e.g. https://console.example.com."),
+        typer.Option(
+            "--host",
+            help="Control-plane URL for staging or self-hosted deployments "
+            f"(default: the stored login's host, else {_config.DEFAULT_HOST}).",
+        ),
     ] = None,
     token: Annotated[
         str | None,
@@ -551,9 +555,10 @@ def login(
     """
     creds = _load_credentials()
     if host is None:
-        host = creds.host if creds else None
-    if host is None:
-        raise _fail("--host is required for the first login")
+        # Re-login sticks to the control plane already logged in to (switching
+        # planes is always an explicit --host); first login targets the hosted
+        # default.
+        host = creds.host if creds else _config.DEFAULT_HOST
 
     if token is None:
         token = _browser_login(host, open_browser=not no_browser)
@@ -605,11 +610,7 @@ def _ensure_logged_in(host: str | None) -> "_config.Credentials":
             )
         return creds
     if host is None:
-        raise _fail(
-            "not logged in — pass --host to log in as part of this command, "
-            "or run `lodedb cloud login --host <control-plane-url>` first",
-            code=EXIT_USAGE,
-        )
+        host = _config.DEFAULT_HOST
     token = _browser_login(host)
     with CloudClient(host, token) as client:
         me = _cloud(client.me)
@@ -722,8 +723,9 @@ def init(
         str | None,
         typer.Option(
             "--host",
-            help="Control-plane URL — when no credential is stored, init logs "
-            "in first (browser approval, the one human step).",
+            help="Control-plane URL for staging or self-hosted deployments "
+            f"(default: {_config.DEFAULT_HOST}) — when no credential is "
+            "stored, init logs in first (browser approval, the one human step).",
         ),
     ] = None,
     agents: Annotated[
@@ -821,7 +823,7 @@ def auth_print_headers() -> None:
     creds = _load_credentials()
     if creds is None:
         raise _fail(
-            "not logged in — run `lodedb cloud login --host <control-plane-url>`",
+            "not logged in — run `lodedb cloud login`",
             code=EXIT_AUTH,
         )
     typer.echo(json.dumps({"Authorization": f"Bearer {creds.token}"}))
@@ -946,7 +948,7 @@ def tokens_mint(
     org/environment; personal tokens take neither flag."""
     creds = _load_credentials()
     if creds is None:
-        raise _fail("not logged in — run `lodedb cloud login --host <control-plane-url>`")
+        raise _fail("not logged in — run `lodedb cloud login`")
     with CloudClient(creds.host, creds.token) as client:
         if kind != "personal" and (org is None or environment is None):
             org, environment = _tenancy(client, org, environment)

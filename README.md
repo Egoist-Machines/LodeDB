@@ -633,8 +633,8 @@ db.search("fox", k=5)
 ```
 
 A bare store id is enough — the org/environment half resolves from the
-credential (`token=`, the `ORECLOUD_TOKEN`/`ORECLOUD_HOST` environment pair,
-or `lodedb cloud login`); pass the full `"org/environment/store"` triple in
+credential (`token=`, the `ORECLOUD_TOKEN` environment variable, or
+`lodedb cloud login`); pass the full `"org/environment/store"` triple in
 cross-environment scripts. For config-driven code, where one string field (an
 env var, a YAML value) must express either a local path or a cloud store, the
 plain constructor accepts the explicit URL form —

@@ -45,6 +45,19 @@ class CloudError(RuntimeError):
         self.detail = detail
 
 
+def _store_hint(org: str, environment: str, store: object) -> str | None:
+    """The `X-Ore-Store` value for a data-plane call, or None when the store
+    isn't identifiable in the payload (the ingress then falls back to plain
+    balancing, which is always correct — stickiness is cache locality only).
+    Percent-encoded: store names are end-user identifiers, and a non-ASCII
+    (or control-character) id must never turn a valid request into a header
+    encoding error. Quoting is deterministic, so the same store always maps
+    to the same hash bucket."""
+    if not isinstance(store, str) or not store:
+        return None
+    return quote(f"{org}/{environment}/{store}", safe="/")
+
+
 def _raise_for(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
@@ -80,7 +93,15 @@ class CloudClient:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, **kwargs) -> Any:
+    def _request(self, method: str, path: str, *, store_hint: str | None = None, **kwargs) -> Any:
+        """One API call. `store_hint` stamps `X-Ore-Store` (org/env/store) on
+        data-plane requests so a store-sticky ingress can hash-route them to
+        the pod holding that store warm; the server never reads it, and any
+        pod answers correctly without it — routing hint, not contract."""
+        if store_hint is not None:
+            headers = dict(kwargs.pop("headers", None) or {})
+            headers["x-ore-store"] = store_hint
+            kwargs["headers"] = headers
         response = self._http.request(method, path, **kwargs)
         _raise_for(response)
         if response.status_code == 204 or not response.content:
@@ -334,12 +355,18 @@ class CloudClient:
 
     def search(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
-            "POST", f"/v1/orgs/{org}/environments/{environment}/stores/search", json=payload
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/search",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def search_many(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
-            "POST", f"/v1/orgs/{org}/environments/{environment}/stores/search-many", json=payload
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/search-many",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def store_text(
@@ -349,12 +376,18 @@ class CloudClient:
         if key:
             params["key"] = key
         return self._request(
-            "GET", f"/v1/orgs/{org}/environments/{environment}/stores/text", params=params
+            "GET",
+            f"/v1/orgs/{org}/environments/{environment}/stores/text",
+            params=params,
+            store_hint=_store_hint(org, environment, params.get("store")),
         )
 
     def add_documents(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
-            "POST", f"/v1/orgs/{org}/environments/{environment}/stores/documents", json=payload
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/documents",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def remove_documents(self, org: str, environment: str, payload: dict) -> dict:
@@ -362,6 +395,7 @@ class CloudClient:
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/documents/remove",
             json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
@@ -369,6 +403,7 @@ class CloudClient:
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/documents/browse",
             json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     # ---------------------------------------------- memory verbs (Phase 8d)
@@ -376,7 +411,10 @@ class CloudClient:
     def recall(self, org: str, environment: str, payload: dict) -> dict:
         """Non-exact retrieval from raw text (server-side sub-queries + RRF)."""
         return self._request(
-            "POST", f"/v1/orgs/{org}/environments/{environment}/stores/recall", json=payload
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/recall",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def context_block(self, org: str, environment: str, payload: dict) -> dict:
@@ -385,6 +423,7 @@ class CloudClient:
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/context-block",
             json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def delete_memories(self, org: str, environment: str, payload: dict) -> dict:
@@ -394,6 +433,7 @@ class CloudClient:
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/memories/delete",
             json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
     def write_status(
@@ -407,6 +447,7 @@ class CloudClient:
             "GET",
             f"/v1/orgs/{org}/environments/{environment}/stores/writes/{write_id}",
             params=params,
+            store_hint=_store_hint(org, environment, store),
         )
 
     def serving_stats(
@@ -423,8 +464,13 @@ class CloudClient:
             params["key"] = key
         if warm:
             params["warm"] = "true"
+        # The hint matters MOST here: `warm=True` is the pre-hydration call,
+        # and it must land on the same pod the hinted queries will.
         return self._request(
-            "GET", f"/v1/orgs/{org}/environments/{environment}/stores/serving-stats", params=params
+            "GET",
+            f"/v1/orgs/{org}/environments/{environment}/stores/serving-stats",
+            params=params,
+            store_hint=_store_hint(org, environment, store),
         )
 
     def upload_blob_proxy(self, proxy_path: str, handle: BinaryIO) -> None:

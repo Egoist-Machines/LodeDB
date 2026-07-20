@@ -26,16 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LodeDB.cloud("user-42")` opens a managed-cloud store through the same
   class as a local path, joining the `open_readonly`/`open_vector_store`
   alternate-constructor family: a bare store id resolves its
-  org/environment from the credential (`token=`,
-  `ORECLOUD_TOKEN`/`ORECLOUD_HOST`, or `lodedb cloud login`), and the
-  `"org/environment/store"` triple and full `orecloud://` URLs are accepted
-  too. The call returns the cloud store handle (same
+  org/environment from the credential (`token=`, `ORECLOUD_TOKEN`, or
+  `lodedb cloud login`), and the `"org/environment/store"` triple and
+  full `orecloud://` URLs are accepted too. The call returns the cloud store handle (same
   `add`/`search`/`get`/`remove` verbs over HTTPS). For config-driven code,
   the plain constructor also dispatches the explicit URL form —
   `LodeDB("orecloud://org/environment/store")` — through the same funnel.
   Local-only construction options (`model=`, `read_only=`, ...) are rejected
   on cloud targets with a targeted error, and a cloud target without the
   `[cloud]` extra's dependencies raises the install hint.
+- The client and CLI default to the hosted control plane
+  (`https://api.egoistmachines.com`), so nobody has to know the URL:
+  `lodedb cloud login` needs no flags, and `Client(token=...)` or
+  `ORECLOUD_TOKEN` alone is enough for CI. `--host`/`ORECLOUD_HOST`
+  remain the override for staging and self-hosted control planes; a
+  host override without a matching token still fails closed.
 
 ## [1.3.2] - 2026-07-16
 

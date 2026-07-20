@@ -225,8 +225,8 @@ class LodeDB:
 
     A managed `OreCloud <https://db.egoistmachines.com>`_ store opens through
     the same verbs via :meth:`cloud` (requires the ``lodedb[cloud]`` extra;
-    credentials come from ``token=``, the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST``
-    environment pair, or ``lodedb cloud login``)::
+    credentials come from ``token=``, the ``ORECLOUD_TOKEN`` environment
+    variable, or ``lodedb cloud login``)::
 
         db = LodeDB.cloud("user-42")          # org/environment from the credential
         db.add("the quick brown fox")         # embedded server-side

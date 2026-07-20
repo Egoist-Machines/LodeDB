@@ -20,8 +20,9 @@ both skips introspection entirely (zero HTTP calls) and relies on the
 server rejecting a mismatched binding at the first request.
 
 Credentials resolve like the CLI's: explicit ``token=``/``host=`` arguments,
-then the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST`` environment pair, then the
-``lodedb cloud login`` credentials file.
+then the ``ORECLOUD_TOKEN`` environment variable, then the ``lodedb cloud
+login`` credentials file. The host defaults to the hosted control plane;
+``host=`` / ``ORECLOUD_HOST`` override it for self-hosted deployments.
 
 Every control-plane verb the SDK speaks hangs off this object with the
 tenancy already applied; per-store reads and writes live on the
@@ -41,28 +42,23 @@ from lodedb.cloud.transfer import CloudClient, CloudError, ManagedRemote
 
 
 def resolve_credentials(token: str | None, host: str | None) -> tuple[str, str]:
-    """(host, token) from explicit arguments, the environment pair, or the
-    `lodedb cloud login` file — raising a CloudError naming the fix when either
-    half is missing."""
+    """(host, token) from explicit arguments, the environment, or the
+    `lodedb cloud login` file. The host falls back to the hosted control
+    plane (`DEFAULT_HOST`), so a bare token is always enough; only a missing
+    token raises, with a CloudError naming the fix."""
     if token is None or host is None:
         stored = _config.load_credentials()
         if token is None:
             token = stored.token if stored else None
         if host is None:
             host = stored.host if stored else None
-    if not host:
-        raise CloudError(
-            401,
-            "no control-plane host configured — pass host=, set ORECLOUD_HOST, "
-            "or run `lodedb cloud login`",
-        )
     if not token:
         raise CloudError(
             401,
             "no credential configured — pass token=, set ORECLOUD_TOKEN, or run "
             "`lodedb cloud login`",
         )
-    return host, token
+    return (host or _config.DEFAULT_HOST).rstrip("/"), token
 
 
 def resolve_tenancy(

@@ -24,9 +24,10 @@ against the cloud. On top of that come the memory verbs: `add` (with TTL),
 `recall`, `context_block`, `browse`, and `delete_memories`.
 
 Credentials resolve like the CLI's: explicit ``token=``/``host=`` arguments
-win, then the ``ORECLOUD_TOKEN``/``ORECLOUD_HOST`` environment pair, then the
-``lodedb cloud login`` credentials file. Server-side, queries are embedded with
-the same preset that indexed the data, so scores are the engine's own.
+win, then the ``ORECLOUD_TOKEN`` environment variable, then the ``lodedb
+cloud login`` credentials file; the host defaults to the hosted control
+plane. Server-side, queries are embedded with the same preset that indexed
+the data, so scores are the engine's own.
 
 Connecting pre-warms the store on the serving tier by default (the first
 query then skips the hydration cold start); pass ``warm=False`` to skip.
@@ -728,9 +729,10 @@ def connect(
     resolves from the credential via `resolve_tenancy`, exactly like
     `Client().store()`), `"org/environment/store"`, or an `orecloud://` URL
     of either (the URL form also allows `org/environment`, defaulting the
-    store). Credentials: explicit arguments, else the
-    `ORECLOUD_TOKEN`/`ORECLOUD_HOST` environment pair, else the credentials
-    file `lodedb cloud login` wrote. `warm=True` (default) asks the serving tier
+    store). Credentials: explicit arguments, else the `ORECLOUD_TOKEN`
+    environment variable, else the credentials file `lodedb cloud login`
+    wrote (the host defaults to the hosted control plane). `warm=True`
+    (default) asks the serving tier
     to hydrate and open the store now, so the first query is warm; it also
     verifies the target exists and the credential can read it. `key` names
     the index key when the store holds more than one (rare — a pushed LodeDB
