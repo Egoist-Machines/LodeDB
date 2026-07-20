@@ -2,8 +2,8 @@
 control-plane API, the sealed-box login handoff, and the managed
 (`orecloud://`) transfer verbs.
 
-Synchronous httpx by design: the CLI is a sequential tool, and the SDK's
-cloud methods (Phase 3) will wrap this client in executors where needed.
+Synchronous httpx by design. The CLI is a sequential tool, and the SDK's
+cloud methods wrap this client in executors where needed.
 `transport` is injectable so tests drive the real client against an
 in-process ASGI app without a socket.
 
@@ -48,7 +48,7 @@ class CloudError(RuntimeError):
 def _store_hint(org: str, environment: str, store: object) -> str | None:
     """The `X-Ore-Store` value for a data-plane call, or None when the store
     isn't identifiable in the payload (the ingress then falls back to plain
-    balancing, which is always correct: stickiness is cache locality only).
+    balancing, which is always correct; stickiness is cache locality only).
     Percent-encoded: store names are end-user identifiers, and a non-ASCII
     (or control-character) id must never turn a valid request into a header
     encoding error. Quoting is deterministic, so the same store always maps
@@ -97,7 +97,8 @@ class CloudClient:
         """One API call. `store_hint` stamps `X-Ore-Store` (org/env/store) on
         data-plane requests so a store-sticky ingress can hash-route them to
         the pod holding that store warm; the server never reads it, and any
-        pod answers correctly without it: routing hint, not contract."""
+        pod answers correctly without it. The header is a routing hint, not
+        a contract."""
         if store_hint is not None:
             headers = dict(kwargs.pop("headers", None) or {})
             headers["x-ore-store"] = store_hint
@@ -240,7 +241,7 @@ class CloudClient:
         hard-deletes the store's rows and objects.
 
         Store names are end-user ids (free-form up to '/'), so the path
-        segment is percent-encoded: a raw `?` or `#` would truncate the URL
+        segment is percent-encoded. A raw `?` or `#` would truncate the URL
         and address a DIFFERENT store."""
         return self._request(
             "DELETE",
@@ -278,7 +279,7 @@ class CloudClient:
 
     def export_org(self, org: str) -> dict:
         """The offboarding manifest: every live environment and store with its
-        head snapshot identity (metadata only: bytes move via pull)."""
+        head snapshot identity (metadata only; bytes move via pull)."""
         return self._request("GET", f"/v1/orgs/{org}/export")
 
     # ------------------------------------------------------------ transfer
@@ -308,7 +309,7 @@ class CloudClient:
     def rollback_store(
         self, org: str, environment: str, store: str, snapshot_id: str, key: str | None = None
     ) -> dict:
-        """Moves the branch head back to a retained snapshot (reversible:
+        """Moves the branch head back to a retained snapshot (reversible;
         the displaced head stays in the window for the retention period)."""
         return self._request(
             "POST",
@@ -412,7 +413,7 @@ class CloudClient:
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
-    # ---------------------------------------------- memory verbs (Phase 8d)
+    # --------------------------------------------------------- memory verbs
 
     def recall(self, org: str, environment: str, payload: dict) -> dict:
         """Non-exact retrieval from raw text (server-side sub-queries + RRF)."""
@@ -618,7 +619,7 @@ class ManagedRemote:
 
     def identity(self, host: str) -> str:
         """The sidecar remote-identity string. Includes the control-plane
-        host: the same org/environment on two deployments is two remotes."""
+        host; the same org/environment on two deployments is two remotes."""
         return (
             f"{self.SCHEME}{self.org}/{self.environment}/{self.store}"
             f"#host={host.rstrip('/')}"
@@ -742,7 +743,7 @@ def _push_with_plan(
         )
     except BaseException:
         # Best-effort: release the server-side session instead of leaving it
-        # to expire on its own. The original failure is what matters: an
+        # to expire on its own. The original failure is what matters. An
         # abort that itself fails (network already gone) must not mask it.
         try:
             client.abort_push(remote.org, remote.environment, begin["session_id"])
@@ -770,8 +771,8 @@ def managed_push(
     include_text: bool = False,
     include_lexical: bool = False,
 ) -> dict:
-    """Publish the local committed generation, raced through the head CAS:
-    the managed analogue of the dumb `push` verb (last writer wins; a
+    """Publish the local committed generation, raced through the head CAS.
+    The managed analogue of the dumb `push` verb (last writer wins; a
     concurrent advance surfaces as a 409, and divergence *protection* is
     `managed_sync`'s job)."""
     head, plan = _plan(
@@ -856,8 +857,8 @@ def managed_pull(
     *,
     host: str,
 ) -> dict:
-    """Restore the branch head into `dir` and verify it opens: the managed
-    analogue of the dumb `pull` verb."""
+    """Restore the branch head into `dir` and verify it opens (the managed
+    analogue of the dumb `pull` verb)."""
     return _pull_with_body(client, dir, key, remote, host, expected_snapshot_id=None)
 
 
@@ -871,8 +872,8 @@ def managed_status(
     include_text: bool = False,
     include_lexical: bool = False,
 ) -> dict:
-    """The status report for a managed remote: same fields as the dumb
-    `status` verb, lineage included."""
+    """The status report for a managed remote (same fields as the dumb
+    `status` verb, lineage included)."""
     _head, plan = _plan(
         client, dir, key, remote, host,
         include_text=include_text, include_lexical=include_lexical,
@@ -898,8 +899,9 @@ def managed_sync(
     force_pull: bool = False,
 ) -> dict:
     """Three-pointer sync against a managed remote: classify (local, sidecar
-    base, branch head), then run at most one fast-forward: the same decision
-    table as the Rust `sync` verb, with the head CAS closing the race window.
+    base, branch head), then run at most one fast-forward. The decision
+    table matches the Rust `sync` verb's; the head CAS closes the race
+    window.
     """
     if force_push and force_pull:
         raise ValueError("force_push and force_pull are mutually exclusive")
@@ -920,7 +922,7 @@ def managed_sync(
 
     def _push_translating_conflict() -> dict:
         """The commit-time CAS 409 (head moved since the push began) is a
-        sync-level conflict, not a generic refusal: re-running the sync
+        sync-level conflict, not a generic refusal. Re-running the sync
         re-classifies against the new head and usually resolves it."""
         try:
             return _push_with_plan(client, dir, key, remote, host, head, plan)

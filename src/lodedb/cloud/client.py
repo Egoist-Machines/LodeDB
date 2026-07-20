@@ -9,7 +9,7 @@
 The org and environment are properties of the *credential*, not of every
 call site: `ore_sk_`/`ore_pk_` tokens are minted bound to one environment,
 and the server rejects any other. So the client asks the control plane what
-the token is (`GET /v1/tokens/self`) and binds itself accordingly: code
+the token is (`GET /v1/tokens/self`) and binds itself accordingly. Code
 that connects with a production key and code that connects with a testing
 key are the same code. Personal tokens (`ore_pat_`) span environments, so
 they resolve to the account's only org and default to the ``testing``
@@ -67,7 +67,7 @@ def resolve_tenancy(
     """The (org, environment) this credential addresses.
 
     Explicit values win. An environment-scoped token supplies its own
-    binding and *refuses* a conflicting explicit value: silently ignoring
+    binding and *refuses* a conflicting explicit value. Silently ignoring
     one would aim writes somewhere the caller didn't name. A personal token
     falls back to the account's only org, then to the org's only live
     environment or the seeded ``testing`` default; anything else raises
@@ -80,7 +80,7 @@ def resolve_tenancy(
     except CloudError as error:
         if error.status_code == 404:
             # A control plane too old to introspect tokens: don't guess what
-            # the credential is: name both escape hatches.
+            # the credential is; name both escape hatches.
             raise CloudError(
                 404,
                 "this control plane does not support token introspection — "
@@ -167,9 +167,9 @@ class Client:
         warm: bool = False,
         read_your_writes: bool = True,
     ):
-        """A read/write handle over one store: one end user's LodeDB
-        instance, auto-provisioned by its first write, so this makes no
-        HTTP call by default. `warm=True` additionally asks the serving
+        """A read/write handle over one store. A store is one end user's
+        LodeDB instance, auto-provisioned by its first write, so this
+        makes no HTTP call by default. `warm=True` additionally asks the serving
         tier to hydrate it now (first query skips the cold start). `key`
         names the index key when the store holds more than one (rare).
         The handle shares this client's connection pool; closing the
@@ -212,8 +212,8 @@ class Client:
         return self._client.update_store(self.org, self.environment, store, key, **changes)
 
     def delete_store(self, store: str, *, erase: bool = False) -> dict:
-        """Soft-delete a whole store: forget this end user (restorable for
-        the grace period; the entitlement slot frees immediately).
+        """Soft-delete a whole store and forget this end user (restorable
+        for the grace period; the entitlement slot frees immediately).
         `erase=True` is data-subject erasure: no grace window, restore
         refuses immediately, and the next lifecycle sweep hard-deletes."""
         return self._client.delete_store(self.org, self.environment, store, erase=erase)
@@ -278,7 +278,7 @@ class Client:
     # ------------------------------------------------------------- tokens
 
     def me(self) -> dict:
-        """The signed-in account (personal tokens only: an environment
+        """The signed-in account (personal tokens only; an environment
         token is not a person and gets a 403)."""
         return self._client.me()
 

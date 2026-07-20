@@ -1498,7 +1498,7 @@ def org_export(
     typer.echo(_json.dumps(manifest, indent=2))
 
 
-# ------------------------------------------------- memory verbs (Phase 8d)
+# ------------------------------------------------------------ memory verbs
 # A store is one end user's LodeDB instance, so these take the store name
 # (= the user's id) directly; `store list` is the user listing and
 # `store delete` the forget-the-user verb.

@@ -1,6 +1,6 @@
 """CloudStore verb wiring against a stub transport: what payload each verb
 puts on the wire and how it folds the acceptance back into session state
-(read-your-writes floor, `last_write_id`). No server involved: the accepted
+(read-your-writes floor, `last_write_id`). No server involved. The accepted
 write contract itself is covered end-to-end in `server/tests`."""
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class _UnprovisionedClient:
 
 def test_unprovisioned_batch_verbs_keep_query_cardinality():
     """Both batched search verbs answer an unprovisioned store with one empty
-    hit list PER query: callers zip queries to results."""
+    hit list PER query. Callers zip queries to results."""
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.search_many(["a", "b", "c"]) == [[], [], []]
     assert store.search_many_by_vector([[0.1, 0.2], [0.3, 0.4]]) == [[], []]
@@ -117,7 +117,7 @@ class _BrowseClient:
 def test_browse_carries_the_session_floor_and_retries_425():
     """Browse is a read like search: after a write on this handle it sends
     the session's read-your-writes floor as min_seq and briefly retries a
-    425 instead of surfacing it: the write is durable, only its visibility
+    425 instead of surfacing it. The write is durable; only its visibility
     trails by a fold cycle."""
     client = _BrowseClient(too_early_first=True)
     store = _store(client)
@@ -210,7 +210,7 @@ def test_get_texts_batches_over_the_by_id_browse():
 
 def test_get_texts_distrusts_a_plain_page_answer():
     """A document nobody asked for means the control plane ignored the by-id
-    fields (an older server answering a plain page): every requested id then
+    fields (an older server answering a plain page). Every requested id then
     goes through the text endpoint, so the result stays exact instead of
     silently partial."""
 
@@ -279,7 +279,7 @@ def test_get_texts_falls_back_to_the_text_endpoint_for_text_only_keys():
 
 
 def test_delete_store_erase_rides_the_query_string():
-    """erase=True must reach the wire as ?erase=true: a silently dropped
+    """erase=True must reach the wire as ?erase=true. A silently dropped
     flag would downgrade a data-subject erasure to a grace-window delete."""
     import httpx
 
@@ -326,7 +326,7 @@ def test_browse_passes_ids_and_order_on_the_wire():
 
 class _PagingBrowseClient:
     """Answers filtered browse pages from a fixed id-ordered corpus, honoring
-    after/limit and recording each payload: enough server for the
+    after/limit and recording each payload. Enough server for the
     list_documents enumeration loop."""
 
     def __init__(self, count: int) -> None:
