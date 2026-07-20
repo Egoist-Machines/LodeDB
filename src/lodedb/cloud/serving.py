@@ -143,36 +143,44 @@ class CloudStore:
     # ------------------------------------------------------------- queries
 
     def _empty_if_unprovisioned(self, call, empty):
-        """Runs one read, answering `empty` when this user's store simply
-        doesn't exist yet. A store is one end user and materializes on its
-        first write, so reading a fresh user before their first memory is
-        the normal zero-setup flow (the hosted MCP tools behave the same).
-        Every other error stays loud."""
+        """Runs one read, answering `empty` when this user's store holds
+        nothing to read yet: it doesn't exist (a store is one end user and
+        materializes on its first write), or it was created ahead of that
+        first write and no snapshot has published. Both are the normal
+        zero-setup flow (the hosted MCP tools behave the same), and neither
+        can hide this session's own writes: a held `min_seq` answers 425,
+        never these 404s. Every other error stays loud."""
         try:
             return call()
         except CloudError as error:
-            if error.status_code == 404 and "no such store" in error.detail:
+            if error.status_code == 404 and (
+                "no such store" in error.detail or "nothing has been pushed" in error.detail
+            ):
                 return empty
             raise
 
-    def _searched(self, call, payload: dict[str, Any]) -> dict:
+    def _searched(self, call, payload: dict[str, Any], *, deadline: float | None = None) -> dict:
         """Runs one search call with session read-your-writes: `min_seq` is
         this handle's last acked write, and a 425 (fold not caught up yet) is
         retried briefly instead of surfacing. The write is durable; only its
         visibility trails by a fold cycle. The pause honors the server's
         Retry-After when it sends one (polling faster than the server asks
-        just burns the search rate limit), capped by the remaining budget."""
+        just burns the search rate limit), capped by the remaining budget.
+        `deadline` (absolute monotonic) clamps the retry window below the
+        handle's visibility budget for callers with their own, tighter one."""
         if self._read_your_writes and self._last_seq > 0:
             payload["min_seq"] = self._last_seq
-        deadline = time.monotonic() + self._write_visibility_timeout
+        stop = time.monotonic() + self._write_visibility_timeout
+        if deadline is not None:
+            stop = min(stop, deadline)
         while True:
             try:
                 return call(self.org, self.environment, payload)
             except CloudError as error:
                 now = time.monotonic()
-                if error.status_code != 425 or now >= deadline:
+                if error.status_code != 425 or now >= stop:
                     raise
-                time.sleep(min(error.retry_after or 0.25, max(deadline - now, 0.0)))
+                time.sleep(min(error.retry_after or 0.25, max(stop - now, 0.0)))
 
     def search(
         self,
@@ -681,8 +689,17 @@ class CloudStore:
             payload["agent_id"] = agent_id
         if run_id is not None:
             payload["run_id"] = run_id
+        return self._browse_page(payload)
+
+    def _browse_page(
+        self, payload: dict[str, Any], *, deadline: float | None = None
+    ) -> list[dict[str, Any]]:
+        """One browse request through the session-floor retry, empty when
+        the store isn't provisioned. `deadline` clamps the 425 retry window:
+        the list_documents walk must not let one page's visibility wait
+        outlive the walk's own budget."""
         result = self._empty_if_unprovisioned(
-            lambda: self._searched(self._client.browse_documents, payload),
+            lambda: self._searched(self._client.browse_documents, payload, deadline=deadline),
             {"documents": []},
         )
         return result["documents"]
@@ -719,22 +736,46 @@ class CloudStore:
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         remaining = None if limit is None else max(int(limit), 0)
 
+        def budget_spent() -> TimeoutError:
+            """The walk's fail-closed refusal, one wording everywhere."""
+            return TimeoutError(
+                f"list_documents did not finish within {timeout}s; narrow the "
+                "filter, page with after/limit, or raise the timeout"
+            )
+
         def check_deadline() -> None:
             """Fails the walk once the budget is spent, wherever it is spent:
             a caller treating `timeout` as a safety bound must never get a
             quiet success that took longer than the bound allows."""
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"list_documents did not finish within {timeout}s; narrow the "
-                    "filter, page with after/limit, or raise the timeout"
-                )
+                raise budget_spent()
 
         records: list[dict[str, Any]] = []
         cursor = after
         while remaining is None or remaining > 0:
             check_deadline()
             page_size = 100 if remaining is None else min(remaining, 100)
-            rows = self.browse(after=cursor, limit=page_size, filter=filter)
+            payload: dict[str, Any] = {
+                "store": self.store,
+                "key": self.key,
+                "after": cursor,
+                "limit": page_size,
+                "include_text": False,
+                "filter": filter,
+            }
+            try:
+                # The page's own read-your-writes wait is clamped to this
+                # walk's deadline; a 425 that outlives the budget IS the walk
+                # not finishing in time.
+                rows = self._browse_page(payload, deadline=deadline)
+            except CloudError as error:
+                if (
+                    error.status_code == 425
+                    and deadline is not None
+                    and time.monotonic() >= deadline
+                ):
+                    raise budget_spent() from error
+                raise
             check_deadline()
             for row in rows:
                 records.append(

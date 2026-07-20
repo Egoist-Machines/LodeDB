@@ -93,6 +93,51 @@ def test_unprovisioned_browse_answers_empty():
     assert store.browse() == []
 
 
+class _NeverPushedClient:
+    """Answers reads with the 404 a created-but-never-written store gives
+    (the store row exists; no snapshot has published)."""
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        from lodedb.cloud.transfer import CloudError
+
+        raise CloudError(404, "nothing has been pushed to this store yet — push a snapshot first")
+
+
+def test_created_but_never_written_store_reads_empty():
+    """A store created ahead of its first write must read as empty, exactly
+    like one that does not exist yet; only genuinely foreign 404s stay loud."""
+    store = CloudStore(_NeverPushedClient(), "acme", "prod", "user-42", owns_client=False)
+    assert store.browse() == []
+    assert store.list_documents() == []
+
+
+class _AlwaysTooEarlyClient:
+    """Every browse answers 425, like a store whose fold never catches up."""
+
+    def add_documents(self, org: str, environment: str, payload: dict) -> dict:
+        return {"ids": ["m1"], "write_id": "w-9", "seq": 41}
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        from lodedb.cloud.transfer import CloudError
+
+        raise CloudError(425, "not folded through seq 41 yet", retry_after=0.01)
+
+
+def test_list_documents_budget_bounds_the_visibility_wait():
+    """A page's 425 retry stops at the walk's own deadline, not the handle's
+    30s visibility budget, and surfaces as the walk's TimeoutError: the
+    caller set one bound and must get one failure mode for breaching it."""
+    import time
+
+    store = _store(_AlwaysTooEarlyClient())
+    store.add("first memory")  # arms the session floor
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="did not finish"):
+        store.list_documents(timeout=0.05)
+    assert time.monotonic() - started < 5.0
+
+
 class _BrowseClient:
     """Duck-types the add + browse calls, recording browse payloads and
     optionally answering one 425 (fold not caught up) before succeeding.
