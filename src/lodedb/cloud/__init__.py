@@ -1,4 +1,4 @@
-"""``lodedb.cloud`` — the OreCloud managed-cloud client (the ``[cloud]`` extra).
+"""``lodedb.cloud`` is the OreCloud managed-cloud client (the ``[cloud]`` extra).
 
 First-party code, shipped in the lodedb wheel: :class:`Client` (one
 credential, one bound org/environment, per-user store handles),
@@ -7,7 +7,7 @@ handle ``LodeDB.cloud()`` returns), the transfer verbs (``push`` / ``pull`` /
 ``sync`` / ``status`` / ``verify`` / ``keys``) over the native transfer core
 bundled as ``lodedb._turbovec.cloud``, and the ``lodedb cloud`` CLI. The
 ``[cloud]`` extra installs only the client's third-party dependencies
-(``httpx``, ``pynacl``) — there is no separate cloud distribution.
+(``httpx``, ``pynacl``); there is no separate cloud distribution.
 
 Every name resolves lazily (PEP 562): importing this module (or ``lodedb``
 itself) touches neither httpx nor the network, guarded by
@@ -43,7 +43,7 @@ _NATIVE_EXPORTS = frozenset({"keys", "pull", "push", "status", "sync", "verify"}
 
 # HTTP-backed exports and the submodule each lives in. These modules import
 # httpx (and, for login, pynacl) at module level, so they are reached only
-# through this lazy table — never on a plain import.
+# through this lazy table, never on a plain import.
 _HTTP_EXPORTS = {
     "Client": "client",
     "connect": "serving",
@@ -62,7 +62,7 @@ __all__ = sorted(
 
 def open_cloud_target(target: str, options: dict[str, Any]) -> Any:
     """Opens a managed-cloud target via :func:`connect` and returns its store
-    handle — the one funnel behind both constructor front doors,
+    handle, the one funnel behind both constructor front doors,
     ``LodeDB.cloud("user-42")`` and the ``LodeDB("orecloud://…")``
     config-string dispatch.
 
@@ -70,7 +70,7 @@ def open_cloud_target(target: str, options: dict[str, Any]) -> Any:
     stays network-free; without the ``[cloud]`` extra's dependencies this
     raises an ``ImportError`` carrying the install hint instead of a bare
     traceback. ``options`` must be keywords of :func:`connect` (``token``,
-    ``host``, ...) — local-only construction options (``model=``,
+    ``host``, ...). Local-only construction options (``model=``,
     ``read_only=``, ...) are rejected up front, because embedding and
     storage for a cloud store are configured server-side, not per handle.
     """
@@ -96,8 +96,8 @@ def open_cloud_target(target: str, options: dict[str, Any]) -> Any:
 
 
 def __getattr__(name: str) -> Any:
-    """PEP 562: resolves the public surface lazily — transfer verbs from the
-    bundled native extension, HTTP-backed names from their submodule (with
+    """PEP 562: resolves the public surface lazily. Transfer verbs come from
+    the bundled native extension, HTTP-backed names from their submodule (with
     the install hint when the extra's dependencies are absent)."""
     if name in _NATIVE_EXPORTS:
         from lodedb import _turbovec

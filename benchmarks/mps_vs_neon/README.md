@@ -2,10 +2,10 @@
 
 Does running the vector scan on the **Apple GPU (Metal/MPS)** beat the default **CPU NEON
 scan** on a Mac? This benchmark answers it on your hardware. It compares the same vendored
-TurboVec index two ways — no Modal, no CUDA:
+TurboVec index two ways, with no Modal and no CUDA:
 
-- **NEON** (default) — TurboVec's native CPU SIMD scan, `index.search(queries, k)`.
-- **MPS exact** (opt-in) — `lodedb.engine.mps_turbovec.MpsDirectTurboVecSession`: dequantized
+- **NEON** (default): TurboVec's native CPU SIMD scan, `index.search(queries, k)`.
+- **MPS exact** (opt-in): `lodedb.engine.mps_turbovec.MpsDirectTurboVecSession`, dequantized
   fp16 rows resident on the Apple GPU, scored with a batched matmul + `torch.topk`. It mirrors
   the CUDA `gpu_turbovec` path.
 
@@ -17,7 +17,7 @@ python benchmarks/mps_vs_neon/run.py --n 100000 --dim 384 --queries 1000
 python benchmarks/mps_vs_neon/diagrams.py
 ```
 
-## Result — Apple M1 (`measured`)
+## Result: Apple M1 (`measured`)
 
 100K × 384, 4-bit, k=64, median of 3 passes:
 
@@ -35,10 +35,10 @@ python benchmarks/mps_vs_neon/diagrams.py
 per-batch dispatch overhead and the fp16 reconstruct, while Apple's CPU NEON scan over compact
 4-bit codes is genuinely fast (and ~8× less memory). MPS does close the gap as batch grows
 (0.08× → 0.53×), so a **much stronger Apple GPU (M-series Pro/Max, M5+) could push the crossover
-past 1.0× at high batch** — which is the open question this benchmark exists to answer. Run it
+past 1.0× at high batch**. That is the open question this benchmark exists to answer. Run it
 on your hardware.
 
-**Recall is preserved** — the MPS path scores dequantized rows exactly (no uint8 LUT error), so
+**Recall is preserved.** The MPS path scores dequantized rows exactly (no uint8 LUT error), so
 its recall is at least the NEON scan's:
 
 | metric | NEON | MPS exact |
@@ -48,6 +48,6 @@ its recall is at least the NEON scan's:
 
 ## Status
 
-The MPS backend is **opt-in and not wired into device selection** — the CPU NEON scan stays the
+The MPS backend is **opt-in and not wired into device selection**; the CPU NEON scan stays the
 default on Mac. Construct `MpsDirectTurboVecSession` explicitly to use it. It should become a
 default only if it beats NEON at a realistic operating point on your hardware.

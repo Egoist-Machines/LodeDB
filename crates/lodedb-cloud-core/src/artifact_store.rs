@@ -24,7 +24,7 @@ use std::io::Read;
 ///
 /// The interface is deliberately small: streaming artifact I/O plus a pointer
 /// compare-and-swap. That is everything the generation-addressed commit format
-/// needs as a cloud substrate. Streaming is the primitive — vector bases run
+/// needs as a cloud substrate. Streaming is the primitive. Vector bases run
 /// to gigabytes, so a transfer's peak memory must be a fixed buffer, never a
 /// function of artifact size; the buffered methods are conveniences for the
 /// small payloads (pointer documents) built on top.
@@ -35,7 +35,7 @@ pub trait ArtifactStore {
     /// [`ArtifactStoreError::NotFound`]: crate::ArtifactStoreError::NotFound
     fn open_read<'a>(&'a self, name: &str) -> Result<Box<dyn Read + 'a>>;
 
-    /// Returns one artifact's bytes, fully buffered — for small payloads
+    /// Returns one artifact's bytes, fully buffered, for small payloads
     /// only; transfers and verification stream via [`open_read`](Self::open_read).
     fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let mut data = Vec::new();
@@ -47,16 +47,16 @@ pub trait ArtifactStore {
     /// exists, hashing incrementally as it copies.
     ///
     /// `sha256` is the expected lowercase-hex digest of the streamed bytes; a
-    /// mismatch is an integrity error and nothing is stored — corruption can
+    /// mismatch is an integrity error and nothing is stored, so corruption can
     /// never land, even when the source is another store's live stream. A
     /// name already present with identical bytes is a no-op (idempotent
-    /// re-push); present with *different* bytes is a conflict — artifacts are
+    /// re-push); present with *different* bytes is a conflict. Artifacts are
     /// immutable and are never overwritten in place. On the already-present
     /// no-op path the incoming stream may be left partially (or wholly)
     /// unread and unvalidated: success then attests that the STORED bytes
     /// match `sha256`, not that the stream did.
     ///
-    /// `size_hint` is the expected byte count (0 = unknown) — advisory only:
+    /// `size_hint` is the expected byte count (0 = unknown), advisory only:
     /// backends use it to pick an upload strategy (the object store's
     /// conditional-claim path has a provider copy-size ceiling), never to
     /// trust the stream's length. Transfers pass the manifest-recorded size.
@@ -105,8 +105,8 @@ pub trait ArtifactStore {
     /// artifacts are published first, then the pointer flips all-or-nothing.
     ///
     /// The precondition is the full committed body, not just its generation number.
-    /// A generation number is not a unique version token — two independent lineages
-    /// can share one with different content — so comparing the whole body is what
+    /// A generation number is not a unique version token (two independent lineages
+    /// can share one with different content), so comparing the whole body is what
     /// makes this a sound compare-and-swap rather than an ABA-prone check.
     ///
     /// [`ArtifactStoreError::PointerConflict`]: crate::ArtifactStoreError::PointerConflict
@@ -121,7 +121,7 @@ pub trait ArtifactStore {
 /// The generation number recorded in a committed body, if present.
 ///
 /// Used only to annotate a [`PointerConflict`](crate::ArtifactStoreError::PointerConflict)
-/// for readability — the swap precondition is the full body, not this number.
+/// for readability; the swap precondition is the full body, not this number.
 pub(crate) fn body_generation(body: &Value) -> Option<u64> {
     body.get("generation").and_then(Value::as_u64)
 }

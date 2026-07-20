@@ -4,13 +4,13 @@ Wraps the LodeDB SDK as a ``langchain_core.vectorstores.VectorStore`` so RAG app
 can drop in the local-first store. LodeDB embeds internally (via its preset), so
 no LangChain ``Embeddings`` object is needed.
 
-**Design note — page_content.** LodeDB's *redacted* artifacts (snapshot, journal,
+**Design note: page_content.** LodeDB's *redacted* artifacts (snapshot, journal,
 telemetry, audit) never carry raw text, but the original text is retained by default in
 a separate ``.tvtext`` sidecar (``store_text=True``). This adapter fills LangChain
 ``Document.page_content`` from a **session-local** ``id -> text`` cache for documents
 added in the current process, and falls back to ``db.get_text(id)`` for documents from a
 prior session whenever the underlying LodeDB retains text. If the store was opened with
-``store_text=False``, no text is kept and ``page_content`` is empty across a reopen — keep
+``store_text=False``, no text is kept and ``page_content`` is empty across a reopen; keep
 your own text store keyed by the returned id/metadata in that case. Retrieval (ids,
 scores, metadata) is always durable.
 """

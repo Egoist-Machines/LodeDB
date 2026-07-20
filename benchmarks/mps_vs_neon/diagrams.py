@@ -4,7 +4,7 @@
     python benchmarks/mps_vs_neon/diagrams.py \
         --results benchmarks/mps_vs_neon/results/mps_vs_neon_m1.json --out docs
 
-matplotlib is a dev-only tool, not a LodeDB runtime dependency — install it
+matplotlib is a dev-only tool, not a LodeDB runtime dependency; install it
 separately (``uv pip install matplotlib``).
 """
 

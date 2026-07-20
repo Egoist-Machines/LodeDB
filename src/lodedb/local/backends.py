@@ -212,7 +212,7 @@ def _preferred_onnx_providers(device: str) -> tuple[str, ...]:
     CUDA hosts prefer the CUDA provider. The Apple **Core ML** provider is **off by default**:
     on the dynamic-shape preset graphs it fragments into many Core ML/CPU partitions and measured
     *slower* than the plain CPU provider for single-query embedding (about 16 ms vs 3 ms on an
-    M-series CPU), so it is opt-in via ``LODEDB_ONNX_COREML=1`` — the same stance the repo takes on
+    M-series CPU), so it is opt-in via ``LODEDB_ONNX_COREML=1``, the same stance the repo takes on
     the MPS vector scan, which is also off by default because NEON was faster. Everything else (CPU,
     and MPS without the opt-in) uses the CPU provider, which is the fast path for these models.
     """

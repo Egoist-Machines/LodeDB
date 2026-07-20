@@ -1,7 +1,7 @@
 """Local CPU-only convenience wrapper for the vanilla-vs-augmented benchmark.
 
 The measurement core lives beside this file (``turbovec_vva_bench`` +
-``turbovec_vva_runner``) as dev-only scripts — not part of the shipped ``lodedb``
+``turbovec_vva_runner``) as dev-only scripts, not part of the shipped ``lodedb``
 package. This wrapper just makes those siblings importable and forwards to the
 runner's CLI:
 

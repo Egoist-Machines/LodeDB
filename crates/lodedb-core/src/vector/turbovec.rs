@@ -348,7 +348,7 @@ impl TurboVecNativeIndex {
     /// Flat-input, arrays-output batch search for the near-zero-copy boundary.
     ///
     /// `queries` is the flat `[nq * dim]` query buffer (no per-query `Vec`), and the
-    /// result is flat `[nq * k]` `(scores, document_ids, k)` — no per-hit struct or
+    /// result is flat `[nq * k]` `(scores, document_ids, k)` with no per-hit struct or
     /// JSON. `k` is 0 when nothing matches. The PyO3 layer turns scores into a
     /// numpy array and document ids into a string list directly, so a batch query
     /// crosses the boundary without the per-hit serialize/parse `search_batch` pays.

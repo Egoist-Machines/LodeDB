@@ -46,7 +46,7 @@ SHARED_VERBS = [
 
 # Keyword-only params only the cloud has: write provenance and retention
 # (`ttl_seconds`/`agent_id`/`run_id`), inline text on hits (`include_text`),
-# and serving warm-up (`warm`). All additive — code written against the
+# and serving warm-up (`warm`). All additive; code written against the
 # shared shape runs unchanged.
 CLOUD_ONLY_KEYWORDS = {"ttl_seconds", "agent_id", "run_id", "include_text", "warm"}
 

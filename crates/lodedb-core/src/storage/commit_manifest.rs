@@ -120,8 +120,8 @@ pub fn read_commit_manifest(path: &Path) -> CoreResult<Option<CommitManifest>> {
 /// Parses and validates pointer-document bytes exactly as
 /// [`read_commit_manifest`] validates the on-disk file (schema version and
 /// body checksum), without touching the filesystem. For consumers that hold a
-/// pointer document from somewhere other than disk — the transfer plane's
-/// object-store pointer mirror — so validation has one implementation.
+/// pointer document from somewhere other than disk (the transfer plane's
+/// object-store pointer mirror), so validation has one implementation.
 pub fn parse_commit_manifest(bytes: &[u8]) -> CoreResult<CommitManifest> {
     let document: Value = serde_json::from_slice(bytes)
         .map_err(|error| corrupt(format!("commit manifest is not valid JSON: {error}")))?;
@@ -207,8 +207,8 @@ pub fn write_commit_manifest(path: &Path, body: &Value, fsync: bool) -> CoreResu
 }
 
 /// Renders the exact pointer-document text a `<key>.commit.json` carrying
-/// `body` holds on disk — the canonical body JSON, its checksum, and the
-/// schema envelope — without touching the filesystem. [`write_commit_manifest`]
+/// `body` holds on disk (the canonical body JSON, its checksum, and the
+/// schema envelope) without touching the filesystem. [`write_commit_manifest`]
 /// persists exactly this text, so the two can never drift.
 pub fn render_commit_manifest(body: &Value) -> CoreResult<String> {
     if !body.is_object() {
@@ -221,7 +221,7 @@ pub fn render_commit_manifest(body: &Value) -> CoreResult<String> {
     ))
 }
 
-/// The engine-canonical `body_sha256` for `body` — the digest a
+/// The engine-canonical `body_sha256` for `body`, the digest a
 /// `<key>.commit.json` pointer carrying exactly this body records. Exported
 /// for the transfer plane, whose identity and lineage decisions key on it;
 /// the alternative is a scratch-file round trip through

@@ -23,7 +23,7 @@ root manifest has been published, so replay after a crash is idempotent.
 
 A WAL *segment* is an immutable standalone blob in exactly the file format
 above (header plus CRC-framed records), produced by `encode_wal_segment` with
-no store open — the building block for out-of-band ingest (see
+no store open. It is the building block for out-of-band ingest (see
 `lodedb.local.segments`). Two deliberate differences from the on-disk
 `<key>.wal`:
 
@@ -35,7 +35,7 @@ no store open — the building block for out-of-band ingest (see
   of an already-folded segment).
 - **Decoding is strict.** A segment is complete by construction, so a short
   header, torn tail, or trailing CRC failure means a corrupt transfer and fails
-  closed — unlike the crash-tolerant `<key>.wal` reader, which drops a torn
+  closed, unlike the crash-tolerant `<key>.wal` reader, which drops a torn
   final frame.
 
 Raw document text enters a segment only when the plan was built with

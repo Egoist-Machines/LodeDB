@@ -13,16 +13,16 @@ mutation, and never written into the redacted ``.json``/``.jsd``/``.tvim``/
 
 Three pieces:
 
-- :func:`tokenize` — lowercases and splits on whitespace/punctuation while
+- :func:`tokenize`: lowercases and splits on whitespace/punctuation while
   keeping alphanumeric runs intact and preserving internal ``-``/``.``/``/``
   inside code-like tokens, so ``E1234``, ``ABC-123``, and ``2024-01-15`` survive
   as single findable tokens. This is the whole point of the feature: the
   embedding cannot see an exact code, but the lexical index can.
-- :class:`Bm25Index` — a classic Okapi BM25 inverted index over a unit space
+- :class:`Bm25Index`: a classic Okapi BM25 inverted index over a unit space
   (LodeDB indexes chunks), scoring a tokenized query into a ranked list; it
   supports both a one-shot bulk build and incremental add/remove of single
   units so a small mutation does not force a full rebuild.
-- :func:`reciprocal_rank_fusion` — fuses ranked id lists with RRF, which needs
+- :func:`reciprocal_rank_fusion`: fuses ranked id lists with RRF, which needs
   no score normalization and therefore composes cleanly with the vector scores.
 
 BM25 reference (Okapi): ``score(D, Q) = Σ idf(q) · tf·(k1+1) / (tf + k1·(1 - b +

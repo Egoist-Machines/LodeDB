@@ -4,17 +4,17 @@
 //! then publishes the destination's root pointer. Because the source is read
 //! through its committed
 //! root pointer (never the `.wal` tail or the on-disk per-store manifests), only
-//! committed state ships — an uncommitted WAL write or a torn half-commit is
+//! committed state ships. An uncommitted WAL write or a torn half-commit is
 //! excluded by construction.
 //!
 //! The copy is O(changed): the destination's existing inventory is diffed against
 //! the source's, so only missing artifacts are uploaded. The destination verifies
 //! each artifact's checksum on write, and the pointer swap is the single commit
 //! point, so a crash mid-transfer leaves the destination on its previous
-//! generation with some extra immutable blobs — never a torn generation.
+//! generation with some extra immutable blobs, never a torn generation.
 //!
 //! Both ends are artifact stores, so a transfer is symmetric: a restore is the
-//! same call with the stores swapped — the remote/backup store as `source` and
+//! same call with the stores swapped, the remote/backup store as `source` and
 //! the local directory as `dest` (a source that was pushed redacted already omits
 //! text, so [`TransferPolicy::full`] on the way back restores it verbatim). Follow
 //! a local restore with
@@ -24,7 +24,7 @@
 //! Every transfer states its [`TransferPolicy`] explicitly: a redacted push
 //! publishes a body whose text/lexical sub-manifests are nulled and skips those
 //! artifacts, so only redacted state leaves the machine; a full policy ships the
-//! generation verbatim. There is deliberately no default-policy convenience —
+//! generation verbatim. There is deliberately no default-policy convenience;
 //! shipping payload-bearing stores must be a visible choice at the call site.
 
 use crate::artifact_store::ArtifactStore;
@@ -58,7 +58,7 @@ pub struct TransferResult {
 /// [`TransferPolicy::full`] policy ships the generation verbatim. Reads the
 /// source's committed root, diffs it against whatever the destination already
 /// holds, uploads only the missing artifacts (each checksum-verified by the
-/// destination), and finally swaps the destination's root pointer — the one
+/// destination), and finally swaps the destination's root pointer, the one
 /// commit point. Idempotent: re-running when the destination already holds the
 /// exact body this transfer would publish uploads nothing and leaves the pointer
 /// untouched.
@@ -98,7 +98,7 @@ pub(crate) fn export_generation_with_body(
 /// supplied by the caller instead of read here.
 ///
 /// The pointer swap preconditions on exactly `dest_body`, so a caller that
-/// already read (and classified) the destination — the sync verb — makes its
+/// already read (and classified) the destination (the sync verb) makes its
 /// transfer conditional on the state it decided on: a concurrent advance of
 /// the destination between that read and this call surfaces as a
 /// [`PointerConflict`](ArtifactStoreError::PointerConflict), with the
@@ -124,7 +124,7 @@ pub(crate) fn export_generation_against(
 /// too, instead of re-read here.
 ///
 /// The sync verb classifies a specific pair of bodies; pinning the source
-/// means the transfer ships exactly the classified snapshot — a concurrent
+/// means the transfer ships exactly the classified snapshot, so a concurrent
 /// source change cannot swap in a body the classifier never saw. The
 /// artifact bytes are still read live by name, but every name/checksum comes
 /// from the pinned body and the destination re-hashes on write, so a mutated
@@ -149,7 +149,7 @@ pub(crate) fn export_generation_pinned(
 /// Splitting staging from publication lets local restores insert their
 /// acceptance checks (candidate verify-open, journal reconstruction) between
 /// the two, so a failed check leaves the destination on its previous committed
-/// generation — the pointer swap stays the single commit point.
+/// generation. The pointer swap stays the single commit point.
 pub(crate) struct StagedExport {
     pub source_body: serde_json::Value,
     pub dest_body: Option<serde_json::Value>,
@@ -163,7 +163,7 @@ pub(crate) struct StagedExport {
 /// destination pointer.
 ///
 /// The destination re-hashes each artifact on write, so a corrupt source
-/// artifact fails here — before any pointer moves. Redaction happens before
+/// artifact fails here, before any pointer moves. Redaction happens before
 /// inventorying, exactly as in [`export_generation_pinned`].
 pub(crate) fn stage_generation_pinned(
     source: &dyn ArtifactStore,
@@ -185,7 +185,7 @@ pub(crate) fn stage_generation_pinned(
     for artifact in &diff.to_upload {
         // Streamed end to end: the destination hashes while it copies, so the
         // transfer's peak memory is a fixed buffer (or one multipart chunk on
-        // object storage) — never the artifact, which for a vector base can
+        // object storage), never the artifact, which for a vector base can
         // be gigabytes. The manifest-recorded size rides along as the
         // strategy hint (it is advisory; the digest gate stays authoritative).
         let mut reader = source.open_read(&artifact.name)?;
@@ -207,10 +207,10 @@ pub(crate) fn stage_generation_pinned(
     })
 }
 
-/// Publishes a staged transfer's pointer — the single commit point.
+/// Publishes a staged transfer's pointer, the single commit point.
 ///
 /// Skips the swap only when the destination already holds this exact committed
-/// *body* — comparing the full body, not just the generation integer, because
+/// *body*. It compares the full body, not just the generation integer, because
 /// two independent lineages can share a generation number with different
 /// content. The swap preconditions on the exact body staging read
 /// (`dest_body`), so a concurrent change between read and swap is caught as a

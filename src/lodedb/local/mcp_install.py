@@ -4,7 +4,7 @@ Backs ``lodedb mcp install`` / ``lodedb mcp uninstall``. Registering the stdio M
 server is otherwise a manual, per-host step: each client keeps its config in a
 different place and format (``claude_desktop_config.json``, ``.cursor/mcp.json``,
 LM Studio's ``mcp.json``, ``~/.codex/config.toml``), and getting ``command`` right
-is error-prone when ``lodedb`` is not on ``PATH`` — the common case inside a
+is error-prone when ``lodedb`` is not on ``PATH``, the common case inside a
 ``uv``/virtualenv install. This module resolves the right invocation for the
 current environment and writes (or removes) the ``lodedb`` entry for a chosen
 client.
@@ -105,13 +105,13 @@ def resolve_server_invocation(*, prefer_uv: bool = False) -> ServerInvocation:
 
     Order, picking the first that applies:
 
-    1. ``lodedb`` on ``PATH`` — the cleanest entry (``command="lodedb"``). Skipped when
+    1. ``lodedb`` on ``PATH``, the cleanest entry (``command="lodedb"``). Skipped when
        ``prefer_uv`` is set.
-    2. A source checkout with ``uv`` available — ``uv run --project <root> lodedb`` so the
+    2. A source checkout with ``uv`` available: ``uv run --project <root> lodedb`` so the
        entry resolves inside the project's environment without ``PATH``.
     3. The absolute path to the installed ``lodedb`` entry-point script (e.g. the venv's
        ``bin/lodedb``).
-    4. Last resort — ``<this python> -m lodedb`` (``lodedb.__main__`` runs the CLI).
+    4. Last resort: ``<this python> -m lodedb`` (``lodedb.__main__`` runs the CLI).
 
     ``prefer_uv`` forces the ``uv run`` form when in a checkout (useful when the on-``PATH``
     ``lodedb`` belongs to a *different* environment than the one being configured).
@@ -200,7 +200,7 @@ def _home() -> Path:
 def _claude_desktop_config_path() -> Path:
     """Returns Claude Desktop's ``claude_desktop_config.json`` for this OS.
 
-    macOS / Windows only — Claude Desktop has no official Linux build, so Linux raises a
+    macOS / Windows only. Claude Desktop has no official Linux build, so Linux raises a
     clear :class:`MCPInstallError` (use ``--config`` to override if you run a community
     build).
     """

@@ -25,7 +25,7 @@ public struct LodeAppendDocument: Sendable, Equatable {
 /// operated in WAL commit mode: the appender logs to the WAL, and only a WAL-mode
 /// writer replays it. A writer that opens the store in generation commit mode
 /// never replays the WAL, so records appended here would be acknowledged yet never
-/// folded in — hence `open` rejects generation-mode options outright. Like
+/// folded in, hence `open` rejects generation-mode options outright. Like
 /// `LodeDB`, a single instance is not thread-safe; serialize calls to it.
 ///
 /// On Windows the shared lock degrades to an exclusive hold, so appenders exclude

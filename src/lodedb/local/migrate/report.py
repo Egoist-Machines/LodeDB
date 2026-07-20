@@ -2,7 +2,7 @@
 
 Every artifact the migrator emits (the plan, the ``migration.json`` manifest, any
 log line) must keep LodeDB's privacy boundary: counts, bytes, timings, ids or id
-hashes, dimensions, versions, and warnings only — never raw documents, queries,
+hashes, dimensions, versions, and warnings only, never raw documents, queries,
 vectors, embeddings, payloads, or credentials. The helpers here are the single
 place that knows how to redact a connection string and how to fingerprint ids and
 source locations without leaking their contents.
@@ -57,7 +57,7 @@ def redact_connection_string(value: str) -> str:
     """Returns a credential-free, log-safe rendering of a connection string.
 
     A DSN such as ``postgresql://user:pw@db.example.com:5432/app`` becomes
-    ``postgresql://<redacted>`` — enough to show the provider scheme without ever
+    ``postgresql://<redacted>``, enough to show the provider scheme without ever
     surfacing the username, password, host, port, or database name. A bare path or
     name (no ``scheme://``) is treated as non-secret and returned unchanged.
     """

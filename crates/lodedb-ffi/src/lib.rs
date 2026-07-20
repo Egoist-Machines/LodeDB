@@ -210,9 +210,9 @@ pub unsafe extern "C" fn lodedb_engine_free(engine: *mut LodeEngine) {
 
 /// Creates a vector index from a minimal JSON create request.
 ///
-/// The JSON object carries only the distinguishing fields — `index_id`,
+/// The JSON object carries only the distinguishing fields: `index_id`,
 /// `vector_dim`, optional `bit_width` (defaults to 4), optional `model` (the
-/// reopen-time embedder-guard identity), and optional `ann` tuning — and the core
+/// reopen-time embedder-guard identity), and optional `ann` tuning. The core
 /// supplies the identity defaults (name, provider, task, route/storage profile,
 /// and `index_key`/`client_id_hash` from `index_id`). This is the single create
 /// entry point: an exact index simply omits `ann`, so bindings never hand-copy the

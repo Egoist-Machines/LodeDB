@@ -2,8 +2,8 @@
 
 LodeDB publishes every persisted file by writing a sibling ``*.tmp`` and then
 ``os.replace``-ing it into place. ``os.replace`` is atomic *within a filesystem*
-on POSIX and Windows — a concurrent reader sees either the whole old file or the
-whole new file, never a torn one — so **atomicity is always on** and free.
+on POSIX and Windows (a concurrent reader sees either the whole old file or the
+whole new file, never a torn one), so **atomicity is always on** and free.
 
 It is not, however, *durable*: after a power loss or kernel panic (as opposed to
 a clean process crash) neither the temp file's bytes nor the rename are

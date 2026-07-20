@@ -1,6 +1,6 @@
 """The `lodedb cloud` trampoline: forwards argv to the first-party cloud CLI
 (`lodedb.cloud.cli`, whose modules pull the [cloud] extra's dependencies),
-and answers a clear install hint — not a traceback — when those dependencies
+and answers a clear install hint, not a traceback, when those dependencies
 are absent. Both paths are forced deterministically, so the suite never
 depends on the venv's extras."""
 
@@ -15,7 +15,7 @@ from typer.testing import CliRunner
 from lodedb.local.cli import app
 
 # The forwarding test monkeypatches into `lodedb.cloud.cli`, which pulls
-# httpx/pynacl — skip cleanly without the [cloud] extra installed (the hint
+# httpx/pynacl, so skip cleanly without the [cloud] extra installed (the hint
 # path blocks the module itself, so it needs no deps either way).
 pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
 pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
@@ -43,7 +43,7 @@ def test_missing_cloud_deps_print_install_hint(monkeypatch):
 
 
 def test_argv_forwards_to_the_cloud_cli(monkeypatch):
-    """Everything after `lodedb cloud` reaches the cloud app untouched —
+    """Everything after `lodedb cloud` reaches the cloud app untouched:
     subcommand, positionals, and options the trampoline knows nothing about."""
     captured: dict[str, object] = {}
     fake_app = typer.Typer()

@@ -62,7 +62,7 @@ def _build_image() -> modal.Image:
         # third_party/turbovec into the lodedb._turbovec extension, and
         # turbovec-python depends on the sibling turbovec core via path = "../turbovec".
         # So the full workspace must live under the build dir (/root/lodedb-src),
-        # exactly as `uv sync` sees it locally and in CI — otherwise maturin errors
+        # exactly as `uv sync` sees it locally and in CI; otherwise maturin errors
         # with "manifest path third_party/turbovec/turbovec-python/Cargo.toml does not exist".
         .add_local_dir(
             str(repo_root / "third_party" / "turbovec"),

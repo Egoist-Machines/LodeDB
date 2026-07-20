@@ -1,6 +1,6 @@
 """`lodedb` CLI: serve | index | query | benchmark | doctor.
 
-Thin wrapper over the local SDK (:class:`LodeDB`) and the existing engine — no
+Thin wrapper over the local SDK (:class:`LodeDB`) and the existing engine; no
 retrieval/storage logic is duplicated here. ``doctor`` reuses
 :func:`local_capability_report`; ``index``/``query``/``benchmark`` drive
 ``LodeDB``; ``serve`` runs a minimal local HTTP loop over the same in-process
@@ -351,7 +351,7 @@ app.add_typer(migrate_app, name="migrate")
     "cloud",
     context_settings={
         # Everything after `lodedb cloud` belongs to the cloud CLI, including
-        # --help and unknown options — forward it all untouched.
+        # --help and unknown options. Forward it all untouched.
         "allow_extra_args": True,
         "ignore_unknown_options": True,
         "help_option_names": [],
@@ -463,7 +463,7 @@ def mcp_install(
 ) -> None:
     """Register the LodeDB MCP server with a coding assistant in one step.
 
-    Writes the correct ``command``/``args`` entry for ``--client`` to that host's config —
+    Writes the correct ``command``/``args`` entry for ``--client`` to that host's config,
     even when ``lodedb`` is not on ``PATH`` (it falls back to the ``uv run --project`` form,
     then an absolute path to the entry point). The edit is idempotent (an existing ``lodedb``
     entry is updated, never duplicated) and leaves other servers untouched. For

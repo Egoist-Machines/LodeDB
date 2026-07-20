@@ -1,7 +1,7 @@
 //! Read-only inventory of the artifacts a committed generation references.
 //!
-//! Given a committed root manifest, this enumerates every artifact it pins —
-//! each per-store base plus its delta segments — as [`ArtifactRef`] records
+//! Given a committed root manifest, this enumerates every artifact it pins
+//! (each per-store base plus its delta segments) as [`ArtifactRef`] records
 //! carrying name, checksum, size, kind, base epoch, and base-vs-delta. It reads
 //! only the committed root (via `read_commit_manifest`); it never stats the
 //! files, reads the `.wal` tail, or reads the on-disk per-store `manifest.json`.
@@ -9,8 +9,8 @@
 //!
 //! [`diff_inventories`] compares a local inventory against a remote one and
 //! reports which artifacts are missing remotely, distinguishing "delta segments
-//! onto an existing base epoch" from "a whole new base epoch" — the signal a
-//! push needs to stay O(changed).
+//! onto an existing base epoch" from "a whole new base epoch". A push needs
+//! that distinction to stay O(changed).
 
 use crate::error::{ArtifactStoreError, Result};
 use crate::paths::resolve_within;
@@ -39,10 +39,10 @@ const GEN_DIR_SUFFIX: &str = ".gen";
 /// suffix, e.g. `g7.json` -> `g7.json.json-delta/`). The key doubles as the base
 /// file extension, since the engine derives base paths as `g<epoch>.<kind>`. A
 /// store is inventoried iff its sub-manifest is non-null; `tvmv` (multi-vector /
-/// late-interaction) is included — omitting it would silently drop those artifacts
-/// from a backup. `tvann` (the persisted ANN cluster partition) is base-only —
-/// the engine treats a missing/corrupt `.tvann` as a cache miss and rebuilds —
-/// but it still ships: a body referencing a base we never uploaded would fail
+/// late-interaction) is included, since omitting it would silently drop those
+/// artifacts from a backup. `tvann` (the persisted ANN cluster partition) is
+/// base-only, and the engine treats a missing/corrupt `.tvann` as a cache miss
+/// and rebuilds. It still ships: a body referencing a base we never uploaded would fail
 /// byte-verification on pull, and shipping it saves the restored/hydrated copy
 /// a corpus-sized re-cluster. Its delta suffix follows the engine's uniform
 /// `<base>.<kind>-delta` derivation (no deltas are ever recorded today).
@@ -55,7 +55,7 @@ const STORE_KINDS: &[(&str, &str)] = &[
     ("tvann", ".tvann-delta"),
     // `tvvf` (the rescore original-vector sidecar, engine 1.3.2+) is a journaled
     // {base, deltas} store like tvim: vector payload, never text-gated, and the
-    // engine refuses to open a rescore store without it — so it ships always.
+    // engine refuses to open a rescore store without it, so it ships always.
     ("tvvf", TVVF_DELTA_DIR_SUFFIX),
 ];
 
@@ -93,8 +93,8 @@ pub struct GenerationInventory {
 
 /// What a local generation has that a remote one does not.
 ///
-/// `ships_base` is true when the transfer must upload a base artifact — a new
-/// base epoch (cold build or compaction) *or* a replacement base under an epoch
+/// `ships_base` is true when the transfer must upload a base artifact, either
+/// a new base epoch (cold build or compaction) or a replacement base under an epoch
 /// the remote already holds at a different checksum (two divergent lineages at
 /// the same epoch number). It is false only when every uploaded artifact is a
 /// delta segment onto a base the remote already holds byte-for-byte (the
@@ -140,7 +140,7 @@ pub fn inventory_from_body(
     let base_epoch = body_u64(body, "base_epoch");
     // Fail closed on a store this table does not know: a future engine that
     // adds a sub-manifest (as `tvann` was added) must not have its artifacts
-    // silently dropped from a backup — an inventory that understates what the
+    // silently dropped from a backup. An inventory that understates what the
     // body pins ships a generation whose blobs were never uploaded. Store
     // sub-manifests are recognizable by shape (an object carrying a journaled
     // `base`), which no scalar body field (`generation`, `native_dim`, …) has.
@@ -264,7 +264,7 @@ pub fn diff_inventories(
 /// Pulls sha256 and byte size straight from the manifest entries (no file stat).
 /// A sub-manifest that is absent or empty yields nothing; one carrying the legacy
 /// pre-journal marker (`present` with no journaled `base`) fails closed rather
-/// than silently omit its artifacts from a backup — rewrite the generation to
+/// than silently omit its artifacts from a backup. Rewrite the generation to
 /// migrate it to the journaled layout first.
 fn refs_for_store(
     index_key: &str,
@@ -276,7 +276,7 @@ fn refs_for_store(
     // Distinguish an absent store (missing key or explicit null -> no artifacts)
     // from a present-but-malformed one. The engine's `store_manifest` treats any
     // non-null value as present, so a non-null, non-object manifest is corrupt and
-    // must fail closed rather than be silently skipped — skipping would publish a
+    // must fail closed rather than be silently skipped. Skipping would publish a
     // body the engine then refuses to open.
     let sub_manifest = match sub_manifest {
         None | Some(Value::Null) => return Ok(Vec::new()),
@@ -312,7 +312,7 @@ fn refs_for_store(
     // rather than copying the wrong file under a name the engine cannot find.
     // Most stores live at `g<base_epoch>.<kind>`; `tvvf` keeps its own epoch
     // counter in the sub-manifest and lives at `vf<vf_epoch>.tvvf`
-    // (`tvvf_store::base_path`), so its refs must derive from that epoch — the
+    // (`tvvf_store::base_path`), so its refs must derive from that epoch. The
     // generation's base_epoch names a file the engine never writes.
     let (store_epoch, base_name) = if kind == "tvvf" {
         let vf_epoch = sub_manifest
@@ -376,11 +376,11 @@ fn refs_for_store(
 ///
 /// The engine writes one journal manifest per store (in
 /// `<base>.<kind>-delta/manifest.json`) whose content IS the store's
-/// sub-manifest in the commit body — but the journal file itself is engine
+/// sub-manifest in the commit body. The journal file itself is engine
 /// working state, not an artifact the body pins, so transfers never ship it.
 /// The read path doesn't need it (it reads the committed root), but the
 /// engine's O(changed) mutation path appends journal deltas through it and
-/// fails closed when it is missing — which would make a restored directory
+/// fails closed when it is missing, which would leave a restored directory
 /// readable but not writable. Restores call this to rebuild every journal
 /// manifest verbatim from the body, so a pulled/hydrated copy behaves
 /// exactly like an engine-authored one. `tvann` is excluded: the ANN sidecar
@@ -440,7 +440,7 @@ pub(crate) fn write_restored_journal_manifests(
 /// Inventory digests cross the trust boundary twice: a managed pull uses them
 /// as staging *file names* (`<staging>/<sha256>`) and the managed layout as
 /// object-key segments, so a value that is not exactly 64 lowercase hex
-/// characters — an absolute path, a `../` traversal, an empty string — must
+/// characters (an absolute path, a `../` traversal, an empty string) must
 /// fail closed here, before it can name a path anywhere downstream.
 fn checked_sha256(kind: &str, entry: &Map<String, Value>) -> Result<String> {
     let digest = str_field(entry, "sha256");
@@ -457,9 +457,9 @@ fn checked_sha256(kind: &str, entry: &Map<String, Value>) -> Result<String> {
 ///
 /// Engine artifact names are always single components (`g7.json`,
 /// `delta-00000000.jsd`). A name containing a path separator or a `.`/`..` segment
-/// would, when joined onto `<key>.gen/`, point outside that directory — still
-/// inside the store root (`resolve_within` confines it there), but under another
-/// index's key — letting a tampered source manifest plant a file during restore.
+/// would, when joined onto `<key>.gen/`, point outside that directory. The result
+/// stays inside the store root (`resolve_within` confines it there) but lands under
+/// another index's key, so a tampered source manifest could plant a file during restore.
 /// Fails closed; every legitimate manifest passes.
 fn ensure_plain_file_name(kind: &str, file_name: &str) -> Result<()> {
     let is_unsafe = file_name.is_empty()

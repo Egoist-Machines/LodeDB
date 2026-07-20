@@ -23,7 +23,7 @@ pub fn sha_hex(data: &[u8]) -> String {
 }
 
 /// Writes a store's base file (and any delta segments) under `<dir>/<key>.gen/`,
-/// returning the `{base, deltas}` sub-manifest that names them — the exact shape
+/// returning the `{base, deltas}` sub-manifest that names them, the exact shape
 /// the engine records and the inventory reads.
 pub fn store_sub(
     dir: &Path,
@@ -115,7 +115,7 @@ pub fn write_json_commit(
     )
 }
 
-/// Builds a commit body without touching the filesystem — for CAS tests that only
+/// Builds a commit body without touching the filesystem, for CAS tests that only
 /// need a well-formed pointer payload.
 pub fn commit_body(key: &str, generation: u64, base_epoch: u64, json_manifest: Value) -> Value {
     build_commit_body(CommitBodyInput {
@@ -193,7 +193,7 @@ pub fn commit_engine_generation(
 }
 
 /// [`commit_engine_generation`], optionally also writing a lexical store
-/// (`tvlex`) — for tests that need both payload-bearing stores.
+/// (`tvlex`), for tests that need both payload-bearing stores.
 pub fn commit_engine_generation_with_lexical(
     dir: &Path,
     key: &str,

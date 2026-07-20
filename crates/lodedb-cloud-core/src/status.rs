@@ -1,20 +1,20 @@
 //! Compare a local generation against a remote one.
 //!
 //! [`compare_generations`] answers "what would a push move, and are the two ends
-//! already in sync?" purely from two inventories — no bytes are read. It composes
+//! already in sync?" purely from two inventories; no bytes are read. It composes
 //! [`diff_inventories`](crate::diff_inventories), so the O(changed) upload set and
 //! the base-vs-delta signal are computed the same way the transfer computes them.
 //!
 //! The comparison is direction-aware (push: local -> remote) and compares the two
 //! inventories exactly as given. A caller applying a [`TransferPolicy`] should
 //! build the local inventory from the *redacted* body, so `in_sync` reflects the
-//! redacted push it intends to make — [`status_for_push`] does exactly that over
+//! redacted push it intends to make. [`status_for_push`] does exactly that over
 //! two stores. `in_sync` means a push would move nothing at
 //! all: no artifacts to upload *and* the remote's committed body already equals the
 //! body the push would publish. The body check matters because a push republishes
-//! the pointer whenever the bodies differ even when no bytes move — e.g. a redacted
-//! push against a previously-full remote uploads nothing yet must still swap the
-//! pointer to drop the text reference, so it is correctly reported as not in sync.
+//! the pointer whenever the bodies differ even when no bytes move. For example, a
+//! redacted push against a previously-full remote uploads nothing yet must still swap
+//! the pointer to drop the text reference, so it is correctly reported as not in sync.
 
 use crate::artifact_store::ArtifactStore;
 use crate::error::Result;
@@ -26,7 +26,7 @@ use crate::transfer_policy::TransferPolicy;
 /// `local_*`/`remote_*` are `None` when that side holds no committed generation.
 /// `artifacts_to_upload`/`bytes_to_upload`/`ships_base` describe a push from local
 /// to remote (the O(changed) upload set). `in_sync` is true when a push would move
-/// nothing — the remote already holds every artifact the local side would ship.
+/// nothing; the remote already holds every artifact the local side would ship.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub index_key: String,
@@ -42,13 +42,13 @@ pub struct StatusReport {
     pub in_sync: bool,
     /// Whether a *trusted* sync sidecar for this remote was found next to the
     /// local index (valid checksum, recorded against the same remote target).
-    /// Always false from [`compare_generations`]/[`status_for_push`] — the
+    /// Always false from [`compare_generations`]/[`status_for_push`]. The
     /// sidecar lives on the local filesystem, so only the client edge
     /// ([`client_ops::status`](crate::client_ops::status)) can fill lineage.
     pub sidecar_present: bool,
     /// Whether a sidecar file was found but failed validation (torn or
     /// tampered) and was therefore ignored. Distinct from a sidecar recorded
-    /// against a different remote, which is valid — just not trusted here.
+    /// against a different remote, which is valid, just not trusted here.
     pub sidecar_corrupt: bool,
     /// The recorded base generation from the sidecar, when one was trusted.
     pub base_generation: Option<u64>,
@@ -119,7 +119,7 @@ pub fn compare_generations(
 
     let diff = diff_inventories(local, remote);
     // A push moves nothing only when there are no artifacts to upload AND the
-    // remote already holds the exact body the push would publish — otherwise the
+    // remote already holds the exact body the push would publish; otherwise the
     // pointer is still re-swapped (e.g. a redaction that drops a store reference
     // without uploading any bytes).
     let body_matches_remote = remote.is_some_and(|remote| remote.root_body == local.root_body);

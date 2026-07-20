@@ -36,7 +36,7 @@ def test_env_host_overrides_the_default(isolated_config, monkeypatch):
 
 def test_env_token_never_borrows_the_file_host(isolated_config, monkeypatch):
     """A CI token must not aim at whatever control plane a developer's stored
-    login points to — without ORECLOUD_HOST it targets the hosted default."""
+    login points to; without ORECLOUD_HOST it targets the hosted default."""
     _config.save_credentials("https://other.example", "ore_pat_stored")
     monkeypatch.setenv("ORECLOUD_TOKEN", "ore_pat_ci")
     creds = _config.load_credentials()
@@ -113,7 +113,7 @@ def test_login_defaults_to_the_hosted_control_plane(isolated_config, monkeypatch
 
 def test_default_host_is_public_on_the_cloud_module():
     """`from lodedb.cloud import DEFAULT_HOST` works without the extra's
-    dependencies — servers rendering docs conditionally rely on it."""
+    dependencies; servers rendering docs conditionally rely on it."""
     from lodedb import cloud
 
     assert cloud.DEFAULT_HOST == _config.DEFAULT_HOST

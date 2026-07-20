@@ -3,7 +3,7 @@
 //! Managed transfers split the client edge in two: the Python layer speaks
 //! HTTP to the control plane (begin/commit push sessions, pull plans,
 //! presigned or proxied blob bytes), while everything that touches the commit
-//! format stays here — inventories, canonical identities, the engine-written
+//! format stays here: inventories, canonical identities, the engine-written
 //! pointer document, sidecar trust, classification, and the restore path with
 //! its verify-open. The seam is deliberate: Python never parses a manifest or
 //! re-serialises a body, so the canonical-JSON contract has exactly one
@@ -14,8 +14,8 @@
 //! returned (stored and served as JSON). Identities recomputed from that body
 //! are stable across the trip because the engine's canonical form is
 //! key-order-insensitive: `serde_json::Value` objects are sorted maps, so a
-//! body that passed through the catalog re-canonicalises to the same digest —
-//! pinned by the end-to-end tests.
+//! body that passed through the catalog re-canonicalises to the same digest.
+//! The end-to-end tests pin this.
 //!
 //! Unlike dumb targets, the remote identity string used for sidecar trust is
 //! supplied by the caller verbatim (`orecloud://org/environment/db#host=…`): the
@@ -57,7 +57,7 @@ pub struct ManagedSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedLocal {
     pub side: ManagedSide,
-    /// The policy-redacted committed body — what a push publishes.
+    /// The policy-redacted committed body, what a push publishes.
     pub body: Value,
     /// The engine-canonical pointer document for `body` (UTF-8 JSON bytes,
     /// carried as a string). Shipped verbatim at commit so the control plane
@@ -76,16 +76,16 @@ pub struct ManagedPlan {
     pub local: Option<ManagedLocal>,
     pub remote: Option<ManagedSide>,
     pub base: Option<SnapRef>,
-    /// Whether the trusted base already records the remote's current snapshot
-    /// — when false after an `in_sync` classification, the caller should
+    /// Whether the trusted base already records the remote's current snapshot.
+    /// When false after an `in_sync` classification, the caller should
     /// refresh the sidecar (mirrors `client_ops::sync`'s stale-base repair).
     pub base_is_current: bool,
     /// The RAW (unredacted) local pointer's snapshot id at classification
     /// time; `None` when the directory holds no committed generation. A
     /// pull-direction materialization pins on this so a local commit landing
     /// between classification and materialization refuses instead of being
-    /// silently overwritten — the managed twin of the dumb sync carrying its
-    /// classified `local_raw` into the pointer CAS.
+    /// silently overwritten. This is the managed twin of the dumb sync carrying
+    /// its classified `local_raw` into the pointer CAS.
     pub local_raw_snapshot_id: Option<String>,
 }
 
@@ -121,7 +121,7 @@ fn managed_side(body: &Value, reference: &SnapRef) -> ManagedSide {
 /// when recorded against exactly `remote_id`), and classifies.
 ///
 /// `remote_body` is the branch-head body the control plane returned (`None`
-/// when the remote holds nothing). Pure local I/O — no network.
+/// when the remote holds nothing). Pure local I/O, no network.
 pub fn managed_plan(
     dir: &str,
     index_key: &str,
@@ -172,7 +172,7 @@ pub fn managed_plan(
             let document = pointer_document(&body)?;
             // Cross-check the document against the recomputed identity: both
             // come from the same engine writer, so a mismatch means the body
-            // changed between the two reads — fail closed rather than begin a
+            // changed between the two reads. Fail closed rather than begin a
             // push whose commit will contradict itself.
             let document_id = identity_from_document(&document)?;
             if document_id != reference.snapshot_id {
@@ -212,7 +212,7 @@ pub fn managed_plan(
 }
 
 /// Records `body` as the sidecar base for `remote_id` after a successful
-/// managed transfer. `remote_id` is stored verbatim — the caller owns the
+/// managed transfer. `remote_id` is stored verbatim; the caller owns the
 /// canonical spelling of managed remote identities.
 pub fn managed_record_base(
     dir: &str,
@@ -345,7 +345,7 @@ impl ArtifactStore for StagingBlobStore {
 ///
 /// The restore runs under the engine's single-writer lock (a live writer and
 /// a restore must never interleave) and refuses when the destination WAL
-/// still holds acknowledged operations — pass `discard_pending_wal` (the
+/// still holds acknowledged operations. Pass `discard_pending_wal` (the
 /// force-pull semantics) to truncate them along with the local lineage. Every
 /// blob is re-hashed against the manifest checksum on write (a corrupt
 /// download fails the pull before any pointer moves), the candidate is
@@ -407,7 +407,7 @@ pub fn managed_materialize(
     // addressed there), but the LOCAL directory still stores artifacts by
     // engine name: force-pulling a diverged lineage that reuses a name with
     // different bytes fails closed on the immutability invariant, exactly
-    // like the dumb-target verbs — recover by pulling into a fresh
+    // like the dumb-target verbs. Recover by pulling into a fresh
     // directory. The wrapper attaches that recovery hint.
     let staged = stage_generation_pinned(
         &staging,
@@ -430,7 +430,7 @@ pub fn managed_materialize(
         )?;
     }
     // Rebuild the journal manifests (working state the body doesn't pin) so
-    // the restored copy is writable, not just readable — the cloud writer
+    // the restored copy is writable, not just readable; the cloud writer
     // opens hydrated copies through this path. Strictly AFTER the swap:
     // writing them first would, on a failed CAS, leave the candidate's
     // journals attached to some other writer's committed body.

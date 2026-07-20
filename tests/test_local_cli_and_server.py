@@ -466,7 +466,7 @@ def test_cli_index_default_get_and_no_store_text_round_trip(tmp_path, monkeypatc
     """`lodedb index` retains text by default; `--no-store-text` opts out.
 
     The CLI builds its own LodeDB, so we inject the deterministic hash backend by
-    patching the symbol the CLI uses — keeping this test model-free like the rest
+    patching the symbol the CLI uses. This keeps the test model-free like the rest
     of the suite while exercising the real command wiring end to end.
     """
 

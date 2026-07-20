@@ -7,10 +7,10 @@ the same way sentence-transformers downloads weights lazily.
 
 Resolution order for a model id:
 
-1. **Cached** — a previous materialization under the cache root; no network.
-2. **Prebuilt snapshot** — many Hugging Face repos already ship an ``onnx/``
+1. **Cached**: a previous materialization under the cache root; no network.
+2. **Prebuilt snapshot**: many Hugging Face repos already ship an ``onnx/``
    export; fetch it with ``huggingface_hub`` (no Optimum / torch needed).
-3. **Optimum export** — fall back to exporting the feature-extraction graph with
+3. **Optimum export**: fall back to exporting the feature-extraction graph with
    Optimum, run as a **subprocess** so Optimum/torch never import into this
    process (keeping a plain ``import lodedb`` lean).
 

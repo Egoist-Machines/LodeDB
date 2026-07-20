@@ -210,7 +210,7 @@ def test_add_then_remove_in_one_fold_batch_stays_reopenable(tmp_path):
     """Regression: a document added and removed within one fold batch (one
     persist) wrote its never-committed row into the delta's removed set, and
     the strict replay rejected the store on every fresh open ("removed-id
-    count mismatch") — the warm handle kept serving while every new reader,
+    count mismatch"); the warm handle kept serving while every new reader,
     hydration, or pull failed. Found by randomized concurrency testing.
 
     The bug lives on the delta path, which only exists over a committed vector

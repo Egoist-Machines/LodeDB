@@ -1,5 +1,5 @@
 //! End-to-end tests for the `sync` verb: two working directories sharing one
-//! remote, exercising every classification the way real use produces them —
+//! remote, exercising every classification the way real use produces them,
 //! plus `contains` on both store backends.
 
 mod common;
@@ -173,7 +173,7 @@ fn an_untrusted_base_requires_force() {
     let remote = tempfile::tempdir().unwrap();
 
     // Two ends that never synced (no sidecar) holding different content.
-    // (Different base epochs — see the fork-collision note above.)
+    // (Different base epochs; see the fork-collision note above.)
     commit_engine_generation(dir1.path(), KEY, 1, 1, "v1", None);
     run_sync(dir1.path(), remote.path(), SyncForce::None);
     commit_engine_generation(dir2.path(), KEY, 1, 2, "different", None);
@@ -218,7 +218,7 @@ fn a_base_recorded_against_another_remote_is_not_trusted() {
     commit_engine_generation(other_dir.path(), KEY, 2, 2, "unrelated", None);
     run_sync(other_dir.path(), remote_b.path(), SyncForce::None);
 
-    // Against remote B, dir's local copy still equals remote A's base — but
+    // Against remote B, dir's local copy still equals remote A's base, but
     // that base must not be trusted here: no fast-forward pull of B's content.
     let err = sync(
         dir.path().to_str().unwrap(),
@@ -324,7 +324,7 @@ fn a_partial_redaction_upgrade_republishes() {
 
 /// The Phase-0 fork-collision limit, pinned: two lineages diverging from one
 /// base reuse the same artifact file names with different bytes, and force
-/// cannot resolve that against a name-addressed remote — sync fails closed
+/// cannot resolve that against a name-addressed remote. Sync fails closed
 /// with a recovery hint instead of overwriting an immutable artifact. (The
 /// managed content-addressed layout of a later milestone absorbs this shape.)
 #[test]
@@ -333,7 +333,7 @@ fn a_same_name_fork_fails_closed_with_a_recovery_hint_even_when_forced() {
     let dir2 = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
 
-    // Both clones share base gen 1, then each commits gen 2 at epoch 2 — the
+    // Both clones share base gen 1, then each commits gen 2 at epoch 2, the
     // natural fork shape: same artifact names, different bytes.
     commit_engine_generation(dir1.path(), KEY, 1, 1, "v1", None);
     run_sync(dir1.path(), remote.path(), SyncForce::None);
@@ -381,7 +381,7 @@ fn a_same_name_fork_fails_closed_with_a_recovery_hint_even_when_forced() {
 
 /// An unpublished payload upgrade is not discarded by a fast-forward: if the
 /// base was recorded redacted, the local copy now syncs with text, and the
-/// remote has meanwhile advanced, both sides have moved — force required.
+/// remote has meanwhile advanced, both sides have moved and force is required.
 #[test]
 fn an_unpublished_payload_upgrade_blocks_a_fast_forward_pull() {
     let dir1 = tempfile::tempdir().unwrap();
@@ -469,7 +469,7 @@ fn an_in_sync_no_op_repairs_a_stale_base() {
         .state
         .unwrap();
 
-    // Advance both ends together, then restore the OLD sidecar — the state a
+    // Advance both ends together, then restore the OLD sidecar, the state a
     // crashed post-transfer sidecar write leaves behind.
     commit_engine_generation(dir.path(), KEY, 2, 2, "v2", None);
     run_sync(dir.path(), remote.path(), SyncForce::None);
@@ -522,7 +522,7 @@ fn a_corrupt_sidecar_is_surfaced_and_treated_as_no_base() {
     run_sync(dir.path(), remote.path(), SyncForce::None);
 
     // Corrupt the sidecar; the two ends are still identical, so sync is a
-    // harmless no-op — but the corruption is reported, by status too.
+    // harmless no-op, but the corruption is reported, by status too.
     let sidecar = lodedb_cloud_core::sync_state::sync_state_path(dir.path(), KEY);
     std::fs::write(&sidecar, b"{ not json").unwrap();
     let report = status(
@@ -550,7 +550,7 @@ fn a_corrupt_sidecar_is_surfaced_and_treated_as_no_base() {
     assert!(!report.sidecar_corrupt);
 
     // When the corruption actually causes a refusal (ends differ, base
-    // untrusted), the error itself carries the diagnosis — the CLI's warning
+    // untrusted), the error itself carries the diagnosis; the CLI's warning
     // path never runs on an error.
     commit_engine_generation(dir.path(), KEY, 2, 2, "v2", None);
     run_sync(dir.path(), remote.path(), SyncForce::None); // remote at v2
@@ -613,8 +613,8 @@ fn contains_on_both_backends() {
 fn sync_pull_refuses_a_pending_wal_and_force_pull_discards_it() {
     // dir2 is behind the remote AND holds acknowledged-but-uncheckpointed WAL
     // records: a plain sync must refuse (those records were acked against the
-    // old lineage), and --force-pull — the explicit "keep the remote copy"
-    // decision — discards them along with the local lineage.
+    // old lineage), and --force-pull (the explicit "keep the remote copy"
+    // decision) discards them along with the local lineage.
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();

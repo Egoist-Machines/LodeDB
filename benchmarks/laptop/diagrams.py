@@ -6,7 +6,7 @@
         --out docs
 
 Produces two charts (PNG + SVG): embedding throughput by device, and end-to-end
-query latency (p50/p95) by device. matplotlib is a dev-only dependency — it is not
+query latency (p50/p95) by device. matplotlib is a dev-only dependency; it is not
 part of the lodedb runtime set, so install it separately to render charts.
 """
 

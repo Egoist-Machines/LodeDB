@@ -8,7 +8,7 @@ use common::commit_engine_generation;
 use lodedb_cloud_core::{logical_id, snapshot_id, TransferPolicy};
 use serde_json::Value;
 
-/// The id IS the `body_sha256` the engine writes in `<key>.commit.json` — not
+/// The id IS the `body_sha256` the engine writes in `<key>.commit.json`, not
 /// a lookalike digest. Pinned against a real engine-committed store by reading
 /// the pointer document raw.
 #[test]
@@ -47,7 +47,7 @@ fn redaction_shares_the_logical_id_but_not_the_snapshot_id() {
         snapshot_id(&redacted).unwrap(),
         "different bytes must have different snapshot ids"
     );
-    // A fully redacted body is its own logical form — the property the sync
+    // A fully redacted body is its own logical form, the property the sync
     // classifier's Republish detection rests on.
     assert_eq!(
         snapshot_id(&redacted).unwrap(),

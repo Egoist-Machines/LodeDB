@@ -28,7 +28,7 @@ fn snap(tag: &str, generation: u64, has_text: bool, has_lexical: bool) -> SnapRe
 }
 
 /// A snapshot of commit `tag` whose *text store identity* disagrees with
-/// [`snap`]'s — same commit, same store set, different payload bytes (a
+/// [`snap`]'s: same commit, same store set, different payload bytes (a
 /// re-encoded or tampered text store).
 fn conflicting_text(tag: &str, generation: u64, has_lexical: bool) -> SnapRef {
     let mut reference = snap(tag, generation, true, has_lexical);
@@ -88,7 +88,7 @@ fn the_decision_table() {
         (Some(&b), Some(&a), Some(&c), Diverged),
         // No base while the ends differ: no way to pick a direction.
         (Some(&a), None, Some(&b), Unknown),
-        // Generation regression against the base: rollback/tamper suspect —
+        // Generation regression against the base: rollback/tamper suspect,
         // even when the two ends agree with each other (a coordinated
         // rollback must be loud, not a silent no-op or republish).
         (Some(&rollback), Some(&a), Some(&a), Unknown),
@@ -116,7 +116,7 @@ fn the_decision_table() {
         (Some(&a_red), Some(&a), Some(&a), InSync),
         (Some(&a_text), Some(&a), Some(&a), InSync),
         // Incomparable store sets of one commit: publishing either way drops
-        // a store the other has — force required.
+        // a store the other has, so force is required.
         (Some(&a_text), Some(&a), Some(&a_lex), Unknown),
         (Some(&a_lex), Some(&a), Some(&a_text), Unknown),
         // Same commit, same store set, but a shared store's payload identity
@@ -148,7 +148,7 @@ fn the_decision_table() {
 
 /// Every combination of local/base/remote drawn from a small domain (absent,
 /// two full commits at different generations, the redacted form of the first,
-/// and a low-generation commit) — the classifier must uphold its global
+/// and a low-generation commit). The classifier must uphold its global
 /// invariants everywhere, not just on the table above.
 #[test]
 fn invariants_hold_over_the_exhaustive_domain() {

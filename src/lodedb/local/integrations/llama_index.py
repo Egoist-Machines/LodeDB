@@ -9,7 +9,7 @@ and feeds LlamaIndex node text (``node.get_content``) and the raw ``query.query_
 LodeDB, which does the embedding. **LlamaIndex's own ``embed_model`` is therefore ignored for
 indexing and querying.** If you build the index through :class:`VectorStoreIndex`, set a cheap
 ``embed_model`` (e.g. ``MockEmbedding``) so LlamaIndex does not try to embed nodes with a
-remote model — the vectors it computes are discarded; LodeDB re-embeds the text. (The SDK does
+remote model. The vectors it computes are discarded; LodeDB re-embeds the text. (The SDK does
 have a vector-in path, but that is a separate *vector-only* index that owns no embedder and is
 out of scope for this text-path adapter; mixing externally embedded vectors with LodeDB's own
 embeddings in one index makes similarity scores meaningless.)

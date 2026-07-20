@@ -5,8 +5,8 @@ accelerated stage (MPS); the TurboVec vector scan runs on the CPU kernel.
 This benchmark therefore reports two distinct numbers and makes no
 GPU-vector-search-on-Mac claim:
 
-1. **Embedding throughput** — docs/sec for the selected backend/device.
-2. **CPU vector-scan latency** — per-query p50/p95 *search* latency (the native
+1. **Embedding throughput**: docs/sec for the selected backend/device.
+2. **CPU vector-scan latency**: per-query p50/p95 *search* latency (the native
    TurboVec scan + result assembly), measured with embedding excluded by timing
    the query embedding and the native vector scan separately.
 

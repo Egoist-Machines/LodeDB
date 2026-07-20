@@ -18,7 +18,7 @@ import Foundation
 //     zip and records its `swift package compute-checksum` value, so consuming a
 //     released build via SwiftPM means setting those two vars (or pinning a manifest
 //     that hard-codes them). Turnkey tag consumption with no env vars is not wired
-//     yet — a fresh external checkout that sets neither will not find the local path.
+//     yet; a fresh external checkout that sets neither will not find the local path.
 let nativeCore: Target = {
     let env = ProcessInfo.processInfo.environment
     if let urlString = env["LODEDB_FFI_BINARY_URL"],

@@ -3,7 +3,7 @@
 One JSON file, `~/.orecloud/credentials.json`, chmod 0600, holding the
 control-plane host and the personal access token from `lodedb cloud login`.
 A plain file (not the OS keychain) is deliberate for now: it works headless
-— CI boxes, containers, SSH sessions — with the same permission story as
+(CI boxes, containers, SSH sessions) with the same permission story as
 `~/.aws/credentials`. ORECLOUD_TOKEN overrides the file entirely, so
 ephemeral environments never need to write it; the host defaults to the
 hosted control plane, with ORECLOUD_HOST (or `--host`) overriding it for
@@ -38,7 +38,7 @@ def credentials_file() -> Path:
 class Credentials:
     host: str
     token: str
-    source: str  # "env" or "file" — surfaced by whoami for debuggability
+    source: str  # "env" or "file", surfaced by whoami for debuggability
 
 
 class CredentialsError(RuntimeError):
@@ -102,8 +102,8 @@ def delete_credentials() -> bool:
 # ---------------------------------------------------------------- orecloud.toml
 
 # The committable per-directory remote record: which control plane and
-# org/environment/store a data directory syncs with. No secrets — credentials
-# stay in ~/.orecloud — so the file is safe to commit next to the data.
+# org/environment/store a data directory syncs with. No secrets (credentials
+# stay in ~/.orecloud), so the file is safe to commit next to the data.
 REMOTE_FILE_NAME = "orecloud.toml"
 
 
@@ -121,7 +121,7 @@ def remote_config_file(local_dir: str | Path) -> Path:
 
 def load_remote(local_dir: str | Path) -> RemoteConfig | None:
     """The directory's recorded remote, or None. A present-but-malformed file
-    raises — guessing around a broken record could aim a push at the wrong
+    raises; guessing around a broken record could aim a push at the wrong
     environment."""
     import tomllib
 

@@ -3,7 +3,7 @@
 //! A committed generation's artifact *names* and pointer *keys* are joined onto a
 //! store root to form on-disk paths. Once a name or key can originate from CLI or
 //! remote/control-plane input (the cloud trust boundary), a crafted `..` segment
-//! or absolute path could otherwise read or write outside the store root — a
+//! or absolute path could otherwise read or write outside the store root, a
 //! cross-tenant disclosure in a multi-tenant store. [`resolve_within`] is the
 //! single primitive that confines every such join to its root.
 
@@ -39,7 +39,7 @@ pub fn resolve_within(root: &Path, candidate: &Path) -> Result<PathBuf> {
 }
 
 /// A path's canonical identity string: absolute, symlink-resolved (through the
-/// existing prefix), `.`/`..`-normalised — the same resolution
+/// existing prefix), `.`/`..`-normalised, the same resolution
 /// [`resolve_within`] uses. Two spellings of one directory (relative vs
 /// absolute, redundant `.` segments) map to one identity. On a resolution
 /// failure the raw spelling is returned, which for the sidecar-trust caller can
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn accepts_a_not_yet_created_root() {
         // A fresh backup destination that does not exist yet must resolve, not
-        // fail with ENOENT — the store creates it on first write.
+        // fail with ENOENT; the store creates it on first write.
         let root = temp_dir("fresh-parent").join("new-backup");
         let resolved = resolve_within(&root, &root.join("idx.commit.json")).unwrap();
         assert!(resolved.ends_with("new-backup/idx.commit.json"));

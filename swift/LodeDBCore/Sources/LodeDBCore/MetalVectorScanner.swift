@@ -24,7 +24,7 @@ public enum ScanBackend: String, Sendable {
 /// TurboVec NEON scan over the quantized index, which on-device benchmarks show is
 /// faster than a GPU/MPS scan (and CUDA is irrelevant on Apple platforms). This
 /// scanner is for callers that hold raw f32 vectors and want a GPU-accelerated exact
-/// scan — e.g. exact reranking of a candidate set, or scanning app-managed vectors —
+/// scan (e.g. exact reranking of a candidate set, or scanning app-managed vectors)
 /// where the Metal path can win at large `count`. Accelerating the core's *quantized*
 /// scan with Metal is deferred pending device benchmarks that show NEON is the
 /// bottleneck.

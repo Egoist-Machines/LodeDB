@@ -3,13 +3,13 @@
 The migrator's first step is to look at a project checkout and decide, without
 running it, which migration path applies. Detection reads three kinds of signal:
 
-- **Dependency files** — ``pyproject.toml`` / ``requirements*.txt`` / ``setup.py`` /
+- **Dependency files**: ``pyproject.toml`` / ``requirements*.txt`` / ``setup.py`` /
   ``package.json`` tell us which package manager to use and which frameworks /
   providers are even installed.
-- **Config and infra files** — Docker Compose, ``settings.yaml``, ``.env.example``,
+- **Config and infra files**: Docker Compose, ``settings.yaml``, ``.env.example``,
   Alembic migrations, and raw SQL hint at a provider (a ``qdrant`` service, a
   ``CREATE EXTENSION vector``) without any Python import.
-- **Python source (AST)** — imported names and a few constructor/call patterns tell
+- **Python source (AST)**: imported names and a few constructor/call patterns tell
   us which framework *owns* the vector store and which direct provider is wired.
 
 The routing rule is the one both issues require: **framework detection wins over
@@ -22,7 +22,7 @@ disambiguate with ``--framework`` / ``--provider``.
 
 Detection never executes project code; it parses files. Reports stay payload-free:
 they carry detected names, counts of matching files, and the chosen install
-command — never file contents.
+command, never file contents.
 """
 
 from __future__ import annotations

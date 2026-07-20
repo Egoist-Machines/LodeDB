@@ -5,7 +5,7 @@ allowlist-pushdown fix for it.
 
 Before the fix, an unfiltered `search_many` rode the GPU-resident scan, but a
 *filtered* one widened the effective `top_k` to the corpus size and
-post-filtered — which tripped the resident `top_k` cap
+post-filtered, which tripped the resident `top_k` cap
 (`GPU_DIRECT_TURBOVEC_MAX_TOP_K = 4096`) and silently bypassed the GPU to the
 CPU kernel, scaling O(corpus) per query. After the fix, the filter is pushed
 into the scan as a shared allowlist (in-kernel on CPU, an `-inf` score mask on
@@ -13,7 +13,7 @@ GPU/MPS), so `top_k` stays `k` and filtered batches stay on the fast path.
 
 The harness sweeps `(gpu_policy × batch_size × {unfiltered, selective,
 non-selective})`, capturing latency and the redacted `query_batch_completed`
-telemetry — `gpu_stage_one_status` / `gpu_fallback_reason` — so the cliff (and
+telemetry (`gpu_stage_one_status` / `gpu_fallback_reason`), so the cliff (and
 its closure) is *proven*, not just timed. It also records the host CPU ISA
 (AVX2 vs AVX-512, which Modal varies per run) and the kernel's own backend
 label.

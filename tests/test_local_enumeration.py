@@ -2,7 +2,7 @@
 
 ``LodeDB.list_documents()`` and ``get_document()`` expose the engine's
 payload-free document records on the SDK, with a ``filter=`` complete-set
-enumeration (no ``k`` cap, no query vector) — the primitive a graph /
+enumeration (no ``k`` cap, no query vector), the primitive a graph /
 knowledge-graph layer needs for deterministic traversal.
 """
 

@@ -226,7 +226,7 @@ fn scan_records(data: &[u8]) -> CoreResult<WalScan> {
 /// on-disk WAL byte format byte-for-byte so one decode path serves both;
 /// callers ship the returned bytes verbatim. Records may carry `lsn: None`
 /// (segments are stamped at fold time) or `Some` (tests pin byte-compat
-/// against `append_record`). Refuses an empty record list — a segment with no
+/// against `append_record`). Refuses an empty record list; a segment with no
 /// records is a writer bug, not a no-op.
 pub fn encode_wal_segment(records: &[WalRecord]) -> CoreResult<Vec<u8>> {
     if records.is_empty() {
@@ -397,7 +397,7 @@ fn encode_body(op: &str, mut payload: Value, lsn: Option<u64>) -> CoreResult<Vec
     Ok(body)
 }
 
-/// Encodes one complete WAL frame — `[u32 BE body_len][body][u32 BE crc]` —
+/// Encodes one complete WAL frame (`[u32 BE body_len][body][u32 BE crc]`)
 /// for `append_record` and `encode_wal_segment` to share, so file appends and
 /// segment bytes can never drift.
 fn encode_frame(op: &str, payload: Value, lsn: Option<u64>) -> CoreResult<Vec<u8>> {
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn segment_bytes_match_append_record_for_stamped_records() {
         // A segment of stamped records must be byte-identical to the file the
-        // append path writes for the same sequence — one frame format, no drift.
+        // append path writes for the same sequence: one frame format, no drift.
         let dir = temp_dir("segment-byte-compat");
         let path = dir.join("default.wal");
         let records = vec![

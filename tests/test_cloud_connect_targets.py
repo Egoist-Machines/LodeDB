@@ -1,7 +1,7 @@
 """`connect()` target forms: the full `org/environment/store` triple (and its
 `orecloud://` spelling) parses locally with zero HTTP, while a bare store id
 (`user-42`, the form behind `LodeDB.cloud("user-42")`) resolves its
-org/environment from the credential via token introspection — exactly like
+org/environment from the credential via token introspection, exactly like
 `Client().store()`. HTTP is a `httpx.MockTransport`, so these run serverless;
 the introspection contract itself is covered in `server/tests`."""
 
@@ -63,7 +63,7 @@ def test_two_segment_bare_form_stays_malformed():
 
 def test_bare_store_resolves_tenancy_from_the_credential():
     """`connect("user-42")` introspects the token once and lands on the bound
-    org/environment — the seam `LodeDB.cloud("user-42")` rides."""
+    org/environment, the seam `LodeDB.cloud("user-42")` rides."""
     transport = _transport(
         {
             "/v1/tokens/self": {
@@ -84,7 +84,7 @@ def test_bare_store_resolves_tenancy_from_the_credential():
 
 
 def test_full_triple_makes_no_http_call():
-    """A fully qualified target must not introspect — the transport rejects
+    """A fully qualified target must not introspect. The transport rejects
     every request, so connecting cold (warm=False) proves zero HTTP."""
     store = connect(
         "acme/prod/user-42",
@@ -102,7 +102,7 @@ def test_full_triple_makes_no_http_call():
 def test_bare_store_with_an_unbound_multi_org_token_refuses_with_choices():
     """A personal token spanning several orgs cannot pin a bare store id:
     connect surfaces resolve_tenancy's 422 naming the choices (and must not
-    leak its freshly opened pool — closing after is a no-op either way)."""
+    leak its freshly opened pool; closing after is a no-op either way)."""
     transport = _transport(
         {
             "/v1/tokens/self": {"kind": "personal", "scopes": [], "org": None, "environment": None},

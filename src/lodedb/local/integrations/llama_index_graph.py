@@ -3,7 +3,7 @@
 Wraps :class:`lodedb.graph.KnowledgeGraph` as a
 ``llama_index.core.graph_stores.types.PropertyGraphStore`` so LlamaIndex's
 ``PropertyGraphIndex`` can use LodeDB's hybrid graph layer (SQLite topology + LodeDB
-semantic index) as its graph store — the graph counterpart to the
+semantic index) as its graph store, the graph counterpart to the
 :class:`~lodedb.local.integrations.llama_index.LodeDBVectorStore` vector-store adapter.
 
 **Node mapping.** A LlamaIndex :class:`EntityNode` maps to a graph node typed by its
@@ -22,7 +22,7 @@ as *vector-only* instead (``KnowledgeGraph(vector_dim=D)``, or
 ``LodeDBPropertyGraphStore.from_path(path, vector_dim=D)``) to bring your own embeddings: then
 :meth:`upsert_nodes` stores each node's ``embedding`` directly at dimension ``D`` and
 :meth:`vector_query` searches by a precomputed query vector. This is the mode that makes
-LlamaIndex's high-level ``PropertyGraphIndex`` work with **any** ``embed_model`` — set ``D`` to
+LlamaIndex's high-level ``PropertyGraphIndex`` work with **any** ``embed_model``. Set ``D`` to
 the embedder's dimension (e.g. 1536) so node and query embeddings stay in the same space.
 
 **Semantic queries.** ``supports_vector_queries`` is True. In text-path mode
@@ -273,7 +273,7 @@ class LodeDBPropertyGraphStore(PropertyGraphStore):
         """Returns the depth-bounded triplet neighbourhood around ``graph_nodes``.
 
         Breadth-first over the topology from the seed nodes, following the target side at each
-        hop, deduping triplets, dropping ``ignore_rels``, and capping at ``limit`` — the same
+        hop, deduping triplets, dropping ``ignore_rels``, and capping at ``limit``, the same
         expansion shape as LlamaIndex's reference store.
         """
 

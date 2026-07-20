@@ -1,7 +1,7 @@
 """The `X-Ore-Store` routing hint: data-plane calls stamp org/env/store so a
 store-sticky ingress can hash-route them for cache locality. Pure transport
-concern — the server never reads the header, and calls without it stay
-correct — so the tests assert wire shape only."""
+concern (the server never reads the header, and calls without it stay
+correct), so the tests assert wire shape only."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def test_data_plane_verbs_carry_the_store_hint(capture):
 
 def test_warm_stats_carries_the_hint(capture):
     """The pre-hydration call must land on the same pod the hinted queries
-    will — a warm on one pod followed by queries on another would defeat it."""
+    will. A warm on one pod followed by queries on another would defeat it."""
     client, seen = capture
     client.serving_stats("acme", "prod", "user-42", warm=True)
     assert seen[0].headers["x-ore-store"] == "acme/prod/user-42"

@@ -20,7 +20,7 @@ fn dir_str(path: &Path) -> &str {
 }
 
 /// Copies every artifact a committed generation pins into a staging directory
-/// under its content digest — what the Python edge does with downloaded blobs.
+/// under its content digest, what the Python edge does with downloaded blobs.
 fn stage_generation(source: &Path, body: &serde_json::Value, staging: &Path) {
     let inventory = lodedb_cloud_core::inventory_from_body(KEY, Some(body))
         .unwrap()
@@ -49,7 +49,7 @@ fn plan_for_a_fresh_local_generation_is_local_ahead_with_full_inventory() {
     assert_eq!(plan.report.classification.as_deref(), Some("local_ahead"));
     let local_part = plan.local.expect("local generation is committed");
     // The redacted policy nulls tvtext/tvlex, so the plan's identity is the
-    // *redacted* body's — and for a text-free commit that equals the raw one.
+    // *redacted* body's, and for a text-free commit that equals the raw one.
     assert_eq!(local_part.side.snapshot_id, snapshot_id(&body).unwrap());
     assert!(!local_part.side.has_text);
     assert!(!local_part.artifacts.is_empty());

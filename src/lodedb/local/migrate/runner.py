@@ -12,7 +12,7 @@ issues. It is deliberately small and explicit about safety:
   store unless ``--overwrite-target`` (or ``--resume``) is set.
 - **Payload-free manifest.** It writes ``migration.json`` with counts, dimensions,
   fingerprints, options, skipped-row reasons (by id hash), validation results,
-  versions, and timestamps — never raw text, vectors, payloads, or credentials.
+  versions, and timestamps, never raw text, vectors, payloads, or credentials.
 
 The runner picks the *target writer* from the plan's route and mode: a framework
 route replays through that framework's shipped LodeDB adapter (so the on-disk shape

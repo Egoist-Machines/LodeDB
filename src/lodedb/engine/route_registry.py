@@ -394,7 +394,7 @@ def default_route_registry() -> RouteRegistry:
     The local DB serves with the direct-TurboVec route policy, whose
     ``index_backend == "turbovec_direct"`` skips the registry-classification
     check (see :meth:`EngineRoutePolicy.validate_index_request`). So a registry
-    with no explicit entries — every lookup resolves to the full-vector default —
+    with no explicit entries (every lookup resolves to the full-vector default)
     is all the local path needs, and nothing has to be loaded from disk.
     """
 

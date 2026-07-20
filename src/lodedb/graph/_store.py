@@ -1,4 +1,4 @@
-"""SQLite topology store — the source-of-truth adjacency for a knowledge graph.
+"""SQLite topology store, the source-of-truth adjacency for a knowledge graph.
 
 LodeDB itself is an exact vector index, not a graph engine: ``search`` ranks the
 top-``k`` semantically similar items, which is the wrong primitive for "every
@@ -8,7 +8,7 @@ sidecar built for deterministic traversal, and uses LodeDB as the rebuildable
 *semantic* index over node/edge text. This module owns the topology half: CRUD
 plus the adjacency queries (`neighbors`, `edges_for`) that back k-hop traversal.
 
-It is stdlib-only (``sqlite3``) and holds no embeddings — vectors live in LodeDB.
+It is stdlib-only (``sqlite3``) and holds no embeddings; vectors live in LodeDB.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@
         --results benchmarks/batched_retrieval/results/laptop_m1.json \
         --out docs
 
-Plots ``search_many`` queries/sec vs query batch size — one line for the CPU kernel and,
+Plots ``search_many`` queries/sec vs query batch size: one line for the CPU kernel and,
 when the results include GPU rows, one for the GPU-resident path. matplotlib is a dev-only
 dependency (not part of the lodedb runtime set); install it separately to render charts.
 """

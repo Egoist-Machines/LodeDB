@@ -5,7 +5,7 @@ into a generation periodically, instead of publishing a new generation on every
 write. It is crash-atomic: the WAL is replayed on open (a torn trailing record
 is discarded) and folded into a generation on a clean close. These tests cover
 the knob plumbing, equivalence with the classic generation mode, the checkpoint,
-and crash recovery — including a hard ``os._exit`` kill of a writer mid-run.
+and crash recovery, including a hard ``os._exit`` kill of a writer mid-run.
 """
 
 from __future__ import annotations
@@ -370,7 +370,7 @@ def _crash_writer(path_str: str) -> None:
     db.add("alpha durable", id="a")
     db.add("beta durable", id="b")
     db.add("gamma durable", id="c")
-    # Hard kill: bypass close(), so no checkpoint and no lock release run — this
+    # Hard kill: bypass close(), so no checkpoint and no lock release run. This
     # is the writer-killed-mid-commit case the WAL must survive.
     os._exit(0)
 

@@ -1,4 +1,4 @@
-"""lodedb — the public API for LodeDB.
+"""lodedb is the public API for LodeDB.
 
 Re-exports the local-first, on-disk SDK (:mod:`lodedb.local`) and the ``lodedb``
 CLI, so you can write ``import lodedb`` / ``from lodedb import LodeDB``. LodeDB

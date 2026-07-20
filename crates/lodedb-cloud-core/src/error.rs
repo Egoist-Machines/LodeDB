@@ -21,7 +21,7 @@ pub enum ArtifactStoreError {
     NotFound(String),
     /// A root-pointer compare-and-swap precondition failed: the committed
     /// generation was not the one the caller expected. Kept distinct because it
-    /// is the *retryable* failure — a concurrent writer advanced the pointer.
+    /// is the *retryable* failure (a concurrent writer advanced the pointer).
     PointerConflict {
         key: String,
         expected: Option<u64>,
@@ -53,12 +53,12 @@ pub enum ArtifactStoreError {
     /// destination's WAL still holds acknowledged-but-uncheckpointed
     /// operations. Replaying those records onto a pulled lineage (or silently
     /// dropping them) would corrupt or lose acknowledged writes, so the caller
-    /// must checkpoint the store first — or explicitly discard the records
+    /// must checkpoint the store first, or explicitly discard the records
     /// with a force-pull. Like [`SyncConflict`](Self::SyncConflict), this is a
     /// *decision*, not a race.
     PendingWal { ops: usize, hint: String },
     /// A storage backend (e.g. an object store) failed for a reason that is not a
-    /// missing object or a pointer precondition — a network error, a permission
+    /// missing object or a pointer precondition: a network error, a permission
     /// denial, or any other transport-level failure. The message carries the
     /// backend's own diagnostic. Missing objects map to [`NotFound`](Self::NotFound)
     /// and failed conditional writes to [`PointerConflict`](Self::PointerConflict),

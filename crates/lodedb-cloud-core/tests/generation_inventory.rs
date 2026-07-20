@@ -95,7 +95,7 @@ fn inventory_covers_multivector_tvmv_store() {
 #[test]
 fn inventory_covers_the_ann_tvann_store() {
     // `tvann` (the persisted ANN cluster partition) is base-only and, to the
-    // engine, a rebuildable cache — but a body referencing a tvann base the
+    // engine, a rebuildable cache. But a body referencing a tvann base the
     // transfer never shipped would fail byte-verification on pull, so the
     // inventory must cover it like any other store.
     let body = json!({
@@ -121,11 +121,11 @@ fn inventory_covers_the_ann_tvann_store() {
 fn inventory_covers_the_rescore_tvvf_store() {
     // `tvvf` (the rescore original-vector sidecar, engine 1.3.2+) is a journaled
     // {base, deltas} store: the engine refuses to open a rescore store without
-    // its sidecar, so a push must ship the base AND any delta segments — a
+    // its sidecar, so a push must ship the base AND any delta segments; a
     // pulled copy missing either would be unopenable, not merely degraded.
     // Its base is NOT `g<base_epoch>.tvvf`: the sidecar keeps its own epoch
     // counter (`vf_epoch`, here deliberately different from base_epoch) and
-    // lives at `vf<vf_epoch>.tvvf` (`tvvf_store::base_path`) — this body
+    // lives at `vf<vf_epoch>.tvvf` (`tvvf_store::base_path`). This body
     // mirrors exactly what `write_base_manifest` records.
     let body = json!({
         "index_key": "idx",
@@ -183,7 +183,7 @@ fn inventory_rejects_a_tvvf_manifest_without_vf_epoch() {
 fn inventory_rejects_a_malformed_artifact_digest() {
     // Digests become staging file names and object keys downstream, so a
     // "digest" carrying a path (or anything that is not 64 lowercase hex
-    // chars) must fail closed at the inventory — before it can name a path.
+    // chars) must fail closed at the inventory, before it can name a path.
     for bad in ["", "abc", "../../../etc/passwd", "/tmp/evil"] {
         let sub = json!({
             "base": { "file_name": "g0.json", "sha256": bad, "file_bytes": 0 },
@@ -199,7 +199,7 @@ fn inventory_rejects_a_malformed_artifact_digest() {
 #[test]
 fn inventory_rejects_an_unknown_store_sub_manifest() {
     // A future engine store this build does not know must refuse the transfer,
-    // not silently drop its artifacts — an understated inventory ships a
+    // not silently drop its artifacts. An understated inventory ships a
     // generation whose referenced blobs were never uploaded.
     let body = json!({
         "index_key": "idx",
@@ -338,7 +338,7 @@ fn inventory_rejects_a_non_object_delta_entry() {
 #[test]
 fn inventory_includes_non_null_tvim_regardless_of_present_flag() {
     // The engine loads a non-null tvim manifest whatever `tvim_present` says, so the
-    // inventory must too — otherwise a restore drops the tvim base it will open.
+    // inventory must too; otherwise a restore drops the tvim base it will open.
     let body = json!({
         "index_key": "idx",
         "generation": 1,
@@ -402,7 +402,7 @@ fn inventory_rejects_a_non_object_store_manifest() {
 #[test]
 fn inventory_rejects_a_body_key_mismatch() {
     // The pointer file-name key ("idx") disagrees with the body's own index_key
-    // ("other") — only possible via tampering, since the body checksum is valid.
+    // ("other"), which is only possible via tampering, since the body checksum is valid.
     let sub = json!({
         "base": { "file_name": "g0.json", "sha256": hex64(0xd), "file_bytes": 0 },
         "deltas": [],

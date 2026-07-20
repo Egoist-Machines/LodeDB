@@ -1,9 +1,9 @@
 """Per-index atomic commit manifest over generation-addressed artifacts.
 
 Stage 1 made each *file* publish atomically (temp + ``os.replace``) and gave the
-single-writer guarantee, but a logical commit spans several files — the JSON
+single-writer guarantee, but a logical commit spans several files (the JSON
 state base, its ``.jsd`` journal, the ``.tvim`` vector base, its ``.tvd``
-journal — published in sequence. A crash (or a lock-free reader) between those
+journal), published in sequence. A crash (or a lock-free reader) between those
 publishes could observe a torn cross-file set: the existing loader *detected*
 that and failed closed, but could not *recover* to the last good state.
 
@@ -26,17 +26,17 @@ and a single top-level pointer:
 
 The root manifest embeds the committed state of both per-store manifests plus
 counts and the live base epoch. A commit writes any new epoch artifacts first,
-then atomically swaps ``<key>.commit.json`` — that swap is the **only** thing
+then atomically swaps ``<key>.commit.json``; that swap is the **only** thing
 that commits a generation. Because bases are epoch-addressed they are never
 overwritten in place, so a crashed commit leaves the previous epoch fully
 intact; recovery just re-points at it and deletes the unreferenced artifacts.
 A lock-free reader reads the root manifest once and loads exactly the artifacts
-it names — a consistent generation, never a torn cross-file mix.
+it names, a consistent generation, never a torn cross-file mix.
 
 The opt-in raw-text store (``store_text=True``) is part of this atomic set: it
 has its own base + ``.txd`` delta journal under the same ``<key>.gen/`` epoch
 and its manifest is embedded in the root, so raw text (visible via the public
-``get`` API) commits and rolls back with exactly the generation the root names —
+``get`` API) commits and rolls back with exactly the generation the root names,
 never leaking an uncommitted overwrite. It remains a separate store: no
 telemetry/redacted/audit path reads it.
 """
@@ -148,7 +148,7 @@ def write_commit_manifest(path: str | Path, body: dict[str, Any], *, fsync: bool
     The body embeds both per-store manifests and is serialized **exactly once**
     per commit: that single ``json.dumps`` is the dominant cost of the write
     (it dwarfs the file I/O), so the one serialization is reused for both the
-    integrity checksum and the on-disk payload — the wrapper is assembled around
+    integrity checksum and the on-disk payload; the wrapper is assembled around
     it rather than re-dumping the body inside a dict.
     """
 

@@ -4,7 +4,7 @@ PrivateGPT (zylon-ai/private-gpt) does not own a vector-store interface of its o
 layer is built on **LlamaIndex's** ``BasePydanticVectorStore``, selected at startup by the
 ``vectorstore.database`` key in ``settings.yaml``. Because LodeDB already ships a LlamaIndex
 ``BasePydanticVectorStore`` (:class:`lodedb.local.integrations.llama_index.LodeDBVectorStore`,
-the ``lodedb[llama-index]`` extra), wiring PrivateGPT up is **not a new adapter** — it is a thin
+the ``lodedb[llama-index]`` extra), wiring PrivateGPT up is **not a new adapter**; it is a thin
 provider shim plus one line of registration.
 
 PrivateGPT's selection mechanism (``private_gpt/components/vector_store/``) is a small factory
@@ -19,10 +19,10 @@ registry:
 
 This module supplies that provider:
 
-- :class:`LodeDBVectorStoreFactory` — a ``VectorStoreFactory`` that reads PrivateGPT's settings
+- :class:`LodeDBVectorStoreFactory`: a ``VectorStoreFactory`` that reads PrivateGPT's settings
   (the embedding ``embed_dim``, the requested ``collection``, and an optional ``lodedb:`` block)
   and builds a :class:`LodeDBVectorStore`, one local on-disk index per collection.
-- :func:`register_lodedb_provider` — registers the factory under ``"lodedb"`` so PrivateGPT can
+- :func:`register_lodedb_provider`: registers the factory under ``"lodedb"`` so PrivateGPT can
   select it. Call it once before PrivateGPT builds its ``VectorStoreComponent``.
 
 **Text-path, like the LlamaIndex adapter.** LodeDB embeds text internally with the model picked
@@ -34,8 +34,8 @@ discards) to avoid a redundant remote embedding call, exactly as documented for 
 
 **What lives where.** Everything LodeDB-specific (this shim, the settings keys it reads, the
 registration call) lives here. The only thing that must happen inside PrivateGPT's own process
-is *triggering* the registration — ``_PROVIDERS`` is process-local with no entry-point
-auto-discovery — which is a one-line import (or a two-line custom launcher); see
+is *triggering* the registration (``_PROVIDERS`` is process-local with no entry-point
+auto-discovery), which is a one-line import (or a two-line custom launcher); see
 ``examples/privategpt_provider.py`` and ``docs/integrations.md``.
 """
 

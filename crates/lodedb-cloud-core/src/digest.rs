@@ -1,6 +1,6 @@
 //! Shared artifact checksum helper.
 //!
-//! Every artifact is addressed by the lowercase-hex SHA-256 of its bytes — the
+//! Every artifact is addressed by the lowercase-hex SHA-256 of its bytes, the
 //! exact digest the engine records per artifact (`sha256_file_hex`). Both the
 //! write path (`LocalArtifactStore::write_bytes_if_absent`) and the verify path
 //! (`verify_generation`) re-hash bytes and compare against the manifest's recorded
@@ -20,7 +20,7 @@ pub(crate) fn sha256_hex_finish(hasher: Sha256) -> String {
 }
 
 /// Streams `reader` to EOF and returns its lowercase-hex SHA-256 plus the byte
-/// count — the bounded-memory replacement for hashing a fully buffered
+/// count, the bounded-memory replacement for hashing a fully buffered
 /// artifact (peak memory is one copy buffer, not the artifact).
 pub(crate) fn sha256_hex_reader(reader: &mut dyn Read) -> std::io::Result<(String, u64)> {
     let mut hasher = Sha256::new();

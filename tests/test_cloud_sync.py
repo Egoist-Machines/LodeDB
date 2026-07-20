@@ -87,7 +87,7 @@ def test_diverged_requires_force_and_force_resolves(committed_store, tmp_path):
 
     # The clone advances once and publishes; the source advances twice on its
     # own lineage. (Different commit counts keep the two lineages on different
-    # base epochs — same-epoch artifact-name collisions across divergent
+    # base epochs; same-epoch artifact-name collisions across divergent
     # lineages are the fork-collision case the Phase-2 content-addressed
     # layout absorbs; a dumb remote fails them closed at the
     # immutable-artifact check.)
@@ -98,7 +98,7 @@ def test_diverged_requires_force_and_force_resolves(committed_store, tmp_path):
     add_documents(source, docs("source-side-b"))
 
     # Diverged: sync refuses, names the classification and both force flags,
-    # and exits with the documented "refused" class (5) — the same class the
+    # and exits with the documented "refused" class (5), the same class the
     # managed sync's 409 maps to, not the generic 1.
     result = runner.invoke(app, ["sync", str(source), str(remote), key])
     assert result.exit_code == 5
@@ -157,7 +157,7 @@ def test_sidecar_is_invisible_to_the_engine(committed_store, tmp_path):
     assert result.exit_code == 0
     assert (source / f"{key}.orecloud").exists()
 
-    # Reopen through the engine and commit — this is exactly what broke when
+    # Reopen through the engine and commit. This is exactly what broke when
     # the sidecar was named `<key>.orecloud.json`.
     add_documents(source, docs("after-sync"))
     (found_key,) = cloud.keys(str(source))

@@ -2,14 +2,14 @@
 repo one-shot for a coding agent, generated from the repo's REAL link (host,
 org, environment, store) rather than placeholders.
 
-Three artifacts, all safe to commit (no secrets — credentials stay in env
+Three artifacts, all safe to commit (no secrets; credentials stay in env
 vars or ~/.orecloud):
 
-- `.claude/skills/orecloud/SKILL.md` — Agent Skills spec (name + description
+- `.claude/skills/orecloud/SKILL.md`: Agent Skills spec (name + description
   frontmatter, short body); read by Claude Code, Cursor, Codex, and Copilot.
   Ours to regenerate: rewritten on every run so it tracks the link.
 - An `## OreCloud` section appended to `AGENTS.md` (created if absent);
-  never touched again once the heading exists — the section is theirs to
+  never touched again once the heading exists. The section is theirs to
   edit after the first drop.
 - An `orecloud-control` entry in `.mcp.json` pointing at the control-plane
   MCP endpoint with `${ORECLOUD_TOKEN}` env expansion; merged into an
@@ -148,7 +148,7 @@ def scaffold_agent_artifacts(
     """Writes the three artifacts into `local_dir`. Returns (written, notes):
     repo-relative paths that were created/updated, and human-readable notes
     for anything deliberately left alone. Paths use forward slashes on every
-    platform — they land in the CLI's JSON output, so the shape is a contract,
+    platform; they land in the CLI's JSON output, so the shape is a contract,
     not a display choice."""
     root = Path(local_dir)
     written: list[str] = []
@@ -163,7 +163,7 @@ def scaffold_agent_artifacts(
     if agents_path.exists():
         existing = agents_path.read_text(encoding="utf-8")
         if AGENTS_SECTION_HEADING in existing:
-            # The section is the repo's to edit after the first drop —
+            # The section is the repo's to edit after the first drop;
             # regenerating over their changes would be data loss.
             notes.append(f"AGENTS.md already has an '{AGENTS_SECTION_HEADING}' section; left as is")
         else:

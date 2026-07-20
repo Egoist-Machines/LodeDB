@@ -15,7 +15,7 @@ import sys
 import pytest
 
 # The tests below import (or monkeypatch into) the client modules, which
-# pull httpx/pynacl — skip cleanly without the [cloud] extra installed.
+# pull httpx/pynacl, so skip cleanly without the [cloud] extra installed.
 pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
 pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
 
@@ -56,8 +56,8 @@ def test_missing_cloud_deps_raise_install_hint(monkeypatch):
 
 
 def test_cloud_target_returns_the_client_handle(monkeypatch):
-    """A cloud target hands back whatever the client's connect() opens —
-    LodeDB.__init__ never runs on it — with the options forwarded."""
+    """A cloud target hands back whatever the client's connect() opens
+    (LodeDB.__init__ never runs on it), with the options forwarded."""
     captured: dict[str, object] = {}
     handle = object()
     _fake_connect(monkeypatch, captured, handle)
@@ -90,8 +90,8 @@ def test_local_only_options_are_rejected_up_front(monkeypatch):
 
 
 def test_cloud_classmethod_accepts_a_bare_store_id(monkeypatch):
-    """`LodeDB.cloud("user-42")` forwards the short target verbatim — the
-    client resolves org/environment from the credential — and returns the
+    """`LodeDB.cloud("user-42")` forwards the short target verbatim (the
+    client resolves org/environment from the credential) and returns the
     handle through the same funnel as the config-string form."""
     captured: dict[str, object] = {}
     handle = object()
@@ -129,7 +129,7 @@ def test_cloud_classmethod_rejects_local_only_options(monkeypatch):
 def test_bare_store_ids_do_not_dispatch_from_the_constructor(tmp_path, monkeypatch):
     """Only `LodeDB.cloud()` accepts scheme-less short forms: a bare id passed
     to the constructor is an ordinary (relative) local path, never a cloud
-    target — so the client's connect must not be consulted."""
+    target, so the client's connect must not be consulted."""
 
     def _exploding_connect(target, **options):
         raise AssertionError("the constructor must not dispatch scheme-less targets")

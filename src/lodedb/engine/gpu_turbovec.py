@@ -17,10 +17,10 @@ reproduces the CPU kernel's calibrated score without its uint8 LUT
 quantization error (the GPU score is the more faithful estimate of the same
 quantized representation; agreement is within the LUT tolerance, roughly
 ``1/sqrt(dim)``-scaled). Queries are rotated on the host with the
-deterministic rotation — exactly the GEMM the native search path runs.
+deterministic rotation, exactly the GEMM the native search path runs.
 
 No custom CUDA kernels: scoring is a tiled fp16→fp32 cast plus cuBLAS
-matmul with a streaming top-k — each row tile's (batch x tile) scores are
+matmul with a streaming top-k. Each row tile's (batch x tile) scores are
 selected with `torch.topk` and merged into a running per-query top-k, so the
 full batch x corpus score matrix is never materialized (bounding GPU memory
 regardless of batch/corpus). It falls back to a full `cupy.argpartition` when
@@ -58,7 +58,7 @@ GPU_DIRECT_TURBOVEC_MAX_TOP_K = 4096
 _TILE_TRANSIENT_BYTES = 128 << 20
 # Each scoring tile's (batch x tile) fp32 score block stays under this budget,
 # so the streaming top-k never materializes the full batch x corpus score
-# matrix (the old full-matrix path needed batch*corpus*4 bytes — ~3.5 GB at
+# matrix (the old full-matrix path needed batch*corpus*4 bytes, ~3.5 GB at
 # batch 1024 x 860K rows, which exceeded GPU memory and forced a CPU fallback).
 _TILE_SCORE_BYTES = 64 << 20
 

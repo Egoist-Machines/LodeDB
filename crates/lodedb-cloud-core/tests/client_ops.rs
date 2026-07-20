@@ -1,6 +1,6 @@
 //! Tests for the string-target client operations (`client_ops`): the facade the
 //! CLI/binding calls. The typed primitives are covered by their own suites;
-//! these tests pin the composition — target resolution, policy pass-through,
+//! these tests pin the composition: target resolution, policy pass-through,
 //! and pull's built-in open-verification.
 
 mod common;
@@ -60,7 +60,7 @@ fn push_status_pull_round_trip_by_target_strings() {
 
     verify(remote_s, KEY).unwrap();
 
-    // Pull restores AND proves the copy opens — one operation.
+    // Pull restores AND proves the copy opens, as one operation.
     let outcome = pull(remote_s, restored_s, KEY).unwrap();
     assert!(outcome.transfer.pointer_published);
     assert_eq!(outcome.open.index_key, KEY);

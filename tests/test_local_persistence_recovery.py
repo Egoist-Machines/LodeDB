@@ -2,7 +2,7 @@
 
 LodeDB reuses the engine's ``.tvim``/``.tvd``/``.jsd`` persistence, which is
 documented to **fail closed** on restart when a sidecar is missing or corrupt for
-a non-empty index — rather than silently returning an empty or partial index.
+a non-empty index, rather than silently returning an empty or partial index.
 These tests corrupt/remove the on-disk sidecars and assert that reopen raises.
 """
 

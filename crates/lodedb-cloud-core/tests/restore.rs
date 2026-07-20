@@ -57,7 +57,7 @@ fn restore_copies_a_generation_that_opens_read_only() {
 #[test]
 fn pull_rebuilds_the_delta_journal_manifests() {
     // The engine's per-store journal manifest is working state the body never
-    // pins, so the transfer doesn't ship it — but the O(changed) mutation
+    // pins, so the transfer doesn't ship it. But the O(changed) mutation
     // path requires it, so a restored copy must be WRITABLE, not just
     // readable. `pull` reconstructs each journal manifest verbatim from the
     // body's sub-manifest.
@@ -173,7 +173,7 @@ fn pull_refuses_over_a_destination_wal_with_pending_records() {
     // The destination WAL's records were acknowledged against the OLD lineage;
     // replaying them onto a pulled snapshot (or silently truncating them)
     // corrupts or loses acked writes. Pull must refuse until the caller
-    // checkpoints — force-pull (a sync flag) is the explicit discard.
+    // checkpoints; force-pull (a sync flag) is the explicit discard.
     const KEY: &str = "cc33dd44ee55ff6600112233445566778899aabbccddeeff0011223344556677";
     let remote = tempfile::tempdir().unwrap();
     commit_engine_generation(remote.path(), KEY, 2, 1, "remote-side", None);

@@ -24,7 +24,7 @@ _IGNORE_PATTERNS = ("{name}", "/{name}", "*.env", ".env*", "**/{name}")
 def write_env_values(path: str | Path, values: dict[str, str]) -> Path:
     """Set `KEY=value` lines in the dotenv file at `path`, creating it if
     missing. Managed keys replace their existing line in place; every other
-    line — comments, other keys, blanks — is preserved. The result is always
+    line (comments, other keys, blanks) is preserved. The result is always
     owner-only (0600): secrets land here, and a pre-existing 0644 `.env` must
     not keep the minted token group/world-readable. Returns the path."""
     target = Path(path)

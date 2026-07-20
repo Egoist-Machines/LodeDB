@@ -3,8 +3,8 @@
 The adapter is duck-typed and dependency-free (it imports neither kotaemon nor
 llama-index), so these tests run in the base suite with no skip guard. They
 mirror the shapes of kotaemon's own ``test_vectorstore.py`` (add / add-from-docs
-/ delete / query / persist-reopen / drop) — including its 3-dimensional toy
-vectors, which exercise the zero-padding path — plus the retrieval-pipeline
+/ delete / query / persist-reopen / drop), including its 3-dimensional toy
+vectors, which exercise the zero-padding path, plus the retrieval-pipeline
 behaviors kotaemon relies on at runtime: the ``doc_ids`` chunk scope and
 duck-typed LlamaIndex ``MetadataFilters`` push-down.
 """

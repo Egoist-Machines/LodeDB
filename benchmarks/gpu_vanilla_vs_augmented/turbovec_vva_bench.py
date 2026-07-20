@@ -1,28 +1,28 @@
-"""Vanilla TurboVec vs the augmented GPU TurboVec — measurement library.
+"""Measurement library for vanilla TurboVec vs the augmented GPU TurboVec.
 
 Compares the *same* vendored 4-bit TurboVec index two ways, with NO FAISS. Both
-scan the same 4-bit codes; the difference is the scoring step — the CPU sums a
+scan the same 4-bit codes; the difference is the scoring step. The CPU sums a
 uint8 LUT (ADC), the GPU reconstructs to fp16 and does a full GEMM dot product.
 So "exact" below means exact over the 4-bit reconstruction, not fp32:
 
-- **vanilla**  — TurboVec's native CPU SIMD scan, ``index.search(queries, k)``,
+- **vanilla**: TurboVec's native CPU SIMD scan, ``index.search(queries, k)``,
   which sums a uint8 lookup table (ADC-style) over the codes. This is exactly the
   kernel the upstream repo benchmarks; the local patches add APIs
   (reconstruction/upsert/encoded-rows) but do not change this scan.
-- **augmented** — the GPU-resident fp16-reconstruction scan
+- **augmented**: the GPU-resident fp16-reconstruction scan
   (:class:`lodedb.engine.gpu_turbovec.GpuDirectTurboVecSession`):
   all rows are reconstructed once to fp16 on the GPU and batches are scored with a
   rotated-query GEMM + streaming device top-k. Because it scores the reconstructed
   vectors with full fp16 arithmetic (not the uint8 LUT), it avoids the uint8-LUT
   rounding error the LUT scan accumulates, so its recall is >= vanilla while
-  throughput scales on the GPU — at higher resident memory (fp16 rows vs compact
+  throughput scales on the GPU, at higher resident memory (fp16 rows vs compact
   2/4-bit codes). Both scans carry the same irreducible 4-bit code-quantization loss.
 
-Axes (all metrics only — no payloads):
-  speed    — ms/query + queries/sec, vanilla uint8-LUT scan (ST + MT) vs augmented fp16 scan.
-  recall   — R@1-within-top-k vs exact fp32 ground truth, vanilla vs augmented.
-  memory   — bytes/vector compact (vanilla, in RAM) vs fp16 resident (augmented GPU).
-  update   — incremental update + persist cost: vanilla full rewrite (O(N)) vs the
+Axes (all metrics only, no payloads):
+  speed:   ms/query + queries/sec, vanilla uint8-LUT scan (ST + MT) vs augmented fp16 scan.
+  recall:  R@1-within-top-k vs exact fp32 ground truth, vanilla vs augmented.
+  memory:  bytes/vector compact (vanilla, in RAM) vs fp16 resident (augmented GPU).
+  update:  incremental update + persist cost, vanilla full rewrite (O(N)) vs the
              augmented delta export (O(changed rows)).
 
 Thread count for the CPU scan is controlled by ``RAYON_NUM_THREADS`` and must be set
@@ -69,7 +69,7 @@ def make_vectors(n: int, dim: int, *, seed: int) -> NDArray[np.float32]:
 def _unit(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
     """Returns row-wise unit-normalized vectors (TurboVec ranks by cosine).
 
-    Applied to loaded datasets so the exact ground truth is cosine top-k — the same
+    Applied to loaded datasets so the exact ground truth is cosine top-k, the same
     metric TurboVec's scan and the GPU reconstruction rank by (both strip the
     per-vector norm). Idempotent on already-unit data (synthetic, most OpenAI).
     """
@@ -101,7 +101,7 @@ def exact_topk_ids(
     """Returns exact top-k stable ids (1-based) by inner product, in fp32.
 
     Computed in row tiles so the full (queries x corpus) score matrix is never
-    materialized — keeps the CPU ground truth feasible at large corpus sizes.
+    materialized, which keeps the CPU ground truth feasible at large corpus sizes.
     """
 
     n = int(vectors.shape[0])
@@ -253,9 +253,9 @@ def time_update_persist(
     Applies ``update_count`` in-place value updates to an existing index and
     measures the persist cost each way:
 
-    - **vanilla**  — no in-place upsert in stock TurboVec: re-add the changed ids
+    - **vanilla**: no in-place upsert in stock TurboVec, so re-add the changed ids
       and write the *whole* ``.tvim`` (the only stock durability primitive).
-    - **augmented** — ``upsert_with_ids`` (in-place slot replace) + ``export_encoded``
+    - **augmented**: ``upsert_with_ids`` (in-place slot replace) + ``export_encoded``
       of just the changed rows (the delta the ``.tvd``/``.tvim`` delta store ships).
     """
 

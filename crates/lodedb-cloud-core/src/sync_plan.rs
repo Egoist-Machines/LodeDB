@@ -1,17 +1,17 @@
-//! Pure three-pointer sync classification — no I/O.
+//! Pure three-pointer sync classification, no I/O.
 //!
 //! Sync compares three snapshots of one index: the **local** committed
 //! generation (as the caller's transfer policy would publish it), the **base**
 //! recorded by the sidecar (the last state both ends agreed on), and the
 //! **remote** committed generation. [`classify`] reduces those to one
-//! [`SyncClassification`] that says which transfer — if any — is a
+//! [`SyncClassification`] that says which transfer, if any, is a
 //! fast-forward, and which situations require an explicit force flag.
 //!
 //! Comparison runs on [`logical_id`](crate::snapshot_identity::logical_id)
 //! (redaction-invariant content identity), never on generation numbers alone:
 //! two independent lineages can share a generation number. Generations serve
 //! only as a monotonicity sanity check, because single-base ancestry is
-//! trust-based — the sidecar is a *claim* the local machine makes about
+//! trust-based. The sidecar is a *claim* the local machine makes about
 //! history, so a generation that moved backwards relative to the recorded base
 //! is treated as rollback/tamper-suspect ([`Unknown`]) rather than
 //! fast-forwarded.
@@ -27,7 +27,7 @@
 /// absent) are what let the classifier compare two snapshots of the *same*
 /// commit: the two stores are independent redaction choices
 /// ([`TransferPolicy`]), so store-set inclusion decides between no-op and
-/// republish — and because `logical_id` is computed with both stores nulled,
+/// republish. And because `logical_id` is computed with both stores nulled,
 /// a store present on *both* ends must also match by identity, or the two
 /// "same" snapshots disagree about payload content (different encodings, or
 /// tampering) and no untransfer-free reconciliation exists.
@@ -47,7 +47,7 @@ pub struct SnapRef {
 }
 
 impl SnapRef {
-    /// Whether a store present on both snapshots differs by identity — the
+    /// Whether a store present on both snapshots differs by identity, the
     /// "same commit, conflicting payload" case that must never be reconciled
     /// silently.
     fn shared_store_conflict(&self, other: &Self) -> bool {
@@ -75,7 +75,7 @@ impl SnapRef {
     /// `base` loses nothing: the same commit, no payload store `base` lacks,
     /// and no shared store whose content disagrees with `base`'s.
     ///
-    /// This — not bare logical equality — is what makes a side "unchanged"
+    /// This, not bare logical equality, is what makes a side "unchanged"
     /// for fast-forward purposes: a side that enriched the base with payload
     /// (an unpublished `--include-text` upgrade) has moved, even though its
     /// logical id has not.
@@ -148,7 +148,7 @@ pub fn classify(
     }
 
     // Generation regression against the recorded base on any present side is
-    // rollback/tamper-suspect: never proceed silently over it — not for ends
+    // rollback/tamper-suspect: never proceed silently over it, not for ends
     // that agree with each other (a coordinated rollback must be loud, and a
     // republish would publish payload onto a suspect remote), and not toward
     // an absent side either (auto-pushing a rolled-back generation to a fresh
@@ -164,7 +164,7 @@ pub fn classify(
 
     let (local, remote) = match (local, remote) {
         // One side absent (and no regression above): the transfer direction
-        // is unambiguous — there is nothing on the other end to discard.
+        // is unambiguous, since there is nothing on the other end to discard.
         (Some(_), None) => return SyncClassification::LocalAhead,
         (None, Some(_)) => return SyncClassification::RemoteAhead,
         (Some(local), Some(remote)) => (local, remote),
@@ -174,7 +174,7 @@ pub fn classify(
     if local.logical_id == remote.logical_id {
         // Same engine commit; the ends should only differ by which payload
         // stores they carry (the logical id nulls exactly those stores).
-        // First, a store present on BOTH ends must match by identity — a
+        // First, a store present on BOTH ends must match by identity; a
         // mismatch means the two "same" snapshots disagree about payload
         // content, which no direction of transfer reconciles losslessly.
         // Then compare the store sets by inclusion:
@@ -182,7 +182,7 @@ pub fn classify(
         //   republishes the pointer, upgrading the remote without discarding
         //   anything;
         // - local carries no more than the remote: nothing to publish, no-op;
-        // - incomparable (each carries a store the other lacks — text-only vs
+        // - incomparable (each carries a store the other lacks, text-only vs
         //   lexical-only): publishing either way drops a store the other end
         //   has, so force is required.
         return if local.snapshot_id == remote.snapshot_id {
@@ -205,7 +205,7 @@ pub fn classify(
     };
 
     // A fast-forward discards the "unchanged" side, so that side must add
-    // nothing over the base — same commit AND no payload the base lacks. A
+    // nothing over the base: same commit AND no payload the base lacks. A
     // side that merely enriched the base with payload stores (an unpublished
     // `--include-text` upgrade of the last-synced commit) has moved too:
     // discarding it would silently drop that payload, so both-moved is
