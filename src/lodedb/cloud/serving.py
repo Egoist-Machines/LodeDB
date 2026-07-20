@@ -578,11 +578,25 @@ class CloudStore:
         limit: int = 25,
         include_text: bool = False,
         filter: dict[str, Any] | None = None,
+        ids: Sequence[str] | None = None,
+        order: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """This store's memories, keyset-paged (ids + metadata, text when
-        asked and allowed)."""
+        """This store's memories (ids + metadata, text when asked and
+        allowed), in one of three shapes: keyset pages in the engine's
+        stable id order (the default), most-recent-first pages
+        (`order="recent"` — same last-id cursor, but it only holds within
+        one served snapshot; a 422 asks the caller to restart when the
+        store changed under the enumeration, and a match set past the
+        server's scan cap also 422s — narrow the filter or use id order),
+        or a by-id fetch (`ids=[...]` — exactly the named documents that
+        exist, no paging; the server refuses `after`/`order` beside it).
+        Like search, the enumeration honors session read-your-writes: after
+        a write on this handle it waits briefly for that write's fold.
+        `ids`/`order`/the read-your-writes token need a control plane that
+        knows them — an older server ignores unknown browse fields and
+        answers a plain id-ordered page."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -591,12 +605,16 @@ class CloudStore:
             "include_text": include_text,
             "filter": filter,
         }
+        if ids is not None:
+            payload["ids"] = list(ids)
+        if order is not None:
+            payload["order"] = order
         if agent_id is not None:
             payload["agent_id"] = agent_id
         if run_id is not None:
             payload["run_id"] = run_id
         result = self._empty_if_unprovisioned(
-            lambda: self._client.browse_documents(self.org, self.environment, payload),
+            lambda: self._searched(self._client.browse_documents, payload),
             {"documents": []},
         )
         return result["documents"]

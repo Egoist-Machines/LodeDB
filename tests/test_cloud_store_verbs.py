@@ -64,12 +64,18 @@ def test_remove_many_rejects_an_empty_batch():
 
 
 class _UnprovisionedClient:
-    """Answers every search with the 404 a not-yet-provisioned store gives."""
+    """Answers every read with the 404 a not-yet-provisioned store gives."""
 
-    def search_many(self, org: str, environment: str, payload: dict) -> dict:
+    def _refuse(self) -> dict:
         from lodedb.cloud.transfer import CloudError
 
         raise CloudError(404, "no such store")
+
+    def search_many(self, org: str, environment: str, payload: dict) -> dict:
+        return self._refuse()
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        return self._refuse()
 
 
 def test_unprovisioned_batch_verbs_keep_query_cardinality():
@@ -78,3 +84,67 @@ def test_unprovisioned_batch_verbs_keep_query_cardinality():
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.search_many(["a", "b", "c"]) == [[], [], []]
     assert store.search_many_by_vector([[0.1, 0.2], [0.3, 0.4]]) == [[], []]
+
+
+def test_unprovisioned_browse_answers_empty():
+    """Enumerating a user who hasn't written yet is the normal zero-setup
+    flow, not an error."""
+    store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
+    assert store.browse() == []
+
+
+class _BrowseClient:
+    """Duck-types the add + browse calls, recording browse payloads and
+    optionally answering one 425 (fold not caught up) before succeeding."""
+
+    def __init__(self, too_early_first: bool = False) -> None:
+        self.calls: list[dict] = []
+        self._too_early = too_early_first
+
+    def add_documents(self, org: str, environment: str, payload: dict) -> dict:
+        return {"ids": ["m1"], "write_id": "w-9", "seq": 41}
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self.calls.append(payload)
+        if self._too_early:
+            self._too_early = False
+            from lodedb.cloud.transfer import CloudError
+
+            raise CloudError(425, "not folded through seq 41 yet")
+        return {"documents": [{"id": "m1", "metadata": {}, "chunk_count": 1}]}
+
+
+def test_browse_carries_the_session_floor_and_retries_425():
+    """Browse is a read like search: after a write on this handle it sends
+    the session's read-your-writes floor as min_seq and briefly retries a
+    425 instead of surfacing it — the write is durable, only its visibility
+    trails by a fold cycle."""
+    client = _BrowseClient(too_early_first=True)
+    store = _store(client)
+    store.add("first memory")  # acks with seq 41
+
+    docs = store.browse()
+
+    assert [doc["id"] for doc in docs] == ["m1"]
+    assert [call.get("min_seq") for call in client.calls] == [41, 41]
+
+
+def test_browse_passes_ids_and_order_on_the_wire():
+    """The by-id fetch and the recency order ride the wire only when asked
+    for, so an untouched browse keeps its old payload shape."""
+    client = _BrowseClient()
+    store = _store(client)
+
+    store.browse(ids=["a", "b"])
+    store.browse(order="recent", after="m0", limit=2)
+    store.browse()
+
+    assert client.calls[0]["ids"] == ["a", "b"]
+    assert "order" not in client.calls[0]
+    assert (client.calls[1]["order"], client.calls[1]["after"], client.calls[1]["limit"]) == (
+        "recent",
+        "m0",
+        2,
+    )
+    assert "ids" not in client.calls[1]
+    assert "ids" not in client.calls[2] and "order" not in client.calls[2]
