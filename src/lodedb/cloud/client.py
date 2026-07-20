@@ -211,10 +211,12 @@ class Client:
         """Flip a store's `expose_text`/`mode` flags."""
         return self._client.update_store(self.org, self.environment, store, key, **changes)
 
-    def delete_store(self, store: str) -> dict:
+    def delete_store(self, store: str, *, erase: bool = False) -> dict:
         """Soft-delete a whole store — forget this end user (restorable for
-        the grace period; the entitlement slot frees immediately)."""
-        return self._client.delete_store(self.org, self.environment, store)
+        the grace period; the entitlement slot frees immediately).
+        `erase=True` is data-subject erasure: no grace window, restore
+        refuses immediately, and the next lifecycle sweep hard-deletes."""
+        return self._client.delete_store(self.org, self.environment, store, erase=erase)
 
     def restore_store(self, parked_store: str) -> dict:
         return self._client.restore_store(self.org, self.environment, parked_store)

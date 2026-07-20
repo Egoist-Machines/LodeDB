@@ -231,15 +231,21 @@ class CloudClient:
     def restore_environment(self, org: str, parked_slug: str) -> dict:
         return self._request("POST", f"/v1/orgs/{org}/environments/{parked_slug}/restore")
 
-    def delete_store(self, org: str, environment: str, store: str) -> dict:
+    def delete_store(
+        self, org: str, environment: str, store: str, *, erase: bool = False
+    ) -> dict:
         """Soft-delete a whole store (every index key in it hides with it).
+        `erase=True` is data-subject erasure: the grace window is skipped,
+        restore refuses from that moment, and the next lifecycle sweep
+        hard-deletes the store's rows and objects.
 
         Store names are end-user ids — free-form up to '/' — so the path
         segment is percent-encoded: a raw `?` or `#` would truncate the URL
         and address a DIFFERENT store."""
         return self._request(
             "DELETE",
-            f"/v1/orgs/{org}/environments/{environment}/stores/{quote(store, safe='')}",
+            f"/v1/orgs/{org}/environments/{environment}/stores/{quote(store, safe='')}"
+            + ("?erase=true" if erase else ""),
         )
 
     def restore_store(self, org: str, environment: str, parked_store: str) -> dict:

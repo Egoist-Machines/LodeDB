@@ -129,6 +129,103 @@ def test_browse_carries_the_session_floor_and_retries_425():
     assert [call.get("min_seq") for call in client.calls] == [41, 41]
 
 
+class _AddClient:
+    """Duck-types add_documents, recording each accepted payload."""
+
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def add_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self.payloads.append(payload)
+        return {
+            "ids": [doc.get("id") or "assigned" for doc in payload["documents"]],
+            "write_id": "w-1",
+            "seq": 1,
+        }
+
+
+def test_add_coerces_metadata_like_the_local_handle():
+    """Code written against the local `db.add` ergonomics may pass int/
+    float/bool metadata values; the wire contract is strict str->str, so the
+    handle stringifies exactly like the local `_coerce_metadata` — and
+    refuses the value types the local handle refuses. Absent metadata stays
+    None on the wire, not an empty map."""
+    client = _AddClient()
+    store = _store(client)
+
+    store.add("hello", metadata={"year": 2020, "vip": True, "score": 1.5, "note": "plain"})
+    meta = client.payloads[0]["documents"][0]["metadata"]
+    assert meta == {"year": "2020", "vip": "true", "score": "1.5", "note": "plain"}
+
+    with pytest.raises(ValueError, match="metadata value"):
+        store.add("hello", metadata={"bad": ["a", "list"]})
+
+    store.add("hello")
+    assert client.payloads[-1]["documents"][0]["metadata"] is None
+
+
+class _TextClient:
+    """Duck-types browse_documents for get_texts: answers the asked-for ids
+    (minus 'missing') plus one stray document a plain-page server might
+    return."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self.calls.append(payload)
+        docs = [
+            {"id": id, "metadata": {}, "chunk_count": 1, "text": f"text-{id}"}
+            for id in payload["ids"]
+            if id != "missing"
+        ]
+        docs.append({"id": "not-asked", "metadata": {}, "chunk_count": 1, "text": "stray"})
+        return {"documents": docs}
+
+
+def test_get_texts_batches_over_the_by_id_browse():
+    """get_texts costs one by-id browse per hundred ids (not one request per
+    id), omits missing ids, and keeps only requested ids — a server that
+    answered a plain page could only under-answer, never mis-answer."""
+    client = _TextClient()
+    store = _store(client)
+
+    ids = [f"doc-{i}" for i in range(150)] + ["missing"]
+    texts = store.get_texts(ids)
+
+    assert [len(call["ids"]) for call in client.calls] == [100, 51]
+    assert all(call["include_text"] for call in client.calls)
+    assert texts["doc-0"] == "text-doc-0" and texts["doc-149"] == "text-doc-149"
+    assert "missing" not in texts and "not-asked" not in texts
+    assert store.get_texts([]) == {}
+    assert len(client.calls) == 2  # the empty batch made no request
+
+
+def test_delete_store_erase_rides_the_query_string():
+    """erase=True must reach the wire as ?erase=true — a silently dropped
+    flag would downgrade a data-subject erasure to a grace-window delete."""
+    import httpx
+
+    from lodedb.cloud.transfer import CloudClient
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        stamp = "2026-07-20T00:00:00Z"
+        return httpx.Response(
+            200, json={"slug": "user-42-del-1", "deleted_at": stamp, "purge_after": stamp}
+        )
+
+    with CloudClient(
+        "https://cloud.test", "tok", transport=httpx.MockTransport(handler)
+    ) as client:
+        client.delete_store("acme", "prod", "user-42")
+        client.delete_store("acme", "prod", "user-42", erase=True)
+    assert seen[0].endswith("/stores/user-42")
+    assert seen[1].endswith("/stores/user-42?erase=true")
+
+
 def test_browse_passes_ids_and_order_on_the_wire():
     """The by-id fetch and the recency order ride the wire only when asked
     for, so an untouched browse keeps its old payload shape."""

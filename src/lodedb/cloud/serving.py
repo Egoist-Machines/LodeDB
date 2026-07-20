@@ -93,6 +93,19 @@ def _hit(row: dict) -> CloudSearchHit:
     )
 
 
+def _coerced_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
+    """The local handle's metadata coercion (ints/floats/bools stringified,
+    other value types refused with the same error), applied before the wire.
+    The server's contract is strict str->str; code written against the local
+    ``db.add`` ergonomics must not 422 on ``{"year": 2020}``. ``None`` stays
+    ``None`` — absent metadata, not an empty map."""
+    if metadata is None:
+        return None
+    from lodedb.local.db import _coerce_metadata
+
+    return _coerce_metadata(metadata)
+
+
 class CloudStore:
     """A read handle over one managed store, duck-typing the local LodeDB
     read surface. Create via :func:`connect`."""
@@ -285,7 +298,9 @@ class CloudStore:
     ) -> list[str]:
         """Add a batch of ``{"text", "id"?, "metadata"?}`` documents as one
         accepted write (one segment; the fold batches concurrent writes into
-        one commit). Returns the ids, in order — assigned at acceptance."""
+        one commit). Metadata values are stringified exactly like the local
+        handle's (the wire contract is strict str->str). Returns the ids, in
+        order — assigned at acceptance."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -293,7 +308,7 @@ class CloudStore:
                 {
                     "text": doc["text"],
                     "id": doc.get("id"),
-                    "metadata": doc.get("metadata"),
+                    "metadata": _coerced_metadata(doc.get("metadata")),
                 }
                 for doc in documents
             ],
@@ -341,7 +356,8 @@ class CloudStore:
     ) -> list[str]:
         """Add a batch of ``{"vector", "id"?, "text"?, "metadata"?}``
         documents as one accepted write. Vector-store counterpart of
-        `add_many`; returns the ids in order."""
+        `add_many` (metadata stringified the same way); returns the ids in
+        order."""
         payload: dict[str, Any] = {
             "store": self.store,
             "key": self.key,
@@ -350,7 +366,7 @@ class CloudStore:
                     "vector": list(doc["vector"]),
                     "text": doc.get("text"),
                     "id": doc.get("id"),
-                    "metadata": doc.get("metadata"),
+                    "metadata": _coerced_metadata(doc.get("metadata")),
                 }
                 for doc in documents
             ],
@@ -482,13 +498,22 @@ class CloudStore:
     get_text = get
 
     def get_texts(self, ids: list[str]) -> dict[str, str]:
-        """Stored text for several ids (missing ids are omitted). One request
-        per id today — prefer `search(..., include_text=True)` for RAG."""
+        """Stored text for several ids (missing ids are omitted), fetched as
+        by-id browse pages of 100 (the by-id bound) — a batch costs one
+        request per hundred ids, not one per id. Needs `read:text`, the
+        store's `expose_text` flag, AND a key that can search: browse is a
+        search-scoped read, where the single-id `get` needs text access
+        only. Answers are filtered to the requested ids, so an older control
+        plane (which ignores the by-id fields and answers a plain page) can
+        only under-answer, never mis-answer."""
         texts: dict[str, str] = {}
-        for id in ids:
-            text = self.get(id)
-            if text is not None:
-                texts[id] = text
+        for start in range(0, len(ids), 100):
+            batch = [str(id) for id in ids[start : start + 100]]
+            wanted = set(batch)
+            for doc in self.browse(ids=batch, include_text=True):
+                text = doc.get("text")
+                if doc.get("id") in wanted and text is not None:
+                    texts[doc["id"]] = text
         return texts
 
     # --------------------------------------------------------------- stats
