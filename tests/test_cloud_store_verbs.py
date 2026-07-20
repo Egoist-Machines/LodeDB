@@ -95,11 +95,14 @@ def test_unprovisioned_browse_answers_empty():
 
 class _BrowseClient:
     """Duck-types the add + browse calls, recording browse payloads and
-    optionally answering one 425 (fold not caught up) before succeeding."""
+    optionally answering one 425 (fold not caught up) before succeeding.
+    When `retry_after` is given the refusal carries it, like a server that
+    sends the Retry-After header."""
 
-    def __init__(self, too_early_first: bool = False) -> None:
+    def __init__(self, too_early_first: bool = False, retry_after: float | None = None) -> None:
         self.calls: list[dict] = []
         self._too_early = too_early_first
+        self._retry_after = retry_after
 
     def add_documents(self, org: str, environment: str, payload: dict) -> dict:
         return {"ids": ["m1"], "write_id": "w-9", "seq": 41}
@@ -110,7 +113,7 @@ class _BrowseClient:
             self._too_early = False
             from lodedb.cloud.transfer import CloudError
 
-            raise CloudError(425, "not folded through seq 41 yet")
+            raise CloudError(425, "not folded through seq 41 yet", retry_after=self._retry_after)
         return {"documents": [{"id": "m1", "metadata": {}, "chunk_count": 1}]}
 
 
@@ -127,6 +130,55 @@ def test_browse_carries_the_session_floor_and_retries_425():
 
     assert [doc["id"] for doc in docs] == ["m1"]
     assert [call.get("min_seq") for call in client.calls] == [41, 41]
+
+
+def test_read_retry_paces_itself_by_the_server_retry_after(monkeypatch):
+    """A 425 carrying Retry-After paces the retry at the server's ask
+    (polling faster just burns the search rate limit); without one the
+    pause stays the 250ms default, and the server's ask never sleeps past
+    the handle's own visibility budget."""
+    pauses: list[float] = []
+    monkeypatch.setattr("lodedb.cloud.serving.time.sleep", lambda s: pauses.append(s))
+
+    store = _store(_BrowseClient(too_early_first=True, retry_after=1.0))
+    store.add("first memory")
+    store.browse()
+    assert pauses == [1.0]
+
+    pauses.clear()
+    store = _store(_BrowseClient(too_early_first=True))
+    store.add("first memory")
+    store.browse()
+    assert pauses == [0.25]
+
+    pauses.clear()
+    client = _BrowseClient(too_early_first=True, retry_after=60.0)
+    store = CloudStore(
+        client, "acme", "prod", "user-42", owns_client=False, write_visibility_timeout=0.5
+    )
+    store.add("first memory")
+    store.browse()
+    assert pauses and pauses[0] <= 0.5
+
+
+def test_cloud_error_parses_the_retry_after_header():
+    """The transport keeps the server's Retry-After on the refusal it
+    raises; absent or malformed headers become None, never a crash."""
+    import httpx
+
+    from lodedb.cloud.transfer import CloudError, _raise_for
+
+    def refusal(headers: dict[str, str]) -> CloudError:
+        response = httpx.Response(425, json={"detail": "not folded yet"}, headers=headers)
+        with pytest.raises(CloudError) as caught:
+            _raise_for(response)
+        return caught.value
+
+    assert refusal({"Retry-After": "1"}).retry_after == 1.0
+    assert refusal({"Retry-After": "2.5"}).retry_after == 2.5
+    assert refusal({}).retry_after is None
+    assert refusal({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}).retry_after is None
+    assert refusal({"Retry-After": "-3"}).retry_after is None
 
 
 class _AddClient:
@@ -395,6 +447,32 @@ def test_list_documents_bounds_the_walk():
         store.list_documents(max_documents=100)
     with pytest.raises(TimeoutError, match="did not finish"):
         store.list_documents(timeout=0.0)
+
+
+class _SlowFinalPageClient:
+    """One short (final) browse page whose fetch alone spends the caller's
+    whole time budget, ticking the injected clock as a slow server would."""
+
+    def __init__(self, clock: dict) -> None:
+        self._clock = clock
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self._clock["now"] += 5.0
+        return {"documents": [{"id": "d1", "metadata": {}, "chunk_count": 1}]}
+
+
+def test_list_documents_fails_closed_when_the_final_page_outlives_the_budget(monkeypatch):
+    """The timeout is enforced around each fetch, not just before it: a
+    single slow final page must raise, never turn a spent budget into a
+    quiet success; callers treat the bound as a refusal mechanism."""
+    clock = {"now": 0.0}
+    monkeypatch.setattr("lodedb.cloud.serving.time.monotonic", lambda: clock["now"])
+    store = CloudStore(
+        _SlowFinalPageClient(clock), "acme", "prod", "user-42", owns_client=False
+    )
+
+    with pytest.raises(TimeoutError, match="did not finish"):
+        store.list_documents(timeout=1.0)
 
 
 def test_unprovisioned_list_documents_answers_empty():

@@ -159,7 +159,9 @@ class CloudStore:
         """Runs one search call with session read-your-writes: `min_seq` is
         this handle's last acked write, and a 425 (fold not caught up yet) is
         retried briefly instead of surfacing. The write is durable; only its
-        visibility trails by a fold cycle."""
+        visibility trails by a fold cycle. The pause honors the server's
+        Retry-After when it sends one (polling faster than the server asks
+        just burns the search rate limit), capped by the remaining budget."""
         if self._read_your_writes and self._last_seq > 0:
             payload["min_seq"] = self._last_seq
         deadline = time.monotonic() + self._write_visibility_timeout
@@ -167,9 +169,10 @@ class CloudStore:
             try:
                 return call(self.org, self.environment, payload)
             except CloudError as error:
-                if error.status_code != 425 or time.monotonic() >= deadline:
+                now = time.monotonic()
+                if error.status_code != 425 or now >= deadline:
                     raise
-                time.sleep(0.25)
+                time.sleep(min(error.retry_after or 0.25, max(deadline - now, 0.0)))
 
     def search(
         self,
@@ -706,22 +709,33 @@ class CloudStore:
         bounds guard that loop against a store that has outgrown the
         caller: ``max_documents`` raises ValueError once more records than
         that match, and ``timeout`` (seconds) raises TimeoutError when the
-        walk outlives it. Each is checked before another page is fetched, and
-        enumeration is read-only, so both leave the store untouched. Like
-        every read, each page honors the session's read-your-writes floor.
+        walk outlives it. The deadline is checked around every page fetch,
+        so a single slow final page still fails closed rather than
+        returning past the budget.
+        Enumeration is read-only, so both bounds leave the store untouched.
+        Like every read, each page honors the session's read-your-writes
+        floor.
         """
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         remaining = None if limit is None else max(int(limit), 0)
+
+        def check_deadline() -> None:
+            """Fails the walk once the budget is spent, wherever it is spent:
+            a caller treating `timeout` as a safety bound must never get a
+            quiet success that took longer than the bound allows."""
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"list_documents did not finish within {timeout}s; narrow the "
+                    "filter, page with after/limit, or raise the timeout"
+                )
+
         records: list[dict[str, Any]] = []
         cursor = after
         while remaining is None or remaining > 0:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"list_documents did not finish within {timeout}s — narrow the "
-                    "filter, page with after/limit, or raise the timeout"
-                )
+            check_deadline()
             page_size = 100 if remaining is None else min(remaining, 100)
             rows = self.browse(after=cursor, limit=page_size, filter=filter)
+            check_deadline()
             for row in rows:
                 records.append(
                     {
@@ -732,7 +746,7 @@ class CloudStore:
                 )
             if max_documents is not None and len(records) > max_documents:
                 raise ValueError(
-                    f"more than {max_documents} documents match — narrow the "
+                    f"more than {max_documents} documents match; narrow the "
                     "filter or page with after/limit"
                 )
             if len(rows) < page_size:

@@ -37,12 +37,15 @@ from lodedb._turbovec import cloud as _core
 
 
 class CloudError(RuntimeError):
-    """A control-plane refusal, carrying the HTTP status and its detail."""
+    """A control-plane refusal, carrying the HTTP status and its detail.
+    `retry_after` is the response's Retry-After header in seconds, the pause
+    a retrying caller should honor; None when the server sent none."""
 
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: str, *, retry_after: float | None = None):
         super().__init__(f"{detail} (HTTP {status_code})")
         self.status_code = status_code
         self.detail = detail
+        self.retry_after = retry_after
 
 
 def _store_hint(org: str, environment: str, store: object) -> str | None:
@@ -58,6 +61,20 @@ def _store_hint(org: str, environment: str, store: object) -> str | None:
     return quote(f"{org}/{environment}/{store}", safe="/")
 
 
+def _retry_after(response: httpx.Response) -> float | None:
+    """Seconds from the response's Retry-After header, None when absent,
+    negative, or not the plain-seconds form (the HTTP-date form is rare
+    enough on API responses not to be worth parsing here)."""
+    value = response.headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def _raise_for(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
@@ -65,7 +82,7 @@ def _raise_for(response: httpx.Response) -> None:
         detail = response.json().get("detail", response.text)
     except ValueError:
         detail = response.text
-    raise CloudError(response.status_code, str(detail))
+    raise CloudError(response.status_code, str(detail), retry_after=_retry_after(response))
 
 
 class CloudClient:
