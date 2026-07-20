@@ -680,6 +680,66 @@ class CloudStore:
         )
         return result["documents"]
 
+    def list_documents(
+        self,
+        *,
+        filter: dict[str, Any] | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+        max_documents: int | None = None,
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Document records, optionally filtered and paged — the cloud
+        `db.list_documents`. Enumeration, not ranking, mirroring the local
+        handle: each record is ``{"id", "metadata", "chunk_count"}`` (the
+        local handle's extra ``content_hash`` is an on-disk artifact detail
+        with no serving-tier counterpart), ``filter`` takes the same grammar
+        as :meth:`search`, and ``after``/``limit`` page the stable
+        id-ordered match set with the same keyset cursor.
+
+        With ``limit=None`` this walks the WHOLE match set in 100-document
+        browse pages — one request per hundred matches. Two keyword-only
+        bounds guard that loop against a store that has outgrown the
+        caller: ``max_documents`` raises ValueError once more records than
+        that match, and ``timeout`` (seconds) raises TimeoutError when the
+        walk outlives it — each checked before another page is fetched, and
+        enumeration is read-only, so both leave the store untouched. Like
+        every read, each page honors the session's read-your-writes floor.
+        """
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        remaining = None if limit is None else max(int(limit), 0)
+        records: list[dict[str, Any]] = []
+        cursor = after
+        while remaining is None or remaining > 0:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"list_documents did not finish within {timeout}s — narrow the "
+                    "filter, page with after/limit, or raise the timeout"
+                )
+            page_size = 100 if remaining is None else min(remaining, 100)
+            rows = self.browse(after=cursor, limit=page_size, filter=filter)
+            for row in rows:
+                records.append(
+                    {
+                        "id": str(row.get("id") or ""),
+                        "metadata": dict(row.get("metadata") or {}),
+                        "chunk_count": int(row.get("chunk_count") or 0),
+                    }
+                )
+            if max_documents is not None and len(records) > max_documents:
+                raise ValueError(
+                    f"more than {max_documents} documents match — narrow the "
+                    "filter or page with after/limit"
+                )
+            if len(rows) < page_size:
+                return records
+            if remaining is not None:
+                remaining -= len(rows)
+            cursor = str(rows[-1].get("id") or "") or None
+            if cursor is None:
+                return records
+        return records
+
     def delete_memories(
         self, *, agent_id: str | None = None, run_id: str | None = None
     ) -> dict[str, Any]:

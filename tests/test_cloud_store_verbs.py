@@ -322,3 +322,83 @@ def test_browse_passes_ids_and_order_on_the_wire():
     )
     assert "ids" not in client.calls[1]
     assert "ids" not in client.calls[2] and "order" not in client.calls[2]
+
+
+class _PagingBrowseClient:
+    """Answers filtered browse pages from a fixed id-ordered corpus, honoring
+    after/limit and recording each payload — enough server for the
+    list_documents enumeration loop."""
+
+    def __init__(self, count: int) -> None:
+        self.calls: list[dict] = []
+        self._ids = [f"doc-{index:04d}" for index in range(count)]
+
+    def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+        self.calls.append(payload)
+        ids = self._ids
+        if payload.get("after"):
+            ids = [id for id in ids if id > payload["after"]]
+        page = ids[: payload["limit"]]
+        return {
+            "documents": [
+                {"id": id, "metadata": {"namespace": "default"}, "chunk_count": 1}
+                for id in page
+            ],
+            "count": len(self._ids),
+            "snapshot_id": "snap-1",
+            "generation": 1,
+        }
+
+
+def test_list_documents_walks_every_page_in_local_record_shape():
+    """limit=None enumerates the whole match set in 100-document pages and
+    answers local-handle-shaped records."""
+    client = _PagingBrowseClient(250)
+    store = CloudStore(client, "acme", "prod", "user-42", owns_client=False)
+
+    records = store.list_documents()
+
+    assert len(records) == 250
+    assert records[0] == {
+        "id": "doc-0000",
+        "metadata": {"namespace": "default"},
+        "chunk_count": 1,
+    }
+    assert [call["limit"] for call in client.calls] == [100, 100, 100]
+    assert client.calls[1]["after"] == "doc-0099"
+    assert client.calls[2]["after"] == "doc-0199"
+
+
+def test_list_documents_forwards_filter_and_pages_like_the_local_cursor():
+    client = _PagingBrowseClient(5)
+    store = CloudStore(client, "acme", "prod", "user-42", owns_client=False)
+
+    records = store.list_documents(
+        filter={"namespace": "default"}, after="doc-0001", limit=2
+    )
+
+    assert [record["id"] for record in records] == ["doc-0002", "doc-0003"]
+    assert client.calls[0]["filter"] == {"namespace": "default"}
+    assert client.calls[0]["after"] == "doc-0001"
+    assert client.calls[0]["limit"] == 2
+
+
+def test_list_documents_bounds_the_walk():
+    """The keyword-only bounds fail closed before another page is fetched: a
+    match set past max_documents raises ValueError, an outlived timeout raises
+    TimeoutError — enumeration never mutates, so both are safe to retry with
+    a narrower filter or explicit paging."""
+    client = _PagingBrowseClient(250)
+    store = CloudStore(client, "acme", "prod", "user-42", owns_client=False)
+
+    with pytest.raises(ValueError, match="more than 100 documents"):
+        store.list_documents(max_documents=100)
+    with pytest.raises(TimeoutError, match="did not finish"):
+        store.list_documents(timeout=0.0)
+
+
+def test_unprovisioned_list_documents_answers_empty():
+    """Enumerating a user who hasn't written yet is the normal zero-setup
+    flow, not an error — same rule as browse."""
+    store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
+    assert store.list_documents() == []
