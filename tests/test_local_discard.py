@@ -67,3 +67,51 @@ def test_discard_read_only_handle(tmp_path):
     _open(tmp_path, commit_mode="generation").close()
     reader = LodeDB.open_readonly(tmp_path, model="minilm", _embedding_backend=_be())
     reader.discard()
+
+
+def _folded_unpersisted(db: LodeDB, text: str, id: str) -> None:
+    """Applies one fold segment to `db` WITHOUT persisting: exactly the
+    in-memory state a graceful close() would publish and discard() drops."""
+    from lodedb.local.segments import (
+        build_embedded_documents_record,
+        encode_segment,
+        fold_segment,
+        plan_documents,
+    )
+
+    plan = plan_documents([{"text": text, "id": id}])
+    chunk_texts = tuple(str(chunk["text"]) for chunk in plan["chunks_to_embed"])
+    record = build_embedded_documents_record(
+        plan, _be().embed_documents(chunk_texts), vector_dim=DIM
+    )
+    fold_segment(db, encode_segment([record]), first_lsn=db.applied_lsn() + 1)
+
+
+def test_exit_hook_honors_discard_at_exit(tmp_path):
+    """The interpreter-exit teardown hook must not turn a process exit into
+    an implicit commit: a handle opened with ``discard_at_exit=True`` and
+    holding applied-but-unpersisted fold state is discarded (the store stays
+    at its committed state), while a default handle still closes gracefully
+    and publishes."""
+    from lodedb.local.db import _close_open_native_dbs_at_exit
+
+    _open(tmp_path / "serve", commit_mode="generation").close()
+    _open(tmp_path / "keep", commit_mode="generation").close()
+    serve = _open(tmp_path / "serve", commit_mode="generation", discard_at_exit=True)
+    keep = _open(tmp_path / "keep", commit_mode="generation")
+    _folded_unpersisted(serve, "tail-applied provisional write", "tail")
+    _folded_unpersisted(keep, "fold in flight at exit", "kept")
+    assert serve.count() == 1 and keep.count() == 1
+
+    _close_open_native_dbs_at_exit()
+
+    serve_reopened = _open(tmp_path / "serve", commit_mode="generation")
+    keep_reopened = _open(tmp_path / "keep", commit_mode="generation")
+    try:
+        assert serve_reopened.count() == 0
+        assert serve_reopened.get("tail") is None
+        assert keep_reopened.count() == 1
+        assert [rec["id"] for rec in keep_reopened.list_documents()] == ["kept"]
+    finally:
+        serve_reopened.close()
+        keep_reopened.close()
