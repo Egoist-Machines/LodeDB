@@ -646,13 +646,17 @@ class CloudStore:
     ) -> list[dict[str, Any]]:
         """This store's memories (ids + metadata, text when asked and
         allowed), in one of three shapes: keyset pages in the engine's
-        stable id order (the default), most-recent-first pages
-        (`order="recent"`: same last-id cursor, but it only holds within
-        one served snapshot; a 422 asks the caller to restart when the
-        store changed under the enumeration, and a match set past the
-        server's scan cap also 422s, so narrow the filter or use id order),
-        or a by-id fetch (`ids=[...]`: exactly the named documents that
-        exist, no paging; the server refuses `after`/`order` beside it).
+        stable id order (the default), ordered pages, or a by-id fetch
+        (`ids=[...]`: exactly the named documents that exist, no paging;
+        the server refuses `after`/`order` beside it). Ordered pages take
+        `order="recent"` (the server's write-instant stamp) or, on a newer
+        control plane, `order="metadata:<key>"` (descending by that
+        metadata value, keyless documents last, so an ISO-8601 stamp of
+        your own reads newest-first). Both use the same last-id cursor,
+        and it only holds within one served snapshot: a 422 asks the
+        caller to restart when the store changed under the enumeration,
+        and a match set past the server's scan cap also 422s, so narrow
+        the filter or use id order.
         Like search, the enumeration honors session read-your-writes: after
         a write on this handle it waits briefly for that write's fold.
         `ids`/`order`/the read-your-writes token need a control plane that
