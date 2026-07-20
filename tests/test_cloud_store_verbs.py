@@ -165,28 +165,34 @@ def test_add_coerces_metadata_like_the_local_handle():
 
 
 class _TextClient:
-    """Duck-types browse_documents for get_texts: answers the asked-for ids
-    (minus 'missing') plus one stray document a plain-page server might
-    return."""
+    """Duck-types browse_documents + store_text for get_texts: the by-id
+    browse answers every asked-for id except 'missing'; the text endpoint
+    records which ids needed a per-id confirmation."""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.text_calls: list[str] = []
 
     def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
         self.calls.append(payload)
-        docs = [
-            {"id": id, "metadata": {}, "chunk_count": 1, "text": f"text-{id}"}
-            for id in payload["ids"]
-            if id != "missing"
-        ]
-        docs.append({"id": "not-asked", "metadata": {}, "chunk_count": 1, "text": "stray"})
-        return {"documents": docs}
+        return {
+            "documents": [
+                {"id": id, "metadata": {}, "chunk_count": 1, "text": f"text-{id}"}
+                for id in payload["ids"]
+                if id != "missing"
+            ]
+        }
+
+    def store_text(self, org: str, environment: str, store: str, id: str, key=None) -> dict:
+        self.text_calls.append(id)
+        return {"id": id, "found": False, "text": None}
 
 
 def test_get_texts_batches_over_the_by_id_browse():
-    """get_texts costs one by-id browse per hundred ids (not one request per
-    id), omits missing ids, and keeps only requested ids — a server that
-    answered a plain page could only under-answer, never mis-answer."""
+    """get_texts does its bulk work as one by-id browse per hundred ids (not
+    one request per id); an id absent from its page is confirmed through the
+    text endpoint so the answer keeps exact per-id semantics, and an empty
+    request makes no request at all."""
     client = _TextClient()
     store = _store(client)
 
@@ -196,9 +202,46 @@ def test_get_texts_batches_over_the_by_id_browse():
     assert [len(call["ids"]) for call in client.calls] == [100, 51]
     assert all(call["include_text"] for call in client.calls)
     assert texts["doc-0"] == "text-doc-0" and texts["doc-149"] == "text-doc-149"
-    assert "missing" not in texts and "not-asked" not in texts
+    assert "missing" not in texts
+    assert client.text_calls == ["missing"]  # only the absent id re-confirms
     assert store.get_texts([]) == {}
-    assert len(client.calls) == 2  # the empty batch made no request
+    assert len(client.calls) == 2  # the empty request made no HTTP call
+
+
+def test_get_texts_distrusts_a_plain_page_answer():
+    """A document nobody asked for means the control plane ignored the by-id
+    fields (an older server answering a plain page): every requested id then
+    goes through the text endpoint, so the result stays exact instead of
+    silently partial."""
+
+    class _PlainPageClient:
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
+            return {
+                "documents": [
+                    {"id": "stray", "metadata": {}, "chunk_count": 1, "text": "stray-text"},
+                    {
+                        "id": payload["ids"][0],
+                        "metadata": {},
+                        "chunk_count": 1,
+                        "text": f"text-{payload['ids'][0]}",
+                    },
+                ]
+            }
+
+        def store_text(self, org: str, environment: str, store: str, id: str, key=None) -> dict:
+            self.text_calls.append(id)
+            return {"id": id, "found": True, "text": f"endpoint-{id}"}
+
+    client = _PlainPageClient()
+    store = _store(client)
+
+    texts = store.get_texts(["a", "b"])
+
+    assert texts == {"a": "endpoint-a", "b": "endpoint-b"}
+    assert client.text_calls == ["a", "b"]
 
 
 class _TextOnlyClient:

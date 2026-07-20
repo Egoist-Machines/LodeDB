@@ -498,18 +498,20 @@ class CloudStore:
     get_text = get
 
     def get_texts(self, ids: list[str]) -> dict[str, str]:
-        """Stored text for several ids (missing ids are omitted), fetched as
-        by-id browse pages of 100 (the by-id bound) — one request per
-        hundred ids, not one per id. Browse is a search-scoped read, so a
-        least-privilege key holding only `read:text` falls back to the
-        single-id text endpoint (one request per id, the pre-batching
-        behavior) instead of failing a previously valid call. Answers are
-        filtered to the requested ids, so an older control plane (which
-        ignores the by-id fields and answers a plain page) can only
-        under-answer, never mis-answer."""
+        """Stored text for several ids (missing ids are omitted), with the
+        text endpoint's exact per-id semantics at batch cost. By-id browse
+        pages of 100 do the bulk work — one request per hundred ids — and
+        anything a page could not answer authoritatively falls back to the
+        single-id text endpoint (the pre-batching shape): an id absent from
+        its page (genuinely gone, TTL-hidden, or an older control plane
+        that ignored the by-id fields and answered a plain page), a stray
+        document nobody asked for (definitely such a control plane — none
+        of its answers are trustworthy), or a 403 (a least-privilege
+        `read:text`-only key; browse is search-scoped)."""
+        requested = list(dict.fromkeys(str(id) for id in ids))
         texts: dict[str, str] = {}
-        for start in range(0, len(ids), 100):
-            batch = [str(id) for id in ids[start : start + 100]]
+        for start in range(0, len(requested), 100):
+            batch = requested[start : start + 100]
             wanted = set(batch)
             try:
                 page = self.browse(ids=batch, include_text=True)
@@ -520,11 +522,24 @@ class CloudStore:
                 # endpoint is exactly what `read:text` grants — and if the
                 # 403 was about text access itself, the fallback's first
                 # request surfaces the same actionable refusal.
-                return self._get_texts_by_id(ids)
+                return self._get_texts_by_id(requested)
+            if any(doc.get("id") not in wanted for doc in page):
+                # A document nobody asked for: this control plane ignored
+                # the allowlist and answered a plain page.
+                return self._get_texts_by_id(requested)
             for doc in page:
-                text = doc.get("text")
-                if doc.get("id") in wanted and text is not None:
-                    texts[doc["id"]] = text
+                if doc.get("text") is not None:
+                    texts[doc["id"]] = doc["text"]
+        # Exactness: confirm every unanswered id through the text endpoint.
+        # On a current control plane this costs one request per id that is
+        # genuinely absent (or TTL-hidden — which the endpoint, like the old
+        # per-id path, still answers); on an older one it recovers the ids
+        # its truncated page left out.
+        for id in requested:
+            if id not in texts:
+                text = self.get(id)
+                if text is not None:
+                    texts[id] = text
         return texts
 
     def _get_texts_by_id(self, ids: list[str]) -> dict[str, str]:
