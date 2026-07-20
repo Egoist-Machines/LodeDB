@@ -276,6 +276,13 @@ writer holds it. Construct one writable handle per path and share it (it is safe
 multiple threads; calls are serialized internally). See the README
 [Concurrency and durability](../README.md#concurrency--durability) section for the durability model.
 
+Read-only handles are also cheaper to hold than writable ones: they skip the open-time
+dequantization of the committed vectors and serve queries from the quantized index (and the
+original-precision rescore sidecar, when configured), so a read-only open neither pays the
+full-corpus f32 reconstruction nor keeps those copies resident. A serving tier that opens one
+read-only handle per tenant should expect memory to scale with the quantized index, not with
+`chunks x dim x 4` bytes.
+
 ### The index directory is LodeDB-owned
 
 A LodeDB path is a directory of files LodeDB manages (`.tvim` / `.tvd` / `.tvtext` / `.tvlex` / WAL /

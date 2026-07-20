@@ -1123,9 +1123,10 @@ impl CoreEngine {
     }
 
     /// Whether the ANN cluster index is currently resident in memory for an index
-    /// (adopted from a persisted `.tvann` sidecar on open, or built by a prior
-    /// query). Returns `false` when it is not resident — a later ANN query builds
-    /// it — or when the index is exact. Observability; does not trigger a build.
+    /// (adopted from a persisted `.tvann` sidecar on a writable/eager open, or
+    /// built by a prior query). Returns `false` when it is not resident — a later
+    /// ANN query builds it, adopting a lazy open's deferred sidecar assignment
+    /// first — or when the index is exact. Observability; does not trigger a build.
     pub fn ann_cluster_resident(&self, index_id: &str) -> Result<bool, CoreError> {
         let index = self.index(index_id)?;
         Ok(index.cluster_index.borrow().is_some())
@@ -1168,6 +1169,9 @@ impl CoreEngine {
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
         let index = self.index(index_id)?;
+        // The scalar scan dots the query against the resident f32 vectors; on a
+        // lazy handle those are empty and every score would silently be 0.0.
+        index.require_vectors_resident()?;
         let rotated_query;
         let query = if let Some(rotation) = &index.query_rotation {
             rotated_query = rotate_query(query_vector, rotation, index.vector_dim)?;
@@ -2319,7 +2323,11 @@ impl CoreEngine {
                         // in place.
                         let base_generation = loaded.generation;
                         let index =
-                            index_from_loaded_store(loaded, persistence_chunk_character_limit)?;
+                            index_from_loaded_store(
+                                loaded,
+                                persistence_chunk_character_limit,
+                                persistence_read_only,
+                            )?;
                         let index_id = index.index_id.clone();
                         self.indexes.insert(index_id.clone(), index);
                         self.replaying_wal = true;
@@ -2380,7 +2388,11 @@ impl CoreEngine {
                     }
                 }
             }
-            let index = index_from_loaded_store(loaded, persistence_chunk_character_limit)?;
+            let index = index_from_loaded_store(
+                loaded,
+                persistence_chunk_character_limit,
+                persistence_read_only,
+            )?;
             self.indexes.insert(index.index_id.clone(), index);
         }
         Ok(())
@@ -3402,6 +3414,7 @@ impl CoreCheckpointer {
 fn index_from_loaded_store(
     loaded: crate::storage::LoadedStore,
     chunk_character_limit: usize,
+    lazy_vectors: bool,
 ) -> Result<VectorOnlyIndex, CoreError> {
     let state = loaded
         .state
@@ -3439,8 +3452,19 @@ fn index_from_loaded_store(
         .cloned()
         .unwrap_or_default();
     let mut documents = BTreeMap::new();
-    let chunk_vectors = reconstruct_tvim_vectors(&loaded, vector_dim)?;
-    let vectors_seeded = loaded.chunk_count() == 0 || chunk_vectors.is_some();
+    // Lazy residency applies only when a committed `.tvim` exists: the serving
+    // index loads from it directly, so the open-time full-corpus dequantization
+    // (and its N*dim*4-byte f32 copy held for the handle's lifetime) is skipped.
+    // Stores without a tvim keep the eager path: they need the reconstruct
+    // outcome to decide `vectors_seeded` and to rebuild a serving index from
+    // documents.
+    let lazy_vectors = lazy_vectors && loaded.tvim_path.is_some() && loaded.chunk_count() > 0;
+    let chunk_vectors = if lazy_vectors {
+        None
+    } else {
+        reconstruct_tvim_vectors(&loaded, vector_dim)?
+    };
+    let vectors_seeded = loaded.chunk_count() == 0 || chunk_vectors.is_some() || lazy_vectors;
     let (chunk_vectors, query_rotation) = chunk_vectors
         .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
         .unwrap_or_default();
@@ -3468,10 +3492,16 @@ fn index_from_loaded_store(
             .filter_map(Value::as_str)
             .map(|chunk_id| ChunkRecord {
                 chunk_id: chunk_id.to_string(),
-                vector: chunk_vectors
-                    .get(chunk_id)
-                    .cloned()
-                    .unwrap_or_else(|| vec![0.0; vector_dim]),
+                // Lazy handles keep the vector empty (non-resident) rather than
+                // zero-filled: an explicit "absent" the guarded consumers refuse,
+                // instead of a plausible-looking all-zeros row.
+                vector: chunk_vectors.get(chunk_id).cloned().unwrap_or_else(|| {
+                    if lazy_vectors {
+                        Vec::new()
+                    } else {
+                        vec![0.0; vector_dim]
+                    }
+                }),
             })
             .collect();
         let token_lists = loaded
@@ -3506,16 +3536,31 @@ fn index_from_loaded_store(
     let lexical_index = lexical_index_for_documents(&documents);
     let (field_indexes, all_docs) = filter_indexes_for_documents(&documents);
     let chunk_owner_by_id = chunk_owner_by_id_for_documents(&documents);
-    let vector_chunks = vector_chunks_for_documents(&documents);
+    // The load only needs (chunk_id, document_id) pairs -- never embeddings --
+    // so both open modes skip cloning the per-chunk vectors here.
+    let chunk_document_ids = documents
+        .iter()
+        .flat_map(|(document_id, record)| {
+            record
+                .chunks
+                .iter()
+                .map(|chunk| (chunk.chunk_id.clone(), document_id.clone()))
+        })
+        .collect::<Vec<_>>();
     let vector_index = match loaded.tvim_path.as_ref() {
-        Some(tvim_path) if vectors_seeded => Some(TurboVecNativeIndex::load_with_manifest(
+        Some(tvim_path) if vectors_seeded => Some(TurboVecNativeIndex::load_with_manifest_ids(
             tvim_path,
             loaded.tvim_manifest.as_ref(),
-            &vector_chunks,
+            &chunk_document_ids,
+            vector_dim,
             loaded.generation,
         )?),
         _ => None,
     };
+    // A lazy handle keeps no query rotation: its only consumer is the scalar-scan
+    // fallback, which require_vectors_resident already refuses, so the dim*dim*4
+    // copy would be dead weight per open store.
+    let query_rotation = if lazy_vectors { None } else { query_rotation };
     // Native owns the generation store as the write-through writer, so it keeps the
     // loaded base epoch and calibration and appends further deltas onto that base
     // across reopens (no co-writer to invalidate it). It opens with no pending
@@ -3588,6 +3633,7 @@ fn index_from_loaded_store(
         applied_lsn: loaded.applied_lsn,
         persisted_applied_lsn: loaded.applied_lsn,
         vectors_seeded,
+        vectors_resident: !lazy_vectors,
         query_rotation,
         delete_count: state
             .get("delete_count")
@@ -3616,6 +3662,7 @@ fn index_from_loaded_store(
         drop_tvvf_manifest: false,
         force_base_rewrite: false,
         cluster_index: RefCell::new(None),
+        pending_persisted_ann: RefCell::new(None),
         field_indexes,
         all_docs,
         chunk_owner_by_id,
@@ -3635,8 +3682,10 @@ fn index_from_loaded_store(
     // reconstructed vector can overwrite the original-precision tvvf sidecar.
     // Adopt a persisted cluster assignment when it is still valid; otherwise the
     // first ANN query rebuilds it. This skips the k-means rebuild after a clean
-    // reopen without ever trusting a stale sidecar.
-    index.install_persisted_ann(loaded.ann, base_calibration_fingerprint);
+    // reopen without ever trusting a stale sidecar. Lazy opens defer the
+    // adoption itself (it reconstructs every row to recompute centroids) to the
+    // first ANN query.
+    index.install_persisted_ann(loaded.ann, base_calibration_fingerprint, lazy_vectors);
     Ok(index)
 }
 
@@ -3665,23 +3714,6 @@ fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> 
         lexical_index.replace_group(document_id, &units);
     }
     lexical_index
-}
-
-fn vector_chunks_for_documents(
-    documents: &BTreeMap<String, DocumentRecord>,
-) -> Vec<CoreVectorChunk> {
-    documents
-        .iter()
-        .flat_map(|(document_id, record)| {
-            record.chunks.iter().map(|chunk| {
-                CoreVectorChunk::new(
-                    chunk.chunk_id.clone(),
-                    document_id.clone(),
-                    chunk.vector.clone(),
-                )
-            })
-        })
-        .collect()
 }
 
 fn filter_indexes_for_documents(
@@ -4948,6 +4980,15 @@ struct VectorOnlyIndex {
     /// truncation is gated on `persisted_applied_lsn >= applied_lsn`.
     persisted_applied_lsn: u64,
     vectors_seeded: bool,
+    /// Whether full-precision chunk vectors are resident in `documents`. A lazily
+    /// loaded read-only handle skips the open-time `.tvim` dequantization and
+    /// leaves every `ChunkRecord.vector` empty: queries run on the quantized
+    /// serving index (and the tvvf sidecar for rescore), so the f32 copies are
+    /// dead weight there. Persist paths need them, but a read-only handle can
+    /// never persist. Guarded paths (the scalar-scan fallback and the
+    /// build-from-documents recovery of the serving index) fail closed on a
+    /// non-resident handle instead of computing over empty vectors.
+    vectors_resident: bool,
     query_rotation: Option<Vec<f32>>,
     delete_count: usize,
     deleted_chunk_count: usize,
@@ -4986,6 +5027,11 @@ struct VectorOnlyIndex {
     /// "dirty, rebuild on the next ANN query". Interior mutability keeps the
     /// query path read-only, mirroring `vector_index`.
     cluster_index: RefCell<Option<ClusterIndex>>,
+    /// A gate-checked `.tvann` assignment a lazy read-only open stashed instead
+    /// of materializing (centroid recompute reconstructs every row). The first
+    /// ANN query or `ann_warm` adopts it; any vector mutation clears it together
+    /// with `cluster_index` so a stale assignment is never adopted.
+    pending_persisted_ann: RefCell<Option<crate::storage::tvann_store::LoadedAnn>>,
     field_indexes: BTreeMap<String, FieldIndex>,
     all_docs: DocSet,
     chunk_owner_by_id: HashMap<String, String>,
@@ -5129,6 +5175,7 @@ impl VectorOnlyIndex {
             applied_lsn: 0,
             persisted_applied_lsn: 0,
             vectors_seeded: true,
+            vectors_resident: true,
             query_rotation: None,
             delete_count: 0,
             deleted_chunk_count: 0,
@@ -5145,6 +5192,7 @@ impl VectorOnlyIndex {
             drop_tvvf_manifest: false,
             force_base_rewrite: false,
             cluster_index: RefCell::new(None),
+            pending_persisted_ann: RefCell::new(None),
             field_indexes: BTreeMap::new(),
             all_docs: DocSet::new(),
             chunk_owner_by_id: HashMap::new(),
@@ -5175,6 +5223,21 @@ impl VectorOnlyIndex {
         self.require_vectors_seeded()
     }
 
+    /// Fails closed on a lazily loaded handle whose full-precision vectors were
+    /// never made resident. The paths that need them (the scalar-scan fallback,
+    /// rebuilding a serving index from documents) would otherwise compute over
+    /// the empty placeholder vectors and return silently wrong results.
+    fn require_vectors_resident(&self) -> Result<(), CoreError> {
+        if !self.vectors_resident {
+            return Err(CoreError::new(
+                CoreErrorCode::Unsupported,
+                "full-precision vectors are not resident on this read-only handle; \
+                 the operation needs a writable (or eagerly loaded) open",
+            ));
+        }
+        Ok(())
+    }
+
     fn sync_vector_index_upsert(&mut self, chunks: &[CoreVectorChunk]) -> Result<(), CoreError> {
         // Build the live index on first use from all current documents (which
         // already include these chunks), then maintain it incrementally. It must
@@ -5182,6 +5245,9 @@ impl VectorOnlyIndex {
         // of truth for both the base write and the tvim deltas; otherwise a delta
         // built against a separately-calibrated index would be rejected on replay.
         let built_now = if self.vector_index.borrow().is_none() {
+            // Same residency rule as `turbovec_index`: never rebuild the serving
+            // index from a lazy handle's empty placeholder vectors.
+            self.require_vectors_resident()?;
             let built = TurboVecNativeIndex::build(
                 &self.vector_chunks(),
                 self.vector_dim,
@@ -5255,6 +5321,7 @@ impl VectorOnlyIndex {
             }
             self.pending_vectors_changed = true;
             self.cluster_index.get_mut().take();
+            self.pending_persisted_ann.get_mut().take();
         }
         Ok(())
     }
@@ -5292,6 +5359,7 @@ impl VectorOnlyIndex {
         // linger in a stale posting; the next ANN query rebuilds from live rows.
         self.pending_vectors_changed = true;
         self.cluster_index.get_mut().take();
+        self.pending_persisted_ann.get_mut().take();
     }
 
     fn add_document_indexes(
@@ -5745,6 +5813,16 @@ impl VectorOnlyIndex {
         if self.ann_options.is_none() || self.cluster_index.borrow().is_some() {
             return Ok(());
         }
+        // Adopt a deferred persisted assignment (stashed by a lazy read-only
+        // open) before falling back to a fresh k-means build. The borrow is
+        // dropped before adoption, which re-borrows sibling RefCells.
+        let pending = self.pending_persisted_ann.borrow_mut().take();
+        if let Some(loaded) = pending {
+            self.adopt_persisted_ann(loaded);
+            if self.cluster_index.borrow().is_some() {
+                return Ok(());
+            }
+        }
         let Some(source) = self.cluster_source_rows()? else {
             return Ok(());
         };
@@ -5816,6 +5894,7 @@ impl VectorOnlyIndex {
         &self,
         loaded: Option<crate::storage::tvann_store::LoadedAnn>,
         base_fingerprint: u64,
+        defer: bool,
     ) {
         let Some(loaded) = loaded else {
             return;
@@ -5832,6 +5911,24 @@ impl VectorOnlyIndex {
         {
             return;
         }
+        // Materializing centroids reconstructs every TurboVec row, which is the
+        // exact open-time cost a lazy read-only open exists to avoid. Stash the
+        // validated assignment instead; the first ANN query (or `ann_warm`)
+        // adopts it. Writable opens stay eager: persist reads the resident
+        // cluster to carry the `.tvann` sidecar forward, so deferring there
+        // would silently drop it on the next base rewrite.
+        if defer {
+            *self.pending_persisted_ann.borrow_mut() = Some(loaded);
+            return;
+        }
+        self.adopt_persisted_ann(loaded);
+    }
+
+    /// Materializes a gate-checked persisted cluster assignment: recomputes
+    /// centroids over the live rows and installs the cluster index. A stale
+    /// assignment (rows changed since the sidecar was written) installs nothing,
+    /// leaving the fresh-build path to serve the next ANN query.
+    fn adopt_persisted_ann(&self, loaded: crate::storage::tvann_store::LoadedAnn) {
         // Cluster over the same reconstructed rows (and rotation) a fresh build
         // uses, so an adopted assignment recomputes bit-identical centroids and its
         // stable-id postings are grouped from the live rows. The caller owns the
@@ -6159,6 +6256,11 @@ impl VectorOnlyIndex {
         {
             let mut cached = self.vector_index.borrow_mut();
             if cached.is_none() {
+                // Building from documents needs resident f32 vectors; a lazy
+                // handle always loads the serving index from its tvim at open,
+                // so reaching this rebuild without one is a fail-closed error,
+                // not a quantize-empty-rows corruption.
+                self.require_vectors_resident()?;
                 *cached = Some(TurboVecNativeIndex::build(
                     &self.vector_chunks(),
                     self.vector_dim,

@@ -109,10 +109,45 @@ impl TurboVecNativeIndex {
     }
 
     /// Loads a `.tvim` index, replays committed `.tvd` deltas, and attaches metadata.
+    ///
+    /// Only the chunk/document ids of `chunks` are read; the embeddings stay
+    /// untouched (the loaded index already holds the quantized rows).
     pub fn load_with_manifest(
         path: impl AsRef<Path>,
         manifest: Option<&Value>,
         chunks: &[CoreVectorChunk],
+        generation: u64,
+    ) -> Result<Self, CoreError> {
+        let ids = chunks
+            .iter()
+            .map(|chunk| (chunk.chunk_id.clone(), chunk.document_id.clone()))
+            .collect::<Vec<_>>();
+        Self::load_with_manifest_core(path, manifest, &ids, None, generation)
+    }
+
+    /// [`Self::load_with_manifest`] over bare `(chunk_id, document_id)` pairs, so a
+    /// caller that holds no embeddings (the lazy read-only open) never materializes
+    /// placeholder chunk structs. `expected_dim` is the committed state's
+    /// `native_dim`: the eager path cross-checks it while reconstructing, so the
+    /// reconstruction-free load must enforce it here.
+    pub fn load_with_manifest_ids(
+        path: impl AsRef<Path>,
+        manifest: Option<&Value>,
+        chunk_document_ids: &[(String, String)],
+        expected_dim: usize,
+        generation: u64,
+    ) -> Result<Self, CoreError> {
+        Self::load_with_manifest_core(path, manifest, chunk_document_ids, Some(expected_dim), generation)
+    }
+
+    /// The shared load body. `expected_dim` is `None` only for the legacy
+    /// chunk-struct entry point, whose engine callers validate the dimension via
+    /// reconstruction on their own eager path.
+    fn load_with_manifest_core(
+        path: impl AsRef<Path>,
+        manifest: Option<&Value>,
+        chunk_document_ids: &[(String, String)],
+        expected_dim: Option<usize>,
         generation: u64,
     ) -> Result<Self, CoreError> {
         let started = Instant::now();
@@ -120,15 +155,49 @@ impl TurboVecNativeIndex {
         let native_dim = index.dim();
         let bit_width = index.bit_width();
         validate_config(native_dim, bit_width)?;
-        let chunk_ids = chunks
+        if let Some(expected_dim) = expected_dim {
+            if native_dim != expected_dim {
+                return Err(CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "persisted TurboVec dimension does not match the committed state",
+                ));
+            }
+        }
+        let chunk_ids = chunk_document_ids
             .iter()
-            .map(|chunk| chunk.chunk_id.clone())
+            .map(|(chunk_id, _)| chunk_id.clone())
             .collect::<Vec<_>>();
         let stable_ids = stable_uint64_ids_for_chunk_ids(&chunk_ids);
-        index.prepare();
-        Ok(Self::from_parts(
+        // Reconstruction used to touch every committed row at open, so a
+        // checksum-valid generation whose `.tvim` disagreed with the JSON state
+        // failed there. Loads no longer reconstruct, so enforce the same
+        // fail-closed contract with O(chunks) id-map probes: every state chunk
+        // must be a loaded row and no extra rows may exist. This must not wait
+        // for query time -- the allowlist scan's kernel contract panics on
+        // unknown stable ids.
+        if index.len() != stable_ids.len() {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "persisted TurboVec row count does not match the committed state's chunks",
+            ));
+        }
+        for stable_id in &stable_ids {
+            if !index.contains(*stable_id) {
+                return Err(CoreError::new(
+                    CoreErrorCode::CorruptStore,
+                    "committed state lists a chunk absent from the persisted TurboVec index",
+                ));
+            }
+        }
+        // No eager prepare(): the kernel materializes the SIMD-blocked layout
+        // lazily on the first search (OnceLock), so a load skips an O(rows*dim)
+        // repack that the first mutation would invalidate anyway. This keeps
+        // apply-and-persist opens (the cloud fold, checkpointers) from paying a
+        // scan-cache build they never query; `build` keeps its eager prepare for
+        // the cold-build/compaction path, which serves queries immediately.
+        Ok(Self::from_id_parts(
             index,
-            chunks,
+            chunk_document_ids,
             &stable_ids,
             native_dim,
             bit_width,
@@ -626,13 +695,37 @@ impl TurboVecNativeIndex {
         generation: u64,
         build_seconds: f64,
     ) -> Self {
+        let ids = chunks
+            .iter()
+            .map(|chunk| (chunk.chunk_id.clone(), chunk.document_id.clone()))
+            .collect::<Vec<_>>();
+        Self::from_id_parts(
+            index,
+            &ids,
+            stable_ids,
+            dim,
+            bit_width,
+            generation,
+            build_seconds,
+        )
+    }
+
+    fn from_id_parts(
+        index: IdMapIndex,
+        chunk_document_ids: &[(String, String)],
+        stable_ids: &[u64],
+        dim: usize,
+        bit_width: usize,
+        generation: u64,
+        build_seconds: f64,
+    ) -> Self {
         let mut chunk_ids_by_stable_id = BTreeMap::new();
         let mut document_ids_by_stable_id = BTreeMap::new();
         let mut stable_id_by_chunk_id = BTreeMap::new();
-        for (stable_id, chunk) in stable_ids.iter().zip(chunks) {
-            chunk_ids_by_stable_id.insert(*stable_id, chunk.chunk_id.clone());
-            document_ids_by_stable_id.insert(*stable_id, chunk.document_id.clone());
-            stable_id_by_chunk_id.insert(chunk.chunk_id.clone(), *stable_id);
+        for (stable_id, (chunk_id, document_id)) in stable_ids.iter().zip(chunk_document_ids) {
+            chunk_ids_by_stable_id.insert(*stable_id, chunk_id.clone());
+            document_ids_by_stable_id.insert(*stable_id, document_id.clone());
+            stable_id_by_chunk_id.insert(chunk_id.clone(), *stable_id);
         }
         Self {
             index,

@@ -5908,3 +5908,144 @@ fn discard_drops_unpersisted_folds_and_releases_the_writer_lock() {
     drop(survivor);
     fs::remove_dir_all(&path).unwrap();
 }
+
+#[test]
+fn readonly_lazy_open_serves_identical_hits_to_writable() {
+    // A read-only open skips the open-time f32 reconstruction (lazy vector
+    // residency) and serves queries purely from the loaded quantized index.
+    // Its results must be identical to a writable (eager) open of the same
+    // committed store, including under a metadata filter.
+    let path = unique_temp_dir("core_readonly_lazy_parity");
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors(
+                "default",
+                &[
+                    doc("a", 0, metadata(&[("topic", "ops")])),
+                    doc("b", 1, metadata(&[("topic", "ml")])),
+                    doc("c", 2, metadata(&[("topic", "ops")])),
+                    doc("d", 3, metadata(&[("topic", "ml")])),
+                ],
+            )
+            .unwrap();
+        engine.persist().unwrap();
+        engine.close().unwrap();
+    }
+
+    let writable = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
+    let readonly =
+        CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
+    let query = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let filter = json!({"metadata": {"topic": "ml"}});
+    for filter in [None, Some(&filter)] {
+        let eager = writable.query_vector("default", &query, 4, filter).unwrap();
+        let lazy = readonly.query_vector("default", &query, 4, filter).unwrap();
+        assert_eq!(eager.hits.len(), lazy.hits.len());
+        for (eager_hit, lazy_hit) in eager.hits.iter().zip(&lazy.hits) {
+            assert_eq!(eager_hit.document_id, lazy_hit.document_id);
+            assert_eq!(eager_hit.chunk_id, lazy_hit.chunk_id);
+            assert!((eager_hit.score - lazy_hit.score).abs() < 1e-6);
+        }
+    }
+    drop(writable);
+    fs::remove_dir_all(&path).unwrap();
+}
+
+#[test]
+fn readonly_lazy_refresh_folds_wal_adds_and_replacements() {
+    // The WAL overlay on a lazily loaded reader mutates the serving index only
+    // with WAL-carried vectors, so appends and replacements folded by refresh()
+    // must query correctly even though the reader holds no resident f32 copies.
+    let path = unique_temp_dir("core_readonly_lazy_overlay");
+    let mut writer_opts = open_options(&path, false, "wal");
+    writer_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(writer_opts.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors(
+                "default",
+                &[doc("a", 0, metadata(&[])), doc("b", 1, metadata(&[]))],
+            )
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    {
+        let appender = CoreAppender::open(writer_opts).expect("open appender");
+        // A fresh document and a replacement that moves "a" from axis 0 to 3.
+        appender
+            .append_vectors(&[doc("c", 2, metadata(&[]))])
+            .expect("append add");
+        appender
+            .append_vectors(&[doc("a", 3, metadata(&[]))])
+            .expect("append replacement");
+    }
+
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    reader.refresh().unwrap();
+    assert_eq!(reader.stats("default").unwrap().document_count, 3);
+
+    let top_hit = |axis: usize| {
+        let mut query = [0.0f32; 8];
+        query[axis] = 1.0;
+        let results = reader.query_vector("default", &query, 1, None).unwrap();
+        (
+            results.hits[0].document_id.clone(),
+            results.hits[0].score,
+        )
+    };
+    assert_eq!(top_hit(2).0, "c", "appended document must be searchable");
+    assert_eq!(top_hit(3).0, "a", "replacement vector must win its new axis");
+    let (stale_doc, stale_score) = top_hit(0);
+    assert!(
+        stale_doc != "a" || stale_score < 0.5,
+        "replaced vector must not keep scoring on its old axis"
+    );
+    fs::remove_dir_all(&path).unwrap();
+}
+
+#[test]
+fn readonly_lazy_open_defers_tvann_adoption_to_first_ann_query() {
+    // A lazy read-only open must not materialize the persisted `.tvann` cluster
+    // (its centroid recompute reconstructs every row -- the open-time cost lazy
+    // residency removes). The assignment is adopted on the first ANN query
+    // instead, serving the same hits as a writable (eager-adopting) open.
+    let path = unique_temp_dir("core_ann_lazy_adopt");
+    {
+        let mut engine = ann_durable(&path);
+        engine.upsert_vectors("default", &blob_docs()).unwrap();
+        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        engine.persist().unwrap();
+        assert!(has_file_with_ext(&path, "tvann"));
+        drop(engine);
+    }
+
+    let reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert!(
+        !reader.ann_cluster_resident("default").unwrap(),
+        "a lazy read-only open must defer .tvann adoption, not materialize it"
+    );
+    let lazy_hits = reader
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert!(
+        reader.ann_cluster_resident("default").unwrap(),
+        "the first ANN query must adopt the deferred assignment"
+    );
+
+    let writable = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+    assert!(writable.ann_cluster_resident("default").unwrap());
+    let eager_hits = writable
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
+    assert_eq!(lazy_hits.hits.len(), eager_hits.hits.len());
+    for (lazy, eager) in lazy_hits.hits.iter().zip(&eager_hits.hits) {
+        assert_eq!(lazy.document_id, eager.document_id);
+        assert!((lazy.score - eager.score).abs() < 1e-6);
+    }
+    drop(writable);
+    drop(reader);
+    fs::remove_dir_all(path).unwrap();
+}

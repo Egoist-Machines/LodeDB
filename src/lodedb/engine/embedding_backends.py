@@ -7,6 +7,7 @@ import io
 import logging
 import math
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,10 @@ class SentenceTransformerEmbeddingBackend:
         self.query_prefix = query_prefix
         self.document_prefix = document_prefix
         self._model: object | None = None
+        # Backends are shared across threads (one per preset per process in
+        # serving tiers); the lock keeps concurrent first embeds from building
+        # duplicate models.
+        self._load_lock = threading.Lock()
 
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Embeds document chunks with the configured local model and document prefix."""
@@ -124,12 +129,14 @@ class SentenceTransformerEmbeddingBackend:
         """Loads the SentenceTransformers model lazily to keep tests dependency-light."""
 
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._load_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
 
-            model = SentenceTransformer(self.model_name, device=self.device)
-            if self.max_seq_length is not None:
-                model.max_seq_length = int(self.max_seq_length)
-            self._model = model
+                    model = SentenceTransformer(self.model_name, device=self.device)
+                    if self.max_seq_length is not None:
+                        model.max_seq_length = int(self.max_seq_length)
+                    self._model = model
         return self._model
 
 
@@ -283,6 +290,8 @@ class CompiledTorchEmbeddingBackend:
         self._model: object | None = None
         self._tokenizer: object | None = None
         self._compiled = False
+        # Shared across threads in serving tiers; guards both lazy loads.
+        self._load_lock = threading.Lock()
 
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Embeds document chunks with the configured document prefix."""
@@ -344,6 +353,14 @@ class CompiledTorchEmbeddingBackend:
 
     def _load_model(self) -> object:
         """Loads, fuses (encoder + pool + norm), and compiles the encoder lazily."""
+
+        if self._model is not None:
+            return self._model
+        with self._load_lock:
+            return self._locked_load_model()
+
+    def _locked_load_model(self) -> object:
+        """The single-threaded body of `_load_model`; caller holds `_load_lock`."""
 
         if self._model is not None:
             return self._model
@@ -438,13 +455,15 @@ class CompiledTorchEmbeddingBackend:
         """Loads the Hugging Face tokenizer lazily to avoid import cost on a plain import."""
 
         if self._tokenizer is None:
-            try:
-                from transformers import AutoTokenizer
-            except ImportError as exc:  # pragma: no cover - optional runtime
-                raise RuntimeError(
-                    "transformers is required to tokenize for the torch-compile runtime."
-                ) from exc
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            with self._load_lock:
+                if self._tokenizer is None:
+                    try:
+                        from transformers import AutoTokenizer
+                    except ImportError as exc:  # pragma: no cover - optional runtime
+                        raise RuntimeError(
+                            "transformers is required to tokenize for the torch-compile runtime."
+                        ) from exc
+                    self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         return self._tokenizer
 
 
@@ -488,6 +507,8 @@ class ClipEmbeddingBackend:
         self.device = device
         self.batch_size = batch_size
         self._model: object | None = None
+        # Shared across threads in serving tiers; guards the lazy model load.
+        self._load_lock = threading.Lock()
 
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Embeds text chunks into the shared CLIP space."""
@@ -535,9 +556,11 @@ class ClipEmbeddingBackend:
         """Loads the sentence-transformers CLIP model lazily."""
 
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._load_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+                    self._model = SentenceTransformer(self.model_name, device=self.device)
         return self._model
 
     @staticmethod
@@ -675,6 +698,8 @@ class ONNXRuntimeEmbeddingBackend:
         self.output_name = output_name
         self._session: object | None = None
         self._tokenizer: object | None = None
+        # Shared across threads in serving tiers; guards both lazy loads.
+        self._load_lock = threading.Lock()
 
     def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
         """Embeds document chunks with the configured document prefix."""
@@ -747,31 +772,35 @@ class ONNXRuntimeEmbeddingBackend:
         """Loads the ONNX Runtime session lazily so a plain import never needs it."""
 
         if self._session is None:
-            try:
-                import onnxruntime as ort
-            except ImportError as exc:  # pragma: no cover - optional runtime
-                raise RuntimeError(
-                    "onnxruntime is required for the ONNX embedding runtime "
-                    "(install it, or use a runtime that falls back to torch)."
-                ) from exc
-            _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
-            self._session = ort.InferenceSession(
-                str(self.onnx_model_path),
-                providers=list(self.providers),
-            )
+            with self._load_lock:
+                if self._session is None:
+                    try:
+                        import onnxruntime as ort
+                    except ImportError as exc:  # pragma: no cover - optional runtime
+                        raise RuntimeError(
+                            "onnxruntime is required for the ONNX embedding runtime "
+                            "(install it, or use a runtime that falls back to torch)."
+                        ) from exc
+                    _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
+                    self._session = ort.InferenceSession(
+                        str(self.onnx_model_path),
+                        providers=list(self.providers),
+                    )
         return self._session
 
     def _load_tokenizer(self) -> object:
         """Loads the Hugging Face tokenizer lazily to avoid import cost on a plain import."""
 
         if self._tokenizer is None:
-            try:
-                from transformers import AutoTokenizer
-            except ImportError as exc:  # pragma: no cover - optional runtime
-                raise RuntimeError(
-                    "transformers is required to tokenize for the ONNX embedding runtime."
-                ) from exc
-            self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
+            with self._load_lock:
+                if self._tokenizer is None:
+                    try:
+                        from transformers import AutoTokenizer
+                    except ImportError as exc:  # pragma: no cover - optional runtime
+                        raise RuntimeError(
+                            "transformers is required to tokenize for the ONNX embedding runtime."
+                        ) from exc
+                    self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
         return self._tokenizer
 
 
