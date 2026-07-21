@@ -303,6 +303,7 @@ class LodeDB:
         rescore_oversample: float | None = None,
         compression: bool = True,
         read_only: bool = False,
+        discard_at_exit: bool = False,
         durability: str | None = None,
         commit_mode: str | None = None,
         route_registry_path: str | Path | None = None,
@@ -435,11 +436,22 @@ class LodeDB:
         rescoring, so changing any of these means a fresh path and a reindex, not an
         in-place conversion (a vector-only path, for one, cannot be reopened as a
         text-in preset index).
+        ``discard_at_exit=True`` marks a writable handle for the interpreter-exit
+        teardown hook to :meth:`discard` rather than :meth:`close`: un-persisted
+        state is dropped, not committed, when the process exits without an
+        explicit close. For a handle that serves a copy whose only publisher is
+        elsewhere (a caching tier applying provisional writes on top of a pushed
+        snapshot), an implicit exit must never become an implicit commit. An
+        explicit :meth:`close` still persists.
         ``_embedding_backend`` is an internal hook for tests/fixtures.
         """
 
         self.path = Path(path)
         self.store_text = bool(store_text)
+        # Exit disposition for the pre-worker-join teardown hook (see
+        # _close_open_native_dbs_at_exit); explicit close()/discard() calls
+        # are unaffected.
+        self._discard_at_exit = bool(discard_at_exit)
         # index_text defaults to match store_text: retaining text also persists its
         # lexical index (so hybrid/lexical are ready out of the box), and opting out
         # of text retention also opts out of persisting tokens (store_text=False keeps
@@ -2423,13 +2435,19 @@ def _close_open_native_dbs_at_exit() -> None:
     """Closes every still-open native engine on its home worker before teardown.
 
     Runs before ``concurrent.futures`` joins its worker threads, so each engine's
-    final decref lands on the worker that created it. ``close()`` is idempotent and
-    detaches the GC finalizer, so a handle the caller already closed is a no-op.
+    final decref lands on the worker that created it. A handle opened with
+    ``discard_at_exit=True`` is discarded instead of closed: the hook exists for
+    teardown hygiene, and it must not turn a process exit into an implicit commit
+    for a handle whose owner never persists. Both paths are idempotent and detach
+    the GC finalizer, so a handle the caller already closed is a no-op.
     """
 
     for db in list(_OPEN_NATIVE_DBS):
         try:
-            db.close()
+            if getattr(db, "_discard_at_exit", False):
+                db.discard()
+            else:
+                db.close()
         except Exception:  # noqa: BLE001 - teardown is best effort; never raise at exit
             pass
 
