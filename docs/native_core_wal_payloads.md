@@ -23,7 +23,7 @@ root manifest has been published, so replay after a crash is idempotent.
 
 A WAL *segment* is an immutable standalone blob in exactly the file format
 above (header plus CRC-framed records), produced by `encode_wal_segment` with
-no store open — the building block for out-of-band ingest (see
+no store open, the building block for out-of-band ingest (see
 `lodedb.local.segments`). Two deliberate differences from the on-disk
 `<key>.wal`:
 
