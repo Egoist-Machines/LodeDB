@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""MPS exact scan vs. TurboVec NEON scan — a local Apple-Silicon benchmark.
+"""MPS exact scan vs. TurboVec NEON scan, a local Apple-Silicon benchmark.
 
-Compares the same vendored TurboVec index two ways — no Modal, no CUDA:
+Compares the same vendored TurboVec index two ways (no Modal, no CUDA):
 
-- **NEON**      — TurboVec's native CPU SIMD scan (``index.search(queries, k)``),
+- **NEON**:       TurboVec's native CPU SIMD scan (``index.search(queries, k)``),
                   the default on Mac.
-- **MPS exact** — the opt-in
+- **MPS exact**:  the opt-in
                   :class:`lodedb.engine.mps_turbovec.MpsDirectTurboVecSession`:
                   dequantized fp16 rows resident on the Apple GPU, scored with a
                   batched matmul + ``torch.topk``.

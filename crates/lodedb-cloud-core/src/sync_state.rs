@@ -1,8 +1,8 @@
 //! The sync sidecar: `<dir>/<key>.orecloud`, the recorded base.
 //!
 //! Three-pointer sync needs a durable record of the last state local and
-//! remote agreed on. That record lives *next to* the index it describes — a
-//! small JSON sidecar beside `<key>.commit.json` — because it is a claim about
+//! remote agreed on. That record lives *next to* the index it describes (a
+//! small JSON sidecar beside `<key>.commit.json`) because it is a claim about
 //! this particular local copy's history, not about the remote (two clones of
 //! one remote each carry their own base).
 //!
@@ -20,9 +20,10 @@
 //! The sidecar is written atomically (temp file + rename, the same discipline
 //! as [`LocalArtifactStore`](crate::LocalArtifactStore)'s pointer writes) and
 //! carries a self-checksum over its payload. A torn, tampered, or
-//! half-migrated sidecar therefore reads as *absent-but-corrupt* — which the
-//! classifier maps to [`Unknown`](crate::sync_plan::SyncClassification::Unknown),
-//! requiring an explicit force — rather than as a trusted base.
+//! half-migrated sidecar therefore reads as *absent-but-corrupt*, never as a
+//! trusted base. The classifier maps that to
+//! [`Unknown`](crate::sync_plan::SyncClassification::Unknown), which requires
+//! an explicit force.
 
 use crate::digest::sha256_hex;
 use crate::error::{ArtifactStoreError, Result};
@@ -33,7 +34,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The sidecar file suffix (`<key>.orecloud`). Must never end in `.json` —
+/// The sidecar file suffix (`<key>.orecloud`). Must never end in `.json`;
 /// see the module docs on the engine's legacy-snapshot glob.
 pub const SYNC_STATE_SUFFIX: &str = ".orecloud";
 
@@ -56,7 +57,7 @@ pub struct SyncState {
 /// flag distinguishing "no sidecar" from "a sidecar was present but corrupt".
 ///
 /// Both cases classify the same way (no trusted base -> `Unknown` when the
-/// ends differ), but a frontend should *warn* on corruption — it usually means
+/// ends differ), but a frontend should *warn* on corruption. It usually means
 /// a torn write or manual tampering, not a fresh directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarRead {
@@ -73,7 +74,7 @@ pub fn sync_state_path(dir: &Path, key: &str) -> PathBuf {
 ///
 /// An absent file is `{state: None, corrupt: false}`. Any parse failure,
 /// schema mismatch, checksum mismatch, or an `index_key` that disagrees with
-/// `key` is `{state: None, corrupt: true}` — the base is untrusted, never
+/// `key` is `{state: None, corrupt: true}`; the base is untrusted, never
 /// partially honored. Only genuine I/O failures (permissions etc.) are errors.
 pub fn read_sync_state(dir: &Path, key: &str) -> Result<SidecarRead> {
     let path = resolve_within(dir, &sync_state_path(dir, key))?;
@@ -102,7 +103,7 @@ pub fn read_sync_state(dir: &Path, key: &str) -> Result<SidecarRead> {
 /// Writes the sidecar for `state.index_key` under `dir`, atomically.
 ///
 /// Temp file + rename in the same directory, so a crash mid-write leaves
-/// either the previous sidecar or a stray `.tmp` — never a torn document (and
+/// either the previous sidecar or a stray `.tmp`, never a torn document (and
 /// a torn document would fail its self-checksum anyway).
 pub fn write_sync_state(dir: &Path, state: &SyncState) -> Result<()> {
     let path = resolve_within(dir, &sync_state_path(dir, &state.index_key))?;
@@ -124,7 +125,7 @@ pub fn write_sync_state(dir: &Path, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
-/// The checksummed payload — everything except the `sha256` field itself.
+/// The checksummed payload: everything except the `sha256` field itself.
 ///
 /// Built with one fixed construction order shared by the write path and the
 /// read-side verification, so the serialized bytes (and therefore the digest)

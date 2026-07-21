@@ -140,8 +140,8 @@ The launch figures (rendered by `benchmarks/direct_gpu_sweep/diagrams.py`):
 
 `gpu_scan_ms` is the vector-scan proof (`gpu_stage_one_search_ms`); `batch_latency_ms` is
 end-to-end (it includes query embedding and result hydration); `recall_parity` shows the
-CPU/GPU document-recall gap staying within tolerance. Two more figures — `search_p50_ms`
-and `memory_copy` (host→device transfer) — are in
+CPU/GPU document-recall gap staying within tolerance. Two more figures, `search_p50_ms`
+and `memory_copy` (host→device transfer), are in
 [`benchmarks/direct_gpu_sweep/docs/`](../benchmarks/direct_gpu_sweep/docs).
 
 ## Laptop: embedding throughput + CPU scan latency
@@ -159,23 +159,23 @@ single run (model pre-warmed), embed batch 64. Reproduce with `python benchmarks
 | `mps` | sentence-transformers | **1,393** | 0.25 / 0.41 | 8.42 / 9.58 |
 | `cpu` | sentence-transformers | 836 | 0.22 / 0.25 | **5.73 / 7.68** |
 
-¹ Warm `add_many` throughput — the embedding model is pre-loaded before timing, so this is
+¹ Warm `add_many` throughput: the embedding model is pre-loaded before timing, so this is
 steady state, not the one-time model load. ² The TurboVec scan is the same
-CPU/NEON kernel regardless of embed device, so the ~0.25 ms p50 is consistent across rows —
-this is the database's own work. ³ Embed one query, then scan; this is what interactive,
+CPU/NEON kernel regardless of embed device, so the ~0.25 ms p50 is consistent across rows.
+This is the database's own work. ³ Embed one query, then scan; this is what interactive,
 one-query-at-a-time serving pays.
 
 ![Embedding throughput by device](../benchmarks/laptop/docs/embed_throughput.png)
 
 ![End-to-end query latency by device](../benchmarks/laptop/docs/query_latency.png)
 
-Reading: the **scan is sub-millisecond** and device-independent — that's LodeDB's job, and
+Reading: the **scan is sub-millisecond** and device-independent. That's LodeDB's job, and
 it's fast. **MPS** leads bulk indexing (it's the GPU); for **single queries** the CPU is
 actually a touch faster end-to-end here, because MPS pays a per-call dispatch overhead that
 doesn't amortize over one query. Pick the embed device for your workload and re-measure on
-your own hardware — these are single-run numbers on one machine.
+your own hardware; these are single-run numbers on one machine.
 
-### Apple-GPU (MPS) vector scan — first-class opt-in, off by default
+### Apple-GPU (MPS) vector scan: first-class opt-in, off by default
 
 The MPS exact scan (`lodedb.engine.mps_turbovec`) is selectable via
 `LODEDB_MPS_DIRECT_TURBOVEC=auto|required`: dequantized fp16 rows live resident on the Apple GPU
@@ -195,14 +195,14 @@ launch claim and current GPU-direct policy.
 The optional `[gpu]` extra adds a GPU-resident **exact** scan (`lodedb.engine.gpu_turbovec`):
 every row is reconstructed once to fp16 on the GPU, and query batches are scored with a GEMM
 plus a streaming device-side top-k. The benchmark compares it against the **vanilla TurboVec
-CPU SIMD scan** over the same index — the same comparison the upstream TurboVec repo plots,
+CPU SIMD scan** over the same index. This is the comparison the upstream TurboVec repo plots,
 with the GPU path in place of FAISS.
 
 **Measured** on Modal **A10** and **L40S** (CUDA), 100K vectors, 1,000 queries, k=64, median
 of repeated passes. Recall uses real OpenAI-DBpedia embeddings (d=1536, d=3072) and GloVe-200.
-Reproduce on any CUDA host — see [`../benchmarks/gpu_vanilla_vs_augmented/`](../benchmarks/gpu_vanilla_vs_augmented).
+Reproduce on any CUDA host; see [`../benchmarks/gpu_vanilla_vs_augmented/`](../benchmarks/gpu_vanilla_vs_augmented).
 
-### Search speed — the win is batched
+### Search speed: the win is batched
 
 The GPU path scores via a batched GEMM, so its throughput climbs with batch size while the
 CPU SIMD scan is batch-insensitive. d=1536, 4-bit, 100K, on the A10:
@@ -216,13 +216,13 @@ CPU SIMD scan is batch-insensitive. d=1536, 4-bit, 100K, on the A10:
 | 1024 | 24,037 | **2.8×** |
 
 Crossover is ≈ batch 50. On an **L40S** the same sweep reaches **50,326 q/s at batch 1024 =
-4.8×** the CPU baseline — the advantage scales with GPU class and would go further on an
+4.8×** the CPU baseline. The advantage scales with GPU class and would go further on an
 A100/H100. Single queries and 2-bit codes favor the compact CPU scan (d=1536/2-bit is 0.8×),
 so route single queries to the CPU and batches to the GPU.
 
 ![GPU throughput vs. batch size](../benchmarks/gpu_vanilla_vs_augmented/docs/speed_batch.png)
 
-### Recall — preserved
+### Recall: preserved
 
 R@1-within-top-k, vanilla quantized scan vs. augmented GPU exact-reconstruction:
 
@@ -233,19 +233,19 @@ R@1-within-top-k, vanilla quantized scan vs. augmented GPU exact-reconstruction:
 | glove-200 | 0.556 / 0.559 | 0.834 / **0.844** |
 
 At d=1536/3072 the quantization error is negligible, so exact scoring doesn't move recall. At
-GloVe d=200 — where the error is largest — exact reconstruction helps a little (+0.010 at
+GloVe d=200, where the error is largest, exact reconstruction helps a little (+0.010 at
 4-bit k=1). The GPU path's value is throughput, not a recall jump.
 
 ![Recall: vanilla vs. augmented](../benchmarks/gpu_vanilla_vs_augmented/docs/recall.png)
 
-### Memory — the GPU's cost
+### Memory: the GPU's cost
 
 The throughput is bought with memory: fp16-resident vectors are ~4× the compact codes
 (d=1536, 4-bit: 3,072 vs. 768 bytes/vector).
 
 ![Memory per vector](../benchmarks/gpu_vanilla_vs_augmented/docs/memory.png)
 
-### Update / persist — the CPU delta win
+### Update / persist: the CPU delta win
 
 A separate augmentation, on the CPU side: applying 1,000 changed rows and persisting. The
 vanilla full `.tvim` rewrite is O(N); the encoded-row delta export is O(changed) and stays

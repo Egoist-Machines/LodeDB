@@ -2,7 +2,7 @@
 """Laptop benchmark: embedding throughput + CPU TurboVec scan latency, per device.
 
 Runs the same metrics-only measurement behind ``lodedb benchmark`` for each available
-embedding device (mps / cpu) and writes one combined results JSON. Metrics only —
+embedding device (mps / cpu) and writes one combined results JSON. Metrics only:
 counts, bytes, and latency; never document or query text.
 
     python benchmarks/laptop/run.py --docs 20000 --queries 200

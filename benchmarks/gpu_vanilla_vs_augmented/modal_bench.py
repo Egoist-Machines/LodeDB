@@ -11,7 +11,7 @@ wheel from ``third_party/turbovec/turbovec-python`` (rustup + maturin), installs
 ``cupy-cuda12x``, installs the local ``lodedb`` package, and mounts this benchmark
 directory so the measurement core (``turbovec_vva_bench`` / ``turbovec_vva_runner``,
 dev-only sibling scripts) is importable. The benchmark core also runs directly on
-any CUDA host without Modal — see ``turbovec_vva_runner.py``.
+any CUDA host without Modal (see ``turbovec_vva_runner.py``).
 
 Launch from the repo root (relative image paths resolve there):
 
@@ -37,8 +37,8 @@ import modal
 
 # Runtime libraries the benchmark core needs in the container. ``lodedb.engine``
 # is imported through the top-level ``lodedb`` package, so its declared runtime
-# deps must be present before lodedb is installed with ``--no-deps`` (below) —
-# installing lodedb's deps via PyPI would otherwise pull a stock ``turbovec`` and
+# deps must be present before lodedb is installed with ``--no-deps`` (below).
+# Installing lodedb's deps via PyPI would otherwise pull a stock ``turbovec`` and
 # clobber the patched vendored wheel.
 _LODEDB_RUNTIME_DEPENDENCIES = (
     "numpy>=2.0.0",
@@ -230,7 +230,7 @@ def _prep_and_run(spec: dict, require_backend: str) -> dict:
     """Shared container body: optional host-CPU guard, prep real datasets, run matrix.
 
     ``require_backend`` (e.g. ``"avx512bw"``) makes the call **bail in seconds** if the
-    host's TurboVec CPU kernel is not the requested one — Modal assigns the host CPU, so
+    host's TurboVec CPU kernel is not the requested one. Modal assigns the host CPU, so
     the launcher can relaunch for a fresh host without paying for a full run on the wrong
     baseline. ``""`` or ``"any"`` accepts whatever host.
     """
@@ -273,7 +273,7 @@ def run_benchmark(spec: dict, require_backend: str = "") -> dict:
 
 @app.function(gpu="L40S", cpu=16.0, memory=65536, timeout=3600)
 def run_benchmark_l40s(spec: dict, require_backend: str = "") -> dict:
-    """GPU-ceiling variant on an L40S (48 GB) — shows where the exact-GEMM path pulls ahead."""
+    """GPU-ceiling variant on an L40S (48 GB). Shows where the exact-GEMM path pulls ahead."""
 
     return _prep_and_run(spec, require_backend)
 

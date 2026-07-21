@@ -632,23 +632,23 @@ db.add("the quick brown fox")   # embedded server-side
 db.search("fox", k=5)
 ```
 
-A bare store id is enough — the org/environment half resolves from the
+A bare store id is enough. The org/environment half resolves from the
 credential (`token=`, the `ORECLOUD_TOKEN` environment variable, or
 `lodedb cloud login`); pass the full `"org/environment/store"` triple in
 cross-environment scripts. For config-driven code, where one string field (an
 env var, a YAML value) must express either a local path or a cloud store, the
-plain constructor accepts the explicit URL form —
-`LodeDB("orecloud://org/environment/store")` — and returns the same handle.
+plain constructor accepts the explicit URL form
+`LodeDB("orecloud://org/environment/store")` and returns the same handle.
 An application serving many end users should hold one `Client` and open
-per-user handles from it (`Client().store(user_id)` — one credential
-resolution, one shared HTTP pool); `from lodedb.cloud import Client` works as
-the import root.
+per-user handles from it (`Client().store(user_id)`); the credential resolves
+once and the handles share one HTTP pool. `from lodedb.cloud import Client`
+works as the import root.
 
 Work locally with `lodedb` exactly as before. The client is first-party code
-in this package — `lodedb.cloud` and the `lodedb cloud` CLI, with push/pull/
-sync running on the same bundled native core as the engine — and the extra
-installs only its dependencies (`httpx`, `pynacl`). Everything cloud loads
-lazily, so a plain `import lodedb` stays network-free.
+in this package (`lodedb.cloud` and the `lodedb cloud` CLI), and push/pull/
+sync run on the same bundled native core as the engine. The extra installs
+only its dependencies (`httpx`, `pynacl`). Everything cloud loads lazily, so
+a plain `import lodedb` stays network-free.
 
 ## Concurrency & durability
 
@@ -693,7 +693,7 @@ lazily, so a plain `import lodedb` stays network-free.
   read-your-writes against an append's returned LSN). On Windows the shared lock degrades to an
   exclusive hold, so appenders serialize there rather than coexisting. A record is a precomputed
   vector plus metadata (with an optional caption, e.g. for an image, retained only when the appender
-  opts into `store_text` -- off by default, so no raw text reaches the WAL); with an embedder
+  opts into `store_text`; it is off by default, so no raw text reaches the WAL); with an embedder
   configured, the appender also ingests full text (chunked by the core, embedded in the binding
   layer, then logged as a post-embedding record) so text writes are multi-producer too, without a
   captured base generation. It requires WAL commit mode. Exposed as the native `CoreAppender`, over

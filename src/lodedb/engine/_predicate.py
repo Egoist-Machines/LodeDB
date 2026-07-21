@@ -1,12 +1,12 @@
 """Metadata filter predicate engine for query-time document filtering.
 
 This module is intentionally dependency-free (stdlib only) and must not import
-``core`` — it is consumed by both the engine trust boundary
+``core``; it is consumed by both the engine trust boundary
 (``LodeEngine._validate_query_filter`` validates; ``core._compile_query_filter``
 compiles the per-document matcher used by the corpus scan) and the SDK ergonomics
 layer (``lodedb.local.db._normalize_filter``).
 
-Grammar (backward compatible — a bare scalar is exact-match sugar for ``$eq``):
+Grammar (backward compatible; a bare scalar is exact-match sugar for ``$eq``):
 
     metadata-filter := { (field | logical)* }            # entries are AND-ed
     field           := <name> : (scalar | operator-map)
@@ -111,7 +111,7 @@ def compile_metadata_filter(
 
     The filter must already be validated (see :func:`validate_metadata_filter`);
     compilation trusts the grammar and does not re-check it. It hoists everything
-    independent of the document out of the per-document path — operator dispatch
+    independent of the document out of the per-document path: operator dispatch
     collapses into a bound comparator, ``$in``/``$nin`` targets stay tuples, and
     ordered operands are parsed to numbers once instead of re-running ``float()``
     on the constant operand for every row scanned. The returned predicate is pure
@@ -291,7 +291,7 @@ def _compile_ordered(
     operand_number = _as_number(operand)
     if operand_number is None:
         # The operand is not a finite number, so a numeric compare is impossible
-        # (both sides must parse) — it is always lexicographic, and the stored
+        # (both sides must parse); it is always lexicographic, and the stored
         # value never needs parsing.
         def _ordered_str(
             meta: Mapping[str, str], _f: str = field, _v: str = operand

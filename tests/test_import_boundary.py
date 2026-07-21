@@ -12,7 +12,7 @@ an earlier test):
    which would otherwise have to be declared and shipped.
 3. Built-in text embedding is opt-in (the ``[embeddings]`` / ``[torch]`` extras),
    so importing the package must not pull any embedding runtime
-   (onnxruntime / transformers / sentence-transformers / torch) — a base
+   (onnxruntime / transformers / sentence-transformers / torch); a base
    ``pip install lodedb`` is a vector store and must import cleanly without them.
 """
 
@@ -64,8 +64,8 @@ _FORBIDDEN = (
     "psycopg", "psycopg2", "asyncpg", "qdrant_client", "chromadb", "lancedb",
     # The [cloud] extra's dependencies (httpx; pynacl imports as `nacl`): the
     # first-party cloud client (lodedb.cloud) reaches them only through its
-    # lazy PEP 562 exports and the CLI trampoline, so a plain import — even of
-    # lodedb.cloud itself — must stay network-free.
+    # lazy PEP 562 exports and the CLI trampoline, so a plain import, even of
+    # lodedb.cloud itself, must stay network-free.
     "httpx", "nacl",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
@@ -76,8 +76,8 @@ for _root in _FORBIDDEN:
 
 # The optional image extra is Pillow (the "clip" preset / add_image path). The CLIP
 # backend imports sentence-transformers and Pillow only inside the methods that
-# encode, so importing LodeDB — including the embedding-backends, presets, and
-# backends modules where the CLIP wiring lives — must not pull Pillow.
+# encode, so importing LodeDB, including the embedding-backends, presets, and
+# backends modules where the CLIP wiring lives, must not pull Pillow.
 _IMAGE_EXTRA_LAZINESS_PROBE = """
 import importlib, sys
 for _m in (

@@ -139,8 +139,8 @@ pub(crate) fn verify_file_sha256(path: &Path, expected: &str, context: &str) -> 
 /// `Ok(Some(file))` holds the lock; `Ok(None)` means another holder currently
 /// blocks it and the caller should retry; `Err` is a real open/lock failure the
 /// caller wraps in its own message. Unix opens read+write+create and takes a
-/// non-blocking advisory `flock` — exclusive, or shared when `exclusive` is false
-/// (a shared `flock` interoperates with the Python writer's `fcntl.flock`).
+/// non-blocking advisory `flock`, exclusive by default or shared when `exclusive`
+/// is false (a shared `flock` interoperates with the Python writer's `fcntl.flock`).
 /// Windows has no advisory `flock` that the Python `msvcrt` byte lock can see, so
 /// it opens with an exclusive share mode (`share_mode(0)`); there is no shared
 /// form, so a shared request degrades to exclusive there. Other platforms open

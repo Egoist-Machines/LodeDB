@@ -136,7 +136,7 @@ then the multiplier.
 | **Recall@10** | 0.95 vs 1.00 | 0.95 vs 1.00 | 0.95 vs 1.00 (filtered 0.95 vs 1.00) |
 
 Every backend, LodeDB included, is fed the same precomputed vectors (LodeDB via its
-vector-in SDK), so none is charged for embedding -- a store-vs-store comparison. The
+vector-in SDK), so none is charged for embedding; the comparison is store against store. The
 in-memory defaults rewrite the whole store to persist one memory and scan in pure
 Python with no batch path. mem0's default Qdrant is a real DB, so its single add is
 fast (0.44 ms), and LodeDB now matches it (0.28 ms) while reading far faster, storing
@@ -160,13 +160,13 @@ pgvector**.
 | pgvector | 1,947 | 35.1 | 1.00 | 2.3 ms | yes | 50 MB | 3.3x |
 
 Among the embedded local DBs, **LodeDB has the smallest footprint and the fastest
-single query** -- LanceDB (10.6 ms), sqlite-vec (27 ms), and pgvector (35 ms) are 24x to
+single query**. LanceDB (10.6 ms), sqlite-vec (27 ms), and pgvector (35 ms) are 24x to
 78x slower per query because they scan without LodeDB's quantized SIMD kernel, trading
 the 5 points of recall LodeDB gives up. LanceDB is the closest on footprint (37 MB vs
 15 MB). pgvector runs via an embedded `pgserver` (Postgres + pgvector, no separate
 service) with no ANN index, so it is an exact seq scan like LodeDB, LanceDB, and
 sqlite-vec. On durable single-add LodeDB's WAL-mode O(changed) commit (0.26 ms) leads
-even the lazy-append stores (sqlite-vec 0.42 ms, qdrant 0.48 ms) -- see "Durable add"
+even the lazy-append stores (sqlite-vec 0.42 ms, qdrant 0.48 ms). See "Durable add"
 under Reading.
 
 ### LlamaIndex (default `SimpleVectorStore`), RAG over ~17.5k docs
@@ -185,7 +185,7 @@ under Reading.
 ### mem0 (default Qdrant), agent-memory workflow over ~17.5k memories
 
 This suite is vector-in (mem0 owns embeddings), so the durable-add column is
-embed-free for every backend -- the fair persist-to-persist comparison.
+embed-free for every backend, the fair persist-to-persist comparison.
 
 | backend | ingest docs/s | query p50 (ms) | recall@10 | filtered recall | durable add p50 | footprint | vs LodeDB |
 |---|---|---|---|---|---|---|---|
@@ -221,7 +221,7 @@ Reading it:
   (see the project's GPU benchmarks).
 - **FAISS is the one close baseline, and it is noisy.** `*` FAISS-CPU is the only
   baseline that batches efficiently, but its throughput is host-dependent on Modal's
-  shared instances (~1,800 to 2,900 qps across suites here) -- treat it as
+  shared instances (~1,800 to 2,900 qps across suites here). Treat it as
   "comparable to several-x slower than LodeDB," not a fixed number.
 - **Scale.** At ~17.5k vectors the GPU is not yet compute-bound, so this understates
   the GPU win. The headline GPU throughput (24k qps A10, 50k qps L40S, 2.8x to 4.8x the
@@ -254,7 +254,7 @@ Reading it:
   LodeDB's single-query range, and it is not durable (full rewrite, no payload
   round-trip).
 - **Recall.** LodeDB returns 0.95 recall@10 (4-bit quantization) versus 1.00 for the
-  exact/flat stores -- the deliberate trade for footprint and query speed. The scan
+  exact/flat stores, the deliberate trade for footprint and query speed. The scan
   is exact (no ANN graph), so there is no recall cliff to tune.
 - **mem0 filtered search.** mem0's FAISS provider has no server-side filtering: it
   over-fetches only `2*k` then post-filters, so within-user recall collapses to 0.04
@@ -278,7 +278,7 @@ Reading it:
 - LlamaIndex's `FaissVectorStore` keeps no docstore, so used standalone it returns the
   faiss positional index rather than the node id (and no payload); the harness maps
   positions back through insertion order so recall is correct.
-- Qdrant and Chroma run in embedded/local mode (no server) -- the apples-to-apples
+- Qdrant and Chroma run in embedded/local mode (no server), the apples-to-apples
   comparison against an embedded store, not their tuned server configuration.
 - LodeDB's cold reopen rebuilds calibration on first open, which at small corpora
   shows as a higher reopen time that amortizes at scale.

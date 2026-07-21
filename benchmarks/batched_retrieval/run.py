@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Batched-retrieval throughput: ``LodeDB.search_many`` queries/sec vs batch size.
 
-This benchmarks the **public SDK path** ``LodeDB.search_many(queries, k=...)`` — the
+This benchmarks the **public SDK path** ``LodeDB.search_many(queries, k=...)``, the
 batched entry point that lets CUDA hosts serve a query batch from the GPU-resident exact
 scan. Single-query ``search`` never takes that path, so batched ``search_many`` is the only
 way the GPU-batch story shows up through the supported API. It reports **queries/sec**
 across batch sizes for the native CPU kernel and, when a CUDA driver is present, the native
-GPU-resident path — so the batch crossover is visible end to end. The native scan reads
+GPU-resident path, so the batch crossover is visible end to end. The native scan reads
 ``LODEDB_GPU_DIRECT_TURBOVEC`` per scan (``off`` forces the CPU baseline, any other value
 leaves the GPU path eligible), toggled here without rebuilding the index.
 
 Embedding is intentionally excluded: queries are embedded by a trivial local hash backend
 so the number isolates **retrieval** (the stage the GPU accelerates), the same property a
-batched-retrieval integration would lean on. Metrics only — counts, batch sizes, timings,
+batched-retrieval integration would lean on. Metrics only: counts, batch sizes, timings,
 throughput, and a CPU-vs-GPU overlap; never documents, queries, or embeddings.
 
     uv run python benchmarks/batched_retrieval/run.py --docs 50000 --queries 1024

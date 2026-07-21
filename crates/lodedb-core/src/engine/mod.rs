@@ -1829,7 +1829,7 @@ impl CoreEngine {
                 // Same strictness as upsert_vectors, per element too: silently
                 // dropping a non-string id would count the record as applied
                 // while deleting nothing. An empty (but well-formed) list stays
-                // a valid no-op — refusing it could wedge replay of a legacy
+                // a valid no-op; refusing it could wedge replay of a legacy
                 // local WAL tail.
                 let document_ids = record
                     .payload
@@ -2373,8 +2373,8 @@ impl CoreEngine {
                         // ("direct TurboVec snapshot is required but missing").
                         //
                         // Fail closed and leave the WAL untouched on disk so the
-                        // Python writer — which checkpoints its own WAL on open and
-                        // writes a complete snapshot — stays the owner of these
+                        // Python writer, which checkpoints its own WAL on open and
+                        // writes a complete snapshot, stays the owner of these
                         // stores. In the Python SDK, Python opens (and checkpoints)
                         // before the native engine, so the native engine never
                         // reaches this branch; a native init failure here also
@@ -2712,7 +2712,7 @@ struct PersistentLock {
 
 /// RAII exclusive hold on a store directory's single-writer lock
 /// (`<dir>/.lodedb.lock`), for out-of-band tools that mutate a database
-/// directory without opening an engine — the cloud transfer plane's
+/// directory without opening an engine, such as the cloud transfer plane's
 /// pull/restore path. Contends with every engine writer (native, Python,
 /// Swift) across processes; dropping the guard releases the hold.
 pub struct DirWriterLock {
@@ -2756,7 +2756,7 @@ impl LockMode {
 }
 
 impl PersistentLock {
-    /// Takes the single-writer lock on ``<dir>/.lodedb.lock`` — the same sentinel
+    /// Takes the single-writer lock on ``<dir>/.lodedb.lock``, the same sentinel
     /// the Python writer uses, so a native/FFI/Swift writer contends with a Python
     /// writer (and another native writer) across processes. Unix takes a BSD
     /// advisory lock (``flock(LOCK_EX|LOCK_NB)``); Windows opens the sentinel with

@@ -37,8 +37,8 @@ _REMOTE_BENCH_DIR = "/root/filtered_batch"
 def _build_image() -> modal.Image:
     """CUDA image with LodeDB compiled from local src (maturin + vendored crate).
 
-    ``/root/lodedb-src`` must mirror the repo layout — pyproject + readme/license
-    + ``src/`` + the full ``third_party/turbovec/`` workspace — so the single
+    ``/root/lodedb-src`` must mirror the repo layout (pyproject + readme/license
+    + ``src/`` + the full ``third_party/turbovec/`` workspace) so the single
     maturin ``pip install`` can compile ``lodedb._turbovec`` against the sibling
     crate, exactly as ``uv sync`` sees it locally and in CI.
     """

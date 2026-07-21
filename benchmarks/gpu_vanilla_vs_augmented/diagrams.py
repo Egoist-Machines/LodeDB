@@ -1,7 +1,7 @@
 """Render vanilla-vs-augmented TurboVec benchmark diagrams from a results JSON.
 
-Plots the comparison across each axis — the vanilla uint8-LUT CPU SIMD scan vs
-the augmented fp16-reconstruction GPU scan (recall curves, search speed, memory,
+Plots the vanilla uint8-LUT CPU SIMD scan against the augmented
+fp16-reconstruction GPU scan on each axis (recall curves, search speed, memory,
 update). No FAISS. Both scan the same 4-bit index; the difference is the scoring
 step (the CPU sums a uint8 LUT (ADC), the GPU does a full fp16 GEMM dot product),
 so "exact" here means exact over the 4-bit reconstruction, not fp32. One figure
@@ -27,10 +27,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-VANILLA_C = "#2563eb"   # blue  — vanilla CPU
-VANILLA2_C = "#93c5fd"  # light blue — vanilla single-thread
-AUG_C = "#dc2626"       # red   — augmented GPU
-FP32_C = "#94a3b8"      # grey  — fp32 reference
+VANILLA_C = "#2563eb"   # blue: vanilla CPU
+VANILLA2_C = "#93c5fd"  # light blue: vanilla single-thread
+AUG_C = "#dc2626"       # red: augmented GPU
+FP32_C = "#94a3b8"      # grey: fp32 reference
 K_GRID = (1, 2, 4, 8, 16, 32, 64)
 
 
@@ -130,7 +130,7 @@ def plot_speed_scaling(rows: list[dict], out: Path) -> list[str]:
     return _save(fig, out, "speed_scaling")
 
 
-L40S_C = "#7c3aed"  # violet — augmented GPU, L40S
+L40S_C = "#7c3aed"  # violet: augmented GPU, L40S
 
 
 def plot_speed_batch(

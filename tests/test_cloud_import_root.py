@@ -13,7 +13,7 @@ import sys
 import pytest
 
 # The tests below import (or monkeypatch into) the client modules, which
-# pull httpx/pynacl — skip cleanly without the [cloud] extra installed.
+# pull httpx/pynacl, so skip cleanly without the [cloud] extra installed.
 pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
 pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
 
@@ -40,7 +40,7 @@ def test_missing_cloud_deps_raise_install_hint(monkeypatch):
     # the extra's dependencies are installed in the dev venv.
     monkeypatch.setitem(sys.modules, "lodedb.cloud.client", None)
     with pytest.raises(ImportError, match=r'pip install "lodedb\[cloud\]"'):
-        cloud.Client  # noqa: B018 — the attribute fetch is the behavior under test
+        cloud.Client  # noqa: B018  # the attribute fetch is the behavior under test
 
 
 def test_unknown_names_stay_attribute_errors():
@@ -52,7 +52,7 @@ def test_unknown_names_stay_attribute_errors():
 
 def test_underscore_probes_never_touch_the_lazy_table(monkeypatch):
     """Attribute machinery probes (`__path__`-style dunders) must resolve
-    locally — blocked submodules stay untouched."""
+    locally; blocked submodules stay untouched."""
     monkeypatch.setitem(sys.modules, "lodedb.cloud.client", None)
     monkeypatch.setitem(sys.modules, "lodedb.cloud.serving", None)
     with pytest.raises(AttributeError):

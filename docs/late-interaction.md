@@ -17,8 +17,8 @@ index, with no engine change. Each document is **one row**: its id is the docume
 id, its vector is the mean-pooled patch vector, and its full patch matrix is kept
 in the per-row text sidecar (at the `storage` precision). An unfiltered query is
 answered by a resident exact scan that holds every patch in one in-memory matrix
-and scores the whole corpus in a single GEMM plus a segmented max -- returning the
-true top-k at a few milliseconds on thousands of pages, with no candidate-recall
+and scores the whole corpus in a single GEMM plus a segmented max. It returns the
+true top-k in a few milliseconds on thousands of pages, with no candidate-recall
 loss. See [Search paths](#search-paths) and [Storage precision](#storage-precision).
 
 ## Encoder is bring-your-own
@@ -63,7 +63,7 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
 
 - **Resident** (default, unfiltered, within the memory budget): every patch is held
   in one in-memory matrix and the whole corpus is scored in a single GEMM plus a
-  segmented max -- a few milliseconds on thousands of pages. Built on the first
+  segmented max, a few milliseconds on thousands of pages. Built on the first
   query (`resident_build_seconds` in the benchmark) and then **maintained in place**
   on each `add`/`remove` (new documents fold into a pending delta, replaced/removed
   ones are tombstoned, and the base is compacted periodically), so an interleaved
@@ -71,14 +71,14 @@ idx.search(query_tokens, k=5, filter={"file": "report.pdf"})
   `resident=True|False|"auto"` (default `"auto"`) and `resident_max_bytes` (default
   512 MB); a corpus that grows past the budget evicts to the streaming path.
 - **Filtered**: a query with a `filter` resolves the matching documents
-  engine-side and scores that subset exhaustively -- so a metadata filter both
+  engine-side and scores that subset exhaustively, so a metadata filter both
   narrows and stays exact.
 - **Streaming**: a corpus over the resident budget (or `resident=False`) is scored
-  by reading documents back from disk in bounded chunks -- slower (disk-bound) but
-  exact and near-constant-memory, so the exact path is never capped by RAM.
+  by reading documents back from disk in bounded chunks. It is slower (disk-bound)
+  but exact and near-constant-memory, so the exact path is never capped by RAM.
 
 Memory note: *patch decode and scoring* are bounded to the chunk budget (the one
-exception is a single document whose patch matrix exceeds the budget -- it is
+exception is a single document whose patch matrix exceeds the budget; it is
 scored whole, since a document is the unit of MaxSim). Two things are not bounded
 by the chunk budget: the streaming path first enumerates the document
 `(id, patch_count)` list, which is O(number of documents) in metadata; and the
@@ -92,7 +92,7 @@ read-back ~38%, scoring ~1%). The resident scan removes both dominant costs.
 
 ### Concurrency
 
-A single index handle is safe to use from multiple threads -- `add` / `remove` and
+A single index handle is safe to use from multiple threads. `add` / `remove` and
 `search` / `search_many` can run concurrently (as with the underlying `LodeDB`,
 e.g. behind `lodedb serve`). Each mutation's commit and resident-cache update are
 applied as one ordered unit, and a query scores a consistent snapshot of the
@@ -100,9 +100,9 @@ cache, so a query never observes a half-applied write or a stale cache.
 
 ### Batched queries
 
-`search_many(queries, k=...)` scores a list of multi-vector queries together --
-all queries' tokens go through one GEMM per document chunk instead of one GEMM per
-query -- and returns the top-k for each, in order. Use it to evaluate or answer
+`search_many(queries, k=...)` scores a list of multi-vector queries
+together (all queries' tokens go through one GEMM per document chunk instead of
+one GEMM per query) and returns the top-k for each, in order. Use it to evaluate or answer
 many queries at once (~3x throughput in a 2k-document benchmark); single-query
 `search` latency is unchanged.
 

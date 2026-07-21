@@ -1,19 +1,19 @@
 """GovReport at scale: vanilla vs augmented TurboVec recall + speed, 100K -> 1M.
 
 Embeds GovReport chunks (MiniLM, cosine) up to ~1M vectors on the GPU, then runs the
-vanilla-vs-augmented cells across a corpus-size sweep — the scale + correctness evidence a
+vanilla-vs-augmented cells across a corpus-size sweep, the scale + correctness evidence a
 launch review flagged as missing for the CPU scan. Both paths read the SAME 4-bit index:
 
 - **recall@k vs fp32 brute force** for the vanilla **uint8-LUT** scan and the augmented
-  **fp16-reconstruction** scan, at each corpus size — does the scan still find the true
+  **fp16-reconstruction** scan, at each corpus size. Does the scan still find the true
   nearest neighbour at 1M?
-- **the CPU scan's practical ceiling** — vanilla single-thread and all-threads throughput
+- **the CPU scan's practical ceiling**: vanilla single-thread and all-threads throughput
   (fresh ``RAYON_NUM_THREADS``-pinned subprocesses) vs the augmented GPU throughput, per
   corpus size and a batch sweep at the top size.
 
 This is a dev-only benchmark (not part of the shipped ``lodedb`` package). It reuses the
 vanilla-vs-augmented cell runner from the sibling ``gpu_vanilla_vs_augmented`` benchmark
-(only the data source is new). GPU-only — the augmented path needs CUDA, and 1M-vector
+(only the data source is new). GPU-only. The augmented path needs CUDA, and 1M-vector
 brute-force ground truth is not laptop-scale.
 """
 

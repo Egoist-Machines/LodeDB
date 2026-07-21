@@ -79,7 +79,7 @@ def _remove(db: LodeDB, id: str) -> dict[str, Any]:
 
 
 def _stats(db: LodeDB) -> dict[str, Any]:
-    """Returns redacted store stats (counts, storage bytes) — never document text."""
+    """Returns redacted store stats (counts, storage bytes), never document text."""
 
     return db.stats()
 
@@ -200,7 +200,7 @@ def build_mcp_server(
 
     @server.tool()
     def lodedb_stats() -> dict[str, Any]:
-        """Return redacted store stats (counts, storage bytes) — never raw text."""
+        """Return redacted store stats (counts, storage bytes), never raw text."""
 
         return _stats(db)
 

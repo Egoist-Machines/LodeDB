@@ -593,7 +593,7 @@ final class NativeCheckpointer {
     }
 }
 
-/// Serde-shaped payload for `lodedb_engine_create_index_json` — a minimal
+/// Serde-shaped payload for `lodedb_engine_create_index_json`, a minimal
 /// `CoreIndexCreateRequest`. Only the distinguishing fields cross the boundary; the
 /// core supplies the identity defaults (name, provider, task, route/storage
 /// profile, and index_key/client_id_hash from index_id). `nil` optionals (`model`,

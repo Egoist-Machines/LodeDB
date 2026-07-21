@@ -85,7 +85,7 @@ def test_forced_onnx_runtime_errors_without_onnxruntime(monkeypatch):
     import lodedb.local.backends as backends
 
     monkeypatch.setattr(backends, "onnxruntime_available", lambda: False)
-    # A working torch tier must not mask the forced-onnx request — the hint still wins.
+    # A working torch tier must not mask the forced-onnx request; the hint still wins.
     monkeypatch.setattr(backends, "sentence_transformers_available", lambda: True)
     with pytest.raises(ModuleNotFoundError, match=r"lodedb\[embeddings\]"):
         build_local_embedding_backend(

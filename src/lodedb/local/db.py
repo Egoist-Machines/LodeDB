@@ -1,10 +1,10 @@
-"""LodeDB — the local-first, embedded, no-auth vector database SDK.
+"""LodeDB is the local-first, embedded, no-auth vector database SDK.
 
 ``LodeDB`` runs the engine in-process in a local profile that:
 
 - binds the embedded SDK to loopback, while `lodedb serve` may intentionally bind a
   private-network address for trusted-LAN demos;
-- requires no authentication — the user never supplies or sees any credential;
+- requires no authentication (the user never supplies or sees any credential);
 - keeps telemetry metrics-only (counts / bytes / latency, never payloads);
 - stores vectors in the compact TurboVec format and commits every change
   atomically via a per-index root manifest (``<key>.commit.json``) over
@@ -71,7 +71,7 @@ from lodedb.local.presets import (
 )
 
 # Fixed local identifier for the single-process client context. It never leaves
-# the process and has no security meaning — the local engine is auth-free.
+# the process and has no security meaning; the local engine is auth-free.
 _LOCAL_CLIENT_ID = "lodedb-local"
 _LOCAL_CLIENT_ID_HASH = sha256_text(_LOCAL_CLIENT_ID)
 # The local DB is a single, stable index. Pinning it to the engine's
@@ -234,8 +234,8 @@ class LodeDB:
 
     For config-driven code, where one string field (an env var, a YAML value)
     must express either a local path or a cloud store, the constructor itself
-    accepts the explicit URL form — ``LodeDB("orecloud://org/environment/store")``
-    — and returns the same handle. Either way the handle duck-types this
+    accepts the explicit URL form (``LodeDB("orecloud://org/environment/store")``)
+    and returns the same handle. Either way the handle duck-types this
     class's read/write surface (``add``, ``search``, ``get``, ``remove``, ...)
     but runs over HTTPS, so local-only construction options (``model=``,
     ``store_text=``, ...) don't apply and local-only verbs (``persist``,
@@ -260,18 +260,18 @@ class LodeDB:
 
     @classmethod
     def cloud(cls, target: str, **options: Any) -> Any:
-        """Opens a managed OreCloud store — the cloud counterpart of
+        """Opens a managed OreCloud store, the cloud counterpart of
         ``LodeDB(path)``, joining :meth:`open_readonly` /
         :meth:`open_vector_store` in the alternate-constructor family.
 
-        ``target`` is a bare store id (``"user-42"`` — org/environment
+        ``target`` is a bare store id (``"user-42"``; org/environment
         resolve from the environment-scoped credential, exactly like
         ``orecloud.Client().store()``), an ``"org/environment/store"``
         triple for cross-environment scripts, or a full ``orecloud://`` URL.
         Keyword options are ``orecloud.connect``'s (``token=``, ``host=``,
         ``key=``, ``warm=``, ``timeout=``, ``read_your_writes=``,
-        ``transport=``). Returns the companion's store handle — duck-typed
-        to this class's verb surface, not a ``LodeDB`` instance — through
+        ``transport=``). Returns the companion's store handle (duck-typed
+        to this class's verb surface, not a ``LodeDB`` instance) through
         the same funnel as the ``LodeDB("orecloud://…")`` config-string
         dispatch. Without the ``lodedb[cloud]`` extra installed this raises
         an ``ImportError`` carrying the install hint; the companion is
@@ -361,7 +361,7 @@ class LodeDB:
         next open (a half-written trailing record is discarded), and a clean
         ``close``/``persist`` folds it into a generation. WAL mode drops the
         lock-free concurrent-reader snapshot that ``open_readonly`` relies on for
-        *uncheckpointed* writes — it is meant for single-process deployments —
+        *uncheckpointed* writes (it is meant for single-process deployments),
         but the on-disk generation a reader sees is always a consistent committed
         one. Pass ``"generation"`` for the historical path where every change
         publishes a new crash-atomic, lock-free MVCC-readable generation. Unset
@@ -370,7 +370,7 @@ class LodeDB:
         ``True``: the original text passed to ``add``/``add_many`` is kept in a
         dedicated on-disk sidecar so ``get``/``get_text``/``get_texts`` can return
         it (across reopens too). Pass ``store_text=False`` to opt out of retaining
-        text at all — telemetry, audit, and the redacted snapshot never carry text
+        text at all. Telemetry, audit, and the redacted snapshot never carry text
         regardless of this flag. Reopen the same path with the same ``store_text``
         value you wrote with.
         ``index_text`` controls durable lexical-index persistence and **defaults to
@@ -688,11 +688,11 @@ class LodeDB:
         Sugar for ``LodeDB(path, vector_dim=vector_dim, bit_width=bit_width, ...)``.
         The index has **no internal embedding model**: the vector-in verbs
         (``add_vectors`` / ``add_vectors_many`` / ``search_by_vector`` /
-        ``search_many_by_vector``) work, and so does keyword search —
+        ``search_many_by_vector``) work, and so does keyword search.
         ``search(query, mode="lexical")`` (and ``search_many``) runs BM25 over the
         text carried on the stored vectors, since lexical ranking needs no
         embedder (requires ``store_text=True``, the default, or ``index_text=True``).
-        The embedding verbs — ``add`` / ``add_many`` and vector/hybrid ``search`` —
+        The embedding verbs (``add`` / ``add_many`` and vector/hybrid ``search``)
         raise :class:`VectorOnlyIndexError` because they would need to embed text.
         Vectors must have dimension ``vector_dim``
         (any value your own embedder produces, e.g. 1536 or 3072), so this is the
@@ -821,7 +821,7 @@ class LodeDB:
 
         The *vector-in* counterpart to :meth:`add`: the caller supplies the
         embedding directly (e.g. from their own model), and LodeDB stores it
-        verbatim without embedding or chunking text — so this is how an
+        verbatim without embedding or chunking text. This is how an
         external system (or a graph layer that embeds once) reuses its own
         vectors. The vector must have the index's embedding dimension
         (``minilm`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
@@ -918,14 +918,14 @@ class LodeDB:
         wherever it can run while a vector-only store still searches without
         raising. Pass an explicit mode to override:
 
-        - ``"vector"`` — embedding cosine similarity only.
-        - ``"hybrid"`` — runs a lexical BM25 ranker alongside the vector scan and
+        - ``"vector"``: embedding cosine similarity only.
+        - ``"hybrid"``: runs a lexical BM25 ranker alongside the vector scan and
           fuses the two ranked lists with Reciprocal Rank Fusion, so exact tokens
           that the embedding misses (error codes like ``E1234``, serials like
           ``ABC-123``, dates like ``2024-01-15``) are surfaced when they appear in
           the document body. The default for local RAG, where a missed exact match
           is the difference between a usable and a useless answer.
-        - ``"lexical"`` — the BM25 ranking alone (no vector scan). Because it embeds
+        - ``"lexical"``: the BM25 ranking alone (no vector scan). Because it embeds
           nothing, ``mode="lexical"`` also works on a **vector-only** index
           (:meth:`open_vector_store`) that retains text: it ranks the text carried on
           the stored vectors. On such an index ``vector``/``hybrid`` still raise
@@ -961,8 +961,8 @@ class LodeDB:
         predicate:
 
         - comparison ``$eq`` ``$ne`` ``$gt`` ``$gte`` ``$lt`` ``$lte`` ``$in``
-          ``$nin`` ``$exists`` — e.g. ``{"year": {"$gte": 2020, "$lt": 2025}}``;
-        - composition ``$and`` / ``$or`` / ``$not`` (nestable) — e.g.
+          ``$nin`` ``$exists``, e.g. ``{"year": {"$gte": 2020, "$lt": 2025}}``;
+        - composition ``$and`` / ``$or`` / ``$not`` (nestable), e.g.
           ``{"$or": [{"topic": "ml"}, {"year": {"$gte": 2023}}]}``.
 
         A bare scalar is exact-match sugar for ``$eq``, so existing filters are
@@ -970,7 +970,7 @@ class LodeDB:
         (``$gt``/``$gte``/``$lt``/``$lte``) compare numerically only when both the
         stored value and the operand parse as finite numbers (otherwise
         lexicographically), whereas ``$eq``/``$ne``/``$in``/``$nin`` always compare
-        as strings — so ``{"price": {"$eq": 9.9}}`` does not match a stored ``9.90``
+        as strings, so ``{"price": {"$eq": 9.9}}`` does not match a stored ``9.90``
         while ``{"price": {"$gte": 9.9, "$lte": 9.9}}`` does. ``$ne``/``$nin`` and
         ``$exists: False`` also match documents missing the field. Raw query text
         never leaves the process and never appears in telemetry.
@@ -981,7 +981,7 @@ class LodeDB:
         if k <= 0:
             raise ValueError("k must be positive")
         # Gates on the resolved mode, not on text-capability alone: a vector-only
-        # handle can still run mode="lexical" (BM25 over retained text) — only
+        # handle can still run mode="lexical" (BM25 over retained text). Only
         # vector/hybrid, which embed the query, raise VectorOnlyIndexError here.
         resolved_mode = self._resolve_mode(mode)
         normalized_filter = _normalize_filter(filter)
@@ -1340,7 +1340,7 @@ class LodeDB:
 
         This is the primary retrieval verb; :meth:`get_text` is a synonym. As a
         deliberate counterpart to ``add``, ``get(hit.id)`` is how an application
-        recovers the original text for a document a search selected — search hits
+        recovers the original text for a document a search selected; search hits
         themselves stay payload-free. Available unless the DB was opened with
         ``store_text=False`` (see :meth:`get_text` for the exact semantics).
         """
@@ -1389,8 +1389,8 @@ class LodeDB:
     def get_document(self, id: str) -> dict[str, Any] | None:
         """Returns one document's redacted record by id, or ``None`` if absent.
 
-        The record is payload-free — ``{"id", "metadata", "chunk_count",
-        "content_hash"}`` — with **no** text and **no** vectors. This is the
+        The record is payload-free (``{"id", "metadata", "chunk_count",
+        "content_hash"}``), with **no** text and **no** vectors. This is the
         by-id metadata read a graph / knowledge-graph layer uses to resolve an
         edge's endpoints (or a node's attributes) without issuing a similarity
         search; use :meth:`get`/:meth:`get_text` to recover the raw text.
@@ -1412,7 +1412,7 @@ class LodeDB:
         """Returns document records, optionally filtered and paged by a keyset cursor.
 
         Unlike :meth:`search`, this is enumeration, not ranking: it returns matching
-        documents with no query vector and no scoring — the primitive a graph /
+        documents with no query vector and no scoring, the primitive a graph /
         knowledge-graph layer needs for deterministic traversal ("all edges whose
         ``src`` is X", "all nodes of ``type`` Person"). Each record is the
         payload-free ``{"id", "metadata", "chunk_count", "content_hash"}``.
@@ -2294,7 +2294,7 @@ class LodeDB:
         ``"vector"`` otherwise, so the fused ranking is the default wherever it
         can run. On a **vector-only** handle (no embedding model) an unset mode
         resolves to ``"lexical"`` instead: such a handle cannot embed the query
-        text, so a text query can only be a keyword (BM25) query — and the
+        text, so a text query can only be a keyword (BM25) query, and the
         lexical-source check below then applies.
 
         Returns the canonical lowercase mode. Raises:
@@ -2305,7 +2305,7 @@ class LodeDB:
           index cannot do (use :meth:`search_by_vector` for vector similarity, or
           ``mode="lexical"`` for keyword search).
         - :class:`ValueError` when a lexical/hybrid mode is requested on a handle
-          with no lexical source — neither ``index_text=True`` (a persisted BM25
+          with no lexical source, neither ``index_text=True`` (a persisted BM25
           postings store) nor ``store_text=True`` (the BM25 index rebuilt from the
           retained raw text), so there is nothing to build the index from.
         """
@@ -2572,7 +2572,7 @@ def _public_document_record(record: Mapping[str, Any]) -> dict[str, Any]:
 
     The engine returns ``document_id``; the public SDK uses ``id`` everywhere
     (``add(id=...)``, ``LodeSearchHit.id``, ``get(id)``), so the key is renamed
-    for consistency. Only redacted fields are surfaced — never text or vectors.
+    for consistency. Only redacted fields are surfaced, never text or vectors.
     """
 
     metadata = record.get("metadata", {})

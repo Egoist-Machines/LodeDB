@@ -125,7 +125,7 @@ fn status_for_push_reflects_the_redacted_push_it_describes() {
     let source = LocalArtifactStore::new(src.path(), false);
     let dest = LocalArtifactStore::new(dst.path(), false);
 
-    // Redacted status counts only the json base — the text artifact would not
+    // Redacted status counts only the json base. The text artifact would not
     // ship, so it must not be reported as pending upload.
     let redacted = status_for_push(&source, &dest, "idx", TransferPolicy::redacted()).unwrap();
     assert_eq!(redacted.artifacts_to_upload, 1);

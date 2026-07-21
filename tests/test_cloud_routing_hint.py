@@ -47,7 +47,7 @@ def test_data_plane_verbs_carry_the_store_hint(capture):
 
 def test_warm_stats_carries_the_hint(capture):
     """The pre-hydration call must land on the same pod the hinted queries
-    will; a warm on one pod followed by queries on another would defeat it."""
+    will. A warm on one pod followed by queries on another would defeat it."""
     client, seen = capture
     client.serving_stats("acme", "prod", "user-42", warm=True)
     assert seen[0].headers["x-ore-store"] == "acme/prod/user-42"

@@ -1,5 +1,5 @@
 """`lodedb cloud init --agents` artifact generators: content correctness and the
-leave-user-files-alone rules (no server needed — pure filesystem)."""
+leave-user-files-alone rules (no server needed, pure filesystem)."""
 
 import json
 
@@ -47,7 +47,7 @@ def test_existing_agents_md_gains_section_once(tmp_path):
     assert content.startswith("# My repo")
     assert AGENTS_SECTION_HEADING in content
 
-    # Second run: the section is the repo's to edit now — never regenerated.
+    # Second run: the section is the repo's to edit now, never regenerated.
     (tmp_path / "AGENTS.md").write_text(content.replace("lodedb cloud sync", "MY EDIT"))
     written, notes = scaffold_agent_artifacts(tmp_path, **LINK)
     assert "AGENTS.md" not in written

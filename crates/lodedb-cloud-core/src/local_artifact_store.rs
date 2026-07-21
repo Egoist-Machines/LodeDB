@@ -2,7 +2,7 @@
 //!
 //! A committed generation already lives on disk as immutable `g<epoch>.*`
 //! artifacts under `<key>.gen/` pinned by `<key>.commit.json`, so the local store
-//! is a thin wrapper over `lodedb-core`'s commit-manifest primitives — there is
+//! is a thin wrapper over `lodedb-core`'s commit-manifest primitives; there is
 //! no second format. Object-storage backends (S3/GCS/Azure) belong in a later
 //! milestone, not here.
 
@@ -42,7 +42,7 @@ impl LocalArtifactStore {
 
     /// The idempotence/immutability answer for an already-present name:
     /// identical content (compared by a streaming re-hash) is Ok, different
-    /// content refuses — artifacts are immutable.
+    /// content refuses. Artifacts are immutable.
     fn refuse_unless_identical(&self, name: &str, path: &Path, sha256: &str) -> Result<()> {
         let (existing, _bytes) = sha256_hex_reader(&mut File::open(path)?)?;
         if existing == sha256 {
@@ -80,7 +80,7 @@ impl ArtifactStore for LocalArtifactStore {
             // lineages can collide on a name. Identical bytes are an idempotent
             // no-op; different bytes are a genuine conflict we refuse rather than
             // clobber (the immutability invariant). Hash the existing file
-            // streaming — it can be as large as any transferred base.
+            // streaming; it can be as large as any transferred base.
             return self.refuse_unless_identical(name, &path, sha256);
         }
         if let Some(parent) = path.parent() {
@@ -89,7 +89,7 @@ impl ArtifactStore for LocalArtifactStore {
         // Stream into a UNIQUELY-NAMED sibling scratch (two concurrent writers
         // of one name must never share a scratch), hashing as we copy, and
         // verify the digest BEFORE publication. The publish is
-        // `persist_noclobber` — an atomic no-replace claim, so the losing
+        // `persist_noclobber`, an atomic no-replace claim, so the losing
         // writer of a name race falls into the identical-bytes check instead
         // of overwriting bytes a committed pointer may already reference.
         // Peak memory is one copy buffer regardless of artifact size.
@@ -129,13 +129,13 @@ impl ArtifactStore for LocalArtifactStore {
                 // rename and the scratch name is gone; the hard-link+unlink
                 // fallback some filesystems take can leave the scratch link
                 // behind on unlink failure, so sweep it (litter, not
-                // correctness — the published bytes are already in place).
+                // correctness; the published bytes are already in place).
                 if scratch_path.exists() {
                     let _ = fs::remove_file(&scratch_path);
                 }
             }
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lost a same-name race: never replace — compare instead.
+                // Lost a same-name race: never replace, compare instead.
                 return self.refuse_unless_identical(name, &path, sha256);
             }
             Err(error) => return Err(ArtifactStoreError::Io(error.error)),
@@ -147,7 +147,7 @@ impl ArtifactStore for LocalArtifactStore {
     }
 
     fn contains(&self, name: &str) -> Result<bool> {
-        // A metadata probe, not a read — `try_exists` surfaces genuine I/O
+        // A metadata probe, not a read. `try_exists` surfaces genuine I/O
         // failures (unlike `Path::exists`, which would mask them as absence).
         let path = resolve_within(&self.root, &self.root.join(name))?;
         Ok(path.try_exists()?)

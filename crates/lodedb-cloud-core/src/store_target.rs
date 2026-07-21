@@ -1,7 +1,7 @@
 //! Resolve a user-facing transfer target into an [`ArtifactStore`].
 //!
 //! The client edge (CLI / Python binding) names each end of a transfer with one
-//! string — a local directory path or an object-store URL — so the mapping from
+//! string, a local directory path or an object-store URL, so the mapping from
 //! that string to a store lives here, once, rather than in every frontend:
 //!
 //! - `s3://bucket/prefix` → [`ObjectArtifactStore`] over Amazon S3 or any
@@ -11,12 +11,12 @@
 //!   read by `AmazonS3Builder::from_env`. The URL path becomes the per-tenant key
 //!   prefix. Setting `AWS_COPY_IF_NOT_EXISTS` (e.g.
 //!   `header: cf-copy-destination-if-none-match: *` on R2) additionally makes the
-//!   large-artifact multipart claim atomic — without it, that one step falls back
+//!   large-artifact multipart claim atomic; without it, that one step falls back
 //!   to a probe-then-copy on providers with no conditional copy.
 //! - anything without a `://` scheme → [`LocalArtifactStore`] on that directory.
 //!
 //! Other object-store schemes (`gs://`, `az://`) are rejected until there is a
-//! deployment that needs them — adding one is a new match arm plus a Cargo
+//! deployment that needs them. Adding one is a new match arm plus a Cargo
 //! feature, never a change to the transfer code.
 
 use crate::artifact_store::ArtifactStore;

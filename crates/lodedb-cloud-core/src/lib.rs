@@ -4,7 +4,7 @@
 //! addressed commit format. Rather than reimplement (or import the hollowing-out
 //! Python implementation of) that format, this crate links `lodedb-core`'s
 //! `storage` module directly, so the cloud and the embedded engine share ONE
-//! commit-format implementation — schema, on-disk layout, canonical-JSON
+//! commit-format implementation: schema, on-disk layout, canonical-JSON
 //! checksum, and every sub-manifest (`json`/`tvim`/`tvtext`/`tvlex`/`tvmv`/`tvann`/`tvvf`).
 //!
 //! It provides an [`ArtifactStore`] abstraction with a filesystem default

@@ -80,7 +80,7 @@ impl ObjectArtifactStore {
     }
 
     /// Claims the final artifact name from a completed scratch upload:
-    /// `copy_if_not_exists` where the backend supports it (atomic — a
+    /// `copy_if_not_exists` where the backend supports it (atomic, so a
     /// concurrent claimant loses cleanly and falls into the identical-bytes
     /// check), probe-then-copy where it does not (the residual race, now
     /// confined to backends without any conditional copy, e.g. plain S3
@@ -109,7 +109,7 @@ impl ObjectArtifactStore {
 
     /// The idempotence/immutability answer for an already-present name:
     /// identical content (compared by a streaming re-hash) is Ok, different
-    /// content refuses — artifacts are immutable.
+    /// content refuses. Artifacts are immutable.
     fn refuse_unless_identical(&self, name: &str, sha256: &str) -> Result<()> {
         let mut existing = self.open_read(name)?;
         let (digest, _bytes) = crate::digest::sha256_hex_reader(&mut *existing)?;
@@ -157,11 +157,11 @@ struct GetBytes {
 /// atomic create-if-absent); anything larger streams as a sequential multipart
 /// upload with `MULTIPART_CHUNK_BYTES` parts, bounding memory to one part.
 /// Object stores offer no conditional create for multipart, so the large path
-/// claims via a scratch key — see `write_stream_if_absent`.
+/// claims via a scratch key (see `write_stream_if_absent`).
 const MULTIPART_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
-/// S3 caps a single copy operation (and one `UploadPartCopy` part — what the
+/// S3 caps a single copy operation (and one `UploadPartCopy` part, which the
 /// `AWS_COPY_IF_NOT_EXISTS=multipart` claim uses) at 5 GiB, so the
 /// scratch-then-conditional-claim strategy only works below it. Larger
 /// artifacts stream their multipart directly onto the final name behind the
@@ -171,8 +171,8 @@ const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// residual race. The size hint decides the strategy up front; an
 /// unknown-size stream that crosses this ceiling mid-upload fails early
 /// (never at claim time, after every byte moved), and a hint that overshoots
-/// the ceiling merely routes a smaller object through the direct path — a
-/// strategy choice, never an integrity one (the digest gate is unconditional).
+/// the ceiling merely routes a smaller object through the direct path. That is
+/// a strategy choice, never an integrity one (the digest gate is unconditional).
 const CLAIMABLE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Process-local uniquifier for scratch upload keys: two same-process uploads
@@ -181,7 +181,7 @@ static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// A synchronous [`Read`] over an object's byte stream: each `read` pulls the
 /// next chunk through the store's own current-thread runtime, so a download's
-/// peak memory is one network chunk — never the object.
+/// peak memory is one network chunk, never the object.
 struct BlockingRead<'a> {
     runtime: &'a Runtime,
     stream: BoxStream<'static, object_store::Result<Bytes>>,
@@ -271,8 +271,8 @@ impl ArtifactStore for ObjectArtifactStore {
 
         // Large object. Multipart completion has no conditional-create mode,
         // so completing directly on the final name could overwrite a
-        // concurrent writer's artifact AFTER that writer's pointer committed
-        // — silent corruption of a committed generation. Instead the parts
+        // concurrent writer's artifact AFTER that writer's pointer committed,
+        // silently corrupting a committed generation. Instead the parts
         // stream to a unique scratch key and the final name is claimed with
         // `copy_if_not_exists`, which is atomic wherever the backend supports
         // it (natively on the in-memory test store; via
@@ -280,7 +280,7 @@ impl ArtifactStore for ObjectArtifactStore {
         // back to probe-then-copy where it is not. Above the provider copy
         // ceiling (`CLAIMABLE_LIMIT_BYTES`) no claim primitive exists at all,
         // so those artifacts stream directly onto the final name behind the
-        // probe — the documented residual race, confined to >5 GiB objects.
+        // probe. That is the documented residual race, confined to >5 GiB objects.
         if self.contains(name)? {
             return self.refuse_unless_identical(name, sha256);
         }
@@ -288,7 +288,7 @@ impl ArtifactStore for ObjectArtifactStore {
         // The scratch key embeds the EXPECTED digest: even if two uploaders
         // somewhere collided on the rest of the key (pid + clock + counter
         // are only process-unique), they can only share a scratch when they
-        // are writing identical content — a substitution can never smuggle
+        // are writing identical content, so a substitution can never smuggle
         // bytes past the digest gate into the claim.
         let scratch = claim_via_scratch.then(|| {
             self.object_path(&format!(
@@ -304,7 +304,7 @@ impl ArtifactStore for ObjectArtifactStore {
         let upload_target = scratch.as_ref().unwrap_or(&path);
         // One FIXED part size for the whole upload, chosen from the size
         // hint: R2 requires every non-final part to be the same size, and
-        // S3 caps an upload at 10,000 parts — so the hint scales the part
+        // S3 caps an upload at 10,000 parts. So the hint scales the part
         // size up front (with headroom for a hint that undershoots) instead
         // of growing parts mid-stream.
         let part_size = if size_hint > 0 {
@@ -468,15 +468,15 @@ impl ArtifactStore for ObjectArtifactStore {
     }
 }
 
-/// Serialises a committed body into pointer-document bytes — the engine's own
-/// rendering, via [`snapshot_identity`](crate::snapshot_identity).
+/// Serialises a committed body into pointer-document bytes, using the engine's
+/// own rendering via [`snapshot_identity`](crate::snapshot_identity).
 fn serialize_pointer_document(body: &Value) -> Result<Vec<u8>> {
     crate::snapshot_identity::pointer_document(body)
 }
 
 /// Validates pointer-document bytes and returns the committed body, through
-/// the engine's own schema + `body_sha256` validation (`parse_commit_manifest`
-/// — no scratch file; this runs on every pointer read).
+/// the engine's own schema + `body_sha256` validation (`parse_commit_manifest`,
+/// with no scratch file; this runs on every pointer read).
 ///
 /// Fails closed on a garbled pointer (bad schema version or body checksum), so
 /// a corrupted object never loads as a valid generation.

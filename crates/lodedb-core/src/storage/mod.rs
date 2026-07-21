@@ -264,7 +264,7 @@ pub fn load_generation_store(
 
 /// Cheap store metadata for the append path: the committed generation and the
 /// index's vector dimension. Read from the commit manifest and the state base
-/// payload only — unlike [`load_store`] it does not read or checksum the `.tvim`
+/// payload only. Unlike [`load_store`] it does not read or checksum the `.tvim`
 /// vectors or the text/lexical/multivec/ann sidecars, so a `CoreAppender` open is
 /// O(state metadata) rather than O(store).
 #[derive(Debug, Clone, Copy)]

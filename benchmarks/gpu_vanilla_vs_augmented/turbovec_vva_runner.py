@@ -1,13 +1,13 @@
 """Orchestrate the vanilla-vs-augmented TurboVec benchmark across all four axes.
 
 This module and its measurement core (``turbovec_vva_bench``) are dev-only
-benchmark scripts that live beside this file — they are NOT part of the shipped
+benchmark scripts that live beside this file; they are NOT part of the shipped
 ``lodedb`` package. Vanilla single- vs multi-threaded speed is measured in fresh
 subprocesses with ``RAYON_NUM_THREADS`` pinned (rayon reads it once per process,
 so the cell module is invoked via ``python -m`` per thread setting); the GPU path
 and the recall/memory/update axes run in-process.
 
-Run directly on any host (``lodedb`` must be importable — e.g. installed, or with
+Run directly on any host (``lodedb`` must be importable, e.g. installed, or with
 this benchmark dir on ``sys.path`` so ``import turbovec_vva_bench`` resolves; the
 file inserts its own directory automatically)::
 

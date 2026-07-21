@@ -38,7 +38,7 @@ pub struct VerifyReport {
 ///
 /// Returns [`ArtifactStoreError::NotFound`] when the store holds no committed
 /// generation for `index_key`, and [`ArtifactStoreError::Integrity`] on the first
-/// artifact whose bytes do not match — failing closed rather than reporting a
+/// artifact whose bytes do not match, failing closed rather than reporting a
 /// partial success. Reading the pointer validates the body checksum as a
 /// side effect (the engine's `read_commit_manifest` fails closed on a garbled
 /// root), so this checks the whole chain: root body, then every referenced blob.
@@ -87,7 +87,7 @@ pub struct OpenReport {
 /// This reuses `lodedb-core`'s `load_store` with `read_only` (which takes no writer
 /// lock and reads the exact committed manifest, never the `.wal` tail), so it
 /// proves a restored directory is loadable exactly as the embedded engine would
-/// read it, the acceptance check after a restore. Returns
+/// read it. This is the acceptance check after a restore. Returns
 /// the loaded document/chunk counts. `persistence_dir` is the local directory the
 /// generation was restored into.
 pub fn verify_local_generation_opens(
@@ -118,8 +118,8 @@ pub fn verify_local_generation_opens(
 /// into a scratch directory alongside reconstructed journal manifests and the
 /// candidate pointer, and the scratch copy is verify-opened read-only. A
 /// checksum-consistent but semantically invalid artifact therefore fails the
-/// restore while the destination still points at its previous generation —
-/// without this, the pointer swap would publish the broken generation before
+/// restore while the destination still points at its previous generation.
+/// Without this, the pointer swap would publish the broken generation before
 /// the open check could reject it.
 pub(crate) fn verify_candidate_opens(
     dir: &Path,
@@ -142,7 +142,7 @@ pub(crate) fn verify_candidate_opens(
         }
         if std::fs::hard_link(&source, &target).is_err() {
             // Filesystems without hardlinks (or cross-device edge cases):
-            // fall back to a byte copy — correctness over speed.
+            // fall back to a byte copy, correctness over speed.
             std::fs::copy(&source, &target)?;
         }
     }

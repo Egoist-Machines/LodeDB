@@ -60,7 +60,7 @@ def test_push_is_redacted_by_default(committed_store, tmp_path):
     assert body["tvtext"] is None
     assert body["tvlex"] is None
     assert body["json"] is not None
-    # The source itself still has its text store — redaction is per-transfer.
+    # The source itself still has its text store; redaction is per-transfer.
     assert read_pointer_body(source, key)["tvtext"] is not None
 
 

@@ -1,4 +1,4 @@
-"""KnowledgeGraph — a hybrid graph/knowledge-graph layer over LodeDB.
+"""KnowledgeGraph is a hybrid graph/knowledge-graph layer over LodeDB.
 
 The architecture is the one every comparable agent-memory system uses (Zep/
 Graphiti, cognee): keep the **topology** in a store built for traversal and use
@@ -11,10 +11,10 @@ Two design choices make this robust rather than a leaky two-database hack:
 - **SQLite is the source of truth; LodeDB is a rebuildable index.** Writes hit
   SQLite first, then the index. If an index write is lost (crash between the
   two), the topology is still correct and :meth:`reindex` rebuilds the index
-  from it — so there is no cross-store atomicity problem to get wrong.
+  from it, so there is no cross-store atomicity problem to get wrong.
 - **Retrieval is hybrid.** :meth:`search_subgraph` runs a LodeDB similarity
   search to find entry-point nodes, then does deterministic k-hop expansion over
-  the SQLite adjacency — the complete-set traversal LodeDB's top-k search can't
+  the SQLite adjacency, the complete-set traversal LodeDB's top-k search can't
   express on its own.
 
 Nodes are embedded by their ``label`` text (LodeDB embeds internally) or by a
@@ -466,7 +466,7 @@ class KnowledgeGraph:
     def list_edges(self) -> list[Edge]:
         """Returns every edge in the graph (complete-set enumeration).
 
-        Like :meth:`list_nodes`, full enumeration over the topology store — the
+        Like :meth:`list_nodes`, full enumeration over the topology store, the
         primitive behind an "all triplets" / "all edges of relation R" view.
         """
 

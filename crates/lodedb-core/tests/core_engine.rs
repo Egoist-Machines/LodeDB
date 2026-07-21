@@ -1323,7 +1323,7 @@ fn cleared_patch_matrix_does_not_resurrect_on_reload() {
         engine.persist().unwrap();
     }
     // 2. Re-upsert the same live document without a matrix. The pooled vector is
-    // unchanged, so this folds as an O(changed) delta (not a base rewrite) — the
+    // unchanged, so this folds as an O(changed) delta (not a base rewrite), the
     // path where an omitted clear would let the base matrix survive.
     {
         let mut engine = CoreEngine::open(options.clone()).unwrap();
@@ -1461,7 +1461,7 @@ fn text_reupsert_clears_a_prior_patch_matrix_on_reload() {
     // 2. Re-add the same id through the TEXT path (which carries no matrix). The
     // chunk embedding equals the base document vector so the calibration
     // fingerprint is unchanged and this folds as an O(changed) delta (not a base
-    // rewrite) — the path where an omitted clear leaves the base matrix behind.
+    // rewrite), the path where an omitted clear leaves the base matrix behind.
     // This is the third replacement site the clear tracking must cover, alongside
     // upsert_vectors and delete.
     {

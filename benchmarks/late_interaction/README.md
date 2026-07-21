@@ -34,7 +34,7 @@ mean-pooling cannot:
 Pooling a page to one vector destroys the per-patch signal MaxSim depends on, so
 its recall against the MaxSim ranking is near zero regardless of tuning. Late
 interaction holds every patch in one in-memory matrix and scores the whole corpus
-with a single GEMM plus a segmented max -- no candidate-recall loss, no
+with a single GEMM plus a segmented max, with no candidate-recall loss and no
 per-candidate read-back.
 
 ### Storage precision (`--storage`)
@@ -58,8 +58,8 @@ generation (~61%) and patch read-back (~38%) dominated. Three changes removed al
 of it:
 
 - **Resident exact scan** (default, unfiltered, within `resident_max_bytes`):
-  scores the whole corpus from one in-memory matrix -- no candidate scan, no
-  read-back. ~110 ms -> a few ms, recall 0.73 -> 1.0.
+  scores the whole corpus from one in-memory matrix, with no candidate scan and
+  no read-back. ~110 ms -> a few ms, recall 0.73 -> 1.0.
 - **One row per document** (the whole patch matrix in a single row): 39-54x faster
   ingest and far fewer rows; filtered queries score the matching subset
   exhaustively, and corpora over the resident budget stream from disk (exact,

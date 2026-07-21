@@ -107,7 +107,7 @@ fn pointer_cas_creates_updates_and_conflicts() {
     );
 
     // A stale expected body (a would-be concurrent writer still holding gen 1)
-    // conflicts — the pointer is now gen 2.
+    // conflicts; the pointer is now gen 2.
     let gen3 = commit_body("idx", 3, 0, json_sub("g0.json"));
     let err = store
         .compare_and_swap_pointer("idx", Some(&gen1), &gen3)
@@ -143,7 +143,7 @@ fn tenants_are_isolated_by_prefix() {
         .unwrap();
 
     // Tenant B, knowing the exact name and checksum, still cannot reach A's blob
-    // or pointer — the prefix namespaces content addressing per tenant.
+    // or pointer; the prefix namespaces content addressing per tenant.
     assert!(matches!(
         tenant_b.read_bytes("idx.gen/g0.json").unwrap_err(),
         ArtifactStoreError::NotFound(_)

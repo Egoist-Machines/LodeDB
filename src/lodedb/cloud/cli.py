@@ -2,7 +2,7 @@
 transfer core (`lodedb._turbovec.cloud`),
 plus the cloud verbs (login, tenancy, managed transfer).
 
-Thin by design — argument parsing and report formatting only. Every operation
+Thin by design, argument parsing and report formatting only. Every operation
 (and all of its validation) lives in the Rust core or `lodedb.cloud.transfer`, so
 the CLI cannot offer a code path the library does not have.
 
@@ -13,15 +13,15 @@ Agent-native output contract:
 - Errors print to stderr as `error: …` (+ a `hint: …` line naming the exact
   next command where one exists), with an exit code per failure class:
   1 unexpected, 2 usage/local config, 3 auth (401/403), 4 not found (404),
-  5 refused (402/409/422 — understood and denied), 6 transient (425/429/503
-  — retry with backoff).
+  5 refused (402/409/422, understood and denied), 6 transient (425/429/503,
+  retry with backoff).
 - Confirmation prompts never hang a pipe: without a TTY they fail
   immediately, naming `--yes`.
 
 Transfer verbs accept three REMOTE spellings: a directory path or `s3://`
 URL (the dumb targets, handled entirely by the Rust core), an explicit
 `orecloud://org/environment[/store]` managed target, or the literal word
-`cloud` — the managed remote recorded in LOCAL_DIR/orecloud.toml by
+`cloud`, the managed remote recorded in LOCAL_DIR/orecloud.toml by
 `lodedb cloud init`/`lodedb cloud link`.
 """
 
@@ -117,7 +117,7 @@ IncludeLexical = Annotated[
 def _run(operation: Callable[[], T]) -> T:
     """Runs one binding operation, mapping its exceptions onto stderr + exit 1
     (sync refusals onto the documented "refused" class, like their managed
-    twins — the message itself carries the force-flag/checkpoint hint)."""
+    twins; the message itself carries the force-flag/checkpoint hint)."""
     try:
         return operation()
     except _core.SyncConflictError as error:
@@ -238,8 +238,8 @@ def sync(
     """Sync KEY between LOCAL_DIR and REMOTE: fast-forward in whichever direction moved.
 
     Refuses (with a nonzero exit) when the two ends diverged past the last
-    recorded sync, or when there is no sync record and the ends differ —
-    resolve with exactly one of --force-push / --force-pull.
+    recorded sync, or when there is no sync record and the ends differ.
+    Resolve with exactly one of --force-push / --force-pull.
     """
     if force_push and force_pull:
         typer.secho(
@@ -362,7 +362,7 @@ def _fail(message: str, code: int = EXIT_UNEXPECTED, hint: str | None = None) ->
 
 def _classify(error: CloudError) -> tuple[int, str | None]:
     """Maps a control-plane refusal to (exit code, fix hint). The hint names
-    the exact next command — errors double as prompts for agents."""
+    the exact next command, so errors double as prompts for agents."""
     status = error.status_code
     if status == 401:
         return EXIT_AUTH, (
@@ -399,7 +399,7 @@ def _classify(error: CloudError) -> tuple[int, str | None]:
 
 def _confirm(prompt: str) -> None:
     """`typer.confirm` with an agent guard: when stdin is not a TTY there is
-    nobody to answer — fail immediately, naming `--yes`, instead of hanging
+    nobody to answer, so fail immediately, naming `--yes`, instead of hanging
     the calling program."""
     if not sys.stdin.isatty():
         raise _fail(
@@ -454,8 +454,8 @@ _TENANCY_HINT = (
 
 def _org_scope(client: CloudClient, org: str | None) -> str:
     """The org a command addresses: the explicit --org, else the token's
-    binding (environment tokens), else the account's only org — failing
-    with the actual choices when several orgs qualify."""
+    binding (environment tokens), else the account's only org. When several
+    orgs qualify it fails with the actual choices."""
     if org:
         return org
     info = _cloud(client.token_self)
@@ -475,10 +475,10 @@ def _org_scope(client: CloudClient, org: str | None) -> str:
 def _tenancy(
     client: CloudClient, org: str | None, environment: str | None
 ) -> tuple[str, str]:
-    """The (org, environment) pair a command addresses — the SDK's
-    resolution (explicit flags win; environment tokens supply their binding
-    and refuse contradictions; personal tokens fall back to the only
-    org/environment), re-raised with the CLI flags in the hint."""
+    """The (org, environment) pair a command addresses. Delegates to the
+    SDK's resolution (explicit flags win; environment tokens supply their
+    binding and refuse contradictions; personal tokens fall back to the only
+    org/environment) and re-raises failures with the CLI flags in the hint."""
     from lodedb.cloud.client import resolve_tenancy
 
     try:
@@ -550,7 +550,7 @@ def login(
     """Log in to an OreCloud control plane and store the credential locally.
 
     Default flow: this machine generates a keypair, your browser approves the
-    login, and the server returns the new token sealed to that keypair — the
+    login, and the server returns the new token sealed to that keypair. The
     secret never crosses in the clear and is never stored server-side.
     """
     creds = _load_credentials()
@@ -563,7 +563,7 @@ def login(
     if token is None:
         token = _browser_login(host, open_browser=not no_browser)
 
-    # Prove the credential works before persisting it — a typo'd --token must
+    # Prove the credential works before persisting it. A typo'd --token must
     # not leave broken state behind.
     with CloudClient(host, token) as client:
         me = _cloud(client.me)
@@ -580,7 +580,7 @@ def _browser_login(host: str, open_browser: bool = True) -> str:
     """The sealed-box browser handoff against `host`: prints the confirmation
     code and approval URL to stderr, blocks until a signed-in browser approves,
     and returns the minted token secret (sealed in transit to this process's
-    keypair — it never crosses in the clear)."""
+    keypair, so it never crosses in the clear)."""
     with CloudClient(host) as anonymous:
         handoff = _cloud(
             lambda: LoginHandoff(
@@ -596,8 +596,8 @@ def _browser_login(host: str, open_browser: bool = True) -> str:
 
 
 def _ensure_logged_in(host: str | None) -> "_config.Credentials":
-    """Stored credentials, or an inline sealed-box login when there are none —
-    the single human touchpoint of `lodedb cloud init`. A `host` that contradicts
+    """Stored credentials, or an inline sealed-box login when there are none.
+    This is the single human touchpoint of `lodedb cloud init`. A `host` that contradicts
     the stored credential fails closed rather than silently re-aiming the
     command at another control plane."""
     creds = _load_credentials()
@@ -656,7 +656,7 @@ def _agents_repo_token(
     """The repo's deterministic `init-<dirname>` scoped key, written into the
     dotenv file. Reused when the file still holds a live token of that name;
     otherwise every stale same-name token is revoked and one fresh key is
-    minted — re-running init never accumulates keys. Returns (report data,
+    minted, so re-running init never accumulates keys. Returns (report data,
     notes)."""
     from datetime import datetime
 
@@ -683,8 +683,8 @@ def _agents_repo_token(
         held = [row for row in live if existing_secret.startswith(str(row["prefix"]))]
         if held:
             # Reuse the key the file already holds; only heal the host line
-            # (the token line stays untouched — we could not rewrite it anyway,
-            # secrets are shown once).
+            # (the token line stays untouched; secrets are shown once, so we
+            # could not rewrite it anyway).
             env.write_env_values(env_file, {"ORECLOUD_HOST": host})
             return (
                 {"token": held[0], "env_file": str(env_file)},
@@ -748,13 +748,13 @@ def init(
         ),
     ] = None,
 ) -> None:
-    """Link LOCAL_DIR to one of the org's environments — the one-command path
+    """Link LOCAL_DIR to one of the org's environments, the one-command path
     from a local data directory to a managed remote. With --agents this is
     the whole setup for a coding agent: log in if needed (one browser
     approval), mint a scoped key into .env, and scaffold the repo's agent
     artifacts. Environments are fixed (production and testing, seeded at
-    signup); init resolves the slug from the credential — or validates an
-    explicit one — rather than creating anything."""
+    signup); init resolves the slug from the credential (or validates an
+    explicit one) rather than creating anything."""
     creds = _ensure_logged_in(host)
     data: dict[str, object] = {}
     notes: list[str] = []
@@ -818,8 +818,8 @@ def auth_print_headers() -> None:
 
     The headersHelper contract (Claude Code and friends run a command to
     obtain MCP auth headers), so the browser-approved login feeds MCP
-    servers without anyone pasting a key into a config file. Always JSON —
-    that IS the output contract."""
+    servers without anyone pasting a key into a config file. Always JSON.
+    That IS the output contract."""
     creds = _load_credentials()
     if creds is None:
         raise _fail(
@@ -831,7 +831,7 @@ def auth_print_headers() -> None:
 
 @app.command()
 def logout() -> None:
-    """Forget the locally stored credential (the token itself stays valid —
+    """Forget the locally stored credential (the token itself stays valid;
     revoke it with `lodedb cloud tokens revoke` to kill it server-side)."""
     deleted = _config.delete_credentials()
     _emit(
@@ -908,7 +908,7 @@ def tokens_list() -> None:
 
 def _write_credential_env(env_file: str | Path, host: str, secret: str) -> dict[str, object]:
     """Write ORECLOUD_HOST + ORECLOUD_TOKEN into the dotenv file (the secret
-    never touches stdout — printed output becomes part of an agent's
+    never touches stdout because printed output becomes part of an agent's
     transcript) and make sure the file is git-ignored. Returns the env_file
     path and any gitignore note, for merging into the command's output."""
     from lodedb.cloud import _env_file as env
@@ -927,7 +927,7 @@ def tokens_mint(
     kind: Annotated[str, typer.Option(help="personal | secret | publishable.")] = "personal",
     scope: Annotated[
         list[str], typer.Option("--scope", help="Repeatable: admin, write, read:search, read:text.")
-    ] = ["admin"],  # noqa: B006 — typer requires a literal default
+    ] = ["admin"],  # noqa: B006  # typer requires a literal default
     name: Annotated[str, typer.Option(help="Label shown in listings.")] = "",
     org: Annotated[str | None, typer.Option(help=_ORG_HELP)] = None,
     environment: Annotated[str | None, typer.Option(help=_ENVIRONMENT_HELP)] = None,
@@ -942,8 +942,8 @@ def tokens_mint(
         ),
     ] = None,
 ) -> None:
-    """Mint a token. The secret is printed once and never retrievable again —
-    or, with --env-file, written straight to the file and never printed.
+    """Mint a token. The secret is printed once and never retrievable again.
+    With --env-file it is written straight to the file and never printed.
     Environment tokens (secret/publishable) default to the resolved
     org/environment; personal tokens take neither flag."""
     creds = _load_credentials()
@@ -1000,7 +1000,7 @@ def mcp_install(
     """Print ready-to-paste MCP configs (Claude Code, Cursor, VS Code) for
     one end user's store. The endpoint speaks Streamable HTTP with Bearer
     auth; the token's scopes decide which tools the agent sees. The store
-    needs no create step — it provisions on the agent's first write."""
+    needs no create step; it provisions on the agent's first write."""
     import json as json_module
     from urllib.parse import quote
 
@@ -1008,7 +1008,7 @@ def mcp_install(
         org, environment = _tenancy(client, org, environment)
     creds = _load_credentials()
     assert creds is not None  # _client() above required it
-    # One URL per end user's store — always the 3-segment form. Slugs are
+    # One URL per end user's store, always the 3-segment form. Slugs are
     # [a-z0-9-] but store names (end-user ids) are free-form: quote them.
     url = (
         f"{creds.host}/mcp/{quote(org, safe='')}/"
@@ -1213,7 +1213,7 @@ def store_create(
         if minted is None:
             return
         # The key was minted bound to this environment, so the snippet never
-        # restates the tenancy — Client resolves it from the credential.
+        # restates the tenancy; Client resolves it from the credential.
         typer.echo()
         typer.echo("Connect from Python (the key is shown once — this is your copy):")
         typer.echo()
@@ -1241,7 +1241,7 @@ def _resolve_index_key(
     client: CloudClient, org: str, environment: str, store: str, key: str | None
 ) -> str:
     """The explicit key, or the store's only index key when it is unambiguous
-    (mirrors `store create`'s omit-the-key ergonomics). Exact-name lookup —
+    (mirrors `store create`'s omit-the-key ergonomics). Exact-name lookup,
     never a page walk (an environment holds one store per end user)."""
     if key is not None:
         return key
@@ -1574,7 +1574,7 @@ def store_export(
     ] = True,
 ) -> None:
     """Export ALL of a user's memories as JSON (pages the browse endpoint
-    to exhaustion) — the per-end-user data-export verb."""
+    to exhaustion). This is the per-end-user data-export verb."""
     import json as _json
 
     with _client() as client:
@@ -1658,7 +1658,7 @@ def store_delete_memories(
 ) -> None:
     """Delete a user's memories in place (expired ones included), keeping
     the store registered. Async like every cloud write. To forget the user
-    entirely — row, entitlement slot and all — use `store delete`."""
+    entirely (row, entitlement slot and all), use `store delete`."""
     with _client() as client:
         org, environment = _tenancy(client, org, environment)
         if not yes:

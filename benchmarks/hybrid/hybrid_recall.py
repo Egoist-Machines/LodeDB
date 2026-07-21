@@ -13,7 +13,7 @@ latency. The deterministic hash embedding backend is used on purpose: it makes
 the "embedding cannot see the literal token" failure mode reproducible without
 downloading a model, so the lexical contribution is isolated rather than masked
 by a model that happens to encode some character-level signal. Output is
-raw-payload-free (counts, ratios, latency only — never tokens or terms).
+raw-payload-free (counts, ratios, latency only, never tokens or terms).
 
 Run::
 

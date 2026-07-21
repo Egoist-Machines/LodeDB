@@ -1,18 +1,18 @@
 """Single-writer file lock for LodeDB persistence (stdlib only).
 
 A LodeDB handle loads on-disk state at open and persists its own in-memory view,
-so two *independent* writers on one directory cannot safely compose — interleaved
+so two *independent* writers on one directory cannot safely compose; interleaved
 deltas leave the journal un-replayable. LodeDB is therefore **single-writer per
 path**: a handle takes an exclusive OS advisory lock when it opens and holds it
 until it closes. A second open blocks until the first closes (so it then loads
 the accumulated state and composes cleanly) and fails fast with
-:class:`ConcurrentWriterError` once the timeout elapses — the model SQLite uses
+:class:`ConcurrentWriterError` once the timeout elapses, the model SQLite uses
 with a busy-timeout. The kernel releases the lock automatically on process exit,
 so a crashed or forgotten handle never wedges the path.
 
 POSIX uses ``fcntl.flock``; Windows uses ``msvcrt.locking``. The lock is taken on
 a dedicated sentinel file ``<dir>/.lodedb.lock``, never the data files (which are
-replaced via ``os.replace`` — a new inode that would drop a lock held on the old
+replaced via ``os.replace``, a new inode that would drop a lock held on the old
 one). Advisory locks are unreliable on network filesystems (NFS/SMB); LodeDB
 targets local disk.
 """
@@ -71,7 +71,7 @@ class WriterLock:
     """An exclusive, held-for-the-handle's-lifetime advisory lock on a directory.
 
     Not reentrant: a second :meth:`acquire` on the same path (this process or
-    another) contends with the first and fails after the timeout — that is the
+    another) contends with the first and fails after the timeout; that is the
     single-writer guarantee. Acquire blocks (polling) until the lock is free or
     the timeout elapses; :meth:`release` is idempotent.
     """

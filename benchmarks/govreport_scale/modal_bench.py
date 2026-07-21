@@ -2,7 +2,7 @@
 
 Embeds GovReport chunks (MiniLM) up to ~1M vectors on the GPU, then measures recall@k vs
 fp32 brute force (the vanilla **uint8-LUT** scan + the augmented **fp16-reconstruction**
-scan — both over the same 4-bit index) and the CPU scan's throughput ceiling (vanilla
+scan, both over the same 4-bit index) and the CPU scan's throughput ceiling (vanilla
 single-/all-threads vs the augmented GPU path) across a 100K -> 1M corpus-size sweep, plus a
 batch sweep at 1M.
 

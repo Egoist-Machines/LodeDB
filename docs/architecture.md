@@ -133,27 +133,27 @@ pulled in transitively by `sentence-transformers`, but importing LodeDB does not
 
 Each index is a per-index generation directory plus a single atomically-swapped root pointer:
 
-- `<key>.commit.json` — the **root commit manifest**: the one file whose atomic swap commits
+- `<key>.commit.json` is the **root commit manifest**: the one file whose atomic swap commits
   a generation. It pins (with checksums) the consistent set of artifacts for that generation.
-- `<key>.gen/` — generation-addressed artifacts for that index:
-  - `g<epoch>.json` — the redacted JSON state base, plus its `.jsd` document journal under
+- `<key>.gen/` holds the generation-addressed artifacts for that index:
+  - `g<epoch>.json`: the redacted JSON state base, plus its `.jsd` document journal under
     `g<epoch>.json.json-delta/`,
-  - `g<epoch>.tvim` — the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
+  - `g<epoch>.tvim`: the TurboVec vector base (quantized vectors + metadata), plus its `.tvd`
     encoded-row journal under `g<epoch>.tvim.tvim-delta/`,
-  - `g<epoch>.tvtext` — the raw-text base (`store_text`, on by default): the full
+  - `g<epoch>.tvtext`: the raw-text base (`store_text`, on by default) holding the full
     `document_id -> text` map, plus its `.txd` text journal under `g<epoch>.tvtext.tvtext-delta/`,
     governed by the same root manifest,
-  - `g<epoch>.tvlex` — the lexical-index base (`index_text`, which defaults to match `store_text`):
-    the full `document_id -> per-chunk token lists` map, plus its `.lxd` token journal under
-    `g<epoch>.tvlex.tvlex-delta/`, governed by the same root manifest.
+  - `g<epoch>.tvlex`: the lexical-index base (`index_text`, which defaults to match `store_text`)
+    holding the full `document_id -> per-chunk token lists` map, plus its `.lxd` token journal
+    under `g<epoch>.tvlex.tvlex-delta/`, governed by the same root manifest.
 
-A commit writes any new artifacts first — bases are generation-addressed and never
-overwritten in place — then atomically swaps `<key>.commit.json`; that swap is the only
+A commit writes any new artifacts first (bases are generation-addressed and never
+overwritten in place), then atomically swaps `<key>.commit.json`; that swap is the only
 commit point. A crash mid-commit leaves the previously committed generation fully intact: on
 reopen a writer rolls back to it (dropping the uncommitted artifacts) rather than failing
-closed, and a lock-free reader loads exactly the generation the root names — consistent
-snapshot isolation, raw text included. Superseded generations are garbage-collected, keeping
-the most recent few for in-flight readers. The redacted artifacts (`.json`/`.jsd`/`.tvim`/
+closed, and a lock-free reader loads exactly the generation the root names, so it gets
+consistent snapshot isolation, raw text included. Superseded generations are
+garbage-collected, keeping the most recent few for in-flight readers. The redacted artifacts (`.json`/`.jsd`/`.tvim`/
 `.tvd`) never carry raw document or query text; only the `.tvtext` base + `.txd` journal hold
 raw text, and only the `.tvlex` base + `.lxd` journal hold payload-derived lexical terms.
 
@@ -240,7 +240,7 @@ base plus a `.txd` delta journal, mirroring the state/vector journals so an incr
 journals only the upserted texts and deleted ids (O(changed), not a full-map rewrite) and a load
 replays the deltas onto the base. Every base and segment is checksum-guarded and fails closed on
 a corrupt/mismatched file. The store is deliberately **separate** from the redacted artifacts
-above — none of them read it — so retrieval (`db.get`/`get_text`/`get_texts`, the `lodedb get`
+above (none of them read it), so retrieval (`db.get`/`get_text`/`get_texts`, the `lodedb get`
 CLI command, `POST /get`, and the MCP `lodedb_get` tool) never weakens any payload-free
 guarantee. Removing a document journals a delete. Opening with `store_text=False` opts out
 entirely: no text is retained, the retrieval paths raise/return empty, and any existing store is
@@ -315,8 +315,8 @@ The appender also ingests full text, so text writes are multi-producer too. Beca
 embed (embeddings live in the binding layer), the appender takes the *post-embedding* shape: it
 chunks the documents (`prepare_documents`, using the store writer's `chunk_character_limit` so chunk
 ids match), the binding embeds the returned chunks, and `append_embedded_documents` logs one
-`apply_embedded_documents` record. This path is replay-independent -- it captures no base generation
-and is never `PlanStale` like the single-writer `prepare_text_upsert`/`apply_text_upsert` -- because
+`apply_embedded_documents` record. This path is replay-independent (it captures no base generation
+and is never `PlanStale` like the single-writer `prepare_text_upsert`/`apply_text_upsert`) because
 the folding writer resolves a replacement's retired chunks from its own index state (so the appended
 record carries an empty removed-chunk list) and normalizes each record's text/tokens to its own
 `store_text`/`index_text` on fold. It is `append_text`/`append_text_many` in Python (`lodedb.Appender`,
@@ -327,8 +327,8 @@ checkpointer* (`CoreCheckpointer`, exposed over the C ABI, in Python as `lodedb.
 Swift as `LodeCheckpointer`) removes that: one process folds the WAL into fresh committed generations
 continuously while appenders keep logging, so appended records become durable (and visible to a
 reader's `refresh`) without an application ever taking a writable open. It holds a crash-reclaimable
-*lease* on a `<dir>/.lodedb.checkpoint.lock` sentinel -- distinct from the writer lock, so it excludes
-neither appenders nor the writer and only elects one checkpointer at a time -- and takes the exclusive
+*lease* on a `<dir>/.lodedb.checkpoint.lock` sentinel (distinct from the writer lock, so it excludes
+neither appenders nor the writer and only elects one checkpointer at a time) and takes the exclusive
 writer lock solely for the brief window of each `checkpoint()`. Single-applier ordering is preserved
 because every fold runs under that same exclusive lock a writable open would take; the fold is
 incremental (only records above the applied-LSN watermark, onto the already-warm index), and if a
@@ -342,5 +342,5 @@ its lifetime: it takes the shared lock per append (re-reading the committed gene
 reservation always clears a fold that advanced it between appends) and releases it in between, which is
 what lets the checkpointer take the exclusive lock to fold. This makes the appender's O(1) torn-tail
 repair span concurrent WAL growth: when bytes sit past its in-session watermark, it scans and truncates
-only to the last CRC-valid frame -- preserving records a concurrent writer or checkpointer left there
--- rather than dropping the tail back to a now-stale boundary.
+only to the last CRC-valid frame rather than dropping the tail back to a now-stale
+boundary. Records a concurrent writer or checkpointer left there survive.

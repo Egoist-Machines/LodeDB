@@ -1,6 +1,6 @@
 """CloudStore verb wiring against a stub transport: what payload each verb
 puts on the wire and how it folds the acceptance back into session state
-(read-your-writes floor, `last_write_id`). No server involved. The accepted
+(read-your-writes floor, `last_write_id`). No server involved; the accepted
 write contract itself is covered end-to-end in `server/tests`."""
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class _UnprovisionedClient:
 
 def test_unprovisioned_batch_verbs_keep_query_cardinality():
     """Both batched search verbs answer an unprovisioned store with one empty
-    hit list PER query. Callers zip queries to results."""
+    hit list PER query, so callers zip queries to results."""
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.search_many(["a", "b", "c"]) == [[], [], []]
     assert store.search_many_by_vector([[0.1, 0.2], [0.3, 0.4]]) == [[], []]
@@ -165,7 +165,7 @@ class _BrowseClient:
 def test_browse_carries_the_session_floor_and_retries_425():
     """Browse is a read like search: after a write on this handle it sends
     the session's read-your-writes floor as min_seq and briefly retries a
-    425 instead of surfacing it. The write is durable; only its visibility
+    425 instead of surfacing it; the write is durable, only its visibility
     trails by a fold cycle."""
     client = _BrowseClient(too_early_first=True)
     store = _store(client)

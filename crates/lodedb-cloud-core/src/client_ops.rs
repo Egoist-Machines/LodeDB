@@ -1,7 +1,7 @@
 //! Client-edge operations: the six verbs a frontend invokes by target string.
 //!
 //! Frontends (the `orecloud` CLI via the Python binding today; `lodedb cloud` /
-//! `LodeDBCloud` later) name each end of an operation with one string — a local
+//! `LodeDBCloud` later) name each end of an operation with one string, a local
 //! directory path or an `s3://bucket/prefix` URL. This module owns the
 //! composition from those strings to the typed primitives (`export_generation`,
 //! `verify_generation`, `status_for_push`, the sync classifier), so every
@@ -49,7 +49,7 @@ pub struct PullOutcome {
 
 /// An explicit override of the sync classification.
 ///
-/// A force overrides the *classification* only — never the stores' integrity
+/// A force overrides the *classification* only, never the stores' integrity
 /// invariants. In particular, divergent lineages that reuse an artifact file
 /// name with different bytes (a same-epoch fork) still fail closed against
 /// plain directory/`s3://` remotes; see [`sync`].
@@ -110,9 +110,9 @@ pub fn push(
 }
 
 /// Restores `index_key`'s committed generation from `remote` into the local
-/// `dir`, then proves the engine can open the restored copy read-only:
-/// restore-verifies-before-accepting as one operation, so no
-/// frontend can offer a pull that skips the check.
+/// `dir`, then proves the engine can open the restored copy read-only.
+/// Restore and verify run as one operation, so no frontend can offer a
+/// pull that skips the check.
 ///
 /// The pull ships the remote verbatim ([`TransferPolicy::full`]): a remote that
 /// was pushed redacted already omits text, so there is nothing to filter on the
@@ -159,7 +159,7 @@ pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
 
 /// The shared local-restore tail: stage the artifacts, prove the candidate
 /// opens through the engine (from a scratch layout), and only then publish
-/// the pointer — so every acceptance failure leaves the destination on its
+/// the pointer, so every acceptance failure leaves the destination on its
 /// previous committed generation. `discard_wal` truncates the destination
 /// WAL right after the swap (force-pull semantics); callers must have
 /// refused a pending WAL beforehand when not forcing. The journal manifests
@@ -170,8 +170,8 @@ pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
 /// beside the new lineage (force-pull only), and a failure between the swap
 /// and the journal rebuild leaves the restored copy readable but
 /// fail-closed on its first O(changed) mutation. Closing them fully needs a
-/// recoverable restore transaction (engine-side recovery on open) — a
-/// follow-up, not this milestone.
+/// recoverable restore transaction (engine-side recovery on open), a
+/// follow-up to this version.
 ///
 /// Caller holds the directory writer lock.
 fn restore_staged(
@@ -217,9 +217,9 @@ fn acquire_writer_lock(dir: &str) -> Result<lodedb_core::engine::DirWriterLock> 
 }
 
 /// Refuses a restore when the destination WAL still holds acknowledged
-/// operations: replaying them onto the pulled lineage — or silently dropping
-/// them — would corrupt or lose acknowledged writes. `hint` names the caller's
-/// resolution path.
+/// operations: replaying them onto the pulled lineage would corrupt
+/// acknowledged writes, and silently dropping them would lose them. `hint`
+/// names the caller's resolution path.
 pub(crate) fn ensure_no_pending_wal(dir: &str, index_key: &str, hint: &str) -> Result<()> {
     let ops = pending_wal_ops(dir, index_key)?;
     if ops > 0 {
@@ -305,15 +305,15 @@ pub fn verify(target: &str, index_key: &str) -> Result<VerifyReport> {
 /// - `InSync` is a no-op; `LocalAhead`/`Republish` push; `RemoteAhead` pulls
 ///   (restore + verify-open, exactly like [`pull`]).
 /// - `Diverged`/`Unknown` refuse with
-///   [`ArtifactStoreError::SyncConflict`] — overwriting either end would
+///   [`ArtifactStoreError::SyncConflict`]. Overwriting either end would
 ///   discard a commit, a decision only the caller can make via `force`.
 /// - A forced push/pull skips the refusal but nothing else: the transfer still
 ///   goes through the pointer CAS and (for pulls) the verify-open. Force also
 ///   cannot override the stores' immutability invariant: two lineages that
 ///   diverged from one base and reuse the same artifact file names with
-///   different bytes (a same-epoch fork) fail closed with a recovery hint —
-///   resolving that shape against a dumb remote needs the managed
-///   content-addressed layout of a later milestone.
+///   different bytes (a same-epoch fork) fail closed with a recovery hint.
+///   Resolving that shape against a dumb remote needs the managed
+///   content-addressed layout.
 ///
 /// Transfers are conditional on the exact remote/local state that was
 /// classified: a concurrent advance of the destination between classification
@@ -321,7 +321,7 @@ pub fn verify(target: &str, index_key: &str) -> Result<VerifyReport> {
 /// that guarantee is depends on the destination backend: object stores use a
 /// genuinely atomic conditional write, while a directory's pointer swap is
 /// read-check-then-replace ([`LocalArtifactStore`](crate::LocalArtifactStore)
-/// documents this) — so running sync concurrently with an *active engine
+/// documents this). So running sync concurrently with an *active engine
 /// writer* on the same directory is out of contract, exactly as LodeDB's
 /// single-writer model already requires. Any successful transfer records the
 /// new base in the sidecar.
@@ -372,7 +372,7 @@ pub fn sync(
         SyncForce::Pull => (false, true),
         SyncForce::None => match classification {
             SyncClassification::InSync => {
-                // No transfer — but if the two ends agree while the recorded
+                // No transfer. But if the two ends agree while the recorded
                 // base is missing (fresh clone of an already-synced pair, a
                 // remote switch to an identical mirror) or stale (a prior
                 // transfer whose sidecar write failed), record the agreed
@@ -436,7 +436,7 @@ pub fn sync(
         // Pull mirrors `pull`: take the writer lock (a live engine writer and
         // a restore must never interleave), refuse or discard a pending WAL,
         // stage + candidate-verify + publish, then record the base. The CAS
-        // preconditions on the raw local body read above — a concurrent
+        // preconditions on the raw local body read above, so a concurrent
         // engine commit fails as a PointerConflict rather than being
         // clobbered.
         let source_raw = remote_body.ok_or_else(|| {
@@ -478,10 +478,10 @@ fn is_local_dir(target: &str) -> bool {
 ///
 /// Two lineages that diverged from one base commonly reuse the same engine
 /// artifact names (`<key>.gen/g<epoch>.*`) with different bytes; the store's
-/// immutability invariant then refuses the overwrite — deliberately, and force
-/// flags do not override it (dumb path/`s3://` remotes store artifacts by
+/// immutability invariant then refuses the overwrite. That refusal is deliberate,
+/// and force flags do not override it (dumb path/`s3://` remotes store artifacts by
 /// engine name until the managed content-addressed layout, which absorbs this,
-/// arrives in a later milestone). Matching on the store's message text is
+/// arrives). Matching on the store's message text is
 /// acceptable here because both sites live in this crate and the immutability
 /// tests pin the wording.
 pub(crate) fn explain_fork_collision(error: ArtifactStoreError) -> ArtifactStoreError {
@@ -502,7 +502,7 @@ pub(crate) fn explain_fork_collision(error: ArtifactStoreError) -> ArtifactStore
 
 /// Builds the identity for a committed body: the id pair, the generation, and
 /// a per-store identity for each payload store (a store is carried iff its
-/// sub-manifest is non-null — the same test the engine uses to load it; the
+/// sub-manifest is non-null, the same test the engine uses to load it; the
 /// identity is a digest of that sub-manifest, which names every artifact and
 /// checksum the store pins).
 pub(crate) fn snap_ref(body: &Value) -> Result<SnapRef> {
@@ -524,17 +524,17 @@ pub(crate) fn snap_ref(body: &Value) -> Result<SnapRef> {
 ///
 /// Local directory targets normalize to an absolute path (resolving symlinks
 /// and `.`/`..` like the store's own containment checks do), because a
-/// relative spelling is cwd-dependent — the same string can name unrelated
+/// relative spelling is cwd-dependent. The same string can name unrelated
 /// directories from different working directories, and trusting on the raw
 /// string would let one remote inherit another's history.
 ///
 /// `s3://` targets additionally carry the effective endpoint: the URL alone
 /// names a backend only through `AWS_ENDPOINT` (MinIO/R2 use the same
 /// `s3://bucket/prefix` spelling against different services), so the endpoint
-/// is part of the identity. Credentials and region are deliberately not —
-/// rotating keys or fixing a region points at the *same* bucket. A
+/// is part of the identity. Credentials and region are deliberately not part
+/// of it; rotating keys or fixing a region points at the *same* bucket. A
 /// normalization failure or identity mismatch can only produce a false
-/// *mismatch* — failing toward force, never toward a wrong fast-forward.
+/// *mismatch*, which fails toward force, never toward a wrong fast-forward.
 fn remote_identity(remote: &str) -> String {
     if is_local_dir(remote) {
         return crate::paths::canonical_identity(Path::new(remote));

@@ -1,5 +1,5 @@
 """`lodedb.cloud._env_file`: dotenv writing that never clobbers, plus the
-gitignore guard — the pieces that keep `tokens mint --env-file` and
+gitignore guard, the pieces that keep `tokens mint --env-file` and
 `init --agents` from leaking or destroying anything."""
 
 import stat

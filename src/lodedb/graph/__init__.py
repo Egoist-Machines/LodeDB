@@ -1,4 +1,4 @@
-"""lodedb.graph — a hybrid knowledge-graph layer over LodeDB.
+"""lodedb.graph is a hybrid knowledge-graph layer over LodeDB.
 
 Topology (nodes, typed edges) lives in an embedded SQLite sidecar built for
 deterministic traversal; LodeDB serves as the rebuildable semantic index for

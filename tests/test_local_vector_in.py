@@ -157,7 +157,7 @@ def test_mixed_text_and_vector_in_same_index(tmp_path):
     assert {r["id"] for r in db.list_documents()} == {"t1", "v1"}
     # Text search still works on the text doc. (HashEmbeddingBackend is a
     # non-semantic hash, so restrict to the text doc by filter to make ranking
-    # deterministic — the point here is coexistence, not retrieval quality.)
+    # deterministic; the point here is coexistence, not retrieval quality.)
     assert db.search("the quick brown fox", k=5, filter={"kind": "text"})[0].id == "t1"
     # vector search finds the vector doc
     assert db.search_by_vector(_onehot(0), k=1)[0].id == "v1"

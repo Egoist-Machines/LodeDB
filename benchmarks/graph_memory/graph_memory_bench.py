@@ -1,20 +1,20 @@
 """Graph-memory benchmark: vector-in, predicate filters, and graph traversal.
 
 Exercises the three capabilities added for the knowledge-graph / memory stack
-and reports **metrics only** (counts, latency, throughput, recall/overlap — never
+and reports **metrics only** (counts, latency, throughput, recall/overlap, never
 raw text, queries, or embeddings), matching the repo's benchmark provenance rules.
 
 Three sub-benchmarks, all driven from the same loaded corpus:
 
-1. ``vector_in`` — text-in ingest (LodeDB embeds internally) vs vector-in ingest
+1. ``vector_in``: text-in ingest (LodeDB embeds internally) vs vector-in ingest
    (caller supplies precomputed vectors via ``add_vectors_many``), plus query
    parity: ``search`` vs ``search_by_vector`` over byte-identical indexes should
    return the same hits, isolating the embedding cost vector-in removes.
-2. ``filters`` — search latency across predicate selectivities: exact ``$eq``
+2. ``filters``: search latency across predicate selectivities, exact ``$eq``
    (posting-allowlist pushdown) vs ``$gte`` / ``$ne`` / ``$exists`` (which today
    are resolved by the per-field planner). Compares the planner against a
    per-document scan.
-3. ``graph`` — a synthetic knowledge graph over the corpus: k-hop traversal
+3. ``graph``: a synthetic knowledge graph over the corpus, with k-hop traversal
    latency (SQLite topology) and hybrid ``search_subgraph`` latency (semantic
    seed + structural expansion) at scale.
 

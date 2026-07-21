@@ -4,7 +4,7 @@ Raw text is retained by default (``store_text=True``) in a dedicated ``.tvtext``
 base plus a ``.txd`` delta journal, so the original text is retrievable by id
 (``get`` / ``get_text`` / ``get_texts``), durably across reopens and committed
 O(changed) per write. The redacted artifacts stay payload-free
-regardless — telemetry, audit, the ``.json`` snapshot, the ``.jsd`` journal, and
+regardless: telemetry, audit, the ``.json`` snapshot, the ``.jsd`` journal, and
 the ``.tvim``/``.tvd`` vector sidecars never carry raw document text. Opening
 with ``store_text=False`` opts out of retaining text at all.
 

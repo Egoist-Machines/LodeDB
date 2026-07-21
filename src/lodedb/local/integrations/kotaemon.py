@@ -21,8 +21,8 @@ from kotaemon with only a settings change (no kotaemon fork)::
         "path": str(KH_USER_DATA_DIR / "vectorstore"),
     }
 
-kotaemon does not configure an embedding dimension anywhere — the store meets
-the dimension of whatever embedding model the user selected at runtime — so the
+kotaemon does not configure an embedding dimension anywhere (the store meets
+the dimension of whatever embedding model the user selected at runtime), so the
 LodeDB index is created lazily on the first ``add`` and its shape is recorded in
 a small ``kotaemon_store.json`` sidecar for reopens. LodeDB indexes require a
 dimension that is a multiple of 8, so vectors at any other dimension are
@@ -302,7 +302,7 @@ class LodeDBVectorStore:
     def drop(self) -> None:
         """Deletes the entire collection from disk.
 
-        Removes ``<path>/<collection_name>`` — but only when this adapter's shape
+        Removes ``<path>/<collection_name>``, but only when this adapter's shape
         sidecar is present, so a misconfigured path can never delete a directory
         the adapter did not create. A collection that was never created is a
         no-op.
@@ -461,7 +461,7 @@ class LodeDBVectorStore:
         A later open depends on this sidecar to know the collection's shape, so
         it follows the same durability mode as the LodeDB store it describes
         (the adapter opens the store without an explicit ``durability=``, which
-        resolves from ``LODEDB_DURABILITY`` — mirror that here).
+        resolves from ``LODEDB_DURABILITY``; mirror that here).
         """
 
         payload = json.dumps(
@@ -501,7 +501,7 @@ def _validated_collection_name(collection_name: str) -> str:
 
     The collection directory is joined under the configured base ``path`` and
     :meth:`LodeDBVectorStore.drop` deletes it recursively, so a name carrying
-    path separators, ``..``, or an absolute prefix must never reach that join —
+    path separators, ``..``, or an absolute prefix must never reach that join;
     it would let a config value write to (and drop) a directory outside the
     vector-store root.
     """

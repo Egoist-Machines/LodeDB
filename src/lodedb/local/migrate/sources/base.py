@@ -7,8 +7,8 @@ source. The runner then replays those rows into a fresh LodeDB target.
 
 Two replay modes mirror the shipped adapters:
 
-- ``text-replay`` — the row carries canonical text + metadata; LodeDB embeds it.
-- ``vector-preserve`` — the row carries the source's own embedding (and payload
+- ``text-replay``: the row carries canonical text + metadata; LodeDB embeds it.
+- ``vector-preserve``: the row carries the source's own embedding (and payload
   text/metadata); LodeDB stores the vector verbatim.
 
 Importers are read-only by construction: they open the source, iterate, and close.

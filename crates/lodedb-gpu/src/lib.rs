@@ -292,7 +292,7 @@ extern "C" __global__ void merge_topk(
 /// CPU kernel, never an error the caller should surface to the user.
 #[derive(Debug, Clone)]
 pub enum GpuScanError {
-    /// No CUDA driver is loadable (CPU-only host) — do not retry this process.
+    /// No CUDA driver is loadable (CPU-only host); do not retry this process.
     Unavailable(String),
     /// The driver loaded but a CUDA call failed (no device, OOM, kernel error).
     Device(String),
@@ -326,8 +326,8 @@ fn debug_enabled() -> bool {
 ///
 /// On by default: the fused path reads each cuBLAS score once instead of the `k`
 /// times `topk_argmax` rescans it, and returns the identical top-k (same cuBLAS
-/// scores, same (score desc, slot asc) order) — verified by exact-parity tests on
-/// A10 and L40S. Set `LODEDB_GPU_FUSED_TOPK=off` (or `0`/`false`/`no`) to force the
+/// scores, same (score desc, slot asc) order). Exact-parity tests on
+/// A10 and L40S verify this. Set `LODEDB_GPU_FUSED_TOPK=off` (or `0`/`false`/`no`) to force the
 /// legacy `topk_argmax` path. Mirrors the on-by-default `LODEDB_GPU_DIRECT_TURBOVEC`
 /// knob: any other value leaves it enabled.
 fn fused_topk_enabled() -> bool {
@@ -787,7 +787,7 @@ impl GpuScanSession {
 
         // Reuse device scratch for this (nq, k) shape; allocate only on first sight.
         // The serving layer drives a small set of shapes, so steady-state queries
-        // do no device allocation or zeroing — only copies and kernels.
+        // do no device allocation or zeroing, only copies and kernels.
         // ceil(n / FUSED_CHUNK_ROWS) without div_ceil (MSRV 1.70); only used when fused.
         let num_chunks = self.n / FUSED_CHUNK_ROWS + usize::from(self.n % FUSED_CHUNK_ROWS != 0);
 

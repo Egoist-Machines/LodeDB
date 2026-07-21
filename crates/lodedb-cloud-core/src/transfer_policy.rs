@@ -1,19 +1,19 @@
 //! Which payload-bearing stores a transfer is allowed to ship.
 //!
-//! The redacted stores (`json`/`tvim`/`tvmv`/`tvann`/`tvvf`) carry no raw text and always ship —
-//! they are the metadata and the vector/late-interaction index a restored copy
+//! The redacted stores (`json`/`tvim`/`tvmv`/`tvann`/`tvvf`) carry no raw text and always ship.
+//! They are the metadata and the vector/late-interaction index a restored copy
 //! needs to answer searches. Two stores are payload-bearing and opt-in:
 //!
-//! - `tvtext` — the raw document text (`db.get(id)` content);
-//! - `tvlex` — lexical terms, which are tokenised text and so payload-derived.
+//! - `tvtext`: the raw document text (`db.get(id)` content);
+//! - `tvlex`: lexical terms, which are tokenised text and so payload-derived.
 //!
 //! A [`TransferPolicy`] gates those two. `tvmv` (late-interaction patch matrices)
-//! is embedding data, not text, so it ships by default like `tvim` — as does
+//! is embedding data, not text, so it ships by default like `tvim`, as does
 //! `tvvf`, the rescore original-vector sidecar (vectors, never text).
 //!
 //! Redaction rewrites the *committed body* rather than merely skipping bytes: a
 //! redacted push publishes a body whose excluded sub-manifests are null, so the
-//! remote generation genuinely has no text — a restore of it cannot resurrect
+//! remote generation genuinely has no text and a restore of it cannot resurrect
 //! text that was never uploaded.
 
 use serde_json::Value;
@@ -33,8 +33,8 @@ pub struct TransferPolicy {
 }
 
 impl TransferPolicy {
-    /// Ships every store, including text and lexical — a verbatim copy of the
-    /// committed generation.
+    /// Ships every store, including text and lexical, for a verbatim copy of
+    /// the committed generation.
     pub fn full() -> Self {
         Self {
             include_text: true,
@@ -42,7 +42,7 @@ impl TransferPolicy {
         }
     }
 
-    /// Ships only the redacted stores (no text, no lexical) — the default posture.
+    /// Ships only the redacted stores (no text, no lexical), the default posture.
     pub fn redacted() -> Self {
         Self {
             include_text: false,

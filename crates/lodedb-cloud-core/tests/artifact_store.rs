@@ -53,7 +53,7 @@ fn rewrite_different_bytes_conflicts() {
         .write_bytes_if_absent("idx.gen/g0.json", b"second", &sha_hex(b"second"))
         .unwrap_err();
     assert!(matches!(err, ArtifactStoreError::Integrity(_)));
-    // The original bytes are preserved — never overwritten in place.
+    // The original bytes are preserved, never overwritten in place.
     assert_eq!(
         store.read_bytes("idx.gen/g0.json").unwrap(),
         b"first".to_vec()
@@ -119,7 +119,7 @@ fn compare_and_swap_enforces_body_precondition() {
 #[test]
 fn compare_and_swap_rejects_same_generation_different_body() {
     // The ABA guard: a body sharing the committed generation *number* but carrying
-    // different content must NOT satisfy the precondition — a number is not a
+    // different content must NOT satisfy the precondition; a number is not a
     // version token. A generation-only check would wrongly let this swap through.
     let dir = tempfile::tempdir().unwrap();
     let store = LocalArtifactStore::new(dir.path(), false);
@@ -154,7 +154,7 @@ fn compare_and_swap_rejects_same_generation_different_body() {
 #[test]
 fn read_pointer_on_nonexistent_root_is_none() {
     // A store bound to a not-yet-created directory reads as empty rather than
-    // erroring — the precondition for exporting into a fresh backup target.
+    // erroring, the precondition for exporting into a fresh backup target.
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("not-created-yet");
     let store = LocalArtifactStore::new(&root, false);
@@ -187,7 +187,7 @@ fn racing_local_writers_never_corrupt_a_published_artifact() {
     // Two writers streaming DIFFERENT bytes under one name: unique scratches
     // plus a no-replace publish mean exactly one lineage's bytes land, every
     // Ok return attests bytes that match one writer's digest in full, and a
-    // loser sees the immutability refusal — never a torn interleaving.
+    // loser sees the immutability refusal, never a torn interleaving.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let payload_a: Vec<u8> = std::iter::repeat_with(|| b'a').take(4 * 1024 * 1024).collect();

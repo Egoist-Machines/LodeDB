@@ -2,12 +2,12 @@
 
 Public surface:
 
-- :class:`LodeDB` — the embedded SDK entrypoint.
-- :class:`LodeSearchHit` — one redacted ``(score, id, metadata)`` result row.
-- :class:`LodeLateInteractionIndex` — multi-vector (MaxSim) late-interaction retrieval.
-- :func:`resolve_local_device` / :func:`build_local_embedding_backend` —
+- :class:`LodeDB`: the embedded SDK entrypoint.
+- :class:`LodeSearchHit`: one redacted ``(score, id, metadata)`` result row.
+- :class:`LodeLateInteractionIndex`: multi-vector (MaxSim) late-interaction retrieval.
+- :func:`resolve_local_device` / :func:`build_local_embedding_backend`:
   embedding device selection (MPS / CUDA / CPU).
-- :func:`local_capability_report` — the data behind ``lodedb doctor``.
+- :func:`local_capability_report`: the data behind ``lodedb doctor``.
 """
 
 from lodedb.engine._filelock import ConcurrentWriterError
