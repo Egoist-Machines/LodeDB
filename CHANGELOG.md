@@ -5,6 +5,27 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`lodedb-graph`: a bi-temporal knowledge graph, the temporal successor to
+  `lodedb.graph.KnowledgeGraph`.** A new native crate (`crates/lodedb-graph`) over
+  `lodedb-core` that keeps the two-store architecture — an authoritative SQLite
+  topology store plus a rebuildable LodeDB semantic index — and adds Graphiti-style
+  bi-temporality: every fact carries event time (`valid_at`/`invalid_at`) and
+  transaction time (`created_at`/`expired_at`), contradictions **invalidate** rather
+  than delete, and every read takes an `as_of` frame (current / as-of an instant /
+  full history). Episodes → entities → facts with provenance, deterministic k-hop
+  traversal, hybrid semantic entry points, and the Graphiti rerankers (RRF, MMR,
+  node-distance, episode-mentions) ported as pure functions. It is the storage-and-
+  query half of Graphiti — no LLM extraction/resolution/contradiction detection;
+  `add_fact` is the analogue of Graphiti's `add_triplet`. Exposed to Python as
+  `lodedb.graph.TemporalKnowledgeGraph` (the `lodedb._turbovec.graph` submodule),
+  driven by a caller-supplied embedder (or precomputed vectors). See
+  [`docs/temporal-graph.md`](docs/temporal-graph.md). A Swift on-device binding is a
+  planned follow-up.
+
 ## [1.4.0] - 2026-07-18
 
 ### Added

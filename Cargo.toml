@@ -4,6 +4,7 @@ members = [
   "crates/lodedb-core",
   "crates/lodedb-ffi",
   "crates/lodedb-gpu",
+  "crates/lodedb-graph",
 ]
 resolver = "2"
 

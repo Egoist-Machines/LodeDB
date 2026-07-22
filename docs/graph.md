@@ -7,6 +7,12 @@ semantic-retrieval layer over nodes and edges, paired with a store built for
 traversal. This page covers the three capabilities that make LodeDB a first-class
 substrate for that, and the `lodedb.graph` layer that ties them together.
 
+> **Need time?** For a *bi-temporal* graph — facts with event-time and
+> transaction-time validity, invalidation-not-deletion, and "as-of" queries, native
+> Rust and available on-device — see [`temporal-graph.md`](temporal-graph.md)
+> (`lodedb.graph.TemporalKnowledgeGraph`). This page covers the non-temporal
+> `KnowledgeGraph`.
+
 One design principle runs through all of it: the graph store is the source of
 truth, and LodeDB is a rebuildable semantic index over it. If an index write is
 lost, the topology is still correct and the index rebuilds from it, so there is no
