@@ -24,8 +24,18 @@ pub const TS_OPEN: TimeMs = 9_223_372_036_854_775_000;
 /// Encode a timestamp as a fixed-width, zero-padded string that sorts lexically in
 /// the same order as it sorts numerically (LodeDB compares metadata numerically
 /// when both sides parse as numbers, and this keeps parity for filters that don't).
+///
+/// LIMITATION — negative (pre-1970) timestamps are clamped to 0 here, whereas the SQL
+/// topology ([`as_of_sql`]) compares the raw signed value. The truth store is therefore
+/// authoritative and correct for pre-1970 dates (a 1965 birthday, a historical event);
+/// only *time-scoped semantic* reads (`semantic_facts` / `search_subgraph` with an
+/// `AsOf::At` instant before 1970) can diverge from the SQL as-of. A full fix — an
+/// order-preserving signed encoding that biases the whole i64 range into the padded
+/// space (and reworks [`TS_OPEN`] to stay the max without overflowing i64) — changes the
+/// on-disk index format and is deferred to a focused change with LodeDB-internal checks.
 pub fn encode_ts(ms: TimeMs) -> String {
-    // Non-negative in practice; clamp defensively so width is stable.
+    // Clamp negatives to 0 (see LIMITATION above); keeps width stable for the common,
+    // non-negative range. The SQL truth store remains correct for negative timestamps.
     let v = if ms < 0 { 0 } else { ms };
     format!("{v:0width$}", width = TS_WIDTH)
 }
@@ -68,10 +78,18 @@ pub fn as_of_sql(as_of: AsOf) -> (String, Vec<TimeMs>) {
 }
 
 /// The timestamps to write when a new fact supersedes a prior one — Graphiti's
-/// rule. The prior fact's event-time end is the new fact's `valid_at` (when known),
-/// and its transaction-time end is `now`.
+/// rule. The prior fact's event-time end (`invalid_at`) is the new fact's `valid_at`
+/// when known, otherwise the new fact's `effective_time` (its `reference_time`, i.e.
+/// the observing episode's event time). It is NEVER left open: were it left `None`, an
+/// `AsOf::At(t)` read would count the prior and its replacement as simultaneously valid
+/// (a double-count), disagreeing with the `AsOf::Now` view. Its transaction-time end
+/// (`expired_at`) is `now`.
 ///
 /// Returns `(invalid_at, expired_at)` to apply to the prior fact.
-pub fn supersede_timestamps(new_fact_valid_at: Option<TimeMs>, now: TimeMs) -> (Option<TimeMs>, TimeMs) {
-    (new_fact_valid_at, now)
+pub fn supersede_timestamps(
+    new_fact_valid_at: Option<TimeMs>,
+    effective_time: TimeMs,
+    now: TimeMs,
+) -> (Option<TimeMs>, TimeMs) {
+    (Some(new_fact_valid_at.unwrap_or(effective_time)), now)
 }

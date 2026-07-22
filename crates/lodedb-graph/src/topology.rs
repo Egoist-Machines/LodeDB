@@ -369,6 +369,60 @@ impl TopologyStore {
         Ok(n > 0)
     }
 
+    /// Atomically close `priors` (the invalidation writes) and insert `new_fact` (the
+    /// replacement) in ONE transaction, so a crash can never leave priors closed with no
+    /// replacement (an event-time validity gap). Each prior is closed only if still live
+    /// on the transaction axis. Returns the ids of the priors actually closed, for the
+    /// caller to re-index.
+    pub fn supersede_and_insert(
+        &self,
+        priors: &[(String, Option<TimeMs>, TimeMs)],
+        new_fact: &Fact,
+    ) -> Result<Vec<String>> {
+        let properties = props_to_text(&new_fact.properties)?;
+        let episodes = serde_json::to_string(&new_fact.episodes)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut closed_ids = Vec::new();
+        {
+            let mut upd = tx.prepare(
+                "UPDATE facts SET invalid_at = ?, expired_at = ? WHERE id = ? AND expired_at IS NULL",
+            )?;
+            for (id, invalid_at, expired_at) in priors {
+                if upd.execute(params![invalid_at, expired_at, id])? > 0 {
+                    closed_ids.push(id.clone());
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO facts \
+                (id, src, relation, dst, fact, properties, episodes, \
+                 valid_at, invalid_at, created_at, expired_at, reference_time) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+                src=excluded.src, relation=excluded.relation, dst=excluded.dst, \
+                fact=excluded.fact, properties=excluded.properties, episodes=excluded.episodes, \
+                valid_at=excluded.valid_at, invalid_at=excluded.invalid_at, \
+                created_at=excluded.created_at, expired_at=excluded.expired_at, \
+                reference_time=excluded.reference_time",
+            params![
+                new_fact.id,
+                new_fact.src,
+                new_fact.relation,
+                new_fact.dst,
+                new_fact.fact,
+                properties,
+                episodes,
+                new_fact.valid_at,
+                new_fact.invalid_at,
+                new_fact.created_at,
+                new_fact.expired_at,
+                new_fact.reference_time,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(closed_ids)
+    }
+
     pub fn iter_facts(&self) -> Result<Vec<Fact>> {
         let sql = format!("SELECT {} FROM facts", FACT_COLS);
         let mut stmt = self.conn.prepare(&sql)?;
