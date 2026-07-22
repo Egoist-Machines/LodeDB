@@ -13,6 +13,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
+// The bi-temporal knowledge-graph C ABI (`lodedb_graph_*`), reusing this module's
+// JSON/error helpers. See src/graph.rs.
+mod graph;
+
 const ABI_VERSION: u32 = lodedb_core::NATIVE_CORE_ABI_VERSION;
 
 #[repr(C)]

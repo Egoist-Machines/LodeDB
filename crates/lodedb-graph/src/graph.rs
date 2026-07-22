@@ -192,6 +192,44 @@ impl TemporalGraph {
         valid_at: Option<TimeMs>,
         invalidates: &[String],
     ) -> Result<String> {
+        self.add_fact_inner(src, relation, dst, fact_text, properties, episodes, valid_at, invalidates, None)
+    }
+
+    /// Vector-in [`add_fact`]: index the fact by a caller-supplied `fact_embedding`
+    /// rather than the engine embedder. This is the on-device path — Swift embeds the
+    /// fact text and passes the vector, so the graph needs no embedder over the FFI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_fact_vec(
+        &mut self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        fact_text: &str,
+        properties: Value,
+        episodes: Vec<String>,
+        valid_at: Option<TimeMs>,
+        invalidates: &[String],
+        fact_embedding: &[f32],
+    ) -> Result<String> {
+        self.add_fact_inner(
+            src, relation, dst, fact_text, properties, episodes, valid_at, invalidates,
+            Some(fact_embedding),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_fact_inner(
+        &mut self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        fact_text: &str,
+        properties: Value,
+        episodes: Vec<String>,
+        valid_at: Option<TimeMs>,
+        invalidates: &[String],
+        fact_embedding: Option<&[f32]>,
+    ) -> Result<String> {
         let now = now_ms();
         // Close superseded facts first, then re-index them so as-of/current search
         // reflects their new closed interval.
@@ -220,7 +258,9 @@ impl TemporalGraph {
             reference_time,
         };
         self.topology.upsert_fact(&fact)?;
-        self.index.index_fact(&fact, self.embedder.as_deref(), None)?;
+        // Vector-in indexes by the supplied embedding; text-in uses the engine embedder.
+        let embedder = if fact_embedding.is_some() { None } else { self.embedder.as_deref() };
+        self.index.index_fact(&fact, embedder, fact_embedding)?;
         Ok(fact.id)
     }
 

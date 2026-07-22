@@ -21,7 +21,11 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// `lodedb_checkpointer_open_json` / `lodedb_checkpointer_checkpoint` /
 /// `lodedb_checkpointer_free` symbols (and the matching PyO3 `CoreCheckpointer`), so
 /// a wrapper that drives a checkpointer must not pair with an older core lacking it.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 4;
+/// Bumped to 5 for the bi-temporal knowledge-graph surface: the new `lodedb_graph_*`
+/// symbols (`lodedb_graph_open_json` / `lodedb_graph_free` plus the JSON verbs) and a
+/// `LodeGraph` handle, so a wrapper that drives a graph (the Swift `LodeGraph`) must
+/// not pair with an older core lacking them.
+pub const NATIVE_CORE_ABI_VERSION: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -33,6 +37,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 4);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 5);
     }
 }

@@ -1164,6 +1164,7 @@ name = "lodedb-ffi"
 version = "1.4.0"
 dependencies = [
  "lodedb-core",
+ "lodedb-graph",
  "serde",
  "serde_json",
 ]
