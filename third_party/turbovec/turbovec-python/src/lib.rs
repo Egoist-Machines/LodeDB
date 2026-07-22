@@ -15,6 +15,7 @@ use pyo3::types::{PyBytes, PyType};
 // format), exposed as the `cloud` submodule so the [cloud] extra's Python
 // client rides the same bundled extension as the engine.
 mod cloud;
+mod graph;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1731,5 +1732,6 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_wal_segment, m)?)?;
     m.add_function(wrap_pyfunction!(decode_wal_segment, m)?)?;
     cloud::register(m)?;
+    graph::register(m)?;
     Ok(())
 }

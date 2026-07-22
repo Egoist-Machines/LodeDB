@@ -1,0 +1,28 @@
+[package]
+name = "lodedb-graph"
+description = "Bi-temporal knowledge graph over lodedb-core — a Graphiti-style temporal graph (episodes, entities, facts with valid/transaction time and invalidation) for local, on-device agent memory."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The vector/lexical engine. lodedb-graph drives a private CoreEngine as its
+# rebuildable semantic index over entity labels and fact text; the topology store
+# below is the source of truth.
+lodedb-core = { path = "../lodedb-core" }
+# Embedded SQL topology store: the authoritative adjacency + bi-temporal validity.
+# Bundled SQLite so there is nothing to install. rusqlite's own `unsafe` lives in
+# the dependency, so this crate keeps the workspace `unsafe_code = forbid`.
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1.0"
+
+[lints]
+workspace = true
