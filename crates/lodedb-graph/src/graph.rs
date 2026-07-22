@@ -34,11 +34,13 @@ fn now_ms() -> TimeMs {
         .unwrap_or(0)
 }
 
-/// A process-unique id with a kind prefix (`ep`/`ent`/`f`). Unique per assertion so
-/// bi-temporal fact history is never collapsed by id reuse.
+/// A unique id with a kind prefix (`ep`/`ent`/`f`). Includes the process id so two
+/// writers on the same DB — or a restart within the same millisecond, which resets the
+/// counter to 0 — cannot mint the same id and collapse bi-temporal fact history via id
+/// reuse (`upsert_fact`'s `ON CONFLICT DO UPDATE` would otherwise overwrite a prior).
 fn gen_id(prefix: &str) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{:x}-{:x}", now_ms(), n)
+    format!("{prefix}-{:x}-{:x}-{:x}", now_ms(), std::process::id(), n)
 }
 
 /// A bi-temporal knowledge graph: authoritative topology + rebuildable semantic
@@ -231,18 +233,18 @@ impl TemporalGraph {
         fact_embedding: Option<&[f32]>,
     ) -> Result<String> {
         let now = now_ms();
-        // Close superseded facts first, then re-index them so as-of/current search
-        // reflects their new closed interval.
-        for prior_id in invalidates {
-            let (inv, exp) = temporal::supersede_timestamps(valid_at, now);
-            let existed = self.topology.close_fact(prior_id, inv, exp)?;
-            if existed {
-                if let Some(closed) = self.topology.get_fact(prior_id)? {
-                    self.index.index_fact(&closed, self.embedder.as_deref(), None)?;
-                }
-            }
-        }
         let reference_time = self.reference_time_for(&episodes)?;
+        let effective = reference_time.unwrap_or(now);
+        // A superseding fact with no explicit start begins when the supersession is
+        // observed (Graphiti defaults `valid_at` to the episode's reference_time), so it
+        // does not overlap the prior it replaces: the prior's `invalid_at` and the new
+        // fact's `valid_at` then meet exactly at `effective`. A standalone undated fact
+        // (no invalidates) keeps `valid_at = None` — genuinely-unknown, unbounded start.
+        let valid_at = if valid_at.is_none() && !invalidates.is_empty() {
+            Some(effective)
+        } else {
+            valid_at
+        };
         let fact = Fact {
             id: gen_id("f"),
             src: src.to_string(),
@@ -257,8 +259,25 @@ impl TemporalGraph {
             expired_at: None,
             reference_time,
         };
-        self.topology.upsert_fact(&fact)?;
-        // Vector-in indexes by the supplied embedding; text-in uses the engine embedder.
+        // Close the superseded priors AND insert the replacement in ONE topology
+        // transaction, so a crash can never leave priors closed with no replacement (an
+        // event-time validity gap). A prior's event-time end is the new fact's valid_at
+        // (now backfilled above when it was open) — never left open.
+        let priors: Vec<(String, Option<TimeMs>, TimeMs)> = invalidates
+            .iter()
+            .map(|id| {
+                let (inv, exp) = temporal::supersede_timestamps(valid_at, effective, now);
+                (id.clone(), inv, exp)
+            })
+            .collect();
+        let closed_ids = self.topology.supersede_and_insert(&priors, &fact)?;
+        // The index is a rebuildable derivative of the truth store, so it is refreshed
+        // AFTER the transaction commits: re-index the closed priors, then the new fact.
+        for prior_id in &closed_ids {
+            if let Some(closed) = self.topology.get_fact(prior_id)? {
+                self.index.index_fact(&closed, self.embedder.as_deref(), None)?;
+            }
+        }
         let embedder = if fact_embedding.is_some() { None } else { self.embedder.as_deref() };
         self.index.index_fact(&fact, embedder, fact_embedding)?;
         Ok(fact.id)

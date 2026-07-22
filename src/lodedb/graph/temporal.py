@@ -71,6 +71,8 @@ def _as_of(as_of: Any) -> tuple[int | None, bool]:
     """
     if as_of is None:
         return None, False
+    if isinstance(as_of, bool):  # bool is an int subclass — reject before it maps to epoch 0/1
+        raise TypeError(f"as_of must be None, an int (epoch ms), or 'all'/'history', not bool: {as_of!r}")
     if isinstance(as_of, str):
         if as_of.lower() in ("all", "history"):
             return None, True

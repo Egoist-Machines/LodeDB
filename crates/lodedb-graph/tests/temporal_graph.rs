@@ -99,6 +99,49 @@ fn invalidation_preserves_history_and_as_of() {
     assert!(acme_fact.expired_at.is_some(), "expired on the transaction axis");
 }
 
+/// Regression: superseding with an UNKNOWN new `valid_at` must still close the prior on
+/// the event axis, using the new fact's effective (reference) time — otherwise an
+/// `AsOf::At` read counts the prior and its replacement as simultaneously valid (a
+/// double-count that disagrees with the `AsOf::Now` view).
+#[test]
+fn supersede_without_valid_at_closes_prior_on_event_axis() {
+    let mut g = graph();
+    g.upsert_entity("alice", "Person", "Alice", json!({}), None, None).unwrap();
+    g.upsert_entity("acme", "Org", "Acme", json!({}), None, None).unwrap();
+    g.upsert_entity("globex", "Org", "Globex", json!({}), None, None).unwrap();
+
+    let f_acme = g
+        .add_fact("alice", "works_at", "acme", "Alice works at Acme", json!({}), vec![], Some(1000), &[])
+        .unwrap();
+    // The superseding fact has NO valid_at, but its episode occurred at t=3000, so the
+    // prior's event-time end must fall back to that reference time.
+    let ep = g.add_episode("note", "Alice moved to Globex", 3000, json!({}), &[]).unwrap();
+    let _f_globex = g
+        .add_fact("alice", "works_at", "globex", "Alice works at Globex", json!({}),
+                  vec![ep], None, &[f_acme.clone()])
+        .unwrap();
+
+    // Now view: exactly one live works_at (Globex).
+    let now = g.neighbors("alice", Direction::Out, Some("works_at"), AsOf::Now).unwrap();
+    assert_eq!(now.len(), 1, "one live works_at in the Now view");
+    assert_eq!(now[0].dst, "globex");
+
+    // The prior is closed on the event axis at the superseding fact's effective time.
+    let acme = g.get_fact(&f_acme).unwrap().unwrap();
+    assert_eq!(acme.invalid_at, Some(3000), "prior closed at the new fact's effective (reference) time");
+    assert!(acme.expired_at.is_some(), "prior expired on the transaction axis");
+
+    // As-of AFTER the move must NOT double-count — only Globex, agreeing with Now.
+    let after = g.neighbors("alice", Direction::Out, Some("works_at"), AsOf::At(5000)).unwrap();
+    assert_eq!(after.len(), 1, "no event-axis double-count of prior + replacement");
+    assert_eq!(after[0].dst, "globex");
+
+    // As-of BEFORE the move: only Acme.
+    let before = g.neighbors("alice", Direction::Out, Some("works_at"), AsOf::At(1500)).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].dst, "acme");
+}
+
 /// Deterministic k-hop traversal over the topology, time-scoped.
 #[test]
 fn k_hop_traversal() {

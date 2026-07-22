@@ -28,13 +28,16 @@ use std::collections::HashMap;
 /// order — Python's `dict` keeps insertion order and its `sort(reverse=True)` is
 /// stable, so the first list/position in which an id appears breaks ties.
 pub fn rrf(ranked_lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
-    let mut scores: HashMap<String, f32> = HashMap::new();
+    // Accumulate and sort in f64 to match Graphiti's reference (Python floats are f64):
+    // f32 accumulation can order two very-close fused scores differently than the port.
+    let k = k as f64;
+    let mut scores: HashMap<String, f64> = HashMap::new();
     // Track first-seen order to mirror Python dict insertion order for stable ties.
     let mut order: Vec<String> = Vec::new();
 
     for list in ranked_lists {
         for (i, id) in list.iter().enumerate() {
-            let inc = 1.0 / (i as f32 + k);
+            let inc = 1.0 / (i as f64 + k);
             if !scores.contains_key(id) {
                 order.push(id.clone());
             }
@@ -42,7 +45,7 @@ pub fn rrf(ranked_lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
         }
     }
 
-    let mut scored: Vec<(String, f32)> = order
+    let mut scored: Vec<(String, f64)> = order
         .into_iter()
         .map(|id| {
             let s = scores[&id];
@@ -56,7 +59,7 @@ pub fn rrf(ranked_lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    scored
+    scored.into_iter().map(|(id, s)| (id, s as f32)).collect()
 }
 
 /// Maximal Marginal Relevance: reorder `candidates` (id, embedding) trading off

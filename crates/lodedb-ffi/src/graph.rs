@@ -19,6 +19,10 @@ use crate::{
 };
 
 /// Opaque handle wrapping a native `TemporalGraph`.
+///
+/// Not thread-safe: the verbs synthesize a `&mut TemporalGraph` from `*mut LodeGraph`,
+/// so a handle must be used by one thread at a time. Callers serialize access (the Swift
+/// `LodeGraph` guards every call with an `NSLock`).
 #[repr(C)]
 pub struct LodeGraph {
     graph: TemporalGraph,
@@ -217,7 +221,12 @@ pub unsafe extern "C" fn lodedb_graph_free(graph: *mut LodeGraph) {
 macro_rules! graph_verb {
     ($name:ident, $graph:ident, $req:ident : $req_ty:ty, $body:expr) => {
         /// # Safety
-        /// `request`, `out`, and `error` must be valid; `request` is UTF-8 JSON.
+        /// `request`, `out`, and `error` must be valid; `request` is UTF-8 JSON. The
+        /// `graph` handle must be **exclusively owned** for the duration of the call: no
+        /// other thread may invoke any `lodedb_graph_*` verb on the same handle
+        /// concurrently. Each verb synthesizes a `&mut TemporalGraph` from the handle, so
+        /// concurrent calls would alias `&mut` (a data race / UB). Serialize access
+        /// externally (the Swift `LodeGraph` does this with an `NSLock`).
         #[no_mangle]
         pub unsafe extern "C" fn $name(
             graph: *mut LodeGraph,
