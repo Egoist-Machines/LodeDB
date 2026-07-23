@@ -33,11 +33,15 @@ as sugar over this class.
 
 from __future__ import annotations
 
+import base64
+import binascii
+from datetime import datetime
 from typing import Any
 
 import httpx
 
 from lodedb.cloud import _config
+from lodedb.cloud._sealing import create_info, seal_material
 from lodedb.cloud.transfer import CloudClient, CloudError, ManagedRemote
 
 
@@ -128,6 +132,23 @@ def resolve_tenancy(
     return org, environment
 
 
+def _require_key_material(material: bytes | None) -> bytes:
+    """Return delegated key material after enforcing its exact byte length."""
+
+    if not isinstance(material, bytes) or len(material) != 32:
+        raise ValueError("key_material must be exactly 32 bytes")
+    return material
+
+
+def _challenge_info(challenge: dict) -> bytes:
+    """Decode the exact standard-base64 HPKE context issued by the server."""
+
+    try:
+        return base64.b64decode(challenge["info"], validate=True)
+    except (KeyError, TypeError, ValueError, binascii.Error) as error:
+        raise ValueError("unseal challenge returned invalid info") from error
+
+
 class Client:
     """One credential, one control plane, one bound (org, environment).
 
@@ -200,12 +221,114 @@ class Client:
         {stores, active_24h, active_7d, new_7d}."""
         return self._client.store_stats(self.org, self.environment)
 
-    def create_store(self, store: str, key: str | None = None, **options: Any) -> dict:
+    def create_store(
+        self,
+        store: str,
+        key: str | None = None,
+        *,
+        encrypted: bool = False,
+        key_material: bytes | None = None,
+        **options: Any,
+    ) -> dict:
         """Register a store explicitly (first writes auto-provision, so this
         is for choosing `mode=`/`preset=`/`expose_text=` up front, or
         `vector_dim=` for a bring-your-own-vectors store, which accepts
-        `add_vectors`/`search_by_vector` and never embeds server-side)."""
-        return self._client.create_store(self.org, self.environment, store, key, **options)
+        `add_vectors`/`search_by_vector` and never embeds server-side).
+
+        With `encrypted=True`, `key_material` is the caller-held 32-byte
+        wrapping key for a sealed store. Losing it makes the store unreadable;
+        the server never persists it. Encrypted stores use `cloud_writer`
+        mode, unless the caller names that mode explicitly.
+        """
+        if key_material is not None and not encrypted:
+            raise ValueError("key_material applies only to encrypted stores")
+        if not encrypted:
+            return self._client.create_store(self.org, self.environment, store, key, **options)
+        material = _require_key_material(key_material)
+        challenge = self._client.store_create_challenge(self.org, self.environment)
+        try:
+            recipient_public_key = challenge["recipient_public_key"]
+        except KeyError as error:
+            raise ValueError("store creation challenge returned no recipient public key") from error
+        options.setdefault("mode", "cloud_writer")
+        return self._client.create_store(
+            self.org,
+            self.environment,
+            store,
+            key,
+            encrypted=True,
+            sealed_material=seal_material(
+                material, recipient_public_key, create_info(self.org, self.environment, store)
+            ),
+            **options,
+        )
+
+    def unseal_store(
+        self, store: str, key_material: bytes, *, ttl_seconds: int | None = None
+    ) -> datetime:
+        """Unseal a store until the server-issued, aware expiry timestamp.
+
+        The 32 bytes are the caller-held wrapping key. The server receives
+        them only HPKE-sealed and never persists them, so losing them makes
+        the store unreadable.
+        """
+        material = _require_key_material(key_material)
+        challenge = self._client.store_unseal_challenge(self.org, self.environment, store)
+        try:
+            recipient_public_key = challenge["recipient_public_key"]
+            nonce = challenge["nonce"]
+        except KeyError as error:
+            raise ValueError("unseal challenge returned incomplete data") from error
+        response = self._client.unseal_store(
+            self.org,
+            self.environment,
+            store,
+            {
+                "ttl_seconds": ttl_seconds,
+                "sealed_material": seal_material(
+                    material, recipient_public_key, _challenge_info(challenge)
+                ),
+                "nonce": nonce,
+            },
+        )
+        try:
+            expires_at = datetime.fromisoformat(response["expires_at"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("unseal response returned invalid expires_at") from error
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("unseal response returned a naive expires_at")
+        return expires_at
+
+    def reseal_store(self, store: str) -> bool:
+        """Remove the live unseal grant and return whether one was removed."""
+
+        response = self._client.reseal_store(self.org, self.environment, store)
+        return bool(response["resealed"])
+
+    def rotate_store_key(self, store: str, new_key_material: bytes) -> None:
+        """Re-wrap a live store under fresh caller-held 32-byte material.
+
+        Rotation requires a live grant. The server returns HTTP 409 when the
+        store has not first been unsealed.
+        """
+        material = _require_key_material(new_key_material)
+        challenge = self._client.store_unseal_challenge(self.org, self.environment, store)
+        try:
+            recipient_public_key = challenge["recipient_public_key"]
+            nonce = challenge["nonce"]
+        except KeyError as error:
+            raise ValueError("unseal challenge returned incomplete data") from error
+        self._client.rotate_store_key(
+            self.org,
+            self.environment,
+            store,
+            {
+                "sealed_material": seal_material(
+                    material, recipient_public_key, _challenge_info(challenge)
+                ),
+                "nonce": nonce,
+            },
+        )
 
     def update_store(self, store: str, key: str, **changes: Any) -> dict:
         """Flip a store's `expose_text`/`mode` flags."""

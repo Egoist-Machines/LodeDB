@@ -66,7 +66,7 @@ _FORBIDDEN = (
     # first-party cloud client (lodedb.cloud) reaches them only through its
     # lazy PEP 562 exports and the CLI trampoline, so a plain import, even of
     # lodedb.cloud itself, must stay network-free.
-    "httpx", "nacl",
+    "httpx", "nacl", "cryptography",
 )
 _loaded = {_name.split(".", 1)[0] for _name in sys.modules}
 for _root in _FORBIDDEN:

@@ -13,7 +13,7 @@ Agent-native output contract:
 - Errors print to stderr as `error: …` (+ a `hint: …` line naming the exact
   next command where one exists), with an exit code per failure class:
   1 unexpected, 2 usage/local config, 3 auth (401/403), 4 not found (404),
-  5 refused (402/409/422, understood and denied), 6 transient (425/429/503,
+  5 refused (402/409/422/423, understood and denied), 6 transient (425/429/503,
   retry with backoff).
 - Confirmation prompts never hang a pipe: without a TTY they fail
   immediately, naming `--yes`.
@@ -25,7 +25,10 @@ URL (the dumb targets, handled entirely by the Rust core), an explicit
 `lodedb cloud init`/`lodedb cloud link`.
 """
 
+import base64
+import binascii
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -385,6 +388,8 @@ def _classify(error: CloudError) -> tuple[int, str | None]:
             "a plan limit was reached — reads keep serving; upgrade or free the "
             "resource (see `lodedb cloud org export` and the console's Usage page)"
         )
+    if status == 423:
+        return EXIT_REFUSED, "the store is sealed; run: lodedb cloud store unseal"
     if status in (409, 422):
         return EXIT_REFUSED, None
     if status in (425, 429):
@@ -440,6 +445,47 @@ def _cloud(operation: Callable[[], T]) -> T:
         raise _fail(str(error), code=EXIT_REFUSED) from error
     except (FileNotFoundError, OSError, RuntimeError) as error:
         raise _fail(str(error)) from error
+
+
+def _load_material(material_env: str | None, generate_material: bool) -> bytes:
+    """Load 32-byte material from an environment variable or generate it once."""
+
+    if material_env and generate_material:
+        raise _fail("pass --material-env or --generate-material, not both", code=EXIT_USAGE)
+    if material_env is None and not generate_material:
+        raise _fail(
+            "sealed stores need --material-env ENVVAR or --generate-material",
+            code=EXIT_USAGE,
+        )
+    if generate_material:
+        from lodedb.cloud._sealing import new_key_material
+
+        material = new_key_material()
+        encoded = base64.b64encode(material).decode()
+        typer.secho(
+            "Keep this sealed-store material safe. It is shown once and cannot be recovered:",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        typer.echo(encoded, err=True)
+        return material
+    assert material_env is not None
+    encoded = os.environ.get(material_env)
+    if not encoded:
+        raise _fail(f"environment variable {material_env!r} is not set", code=EXIT_USAGE)
+    try:
+        material = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise _fail(
+            f"environment variable {material_env!r} must hold standard base64 material",
+            code=EXIT_USAGE,
+        ) from error
+    if len(material) != 32:
+        raise _fail(
+            f"environment variable {material_env!r} must decode to exactly 32 bytes",
+            code=EXIT_USAGE,
+        )
+    return material
 
 
 # The tenancy flags share one story: the credential knows where it belongs.
@@ -1151,6 +1197,27 @@ def store_create(
     expose_text: Annotated[
         bool, typer.Option("--expose-text", help="Allow read:text-scoped reads to return text.")
     ] = False,
+    encrypted: Annotated[
+        bool,
+        typer.Option(
+            "--encrypted",
+            help="Create a server-side encrypted store with caller-held wrapping material.",
+        ),
+    ] = False,
+    material_env: Annotated[
+        str | None,
+        typer.Option(
+            "--material-env",
+            help="Environment variable holding standard-base64 sealed-store material.",
+        ),
+    ] = None,
+    generate_material: Annotated[
+        bool,
+        typer.Option(
+            "--generate-material",
+            help="Generate fresh sealed-store material and print it once to stderr.",
+        ),
+    ] = False,
     connect_key: Annotated[
         bool,
         typer.Option(
@@ -1172,11 +1239,26 @@ def store_create(
             "server-side OR takes your vectors)",
             code=EXIT_USAGE,
         )
+    if not encrypted and (material_env is not None or generate_material):
+        raise _fail("--material-env and --generate-material require --encrypted", code=EXIT_USAGE)
+    if encrypted and mode != "cloud_writer":
+        raise _fail("encrypted stores require --mode cloud_writer", code=EXIT_USAGE)
     if mode == "cloud_writer" and preset is None and vector_dim is None:
         preset = "minilm"
     minted = None
     with _client() as client:
         org, environment = _tenancy(client, org, environment)
+        material = _load_material(material_env, generate_material) if encrypted else None
+        sealed_material = None
+        if material is not None:
+            from lodedb.cloud._sealing import create_info, seal_material
+
+            challenge = _cloud(lambda: client.store_create_challenge(org, environment))
+            sealed_material = seal_material(
+                material,
+                challenge["recipient_public_key"],
+                create_info(org, environment, store),
+            )
         row = _cloud(
             lambda: client.create_store(
                 org,
@@ -1187,6 +1269,8 @@ def store_create(
                 expose_text=expose_text,
                 preset=preset,
                 vector_dim=vector_dim,
+                encrypted=encrypted,
+                sealed_material=sealed_material,
             )
         )
         if connect_key and mode == "cloud_writer":
@@ -1235,6 +1319,69 @@ def store_create(
         },
         human,
     )
+
+
+@store_app.command("unseal")
+def store_unseal(
+    store: Annotated[str, typer.Argument(help="Store name.")],
+    material_env: Annotated[
+        str | None,
+        typer.Option(
+            "--material-env",
+            help="Environment variable holding standard-base64 sealed-store material.",
+        ),
+    ] = None,
+    ttl_seconds: Annotated[
+        int | None,
+        typer.Option("--ttl-seconds", min=1, help="Requested live-grant lifetime in seconds."),
+    ] = None,
+    environment: Annotated[str | None, typer.Option(help=_ENVIRONMENT_HELP)] = None,
+    org: Annotated[str | None, typer.Option(help=_ORG_HELP)] = None,
+) -> None:
+    """Unseal a store with caller-held material until its server-issued expiry."""
+
+    with _client() as client:
+        org, environment = _tenancy(client, org, environment)
+        # Fresh material can never open an existing store, so unlike create
+        # there is no --generate-material here: the creation-time secret is
+        # the only thing that unseals.
+        material = _load_material(material_env, generate_material=False)
+        challenge = _cloud(lambda: client.store_unseal_challenge(org, environment, store))
+        try:
+            info = base64.b64decode(challenge["info"], validate=True)
+        except (KeyError, TypeError, ValueError, binascii.Error) as error:
+            raise _fail("unseal challenge returned invalid info") from error
+        from lodedb.cloud._sealing import seal_material
+
+        out = _cloud(
+            lambda: client.unseal_store(
+                org,
+                environment,
+                store,
+                {
+                    "ttl_seconds": ttl_seconds,
+                    "sealed_material": seal_material(
+                        material, challenge["recipient_public_key"], info
+                    ),
+                    "nonce": challenge["nonce"],
+                },
+            )
+        )
+    _emit(out, lambda: typer.echo(f"unsealed {store} until {out['expires_at']}"))
+
+
+@store_app.command("reseal")
+def store_reseal(
+    store: Annotated[str, typer.Argument(help="Store name.")],
+    environment: Annotated[str | None, typer.Option(help=_ENVIRONMENT_HELP)] = None,
+    org: Annotated[str | None, typer.Option(help=_ORG_HELP)] = None,
+) -> None:
+    """Remove a store's live unseal grant and evict decrypted serving state."""
+
+    with _client() as client:
+        org, environment = _tenancy(client, org, environment)
+        out = _cloud(lambda: client.reseal_store(org, environment, store))
+    _emit(out, lambda: typer.echo(f"resealed {store}: {out['resealed']}"))
 
 
 def _resolve_index_key(

@@ -40,8 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
 
-      - name: Sync (base runtime + dev/embeddings/torch/mcp/langchain/llama-index/mem0/image/cloud extras)
-        run: uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image --extra cloud
+      - name: Sync (base runtime + dev/embeddings/torch/mcp/langchain/llama-index/mem0/image/cloud/cloud-sealed extras)
+        run: uv sync --extra dev --extra embeddings --extra torch --extra mcp --extra langchain --extra llama-index --extra mem0 --extra image --extra cloud --extra cloud-sealed
 
       - name: Lint
         run: uv run ruff check .

@@ -221,7 +221,11 @@ class CloudClient:
         expose_text: bool = False,
         preset: str | None = None,
         vector_dim: int | None = None,
+        encrypted: bool = False,
+        sealed_material: str | None = None,
     ) -> dict:
+        """Register a store, optionally carrying delegated sealed material."""
+
         body: dict[str, Any] = {"store": store, "mode": mode, "expose_text": expose_text}
         if key is not None:
             body["key"] = key
@@ -229,8 +233,55 @@ class CloudClient:
             body["preset"] = preset
         if vector_dim is not None:
             body["vector_dim"] = vector_dim
+        if encrypted:
+            body["encrypted"] = True
+        if sealed_material is not None:
+            body["sealed_material"] = sealed_material
         return self._request(
             "POST", f"/v1/orgs/{org}/environments/{environment}/stores", json=body
+        )
+
+    def store_create_challenge(self, org: str, environment: str) -> dict:
+        """Fetch the HPKE recipient used to create an encrypted store."""
+
+        return self._request(
+            "GET", f"/v1/orgs/{org}/environments/{environment}/stores/create-challenge"
+        )
+
+    def store_unseal_challenge(self, org: str, environment: str, store: str) -> dict:
+        """Fetch a single-use HPKE challenge for unsealing or key rotation."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/"
+            f"{quote(store, safe='')}/unseal/challenge",
+        )
+
+    def unseal_store(self, org: str, environment: str, store: str, payload: dict) -> dict:
+        """Submit a sealed material response and request a live unseal grant."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/{quote(store, safe='')}/unseal",
+            json=payload,
+        )
+
+    def reseal_store(self, org: str, environment: str, store: str) -> dict:
+        """Remove a store's live unseal grant and evict its decrypted state."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/{quote(store, safe='')}/reseal",
+        )
+
+    def rotate_store_key(self, org: str, environment: str, store: str, payload: dict) -> dict:
+        """Re-wrap a currently live store key under freshly sealed material."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/"
+            f"{quote(store, safe='')}/key/rotate",
+            json=payload,
         )
 
     # ------------------------------------------------------------ lifecycle
