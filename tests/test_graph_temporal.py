@@ -100,9 +100,10 @@ def test_enumerate_and_search():
 def test_reindex_rebuilds_from_truth():
     g = graph()
     g.upsert_entity("x", "Thing", "widget")
+    g.upsert_entity("y", "Thing", "gadget")
     g.add_fact("x", "is", "y", "x is y", valid_at=1)
     out = g.reindex()
-    assert out["reindexed_entities"] == 1
+    assert out["reindexed_entities"] == 2
     assert out["reindexed_facts"] == 1
 
 
@@ -134,6 +135,57 @@ def test_open_start_as_of_consistency():
 
     hits = g.semantic_facts("linked forever", k=5, as_of=500)
     assert hits  # index agrees the open-start fact is valid at any T
+
+
+def test_vector_in_graph_indexes_facts_and_refuses_reindex():
+    """A graph opened without an embedder indexes facts via add_fact_vec, and
+    reindex() is refused (the topology stores no vectors to rebuild from)."""
+    g = TemporalKnowledgeGraph(vector_dim=8)
+    v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    g.upsert_entity_vec("a", "Thing", "thing a", v)
+    g.upsert_entity_vec("b", "Thing", "thing b", v)
+    g.add_fact_vec("a", "rel", "b", "a rel b", v, valid_at=10)
+
+    hits = g.semantic_facts(None, k=5, embedding=v)
+    assert [f["id"] for _s, f in hits], "vector-in fact is semantically findable"
+
+    with pytest.raises(Exception, match="vector-in"):
+        g.reindex()
+    # The refused reindex left the index intact.
+    assert g.semantic_facts(None, k=5, embedding=v)
+
+
+def test_bool_as_of_is_rejected():
+    g = graph()
+    g.upsert_entity("a", "Thing", "thing a")
+    with pytest.raises(TypeError):
+        g.entities(as_of=True)
+
+
+def test_invalidates_unknown_id_fails_atomically():
+    g = graph()
+    g.upsert_entity("a", "Thing", "thing a")
+    g.upsert_entity("b", "Thing", "thing b")
+    with pytest.raises(Exception, match="f-nope"):
+        g.add_fact("a", "rel", "b", "a rel b", valid_at=10, invalidates=["f-nope"])
+    assert g.stats()["facts"] == 0, "nothing persisted from the failed call"
+
+
+def test_dangling_endpoints_and_episodes_are_refused():
+    g = graph()
+    g.upsert_entity("a", "Thing", "thing a")
+    with pytest.raises(Exception, match="ghost"):
+        g.add_fact("a", "rel", "ghost", "a rel ghost")
+    with pytest.raises(Exception, match="ghost"):
+        g.add_episode("note", "text", 100, mentions=["ghost"])
+
+
+def test_index_text_false_opens_and_searches_by_vector():
+    g = TemporalKnowledgeGraph(vector_dim=8, index_text=False)
+    v = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    g.upsert_entity_vec("a", "Thing", "thing a", v)
+    hits = g.semantic_entities(None, k=5, embedding=v)
+    assert [e["id"] for _s, e in hits] == ["a"]
 
 
 if __name__ == "__main__":

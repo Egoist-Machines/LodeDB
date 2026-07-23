@@ -13,8 +13,8 @@ public enum GraphAsOf: Sendable, Equatable {
 
 // MARK: - Result types (decoded from the native JSON)
 
-/// A resolved thing in the world. `properties` are not decoded here (v1); the
-/// visualizer draws from `label`, `type`, and the relations.
+/// A resolved thing in the world. `properties` are not decoded here (v1); read
+/// from `label`, `type`, and the relations.
 public struct GraphEntity: Decodable, Equatable, Sendable {
     public let id: String
     public let type: String
@@ -150,10 +150,10 @@ public struct GraphReindexStats: Decodable, Equatable, Sendable {
 
 /// A bi-temporal knowledge graph on device (the native `lodedb-graph`).
 ///
-/// Notes and chats go in as **episodes**; an extractor turns them into typed
-/// **entities** and **facts**; the LIFE tab visualizes the graph by enumerating
-/// entities and traversing facts, "as of" now or any past instant. The graph holds
-/// no embedder — this type embeds label/fact/query text on device (via the supplied
+/// Raw observations go in as **episodes**; a caller-side extractor turns them into
+/// typed **entities** and **facts**, which apps read back by enumerating entities
+/// and traversing facts, "as of" now or any past instant. The graph holds no
+/// embedder — this type embeds label/fact/query text on device (via the supplied
 /// `LodeEmbedder`) and feeds the native store vectors. Thread-safe (serialized).
 public final class LodeGraph {
     private let native: NativeTemporalGraph
@@ -161,14 +161,17 @@ public final class LodeGraph {
     private let lock = NSLock()
 
     /// Open (or create) a graph. `path == nil` is in-memory. The embedder's
-    /// `dimension` sets the index dimension.
-    public init(path: URL? = nil, embedder: LodeEmbedder, indexFacts: Bool = true) throws {
+    /// `dimension` sets the index dimension. `indexText: false` keeps the semantic
+    /// index vector-only (no label/fact text retained on the index side).
+    public init(path: URL? = nil, embedder: LodeEmbedder, indexFacts: Bool = true,
+                indexText: Bool = true) throws {
         self.embedder = embedder
-        let req = OpenRequest(path: path?.path, vector_dim: embedder.dimension, index_facts: indexFacts)
+        let req = OpenRequest(path: path?.path, vector_dim: embedder.dimension,
+                              index_facts: indexFacts, index_text: indexText)
         self.native = try NativeTemporalGraph.open(requestJSON: try encodeGraphJSON(req))
     }
 
-    // -- episodes (Notes / Chats) ------------------------------------------
+    // -- episodes ------------------------------------------------------------
 
     /// Store a raw observation (no extraction, no embedding). Returns its id.
     @discardableResult
@@ -180,7 +183,7 @@ public final class LodeGraph {
         }
     }
 
-    // -- entities & facts (from the extractor) -----------------------------
+    // -- entities & facts ----------------------------------------------------
 
     /// Create or replace an entity (upsert by id); its label is embedded on device.
     @discardableResult
@@ -217,7 +220,7 @@ public final class LodeGraph {
         }
     }
 
-    // -- reads (LIFE visualizer) -------------------------------------------
+    // -- reads ---------------------------------------------------------------
 
     /// Every entity of a type (nil = all), in a temporal frame.
     public func entities(type: String? = nil, asOf: GraphAsOf = .now) throws -> [GraphEntity] {
@@ -269,7 +272,7 @@ public final class LodeGraph {
         }
     }
 
-    /// Semantic seed entities + k-hop expansion — the headline visualizer query.
+    /// Semantic seed entities + k-hop expansion, the headline retrieval query.
     public func searchSubgraph(_ query: String, k: Int = 5, hops: Int = 1, direction: String = "both",
                                type: String? = nil, asOf: GraphAsOf = .now) throws -> GraphSubgraph {
         try locked {
@@ -343,7 +346,7 @@ private func decodeGraphJSON<T: Decodable>(_ type: T.Type, from text: String) th
     return try JSONDecoder().decode(type, from: data)
 }
 
-private struct OpenRequest: Encodable { let path: String?; let vector_dim: Int; let index_facts: Bool }
+private struct OpenRequest: Encodable { let path: String?; let vector_dim: Int; let index_facts: Bool; let index_text: Bool }
 private struct AddEpisodeRequest: Encodable { let source: String; let body: String; let occurred_at: Int64; let mentions: [String] }
 private struct UpsertEntityVecRequest: Encodable { let id: String; let type: String; let label: String; let embedding: [Float]; let valid_at: Int64?; let invalid_at: Int64? }
 private struct AddFactVecRequest: Encodable { let src: String; let relation: String; let dst: String; let fact: String; let embedding: [Float]; let episodes: [String]; let valid_at: Int64?; let invalidates: [String] }

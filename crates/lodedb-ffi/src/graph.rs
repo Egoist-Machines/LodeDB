@@ -68,6 +68,9 @@ struct OpenReq {
     path: Option<String>,
     vector_dim: usize,
     index_facts: Option<bool>,
+    /// Retain label/fact text in the semantic index for lexical (BM25) hybrid
+    /// search. `false` keeps the index vector-only (no text on the index side).
+    index_text: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -190,7 +193,7 @@ pub unsafe extern "C" fn lodedb_graph_open_json(
         let req = read_json_view::<OpenReq>(request)?;
         let config = GraphConfig {
             vector_dim: req.vector_dim,
-            index_text: true,
+            index_text: req.index_text.unwrap_or(true),
             index_facts: req.index_facts.unwrap_or(true),
         };
         let graph = match req.path {

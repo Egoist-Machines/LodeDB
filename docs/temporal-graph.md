@@ -16,7 +16,6 @@ This is a faithful, storage-oriented port of the temporal core of
 stores what it is given and answers temporal queries. Entity extraction, entity
 resolution, temporal extraction, and contradiction detection stay with the caller
 (an LLM layer) — `add_fact` is the analogue of Graphiti's LLM-free `add_triplet`.
-The deeper design rationale is in [`temporal-graph-design.html`](temporal-graph-design.html).
 
 ## The model: episodes → entities → facts
 
@@ -47,7 +46,7 @@ contradicting fact closes the prior one — its `invalid_at` is set to the new f
 from lodedb.graph import TemporalKnowledgeGraph
 
 # Bring an embedder: any object with `dimension` and `embed(texts, role)`.
-kg = TemporalKnowledgeGraph(path="./life", embedder=my_embedder)   # path=None → in-memory
+kg = TemporalKnowledgeGraph(path="./kg", embedder=my_embedder)     # path=None → in-memory
 
 kg.upsert_entity("alice", "Person", "Alice, software engineer")
 kg.upsert_entity("acme",  "Org",    "Acme Corp")
@@ -67,7 +66,7 @@ Every read takes an `as_of` frame: `None` (the current view), an epoch-ms instan
 
 ```python
 kg.neighbors("alice", relation="works_at")               # -> Globex   (current)
-kg.neighbors("alice", relation="works_at", as_of=1500)   # -> Acme     (as of 2019)
+kg.neighbors("alice", relation="works_at", as_of=1500)   # -> Acme     (as of t=1500)
 kg.neighbors("alice", relation="works_at", as_of=2500)   # -> Globex
 kg.history("alice")                                       # both facts, preserved
 
@@ -88,8 +87,16 @@ leaving the merge decision to you.
 driven by a caller-supplied embedder, mirroring the Swift `LodeEmbedder` contract. In
 Python it is any object with a `dimension` and an `embed(texts, role)` method (`role`
 is `"document"` on ingest, `"query"` on search). Callers who already hold vectors can
-skip it and use the vector-in verbs (`upsert_entity_vec`, and the `embedding=`
-argument on the `semantic_*` calls).
+skip it and use the vector-in verbs (`upsert_entity_vec`, `add_fact_vec`, and the
+`embedding=` argument on the `semantic_*` calls).
+
+Both write paths validate at the boundary: fact endpoints must be existing
+entities, provenance must reference existing episodes, and every id named in
+`invalidates` must close, or the whole call fails and nothing persists. Pass
+`index_text=False` at open to keep the semantic index vector-only (no label/fact
+text retained on the index side; lexical hybrid search degrades to pure vector).
+The topology store still holds the text you pass in — that store is the graph's
+data.
 
 ## The Rust crate
 
@@ -97,8 +104,10 @@ The engine is `crates/lodedb-graph`, a small crate over `lodedb-core`:
 
 - an embedded SQLite **topology truth store** (episodes, entities, typed facts,
   provenance, bi-temporal validity) — the authoritative adjacency;
-- a `lodedb-core` **semantic index** driven as a rebuildable derived artifact
-  (`reindex()` restores it from the truth store);
+- a `lodedb-core` **semantic index** driven as a rebuildable derived artifact.
+  On a graph opened with an embedder, `reindex()` restores it from the truth store;
+  a vector-in graph refuses `reindex()` (the topology stores no vectors to rebuild
+  from), so keep the caller's vectors re-supplyable if you need index recovery;
 - the bi-temporal logic (as-of resolution, invalidation) and the Graphiti rerankers
   (RRF, MMR, node-distance, episode-mentions) ported as pure functions.
 

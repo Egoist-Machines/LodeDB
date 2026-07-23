@@ -139,16 +139,17 @@ impl PyTemporalGraph {
     /// is a Python object with `dimension` + `embed(texts, role)`; pass `None` for a
     /// vector-in graph (then use the `*_vec` verbs).
     #[new]
-    #[pyo3(signature = (path=None, vector_dim=384, embedder=None, index_facts=true))]
+    #[pyo3(signature = (path=None, vector_dim=384, embedder=None, index_facts=true, index_text=true))]
     fn new(
         path: Option<&str>,
         vector_dim: usize,
         embedder: Option<Py<PyAny>>,
         index_facts: bool,
+        index_text: bool,
     ) -> PyResult<Self> {
         let config = GraphConfig {
             vector_dim,
-            index_text: true,
+            index_text,
             index_facts,
         };
         let boxed: Option<Box<dyn Embedder>> = embedder.map(|obj| {
@@ -261,6 +262,26 @@ impl PyTemporalGraph {
         let props = parse_props(properties)?;
         self.inner
             .add_fact(src, relation, dst, fact, props, episodes, valid_at, &invalidates)
+            .map_err(to_py_err)
+    }
+
+    #[pyo3(signature = (src, relation, dst, fact, embedding, properties=None, episodes=Vec::new(), valid_at=None, invalidates=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_fact_vec(
+        &mut self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        fact: &str,
+        embedding: Vec<f32>,
+        properties: Option<&str>,
+        episodes: Vec<String>,
+        valid_at: Option<i64>,
+        invalidates: Vec<String>,
+    ) -> PyResult<String> {
+        let props = parse_props(properties)?;
+        self.inner
+            .add_fact_vec(src, relation, dst, fact, props, episodes, valid_at, &invalidates, &embedding)
             .map_err(to_py_err)
     }
 

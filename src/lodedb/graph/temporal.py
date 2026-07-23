@@ -20,7 +20,8 @@ Rust; this layer only marshals dict ⇄ JSON properties and the ``as_of`` frame.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = ["TemporalKnowledgeGraph", "Embedder"]
 
@@ -72,7 +73,9 @@ def _as_of(as_of: Any) -> tuple[int | None, bool]:
     if as_of is None:
         return None, False
     if isinstance(as_of, bool):  # bool is an int subclass — reject before it maps to epoch 0/1
-        raise TypeError(f"as_of must be None, an int (epoch ms), or 'all'/'history', not bool: {as_of!r}")
+        raise TypeError(
+            f"as_of must be None, an int (epoch ms), or 'all'/'history', not bool: {as_of!r}"
+        )
     if isinstance(as_of, str):
         if as_of.lower() in ("all", "history"):
             return None, True
@@ -114,13 +117,18 @@ class TemporalKnowledgeGraph:
         embedder: Embedder | None = None,
         vector_dim: int | None = None,
         index_facts: bool = True,
+        index_text: bool = True,
     ) -> None:
         from lodedb import _turbovec  # bundled native extension
 
         self._embedder = embedder
         dim = _resolve_dimension(embedder, vector_dim)
+        # index_text=False keeps the semantic index vector-only: no label/fact text
+        # is retained on the index side (lexical hybrid search degrades to pure
+        # vector). The topology store still holds the text you pass in; that store
+        # IS the graph's data.
         self._g = _turbovec.graph.TemporalKnowledgeGraph(
-            path, dim, embedder, index_facts
+            path, dim, embedder, index_facts, index_text
         )
 
     # -- episodes -----------------------------------------------------------
@@ -201,6 +209,27 @@ class TemporalKnowledgeGraph:
         """
         return self._g.add_fact(
             src, relation, dst, fact, _dumps(properties),
+            list(episodes), valid_at, list(invalidates),
+        )
+
+    def add_fact_vec(
+        self,
+        src: str,
+        relation: str,
+        dst: str,
+        fact: str,
+        embedding: Sequence[float],
+        *,
+        properties: Mapping[str, Any] | None = None,
+        episodes: Sequence[str] = (),
+        valid_at: int | None = None,
+        invalidates: Sequence[str] = (),
+    ) -> str:
+        """:meth:`add_fact` with a precomputed embedding (vector-in), so a graph
+        opened without an embedder can still index facts for ``semantic_facts``.
+        """
+        return self._g.add_fact_vec(
+            src, relation, dst, fact, list(embedding), _dumps(properties),
             list(episodes), valid_at, list(invalidates),
         )
 
