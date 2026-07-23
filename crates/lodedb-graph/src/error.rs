@@ -1,8 +1,8 @@
 //! Error type for the bi-temporal graph layer.
 //!
-//! Mirrors the shape of `lodedb_core::CoreError`: a small, matchable enum with a
-//! stable status code, so the FFI/pyo3 bindings can map it the same way they map
-//! the core's errors.
+//! Mirrors the shape of `lodedb_core::CoreError`: a small, matchable enum the
+//! FFI and pyo3 bindings map onto their existing error surfaces (`CoreErrorCode`
+//! and Python exceptions respectively).
 
 use std::fmt;
 
@@ -26,22 +26,6 @@ pub enum GraphError {
 
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, GraphError>;
-
-impl GraphError {
-    /// A stable status code for the C-ABI / pyo3 bindings (parallels
-    /// `CoreErrorCode`): 1 invalid, 2 not-found, 3 topology, 4 index, 5 embedding,
-    /// 255 internal.
-    pub fn status_code(&self) -> u32 {
-        match self {
-            GraphError::InvalidArgument(_) => 1,
-            GraphError::NotFound(_) => 2,
-            GraphError::Topology(_) => 3,
-            GraphError::Index(_) => 4,
-            GraphError::Embedding(_) => 5,
-            GraphError::Internal(_) => 255,
-        }
-    }
-}
 
 impl fmt::Display for GraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

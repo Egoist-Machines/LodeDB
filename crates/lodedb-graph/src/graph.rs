@@ -1,10 +1,6 @@
 //! `TemporalGraph` — the public facade wiring the topology truth store, the
 //! `lodedb-core` semantic index, and the bi-temporal helpers into one handle.
-//!
-//! This is the integration layer (owned by Wave 2): it composes the modules and is
-//! the surface the Python/Swift bindings marshal. The module methods it calls are
-//! implemented by Wave 1 (topology / index / temporal); until then the facade
-//! compiles and each verb panics with `unimplemented!` from the module it drives.
+//! This is the surface the Python/Swift bindings marshal.
 //!
 //! Verb parity with Graphiti's `Graphiti` class, minus the LLM pipeline:
 //! `add_episode` stores (no extraction); `add_fact` is the LLM-free `add_triplet`
@@ -93,10 +89,8 @@ impl TemporalGraph {
             created_at: now_ms(),
             properties,
         };
-        self.topology.upsert_episode(&episode)?;
-        if !mentions.is_empty() {
-            self.topology.link_mentions(&id, mentions)?;
-        }
+        // One transaction: a bad mention id must not leave a half-written episode.
+        self.topology.upsert_episode_with_mentions(&episode, mentions)?;
         Ok(id)
     }
 
@@ -232,6 +226,11 @@ impl TemporalGraph {
         invalidates: &[String],
         fact_embedding: Option<&[f32]>,
     ) -> Result<String> {
+        for (name, value) in [("src", src), ("relation", relation), ("dst", dst)] {
+            if value.trim().is_empty() {
+                return Err(GraphError::InvalidArgument(format!("fact {name} is required")));
+            }
+        }
         let now = now_ms();
         let reference_time = self.reference_time_for(&episodes)?;
         let effective = reference_time.unwrap_or(now);
@@ -262,9 +261,14 @@ impl TemporalGraph {
         // Close the superseded priors AND insert the replacement in ONE topology
         // transaction, so a crash can never leave priors closed with no replacement (an
         // event-time validity gap). A prior's event-time end is the new fact's valid_at
-        // (now backfilled above when it was open) — never left open.
+        // (now backfilled above when it was open) — never left open. Duplicate ids
+        // collapse here; a prior that does not exist or is already expired fails the
+        // whole call (see `supersede_and_insert`), so a typo'd id cannot silently
+        // leave its target live.
+        let mut seen = std::collections::BTreeSet::new();
         let priors: Vec<(String, Option<TimeMs>, TimeMs)> = invalidates
             .iter()
+            .filter(|id| seen.insert(id.as_str()))
             .map(|id| {
                 let (inv, exp) = temporal::supersede_timestamps(valid_at, effective, now);
                 (id.clone(), inv, exp)
@@ -395,6 +399,10 @@ impl TemporalGraph {
         Ok(hits
             .into_iter()
             .filter_map(|h| by_id.get(&h.id).cloned().map(|e| (h.score, e)))
+            // Re-check the frame against the authoritative row; a stale index hit
+            // (crash between topology commit and index refresh) must not leak an
+            // expired entity into a scoped read.
+            .filter(|(_score, e)| e.matches(as_of))
             .collect())
     }
 
@@ -418,8 +426,14 @@ impl TemporalGraph {
         )?;
         let mut out = Vec::new();
         for h in hits {
+            // Re-check the frame against the authoritative row: the index is a
+            // derivative and may lag it (crash between topology commit and index
+            // refresh), and a stale hit must not leak an expired fact into a
+            // scoped read.
             if let Some(f) = self.topology.get_fact(&h.id)? {
-                out.push((h.score, f));
+                if f.matches(as_of) {
+                    out.push((h.score, f));
+                }
             }
         }
         Ok(out)
@@ -489,17 +503,29 @@ impl TemporalGraph {
     /// Rebuild the semantic index from the topology truth store: drop orphans, then
     /// re-index every entity and fact. Makes the index a throwaway artifact.
     pub fn reindex(&mut self) -> Result<ReindexStats> {
+        // Rebuilding re-embeds label/fact text from the topology, so it needs the
+        // graph's embedder. A vector-in graph stores no vectors in the topology and
+        // therefore CANNOT be rebuilt from truth; running the loop below without an
+        // embedder would hit `write_document`'s no-content branch and delete every
+        // live index document while reporting success.
+        let Some(embedder) = self.embedder.as_deref() else {
+            return Err(GraphError::InvalidArgument(
+                "reindex needs the graph's embedder; a vector-in graph cannot be \
+                 rebuilt from the topology (vectors are not stored there): re-upsert \
+                 records with their vectors instead"
+                    .into(),
+            ));
+        };
         let entities = self.topology.iter_entities()?;
         let facts = self.topology.iter_facts()?;
         let live_entity_ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
         let live_fact_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
         let removed_orphans = self.index.drop_orphans(&live_entity_ids, &live_fact_ids)?;
-        let embedder = self.embedder.as_deref();
         for e in &entities {
-            self.index.index_entity(e, embedder, None)?;
+            self.index.index_entity(e, Some(embedder), None)?;
         }
         for f in &facts {
-            self.index.index_fact(f, embedder, None)?;
+            self.index.index_fact(f, Some(embedder), None)?;
         }
         Ok(ReindexStats {
             reindexed_entities: entities.len(),

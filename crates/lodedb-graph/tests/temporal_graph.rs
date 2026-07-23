@@ -189,9 +189,10 @@ fn enumerate_and_search() {
 fn reindex_rebuilds_from_truth() {
     let mut g = graph();
     g.upsert_entity("x", "Thing", "widget", json!({}), None, None).unwrap();
+    g.upsert_entity("y", "Thing", "gadget", json!({}), None, None).unwrap();
     g.add_fact("x", "is", "y", "x is y", json!({}), vec![], Some(1), &[]).unwrap();
     let out = g.reindex().unwrap();
-    assert_eq!(out.reindexed_entities, 1);
+    assert_eq!(out.reindexed_entities, 2);
     assert_eq!(out.reindexed_facts, 1);
 }
 
@@ -230,4 +231,119 @@ fn open_start_as_of_consistency() {
     // Index path: semantic fact search as-of the same instant also includes it.
     let hits = g.semantic_facts(Some("linked forever"), None, 5, None, AsOf::At(500)).unwrap();
     assert!(!hits.is_empty(), "open-start fact is valid at any T (index) — encoding is consistent");
+}
+
+/// A vector-in graph (no embedder) must refuse `reindex()`: the topology stores no
+/// vectors to rebuild from, and the old behavior silently deleted every live index
+/// document while reporting success.
+#[test]
+fn reindex_refuses_vector_in_graph() {
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    let mut g = TemporalGraph::open_in_memory(config, None).unwrap();
+    g.upsert_entity_vec("x", "Thing", "widget", json!({}), &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], None, None)
+        .unwrap();
+    let err = g.reindex().unwrap_err();
+    assert!(err.to_string().contains("vector-in"), "clear refusal, got: {err}");
+    // The index is untouched: the entity is still findable by vector.
+    let hits = g
+        .semantic_entities(None, Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 5, None, AsOf::Now)
+        .unwrap();
+    assert!(hits.iter().any(|(_s, e)| e.id == "x"), "index survives the refused reindex");
+}
+
+/// `invalidates` naming a fact that does not exist (or is already expired) must fail
+/// the whole `add_fact` and leave nothing behind: a typo'd id silently leaving its
+/// target live would defeat the invalidation semantics.
+#[test]
+fn invalidates_unknown_fact_fails_atomically() {
+    let mut g = graph();
+    g.upsert_entity("a", "Thing", "thing a", json!({}), None, None).unwrap();
+    g.upsert_entity("b", "Thing", "thing b", json!({}), None, None).unwrap();
+
+    let err = g
+        .add_fact("a", "rel", "b", "a rel b", json!({}), vec![], Some(10), &["f-nope".to_string()])
+        .unwrap_err();
+    assert!(err.to_string().contains("f-nope"), "names the missing prior: {err}");
+    assert_eq!(g.stats().unwrap().facts, 0, "the new fact must not have been inserted");
+
+    // Already-expired priors are refused the same way.
+    let f1 = g.add_fact("a", "rel", "b", "first", json!({}), vec![], Some(10), &[]).unwrap();
+    g.invalidate_fact(&f1, Some(20)).unwrap();
+    let err = g
+        .add_fact("a", "rel", "b", "second", json!({}), vec![], Some(30), &[f1])
+        .unwrap_err();
+    assert!(err.to_string().contains("already expired"), "got: {err}");
+}
+
+/// Fact endpoints must be existing entities, and provenance must reference existing
+/// episodes; dangling references are refused, not silently stored.
+#[test]
+fn add_fact_validates_endpoints_and_episodes() {
+    let mut g = graph();
+    g.upsert_entity("a", "Thing", "thing a", json!({}), None, None).unwrap();
+
+    let err = g.add_fact("a", "rel", "ghost", "a rel ghost", json!({}), vec![], None, &[]).unwrap_err();
+    assert!(err.to_string().contains("ghost"), "names the missing endpoint: {err}");
+
+    g.upsert_entity("b", "Thing", "thing b", json!({}), None, None).unwrap();
+    let err = g
+        .add_fact("a", "rel", "b", "a rel b", json!({}), vec!["ep-ghost".to_string()], None, &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("ep-ghost"), "names the missing episode: {err}");
+
+    let err = g.add_fact("", "rel", "b", "empty src", json!({}), vec![], None, &[]).unwrap_err();
+    assert!(err.to_string().contains("src"), "empty src refused: {err}");
+}
+
+/// `add_episode` with a bad mention id must fail whole; the rollback (no orphan
+/// episode row) is asserted at the store level in `topology.rs`.
+#[test]
+fn add_episode_with_bad_mention_fails() {
+    let mut g = graph();
+    let err = g
+        .add_episode("note", "text", 100, json!({}), &["ghost".to_string()])
+        .unwrap_err();
+    assert!(err.to_string().contains("ghost"), "names the missing entity: {err}");
+}
+
+/// Fact provenance is written to the `fact_episodes` join table, and `history`
+/// round-trips it through the record's `episodes` list.
+#[test]
+fn fact_episode_provenance_round_trips() {
+    let mut g = graph();
+    g.upsert_entity("p", "Person", "Pat", json!({}), None, None).unwrap();
+    g.upsert_entity("q", "Org", "QCo", json!({}), None, None).unwrap();
+    let ep = g.add_episode("note", "Pat joined QCo", 4242, json!({}), &[]).unwrap();
+    let fid = g
+        .add_fact("p", "works_at", "q", "Pat works at QCo", json!({}), vec![ep.clone()], None, &[])
+        .unwrap();
+    let fact = g.get_fact(&fid).unwrap().unwrap();
+    assert_eq!(fact.episodes, vec![ep]);
+}
+
+/// On-disk lifecycle: open → write → drop → reopen serves the same records, and
+/// reopening with a different embedding dimension is refused up front.
+#[test]
+fn on_disk_reopen_and_dim_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    {
+        let mut g = TemporalGraph::open(&path, config.clone(), Some(Box::new(HashEmbedder))).unwrap();
+        g.upsert_entity("alice", "Person", "Alice, engineer", json!({}), None, None).unwrap();
+        g.upsert_entity("acme", "Org", "Acme Corp", json!({}), None, None).unwrap();
+        g.add_fact("alice", "works_at", "acme", "Alice works at Acme", json!({}), vec![], Some(1000), &[])
+            .unwrap();
+        g.persist().unwrap();
+    }
+    {
+        let g = TemporalGraph::open(&path, config.clone(), Some(Box::new(HashEmbedder))).unwrap();
+        let nbrs = g.neighbors("alice", Direction::Out, Some("works_at"), AsOf::Now).unwrap();
+        assert_eq!(nbrs.len(), 1, "topology survives reopen");
+        let hits = g.semantic_entities(Some("engineer"), None, 5, None, AsOf::Now).unwrap();
+        assert!(hits.iter().any(|(_s, e)| e.id == "alice"), "index survives reopen");
+    }
+    let bad = GraphConfig { vector_dim: 16, ..GraphConfig::default() };
+    let err = TemporalGraph::open(&path, bad, None).err().expect("dim mismatch must refuse");
+    assert!(err.to_string().contains("dimension"), "dim mismatch refused at open: {err}");
 }

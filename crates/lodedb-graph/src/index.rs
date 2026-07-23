@@ -7,7 +7,7 @@
 //! `_search_index` / `reindex`), retargeted from the Python `LodeDB` SDK onto the
 //! Rust `lodedb_core::engine::CoreEngine`.
 //!
-//! IMPLEMENTATION NOTE (Wave 1c): the engine does not embed. For text-in, call
+//! The engine does not embed. For text-in, call
 //! `prepare_text_upsert` → embed the returned chunks via the caller's
 //! [`Embedder`] → `apply_text_upsert`. For vector-in, `upsert_vectors`. Search:
 //! `prepare_query_text` + embed query + `search_embedded_text`, or `query_vector`.
@@ -76,7 +76,21 @@ impl SemanticIndex {
             acquire_writer_lock: true,
         };
         let mut engine = CoreEngine::open(options)?;
-        if !engine.index_ids().iter().any(|id| id == INDEX_ID) {
+        if engine.index_ids().iter().any(|id| id == INDEX_ID) {
+            // Reopening: the on-disk dimension is authoritative. A config that
+            // disagrees means the caller swapped embedders; failing here beats the
+            // confusing per-call dimension errors (or silently mixed vector
+            // spaces) it would otherwise cause downstream.
+            let existing_dim = engine.stats(INDEX_ID)?.vector_dim;
+            if existing_dim != config.vector_dim {
+                return Err(GraphError::InvalidArgument(format!(
+                    "the graph's semantic index was created with dimension \
+                     {existing_dim} but the embedder/config supplies \
+                     {}; reopen with the original embedding dimension",
+                    config.vector_dim
+                )));
+            }
+        } else {
             engine.create_index(INDEX_ID, config.vector_dim, 4)?;
         }
         Ok(Self::from_engine(engine, config))
@@ -565,9 +579,10 @@ mod tests {
         assert!(ids(&candidates).contains(&"acme"));
 
         // A live fact is found by semantic_facts under AsOf::Now. Give it a concrete
-        // event-time start so the AsOf::At assertions below are meaningful (a fact
-        // with an open `valid_at` is encoded to the far-future sentinel and so never
-        // satisfies `valid_at <= t` — see the module note on encode_ts_open).
+        // event-time start so the AsOf::At assertions below exercise a real
+        // boundary (an open `valid_at` encodes to the epoch floor and would satisfy
+        // `valid_at <= t` for every t; see encode_ts_start and the
+        // open_start_as_of_consistency test).
         let mut f = fact("f1", "alice", "works_at", "acme", "Alice works at Acme robotics");
         f.valid_at = Some(1_000);
         index.index_fact(&f, Some(&embedder), None).unwrap();

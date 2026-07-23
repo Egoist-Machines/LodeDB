@@ -25,7 +25,7 @@
 //! caller's. It needs only a caller-supplied [`Embedder`] (or precomputed vectors),
 //! mirroring how `lodedb-core` keeps embedding in the binding layer.
 //!
-//! See `docs/temporal-graph-design.html` for the full design.
+//! See `docs/temporal-graph.md` for the full design.
 
 mod error;
 mod graph;

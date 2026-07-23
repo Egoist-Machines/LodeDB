@@ -77,6 +77,26 @@ pub fn as_of_sql(as_of: AsOf) -> (String, Vec<TimeMs>) {
     }
 }
 
+/// Whether a record's temporal endpoints satisfy a frame: the in-memory twin of
+/// [`as_of_sql`], kept adjacent so the two definitions cannot drift. Hydration
+/// paths re-check semantic-index hits against the authoritative topology row with
+/// this, so a stale index (a crash between the topology commit and the index
+/// refresh) cannot leak an expired record into a scoped read.
+pub fn frame_matches(
+    as_of: AsOf,
+    valid_at: Option<TimeMs>,
+    invalid_at: Option<TimeMs>,
+    expired_at: Option<TimeMs>,
+) -> bool {
+    match as_of {
+        AsOf::All => true,
+        AsOf::Now => expired_at.is_none() && invalid_at.is_none(),
+        AsOf::At(t) => {
+            valid_at.is_none_or(|v| v <= t) && invalid_at.is_none_or(|i| i > t)
+        }
+    }
+}
+
 /// The timestamps to write when a new fact supersedes a prior one — Graphiti's
 /// rule. The prior fact's event-time end (`invalid_at`) is the new fact's `valid_at`
 /// when known, otherwise the new fact's `effective_time` (its `reference_time`, i.e.

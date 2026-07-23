@@ -8,7 +8,7 @@
 //! rerankers for `search_subgraph`/`semantic_*` and are the natural extension point
 //! for center-node and diversity reranking.
 //!
-//! IMPLEMENTATION NOTE (Wave 1c): port each function faithfully. `rrf` is
+//! Each function is a faithful port. `rrf` is
 //! reciprocal-rank fusion over several ranked id lists; `maximal_marginal_relevance`
 //! trades relevance against diversity given candidate embeddings; the graph-aware
 //! rerankers take auxiliary inputs (a center node's neighbour distances, per-id

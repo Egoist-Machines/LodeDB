@@ -6,11 +6,11 @@
 //! schema shape from LodeDB's own Python topology store
 //! (`src/lodedb/graph/_store.py`), translated Cypher → SQL. rusqlite, bundled.
 //!
-//! IMPLEMENTATION NOTE (Wave 1a): implement every method below against the schema
-//! in `SCHEMA`. Use one transaction per mutation; JSON-encode `properties` and
-//! `episodes` to TEXT; use the `crate::temporal::as_of_sql` fragment for temporal
-//! filtering; chunk `IN (...)` lists (SQLite bound-param limit) as `_store.py`
-//! does. Timestamps are `i64` epoch-ms columns; `NULL` = open interval.
+//! Conventions: one transaction per mutation; `properties` and `episodes` are
+//! JSON-encoded TEXT; temporal filtering shares `crate::temporal::as_of_sql`;
+//! `IN (...)` lists are chunked under SQLite's bound-parameter limit as
+//! `_store.py` does. Timestamps are `i64` epoch-ms columns; `NULL` = open
+//! interval.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,10 +18,10 @@ use std::path::Path;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, Row};
 
-use crate::error::Result;
+use crate::error::{GraphError, Result};
 use crate::model::{AsOf, Direction, Entity, Episode, Fact, TimeMs};
 
-/// DDL for the topology store. See `docs/temporal-graph-design.html` §05.
+/// DDL for the topology store.
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS episodes (
     id          TEXT PRIMARY KEY,
@@ -116,9 +116,36 @@ impl TopologyStore {
 
     // -- episodes -----------------------------------------------------------
 
-    pub fn upsert_episode(&self, episode: &Episode) -> Result<()> {
+    pub fn get_episode(&self, id: &str) -> Result<Option<Episode>> {
+        let sql = format!("SELECT {} FROM episodes WHERE id = ?", EPISODE_COLS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_episode(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert (or replace) an episode and its entity mentions (Graphiti
+    /// `MENTIONS`) in ONE transaction,
+    /// so a bad mention id can never leave a half-written episode behind. Every
+    /// mentioned entity must already exist; missing ids fail the whole call with
+    /// `NotFound` and nothing persists.
+    pub fn upsert_episode_with_mentions(
+        &self,
+        episode: &Episode,
+        entity_ids: &[String],
+    ) -> Result<()> {
         let properties = props_to_text(&episode.properties)?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let missing = missing_ids(&tx, "entities", entity_ids)?;
+        if !missing.is_empty() {
+            return Err(GraphError::NotFound(format!(
+                "mentioned entities do not exist: {}",
+                missing.join(", ")
+            )));
+        }
+        tx.execute(
             "INSERT INTO episodes (id, source, body, occurred_at, created_at, properties) \
              VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
@@ -133,31 +160,12 @@ impl TopologyStore {
                 properties,
             ],
         )?;
-        Ok(())
-    }
-
-    pub fn get_episode(&self, id: &str) -> Result<Option<Episode>> {
-        let sql = format!("SELECT {} FROM episodes WHERE id = ?", EPISODE_COLS);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_episode(row)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Record which entities an episode mentions (Graphiti `MENTIONS`).
-    pub fn link_mentions(&self, episode_id: &str, entity_ids: &[String]) -> Result<()> {
-        if entity_ids.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO episode_mentions (episode_id, entity_id) VALUES (?, ?)",
             )?;
             for entity_id in entity_ids {
-                stmt.execute(params![episode_id, entity_id])?;
+                stmt.execute(params![episode.id, entity_id])?;
             }
         }
         tx.commit()?;
@@ -310,6 +318,10 @@ impl TopologyStore {
 
     // -- facts --------------------------------------------------------------
 
+    /// Test fixture: raw fact insert/replace that bypasses the facade's boundary
+    /// checks (entity/episode existence). Facade writes go through
+    /// `supersede_and_insert`.
+    #[cfg(test)]
     pub fn upsert_fact(&self, fact: &Fact) -> Result<()> {
         let properties = props_to_text(&fact.properties)?;
         let episodes = serde_json::to_string(&fact.episodes)?;
@@ -382,6 +394,28 @@ impl TopologyStore {
         let properties = props_to_text(&new_fact.properties)?;
         let episodes = serde_json::to_string(&new_fact.episodes)?;
         let tx = self.conn.unchecked_transaction()?;
+
+        // Boundary checks first, all inside the transaction, so any failure rolls
+        // the whole assertion back. Endpoints must be existing entities (this store
+        // does not auto-create nodes; resolution is the caller's job), provenance
+        // must reference existing episodes, and every prior the caller names must
+        // actually close — a typo'd id silently leaving the prior live would defeat
+        // the invalidation semantics.
+        let endpoints = [new_fact.src.clone(), new_fact.dst.clone()];
+        let missing = missing_ids(&tx, "entities", &endpoints)?;
+        if !missing.is_empty() {
+            return Err(GraphError::NotFound(format!(
+                "fact endpoints do not exist as entities: {}",
+                missing.join(", ")
+            )));
+        }
+        let missing = missing_ids(&tx, "episodes", &new_fact.episodes)?;
+        if !missing.is_empty() {
+            return Err(GraphError::NotFound(format!(
+                "fact provenance episodes do not exist: {}",
+                missing.join(", ")
+            )));
+        }
         let mut closed_ids = Vec::new();
         {
             let mut upd = tx.prepare(
@@ -390,20 +424,21 @@ impl TopologyStore {
             for (id, invalid_at, expired_at) in priors {
                 if upd.execute(params![invalid_at, expired_at, id])? > 0 {
                     closed_ids.push(id.clone());
+                } else {
+                    return Err(GraphError::NotFound(format!(
+                        "fact to invalidate does not exist or is already expired: {id}"
+                    )));
                 }
             }
         }
+        // Plain INSERT: the id is freshly generated, so a collision is a bug and
+        // must fail loudly instead of silently overwriting a prior fact's history
+        // (`upsert_fact` exists for deliberate replacement).
         tx.execute(
             "INSERT INTO facts \
                 (id, src, relation, dst, fact, properties, episodes, \
                  valid_at, invalid_at, created_at, expired_at, reference_time) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                src=excluded.src, relation=excluded.relation, dst=excluded.dst, \
-                fact=excluded.fact, properties=excluded.properties, episodes=excluded.episodes, \
-                valid_at=excluded.valid_at, invalid_at=excluded.invalid_at, \
-                created_at=excluded.created_at, expired_at=excluded.expired_at, \
-                reference_time=excluded.reference_time",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 new_fact.id,
                 new_fact.src,
@@ -419,6 +454,14 @@ impl TopologyStore {
                 new_fact.reference_time,
             ],
         )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO fact_episodes (fact_id, episode_id) VALUES (?, ?)",
+            )?;
+            for episode_id in &new_fact.episodes {
+                stmt.execute(params![new_fact.id, episode_id])?;
+            }
+        }
         tx.commit()?;
         Ok(closed_ids)
     }
@@ -542,6 +585,31 @@ impl TopologyStore {
 // -- helpers ----------------------------------------------------------------
 
 /// A comma-separated run of `n` positional placeholders (`?, ?, ...`).
+/// The subset of `ids` with no row in `table` (deduplicated), chunked under the
+/// bound-parameter limit. `table` is always a literal from this module, never
+/// caller input.
+fn missing_ids(conn: &Connection, table: &str, ids: &[String]) -> Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut missing: std::collections::BTreeSet<String> = ids.iter().cloned().collect();
+    let unique: Vec<String> = missing.iter().cloned().collect();
+    for chunk in unique.chunks(IN_CHUNK) {
+        let sql = format!(
+            "SELECT id FROM {} WHERE id IN ({})",
+            table,
+            placeholders(chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            missing.remove(&id);
+        }
+    }
+    Ok(missing.into_iter().collect())
+}
+
 fn placeholders(n: usize) -> String {
     std::iter::repeat("?")
         .take(n)
@@ -673,7 +741,7 @@ mod tests {
             created_at: 60,
             properties: json!({ "x": 1 }),
         };
-        store.upsert_episode(&ep).unwrap();
+        store.upsert_episode_with_mentions(&ep, &[]).unwrap();
         assert_eq!(store.get_episode("ep1").unwrap().unwrap(), ep);
         assert_eq!(store.get_episode("nope").unwrap(), None);
 
@@ -898,6 +966,28 @@ mod tests {
     }
 
     #[test]
+    fn episode_with_bad_mention_rolls_back() {
+        let store = TopologyStore::open_in_memory().unwrap();
+        store.upsert_entity(&entity("a")).unwrap();
+        let ep = Episode {
+            id: "ep1".to_string(),
+            source: String::new(),
+            body: String::new(),
+            occurred_at: 1,
+            created_at: 1,
+            properties: serde_json::Value::Null,
+        };
+        // "ghost" does not exist: the whole upsert must roll back, leaving no
+        // half-written episode row behind.
+        let err = store.upsert_episode_with_mentions(&ep, &["a".to_string(), "ghost".to_string()]);
+        assert!(err.is_err());
+        assert!(store.get_episode("ep1").unwrap().is_none(), "episode row rolled back");
+
+        store.upsert_episode_with_mentions(&ep, &["a".to_string()]).unwrap();
+        assert!(store.get_episode("ep1").unwrap().is_some());
+    }
+
+    #[test]
     fn link_mentions_is_idempotent() {
         let store = TopologyStore::open_in_memory().unwrap();
         store.upsert_entity(&entity("a")).unwrap();
@@ -910,17 +1000,17 @@ mod tests {
             created_at: 1,
             properties: serde_json::Value::Null,
         };
-        store.upsert_episode(&ep).unwrap();
+        store.upsert_episode_with_mentions(&ep, &[]).unwrap();
 
         store
-            .link_mentions("ep1", &["a".to_string(), "b".to_string()])
+            .upsert_episode_with_mentions(&ep, &["a".to_string(), "b".to_string()])
             .unwrap();
         // Re-linking (with overlap) must not error — the join PK dedups.
         store
-            .link_mentions("ep1", &["a".to_string()])
+            .upsert_episode_with_mentions(&ep, &["a".to_string()])
             .unwrap();
         // Empty list short-circuits.
-        store.link_mentions("ep1", &[]).unwrap();
+        store.upsert_episode_with_mentions(&ep, &[]).unwrap();
     }
 
     #[test]

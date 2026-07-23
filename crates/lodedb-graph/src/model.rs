@@ -11,7 +11,7 @@
 //! pipeline. It stores what it is given and answers temporal queries; entity
 //! extraction, entity resolution, temporal extraction, and contradiction
 //! detection stay with the caller (an LLM layer, exactly as Graphiti's own
-//! `add_triplet` is the LLM-free insertion path). See `docs/temporal-graph-design.html`.
+//! `add_triplet` is the LLM-free insertion path). See `docs/temporal-graph.md`.
 //!
 //! Timestamps are epoch **milliseconds** (`i64`); `None` encodes an open interval,
 //! matching Graphiti's nullable `datetime` fields.
@@ -107,6 +107,20 @@ impl Fact {
     /// (`expired_at IS NULL AND invalid_at IS NULL`).
     pub fn is_live(&self) -> bool {
         self.expired_at.is_none() && self.invalid_at.is_none()
+    }
+
+    /// Whether the fact satisfies `as_of` per the authoritative row — the
+    /// in-memory twin of the SQL frame (see `temporal::frame_matches`).
+    pub fn matches(&self, as_of: AsOf) -> bool {
+        crate::temporal::frame_matches(as_of, self.valid_at, self.invalid_at, self.expired_at)
+    }
+}
+
+impl Entity {
+    /// Whether the entity satisfies `as_of` per the authoritative row — the
+    /// in-memory twin of the SQL frame (see `temporal::frame_matches`).
+    pub fn matches(&self, as_of: AsOf) -> bool {
+        crate::temporal::frame_matches(as_of, self.valid_at, self.invalid_at, self.expired_at)
     }
 }
 
