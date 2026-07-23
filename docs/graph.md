@@ -7,9 +7,9 @@ semantic-retrieval layer over nodes and edges, paired with a store built for
 traversal. This page covers the three capabilities that make LodeDB a first-class
 substrate for that, and the `lodedb.graph` layer that ties them together.
 
-> **Need time?** For a *bi-temporal* graph — facts with event-time and
+> **Need time?** For a *bi-temporal* graph (facts with event-time and
 > transaction-time validity, invalidation-not-deletion, and "as-of" queries, native
-> Rust and available on-device — see [`temporal-graph.md`](temporal-graph.md)
+> Rust and available on-device) see [`temporal-graph.md`](temporal-graph.md)
 > (`lodedb.graph.TemporalKnowledgeGraph`). This page covers the non-temporal
 > `KnowledgeGraph`.
 
@@ -186,8 +186,8 @@ There are two embedding modes:
 - **Vector-only (bring your own embeddings).** Open the graph with a `vector_dim` and the
   semantic index has no embedder: the adapter stores each node's own `embedding` and
   `vector_query` searches by `query.query_embedding`. This is what LlamaIndex's high-level
-  `PropertyGraphIndex` / `VectorContextRetriever` use, so it works with **any** `embed_model`.
-  Set the dimension to the embedder's:
+  `PropertyGraphIndex` / `VectorContextRetriever` use, so it works with **any** `embed_model`
+  — set the dimension to the embedder's:
 
   ```python
   # match your embed_model's dimension (e.g. 1536); nodes and queries stay in one space

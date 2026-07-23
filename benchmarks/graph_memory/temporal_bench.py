@@ -105,7 +105,7 @@ def run(entities: int, facts: int, contradiction_rate: float, query_count: int) 
 
     # 4. As-of semantic subgraph queries.
     subgraph_ms: list[float] = []
-    for q in range(query_count):
+    for _q in range(query_count):
         s = time.perf_counter()
         kg.search_subgraph("entity thing widget", k=5, hops=1, as_of=mid)
         subgraph_ms.append((time.perf_counter() - s) * 1000.0)
@@ -142,7 +142,9 @@ def run(entities: int, facts: int, contradiction_rate: float, query_count: int) 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LodeDB bi-temporal graph benchmark (metrics only)")
+    parser = argparse.ArgumentParser(
+        description="LodeDB bi-temporal graph benchmark (metrics only)"
+    )
     parser.add_argument("--entities", type=int, default=2000)
     parser.add_argument("--facts", type=int, default=4000)
     parser.add_argument("--contradiction-rate", type=float, default=0.25)
