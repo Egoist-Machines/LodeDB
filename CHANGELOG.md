@@ -7,61 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-23
+
 ### Added
 
 - **`lodedb-graph`: a bi-temporal knowledge graph, the temporal successor to
   `lodedb.graph.KnowledgeGraph`.** A new native crate (`crates/lodedb-graph`) over
-  `lodedb-core` that keeps the two-store architecture, an authoritative SQLite
-  topology store plus a rebuildable LodeDB semantic index, and adds Graphiti-style
-  bi-temporality: every fact carries event time (`valid_at`/`invalid_at`) and
-  transaction time (`created_at`/`expired_at`), contradictions **invalidate** rather
-  than delete, and every read takes an `as_of` frame (current / as-of an instant /
-  full history). Episodes → entities → facts with provenance, deterministic k-hop
-  traversal, hybrid semantic entry points, and the Graphiti rerankers (RRF, MMR,
-  node-distance, episode-mentions) ported as pure functions. It is the storage-and-
-  query half of Graphiti, with no LLM extraction, resolution, or contradiction
-  detection; `add_fact` is the analogue of Graphiti's `add_triplet`. Exposed to Python as
-  `lodedb.graph.TemporalKnowledgeGraph` (the `lodedb._turbovec.graph` submodule),
-  driven by a caller-supplied embedder (or precomputed vectors), and to Swift as
-  `LodeGraph`, which embeds on device and drives the same engine over the C ABI.
-  See [`docs/temporal-graph.md`](docs/temporal-graph.md).
+  `lodedb-core` that keeps the two-store architecture (an authoritative SQLite topology
+  store plus a rebuildable LodeDB semantic index) and adds Graphiti-style bi-temporality:
+  every fact carries event time (`valid_at`/`invalid_at`) and transaction time
+  (`created_at`/`expired_at`), contradictions **invalidate** rather than delete, and every
+  read takes an `as_of` frame (current, as of an instant, or full history). It models
+  episodes, entities, and facts with provenance, with deterministic k-hop traversal, hybrid
+  semantic entry points, and the Graphiti rerankers (RRF, MMR, node-distance,
+  episode-mentions) ported as pure functions. It is the storage-and-query half of Graphiti,
+  with no LLM extraction, resolution, or contradiction detection; `add_fact` is the analogue
+  of Graphiti's `add_triplet`. Exposed to Python as `lodedb.graph.TemporalKnowledgeGraph`
+  (the `lodedb._turbovec.graph` submodule), driven by a caller-supplied embedder or
+  precomputed vectors, and to Swift as `LodeGraph`, which embeds on device and drives the
+  same engine over the C ABI. See [`docs/temporal-graph.md`](docs/temporal-graph.md).
 
-## [1.4.0] - 2026-07-18
+- **`add_fact_vec` and an `index_text` opt-out on the graph bindings.** `add_fact_vec`
+  indexes a fact from a precomputed vector, so a graph opened without an embedder can still
+  populate its semantic index (previously that path silently cleared the fact's document).
+  `index_text=False` keeps a graph's semantic index vector-only, and the flag now reaches
+  the Python constructor, the FFI open request, and `LodeGraph`.
 
-### Added
+- **First-party managed cloud, the `[cloud]` extra.** `lodedb.cloud` ships in this package:
+  `Client` (one credential, one bound org/environment, per-user store handles),
+  `connect`/`CloudStore` (one end user's store over HTTPS, duck-typing the local verb
+  surface), the transfer verbs (`push`/`pull`/`sync`/`status`/`verify`/`keys`) on a native
+  transfer core bundled into the extension as `lodedb._turbovec.cloud`, and the full `lodedb
+  cloud` CLI (login, tokens, store/environment/org management, transfer, agent scaffolding).
+  The transfer core is the new `crates/lodedb-cloud-core`, one commit-format implementation
+  shared with the engine; it also reads the 1.3.2 `tvvf` rescore sidecar so rescore stores
+  transfer completely. The extra installs only the client's dependencies (`httpx`,
+  `pynacl`), and everything cloud resolves lazily, so a plain `import lodedb` stays
+  network-free (guarded by `tests/test_import_boundary.py`). There is no separate cloud
+  package.
 
-- **The OreCloud managed-cloud client, first-party, as the `[cloud]` extra.**
-  `lodedb.cloud` ships in this package: `Client` (one credential, one bound
-  org/environment, per-user store handles), `connect`/`CloudStore` (one end
-  user's store over HTTPS, duck-typing the local verb surface), the transfer
-  verbs (`push`/`pull`/`sync`/`status`/`verify`/`keys`) on a native transfer
-  core bundled into the extension as `lodedb._turbovec.cloud` (one
-  commit-format implementation shared with the engine — the new
-  `crates/lodedb-cloud-core`, which also learns the 1.3.2 `tvvf` rescore
-  sidecar so rescore stores transfer completely), and the full `lodedb
-  cloud` CLI (login, tokens, store/environment/org management, transfer,
-  agent scaffolding). The extra installs only the client's dependencies
-  (`httpx`, `pynacl`); everything cloud resolves lazily, so a plain
-  `import lodedb` stays network-free (guarded by
-  `tests/test_import_boundary.py`). There is no separate cloud package.
-- `LodeDB.cloud("user-42")` opens a managed-cloud store through the same
-  class as a local path, joining the `open_readonly`/`open_vector_store`
-  alternate-constructor family: a bare store id resolves its
-  org/environment from the credential (`token=`, `ORECLOUD_TOKEN`, or
-  `lodedb cloud login`), and the `"org/environment/store"` triple and
-  full `orecloud://` URLs are accepted too. The call returns the cloud store handle (same
-  `add`/`search`/`get`/`remove` verbs over HTTPS). For config-driven code,
-  the plain constructor also dispatches the explicit URL form —
-  `LodeDB("orecloud://org/environment/store")` — through the same funnel.
-  Local-only construction options (`model=`, `read_only=`, ...) are rejected
-  on cloud targets with a targeted error, and a cloud target without the
-  `[cloud]` extra's dependencies raises the install hint.
-- The client and CLI default to the hosted control plane
-  (`https://api.egoistmachines.com`), so nobody has to know the URL:
-  `lodedb cloud login` needs no flags, and `Client(token=...)` or
-  `ORECLOUD_TOKEN` alone is enough for CI. `--host`/`ORECLOUD_HOST`
-  remain the override for staging and self-hosted control planes; a
-  host override without a matching token still fails closed.
+- **`LodeDB.cloud("user-42")` opens a managed-cloud store through the same class as a local
+  path**, joining the `open_readonly`/`open_vector_store` alternate-constructor family. A
+  bare store id resolves its org/environment from the credential (`token=`, `ORECLOUD_TOKEN`,
+  or `lodedb cloud login`); the `"org/environment/store"` triple and full `orecloud://` URLs
+  work too. The call returns the cloud store handle with the same `add`/`search`/`get`/`remove`
+  verbs over HTTPS. For config-driven code the plain constructor also dispatches the explicit
+  URL form, `LodeDB("orecloud://org/environment/store")`, through the same funnel. Local-only
+  construction options (`model=`, `read_only=`, and the rest) are rejected on cloud targets
+  with a targeted error, and a cloud target without the `[cloud]` extra's dependencies raises
+  the install hint.
+
+- **The cloud client and CLI default to the hosted control plane**
+  (`https://api.egoistmachines.com`), so `lodedb cloud login` needs no flags and
+  `Client(token=...)` or `ORECLOUD_TOKEN` alone is enough for CI. `--host`/`ORECLOUD_HOST`
+  remain the override for staging and self-hosted control planes; a host override without a
+  matching token still fails closed.
+
+- **The cloud handle reaches migration parity with the local handle.** `list_documents`
+  enumerates a store in local-record shape (`{id, metadata, chunk_count}`) with the same
+  filter grammar and `after`/`limit` keyset cursor, walking the match set in pages under
+  keyword-only `max_documents`/`timeout` bounds. `get_texts` rides a batched by-id fetch (one
+  request per hundred ids), `browse` honors read-your-writes (it sends the session's write
+  floor and briefly retries a 425 so an enumeration sees its own writes) and gains by-id and
+  most-recent-first paging, `add`/`add_vectors` coerce int/float/bool metadata through the
+  local handle's own rules before the wire, and `delete_store(erase=True)` requests the
+  control plane's data-subject erasure. Read retries honor the response's `Retry-After`
+  within the visibility budget.
+
+- **Sealed (client-encrypted) cloud stores, the `[cloud-sealed]` extra.**
+  `Client.create_store(encrypted=True, key_material=...)` HPKE-seals a caller-held 32-byte
+  wrapping key to the plane's creation recipient; `unseal_store`, `reseal_store`, and
+  `rotate_store_key` drive the grant lifecycle over a challenge-nonce contract. The CLI gains
+  `store unseal`, `store reseal`, and `create --encrypted` (env-sourced or generated key
+  material) with a 423 hint. The `cryptography` dependency arrives only with `[cloud-sealed]`
+  and is imported only while sealing, so the import boundary still forbids it on a plain
+  `import lodedb`.
+
+- **A `discard_at_exit=True` handle flag.** The pre-exit teardown hook persists every open
+  writable handle by default; `LodeDB(discard_at_exit=True)` routes a handle to `discard()`
+  at exit instead, so a serving tier applying provisional records over a pushed snapshot never
+  publishes them on a process exit. An explicit `close()` still persists.
+
+### Changed
+
+- **Read-only opens are lazy and validated.** A read-only open with a committed `.tvim` no
+  longer reconstructs the corpus to f32: chunk vectors stay non-resident, the SIMD-blocked
+  repack moves from open to the first search (apply-and-persist opens never pay it), and a
+  persisted ANN assignment is adopted on the first ANN query instead of recomputing centroids
+  eagerly. Loads now validate row count, chunk-id membership, and `native_dim` against the
+  committed state, failing closed as a corrupt store where reconstruction used to mask the
+  mismatch. Measured on a 20k by 384 4-bit store: read-only open 299 to 227 ms, handle
+  residency 338 to 235 MiB.
+
+- **The cloud transfer plane streams instead of buffering whole artifacts.** Push, pull,
+  verify, and restore move artifacts through streaming primitives with an incremental SHA-256
+  digest gate and atomic no-clobber publication, so peak memory no longer tracks the largest
+  artifact. Pushing a 512 MiB single-artifact generation peaks under 200 MB RSS for the whole
+  process, and verification no longer materializes artifacts at all.
+
+- **Minimum supported Rust version is now 1.88.** The locked dependency graph already required
+  it (`libloading` 0.9 through the `lodedb-gpu`/`cudarc` chain, and the `icu` family through
+  `object_store`), so the declared MSRV now matches what the lockfiles need. Installing the
+  published wheels is unaffected; only building the crates from source needs the newer
+  toolchain.
 
 ## [1.3.2] - 2026-07-16
 
