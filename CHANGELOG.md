@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-07-24
+
 ### Added
 
-- Added explicit stored-vector reads for the 2.0.2 release. Python and Rust expose
+- Added explicit stored-vector reads. Python and Rust expose
   `get_vectors(ids)`, and Swift exposes `getVectors(_:)`. A document id expands to
   its current chunks, while a chunk id selects one row. Results are f32
   reconstructions in the original embedding coordinate space.
