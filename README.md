@@ -650,6 +650,41 @@ sync run on the same bundled native core as the engine. The extra installs
 only its dependencies (`httpx`, `pynacl`). Everything cloud loads lazily, so
 a plain `import lodedb` stays network-free.
 
+### Sealed stores
+
+OreCloud can host a server-side encrypted store whose 32-byte wrapping key
+remains with your application. Install the additional lazy crypto support,
+keep that material outside source control, and keep a recovery copy: losing
+it makes the store unreadable and the service never persists it.
+
+```sh
+pip install "lodedb[cloud,cloud-sealed]"
+```
+
+```python
+import secrets
+
+from lodedb.cloud import Client
+
+material = secrets.token_bytes(32)
+client = Client()
+client.create_store(
+    "user-42",
+    encrypted=True,
+    key_material=material,
+    mode="cloud_writer",
+    preset="minilm",
+)
+expires_at = client.unseal_store("user-42", material, ttl_seconds=900)
+# Query or write while the grant is live, then remove it when finished.
+client.reseal_store("user-42")
+```
+
+`Client.rotate_store_key("user-42", fresh_material)` replaces the caller-held
+material after the store is unsealed. A sealed data-plane read returns
+`CloudError` with status 423 and a `store_sealed:` detail; applications decide
+when to request an unseal grant.
+
 ## Concurrency & durability
 
 - **Single writer, many readers, per path.** One handle holds the path open for *writing* at

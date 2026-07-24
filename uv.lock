@@ -2079,6 +2079,9 @@ cloud = [
     { name = "httpx" },
     { name = "pynacl" },
 ]
+cloud-sealed = [
+    { name = "cryptography" },
+]
 cognee = [
     { name = "cognee", marker = "python_full_version < '3.15'" },
 ]
@@ -2119,6 +2122,7 @@ torch = [
 [package.metadata]
 requires-dist = [
     { name = "cognee", marker = "python_full_version < '3.15' and extra == 'cognee'", specifier = ">=1.1.0,<2" },
+    { name = "cryptography", marker = "extra == 'cloud-sealed'", specifier = ">=47" },
     { name = "cupy-cuda12x", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=13.0.0" },
     { name = "httpx", marker = "extra == 'cloud'", specifier = ">=0.27" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=0.3.0" },
@@ -2139,7 +2143,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'embeddings'", specifier = ">=4.40.0,<5" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["embeddings", "torch", "gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "cognee", "cloud", "image", "all", "dev"]
+provides-extras = ["embeddings", "torch", "gpu", "onnx-export", "mcp", "langchain", "llama-index", "mem0", "cognee", "cloud", "cloud-sealed", "image", "all", "dev"]
 
 [[package]]
 name = "lupa"
