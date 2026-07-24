@@ -32,6 +32,7 @@ final class LodeGraphTests: XCTestCase {
 
         let fAcme = try g.addFact(src: "alice", relation: "works_at", dst: "acme",
                                   fact: "Alice works at Acme", validAt: 1000)
+        Thread.sleep(forTimeInterval: 0.005)
         let fGlobex = try g.addFact(src: "alice", relation: "works_at", dst: "globex",
                                     fact: "Alice works at Globex", validAt: 2000,
                                     invalidates: [fAcme])
