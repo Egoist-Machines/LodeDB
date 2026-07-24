@@ -11,7 +11,9 @@ pytest.importorskip("httpx", reason="needs the [cloud] extra's dependencies")
 pytest.importorskip("nacl", reason="needs the [cloud] extra's dependencies")
 
 import httpx  # noqa: E402
+from typer.testing import CliRunner  # noqa: E402
 
+from lodedb.cloud import cli  # noqa: E402
 from lodedb.cloud.client import Client  # noqa: E402
 from lodedb.cloud.serving import CloudStore  # noqa: E402
 from lodedb.cloud.transfer import CloudClient, CloudError  # noqa: E402
@@ -289,3 +291,47 @@ def test_missing_cryptography_names_the_cloud_sealed_install_extra(monkeypatch):
     monkeypatch.setattr(_sealing.importlib, "import_module", unavailable)
     with pytest.raises(ImportError, match=r"lodedb\[cloud-sealed\]"):
         _sealing.seal_material(b"m" * 32, base64.b64encode(b"p" * 32).decode(), b"info")
+
+
+def test_cli_missing_cryptography_is_a_classified_error(monkeypatch):
+    """The sealed-store CLI never leaks the optional-dependency traceback."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_create_challenge(self, _org: str, _environment: str) -> dict:
+            return {"recipient_public_key": base64.b64encode(b"p" * 32).decode()}
+
+        def create_store(self, *_args, **_kwargs):
+            raise AssertionError("create must not run when sealing is unavailable")
+
+    from lodedb.cloud import _sealing
+
+    def unavailable(*_args, **_kwargs):
+        raise ImportError("sealed-store support requires cryptography; run: cloud-sealed")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+    monkeypatch.setattr(_sealing, "seal_material", unavailable)
+    monkeypatch.setenv("SEALED_MATERIAL", base64.b64encode(b"m" * 32).decode())
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "store",
+            "create",
+            "user-42",
+            "--encrypted",
+            "--material-env",
+            "SEALED_MATERIAL",
+            "--no-connect-key",
+        ],
+    )
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "error: sealed-store support requires cryptography" in result.output
+    assert "Traceback" not in result.output

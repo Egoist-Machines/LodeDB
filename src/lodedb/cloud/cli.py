@@ -488,6 +488,23 @@ def _load_material(material_env: str | None, generate_material: bool) -> bytes:
     return material
 
 
+def _seal_material_for_cli(material: bytes, recipient_public_key: object, info: bytes) -> str:
+    """Seal material while preserving the CLI's classified-error contract."""
+
+    try:
+        from lodedb.cloud._sealing import seal_material
+    except ImportError as error:
+        raise _fail(str(error), code=EXIT_USAGE) from error
+    try:
+        return seal_material(material, recipient_public_key, info)
+    except ImportError as error:
+        # ``_sealing`` itself is dependency-free; the optional cryptography
+        # import happens only when ``seal_material`` is called.
+        raise _fail(str(error), code=EXIT_USAGE) from error
+    except (TypeError, ValueError) as error:
+        raise _fail(f"sealed-store challenge is invalid: {error}") from error
+
+
 # The tenancy flags share one story: the credential knows where it belongs.
 _ORG_HELP = "Org slug; defaults to the token's binding, else your only org."
 _ENVIRONMENT_HELP = (
@@ -1251,13 +1268,15 @@ def store_create(
         material = _load_material(material_env, generate_material) if encrypted else None
         sealed_material = None
         if material is not None:
-            from lodedb.cloud._sealing import create_info, seal_material
+            from lodedb.cloud._sealing import create_info
 
             challenge = _cloud(lambda: client.store_create_challenge(org, environment))
-            sealed_material = seal_material(
-                material,
-                challenge["recipient_public_key"],
-                create_info(org, environment, store),
+            try:
+                recipient_public_key = challenge["recipient_public_key"]
+            except (KeyError, TypeError) as error:
+                raise _fail("store creation challenge returned incomplete data") from error
+            sealed_material = _seal_material_for_cli(
+                material, recipient_public_key, create_info(org, environment, store)
             )
         row = _cloud(
             lambda: client.create_store(
@@ -1349,9 +1368,11 @@ def store_unseal(
         challenge = _cloud(lambda: client.store_unseal_challenge(org, environment, store))
         try:
             info = base64.b64decode(challenge["info"], validate=True)
+            recipient_public_key = challenge["recipient_public_key"]
+            nonce = challenge["nonce"]
         except (KeyError, TypeError, ValueError, binascii.Error) as error:
-            raise _fail("unseal challenge returned invalid info") from error
-        from lodedb.cloud._sealing import seal_material
+            raise _fail("unseal challenge returned incomplete or invalid data") from error
+        sealed_material = _seal_material_for_cli(material, recipient_public_key, info)
 
         out = _cloud(
             lambda: client.unseal_store(
@@ -1360,10 +1381,8 @@ def store_unseal(
                 store,
                 {
                     "ttl_seconds": ttl_seconds,
-                    "sealed_material": seal_material(
-                        material, challenge["recipient_public_key"], info
-                    ),
-                    "nonce": challenge["nonce"],
+                    "sealed_material": sealed_material,
+                    "nonce": nonce,
                 },
             )
         )
