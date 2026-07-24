@@ -84,11 +84,19 @@ def _as_of(as_of: Any) -> tuple[int | None, bool]:
 
 
 def _resolve_dimension(embedder: Any, vector_dim: int | None) -> int:
-    if vector_dim is not None:
-        return int(vector_dim)
+    embedder_dim: int | None = None
     if embedder is not None and hasattr(embedder, "dimension"):
         dim = embedder.dimension
-        return int(dim() if callable(dim) else dim)
+        embedder_dim = int(dim() if callable(dim) else dim)
+    if vector_dim is not None:
+        requested = int(vector_dim)
+        if embedder_dim is not None and embedder_dim != requested:
+            raise ValueError(
+                f"embedder dimension {embedder_dim} does not match vector_dim {requested}"
+            )
+        return requested
+    if embedder_dim is not None:
+        return embedder_dim
     return 384
 
 

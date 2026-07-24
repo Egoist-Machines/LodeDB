@@ -103,11 +103,11 @@ data.
 The engine is `crates/lodedb-graph`, a small crate over `lodedb-core`:
 
 - an embedded SQLite **topology truth store** (episodes, entities, typed facts,
-  provenance, bi-temporal validity) — the authoritative adjacency;
+  provenance, bi-temporal validity, and caller-supplied vectors) — the
+  authoritative adjacency;
 - a `lodedb-core` **semantic index** driven as a rebuildable derived artifact.
-  On a graph opened with an embedder, `reindex()` restores it from the truth store;
-  a vector-in graph refuses `reindex()` (the topology stores no vectors to rebuild
-  from), so keep the caller's vectors re-supplyable if you need index recovery;
+  `reindex()` restores both text-in records (through the embedder) and vector-in
+  records (from vectors retained in the topology store);
 - the bi-temporal logic (as-of resolution, invalidation) and the Graphiti rerankers
   (RRF, MMR, node-distance, episode-mentions) ported as pure functions.
 

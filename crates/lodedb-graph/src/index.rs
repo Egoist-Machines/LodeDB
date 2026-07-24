@@ -44,6 +44,13 @@ pub struct IndexHit {
     pub score: f32,
 }
 
+struct PendingDocument<'a> {
+    doc_id: String,
+    metadata: BTreeMap<String, String>,
+    text: &'a str,
+    vector: Option<&'a [f32]>,
+}
+
 /// The `lodedb-core`-backed semantic index. Derived from the topology store and
 /// rebuildable via [`SemanticIndex::reindex_from`].
 pub struct SemanticIndex {
@@ -59,6 +66,9 @@ pub struct SemanticIndex {
     /// search. Seeds `store_text`/`index_text` on the text-ingest path and selects
     /// hybrid vs. vector query mode.
     index_text: bool,
+    /// Whether this open created the private index rather than finding one. The
+    /// facade uses this to rebuild when a derived index directory was removed.
+    created: bool,
 }
 
 impl SemanticIndex {
@@ -76,7 +86,8 @@ impl SemanticIndex {
             acquire_writer_lock: true,
         };
         let mut engine = CoreEngine::open(options)?;
-        if engine.index_ids().iter().any(|id| id == INDEX_ID) {
+        let created = !engine.index_ids().iter().any(|id| id == INDEX_ID);
+        if !created {
             // Reopening: the on-disk dimension is authoritative. A config that
             // disagrees means the caller swapped embedders; failing here beats the
             // confusing per-call dimension errors (or silently mixed vector
@@ -93,24 +104,29 @@ impl SemanticIndex {
         } else {
             engine.create_index(INDEX_ID, config.vector_dim, 4)?;
         }
-        Ok(Self::from_engine(engine, config))
+        Ok(Self::from_engine(engine, config, created))
     }
 
     /// Open an in-memory index (tests).
     pub fn open_in_memory(config: &GraphConfig) -> Result<Self> {
         let mut engine = CoreEngine::new_in_memory();
         engine.create_index(INDEX_ID, config.vector_dim, 4)?;
-        Ok(Self::from_engine(engine, config))
+        Ok(Self::from_engine(engine, config, true))
     }
 
-    fn from_engine(engine: CoreEngine, config: &GraphConfig) -> Self {
+    fn from_engine(engine: CoreEngine, config: &GraphConfig, created: bool) -> Self {
         SemanticIndex {
             engine,
             index_id: INDEX_ID.to_string(),
             dim: config.vector_dim,
             index_facts: config.index_facts,
             index_text: config.index_text,
+            created,
         }
+    }
+
+    pub fn was_created(&self) -> bool {
+        self.created
     }
 
     // -- indexing (mirror one entity/fact into the index) -------------------
@@ -123,13 +139,26 @@ impl SemanticIndex {
         embedder: Option<&dyn Embedder>,
         vector: Option<&[f32]>,
     ) -> Result<()> {
-        let doc_id = format!("{ENTITY_PREFIX}{}", entity.id);
-        let mut metadata = BTreeMap::new();
-        metadata.insert("kind".to_string(), "entity".to_string());
-        metadata.insert("type".to_string(), entity.entity_type.clone());
-        metadata.insert("entity_id".to_string(), entity.id.clone());
-        self.mirror_temporal(&mut metadata, entity.valid_at, entity.invalid_at, entity.expired_at);
-        self.write_document(doc_id, metadata, &entity.label, embedder, vector)
+        self.index_entities(&[(entity, vector)], embedder)
+    }
+
+    /// Batch entity indexing so recovery/reindex performs one engine upsert per
+    /// ingest mode instead of one persisted engine mutation per topology row.
+    pub fn index_entities(
+        &mut self,
+        entities: &[(&Entity, Option<&[f32]>)],
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
+        let documents = entities
+            .iter()
+            .map(|(entity, vector)| PendingDocument {
+                doc_id: format!("{ENTITY_PREFIX}{}", entity.id),
+                metadata: self.entity_metadata(entity),
+                text: &entity.label,
+                vector: *vector,
+            })
+            .collect();
+        self.write_documents(documents, embedder)
     }
 
     /// Index (or clear) a fact's text/embedding for `semantic_facts`.
@@ -139,20 +168,36 @@ impl SemanticIndex {
         embedder: Option<&dyn Embedder>,
         vector: Option<&[f32]>,
     ) -> Result<()> {
-        let doc_id = format!("{FACT_PREFIX}{}", fact.id);
-        // Facts are topology-only unless edge indexing is enabled; clear any stale doc.
+        self.index_facts(&[(fact, vector)], embedder)
+    }
+
+    /// Batch fact indexing, including vector-in history updates during a
+    /// supersession and full index recovery.
+    pub fn index_facts(
+        &mut self,
+        facts: &[(&Fact, Option<&[f32]>)],
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
         if !self.index_facts {
-            self.engine.delete_documents(&self.index_id, &[doc_id])?;
+            let doc_ids: Vec<String> = facts
+                .iter()
+                .map(|(fact, _)| format!("{FACT_PREFIX}{}", fact.id))
+                .collect();
+            if !doc_ids.is_empty() {
+                self.engine.delete_documents(&self.index_id, &doc_ids)?;
+            }
             return Ok(());
         }
-        let mut metadata = BTreeMap::new();
-        metadata.insert("kind".to_string(), "fact".to_string());
-        metadata.insert("relation".to_string(), fact.relation.clone());
-        metadata.insert("fact_id".to_string(), fact.id.clone());
-        metadata.insert("src".to_string(), fact.src.clone());
-        metadata.insert("dst".to_string(), fact.dst.clone());
-        self.mirror_temporal(&mut metadata, fact.valid_at, fact.invalid_at, fact.expired_at);
-        self.write_document(doc_id, metadata, &fact.fact, embedder, vector)
+        let documents = facts
+            .iter()
+            .map(|(fact, vector)| PendingDocument {
+                doc_id: format!("{FACT_PREFIX}{}", fact.id),
+                metadata: self.fact_metadata(fact),
+                text: &fact.fact,
+                vector: *vector,
+            })
+            .collect();
+        self.write_documents(documents, embedder)
     }
 
     /// Remove an entity's index document by id.
@@ -164,8 +209,19 @@ impl SemanticIndex {
 
     /// Remove a fact's index document by id.
     pub fn remove_fact(&mut self, id: &str) -> Result<()> {
+        self.remove_facts(&[id.to_string()])
+    }
+
+    /// Remove fact documents in one engine mutation (important for deleting a
+    /// high-degree entity and all of its incident facts).
+    pub fn remove_facts(&mut self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let document_ids: Vec<String> =
+            ids.iter().map(|id| format!("{FACT_PREFIX}{id}")).collect();
         self.engine
-            .delete_documents(&self.index_id, &[format!("{FACT_PREFIX}{id}")])?;
+            .delete_documents(&self.index_id, &document_ids)?;
         Ok(())
     }
 
@@ -225,8 +281,7 @@ impl SemanticIndex {
         live_entity_ids: &[String],
         live_fact_ids: &[String],
     ) -> Result<usize> {
-        let entity_orphans =
-            self.orphan_doc_ids("entity", ENTITY_PREFIX, live_entity_ids)?;
+        let entity_orphans = self.orphan_doc_ids("entity", ENTITY_PREFIX, live_entity_ids)?;
         let fact_orphans = self.orphan_doc_ids("fact", FACT_PREFIX, live_fact_ids)?;
         let mut removed = 0usize;
         for batch in [entity_orphans, fact_orphans] {
@@ -249,7 +304,55 @@ impl SemanticIndex {
         Ok(self.engine.stats(&self.index_id)?.document_count)
     }
 
+    /// Validate a caller-supplied vector before the authoritative topology
+    /// transaction begins, so a boundary error cannot leave a committed row.
+    pub fn validate_vector(&self, vector: &[f32]) -> Result<()> {
+        if vector.len() != self.dim {
+            return Err(GraphError::InvalidArgument(format!(
+                "vector has dimension {} but the index is {}",
+                vector.len(),
+                self.dim
+            )));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(GraphError::InvalidArgument(
+                "vector contains a non-finite value".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     // -- private helpers ----------------------------------------------------
+
+    fn entity_metadata(&self, entity: &Entity) -> BTreeMap<String, String> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("kind".to_string(), "entity".to_string());
+        metadata.insert("type".to_string(), entity.entity_type.clone());
+        metadata.insert("entity_id".to_string(), entity.id.clone());
+        self.mirror_temporal(
+            &mut metadata,
+            entity.valid_at,
+            entity.invalid_at,
+            entity.expired_at,
+        );
+        metadata
+    }
+
+    fn fact_metadata(&self, fact: &Fact) -> BTreeMap<String, String> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("kind".to_string(), "fact".to_string());
+        metadata.insert("relation".to_string(), fact.relation.clone());
+        metadata.insert("fact_id".to_string(), fact.id.clone());
+        metadata.insert("src".to_string(), fact.src.clone());
+        metadata.insert("dst".to_string(), fact.dst.clone());
+        self.mirror_temporal(
+            &mut metadata,
+            fact.valid_at,
+            fact.invalid_at,
+            fact.expired_at,
+        );
+        metadata
+    }
 
     /// Mirror the three bi-temporal endpoints into sortable-string metadata, so the
     /// as-of filter runs engine-side. Open endpoints map to the [`crate::temporal`]
@@ -261,51 +364,55 @@ impl SemanticIndex {
         invalid_at: Option<i64>,
         expired_at: Option<i64>,
     ) {
-        // Open START (valid_at) → epoch floor (started long ago); open END
-        // (invalid_at / expired_at) → far future (still valid). Keeps the index's
-        // as-of filter consistent with the SQL topology's `IS NULL` semantics.
+        // Open START sorts below every timestamp; open END sorts above every
+        // timestamp. This keeps the index's as-of filter consistent with the SQL
+        // topology's `IS NULL` semantics across the full signed i64 domain.
         metadata.insert("valid_at".to_string(), encode_ts_start(valid_at));
         metadata.insert("invalid_at".to_string(), encode_ts_open(invalid_at));
         metadata.insert("expired_at".to_string(), encode_ts_open(expired_at));
     }
 
-    /// The write half shared by entities and facts: vector-in upserts the given
-    /// vector, an embeddable text goes through the prepare/embed/apply text path,
-    /// and anything else clears the (possibly stale) index document.
-    fn write_document(
+    /// Batch the write half shared by entities and facts. Vector-in documents use
+    /// one vector upsert, text-in documents use one prepare/embed/apply cycle, and
+    /// empty records are cleared in one delete.
+    fn write_documents(
         &mut self,
-        doc_id: String,
-        metadata: BTreeMap<String, String>,
-        text: &str,
+        documents: Vec<PendingDocument<'_>>,
         embedder: Option<&dyn Embedder>,
-        vector: Option<&[f32]>,
     ) -> Result<()> {
-        if let Some(vector) = vector {
-            if vector.len() != self.dim {
-                return Err(GraphError::InvalidArgument(format!(
-                    "vector has dimension {} but the index is {}",
-                    vector.len(),
-                    self.dim
-                )));
+        let mut vector_documents = Vec::new();
+        let mut text_documents = Vec::new();
+        let mut delete_ids = Vec::new();
+        for document in documents {
+            if let Some(vector) = document.vector {
+                self.validate_vector(vector)?;
+                vector_documents.push(CoreVectorDocument {
+                    document_id: document.doc_id,
+                    vector: vector.to_vec(),
+                    metadata: document.metadata,
+                    // Vector-in records still carry label/fact text. Preserve it
+                    // when requested so BM25 behaves like the text-in path.
+                    text: self.index_text.then(|| document.text.to_string()),
+                    patch_matrix: None,
+                });
+            } else if embedder.is_some() && !document.text.trim().is_empty() {
+                text_documents.push(CoreDocument {
+                    document_id: document.doc_id,
+                    text: document.text.to_string(),
+                    metadata: document.metadata,
+                });
+            } else {
+                delete_ids.push(document.doc_id);
             }
-            let document = CoreVectorDocument {
-                document_id: doc_id,
-                vector: vector.to_vec(),
-                metadata,
-                text: None,
-                patch_matrix: None,
-            };
-            self.engine.upsert_vectors(&self.index_id, &[document])?;
-        } else if embedder.is_some() && !text.trim().is_empty() {
-            let embedder = embedder.expect("checked is_some above");
-            let document = CoreDocument {
-                document_id: doc_id,
-                text: text.to_string(),
-                metadata,
-            };
+        }
+        if !vector_documents.is_empty() {
+            self.engine
+                .upsert_vectors(&self.index_id, &vector_documents)?;
+        }
+        if !text_documents.is_empty() {
             let plan = self.engine.prepare_text_upsert(
                 &self.index_id,
-                &[document],
+                &text_documents,
                 self.index_text,
                 self.index_text,
                 CHUNK_CHARACTER_LIMIT,
@@ -318,14 +425,16 @@ impl SemanticIndex {
             let embeddings = if texts.is_empty() {
                 Vec::new()
             } else {
+                let embedder = embedder.expect("text documents require an embedder");
                 let embeddings = embedder.embed(&texts, EmbedRole::Document)?;
                 self.check_embedding_shape(&embeddings)?;
                 embeddings
             };
             self.engine.apply_text_upsert(&plan, &embeddings, 0.0)?;
-        } else {
-            // No embeddable content: make sure any stale index doc is cleared.
-            self.engine.delete_documents(&self.index_id, &[doc_id])?;
+        }
+        if !delete_ids.is_empty() {
+            self.engine
+                .delete_documents(&self.index_id, &delete_ids)?;
         }
         Ok(())
     }
@@ -396,7 +505,10 @@ impl SemanticIndex {
     /// a wrong-shape embedder fails as an [`GraphError::Embedding`] rather than a
     /// deeper engine error.
     fn check_embedding_shape(&self, embeddings: &[Vec<f32>]) -> Result<()> {
-        if let Some(bad) = embeddings.iter().find(|embedding| embedding.len() != self.dim) {
+        if let Some(bad) = embeddings
+            .iter()
+            .find(|embedding| embedding.len() != self.dim)
+        {
             return Err(GraphError::Embedding(format!(
                 "embedder returned dimension {} but the index is {}",
                 bad.len(),
@@ -407,12 +519,7 @@ impl SemanticIndex {
     }
 
     /// The prefixed doc-ids of `kind` documents whose stripped id is not in `live`.
-    fn orphan_doc_ids(
-        &self,
-        kind: &str,
-        prefix: &str,
-        live: &[String],
-    ) -> Result<Vec<String>> {
+    fn orphan_doc_ids(&self, kind: &str, prefix: &str, live: &[String]) -> Result<Vec<String>> {
         let live: std::collections::HashSet<&str> = live.iter().map(String::as_str).collect();
         let filter = json!({ "kind": kind });
         let mut orphans = Vec::new();
@@ -438,11 +545,7 @@ impl SemanticIndex {
 /// - [`AsOf::Now`]: both open sentinels (`expired_at`/`invalid_at` still open).
 /// - [`AsOf::At`]: `valid_at <= t` and `invalid_at > t` over the sortable strings.
 /// - [`AsOf::All`]: no temporal clause (every version).
-fn asof_filter(
-    kind: &str,
-    type_or_relation: Option<(&str, &str)>,
-    as_of: AsOf,
-) -> Option<Value> {
+fn asof_filter(kind: &str, type_or_relation: Option<(&str, &str)>, as_of: AsOf) -> Option<Value> {
     let mut clauses: Vec<Value> = vec![json!({ "kind": kind })];
     if let Some((key, value)) = type_or_relation {
         clauses.push(json!({ key: value }));
@@ -562,20 +665,48 @@ mod tests {
 
         // Both entities are returned (k >= corpus); assert membership, not order.
         let hits = index
-            .semantic_entities(Some("Alice engineer"), None, Some(&embedder), 5, None, AsOf::Now)
+            .semantic_entities(
+                Some("Alice engineer"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::Now,
+            )
             .unwrap();
-        assert!(ids(&hits).contains(&"alice"), "alice must be found: {:?}", ids(&hits));
-        assert!(ids(&hits).contains(&"acme"), "acme must be found: {:?}", ids(&hits));
+        assert!(
+            ids(&hits).contains(&"alice"),
+            "alice must be found: {:?}",
+            ids(&hits)
+        );
+        assert!(
+            ids(&hits).contains(&"acme"),
+            "acme must be found: {:?}",
+            ids(&hits)
+        );
 
         // The entity_type filter narrows to Person only.
         let persons = index
-            .semantic_entities(Some("Alice"), None, Some(&embedder), 5, Some("Person"), AsOf::Now)
+            .semantic_entities(
+                Some("Alice"),
+                None,
+                Some(&embedder),
+                5,
+                Some("Person"),
+                AsOf::Now,
+            )
             .unwrap();
         assert!(ids(&persons).contains(&"alice"));
-        assert!(!ids(&persons).contains(&"acme"), "Org must be excluded: {:?}", ids(&persons));
+        assert!(
+            !ids(&persons).contains(&"acme"),
+            "Org must be excluded: {:?}",
+            ids(&persons)
+        );
 
         // resolve_entity surfaces candidates (AsOf::All) for the caller's merge step.
-        let candidates = index.resolve_entity("robotics", Some(&embedder), 5).unwrap();
+        let candidates = index
+            .resolve_entity("robotics", Some(&embedder), 5)
+            .unwrap();
         assert!(ids(&candidates).contains(&"acme"));
 
         // A live fact is found by semantic_facts under AsOf::Now. Give it a concrete
@@ -583,13 +714,30 @@ mod tests {
         // boundary (an open `valid_at` encodes to the epoch floor and would satisfy
         // `valid_at <= t` for every t; see encode_ts_start and the
         // open_start_as_of_consistency test).
-        let mut f = fact("f1", "alice", "works_at", "acme", "Alice works at Acme robotics");
+        let mut f = fact(
+            "f1",
+            "alice",
+            "works_at",
+            "acme",
+            "Alice works at Acme robotics",
+        );
         f.valid_at = Some(1_000);
         index.index_fact(&f, Some(&embedder), None).unwrap();
         let live = index
-            .semantic_facts(Some("works at Acme"), None, Some(&embedder), 5, None, AsOf::Now)
+            .semantic_facts(
+                Some("works at Acme"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::Now,
+            )
             .unwrap();
-        assert!(live.iter().any(|h| h.id == "f1"), "live fact must be found: {:?}", ids(&live));
+        assert!(
+            live.iter().any(|h| h.id == "f1"),
+            "live fact must be found: {:?}",
+            ids(&live)
+        );
 
         // Close (invalidate) the fact and re-index the same doc-id: AsOf::Now must
         // now exclude it while AsOf::All still returns it.
@@ -601,7 +749,14 @@ mod tests {
         index.index_fact(&closed, Some(&embedder), None).unwrap();
 
         let now = index
-            .semantic_facts(Some("works at Acme"), None, Some(&embedder), 5, None, AsOf::Now)
+            .semantic_facts(
+                Some("works at Acme"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::Now,
+            )
             .unwrap();
         assert!(
             !now.iter().any(|h| h.id == "f1"),
@@ -609,7 +764,14 @@ mod tests {
             ids(&now)
         );
         let all = index
-            .semantic_facts(Some("works at Acme"), None, Some(&embedder), 5, None, AsOf::All)
+            .semantic_facts(
+                Some("works at Acme"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::All,
+            )
             .unwrap();
         assert!(
             all.iter().any(|h| h.id == "f1"),
@@ -619,13 +781,35 @@ mod tests {
 
         // AsOf::At sees the fact before it was invalidated, but not after.
         let before = index
-            .semantic_facts(Some("works at Acme"), None, Some(&embedder), 5, None, AsOf::At(1_500))
+            .semantic_facts(
+                Some("works at Acme"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::At(1_500),
+            )
             .unwrap();
-        assert!(before.iter().any(|h| h.id == "f1"), "At(1500) is inside validity: {:?}", ids(&before));
+        assert!(
+            before.iter().any(|h| h.id == "f1"),
+            "At(1500) is inside validity: {:?}",
+            ids(&before)
+        );
         let after = index
-            .semantic_facts(Some("works at Acme"), None, Some(&embedder), 5, None, AsOf::At(2_500))
+            .semantic_facts(
+                Some("works at Acme"),
+                None,
+                Some(&embedder),
+                5,
+                None,
+                AsOf::At(2_500),
+            )
             .unwrap();
-        assert!(!after.iter().any(|h| h.id == "f1"), "At(2500) is past invalidation: {:?}", ids(&after));
+        assert!(
+            !after.iter().any(|h| h.id == "f1"),
+            "At(2500) is past invalidation: {:?}",
+            ids(&after)
+        );
     }
 
     #[test]
@@ -646,7 +830,11 @@ mod tests {
         let hits = index
             .semantic_entities(None, Some(&va), None, 5, None, AsOf::All)
             .unwrap();
-        assert!(ids(&hits).contains(&"a"), "vector query must surface a: {:?}", ids(&hits));
+        assert!(
+            ids(&hits).contains(&"a"),
+            "vector query must surface a: {:?}",
+            ids(&hits)
+        );
 
         // A wrong-dimension precomputed embedding is rejected up front.
         assert!(index

@@ -3,8 +3,12 @@
 //! retrieval — driven through the public API exactly as a binding would.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use lodedb_graph::{AsOf, Direction, EmbedRole, Embedder, GraphConfig, Result, TemporalGraph};
+use lodedb_graph::{
+    AsOf, Direction, EmbedRole, Embedder, GraphConfig, GraphError, Result, TemporalGraph,
+};
 use serde_json::json;
 
 /// A tiny deterministic embedder (dim 8): bucket bytes into 8 bins, L2-normalize.
@@ -33,6 +37,26 @@ impl Embedder for HashEmbedder {
                 }
                 v
             })
+            .collect())
+    }
+}
+
+struct ToggleEmbedder {
+    fail: Arc<AtomicBool>,
+}
+
+impl Embedder for ToggleEmbedder {
+    fn dimension(&self) -> usize {
+        8
+    }
+
+    fn embed(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(GraphError::Embedding("injected embedding failure".to_string()));
+        }
+        Ok(texts
+            .iter()
+            .map(|_| vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .collect())
     }
 }
@@ -72,7 +96,7 @@ fn invalidation_preserves_history_and_as_of() {
             json!({}),
             vec![],
             Some(2000),
-            &[f_acme.clone()],
+            std::slice::from_ref(&f_acme),
         )
         .unwrap();
 
@@ -118,7 +142,7 @@ fn supersede_without_valid_at_closes_prior_on_event_axis() {
     let ep = g.add_episode("note", "Alice moved to Globex", 3000, json!({}), &[]).unwrap();
     let _f_globex = g
         .add_fact("alice", "works_at", "globex", "Alice works at Globex", json!({}),
-                  vec![ep], None, &[f_acme.clone()])
+                  vec![ep], None, std::slice::from_ref(&f_acme))
         .unwrap();
 
     // Now view: exactly one live works_at (Globex).
@@ -233,22 +257,129 @@ fn open_start_as_of_consistency() {
     assert!(!hits.is_empty(), "open-start fact is valid at any T (index) — encoding is consistent");
 }
 
-/// A vector-in graph (no embedder) must refuse `reindex()`: the topology stores no
-/// vectors to rebuild from, and the old behavior silently deleted every live index
-/// document while reporting success.
+/// Vector-in vectors are retained with the topology, so both explicit reindex and
+/// invalidation preserve historical semantic results without an embedder.
 #[test]
-fn reindex_refuses_vector_in_graph() {
+fn vector_in_reindex_preserves_invalidation_history() {
     let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
     let mut g = TemporalGraph::open_in_memory(config, None).unwrap();
-    g.upsert_entity_vec("x", "Thing", "widget", json!({}), &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], None, None)
+    let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    g.upsert_entity_vec("x", "Thing", "widget", json!({}), &v, None, None)
         .unwrap();
-    let err = g.reindex().unwrap_err();
-    assert!(err.to_string().contains("vector-in"), "clear refusal, got: {err}");
-    // The index is untouched: the entity is still findable by vector.
+    g.upsert_entity_vec("y", "Thing", "gadget", json!({}), &v, None, None)
+        .unwrap();
+    let old = g
+        .add_fact_vec(
+            "x",
+            "state",
+            "y",
+            "old state",
+            json!({}),
+            vec![],
+            Some(1_000),
+            &[],
+            &v,
+        )
+        .unwrap();
+    g.add_fact_vec(
+        "x",
+        "state",
+        "y",
+        "new state",
+        json!({}),
+        vec![],
+        Some(2_000),
+        std::slice::from_ref(&old),
+        &v,
+    )
+    .unwrap();
+
+    let before = g
+        .semantic_facts(None, Some(&v), 5, None, AsOf::At(1_500))
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1.id, old);
+
+    let out = g.reindex().unwrap();
+    assert_eq!(out.reindexed_entities, 2);
+    assert_eq!(out.reindexed_facts, 2);
+    let rebuilt = g
+        .semantic_facts(None, Some(&v), 5, None, AsOf::At(1_500))
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].1.id, old);
+}
+
+/// Caller-vector validation happens before topology mutation, so bad dimensions
+/// and non-finite coordinates cannot leave authoritative rows behind.
+#[test]
+fn invalid_vectors_do_not_mutate_topology() {
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    let mut g = TemporalGraph::open_in_memory(config, None).unwrap();
+    assert!(g
+        .upsert_entity_vec("bad", "Thing", "bad", json!({}), &[1.0, 0.0], None, None)
+        .is_err());
+    assert!(g.get_entity("bad").unwrap().is_none());
+
+    let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    g.upsert_entity_vec("a", "Thing", "a", json!({}), &v, None, None)
+        .unwrap();
+    g.upsert_entity_vec("b", "Thing", "b", json!({}), &v, None, None)
+        .unwrap();
+    let mut non_finite = v;
+    non_finite[3] = f32::NAN;
+    assert!(g
+        .add_fact_vec(
+            "a",
+            "rel",
+            "b",
+            "a rel b",
+            json!({}),
+            vec![],
+            None,
+            &[],
+            &non_finite,
+        )
+        .is_err());
+    assert_eq!(g.stats().unwrap().facts, 0);
+}
+
+/// Negative epoch milliseconds remain exactly ordered in both SQLite and semantic
+/// metadata filtering.
+#[test]
+fn negative_timestamps_match_in_topology_and_semantic_index() {
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    let mut g = TemporalGraph::open_in_memory(config, None).unwrap();
+    let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    g.upsert_entity_vec("a", "Thing", "a", json!({}), &v, None, None)
+        .unwrap();
+    g.upsert_entity_vec("b", "Thing", "b", json!({}), &v, None, None)
+        .unwrap();
+    let fact_id = g
+        .add_fact_vec(
+            "a",
+            "rel",
+            "b",
+            "a rel b",
+            json!({}),
+            vec![],
+            Some(-2_000),
+            &[],
+            &v,
+        )
+        .unwrap();
+    g.invalidate_fact(&fact_id, Some(-500)).unwrap();
+
+    let neighbors = g
+        .neighbors("a", Direction::Out, None, AsOf::At(-1_000))
+        .unwrap();
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(neighbors[0].id, fact_id);
     let hits = g
-        .semantic_entities(None, Some(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 5, None, AsOf::Now)
+        .semantic_facts(None, Some(&v), 5, None, AsOf::At(-1_000))
         .unwrap();
-    assert!(hits.iter().any(|(_s, e)| e.id == "x"), "index survives the refused reindex");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1.id, fact_id);
 }
 
 /// `invalidates` naming a fact that does not exist (or is already expired) must fail
@@ -321,10 +452,123 @@ fn fact_episode_provenance_round_trips() {
     assert_eq!(fact.episodes, vec![ep]);
 }
 
-/// On-disk lifecycle: open → write → drop → reopen serves the same records, and
-/// reopening with a different embedding dimension is refused up front.
+/// An index callback failure rolls back SQLite. A durable dirty marker left by a
+/// simulated crash makes the next open rebuild topology truth before serving reads.
 #[test]
-fn on_disk_reopen_and_dim_guard() {
+fn index_failure_rolls_back_topology_and_reopen_repairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    let fail = Arc::new(AtomicBool::new(false));
+    {
+        let mut g = TemporalGraph::open(
+            &path,
+            config.clone(),
+            Some(Box::new(ToggleEmbedder { fail: fail.clone() })),
+        )
+        .unwrap();
+        g.upsert_entity("a", "Thing", "a", json!({}), None, None)
+            .unwrap();
+        g.upsert_entity("b", "Thing", "b", json!({}), None, None)
+            .unwrap();
+
+        fail.store(true, Ordering::SeqCst);
+        let err = g
+            .add_fact(
+                "a",
+                "rel",
+                "b",
+                "must roll back",
+                json!({}),
+                vec![],
+                None,
+                &[],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected embedding failure"),
+            "original failure remains visible: {err}"
+        );
+        assert_eq!(g.stats().unwrap().facts, 0, "topology transaction rolled back");
+
+        fail.store(false, Ordering::SeqCst);
+        g.upsert_entity("c", "Thing", "c", json!({}), None, None)
+            .unwrap();
+    }
+    let topology_path = path.join("topology.sqlite3");
+    let conn = rusqlite::Connection::open(topology_path).unwrap();
+    conn.execute(
+        "UPDATE graph_meta SET value = '1' WHERE key = 'index_dirty'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let g = TemporalGraph::open(
+        &path,
+        config,
+        Some(Box::new(ToggleEmbedder { fail })),
+    )
+    .unwrap();
+    let stats = g.stats().unwrap();
+    assert_eq!(stats.facts, 0);
+    assert_eq!(stats.indexed_documents, 3, "dirty index rebuilt on reopen");
+    let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let hits = g
+        .semantic_entities(None, Some(&query), 5, None, AsOf::Now)
+        .unwrap();
+    assert_eq!(hits.len(), 3, "dirty index rebuilt from topology on reopen");
+}
+
+/// A deleted derivative is rebuilt from topology. Configuration is checked before
+/// creating its replacement, so one bad open cannot strand a wrong-dimension index.
+#[test]
+fn missing_index_rebuilds_without_bad_open_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
+    {
+        let mut g =
+            TemporalGraph::open(&path, config.clone(), Some(Box::new(HashEmbedder))).unwrap();
+        g.upsert_entity("a", "Thing", "alpha", json!({}), None, None)
+            .unwrap();
+        g.persist().unwrap();
+    }
+    let index_path = path.join("index");
+    std::fs::remove_dir_all(&index_path).unwrap();
+
+    let bad = GraphConfig { vector_dim: 16, ..GraphConfig::default() };
+    assert!(TemporalGraph::open(&path, bad, None).is_err());
+    assert!(
+        !index_path.exists(),
+        "configuration refusal must happen before index creation"
+    );
+
+    let g = TemporalGraph::open(&path, config, Some(Box::new(HashEmbedder))).unwrap();
+    assert_eq!(g.stats().unwrap().indexed_documents, 1);
+    let hits = g
+        .semantic_entities(Some("alpha"), None, 5, None, AsOf::Now)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1.id, "a");
+}
+
+#[test]
+fn embedder_dimension_mismatch_is_rejected_before_creating_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let config = GraphConfig { vector_dim: 16, ..GraphConfig::default() };
+    let err = TemporalGraph::open(&path, config, Some(Box::new(HashEmbedder)))
+        .err()
+        .expect("dimension mismatch must refuse");
+    assert!(err.to_string().contains("embedder dimension"));
+    assert!(!path.exists(), "invalid open must not claim an on-disk config");
+}
+
+/// On-disk lifecycle: open → write → drop → reopen serves the same records, and
+/// reopening with any index-shaping configuration change is refused up front.
+#[test]
+fn on_disk_reopen_and_configuration_guards() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("g");
     let config = GraphConfig { vector_dim: 8, ..GraphConfig::default() };
@@ -345,5 +589,20 @@ fn on_disk_reopen_and_dim_guard() {
     }
     let bad = GraphConfig { vector_dim: 16, ..GraphConfig::default() };
     let err = TemporalGraph::open(&path, bad, None).err().expect("dim mismatch must refuse");
-    assert!(err.to_string().contains("dimension"), "dim mismatch refused at open: {err}");
+    assert!(err.to_string().contains("vector_dim"), "dim mismatch refused at open: {err}");
+
+    let bad = GraphConfig { vector_dim: 8, index_facts: false, index_text: true };
+    let err = TemporalGraph::open(&path, bad, Some(Box::new(HashEmbedder)))
+        .err()
+        .expect("index_facts mismatch must refuse");
+    assert!(
+        err.to_string().contains("index_facts"),
+        "index_facts mismatch refused at open: {err}"
+    );
+
+    let bad = GraphConfig { vector_dim: 8, index_facts: true, index_text: false };
+    assert!(
+        TemporalGraph::open(&path, bad, Some(Box::new(HashEmbedder))).is_err(),
+        "index_text mismatch must refuse"
+    );
 }

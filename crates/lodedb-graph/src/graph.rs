@@ -21,6 +21,7 @@ use crate::temporal;
 use crate::topology::TopologyStore;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const INDEX_BATCH_SIZE: usize = 256;
 
 /// Wall-clock epoch milliseconds (transaction-time stamp).
 fn now_ms() -> TimeMs {
@@ -50,22 +51,75 @@ pub struct TemporalGraph {
 }
 
 impl TemporalGraph {
+    fn validate_open_config(
+        config: &GraphConfig,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
+        if config.vector_dim == 0 {
+            return Err(GraphError::InvalidArgument(
+                "vector_dim must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(embedder) = embedder {
+            let actual = embedder.dimension();
+            if actual != config.vector_dim {
+                return Err(GraphError::InvalidArgument(format!(
+                    "embedder dimension {actual} does not match vector_dim {}",
+                    config.vector_dim
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Open (creating if needed) a graph rooted at `path`: `path/topology.sqlite3`
     /// (truth) + `path/index` (semantic). `embedder` drives the text-in path; pass
     /// `None` for a vector-in graph and use the `*_vec` verbs.
-    pub fn open(path: &Path, config: GraphConfig, embedder: Option<Box<dyn Embedder>>) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        config: GraphConfig,
+        embedder: Option<Box<dyn Embedder>>,
+    ) -> Result<Self> {
+        Self::validate_open_config(&config, embedder.as_deref())?;
         std::fs::create_dir_all(path)
             .map_err(|e| GraphError::Topology(format!("create dir {}: {e}", path.display())))?;
         let topology = TopologyStore::open(&path.join("topology.sqlite3"))?;
+        // Validate known topology metadata before opening/creating the derivative
+        // index. Then let an existing legacy index validate its dimension before
+        // claiming metadata that a failed open would make impossible to correct.
+        topology.validate_configuration(&config)?;
         let index = SemanticIndex::open(&path.join("index"), &config)?;
-        Ok(TemporalGraph { topology, index, embedder, config })
+        topology.configure(&config)?;
+        let mut graph = TemporalGraph {
+            topology,
+            index,
+            embedder,
+            config,
+        };
+        if graph.index.was_created() {
+            // A missing derived index is recoverable even when the last explicit
+            // checkpoint left the topology's marker clean.
+            graph.topology.mark_index_dirty()?;
+        }
+        graph.repair_index_if_dirty()?;
+        Ok(graph)
     }
 
     /// Open a fully in-memory graph (tests).
-    pub fn open_in_memory(config: GraphConfig, embedder: Option<Box<dyn Embedder>>) -> Result<Self> {
+    pub fn open_in_memory(
+        config: GraphConfig,
+        embedder: Option<Box<dyn Embedder>>,
+    ) -> Result<Self> {
+        Self::validate_open_config(&config, embedder.as_deref())?;
         let topology = TopologyStore::open_in_memory()?;
+        topology.configure(&config)?;
         let index = SemanticIndex::open_in_memory(&config)?;
-        Ok(TemporalGraph { topology, index, embedder, config })
+        Ok(TemporalGraph {
+            topology,
+            index,
+            embedder,
+            config,
+        })
     }
 
     // -- episodes -----------------------------------------------------------
@@ -90,7 +144,8 @@ impl TemporalGraph {
             properties,
         };
         // One transaction: a bad mention id must not leave a half-written episode.
-        self.topology.upsert_episode_with_mentions(&episode, mentions)?;
+        self.topology
+            .upsert_episode_with_mentions(&episode, mentions)?;
         Ok(id)
     }
 
@@ -126,8 +181,22 @@ impl TemporalGraph {
             created_at,
             expired_at: None,
         };
-        self.topology.upsert_entity(&entity)?;
-        self.index.index_entity(&entity, self.embedder.as_deref(), None)?;
+        if self.embedder.is_none() && !entity.label.trim().is_empty() {
+            return Err(GraphError::InvalidArgument(
+                "upsert_entity needs the graph's embedder; use upsert_entity_vec on a vector-in graph"
+                    .into(),
+            ));
+        }
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            let embedder = self.embedder.as_deref();
+            topology.upsert_entity_before_commit(&entity, None, || {
+                index.index_entity(&entity, embedder, None)
+            })
+        };
+        self.finish_indexed_mutation(result)?;
         Ok(entity.id)
     }
 
@@ -145,7 +214,12 @@ impl TemporalGraph {
         if id.trim().is_empty() {
             return Err(GraphError::InvalidArgument("entity id is required".into()));
         }
-        let created_at = self.topology.get_entity(id)?.map(|e| e.created_at).unwrap_or_else(now_ms);
+        self.index.validate_vector(embedding)?;
+        let created_at = self
+            .topology
+            .get_entity(id)?
+            .map(|e| e.created_at)
+            .unwrap_or_else(now_ms);
         let entity = Entity {
             id: id.to_string(),
             entity_type: entity_type.to_string(),
@@ -156,8 +230,15 @@ impl TemporalGraph {
             created_at,
             expired_at: None,
         };
-        self.topology.upsert_entity(&entity)?;
-        self.index.index_entity(&entity, None, Some(embedding))?;
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            topology.upsert_entity_before_commit(&entity, Some(embedding), || {
+                index.index_entity(&entity, None, Some(embedding))
+            })
+        };
+        self.finish_indexed_mutation(result)?;
         Ok(entity.id)
     }
 
@@ -188,7 +269,17 @@ impl TemporalGraph {
         valid_at: Option<TimeMs>,
         invalidates: &[String],
     ) -> Result<String> {
-        self.add_fact_inner(src, relation, dst, fact_text, properties, episodes, valid_at, invalidates, None)
+        self.add_fact_inner(
+            src,
+            relation,
+            dst,
+            fact_text,
+            properties,
+            episodes,
+            valid_at,
+            invalidates,
+            None,
+        )
     }
 
     /// Vector-in [`add_fact`]: index the fact by a caller-supplied `fact_embedding`
@@ -208,7 +299,14 @@ impl TemporalGraph {
         fact_embedding: &[f32],
     ) -> Result<String> {
         self.add_fact_inner(
-            src, relation, dst, fact_text, properties, episodes, valid_at, invalidates,
+            src,
+            relation,
+            dst,
+            fact_text,
+            properties,
+            episodes,
+            valid_at,
+            invalidates,
             Some(fact_embedding),
         )
     }
@@ -228,8 +326,18 @@ impl TemporalGraph {
     ) -> Result<String> {
         for (name, value) in [("src", src), ("relation", relation), ("dst", dst)] {
             if value.trim().is_empty() {
-                return Err(GraphError::InvalidArgument(format!("fact {name} is required")));
+                return Err(GraphError::InvalidArgument(format!(
+                    "fact {name} is required"
+                )));
             }
+        }
+        if let Some(embedding) = fact_embedding {
+            self.index.validate_vector(embedding)?;
+        } else if self.embedder.is_none() && self.config.index_facts && !fact_text.trim().is_empty()
+        {
+            return Err(GraphError::InvalidArgument(
+                "add_fact needs the graph's embedder; use add_fact_vec on a vector-in graph".into(),
+            ));
         }
         let now = now_ms();
         let reference_time = self.reference_time_for(&episodes)?;
@@ -274,28 +382,47 @@ impl TemporalGraph {
                 (id.clone(), inv, exp)
             })
             .collect();
-        let closed_ids = self.topology.supersede_and_insert(&priors, &fact)?;
-        // The index is a rebuildable derivative of the truth store, so it is refreshed
-        // AFTER the transaction commits: re-index the closed priors, then the new fact.
-        for prior_id in &closed_ids {
-            if let Some(closed) = self.topology.get_fact(prior_id)? {
-                self.index.index_fact(&closed, self.embedder.as_deref(), None)?;
-            }
-        }
-        let embedder = if fact_embedding.is_some() { None } else { self.embedder.as_deref() };
-        self.index.index_fact(&fact, embedder, fact_embedding)?;
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            let graph_embedder = self.embedder.as_deref();
+            topology.supersede_and_insert_before_commit(&priors, &fact, fact_embedding, |closed| {
+                let mut records: Vec<(&Fact, Option<&[f32]>)> = closed
+                    .iter()
+                    .map(|record| (&record.fact, record.vector.as_deref()))
+                    .collect();
+                records.push((&fact, fact_embedding));
+                for batch in records.chunks(INDEX_BATCH_SIZE) {
+                    index.index_facts(batch, graph_embedder)?;
+                }
+                Ok(())
+            })
+        };
+        self.finish_indexed_mutation(result)?;
         Ok(fact.id)
     }
 
     /// Close a fact's validity without a replacement (an explicit end / retraction).
     pub fn invalidate_fact(&mut self, id: &str, invalid_at: Option<TimeMs>) -> Result<bool> {
-        let existed = self.topology.close_fact(id, invalid_at, now_ms())?;
-        if existed {
-            if let Some(closed) = self.topology.get_fact(id)? {
-                self.index.index_fact(&closed, self.embedder.as_deref(), None)?;
-            }
-        }
-        Ok(existed)
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            let graph_embedder = self.embedder.as_deref();
+            topology.close_fact_before_commit(id, invalid_at, now_ms(), |closed| {
+                if let Some(record) = closed {
+                    let embedder = if record.vector.is_some() {
+                        None
+                    } else {
+                        graph_embedder
+                    };
+                    index.index_fact(&record.fact, embedder, record.vector.as_deref())?;
+                }
+                Ok(())
+            })
+        };
+        self.finish_indexed_mutation(result)
     }
 
     pub fn get_fact(&self, id: &str) -> Result<Option<Fact>> {
@@ -325,7 +452,8 @@ impl TemporalGraph {
         relation: Option<&str>,
         as_of: AsOf,
     ) -> Result<Vec<Fact>> {
-        self.topology.facts_for(&[id.to_string()], direction, relation, as_of)
+        self.topology
+            .facts_for(&[id.to_string()], direction, relation, as_of)
     }
 
     /// Deterministic k-hop neighbourhood (BFS) around `seeds`, in a temporal frame.
@@ -424,19 +552,25 @@ impl TemporalGraph {
             relation,
             as_of,
         )?;
-        let mut out = Vec::new();
-        for h in hits {
-            // Re-check the frame against the authoritative row: the index is a
-            // derivative and may lag it (crash between topology commit and index
-            // refresh), and a stale hit must not leak an expired fact into a
-            // scoped read.
-            if let Some(f) = self.topology.get_fact(&h.id)? {
-                if f.matches(as_of) {
-                    out.push((h.score, f));
-                }
-            }
-        }
-        Ok(out)
+        let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+        let by_id: std::collections::HashMap<String, Fact> = self
+            .topology
+            .get_facts(&ids)?
+            .into_iter()
+            .map(|fact| (fact.id.clone(), fact))
+            .collect();
+        Ok(hits
+            .into_iter()
+            .filter_map(|hit| {
+                by_id
+                    .get(&hit.id)
+                    .cloned()
+                    .map(|fact| (hit.score, fact))
+            })
+            // Re-check against authoritative rows so a stale derivative cannot
+            // leak an expired fact into a scoped read.
+            .filter(|(_score, fact)| fact.matches(as_of))
+            .collect())
     }
 
     /// Semantic seed entities + k-hop expansion (the headline query), time-scoped.
@@ -455,7 +589,10 @@ impl TemporalGraph {
         let seed_ids: Vec<String> = seeds.iter().map(|(_s, e)| e.id.clone()).collect();
         let mut subgraph = self.k_hop(&seed_ids, hops, direction, as_of)?;
         for (score, entity) in &seeds {
-            subgraph.entities.entry(entity.id.clone()).or_insert_with(|| entity.clone());
+            subgraph
+                .entities
+                .entry(entity.id.clone())
+                .or_insert_with(|| entity.clone());
             subgraph.seeds.push((entity.id.clone(), *score));
         }
         Ok(subgraph)
@@ -464,14 +601,25 @@ impl TemporalGraph {
     /// Candidate entities matching `name` for the caller's resolution step
     /// (embedding + lexical); the caller decides the merge.
     pub fn resolve_entity(&self, name: &str, k: usize) -> Result<Vec<(f32, Entity)>> {
-        let hits = self.index.resolve_entity(name, self.embedder.as_deref(), k)?;
-        let mut out = Vec::new();
-        for h in hits {
-            if let Some(e) = self.topology.get_entity(&h.id)? {
-                out.push((h.score, e));
-            }
-        }
-        Ok(out)
+        let hits = self
+            .index
+            .resolve_entity(name, self.embedder.as_deref(), k)?;
+        let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+        let by_id: std::collections::HashMap<String, Entity> = self
+            .topology
+            .get_entities(&ids)?
+            .into_iter()
+            .map(|entity| (entity.id.clone(), entity))
+            .collect();
+        Ok(hits
+            .into_iter()
+            .filter_map(|hit| {
+                by_id
+                    .get(&hit.id)
+                    .cloned()
+                    .map(|entity| (hit.score, entity))
+            })
+            .collect())
     }
 
     /// Every fact ever touching an entity, all frames (history).
@@ -483,55 +631,149 @@ impl TemporalGraph {
 
     /// Remove an entity and its incident facts from both stores.
     pub fn remove_entity(&mut self, id: &str) -> Result<bool> {
-        let (existed, removed_fact_ids) = self.topology.remove_entity(id)?;
-        self.index.remove_entity(id)?;
-        for fid in removed_fact_ids {
-            self.index.remove_fact(&fid)?;
-        }
-        Ok(existed)
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            topology.remove_entity_before_commit(id, |removed_fact_ids| {
+                index.remove_entity(id)?;
+                index.remove_facts(removed_fact_ids)
+            })
+        };
+        self.finish_indexed_mutation(result)
+            .map(|(existed, _)| existed)
     }
 
     /// Hard-remove a single fact from both stores (Graphiti edge deletion). Prefer
     /// [`TemporalGraph::invalidate_fact`], which preserves history; this deletes the
     /// row outright. Returns whether the fact existed.
     pub fn remove_fact(&mut self, id: &str) -> Result<bool> {
-        let existed = self.topology.remove_fact(id)?;
-        self.index.remove_fact(id)?;
-        Ok(existed)
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            topology.remove_fact_before_commit(id, || index.remove_fact(id))
+        };
+        self.finish_indexed_mutation(result)
     }
 
     /// Rebuild the semantic index from the topology truth store: drop orphans, then
     /// re-index every entity and fact. Makes the index a throwaway artifact.
     pub fn reindex(&mut self) -> Result<ReindexStats> {
-        // Rebuilding re-embeds label/fact text from the topology, so it needs the
-        // graph's embedder. A vector-in graph stores no vectors in the topology and
-        // therefore CANNOT be rebuilt from truth; running the loop below without an
-        // embedder would hit `write_document`'s no-content branch and delete every
-        // live index document while reporting success.
-        let Some(embedder) = self.embedder.as_deref() else {
-            return Err(GraphError::InvalidArgument(
-                "reindex needs the graph's embedder; a vector-in graph cannot be \
-                 rebuilt from the topology (vectors are not stored there): re-upsert \
-                 records with their vectors instead"
-                    .into(),
-            ));
-        };
-        let entities = self.topology.iter_entities()?;
-        let facts = self.topology.iter_facts()?;
-        let live_entity_ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
-        let live_fact_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
-        let removed_orphans = self.index.drop_orphans(&live_entity_ids, &live_fact_ids)?;
-        for e in &entities {
-            self.index.index_entity(e, Some(embedder), None)?;
+        self.topology.mark_index_dirty()?;
+        let result = self.reindex_internal();
+        if result.is_ok() {
+            self.index.persist()?;
+            self.topology.mark_index_clean()?;
         }
-        for f in &facts {
-            self.index.index_fact(f, Some(embedder), None)?;
+        result
+    }
+
+    fn reindex_internal(&mut self) -> Result<ReindexStats> {
+        let entities = self.topology.iter_entity_index_records()?;
+        let facts = self.topology.iter_fact_index_records()?;
+        let live_entity_ids: Vec<String> =
+            entities.iter().map(|record| record.entity.id.clone()).collect();
+        let live_fact_ids: Vec<String> =
+            facts.iter().map(|record| record.fact.id.clone()).collect();
+        for record in &entities {
+            if record.vector.is_none()
+                && self.embedder.is_none()
+                && !record.entity.label.trim().is_empty()
+            {
+                return Err(GraphError::InvalidArgument(format!(
+                    "entity {:?} has no retained vector and the graph has no embedder",
+                    record.entity.id
+                )));
+            }
+        }
+        for record in &facts {
+            if self.config.index_facts
+                && record.vector.is_none()
+                && self.embedder.is_none()
+                && !record.fact.fact.trim().is_empty()
+            {
+                return Err(GraphError::InvalidArgument(format!(
+                    "fact {:?} has no retained vector and the graph has no embedder",
+                    record.fact.id
+                )));
+            }
+        }
+        // Do not mutate the derivative until every topology record is known to be
+        // rebuildable. In particular, a legacy vector-in graph with no retained
+        // vectors must fail without first deleting orphan/index documents.
+        let removed_orphans = self.index.drop_orphans(&live_entity_ids, &live_fact_ids)?;
+        for batch in entities.chunks(INDEX_BATCH_SIZE) {
+            let documents: Vec<(&Entity, Option<&[f32]>)> = batch
+                .iter()
+                .map(|record| (&record.entity, record.vector.as_deref()))
+                .collect();
+            self.index
+                .index_entities(&documents, self.embedder.as_deref())?;
+        }
+        for batch in facts.chunks(INDEX_BATCH_SIZE) {
+            let documents: Vec<(&Fact, Option<&[f32]>)> = batch
+                .iter()
+                .map(|record| (&record.fact, record.vector.as_deref()))
+                .collect();
+            self.index
+                .index_facts(&documents, self.embedder.as_deref())?;
         }
         Ok(ReindexStats {
             reindexed_entities: entities.len(),
             reindexed_facts: facts.len(),
             removed_orphans,
         })
+    }
+
+    fn repair_index_if_dirty(&mut self) -> Result<()> {
+        if self.topology.index_dirty()? {
+            self.reindex_internal()?;
+            // A clean marker means the derivative is durable, not merely correct
+            // in this process. Persist before clearing so a crash between these
+            // steps can only cause a harmless extra rebuild.
+            self.index.persist()?;
+            self.topology.mark_index_clean()?;
+        }
+        Ok(())
+    }
+
+    /// Complete an index-coordinated topology transaction. The dirty marker is
+    /// durable before either store changes. A callback/index/commit failure rolls
+    /// the topology transaction back and rebuilds any partially changed derivative
+    /// before returning the original error.
+    fn finish_indexed_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
+        match result {
+            // The core's WAL makes a successful mutation reopenable even before
+            // an explicit generation checkpoint. Clear only after the topology
+            // transaction also committed; every earlier crash window remains
+            // covered by the durable dirty marker.
+            Ok(value) => {
+                self.topology.mark_index_clean()?;
+                Ok(value)
+            }
+            Err(error) => match self.reindex_internal() {
+                // Failure paths are rare, so make the repair durable before
+                // returning. This also avoids turning a rejected validation-only
+                // mutation into needless recovery work on the next open.
+                Ok(_) => {
+                    if let Err(repair_error) = self.index.persist() {
+                        return Err(GraphError::Internal(format!(
+                            "{error}; repaired semantic index could not be persisted: {repair_error}"
+                        )));
+                    }
+                    if let Err(marker_error) = self.topology.mark_index_clean() {
+                        return Err(GraphError::Internal(format!(
+                            "{error}; repaired semantic index was persisted but its clean marker failed: {marker_error}"
+                        )));
+                    }
+                    Err(error)
+                }
+                Err(repair_error) => Err(GraphError::Internal(format!(
+                    "{error}; semantic-index repair also failed: {repair_error}"
+                ))),
+            },
+        }
     }
 
     /// Node/fact counts and the index document count.
@@ -545,7 +787,8 @@ impl TemporalGraph {
 
     /// Checkpoint the semantic index (the topology store autocommits per write).
     pub fn persist(&mut self) -> Result<()> {
-        self.index.persist()
+        self.index.persist()?;
+        self.topology.mark_index_clean()
     }
 }
 

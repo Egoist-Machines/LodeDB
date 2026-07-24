@@ -39,6 +39,13 @@ def graph() -> TemporalKnowledgeGraph:
     return TemporalKnowledgeGraph(embedder=HashEmbedder())
 
 
+def test_embedder_dimension_mismatch_is_rejected_before_creating_path(tmp_path):
+    path = tmp_path / "graph"
+    with pytest.raises(ValueError, match="embedder dimension"):
+        TemporalKnowledgeGraph(path=str(path), embedder=HashEmbedder(), vector_dim=16)
+    assert not path.exists()
+
+
 def test_invalidation_preserves_history_and_as_of():
     g = graph()
     g.upsert_entity("alice", "Person", "Alice, engineer")
@@ -137,22 +144,24 @@ def test_open_start_as_of_consistency():
     assert hits  # index agrees the open-start fact is valid at any T
 
 
-def test_vector_in_graph_indexes_facts_and_refuses_reindex():
-    """A graph opened without an embedder indexes facts via add_fact_vec, and
-    reindex() is refused (the topology stores no vectors to rebuild from)."""
+def test_vector_in_graph_reindexes_and_preserves_history():
+    """Retained caller vectors rebuild the index and keep invalidated history searchable."""
     g = TemporalKnowledgeGraph(vector_dim=8)
     v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     g.upsert_entity_vec("a", "Thing", "thing a", v)
     g.upsert_entity_vec("b", "Thing", "thing b", v)
-    g.add_fact_vec("a", "rel", "b", "a rel b", v, valid_at=10)
+    old = g.add_fact_vec("a", "rel", "b", "old fact", v, valid_at=10)
+    g.add_fact_vec("a", "rel", "b", "new fact", v, valid_at=20, invalidates=[old])
 
-    hits = g.semantic_facts(None, k=5, embedding=v)
-    assert [f["id"] for _s, f in hits], "vector-in fact is semantically findable"
+    hits = g.semantic_facts(None, k=5, embedding=v, as_of=15)
+    assert [f["id"] for _s, f in hits] == [old]
 
-    with pytest.raises(Exception, match="vector-in"):
-        g.reindex()
-    # The refused reindex left the index intact.
-    assert g.semantic_facts(None, k=5, embedding=v)
+    result = g.reindex()
+    assert result["reindexed_entities"] == 2
+    assert result["reindexed_facts"] == 2
+    assert [f["id"] for _s, f in g.semantic_facts(None, k=5, embedding=v, as_of=15)] == [
+        old
+    ]
 
 
 def test_bool_as_of_is_rejected():

@@ -16,10 +16,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::error::{GraphError, Result};
-use crate::model::{AsOf, Direction, Entity, Episode, Fact, TimeMs};
+use crate::model::{AsOf, Direction, Entity, Episode, Fact, GraphConfig, TimeMs};
 
 /// DDL for the topology store.
 pub const SCHEMA: &str = r#"
@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS episode_mentions (
     entity_id   TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     PRIMARY KEY (episode_id, entity_id)
 );
+CREATE TABLE IF NOT EXISTS entity_vectors (
+    entity_id   TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+    embedding  BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fact_vectors (
+    fact_id     TEXT PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+    embedding  BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS graph_meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_facts_src ON facts(src, relation);
 CREATE INDEX IF NOT EXISTS idx_facts_dst ON facts(dst, relation);
 CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_at, invalid_at);
@@ -77,6 +89,16 @@ CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
 pub struct TopologyStore {
     #[allow(dead_code)]
     conn: Connection,
+}
+
+pub struct EntityIndexRecord {
+    pub entity: Entity,
+    pub vector: Option<Vec<f32>>,
+}
+
+pub struct FactIndexRecord {
+    pub fact: Fact,
+    pub vector: Option<Vec<f32>>,
 }
 
 /// Max ids per `IN`-clause chunk; kept well under SQLite's bound-parameter limit
@@ -112,6 +134,97 @@ impl TopologyStore {
         conn.execute("PRAGMA foreign_keys=ON", [])?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    /// Persist the index-shaping graph configuration on first open and reject any
+    /// later open that would reinterpret existing index contents.
+    pub fn validate_configuration(&self, config: &GraphConfig) -> Result<()> {
+        for (key, value) in expected_configuration(config) {
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT value FROM graph_meta WHERE key = ?",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != value {
+                    return Err(GraphError::InvalidArgument(format!(
+                        "graph configuration mismatch for {key}: stored {existing}, requested {value}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn configure(&self, config: &GraphConfig) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let had_format_version: bool = tx
+            .query_row(
+                "SELECT 1 FROM graph_meta WHERE key = 'format_version'",
+                [],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        for (key, value) in expected_configuration(config) {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM graph_meta WHERE key = ?",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != value {
+                    return Err(GraphError::InvalidArgument(format!(
+                        "graph configuration mismatch for {key}: stored {existing}, requested {value}"
+                    )));
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO graph_meta (key, value) VALUES (?, ?)",
+                    params![key, value],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO graph_meta (key, value) VALUES ('index_dirty', ?)",
+            params![if had_format_version { "0" } else { "1" }],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn index_dirty(&self) -> Result<bool> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM graph_meta WHERE key = 'index_dirty'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.is_some_and(|value| value == "1"))
+    }
+
+    pub fn mark_index_dirty(&self) -> Result<()> {
+        self.set_index_dirty(true)
+    }
+
+    pub fn mark_index_clean(&self) -> Result<()> {
+        self.set_index_dirty(false)
+    }
+
+    fn set_index_dirty(&self, dirty: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO graph_meta (key, value) VALUES ('index_dirty', ?) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![bool_text(dirty)],
+        )?;
+        Ok(())
     }
 
     // -- episodes -----------------------------------------------------------
@@ -174,9 +287,27 @@ impl TopologyStore {
 
     // -- entities -----------------------------------------------------------
 
+    #[cfg(test)]
     pub fn upsert_entity(&self, entity: &Entity) -> Result<()> {
+        self.upsert_entity_before_commit(entity, None, || Ok(()))
+    }
+
+    /// Upsert an entity and its optional authoritative vector, invoking
+    /// `before_commit` while the SQL transaction is still rollbackable. The
+    /// semantic index uses this seam so an index failure cannot leave a topology
+    /// mutation committed even though the public call returned an error.
+    pub fn upsert_entity_before_commit<F>(
+        &self,
+        entity: &Entity,
+        vector: Option<&[f32]>,
+        before_commit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let properties = props_to_text(&entity.properties)?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO entities \
                 (id, type, label, properties, valid_at, invalid_at, created_at, expired_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
@@ -195,6 +326,9 @@ impl TopologyStore {
                 entity.expired_at,
             ],
         )?;
+        store_vector(&tx, "entity_vectors", "entity_id", &entity.id, vector)?;
+        before_commit()?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -281,19 +415,41 @@ impl TopologyStore {
         Ok(ids)
     }
 
-    pub fn iter_entities(&self) -> Result<Vec<Entity>> {
-        let sql = format!("SELECT {} FROM entities", ENTITY_COLS);
+    /// Read every entity and retained caller-supplied vector in one scan for
+    /// reindexing. Keeping the join here avoids an N+1 SQLite query per record.
+    pub fn iter_entity_index_records(&self) -> Result<Vec<EntityIndexRecord>> {
+        let sql = format!(
+            "SELECT {}, v.embedding AS embedding \
+             FROM entities e LEFT JOIN entity_vectors v ON v.entity_id = e.id",
+            ENTITY_COLS
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row_to_entity(row)?);
+            let bytes: Option<Vec<u8>> = row.get("embedding")?;
+            out.push(EntityIndexRecord {
+                entity: row_to_entity(row)?,
+                vector: bytes.as_deref().map(vector_from_bytes).transpose()?,
+            });
         }
         Ok(out)
     }
 
     /// Remove an entity and its incident facts; returns `(existed, removed_fact_ids)`.
+    #[cfg(test)]
     pub fn remove_entity(&self, id: &str) -> Result<(bool, Vec<String>)> {
+        self.remove_entity_before_commit(id, |_removed| Ok(()))
+    }
+
+    pub fn remove_entity_before_commit<F>(
+        &self,
+        id: &str,
+        before_commit: F,
+    ) -> Result<(bool, Vec<String>)>
+    where
+        F: FnOnce(&[String]) -> Result<()>,
+    {
         let tx = self.conn.unchecked_transaction()?;
         let removed: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM facts WHERE src = ? OR dst = ?")?;
@@ -302,9 +458,13 @@ impl TopologyStore {
                 .collect::<rusqlite::Result<Vec<String>>>()?;
             ids
         };
-        tx.execute("DELETE FROM facts WHERE src = ? OR dst = ?", params![id, id])?;
+        tx.execute(
+            "DELETE FROM facts WHERE src = ? OR dst = ?",
+            params![id, id],
+        )?;
         // episode_mentions rows for this entity cascade via the FK.
         let removed_entity = tx.execute("DELETE FROM entities WHERE id = ?", params![id])?;
+        before_commit(&removed)?;
         tx.commit()?;
         Ok((removed_entity > 0, removed))
     }
@@ -364,33 +524,94 @@ impl TopologyStore {
         }
     }
 
+    /// Batched fact hydration (chunked `IN`), missing ids omitted.
+    pub fn get_facts(&self, ids: &[String]) -> Result<Vec<Fact>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for chunk in ids.chunks(IN_CHUNK) {
+            let sql = format!(
+                "SELECT {} FROM facts WHERE id IN ({})",
+                FACT_COLS,
+                placeholders(chunk.len())
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                found.push(row_to_fact(row)?);
+            }
+        }
+        Ok(found)
+    }
+
     /// Close a fact's validity (the invalidation write): set `invalid_at` and
     /// `expired_at`. Returns whether the fact existed and was live.
+    #[cfg(test)]
     pub fn close_fact(
         &self,
         id: &str,
         invalid_at: Option<TimeMs>,
         expired_at: TimeMs,
     ) -> Result<bool> {
+        self.close_fact_before_commit(id, invalid_at, expired_at, |_closed| Ok(()))
+    }
+
+    pub fn close_fact_before_commit<F>(
+        &self,
+        id: &str,
+        invalid_at: Option<TimeMs>,
+        expired_at: TimeMs,
+        before_commit: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(Option<&FactIndexRecord>) -> Result<()>,
+    {
+        let tx = self.conn.unchecked_transaction()?;
         // Only close a fact that is still live on the transaction axis; never
         // re-close an already-expired one.
-        let n = self.conn.execute(
+        let n = tx.execute(
             "UPDATE facts SET invalid_at = ?, expired_at = ? WHERE id = ? AND expired_at IS NULL",
             params![invalid_at, expired_at, id],
         )?;
+        let closed = if n > 0 {
+            let sql = format!("SELECT {} FROM facts WHERE id = ?", FACT_COLS);
+            let fact = {
+                let mut stmt = tx.prepare(&sql)?;
+                let mut rows = stmt.query(params![id])?;
+                match rows.next()? {
+                    Some(row) => Some(row_to_fact(row)?),
+                    None => None,
+                }
+            };
+            match fact {
+                Some(fact) => Some(FactIndexRecord {
+                    vector: load_vector(&tx, "fact_vectors", "fact_id", id)?,
+                    fact,
+                }),
+                None => None,
+            }
+        } else {
+            None
+        };
+        before_commit(closed.as_ref())?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
-    /// Atomically close `priors` (the invalidation writes) and insert `new_fact` (the
-    /// replacement) in ONE transaction, so a crash can never leave priors closed with no
-    /// replacement (an event-time validity gap). Each prior is closed only if still live
-    /// on the transaction axis. Returns the ids of the priors actually closed, for the
-    /// caller to re-index.
-    pub fn supersede_and_insert(
+    /// Atomically close `priors` (the invalidation writes) and insert `new_fact`
+    /// (the replacement) in one transaction, invoking `before_commit` while every
+    /// topology change is still rollbackable.
+    pub fn supersede_and_insert_before_commit<F>(
         &self,
         priors: &[(String, Option<TimeMs>, TimeMs)],
         new_fact: &Fact,
-    ) -> Result<Vec<String>> {
+        vector: Option<&[f32]>,
+        before_commit: F,
+    ) -> Result<Vec<String>>
+    where
+        F: FnOnce(&[FactIndexRecord]) -> Result<()>,
+    {
         let properties = props_to_text(&new_fact.properties)?;
         let episodes = serde_json::to_string(&new_fact.episodes)?;
         let tx = self.conn.unchecked_transaction()?;
@@ -462,25 +683,66 @@ impl TopologyStore {
                 stmt.execute(params![new_fact.id, episode_id])?;
             }
         }
+        store_vector(&tx, "fact_vectors", "fact_id", &new_fact.id, vector)?;
+        let mut closed_facts = Vec::with_capacity(closed_ids.len());
+        if !closed_ids.is_empty() {
+            let sql = format!("SELECT {} FROM facts WHERE id = ?", FACT_COLS);
+            let mut stmt = tx.prepare(&sql)?;
+            for id in &closed_ids {
+                let fact = {
+                    let mut rows = stmt.query(params![id])?;
+                    let row = rows.next()?.ok_or_else(|| {
+                        GraphError::Internal(format!(
+                            "closed fact disappeared in transaction: {id}"
+                        ))
+                    })?;
+                    row_to_fact(row)?
+                };
+                closed_facts.push(FactIndexRecord {
+                    vector: load_vector(&tx, "fact_vectors", "fact_id", id)?,
+                    fact,
+                });
+            }
+        }
+        before_commit(&closed_facts)?;
         tx.commit()?;
         Ok(closed_ids)
     }
 
-    pub fn iter_facts(&self) -> Result<Vec<Fact>> {
-        let sql = format!("SELECT {} FROM facts", FACT_COLS);
+    /// Read every fact and retained caller-supplied vector in one scan for
+    /// reindexing. Keeping the join here avoids an N+1 SQLite query per record.
+    pub fn iter_fact_index_records(&self) -> Result<Vec<FactIndexRecord>> {
+        let sql = format!(
+            "SELECT {}, v.embedding AS embedding \
+             FROM facts f LEFT JOIN fact_vectors v ON v.fact_id = f.id",
+            FACT_COLS
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row_to_fact(row)?);
+            let bytes: Option<Vec<u8>> = row.get("embedding")?;
+            out.push(FactIndexRecord {
+                fact: row_to_fact(row)?,
+                vector: bytes.as_deref().map(vector_from_bytes).transpose()?,
+            });
         }
         Ok(out)
     }
 
+    #[cfg(test)]
     pub fn remove_fact(&self, id: &str) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM facts WHERE id = ?", params![id])?;
+        self.remove_fact_before_commit(id, || Ok(()))
+    }
+
+    pub fn remove_fact_before_commit<F>(&self, id: &str, before_commit: F) -> Result<bool>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let tx = self.conn.unchecked_transaction()?;
+        let n = tx.execute("DELETE FROM facts WHERE id = ?", params![id])?;
+        before_commit()?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -584,6 +846,76 @@ impl TopologyStore {
 
 // -- helpers ----------------------------------------------------------------
 
+fn bool_text(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn expected_configuration(config: &GraphConfig) -> [(&'static str, String); 4] {
+    [
+        ("format_version", "2".to_string()),
+        ("vector_dim", config.vector_dim.to_string()),
+        ("index_text", bool_text(config.index_text).to_string()),
+        ("index_facts", bool_text(config.index_facts).to_string()),
+    ]
+}
+
+fn vector_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn vector_from_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
+        return Err(GraphError::Internal(
+            "stored graph vector has an invalid byte length".to_string(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn store_vector(
+    conn: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    vector: Option<&[f32]>,
+) -> Result<()> {
+    if let Some(vector) = vector {
+        let sql = format!(
+            "INSERT INTO {table} ({id_column}, embedding) VALUES (?, ?) \
+             ON CONFLICT({id_column}) DO UPDATE SET embedding=excluded.embedding"
+        );
+        conn.execute(&sql, params![id, vector_bytes(vector)])?;
+    } else {
+        let sql = format!("DELETE FROM {table} WHERE {id_column} = ?");
+        conn.execute(&sql, params![id])?;
+    }
+    Ok(())
+}
+
+fn load_vector(
+    conn: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+) -> Result<Option<Vec<f32>>> {
+    let sql = format!("SELECT embedding FROM {table} WHERE {id_column} = ?");
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(&sql, params![id], |row| row.get(0))
+        .optional()?;
+    bytes.as_deref().map(vector_from_bytes).transpose()
+}
+
 /// A comma-separated run of `n` positional placeholders (`?, ?, ...`).
 /// The subset of `ids` with no row in `table` (deduplicated), chunked under the
 /// bound-parameter limit. `table` is always a literal from this module, never
@@ -611,10 +943,7 @@ fn missing_ids(conn: &Connection, table: &str, ids: &[String]) -> Result<Vec<Str
 }
 
 fn placeholders(n: usize) -> String {
-    std::iter::repeat("?")
-        .take(n)
-        .collect::<Vec<_>>()
-        .join(",")
+    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
 }
 
 /// Encode a `properties` value for the TEXT column, mapping the "absent" `Null`
@@ -732,6 +1061,13 @@ mod tests {
         store.upsert_fact(&f).unwrap();
         assert_eq!(store.get_fact("f1").unwrap().unwrap(), f);
         assert_eq!(store.get_fact("nope").unwrap(), None);
+        assert_eq!(
+            store
+                .get_facts(&["f1".to_string(), "nope".to_string()])
+                .unwrap(),
+            vec![f.clone()]
+        );
+        assert!(store.get_facts(&[]).unwrap().is_empty());
 
         let ep = Episode {
             id: "ep1".to_string(),
@@ -913,7 +1249,7 @@ mod tests {
         let mut all_ids = store.all_entity_ids().unwrap();
         all_ids.sort();
         assert_eq!(all_ids, vec!["a", "b", "c"]);
-        assert_eq!(store.iter_entities().unwrap().len(), 3);
+        assert_eq!(store.iter_entity_index_records().unwrap().len(), 3);
     }
 
     #[test]
@@ -931,7 +1267,10 @@ mod tests {
         // At(1500): within [1000, 2000).
         assert_eq!(store.list_entities(None, AsOf::At(1500)).unwrap().len(), 1);
         // At(2500): after it ended.
-        assert!(store.list_entities(None, AsOf::At(2500)).unwrap().is_empty());
+        assert!(store
+            .list_entities(None, AsOf::At(2500))
+            .unwrap()
+            .is_empty());
         // All: no temporal filter.
         assert_eq!(store.list_entities(None, AsOf::All).unwrap().len(), 1);
     }
@@ -981,9 +1320,14 @@ mod tests {
         // half-written episode row behind.
         let err = store.upsert_episode_with_mentions(&ep, &["a".to_string(), "ghost".to_string()]);
         assert!(err.is_err());
-        assert!(store.get_episode("ep1").unwrap().is_none(), "episode row rolled back");
+        assert!(
+            store.get_episode("ep1").unwrap().is_none(),
+            "episode row rolled back"
+        );
 
-        store.upsert_episode_with_mentions(&ep, &["a".to_string()]).unwrap();
+        store
+            .upsert_episode_with_mentions(&ep, &["a".to_string()])
+            .unwrap();
         assert!(store.get_episode("ep1").unwrap().is_some());
     }
 
@@ -1023,6 +1367,6 @@ mod tests {
             ..fact("f2", "a", "r", "b")
         };
         store.upsert_fact(&f2).unwrap();
-        assert_eq!(store.iter_facts().unwrap().len(), 2);
+        assert_eq!(store.iter_fact_index_records().unwrap().len(), 2);
     }
 }

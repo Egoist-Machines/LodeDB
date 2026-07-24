@@ -152,9 +152,25 @@ impl PyTemporalGraph {
             index_text,
             index_facts,
         };
-        let boxed: Option<Box<dyn Embedder>> = embedder.map(|obj| {
-            Box::new(PyEmbedder { obj, dim: vector_dim }) as Box<dyn Embedder>
-        });
+        let boxed: Option<Box<dyn Embedder>> = embedder
+            .map(|obj| {
+                let dim = Python::attach(|py| -> PyResult<usize> {
+                    let value = obj.bind(py).getattr("dimension")?;
+                    let value = if value.is_callable() {
+                        value.call0()?
+                    } else {
+                        value
+                    };
+                    value.extract()
+                })?;
+                if dim != vector_dim {
+                    return Err(PyValueError::new_err(format!(
+                        "embedder dimension {dim} does not match vector_dim {vector_dim}"
+                    )));
+                }
+                Ok(Box::new(PyEmbedder { obj, dim }) as Box<dyn Embedder>)
+            })
+            .transpose()?;
         let inner = match path {
             Some(p) => TemporalGraph::open(std::path::Path::new(p), config, boxed),
             None => TemporalGraph::open_in_memory(config, boxed),

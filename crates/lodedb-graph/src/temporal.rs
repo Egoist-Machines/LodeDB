@@ -12,48 +12,39 @@
 
 use crate::model::{AsOf, TimeMs};
 
-/// Width of the zero-padded epoch-millis string mirrored into index metadata.
-/// Wide enough that lexical ordering equals numeric ordering for all realistic
-/// (and far-future) timestamps, and for the sentinel below.
+/// Width of the biased unsigned timestamp portion mirrored into index metadata.
+/// An additional leading tag orders open-start < every i64 timestamp < open-end,
+/// so the complete signed epoch-millisecond domain remains representable.
 pub const TS_WIDTH: usize = 20;
 
-/// Sentinel used for an open `invalid_at`/`expired_at` in the index mirror, so a
-/// `$gt`/`$lte` range filter treats "still valid" as "valid arbitrarily far out".
-pub const TS_OPEN: TimeMs = 9_223_372_036_854_775_000;
+// Keep every encoding deliberately non-numeric. The core metadata filter parses
+// numeric-looking strings as f64 before ordered comparison; at epoch-sized
+// magnitudes that would collapse nearby millisecond values through rounding.
+const ACTUAL_TAG: char = 'b';
+const OPEN_START: &str = "a00000000000000000000";
+const OPEN_END: &str = "c00000000000000000000";
 
-/// Encode a timestamp as a fixed-width, zero-padded string that sorts lexically in
-/// the same order as it sorts numerically (LodeDB compares metadata numerically
-/// when both sides parse as numbers, and this keeps parity for filters that don't).
-///
-/// LIMITATION — negative (pre-1970) timestamps are clamped to 0 here, whereas the SQL
-/// topology ([`as_of_sql`]) compares the raw signed value. The truth store is therefore
-/// authoritative and correct for pre-1970 dates (a 1965 birthday, a historical event);
-/// only *time-scoped semantic* reads (`semantic_facts` / `search_subgraph` with an
-/// `AsOf::At` instant before 1970) can diverge from the SQL as-of. A full fix — an
-/// order-preserving signed encoding that biases the whole i64 range into the padded
-/// space (and reworks [`TS_OPEN`] to stay the max without overflowing i64) — changes the
-/// on-disk index format and is deferred to a focused change with LodeDB-internal checks.
+/// Encode any signed epoch-millisecond timestamp as a fixed-width string whose
+/// lexical order is its numeric order. Flipping the sign bit maps
+/// `i64::MIN..=i64::MAX` monotonically onto `0..=u64::MAX`; the `b` tag leaves room
+/// for `a`/`c` open-start/open-end sentinels without sacrificing either endpoint.
+/// The alphabetic tags also force the metadata filter to use exact lexical ordering.
 pub fn encode_ts(ms: TimeMs) -> String {
-    // Clamp negatives to 0 (see LIMITATION above); keeps width stable for the common,
-    // non-negative range. The SQL truth store remains correct for negative timestamps.
-    let v = if ms < 0 { 0 } else { ms };
-    format!("{v:0width$}", width = TS_WIDTH)
+    let biased = (ms as u64) ^ (1_u64 << 63);
+    format!("{ACTUAL_TAG}{biased:0width$}", width = TS_WIDTH)
 }
 
 /// Encode an optional END endpoint (`invalid_at` / `expired_at`), mapping "open"
-/// (still valid) to [`TS_OPEN`] so an `invalid_at > T` range filter treats it as
-/// valid arbitrarily far into the future.
+/// (still valid) above every possible i64 timestamp.
 pub fn encode_ts_open(ms: Option<TimeMs>) -> String {
-    encode_ts(ms.unwrap_or(TS_OPEN))
+    ms.map(encode_ts).unwrap_or_else(|| OPEN_END.to_string())
 }
 
 /// Encode an optional START endpoint (`valid_at`), mapping "open" (unknown start) to
-/// the epoch floor so a `valid_at <= T` range filter treats it as having started
-/// arbitrarily far in the past. This matches the `f.valid_at IS NULL` "started"
-/// semantics in [`as_of_sql`], so the semantic index and the SQL topology agree on
-/// as-of for open-start records.
+/// below every possible i64 timestamp. This matches the `f.valid_at IS NULL`
+/// "started" semantics in [`as_of_sql`].
 pub fn encode_ts_start(ms: Option<TimeMs>) -> String {
-    encode_ts(ms.unwrap_or(0))
+    ms.map(encode_ts).unwrap_or_else(|| OPEN_START.to_string())
 }
 
 /// The SQL `WHERE` fragment (over a `facts` alias `f`) for a temporal frame, plus
@@ -91,9 +82,7 @@ pub fn frame_matches(
     match as_of {
         AsOf::All => true,
         AsOf::Now => expired_at.is_none() && invalid_at.is_none(),
-        AsOf::At(t) => {
-            valid_at.is_none_or(|v| v <= t) && invalid_at.is_none_or(|i| i > t)
-        }
+        AsOf::At(t) => valid_at.is_none_or(|v| v <= t) && invalid_at.is_none_or(|i| i > t),
     }
 }
 
@@ -112,4 +101,26 @@ pub fn supersede_timestamps(
     now: TimeMs,
 ) -> (Option<TimeMs>, TimeMs) {
     (Some(new_fact_valid_at.unwrap_or(effective_time)), now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_ts, encode_ts_open, encode_ts_start};
+
+    #[test]
+    fn signed_timestamp_encoding_is_lexically_ordered() {
+        let ordered = [
+            encode_ts_start(None),
+            encode_ts(i64::MIN),
+            encode_ts(-2_000),
+            encode_ts(-1),
+            encode_ts(0),
+            encode_ts(1),
+            encode_ts(2_000),
+            encode_ts(i64::MAX),
+            encode_ts_open(None),
+        ];
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ordered.iter().all(|encoded| encoded.len() == 21));
+    }
 }
