@@ -606,3 +606,443 @@ fn on_disk_reopen_and_configuration_guards() {
         "index_text mismatch must refuse"
     );
 }
+#[test]
+fn strict_now_excludes_future_dated_facts_without_breaking_current_view() {
+    let mut g = graph();
+    g.upsert_entity(
+        "future-src",
+        "Thing",
+        "future source",
+        json!({}),
+        None,
+        None,
+    )
+    .unwrap();
+    g.upsert_entity(
+        "future-dst",
+        "Thing",
+        "future target",
+        json!({}),
+        None,
+        None,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let future = now + 7 * 24 * 60 * 60 * 1_000;
+    let fact_id = g
+        .add_fact(
+            "future-src",
+            "activates",
+            "future-dst",
+            "future source activates future target",
+            json!({}),
+            vec![],
+            Some(future),
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(
+        g.neighbors("future-src", Direction::Out, None, AsOf::Now)
+            .unwrap()
+            .len(),
+        1,
+        "the compatibility current view remains Graphiti-like"
+    );
+    assert!(
+        g.neighbors(
+            "future-src",
+            Direction::Out,
+            None,
+            AsOf::NowValid(now)
+        )
+        .unwrap()
+        .is_empty(),
+        "strict current validity rejects a future start"
+    );
+    assert!(
+        g.semantic_facts(
+            Some("activates future target"),
+            None,
+            5,
+            None,
+            AsOf::NowValid(now),
+        )
+        .unwrap()
+        .is_empty(),
+        "the strict frame is pushed into semantic fact retrieval"
+    );
+    let subgraph = g
+        .search_subgraph(
+            Some("future source"),
+            None,
+            5,
+            1,
+            Direction::Both,
+            None,
+            AsOf::NowValid(now),
+        )
+        .unwrap();
+    assert!(
+        subgraph.facts.iter().all(|fact| fact.id != fact_id),
+        "strict search_subgraph expansion does not leak the future fact"
+    );
+}
+
+#[test]
+fn transaction_time_travel_reconstructs_what_was_known() {
+    let mut g = graph();
+    for (id, label) in [("person", "Person"), ("old-org", "Old Org"), ("new-org", "New Org")] {
+        g.upsert_entity(id, "Thing", label, json!({}), None, None)
+            .unwrap();
+    }
+    let old = g
+        .add_fact(
+            "person",
+            "works_at",
+            "old-org",
+            "Person works at Old Org",
+            json!({}),
+            vec![],
+            Some(1_000),
+            &[],
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let new = g
+        .add_fact(
+            "person",
+            "works_at",
+            "new-org",
+            "Person works at New Org",
+            json!({}),
+            vec![],
+            Some(2_000),
+            std::slice::from_ref(&old),
+        )
+        .unwrap();
+    let old_row = g.get_fact(&old).unwrap().unwrap();
+    let new_row = g.get_fact(&new).unwrap().unwrap();
+    let learned_replacement_at = old_row.expired_at.unwrap();
+    assert!(old_row.created_at < learned_replacement_at);
+
+    let before_learning = g
+        .neighbors(
+            "person",
+            Direction::Out,
+            Some("works_at"),
+            AsOf::AtKnown {
+                valid_at: 2_500,
+                known_at: learned_replacement_at - 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(before_learning.len(), 1);
+    assert_eq!(before_learning[0].id, old);
+    let before_learning_semantic = g
+        .semantic_facts(
+            Some("Person works at"),
+            None,
+            5,
+            Some("works_at"),
+            AsOf::AtKnown {
+                valid_at: 2_500,
+                known_at: learned_replacement_at - 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(before_learning_semantic.len(), 1);
+    assert_eq!(before_learning_semantic[0].1.id, old);
+
+    let after_learning = g
+        .neighbors(
+            "person",
+            Direction::Out,
+            Some("works_at"),
+            AsOf::AtKnown {
+                valid_at: 2_500,
+                known_at: new_row.created_at,
+            },
+        )
+        .unwrap();
+    assert_eq!(after_learning.len(), 1);
+    assert_eq!(after_learning[0].id, new);
+    let after_learning_semantic = g
+        .semantic_facts(
+            Some("Person works at"),
+            None,
+            5,
+            Some("works_at"),
+            AsOf::AtKnown {
+                valid_at: 2_500,
+                known_at: new_row.created_at,
+            },
+        )
+        .unwrap();
+    assert_eq!(after_learning_semantic.len(), 1);
+    assert_eq!(after_learning_semantic[0].1.id, new);
+}
+
+#[test]
+fn caller_stable_ids_make_episode_and_fact_retries_idempotent() {
+    let mut g = graph();
+    g.upsert_entity("a", "Thing", "A", json!({}), None, None)
+        .unwrap();
+    g.upsert_entity("b", "Thing", "B", json!({}), None, None)
+        .unwrap();
+    let episode = g
+        .add_episode_with_id(
+            Some("episode-stable"),
+            "note",
+            "A relates to B",
+            100,
+            json!({"owner": "u1"}),
+            &["a".to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        g.add_episode_with_id(
+            Some("episode-stable"),
+            "note",
+            "A relates to B",
+            100,
+            json!({"owner": "u1"}),
+            &["a".to_string()],
+        )
+        .unwrap(),
+        episode
+    );
+    assert!(
+        g.add_episode_with_id(
+            Some("episode-stable"),
+            "note",
+            "different",
+            100,
+            json!({"owner": "u1"}),
+            &[],
+        )
+        .is_err()
+    );
+
+    let fact = g
+        .add_fact_with_id(
+            Some("fact-stable"),
+            "a",
+            "rel",
+            "b",
+            "A relates to B",
+            json!({"owner": "u1"}),
+            vec![episode.clone()],
+            Some(100),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        g.add_fact_with_id(
+            Some("fact-stable"),
+            "a",
+            "rel",
+            "b",
+            "A relates to B",
+            json!({"owner": "u1"}),
+            vec![episode],
+            Some(100),
+            &[],
+        )
+        .unwrap(),
+        fact
+    );
+    assert_eq!(g.stats().unwrap().facts, 1);
+}
+
+#[test]
+fn episode_enumeration_provenance_and_rollback_are_public() {
+    let mut g = graph();
+    g.upsert_entity("a", "Thing", "A", json!({}), None, None)
+        .unwrap();
+    g.upsert_entity("b", "Thing", "B", json!({}), None, None)
+        .unwrap();
+    let ep1 = g
+        .add_episode_with_id(Some("ep1"), "note", "one", 1, json!({}), &[])
+        .unwrap();
+    let ep2 = g
+        .add_episode_with_id(Some("ep2"), "note", "two", 2, json!({}), &[])
+        .unwrap();
+    let retained = g
+        .add_fact(
+            "a",
+            "rel",
+            "b",
+            "supported by two episodes",
+            json!({}),
+            vec![ep1.clone(), ep2.clone()],
+            Some(1),
+            &[],
+        )
+        .unwrap();
+    let removed = g
+        .add_fact(
+            "a",
+            "rel2",
+            "b",
+            "created by episode two",
+            json!({}),
+            vec![ep2.clone()],
+            Some(2),
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(g.episodes().unwrap().len(), 2);
+    assert_eq!(g.facts_by_episode(&ep2).unwrap().len(), 2);
+    assert!(g.remove_episode(&ep2).unwrap());
+    assert!(g.get_episode(&ep2).unwrap().is_none());
+    assert!(g.get_fact(&removed).unwrap().is_none());
+    assert_eq!(
+        g.get_fact(&retained).unwrap().unwrap().episodes,
+        vec![ep1],
+        "non-primary support is detached without deleting the fact"
+    );
+}
+
+#[test]
+fn entity_properties_have_independent_version_lineage() {
+    let mut g = graph();
+    g.upsert_entity(
+        "device",
+        "Device",
+        "Device",
+        json!({"status": "new", "region": "us"}),
+        Some(100),
+        None,
+    )
+    .unwrap();
+    let episode = g
+        .add_episode_with_id(
+            Some("status-update"),
+            "event",
+            "device activated",
+            200,
+            json!({}),
+            &[],
+        )
+        .unwrap();
+    let mut sources = BTreeMap::new();
+    sources.insert("status".to_string(), episode.clone());
+    g.upsert_entity_with_sources(
+        "device",
+        "Device",
+        "Device",
+        json!({"status": "active", "region": "us"}),
+        Some(200),
+        None,
+        &sources,
+    )
+    .unwrap();
+
+    let status = g
+        .entity_property_history("device", Some("status"))
+        .unwrap();
+    assert_eq!(status.len(), 2);
+    assert_eq!(status[0].value, json!("new"));
+    assert!(status[0].expired_at.is_some());
+    assert_eq!(status[1].value, json!("active"));
+    assert_eq!(status[1].episode_id.as_deref(), Some(episode.as_str()));
+    assert!(status[1].expired_at.is_none());
+    assert_eq!(
+        g.entity_property_history("device", Some("region"))
+            .unwrap()
+            .len(),
+        1,
+        "an unchanged property does not mint a new version"
+    );
+}
+
+#[test]
+fn authorization_predicates_run_before_semantic_ranking_and_expansion() {
+    let mut g = graph();
+    for (id, owner) in [("allowed-a", "u1"), ("allowed-b", "u1"), ("forbidden", "u2")] {
+        g.upsert_entity(
+            id,
+            "Thing",
+            &format!("shared semantic label {id}"),
+            json!({"owner": owner, "allowed": owner == "u1"}),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    g.add_fact(
+        "allowed-a",
+        "rel",
+        "allowed-b",
+        "shared semantic allowed fact",
+        json!({"owner": "u1", "allowed": true}),
+        vec![],
+        None,
+        &[],
+    )
+    .unwrap();
+    g.add_fact(
+        "forbidden",
+        "rel",
+        "allowed-b",
+        "shared semantic forbidden fact",
+        json!({"owner": "u2", "allowed": false}),
+        vec![],
+        None,
+        &[],
+    )
+    .unwrap();
+    let predicate = json!({"$and": [{"owner": "u1"}, {"allowed": true}]});
+
+    let entities = g
+        .semantic_entities_filtered(
+            Some("shared semantic label"),
+            None,
+            10,
+            None,
+            AsOf::Now,
+            Some(&predicate),
+        )
+        .unwrap();
+    assert!(entities.iter().all(|(_score, entity)| entity.id != "forbidden"));
+    let facts = g
+        .semantic_facts_filtered(
+            Some("shared semantic"),
+            None,
+            10,
+            None,
+            AsOf::Now,
+            Some(&predicate),
+        )
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].1.src, "allowed-a");
+    assert!(
+        g.resolve_entity_filtered("shared semantic label", 10, Some(&predicate))
+            .unwrap()
+            .iter()
+            .all(|(_score, entity)| entity.id != "forbidden")
+    );
+    let subgraph = g
+        .search_subgraph_filtered(
+            Some("shared semantic allowed fact"),
+            None,
+            5,
+            1,
+            Direction::Both,
+            None,
+            Some("rel"),
+            AsOf::Now,
+            Some(&predicate),
+            "fact",
+        )
+        .unwrap();
+    assert!(subgraph.entities.contains_key("allowed-a"));
+    assert!(!subgraph.entities.contains_key("forbidden"));
+    assert!(subgraph.facts.iter().all(|fact| fact.src != "forbidden"));
+}

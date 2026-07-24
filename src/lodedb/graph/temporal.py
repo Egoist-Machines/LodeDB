@@ -23,7 +23,14 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["TemporalKnowledgeGraph", "Embedder"]
+__all__ = [
+    "TemporalKnowledgeGraph",
+    "Embedder",
+    "rrf",
+    "maximal_marginal_relevance",
+    "node_distance_reranker",
+    "episode_mentions_reranker",
+]
 
 
 @runtime_checkable
@@ -64,23 +71,81 @@ def _parse_records(records: list[dict]) -> list[dict]:
     return [_parse_record(r) for r in records]
 
 
-def _as_of(as_of: Any) -> tuple[int | None, bool]:
-    """Translate a friendly ``as_of`` into the native ``(as_of_ms, all_time)`` pair.
+def _parse_property_versions(records: list[dict]) -> list[dict]:
+    for record in records:
+        raw = record.get("value")
+        if isinstance(raw, str):
+            record["value"] = json.loads(raw)
+    return records
 
-    ``None`` → current view; an int (epoch ms) → as-of that instant; ``"all"`` /
-    ``"history"`` → every version.
+
+def _as_of(as_of: Any) -> tuple[int | None, bool, bool, int | None]:
+    """Translate a friendly frame into the native temporal wire fields.
+
+    ``None`` keeps the Graphiti-compatible current view. ``"now_valid"`` performs
+    a strict current read. An int selects event time only. A two-item
+    ``(valid_at_ms, known_at_ms)`` tuple selects both temporal axes.
     """
     if as_of is None:
-        return None, False
+        return None, False, False, None
     if isinstance(as_of, bool):  # bool is an int subclass — reject before it maps to epoch 0/1
         raise TypeError(
             f"as_of must be None, an int (epoch ms), or 'all'/'history', not bool: {as_of!r}"
         )
     if isinstance(as_of, str):
         if as_of.lower() in ("all", "history"):
-            return None, True
-        raise ValueError(f"as_of string must be 'all'/'history', got {as_of!r}")
-    return int(as_of), False
+            return None, True, False, None
+        if as_of.lower() in ("now_valid", "strict"):
+            return None, False, True, None
+        raise ValueError(
+            f"as_of string must be 'all'/'history' or 'now_valid'/'strict', got {as_of!r}"
+        )
+    if isinstance(as_of, tuple):
+        if len(as_of) != 2:
+            raise ValueError("a bi-temporal as_of tuple must contain (valid_at_ms, known_at_ms)")
+        return int(as_of[0]), False, False, int(as_of[1])
+    return int(as_of), False, False, None
+
+
+def _predicate(predicate: Mapping[str, Any] | None) -> str | None:
+    return _dumps(predicate)
+
+
+def rrf(ranked_lists: Sequence[Sequence[str]], k: float = 1.0) -> list[tuple[str, float]]:
+    """Reciprocal rank fusion, implemented by the native graph crate."""
+    from lodedb import _turbovec
+
+    return _turbovec.graph.rrf([list(items) for items in ranked_lists], float(k))
+
+
+def maximal_marginal_relevance(
+    query: Sequence[float],
+    candidates: Sequence[tuple[str, Sequence[float]]],
+    lambda_: float = 0.5,
+) -> list[str]:
+    """Graphiti-compatible maximal marginal relevance ranking."""
+    from lodedb import _turbovec
+
+    values = [(id, list(vector)) for id, vector in candidates]
+    return _turbovec.graph.maximal_marginal_relevance(
+        list(query), values, float(lambda_)
+    )
+
+
+def node_distance_reranker(
+    ids: Sequence[str], distances: Mapping[str, int]
+) -> list[str]:
+    from lodedb import _turbovec
+
+    return _turbovec.graph.node_distance_reranker(list(ids), dict(distances))
+
+
+def episode_mentions_reranker(
+    ids: Sequence[str], mention_counts: Mapping[str, int]
+) -> list[str]:
+    from lodedb import _turbovec
+
+    return _turbovec.graph.episode_mentions_reranker(list(ids), dict(mention_counts))
 
 
 def _resolve_dimension(embedder: Any, vector_dim: int | None) -> int:
@@ -149,12 +214,27 @@ class TemporalKnowledgeGraph:
         *,
         properties: Mapping[str, Any] | None = None,
         mentions: Sequence[str] = (),
+        id: str | None = None,
     ) -> str:
         """Store a raw observation (no extraction); returns its id."""
-        return self._g.add_episode(source, body, occurred_at, _dumps(properties), list(mentions))
+        return self._g.add_episode(
+            source, body, occurred_at, _dumps(properties), list(mentions), id
+        )
 
     def get_episode(self, id: str) -> dict | None:
         return _parse_record(self._g.get_episode(id))
+
+    def episodes(self) -> list[dict]:
+        """Enumerate every episode in insertion order."""
+        return _parse_records(self._g.episodes())
+
+    def facts_by_episode(self, id: str) -> list[dict]:
+        """Return facts whose provenance includes ``id``."""
+        return _parse_records(self._g.facts_by_episode(id))
+
+    def remove_episode(self, id: str) -> bool:
+        """Remove an episode and roll back facts it originally created."""
+        return self._g.remove_episode(id)
 
     # -- entities -----------------------------------------------------------
 
@@ -167,9 +247,18 @@ class TemporalKnowledgeGraph:
         properties: Mapping[str, Any] | None = None,
         valid_at: int | None = None,
         invalid_at: int | None = None,
+        property_sources: Mapping[str, str] | None = None,
     ) -> str:
         """Create or replace an entity (upsert by id) and (re)index it."""
-        return self._g.upsert_entity(id, type, label, _dumps(properties), valid_at, invalid_at)
+        return self._g.upsert_entity(
+            id,
+            type,
+            label,
+            _dumps(properties),
+            valid_at,
+            invalid_at,
+            _dumps(property_sources),
+        )
 
     def upsert_entity_vec(
         self,
@@ -181,19 +270,33 @@ class TemporalKnowledgeGraph:
         properties: Mapping[str, Any] | None = None,
         valid_at: int | None = None,
         invalid_at: int | None = None,
+        property_sources: Mapping[str, str] | None = None,
     ) -> str:
         """Create or replace an entity indexed by a precomputed vector (vector-in)."""
         return self._g.upsert_entity_vec(
-            id, type, label, list(embedding), _dumps(properties), valid_at, invalid_at
+            id,
+            type,
+            label,
+            list(embedding),
+            _dumps(properties),
+            valid_at,
+            invalid_at,
+            _dumps(property_sources),
         )
 
     def get_entity(self, id: str) -> dict | None:
         return _parse_record(self._g.get_entity(id))
 
+    def entity_property_history(self, id: str, key: str | None = None) -> list[dict]:
+        """Return independently versioned property values and source episodes."""
+        return _parse_property_versions(self._g.entity_property_history(id, key))
+
     def entities(self, type: str | None = None, *, as_of: Any = None) -> list[dict]:
         """Complete-set enumeration by type (None = all) in a temporal frame."""
-        ms, all_time = _as_of(as_of)
-        return _parse_records(self._g.entities(type, ms, all_time))
+        ms, all_time, strict_now, known_at = _as_of(as_of)
+        return _parse_records(
+            self._g.entities(type, ms, all_time, strict_now, known_at)
+        )
 
     def remove_entity(self, id: str) -> bool:
         return self._g.remove_entity(id)
@@ -211,13 +314,14 @@ class TemporalKnowledgeGraph:
         episodes: Sequence[str] = (),
         valid_at: int | None = None,
         invalidates: Sequence[str] = (),
+        id: str | None = None,
     ) -> str:
         """Assert a fact (a distinct, uniquely-id'd assertion, so history survives).
         ``invalidates`` closes prior facts using Graphiti's rule. Returns the fact id.
         """
         return self._g.add_fact(
             src, relation, dst, fact, _dumps(properties),
-            list(episodes), valid_at, list(invalidates),
+            list(episodes), valid_at, list(invalidates), id,
         )
 
     def add_fact_vec(
@@ -232,13 +336,14 @@ class TemporalKnowledgeGraph:
         episodes: Sequence[str] = (),
         valid_at: int | None = None,
         invalidates: Sequence[str] = (),
+        id: str | None = None,
     ) -> str:
         """:meth:`add_fact` with a precomputed embedding (vector-in), so a graph
         opened without an embedder can still index facts for ``semantic_facts``.
         """
         return self._g.add_fact_vec(
             src, relation, dst, fact, list(embedding), _dumps(properties),
-            list(episodes), valid_at, list(invalidates),
+            list(episodes), valid_at, list(invalidates), id,
         )
 
     def invalidate_fact(self, id: str, *, invalid_at: int | None = None) -> bool:
@@ -263,8 +368,12 @@ class TemporalKnowledgeGraph:
         as_of: Any = None,
     ) -> list[dict]:
         """Facts incident to ``id`` (out/in/both, optional relation), as-of a frame."""
-        ms, all_time = _as_of(as_of)
-        return _parse_records(self._g.neighbors(id, direction, relation, ms, all_time))
+        ms, all_time, strict_now, known_at = _as_of(as_of)
+        return _parse_records(
+            self._g.neighbors(
+                id, direction, relation, ms, all_time, strict_now, known_at
+            )
+        )
 
     def k_hop(
         self,
@@ -273,11 +382,23 @@ class TemporalKnowledgeGraph:
         k: int = 1,
         direction: str = "both",
         as_of: Any = None,
+        predicate: Mapping[str, Any] | None = None,
     ) -> dict:
         """Deterministic k-hop neighbourhood around ``seeds``, in a temporal frame."""
         seed_ids = [seeds] if isinstance(seeds, str) else list(seeds)
-        ms, all_time = _as_of(as_of)
-        return self._parse_subgraph(self._g.k_hop(seed_ids, k, direction, ms, all_time))
+        ms, all_time, strict_now, known_at = _as_of(as_of)
+        return self._parse_subgraph(
+            self._g.k_hop(
+                seed_ids,
+                k,
+                direction,
+                ms,
+                all_time,
+                strict_now,
+                known_at,
+                _predicate(predicate),
+            )
+        )
 
     # -- semantic retrieval -------------------------------------------------
 
@@ -289,11 +410,22 @@ class TemporalKnowledgeGraph:
         k: int = 10,
         type: str | None = None,
         as_of: Any = None,
+        predicate: Mapping[str, Any] | None = None,
     ) -> list[tuple[float, dict]]:
         """Top-``k`` entities for ``query``/``embedding``, optionally by type, as-of."""
-        ms, all_time = _as_of(as_of)
+        ms, all_time, strict_now, known_at = _as_of(as_of)
         emb = list(embedding) if embedding is not None else None
-        hits = self._g.semantic_entities(query, emb, k, type, ms, all_time)
+        hits = self._g.semantic_entities(
+            query,
+            emb,
+            k,
+            type,
+            ms,
+            all_time,
+            strict_now,
+            known_at,
+            _predicate(predicate),
+        )
         return [(score, _parse_record(rec)) for score, rec in hits]
 
     def semantic_facts(
@@ -304,11 +436,22 @@ class TemporalKnowledgeGraph:
         k: int = 10,
         relation: str | None = None,
         as_of: Any = None,
+        predicate: Mapping[str, Any] | None = None,
     ) -> list[tuple[float, dict]]:
         """Top-``k`` facts for ``query``/``embedding`` (Graphiti's default shape)."""
-        ms, all_time = _as_of(as_of)
+        ms, all_time, strict_now, known_at = _as_of(as_of)
         emb = list(embedding) if embedding is not None else None
-        hits = self._g.semantic_facts(query, emb, k, relation, ms, all_time)
+        hits = self._g.semantic_facts(
+            query,
+            emb,
+            k,
+            relation,
+            ms,
+            all_time,
+            strict_now,
+            known_at,
+            _predicate(predicate),
+        )
         return [(score, _parse_record(rec)) for score, rec in hits]
 
     def search_subgraph(
@@ -320,18 +463,44 @@ class TemporalKnowledgeGraph:
         hops: int = 1,
         direction: str = "both",
         type: str | None = None,
+        relation: str | None = None,
         as_of: Any = None,
+        predicate: Mapping[str, Any] | None = None,
+        seed_kind: str = "entity",
     ) -> dict:
         """Semantic seed entities + k-hop expansion (the headline query)."""
-        ms, all_time = _as_of(as_of)
+        ms, all_time, strict_now, known_at = _as_of(as_of)
         emb = list(embedding) if embedding is not None else None
         return self._parse_subgraph(
-            self._g.search_subgraph(query, emb, k, hops, direction, type, ms, all_time)
+            self._g.search_subgraph(
+                query,
+                emb,
+                k,
+                hops,
+                direction,
+                type,
+                relation,
+                ms,
+                all_time,
+                strict_now,
+                known_at,
+                _predicate(predicate),
+                seed_kind,
+            )
         )
 
-    def resolve_entity(self, name: str, *, k: int = 5) -> list[tuple[float, dict]]:
+    def resolve_entity(
+        self,
+        name: str,
+        *,
+        k: int = 5,
+        predicate: Mapping[str, Any] | None = None,
+    ) -> list[tuple[float, dict]]:
         """Candidate entities matching ``name`` for the caller's resolution step."""
-        return [(score, _parse_record(rec)) for score, rec in self._g.resolve_entity(name, k)]
+        return [
+            (score, _parse_record(rec))
+            for score, rec in self._g.resolve_entity(name, k, _predicate(predicate))
+        ]
 
     def history(self, entity_id: str) -> list[dict]:
         """Every fact ever touching an entity, all frames (history)."""

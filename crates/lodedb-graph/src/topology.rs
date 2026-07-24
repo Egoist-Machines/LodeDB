@@ -12,14 +12,16 @@
 //! `_store.py` does. Timestamps are `i64` epoch-ms columns; `NULL` = open
 //! interval.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::error::{GraphError, Result};
-use crate::model::{AsOf, Direction, Entity, Episode, Fact, GraphConfig, TimeMs};
+use crate::model::{
+    AsOf, Direction, Entity, EntityPropertyVersion, Episode, Fact, GraphConfig, TimeMs,
+};
 
 /// DDL for the topology store.
 pub const SCHEMA: &str = r#"
@@ -65,6 +67,17 @@ CREATE TABLE IF NOT EXISTS episode_mentions (
     entity_id   TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     PRIMARY KEY (episode_id, entity_id)
 );
+CREATE TABLE IF NOT EXISTS entity_property_versions (
+    version_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id   TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    property_key TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    episode_id  TEXT REFERENCES episodes(id) ON DELETE SET NULL,
+    valid_at    INTEGER,
+    invalid_at  INTEGER,
+    created_at  INTEGER NOT NULL,
+    expired_at  INTEGER
+);
 CREATE TABLE IF NOT EXISTS entity_vectors (
     entity_id   TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
     embedding  BLOB NOT NULL
@@ -83,6 +96,12 @@ CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_at, invalid_at);
 CREATE INDEX IF NOT EXISTS idx_facts_live ON facts(expired_at);
 CREATE INDEX IF NOT EXISTS idx_mentions_entity ON episode_mentions(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+CREATE INDEX IF NOT EXISTS idx_fact_episodes_episode ON fact_episodes(episode_id, fact_id);
+CREATE INDEX IF NOT EXISTS idx_property_versions_entity
+    ON entity_property_versions(entity_id, property_key, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_property_versions_current
+    ON entity_property_versions(entity_id, property_key)
+    WHERE expired_at IS NULL;
 "#;
 
 /// Embedded SQL store of episodes/entities/facts with bi-temporal validity.
@@ -111,6 +130,10 @@ const ENTITY_COLS: &str =
     "id, type, label, properties, valid_at, invalid_at, created_at, expired_at";
 const FACT_COLS: &str = "id, src, relation, dst, fact, properties, episodes, \
      valid_at, invalid_at, created_at, expired_at, reference_time";
+const FACT_COLS_F: &str = "f.id AS id, f.src AS src, f.relation AS relation, \
+     f.dst AS dst, f.fact AS fact, f.properties AS properties, f.episodes AS episodes, \
+     f.valid_at AS valid_at, f.invalid_at AS invalid_at, f.created_at AS created_at, \
+     f.expired_at AS expired_at, f.reference_time AS reference_time";
 const EPISODE_COLS: &str = "id, source, body, occurred_at, created_at, properties";
 
 impl TopologyStore {
@@ -133,7 +156,9 @@ impl TopologyStore {
         // The set-form of `foreign_keys` returns no rows, so `execute` is right.
         conn.execute("PRAGMA foreign_keys=ON", [])?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.backfill_property_versions()?;
+        Ok(store)
     }
 
     /// Persist the index-shaping graph configuration on first open and reject any
@@ -169,6 +194,14 @@ impl TopologyStore {
             )
             .optional()?
             .is_some();
+        let had_index_metadata_version: bool = tx
+            .query_row(
+                "SELECT 1 FROM graph_meta WHERE key = 'index_metadata_version'",
+                [],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
         for (key, value) in expected_configuration(config) {
             let existing: Option<String> = tx
                 .query_row(
@@ -190,10 +223,18 @@ impl TopologyStore {
                 )?;
             }
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO graph_meta (key, value) VALUES ('index_dirty', ?)",
-            params![if had_format_version { "0" } else { "1" }],
-        )?;
+        if had_index_metadata_version {
+            tx.execute(
+                "INSERT OR IGNORE INTO graph_meta (key, value) VALUES ('index_dirty', ?)",
+                params![if had_format_version { "0" } else { "1" }],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO graph_meta (key, value) VALUES ('index_dirty', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value='1'",
+                [],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -227,6 +268,69 @@ impl TopologyStore {
         Ok(())
     }
 
+    /// Seed lineage for stores created before the lineage table existed. This is
+    /// idempotent and only fills a missing current version for a property that is
+    /// present in the entity snapshot.
+    fn backfill_property_versions(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let entities: Vec<(
+            String,
+            String,
+            Option<TimeMs>,
+            Option<TimeMs>,
+            TimeMs,
+            Option<TimeMs>,
+        )> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, properties, valid_at, invalid_at, created_at, expired_at FROM entities",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (entity_id, properties, valid_at, invalid_at, created_at, expired_at) in entities {
+            let value: serde_json::Value = serde_json::from_str(&properties)?;
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            for (key, property_value) in object {
+                tx.execute(
+                    "INSERT INTO entity_property_versions \
+                        (entity_id, property_key, value, episode_id, valid_at, invalid_at, \
+                         created_at, expired_at) \
+                     SELECT ?, ?, ?, NULL, ?, ?, ?, ? \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM entity_property_versions \
+                         WHERE entity_id = ? AND property_key = ? \
+                     )",
+                    params![
+                        entity_id,
+                        key,
+                        serde_json::to_string(property_value)?,
+                        valid_at,
+                        invalid_at,
+                        created_at,
+                        expired_at,
+                        entity_id,
+                        key,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // -- episodes -----------------------------------------------------------
 
     pub fn get_episode(&self, id: &str) -> Result<Option<Episode>> {
@@ -237,6 +341,30 @@ impl TopologyStore {
             Some(row) => Ok(Some(row_to_episode(row)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn list_episodes(&self) -> Result<Vec<Episode>> {
+        let sql = format!(
+            "SELECT {} FROM episodes ORDER BY created_at, id",
+            EPISODE_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_episode(row)?);
+        }
+        Ok(out)
+    }
+
+    pub fn episode_mentions(&self, id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entity_id FROM episode_mentions WHERE episode_id = ? ORDER BY entity_id",
+        )?;
+        let mentions = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(mentions)
     }
 
     /// Insert (or replace) an episode and its entity mentions (Graphiti
@@ -296,6 +424,7 @@ impl TopologyStore {
     /// `before_commit` while the SQL transaction is still rollbackable. The
     /// semantic index uses this seam so an index failure cannot leave a topology
     /// mutation committed even though the public call returned an error.
+    #[allow(dead_code)]
     pub fn upsert_entity_before_commit<F>(
         &self,
         entity: &Entity,
@@ -305,8 +434,46 @@ impl TopologyStore {
     where
         F: FnOnce() -> Result<()>,
     {
+        self.upsert_entity_with_lineage_before_commit(
+            entity,
+            vector,
+            &BTreeMap::new(),
+            entity.created_at,
+            before_commit,
+        )
+    }
+
+    /// Upsert an entity snapshot and independently version each changed top-level
+    /// property. `property_sources` maps property names to the episode that
+    /// supplied that value.
+    pub fn upsert_entity_with_lineage_before_commit<F>(
+        &self,
+        entity: &Entity,
+        vector: Option<&[f32]>,
+        property_sources: &BTreeMap<String, String>,
+        recorded_at: TimeMs,
+        before_commit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let properties = props_to_text(&entity.properties)?;
         let tx = self.conn.unchecked_transaction()?;
+        let existing_properties: Option<String> = tx
+            .query_row(
+                "SELECT properties FROM entities WHERE id = ?",
+                params![entity.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let source_ids: Vec<String> = property_sources.values().cloned().collect();
+        let missing = missing_ids(&tx, "episodes", &source_ids)?;
+        if !missing.is_empty() {
+            return Err(GraphError::NotFound(format!(
+                "property source episodes do not exist: {}",
+                missing.join(", ")
+            )));
+        }
         tx.execute(
             "INSERT INTO entities \
                 (id, type, label, properties, valid_at, invalid_at, created_at, expired_at) \
@@ -326,10 +493,55 @@ impl TopologyStore {
                 entity.expired_at,
             ],
         )?;
+        sync_property_versions(
+            &tx,
+            &entity.id,
+            existing_properties.as_deref(),
+            &entity.properties,
+            property_sources,
+            entity.valid_at,
+            recorded_at,
+        )?;
         store_vector(&tx, "entity_vectors", "entity_id", &entity.id, vector)?;
         before_commit()?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn entity_property_history(
+        &self,
+        entity_id: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<EntityPropertyVersion>> {
+        let (sql, binds): (String, Vec<SqlValue>) = match key {
+            Some(key) => (
+                "SELECT entity_id, property_key, value, episode_id, valid_at, invalid_at, \
+                        created_at, expired_at \
+                 FROM entity_property_versions \
+                 WHERE entity_id = ? AND property_key = ? \
+                 ORDER BY created_at, version_id"
+                    .to_string(),
+                vec![
+                    SqlValue::Text(entity_id.to_string()),
+                    SqlValue::Text(key.to_string()),
+                ],
+            ),
+            None => (
+                "SELECT entity_id, property_key, value, episode_id, valid_at, invalid_at, \
+                        created_at, expired_at \
+                 FROM entity_property_versions \
+                 WHERE entity_id = ? ORDER BY property_key, created_at, version_id"
+                    .to_string(),
+                vec![SqlValue::Text(entity_id.to_string())],
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(binds.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_property_version(row)?);
+        }
+        Ok(out)
     }
 
     pub fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
@@ -377,6 +589,18 @@ impl TopologyStore {
             AsOf::Now => {
                 where_parts.push("(e.expired_at IS NULL AND e.invalid_at IS NULL)".to_string());
             }
+            AsOf::NowValid(t) => {
+                where_parts.push(
+                    "((e.valid_at IS NULL OR e.valid_at <= ?) \
+                      AND (e.invalid_at IS NULL OR e.invalid_at > ?) \
+                      AND e.created_at <= ? \
+                      AND (e.expired_at IS NULL OR e.expired_at > ?))"
+                        .to_string(),
+                );
+                for _ in 0..4 {
+                    binds.push(SqlValue::Integer(t));
+                }
+            }
             AsOf::At(t) => {
                 where_parts.push(
                     "((e.valid_at IS NULL OR e.valid_at <= ?) \
@@ -385,6 +609,20 @@ impl TopologyStore {
                 );
                 binds.push(SqlValue::Integer(t));
                 binds.push(SqlValue::Integer(t));
+            }
+            AsOf::AtKnown { valid_at, known_at } => {
+                where_parts.push(
+                    "((e.valid_at IS NULL OR e.valid_at <= ?) \
+                      AND e.created_at <= ? \
+                      AND (e.expired_at IS NULL OR e.expired_at > ?) \
+                      AND (e.expired_at > ? OR e.invalid_at IS NULL OR e.invalid_at > ?))"
+                        .to_string(),
+                );
+                binds.push(SqlValue::Integer(valid_at));
+                binds.push(SqlValue::Integer(known_at));
+                binds.push(SqlValue::Integer(known_at));
+                binds.push(SqlValue::Integer(known_at));
+                binds.push(SqlValue::Integer(valid_at));
             }
             AsOf::All => {}
         }
@@ -522,6 +760,80 @@ impl TopologyStore {
             Some(row) => Ok(Some(row_to_fact(row)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn facts_by_episode(&self, episode_id: &str) -> Result<Vec<Fact>> {
+        let sql = format!(
+            "SELECT {} FROM facts f \
+             INNER JOIN fact_episodes p ON p.fact_id = f.id \
+             WHERE p.episode_id = ? ORDER BY f.created_at, f.id",
+            FACT_COLS_F
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![episode_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_fact(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Remove an episode and roll back facts it originally created. Facts for
+    /// which the episode was only additional support are retained with that
+    /// provenance link removed.
+    pub fn remove_episode_before_commit<F>(&self, id: &str, before_commit: F) -> Result<bool>
+    where
+        F: FnOnce(&[String]) -> Result<()>,
+    {
+        let tx = self.conn.unchecked_transaction()?;
+        let existed: bool = tx
+            .query_row("SELECT 1 FROM episodes WHERE id = ?", params![id], |_row| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !existed {
+            before_commit(&[])?;
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let linked: Vec<Fact> = {
+            let sql = format!(
+                "SELECT {} FROM facts f \
+                 INNER JOIN fact_episodes p ON p.fact_id = f.id \
+                 WHERE p.episode_id = ?",
+                FACT_COLS_F
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(params![id])?;
+            let mut facts = Vec::new();
+            while let Some(row) = rows.next()? {
+                facts.push(row_to_fact(row)?);
+            }
+            facts
+        };
+        let mut removed = Vec::new();
+        for mut fact in linked {
+            if fact.episodes.first().is_some_and(|episode| episode == id) {
+                tx.execute("DELETE FROM facts WHERE id = ?", params![fact.id])?;
+                removed.push(fact.id);
+            } else {
+                fact.episodes.retain(|episode| episode != id);
+                tx.execute(
+                    "UPDATE facts SET episodes = ? WHERE id = ?",
+                    params![serde_json::to_string(&fact.episodes)?, fact.id],
+                )?;
+                tx.execute(
+                    "DELETE FROM fact_episodes WHERE fact_id = ? AND episode_id = ?",
+                    params![fact.id, id],
+                )?;
+            }
+        }
+        tx.execute("DELETE FROM episodes WHERE id = ?", params![id])?;
+        before_commit(&removed)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Batched fact hydration (chunked `IN`), missing ids omitted.
@@ -846,6 +1158,72 @@ impl TopologyStore {
 
 // -- helpers ----------------------------------------------------------------
 
+fn property_object(value: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_property_versions(
+    conn: &Connection,
+    entity_id: &str,
+    existing_properties: Option<&str>,
+    new_properties: &serde_json::Value,
+    property_sources: &BTreeMap<String, String>,
+    new_valid_at: Option<TimeMs>,
+    recorded_at: TimeMs,
+) -> Result<()> {
+    let old_value = existing_properties
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or(serde_json::Value::Null);
+    let old = property_object(&old_value);
+    let new = property_object(new_properties);
+    for key in property_sources.keys() {
+        if !new.contains_key(key) {
+            return Err(GraphError::InvalidArgument(format!(
+                "property source was supplied for missing property {key:?}"
+            )));
+        }
+    }
+
+    let keys: BTreeSet<String> = old.keys().chain(new.keys()).cloned().collect();
+    for key in keys {
+        let old_value = old.get(&key);
+        let new_value = new.get(&key);
+        if old_value == new_value {
+            continue;
+        }
+        conn.execute(
+            "UPDATE entity_property_versions \
+             SET invalid_at = ?, expired_at = ? \
+             WHERE entity_id = ? AND property_key = ? AND expired_at IS NULL",
+            params![
+                new_valid_at.unwrap_or(recorded_at),
+                recorded_at,
+                entity_id,
+                key,
+            ],
+        )?;
+        if let Some(value) = new_value {
+            conn.execute(
+                "INSERT INTO entity_property_versions \
+                    (entity_id, property_key, value, episode_id, valid_at, invalid_at, \
+                     created_at, expired_at) \
+                 VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",
+                params![
+                    entity_id,
+                    key,
+                    serde_json::to_string(value)?,
+                    property_sources.get(&key),
+                    new_valid_at,
+                    recorded_at,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn bool_text(value: bool) -> &'static str {
     if value {
         "1"
@@ -854,9 +1232,10 @@ fn bool_text(value: bool) -> &'static str {
     }
 }
 
-fn expected_configuration(config: &GraphConfig) -> [(&'static str, String); 4] {
+fn expected_configuration(config: &GraphConfig) -> [(&'static str, String); 5] {
     [
         ("format_version", "2".to_string()),
+        ("index_metadata_version", "2".to_string()),
         ("vector_dim", config.vector_dim.to_string()),
         ("index_text", bool_text(config.index_text).to_string()),
         ("index_facts", bool_text(config.index_facts).to_string()),
@@ -999,6 +1378,20 @@ fn row_to_episode(row: &Row<'_>) -> Result<Episode> {
         occurred_at: row.get("occurred_at")?,
         created_at: row.get("created_at")?,
         properties: serde_json::from_str(&properties)?,
+    })
+}
+
+fn row_to_property_version(row: &Row<'_>) -> Result<EntityPropertyVersion> {
+    let value: String = row.get("value")?;
+    Ok(EntityPropertyVersion {
+        entity_id: row.get("entity_id")?,
+        key: row.get("property_key")?,
+        value: serde_json::from_str(&value)?,
+        episode_id: row.get("episode_id")?,
+        valid_at: row.get("valid_at")?,
+        invalid_at: row.get("invalid_at")?,
+        created_at: row.get("created_at")?,
+        expired_at: row.get("expired_at")?,
     })
 }
 
@@ -1250,6 +1643,34 @@ mod tests {
         all_ids.sort();
         assert_eq!(all_ids, vec!["a", "b", "c"]);
         assert_eq!(store.iter_entity_index_records().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn missing_index_metadata_version_forces_a_rebuild() {
+        let store = TopologyStore::open_in_memory().unwrap();
+        let config = GraphConfig::default();
+        store.configure(&config).unwrap();
+        store.mark_index_clean().unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM graph_meta WHERE key = 'index_metadata_version'",
+                [],
+            )
+            .unwrap();
+
+        store.configure(&config).unwrap();
+
+        assert!(store.index_dirty().unwrap());
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM graph_meta WHERE key = 'index_metadata_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
     }
 
     #[test]

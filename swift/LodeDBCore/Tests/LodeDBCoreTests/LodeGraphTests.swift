@@ -32,8 +32,10 @@ final class LodeGraphTests: XCTestCase {
 
         let fAcme = try g.addFact(src: "alice", relation: "works_at", dst: "acme",
                                   fact: "Alice works at Acme", validAt: 1000)
-        _ = try g.addFact(src: "alice", relation: "works_at", dst: "globex",
-                          fact: "Alice works at Globex", validAt: 2000, invalidates: [fAcme])
+        Thread.sleep(forTimeInterval: 0.005)
+        let fGlobex = try g.addFact(src: "alice", relation: "works_at", dst: "globex",
+                                    fact: "Alice works at Globex", validAt: 2000,
+                                    invalidates: [fAcme])
 
         XCTAssertEqual(try g.neighbors(id: "alice", relation: "works_at").map(\.dst), ["globex"])
         XCTAssertEqual(try g.neighbors(id: "alice", relation: "works_at", asOf: .at(1500)).map(\.dst), ["acme"])
@@ -44,6 +46,21 @@ final class LodeGraphTests: XCTestCase {
         let acme = try XCTUnwrap(hist.first { $0.id == fAcme })
         XCTAssertEqual(acme.invalidAt, 2000)
         XCTAssertNotNil(acme.expiredAt)
+        let globex = try XCTUnwrap(try g.getFact(fGlobex))
+        XCTAssertEqual(
+            try g.neighbors(
+                id: "alice", relation: "works_at",
+                asOf: .atKnown(validAt: 2500, knownAt: try XCTUnwrap(acme.expiredAt) - 1)
+            ).map(\.id),
+            [fAcme]
+        )
+        XCTAssertEqual(
+            try g.neighbors(
+                id: "alice", relation: "works_at",
+                asOf: .atKnown(validAt: 2500, knownAt: globex.createdAt)
+            ).map(\.id),
+            [fGlobex]
+        )
     }
 
     func testKHopTraversal() throws {
@@ -86,5 +103,62 @@ final class LodeGraphTests: XCTestCase {
         let fid = try g.addFact(src: "p", relation: "works_at", dst: "q", fact: "Pat works at QCo",
                                 episodes: [ep], validAt: 4242)
         XCTAssertEqual(try g.getFact(fid)?.referenceTime, 4242)
+    }
+
+    func testStrictNowAndStableEpisodeRollback() throws {
+        let g = try graph()
+        _ = try g.upsertEntity(id: "a", type: "Thing", label: "future source")
+        _ = try g.upsertEntity(id: "b", type: "Thing", label: "future target")
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        _ = try g.addFact(src: "a", relation: "rel", dst: "b",
+                          fact: "future relation", validAt: now + 86_400_000)
+        XCTAssertEqual(try g.neighbors(id: "a").count, 1)
+        XCTAssertTrue(try g.neighbors(id: "a", asOf: .nowValid).isEmpty)
+
+        let episode = try g.addEpisode(source: "note", body: "stable", occurredAt: now,
+                                       id: "stable-episode")
+        XCTAssertEqual(
+            try g.addEpisode(source: "note", body: "stable", occurredAt: now,
+                             id: "stable-episode"),
+            episode
+        )
+        let episodeFact = try g.addFact(
+            src: "a", relation: "from_episode", dst: "b", fact: "stable derivation",
+            episodes: [episode], id: "stable-fact"
+        )
+        XCTAssertEqual(
+            try g.addFact(
+                src: "a", relation: "from_episode", dst: "b", fact: "stable derivation",
+                episodes: [episode], id: "stable-fact"
+            ),
+            episodeFact
+        )
+        XCTAssertTrue(try g.episodes().contains { $0.id == episode })
+        XCTAssertEqual(try g.factsByEpisode(episode).map(\.id), [episodeFact])
+        XCTAssertTrue(try g.removeEpisode(episode))
+        XCTAssertNil(try g.getEpisode(episode))
+        XCTAssertNil(try g.getFact(episodeFact))
+
+        let source = try g.addEpisode(
+            source: "event", body: "activated", occurredAt: now, id: "activation"
+        )
+        _ = try g.upsertEntity(
+            id: "a", type: "Thing", label: "future source",
+            properties: ["owner": "u1", "status": "new"]
+        )
+        _ = try g.upsertEntity(
+            id: "a", type: "Thing", label: "future source",
+            properties: ["owner": "u1", "status": "active"],
+            propertySources: ["status": source]
+        )
+        let status = try g.entityPropertyHistory("a", key: "status")
+        XCTAssertEqual(status.map(\.value), [.string("new"), .string("active")])
+        XCTAssertEqual(status.last?.episodeID, source)
+        XCTAssertEqual(
+            try g.semanticEntities(
+                "future source", predicate: .equals("owner", "u1")
+            ).map(\.entity.id),
+            ["a"]
+        )
     }
 }

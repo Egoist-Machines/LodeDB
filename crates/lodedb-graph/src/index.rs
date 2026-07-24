@@ -218,8 +218,7 @@ impl SemanticIndex {
         if ids.is_empty() {
             return Ok(());
         }
-        let document_ids: Vec<String> =
-            ids.iter().map(|id| format!("{FACT_PREFIX}{id}")).collect();
+        let document_ids: Vec<String> = ids.iter().map(|id| format!("{FACT_PREFIX}{id}")).collect();
         self.engine
             .delete_documents(&self.index_id, &document_ids)?;
         Ok(())
@@ -229,6 +228,7 @@ impl SemanticIndex {
 
     /// Top-`k` entities for a text query (hybrid) or a precomputed embedding
     /// (vector), optionally narrowed to `entity_type` and time-scoped by `as_of`.
+    #[allow(dead_code)]
     pub fn semantic_entities(
         &self,
         query: Option<&str>,
@@ -238,12 +238,29 @@ impl SemanticIndex {
         entity_type: Option<&str>,
         as_of: AsOf,
     ) -> Result<Vec<IndexHit>> {
-        let filter = asof_filter("entity", entity_type.map(|t| ("type", t)), as_of);
+        self.semantic_entities_filtered(query, embedding, embedder, k, entity_type, as_of, None)
+    }
+
+    /// [`semantic_entities`] with a property predicate pushed into the index
+    /// before candidate generation and ranking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_entities_filtered(
+        &self,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        embedder: Option<&dyn Embedder>,
+        k: usize,
+        entity_type: Option<&str>,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<IndexHit>> {
+        let filter = asof_filter("entity", entity_type.map(|t| ("type", t)), as_of, predicate)?;
         self.search(query, embedding, embedder, k, filter, ENTITY_PREFIX)
     }
 
     /// Top-`k` facts for a query/embedding, optionally restricted to `relation`,
     /// time-scoped by `as_of` — Graphiti's default (edge/fact) search shape.
+    #[allow(dead_code)]
     pub fn semantic_facts(
         &self,
         query: Option<&str>,
@@ -253,7 +270,23 @@ impl SemanticIndex {
         relation: Option<&str>,
         as_of: AsOf,
     ) -> Result<Vec<IndexHit>> {
-        let filter = asof_filter("fact", relation.map(|r| ("relation", r)), as_of);
+        self.semantic_facts_filtered(query, embedding, embedder, k, relation, as_of, None)
+    }
+
+    /// [`semantic_facts`] with a property predicate pushed into the index before
+    /// candidate generation and ranking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_facts_filtered(
+        &self,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        embedder: Option<&dyn Embedder>,
+        k: usize,
+        relation: Option<&str>,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<IndexHit>> {
+        let filter = asof_filter("fact", relation.map(|r| ("relation", r)), as_of, predicate)?;
         self.search(query, embedding, embedder, k, filter, FACT_PREFIX)
     }
 
@@ -261,6 +294,7 @@ impl SemanticIndex {
     /// caller's entity-resolution step. The engine surfaces candidates; the caller
     /// (an LLM, or a threshold) decides the merge. This is the helper Graphiti's
     /// resolution leans on, exposed without the LLM.
+    #[allow(dead_code)]
     pub fn resolve_entity(
         &self,
         name: &str,
@@ -270,6 +304,18 @@ impl SemanticIndex {
         // Candidates regardless of temporal validity (AsOf::All): resolution merges
         // against every version, not just the currently-live ones.
         self.semantic_entities(Some(name), None, embedder, k, None, AsOf::All)
+    }
+
+    /// [`resolve_entity`] with an authorization/support predicate applied before
+    /// candidates can influence ranking.
+    pub fn resolve_entity_filtered(
+        &self,
+        name: &str,
+        embedder: Option<&dyn Embedder>,
+        k: usize,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<IndexHit>> {
+        self.semantic_entities_filtered(Some(name), None, embedder, k, None, AsOf::All, predicate)
     }
 
     // -- maintenance --------------------------------------------------------
@@ -329,10 +375,12 @@ impl SemanticIndex {
         metadata.insert("kind".to_string(), "entity".to_string());
         metadata.insert("type".to_string(), entity.entity_type.clone());
         metadata.insert("entity_id".to_string(), entity.id.clone());
+        self.mirror_properties(&mut metadata, &entity.properties);
         self.mirror_temporal(
             &mut metadata,
             entity.valid_at,
             entity.invalid_at,
+            entity.created_at,
             entity.expired_at,
         );
         metadata
@@ -345,10 +393,12 @@ impl SemanticIndex {
         metadata.insert("fact_id".to_string(), fact.id.clone());
         metadata.insert("src".to_string(), fact.src.clone());
         metadata.insert("dst".to_string(), fact.dst.clone());
+        self.mirror_properties(&mut metadata, &fact.properties);
         self.mirror_temporal(
             &mut metadata,
             fact.valid_at,
             fact.invalid_at,
+            fact.created_at,
             fact.expired_at,
         );
         metadata
@@ -362,6 +412,7 @@ impl SemanticIndex {
         metadata: &mut BTreeMap<String, String>,
         valid_at: Option<i64>,
         invalid_at: Option<i64>,
+        created_at: i64,
         expired_at: Option<i64>,
     ) {
         // Open START sorts below every timestamp; open END sorts above every
@@ -369,7 +420,33 @@ impl SemanticIndex {
         // topology's `IS NULL` semantics across the full signed i64 domain.
         metadata.insert("valid_at".to_string(), encode_ts_start(valid_at));
         metadata.insert("invalid_at".to_string(), encode_ts_open(invalid_at));
+        metadata.insert("created_at".to_string(), encode_ts(created_at));
         metadata.insert("expired_at".to_string(), encode_ts_open(expired_at));
+        metadata.insert(
+            "expired_at_is_open".to_string(),
+            expired_at.is_none().to_string(),
+        );
+    }
+
+    /// Mirror top-level scalar properties under a reserved namespace. Search
+    /// predicates are rewritten into the same namespace, so callers cannot
+    /// override `kind`, temporal bounds, ids, or relation/type constraints.
+    fn mirror_properties(&self, metadata: &mut BTreeMap<String, String>, properties: &Value) {
+        let Some(object) = properties.as_object() else {
+            return;
+        };
+        for (key, value) in object {
+            let encoded = match value {
+                Value::Null => Some(String::new()),
+                Value::String(text) => Some(text.clone()),
+                Value::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_string()),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Array(_) | Value::Object(_) => None,
+            };
+            if let Some(encoded) = encoded {
+                metadata.insert(format!("property:{key}"), encoded);
+            }
+        }
     }
 
     /// Batch the write half shared by entities and facts. Vector-in documents use
@@ -433,8 +510,7 @@ impl SemanticIndex {
             self.engine.apply_text_upsert(&plan, &embeddings, 0.0)?;
         }
         if !delete_ids.is_empty() {
-            self.engine
-                .delete_documents(&self.index_id, &delete_ids)?;
+            self.engine.delete_documents(&self.index_id, &delete_ids)?;
         }
         Ok(())
     }
@@ -545,7 +621,12 @@ impl SemanticIndex {
 /// - [`AsOf::Now`]: both open sentinels (`expired_at`/`invalid_at` still open).
 /// - [`AsOf::At`]: `valid_at <= t` and `invalid_at > t` over the sortable strings.
 /// - [`AsOf::All`]: no temporal clause (every version).
-fn asof_filter(kind: &str, type_or_relation: Option<(&str, &str)>, as_of: AsOf) -> Option<Value> {
+fn asof_filter(
+    kind: &str,
+    type_or_relation: Option<(&str, &str)>,
+    as_of: AsOf,
+    predicate: Option<&Value>,
+) -> Result<Option<Value>> {
     let mut clauses: Vec<Value> = vec![json!({ "kind": kind })];
     if let Some((key, value)) = type_or_relation {
         clauses.push(json!({ key: value }));
@@ -555,13 +636,82 @@ fn asof_filter(kind: &str, type_or_relation: Option<(&str, &str)>, as_of: AsOf) 
             clauses.push(json!({ "expired_at": encode_ts_open(None) }));
             clauses.push(json!({ "invalid_at": encode_ts_open(None) }));
         }
+        AsOf::NowValid(t) => {
+            clauses.push(json!({ "valid_at": { "$lte": encode_ts(t) } }));
+            clauses.push(json!({ "invalid_at": { "$gt": encode_ts(t) } }));
+            clauses.push(json!({ "created_at": { "$lte": encode_ts(t) } }));
+            clauses.push(json!({ "expired_at": { "$gt": encode_ts(t) } }));
+        }
         AsOf::At(t) => {
             clauses.push(json!({ "valid_at": { "$lte": encode_ts(t) } }));
             clauses.push(json!({ "invalid_at": { "$gt": encode_ts(t) } }));
         }
+        AsOf::AtKnown { valid_at, known_at } => {
+            clauses.push(json!({ "valid_at": { "$lte": encode_ts(valid_at) } }));
+            clauses.push(json!({ "created_at": { "$lte": encode_ts(known_at) } }));
+            clauses.push(json!({ "expired_at": { "$gt": encode_ts(known_at) } }));
+            clauses.push(json!({
+                "$or": [
+                    {
+                        "$and": [
+                            { "expired_at_is_open": "false" },
+                            { "expired_at": { "$gt": encode_ts(known_at) } }
+                        ]
+                    },
+                    { "invalid_at": { "$gt": encode_ts(valid_at) } }
+                ]
+            }));
+        }
         AsOf::All => {}
     }
-    Some(json!({ "$and": clauses }))
+    if let Some(predicate) = predicate {
+        let predicate = lodedb_core::filter::coerce_sdk_filter(predicate)
+            .map_err(|error| GraphError::InvalidArgument(error.to_string()))?;
+        clauses.push(namespace_property_predicate(&predicate)?);
+    }
+    Ok(Some(json!({ "$and": clauses })))
+}
+
+fn namespace_property_predicate(predicate: &Value) -> Result<Value> {
+    fn walk(value: &Value) -> std::result::Result<Value, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "property predicate must be an object".to_string())?;
+        if object.is_empty() {
+            return Err("property predicate must be a non-empty object".to_string());
+        }
+        let mut out = serde_json::Map::new();
+        for (key, spec) in object {
+            match key.as_str() {
+                "$and" | "$or" => {
+                    let items = spec
+                        .as_array()
+                        .ok_or_else(|| format!("{key} requires a list of predicates"))?;
+                    out.insert(
+                        key.clone(),
+                        Value::Array(
+                            items
+                                .iter()
+                                .map(walk)
+                                .collect::<std::result::Result<_, _>>()?,
+                        ),
+                    );
+                }
+                "$not" => {
+                    out.insert(key.clone(), walk(spec)?);
+                }
+                _ if key.starts_with('$') => {
+                    return Err(format!("unsupported property predicate operator {key:?}"));
+                }
+                _ => {
+                    out.insert(format!("property:{key}"), spec.clone());
+                }
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    walk(predicate).map_err(GraphError::InvalidArgument)
 }
 
 /// Strip a known doc-id prefix to recover the entity/fact id.

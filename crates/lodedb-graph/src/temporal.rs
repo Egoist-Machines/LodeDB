@@ -60,10 +60,26 @@ pub fn as_of_sql(as_of: AsOf) -> (String, Vec<TimeMs>) {
             "(f.expired_at IS NULL AND f.invalid_at IS NULL)".to_string(),
             vec![],
         ),
+        AsOf::NowValid(t) => (
+            "(f.valid_at IS NULL OR f.valid_at <= ?) \
+             AND (f.invalid_at IS NULL OR f.invalid_at > ?) \
+             AND f.created_at <= ? \
+             AND (f.expired_at IS NULL OR f.expired_at > ?)"
+                .to_string(),
+            vec![t, t, t, t],
+        ),
         AsOf::At(t) => (
             "(f.valid_at IS NULL OR f.valid_at <= ?) AND (f.invalid_at IS NULL OR f.invalid_at > ?)"
                 .to_string(),
             vec![t, t],
+        ),
+        AsOf::AtKnown { valid_at, known_at } => (
+            "(f.valid_at IS NULL OR f.valid_at <= ?) \
+             AND f.created_at <= ? \
+             AND (f.expired_at IS NULL OR f.expired_at > ?) \
+             AND (f.expired_at > ? OR f.invalid_at IS NULL OR f.invalid_at > ?)"
+                .to_string(),
+            vec![valid_at, known_at, known_at, known_at, valid_at],
         ),
     }
 }
@@ -77,12 +93,28 @@ pub fn frame_matches(
     as_of: AsOf,
     valid_at: Option<TimeMs>,
     invalid_at: Option<TimeMs>,
+    created_at: TimeMs,
     expired_at: Option<TimeMs>,
 ) -> bool {
     match as_of {
         AsOf::All => true,
         AsOf::Now => expired_at.is_none() && invalid_at.is_none(),
+        AsOf::NowValid(t) => {
+            valid_at.is_none_or(|v| v <= t)
+                && invalid_at.is_none_or(|i| i > t)
+                && created_at <= t
+                && expired_at.is_none_or(|e| e > t)
+        }
         AsOf::At(t) => valid_at.is_none_or(|v| v <= t) && invalid_at.is_none_or(|i| i > t),
+        AsOf::AtKnown {
+            valid_at: v,
+            known_at: k,
+        } => {
+            valid_at.is_none_or(|start| start <= v)
+                && created_at <= k
+                && expired_at.is_none_or(|end| end > k)
+                && (expired_at.is_some_and(|end| end > k) || invalid_at.is_none_or(|end| end > v))
+        }
     }
 }
 

@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 5
+let lodeNativeExpectedABIVersion: UInt32 = 6
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -680,6 +680,9 @@ final class NativeTemporalGraph {
     func removeFact(_ j: String) throws -> String {
         try ownedCall { o, e in withStringView(j) { lodedb_graph_remove_fact_json(handle, $0, o, e) } }
     }
+    func removeEpisode(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_remove_episode_json(handle, $0, o, e) } }
+    }
     func getEntity(_ j: String) throws -> String {
         try ownedCall { o, e in withStringView(j) { lodedb_graph_get_entity_json(handle, $0, o, e) } }
     }
@@ -688,6 +691,15 @@ final class NativeTemporalGraph {
     }
     func getEpisode(_ j: String) throws -> String {
         try ownedCall { o, e in withStringView(j) { lodedb_graph_get_episode_json(handle, $0, o, e) } }
+    }
+    func episodes(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_episodes_json(handle, $0, o, e) } }
+    }
+    func factsByEpisode(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_facts_by_episode_json(handle, $0, o, e) } }
+    }
+    func entityPropertyHistory(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_entity_property_history_json(handle, $0, o, e) } }
     }
     func entities(_ j: String) throws -> String {
         try ownedCall { o, e in withStringView(j) { lodedb_graph_entities_json(handle, $0, o, e) } }

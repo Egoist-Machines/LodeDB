@@ -15,7 +15,14 @@ from __future__ import annotations
 
 from ._store import Edge, Node
 from .knowledge_graph import KnowledgeGraph, Subgraph
-from .temporal import Embedder, TemporalKnowledgeGraph
+from .temporal import (
+    Embedder,
+    TemporalKnowledgeGraph,
+    episode_mentions_reranker,
+    maximal_marginal_relevance,
+    node_distance_reranker,
+    rrf,
+)
 
 __all__ = [
     "Edge",
@@ -24,4 +31,8 @@ __all__ = [
     "Node",
     "Subgraph",
     "TemporalKnowledgeGraph",
+    "episode_mentions_reranker",
+    "maximal_marginal_relevance",
+    "node_distance_reranker",
+    "rrf",
 ]
