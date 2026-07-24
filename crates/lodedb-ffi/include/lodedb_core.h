@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 4u
+#define LODEDB_ABI_VERSION 5u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -314,6 +314,58 @@ uint32_t lodedb_checkpointer_checkpoint(
     LodeCheckpointer *checkpointer,
     uint64_t *out_folded,
     LodeError **error);
+
+/* --- Bi-temporal knowledge graph (lodedb-graph) -------------------------
+   Opened without an embedder: the caller (e.g. Swift LodeGraph) embeds
+   label/fact/query text on device and passes vectors to the vector-in verbs.
+   Every verb below takes one JSON request LodeStringView and writes one JSON
+   response LodeOwnedString, using the same status/error contract as the engine. */
+typedef struct LodeGraph LodeGraph;
+
+uint32_t lodedb_graph_open_json(
+    LodeStringView request,
+    LodeGraph **out,
+    LodeError **error);
+void lodedb_graph_free(LodeGraph *graph);
+
+uint32_t lodedb_graph_add_episode_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_upsert_entity_vec_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_add_fact_vec_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_invalidate_fact_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_remove_entity_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_remove_fact_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_get_entity_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_get_fact_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_get_episode_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_entities_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_history_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_neighbors_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_k_hop_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_semantic_entities_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_semantic_facts_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_search_subgraph_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_reindex_json(
+    LodeGraph *graph, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_stats_json(
+    const LodeGraph *graph, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_persist(
+    LodeGraph *graph, LodeError **error);
 
 #ifdef __cplusplus
 }

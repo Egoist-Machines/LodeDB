@@ -124,7 +124,7 @@ def _text_add_search_embed_counts(mode, write_mode, store_dir, monkeypatch):
 
 
 def test_native_core_extension_executes_vector_store_flow() -> None:
-    assert native_core.native_core_abi_version() == 4
+    assert native_core.native_core_abi_version() == 5
     engine = native_core.CoreEngine()
     engine.create_index("default", 8, 4)
     mutation = _loads(

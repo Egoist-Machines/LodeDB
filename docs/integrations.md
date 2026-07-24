@@ -189,14 +189,14 @@ the local-bridge step first.
 
 ### kotaemon
 - **Repo:** Cinnamon/kotaemon (~26k★, Apache-2.0). Local, open-source RAG UI for chatting
-  with documents. **Install:** none. The adapter is dependency-free (it duck-types
+  with documents. **Install:** none — the adapter is dependency-free (it duck-types
   kotaemon's `DocumentWithEmbedding` and LlamaIndex's `MetadataFilters` rather than
   importing either package), so plain `lodedb` inside kotaemon's environment is enough.
 - **Pattern:** `lodedb.local.integrations.kotaemon.LodeDBVectorStore` implements kotaemon's
   `BaseVectorStore` contract (`add` / `delete` / `query` / `drop`, plus `count` and
   `__persist_flow__`). kotaemon resolves its vector store from a dotted `__type__` path via
-  theflow's `deserialize`, so selection is a settings change only, with no kotaemon fork
-  and no registration call:
+  theflow's `deserialize`, so selection is a settings change only — no kotaemon fork, no
+  registration call:
 
   ```python
   # flowsettings.py
@@ -210,12 +210,12 @@ the local-bridge step first.
   LodeDB store under `<path>/<collection_name>`. See
   [`examples/kotaemon_store.py`](../examples/kotaemon_store.py).
 - **Why it fits:** kotaemon's default is a Chroma collection per file index, rebuilt chunk
-  batch by chunk batch as users upload files. That is exactly the incremental-write workload
+  batch by chunk batch as users upload files — exactly the incremental-write workload
   LodeDB's O(changed) delta persistence targets, and the app is local-first so a zero-server
   embedded store is a category match.
 - **Embeddings:** kotaemon owns embedding (its pipelines pass precomputed vectors), so the
-  adapter uses LodeDB's vector-in path. kotaemon never configures an embedding dimension
-  (the store meets whatever model the user selected), so the LodeDB index is created lazily on
+  adapter uses LodeDB's vector-in path. kotaemon never configures an embedding dimension —
+  the store meets whatever model the user selected — so the LodeDB index is created lazily on
   first `add` and its shape is recorded in a `kotaemon_store.json` sidecar for reopens.
   Dimensions that are not a multiple of 8 (a LodeDB index requirement) are zero-padded up,
   which changes neither norms nor dot products before LodeDB's configured quantization. Chunk
@@ -230,14 +230,14 @@ the local-bridge step first.
   default on normalized vectors (14/14 checks).
 - **Benchmark (kotaemon interface, 20k × 384-dim normalized vectors, batches of 100, one
   process per backend, M-series CPU):** vs the default `ChromaVectorStore`, byte-identical
-  vectors/ids/metadata/top-k on both sides. Ingest 1.8s vs 16.9s (~9×); per-100-chunk add
+  vectors/ids/metadata/top-k on both sides — ingest 1.8s vs 16.9s (~9×); per-100-chunk add
   (= durable commit at this seam) p50 8.6ms / p95 8.9ms / p99 9.0ms vs p50 83.9ms / p95
   111ms / p99 126ms (the O(changed) tail story); query p50 0.17ms / p95 0.22ms vs 64.2ms /
   65.1ms; 500-chunk scoped query p50 0.31ms vs 64.5ms; disk 10.5MB vs 424MB (~40×); peak RSS
   ~even (592MB vs 577MB, both dominated by the benchmark fixture); top-1 accuracy vs a
   brute-force oracle 1.000 vs 0.440 (near-tie random vectors are adversarial for HNSW;
   real-embedding gaps are smaller, but exact scan cannot miss the true neighbor). Chroma's
-  cold reopen is faster (0.07s vs 0.43s). Batch-query latency is N/A at this seam because
+  cold reopen is faster (0.07s vs 0.43s). Batch-query latency is N/A at this seam —
   kotaemon's `BaseVectorStore` has no batch-query API (retrieval issues single queries);
   LodeDB's batch path is covered by the repo's own benchmarks. Score scale differs by
   design: LodeDB returns cosine similarity, Chroma's default collection ranks by L2
@@ -247,7 +247,7 @@ the local-bridge step first.
 - **Scope:** vector store only; kotaemon's docstore (LanceDB/Elasticsearch/SimpleFile) and
   graph indices are separate seams and unchanged. Upstream, kotaemon bundles store choices in
   `libs/kotaemon/kotaemon/storages/vectorstores/`; a PR there would add a thin subclass plus
-  a `pip install lodedb` extra in their docs; the settings-path integration above works
+  a `pip install lodedb` extra in their docs — the settings-path integration above works
   today without it.
 
 ### cognee ([#74](https://github.com/Egoist-Machines/LodeDB/pull/74), in review)

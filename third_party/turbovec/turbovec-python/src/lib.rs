@@ -15,6 +15,7 @@ use pyo3::types::{PyBytes, PyType};
 // format), exposed as the `cloud` submodule so the [cloud] extra's Python
 // client rides the same bundled extension as the engine.
 mod cloud;
+mod graph;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1310,7 +1311,7 @@ impl PyCoreEngine {
     /// of records actually applied (records at or below the store's applied
     /// watermark skip for refold idempotence). Refuses a segment that already
     /// carries LSNs -- stamping is this binding's job, and a pre-stamped blob
-    /// signals a re-fold of an already-folded segment. Does NOT persist: the caller
+    /// signals a re-upload of an already-folded file. Does NOT persist: the caller
     /// publishes one generation delta per fold batch via `persist()`. Decode +
     /// stamp + apply run in one native call so embedding-heavy records never
     /// round-trip through Python JSON.
@@ -1464,7 +1465,7 @@ fn plan_segment_documents(
 /// Builds the `apply_embedded_documents` WAL payload (as JSON) for an
 /// `IngestPlan` JSON plus a contiguous `(n, dim)` f32 embedding matrix, one row
 /// per `plan.chunks_to_embed` in order. Count, dimension, and finiteness are
-/// validated natively so a poison record can never be encoded.
+/// validated natively so a poison record can never be encoded and uploaded.
 #[pyfunction]
 fn build_embedded_documents_payload(
     plan_json: &str,
@@ -1482,7 +1483,7 @@ fn build_embedded_documents_payload(
 /// Encodes a JSON array of `{op, payload}` records into an immutable
 /// LodeDB WAL-format segment (file header + CRC-framed records, LSNs
 /// unassigned). Ops are validated against the native-replayable set and
-/// records must be unstamped -- both fail closed here, at encode time.
+/// records must be unstamped -- both fail closed here, before an upload.
 #[pyfunction]
 fn encode_wal_segment<'py>(py: Python<'py>, records_json: &str) -> PyResult<Bound<'py, PyBytes>> {
     #[derive(serde::Deserialize)]
@@ -1731,5 +1732,6 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_wal_segment, m)?)?;
     m.add_function(wrap_pyfunction!(decode_wal_segment, m)?)?;
     cloud::register(m)?;
+    graph::register(m)?;
     Ok(())
 }

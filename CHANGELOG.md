@@ -5,6 +5,27 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`lodedb-graph`: a bi-temporal knowledge graph, the temporal successor to
+  `lodedb.graph.KnowledgeGraph`.** A new native crate (`crates/lodedb-graph`) over
+  `lodedb-core` that keeps the two-store architecture, an authoritative SQLite
+  topology store plus a rebuildable LodeDB semantic index, and adds Graphiti-style
+  bi-temporality: every fact carries event time (`valid_at`/`invalid_at`) and
+  transaction time (`created_at`/`expired_at`), contradictions **invalidate** rather
+  than delete, and every read takes an `as_of` frame (current / as-of an instant /
+  full history). Episodes → entities → facts with provenance, deterministic k-hop
+  traversal, hybrid semantic entry points, and the Graphiti rerankers (RRF, MMR,
+  node-distance, episode-mentions) ported as pure functions. It is the storage-and-
+  query half of Graphiti, with no LLM extraction, resolution, or contradiction
+  detection; `add_fact` is the analogue of Graphiti's `add_triplet`. Exposed to Python as
+  `lodedb.graph.TemporalKnowledgeGraph` (the `lodedb._turbovec.graph` submodule),
+  driven by a caller-supplied embedder (or precomputed vectors), and to Swift as
+  `LodeGraph`, which embeds on device and drives the same engine over the C ABI.
+  See [`docs/temporal-graph.md`](docs/temporal-graph.md).
+
 ## [1.4.0] - 2026-07-18
 
 ### Added
@@ -15,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user's store over HTTPS, duck-typing the local verb surface), the transfer
   verbs (`push`/`pull`/`sync`/`status`/`verify`/`keys`) on a native transfer
   core bundled into the extension as `lodedb._turbovec.cloud` (one
-  commit-format implementation shared with the engine, the new
+  commit-format implementation shared with the engine — the new
   `crates/lodedb-cloud-core`, which also learns the 1.3.2 `tvvf` rescore
   sidecar so rescore stores transfer completely), and the full `lodedb
   cloud` CLI (login, tokens, store/environment/org management, transfer,
@@ -30,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lodedb cloud login`), and the `"org/environment/store"` triple and
   full `orecloud://` URLs are accepted too. The call returns the cloud store handle (same
   `add`/`search`/`get`/`remove` verbs over HTTPS). For config-driven code,
-  the plain constructor also dispatches the explicit URL form
-  `LodeDB("orecloud://org/environment/store")` through the same funnel.
+  the plain constructor also dispatches the explicit URL form —
+  `LodeDB("orecloud://org/environment/store")` — through the same funnel.
   Local-only construction options (`model=`, `read_only=`, ...) are rejected
   on cloud targets with a targeted error, and a cloud target without the
   `[cloud]` extra's dependencies raises the install hint.
@@ -62,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`open_vector_store` / `LodeDB(vector_dim=...)`) that retains text (`store_text=True`,
   the default, or `index_text=True`): they rank the text carried on the stored vectors with
   LodeDB's Okapi BM25, no embedder needed. `mode="vector"`/`"hybrid"` still raise
-  `VectorOnlyIndexError` on such a store (they must embed the query; use `search_by_vector`),
+  `VectorOnlyIndexError` on such a store (they must embed the query — use `search_by_vector`),
   and an unset `mode` resolves to `"lexical"` there instead of `"hybrid"`. This lets
   vector-in integrations (mem0, Haystack, any external embedder) offer keyword search through
   the public API instead of reaching into engine internals. No on-disk format change.
@@ -75,15 +96,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WAL segment primitives for out-of-band ingest (`lodedb.local.segments`).** Store-free
   planning (`plan_documents`), record building (`build_embedded_documents_record`,
   `delete_documents_record`), immutable WAL-format segment encode/decode
-  (`encode_segment`/`decode_segment`, strict), and `fold_segment`, which folds a
-  downloaded segment into a warm writable `commit_mode="generation"` handle, stamps LSNs
-  at fold time, and publishes one O(changed) generation delta per batch via `LodeDB.persist()`.
-  Core: `plan_documents`,
+  (`encode_segment`/`decode_segment`, strict), and `fold_segment` — fold a downloaded
+  segment into a warm writable `commit_mode="generation"` handle, stamping LSNs at fold
+  time and publishing one O(changed) generation delta per batch via `LodeDB.persist()`.
+  Enables cloud multi-writer pipelines (writers encode and upload segments lease-free; a
+  single fold orchestrator batches them into one commit). Core: `plan_documents`,
   `build_embedded_documents_payload`, `is_native_replayable_op`, and
   `CoreEngine::apply_wal_records` in `lodedb-core`; segments reuse the WAL frame format
-  byte-for-byte and carry raw text only under `store_text=True`. Advanced API, not
+  byte-for-byte and carry raw text only under `store_text=True`. Advanced API — not
   re-exported from the package root.
-- **`LodeDB.discard()`: close without persisting.** Releases the handle and its writer
+- **`LodeDB.discard()` — close without persisting.** Releases the handle and its writer
   lock while dropping un-persisted in-memory state, leaving the store at its last
   committed generation. The abort path after a failed `fold_segment` batch, where the
   in-memory state may be partially applied and a graceful `close()` would persist it.
@@ -95,14 +117,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A document added and removed between two persists no longer bricks the store.** The
   vector delta recorded the never-committed row's removal, and the strict delta replay
-  ("removed-id count mismatch") then rejected the store on every fresh open. The warm
+  ("removed-id count mismatch") then rejected the store on every fresh open — the warm
   handle kept serving while every new reader failed. The add+remove now cancel out of the
   delta; a *committed* row replaced or removed in the same window still records its
   removal. Reachable from any multi-record fold (`Checkpointer` over appended WAL records,
   `fold_segment` batches); found by a randomized concurrency test in the cloud companion.
 - **Duplicate document ids within one ingest batch are refused.** A repeated id in one
   `plan_documents` batch built a single `apply_embedded_documents` record whose earlier
-  occurrence's vector row survived the fold with no owner. After reopen, any query
+  occurrence's vector row survived the fold with no owner — after reopen, any query
   touching the orphan row failed with "TurboVec returned an unknown stable id". The
   planner, the payload builder, and the replay boundary now all reject the shape; callers
   that mean "replace" should keep the last occurrence or split the batch.
@@ -227,11 +249,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The native Rust core (TurboVec) is now the sole engine.** The Python `LodeEngine` and
-  `LodeIndex` are removed; every read and write runs through the in-process Rust
-  `CoreEngine`, with no Python fallback. That covers text and vector ingest, search
+  `LodeIndex` are removed; every read and write — text and vector ingest, search
   (vector / hybrid / lexical), filters, batch, late-interaction, persistence, and the
-  WAL/generation commit. The public Python API is unchanged but for one additive change:
-  `list_documents` gains `after`/`limit` keyset paging. MPS vector scanning was dropped (MPS embedding via
+  WAL/generation commit — runs through the in-process Rust `CoreEngine`, with no Python
+  fallback. The public Python API is unchanged but for one additive change: `list_documents`
+  gains `after`/`limit` keyset paging. MPS vector scanning was dropped (MPS embedding via
   PyTorch is unaffected).
 
 ### Added
@@ -367,7 +389,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **LlamaIndex `VectorStore` adapter** (`lodedb[llama-index]`). `LodeDBVectorStore` in
   `lodedb.local.integrations.llama_index` wraps the LodeDB SDK as a LlamaIndex
-  `BasePydanticVectorStore`, joining the existing LangChain adapter. It is *text-path*:
+  `BasePydanticVectorStore`, joining the existing LangChain adapter. It is *text-path* —
   LodeDB embeds text internally (`is_embedding_query=False`), so LlamaIndex's own
   `embed_model` is not used. Query modes map onto the SDK's retrieval modes:
   `VectorStoreQueryMode.DEFAULT` to vector search, `HYBRID`/`SEMANTIC_HYBRID` to the BM25 + RRF
@@ -460,19 +482,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact-match, so existing filters are unchanged. Ordered comparisons (`$gt`/`$gte`/`$lt`/`$lte`)
   are numeric when both the stored value and the operand parse as numbers, otherwise
   lexicographic; equality and membership (`$eq`/`$ne`/`$in`/`$nin`) always compare as strings, so
-  `{"n": {"$eq": 9.9}}` does not match a stored `9.90`. There is no storage-format change;
-  the predicates evaluate at query time over the existing string metadata.
+  `{"n": {"$eq": 9.9}}` does not match a stored `9.90`. No storage-format change — the predicates
+  evaluate at query time over the existing string metadata.
 - **Single-writer concurrency safety.** A LodeDB handle now holds an exclusive OS advisory
   lock (`<dir>/.lodedb.lock`) for its lifetime, so concurrent processes can no longer corrupt
-  the on-disk store. A second open of the same path waits for the first to close (then
-  loads the accumulated state and composes) and fails fast with `ConcurrentWriterError` once
+  the on-disk store. A second open of the same path waits for the first to close — then loads
+  the accumulated state and composes — and fails fast with `ConcurrentWriterError` once
   `LODEDB_PERSIST_LOCK_TIMEOUT` (default 30s) elapses, the model SQLite uses with a busy
   timeout. The kernel releases the lock on process exit, so a crash never wedges the path.
   Local filesystems only (advisory locks are unreliable on NFS/SMB). Live cross-process
   refresh (a reader auto-seeing another live process's writes) remains out of scope.
 - **Read-only handles (single writer, many readers).** `LodeDB.open_readonly(path)` (or
   `read_only=True`) opens a non-mutating snapshot that takes **no** writer lock, so it can
-  read a path while a writer holds it. `lodedb query` and `lodedb get` now use it, so they
+  read a path while a writer holds it — `lodedb query` and `lodedb get` now use it, so they
   work alongside a running `lodedb serve`/`mcp`. Mutating calls raise `ReadOnlyError`; the
   path must already exist. A read-only open loads the single consistent generation named by
   the atomic commit manifest (below), so it never observes a torn cross-file mix.
@@ -487,15 +509,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (JSON state base + `.jsd` journal, `.tvim` vector base + `.tvd` journal, and the opt-in
   `.tvtext` raw-text base + `.txd` journal); they are now written as generation-addressed
   artifacts under a per-index `<key>.gen/` directory and sealed by atomically swapping a single
-  `<key>.commit.json` root pointer; that swap is the only commit point. Because every
+  `<key>.commit.json` root pointer — that swap is the only commit point. Because every
   artifact (including raw text, on by default) is generation-addressed and pinned by the root,
   none is overwritten in place, so a crash (or `kill -9`) mid-commit leaves the previously
   committed generation fully intact and the next open rolls back to it (dropping the
   uncommitted artifacts) instead of failing closed and stuck. Lock-free readers load exactly
-  the generation the root manifest names, so they get consistent snapshot isolation (text
-  included) and never a torn cross-file read. Stores written by v0.1.x load via a legacy
-  fallback and migrate to the new layout on their next write; superseded generations are
-  garbage-collected (the most recent few are retained for in-flight readers).
+  the generation the root manifest names — consistent snapshot isolation (text included), no
+  torn cross-file reads. Stores written by v0.1.x load via a legacy fallback and migrate to
+  the new layout on their next write; superseded generations are garbage-collected (the most
+  recent few are retained for in-flight readers).
 - **First-class opt-in Apple-GPU (MPS) exact scan.** The Metal/MPS resident scan is now a
   selectable route at CUDA-level capability, off by default: in-place `patch()` on small
   mutations (O(changed) swap-remove + batched upsert), an `MpsDirectTurboVecPolicy`
@@ -503,7 +525,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an optional `LODEDB_MPS_MEMORY_BUDGET_BYTES` guard, and honest `lodedb doctor` reporting.
   MPS uses shared resident-scan helper code for deterministic top-k ordering and tile sizing;
   CUDA extraction onto those helpers remains a hardware-verified follow-up. **NEON remains the
-  default on Apple Silicon.** The MPS scan was slower than NEON at every batch size on the
+  default on Apple Silicon** — the MPS scan was slower than NEON at every batch size on the
   measured M1, so it is opt-in and off by default; any future default flip is gated on per-chip
   `benchmarks/mps_vs_neon` crossover data, especially for newer Apple GPUs such as M5.
 
@@ -546,8 +568,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GPU (`[gpu]`) resident copy now patches in place on small mutations** instead of
   rebuilding the whole dequantized array. Adds and removes apply in O(changed) rows
   (swap-remove + batched upsert) with a fail-closed rebuild fallback, so syncing a small
-  delta into a large GPU-resident index is dramatically cheaper (e.g. ~560× faster at
-  1,000 changed rows over a 1M-row corpus on an A10), with identical top-k results.
+  delta into a large GPU-resident index is dramatically cheaper — e.g. ~560× faster at
+  1,000 changed rows over a 1M-row corpus on an A10 — with identical top-k results.
 
 ### Fixed
 
@@ -570,15 +592,15 @@ First public release.
 - **Delta persistence**: on-disk index (`.tvim` / `.tvd`) plus a journal (`.jsd`) for fast
   incremental updates, and an optional `.tvtext` raw-text sidecar gated by `store_text`
   (default `True`; set `store_text=False` to keep no document text on disk).
-- **Python API**: `LodeDB` with `add`, `search`, `search_many`, `get`, and `persist`;
+- **Python API** — `LodeDB` with `add`, `search`, `search_many`, `get`, and `persist`;
   results returned as `LodeSearchHit`.
-- **`lodedb` CLI**: `doctor`, `index`, `query`, `get`, `benchmark`, `serve`, `mcp`.
-- **Local HTTP dev server** (`lodedb serve`): loopback-only, no auth, metrics-only
+- **`lodedb` CLI** — `doctor`, `index`, `query`, `get`, `benchmark`, `serve`, `mcp`.
+- **Local HTTP dev server** (`lodedb serve`) — loopback-only, no auth, metrics-only
   telemetry; exposes `/healthz`, `/stats`, `/search`, and `/get`.
 - **Optional extras**:
-  - `[gpu]`: opt-in CUDA-resident exact scan (cupy; Linux/CUDA only).
-  - `[mcp]`: stdio MCP server so coding agents can use LodeDB as local memory.
-  - `[langchain]`: LangChain `VectorStore` adapter.
+  - `[gpu]` — opt-in CUDA-resident exact scan (cupy; Linux/CUDA only).
+  - `[mcp]` — stdio MCP server so coding agents can use LodeDB as local memory.
+  - `[langchain]` — LangChain `VectorStore` adapter.
 
 ### Notes
 
@@ -586,7 +608,7 @@ First public release.
   `pyyaml`. Heavier research dependencies are not imported on the core path; this is
   enforced by `tests/test_import_boundary.py`.
 - LodeDB is licensed under Apache-2.0. The vendored TurboVec core
-  (`third_party/turbovec/`) is MIT; see [`NOTICE`](NOTICE).
+  (`third_party/turbovec/`) is MIT — see [`NOTICE`](NOTICE).
 
 [Unreleased]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.2...HEAD
 [0.1.2]: https://github.com/Egoist-Machines/LodeDB/compare/v0.1.1...v0.1.2

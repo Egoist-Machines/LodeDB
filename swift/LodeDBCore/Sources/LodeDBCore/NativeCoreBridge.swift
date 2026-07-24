@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 4
+let lodeNativeExpectedABIVersion: UInt32 = 5
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -623,5 +623,101 @@ func withStringView<T>(_ string: String, _ body: (LodeStringView) throws -> T) r
             len: UInt(string.utf8.count)
         )
         return try body(view)
+    }
+}
+
+/// Owning wrapper around a native `LodeGraph *` (the bi-temporal knowledge graph),
+/// statically linked from the `LodeDBCoreFFI` XCFramework (no `dlopen`). Not
+/// thread-safe; callers serialize access (see `LodeGraph`). Every verb takes one
+/// JSON request and returns one JSON response, reusing `NativeEngine`'s status/error
+/// and owned-string helpers.
+final class NativeTemporalGraph {
+    private let handle: OpaquePointer
+
+    private init(handle: OpaquePointer) { self.handle = handle }
+    deinit { lodedb_graph_free(handle) }
+
+    /// Opens (or creates) a graph from an `{path?, vector_dim, index_facts?}` JSON
+    /// request. Opened without an embedder — the Swift layer embeds and passes vectors.
+    static func open(requestJSON: String) throws -> NativeTemporalGraph {
+        try NativeEngine.requireABI()
+        var handle: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(requestJSON) { lodedb_graph_open_json($0, &handle, &error) }
+        try NativeEngine.check(status, error: error)
+        guard let handle else {
+            throw LodeDBError.internalError("native core did not return a graph")
+        }
+        return NativeTemporalGraph(handle: handle)
+    }
+
+    private func ownedCall(
+        _ body: (UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>,
+                 UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>) -> UInt32
+    ) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = body(&out, &error)
+        try NativeEngine.check(status, error: error)
+        return try NativeEngine.copyOwnedString(out)
+    }
+
+    func addEpisode(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_add_episode_json(handle, $0, o, e) } }
+    }
+    func upsertEntityVec(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_upsert_entity_vec_json(handle, $0, o, e) } }
+    }
+    func addFactVec(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_add_fact_vec_json(handle, $0, o, e) } }
+    }
+    func invalidateFact(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_invalidate_fact_json(handle, $0, o, e) } }
+    }
+    func removeEntity(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_remove_entity_json(handle, $0, o, e) } }
+    }
+    func removeFact(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_remove_fact_json(handle, $0, o, e) } }
+    }
+    func getEntity(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_get_entity_json(handle, $0, o, e) } }
+    }
+    func getFact(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_get_fact_json(handle, $0, o, e) } }
+    }
+    func getEpisode(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_get_episode_json(handle, $0, o, e) } }
+    }
+    func entities(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_entities_json(handle, $0, o, e) } }
+    }
+    func history(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_history_json(handle, $0, o, e) } }
+    }
+    func neighbors(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_neighbors_json(handle, $0, o, e) } }
+    }
+    func kHop(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_k_hop_json(handle, $0, o, e) } }
+    }
+    func semanticEntities(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_semantic_entities_json(handle, $0, o, e) } }
+    }
+    func semanticFacts(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_semantic_facts_json(handle, $0, o, e) } }
+    }
+    func searchSubgraph(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_graph_search_subgraph_json(handle, $0, o, e) } }
+    }
+    func reindex() throws -> String {
+        try ownedCall { o, e in lodedb_graph_reindex_json(handle, o, e) }
+    }
+    func stats() throws -> String {
+        try ownedCall { o, e in lodedb_graph_stats_json(handle, o, e) }
+    }
+    func persist() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try NativeEngine.check(lodedb_graph_persist(handle, &error), error: error)
     }
 }
