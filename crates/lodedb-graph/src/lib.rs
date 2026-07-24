@@ -36,10 +36,11 @@ mod temporal;
 mod topology;
 
 pub use error::{GraphError, Result};
-pub use graph::{GraphStats, ReindexStats, TemporalGraph};
+pub use graph::{now_valid_frame, GraphStats, ReindexStats, TemporalGraph};
 pub use index::IndexHit;
 pub use model::{
-    AsOf, Direction, EmbedRole, Embedder, Entity, Episode, Fact, GraphConfig, Subgraph, TimeMs,
+    AsOf, Direction, EmbedRole, Embedder, Entity, EntityPropertyVersion, Episode, Fact,
+    GraphConfig, Subgraph, TimeMs,
 };
 
 // The reranker primitives (ported from Graphiti's search_utils) are public so the

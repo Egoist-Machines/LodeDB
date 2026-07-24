@@ -25,7 +25,9 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// symbols (`lodedb_graph_open_json` / `lodedb_graph_free` plus the JSON verbs) and a
 /// `LodeGraph` handle, so a wrapper that drives a graph (the Swift `LodeGraph`) must
 /// not pair with an older core lacking them.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 5;
+/// Bumped to 6 for episode enumeration and rollback plus entity-property lineage
+/// reads on the graph FFI.
+pub const NATIVE_CORE_ABI_VERSION: u32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -37,6 +39,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 5);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 6);
     }
 }

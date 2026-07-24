@@ -112,7 +112,13 @@ impl Fact {
     /// Whether the fact satisfies `as_of` per the authoritative row — the
     /// in-memory twin of the SQL frame (see `temporal::frame_matches`).
     pub fn matches(&self, as_of: AsOf) -> bool {
-        crate::temporal::frame_matches(as_of, self.valid_at, self.invalid_at, self.expired_at)
+        crate::temporal::frame_matches(
+            as_of,
+            self.valid_at,
+            self.invalid_at,
+            self.created_at,
+            self.expired_at,
+        )
     }
 }
 
@@ -120,8 +126,35 @@ impl Entity {
     /// Whether the entity satisfies `as_of` per the authoritative row — the
     /// in-memory twin of the SQL frame (see `temporal::frame_matches`).
     pub fn matches(&self, as_of: AsOf) -> bool {
-        crate::temporal::frame_matches(as_of, self.valid_at, self.invalid_at, self.expired_at)
+        crate::temporal::frame_matches(
+            as_of,
+            self.valid_at,
+            self.invalid_at,
+            self.created_at,
+            self.expired_at,
+        )
     }
+}
+
+/// One version of one entity property.
+///
+/// Entity rows remain convenient materialized snapshots, while this record keeps
+/// the independently versioned value and its optional source episode. A changed
+/// property closes the prior version instead of erasing it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityPropertyVersion {
+    pub entity_id: String,
+    pub key: String,
+    pub value: Value,
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    #[serde(default)]
+    pub valid_at: Option<TimeMs>,
+    #[serde(default)]
+    pub invalid_at: Option<TimeMs>,
+    pub created_at: TimeMs,
+    #[serde(default)]
+    pub expired_at: Option<TimeMs>,
 }
 
 /// Direction of traversal over facts, relative to a set of seed nodes.
@@ -151,13 +184,24 @@ impl Direction {
 
 /// The temporal frame a read resolves under.
 ///
-/// - [`AsOf::Now`] — the current view (live facts only): Graphiti's default.
-/// - [`AsOf::At`] — as-of an event-time instant `T`: facts valid at `T`.
-/// - [`AsOf::All`] — every version, no temporal filter (history).
+/// - [`AsOf::Now`] is the compatibility current view used by Graphiti. It requires
+///   open `invalid_at` and `expired_at`, but does not reject future `valid_at`.
+/// - [`AsOf::NowValid`] is a strict "true now" frame on both clocks.
+/// - [`AsOf::At`] travels on event time only, preserving the original API.
+/// - [`AsOf::AtKnown`] selects event time and transaction time independently.
+/// - [`AsOf::All`] returns every version with no temporal filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsOf {
     Now,
+    /// Strict current validity, with the captured wall-clock epoch milliseconds.
+    NowValid(TimeMs),
     At(TimeMs),
+    /// Event-time validity at `valid_at`, using only knowledge recorded at
+    /// transaction time `known_at`.
+    AtKnown {
+        valid_at: TimeMs,
+        known_at: TimeMs,
+    },
     All,
 }
 

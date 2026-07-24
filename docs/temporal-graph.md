@@ -61,13 +61,33 @@ kg.add_fact("alice", "works_at", "globex", "Alice works at Globex",
 
 ## As-of queries and history
 
-Every read takes an `as_of` frame: `None` (the current view), an epoch-ms instant
-(as of that moment), or `"all"` (every version).
+Reads support two time axes. Event time answers when a fact was true in the
+world. Transaction time answers what the database knew at a given time.
+
+| Python `as_of` | Rust | Meaning |
+| --- | --- | --- |
+| `None` | `AsOf::Now` | Graphiti-compatible current view |
+| `"now_valid"` | `AsOf::NowValid(now_ms)` | Strict validity on both clocks |
+| `event_ms` | `AsOf::At(event_ms)` | Event-time travel only |
+| `(event_ms, known_ms)` | `AsOf::AtKnown { ... }` | Event and knowledge time |
+| `"all"` | `AsOf::All` | Every stored version |
+
+The compatibility current view intentionally follows Graphiti's open-ended
+semantics: it requires `expired_at IS NULL AND invalid_at IS NULL`, but does not
+check `valid_at <= now`. A future-dated fact can therefore appear under
+`as_of=None`. Use `as_of="now_valid"` for "what is true now" reads. Graphiti
+likewise exposes temporal fields as optional search filters and leaves them unset
+by default in
+[`SearchFilters`](https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_filters.py).
 
 ```python
 kg.neighbors("alice", relation="works_at")               # -> Globex   (current)
+kg.neighbors("alice", relation="works_at",
+             as_of="now_valid")                          # strict current validity
 kg.neighbors("alice", relation="works_at", as_of=1500)   # -> Acme     (as of t=1500)
 kg.neighbors("alice", relation="works_at", as_of=2500)   # -> Globex
+kg.neighbors("alice", relation="works_at",
+             as_of=(2500, learned_at))                   # what was known then
 kg.history("alice")                                       # both facts, preserved
 
 # Semantic entry points + k-hop expansion, time-scoped:
@@ -80,6 +100,92 @@ for fact in sub["facts"]: ...
 Graphiti-style fact search) all take the same frame. `resolve_entity(name)` returns
 candidate entities for a caller-driven resolution step (embedding + lexical match),
 leaving the merge decision to you.
+
+Swift exposes the same frames as `.now`, `.nowValid`, `.at(eventMs)`,
+`.atKnown(validAt: eventMs, knownAt: learnedMs)`, and `.all`.
+
+## Stable ingest and provenance rollback
+
+Supply a stable id when an upstream event or extraction job may retry:
+
+```python
+episode_id = kg.add_episode(
+    "connector",
+    payload,
+    occurred_at,
+    id="mailbox/message-42",
+)
+fact_id = kg.add_fact(
+    "alice",
+    "works_at",
+    "acme",
+    "Alice works at Acme",
+    episodes=[episode_id],
+    id="mailbox/message-42#fact-1",
+)
+```
+
+Repeating an id with the same payload returns the original id without creating a
+second derivation. Reusing it with a different payload raises an error.
+`episodes()` enumerates source records, `facts_by_episode(id)` exposes provenance,
+and `remove_episode(id)` rolls back facts originated by that episode. If an episode
+only added support to a fact originated elsewhere, removal detaches that support
+and keeps the fact.
+
+## Authorization predicates
+
+Semantic predicates run in the index before candidate generation and ranking.
+They are not post-filters. The same predicate is applied before every subgraph
+expansion frontier.
+
+```python
+scope = {"owner_id": {"$in": authorized_owner_ids}}
+
+entities = kg.semantic_entities("billing contact", predicate=scope)
+facts = kg.semantic_facts("approved access", predicate=scope)
+resolved = kg.resolve_entity("Alice", predicate=scope)
+subgraph = kg.search_subgraph(
+    "approved access",
+    predicate=scope,
+    seed_kind="fact",
+    relation="can_access",
+)
+```
+
+Predicates use LodeDB's metadata grammar (`$eq`, `$ne`, `$in`, `$nin`, ordered
+comparisons, `$exists`, `$and`, `$or`, and `$not`) over top-level scalar
+properties. Put the authorization fields on both entities and facts when a
+protected query expands through topology. Swift provides `GraphPropertyPredicate`
+for equality, set membership, existence, and logical composition.
+
+## Per-property entity lineage
+
+Entity snapshots remain convenient to read, but each changed top-level property
+now has its own version history. A version records its value, event-time bounds,
+transaction-time bounds, and an optional source episode.
+
+```python
+kg.upsert_entity(
+    "device-7",
+    "Device",
+    "Device 7",
+    properties={"status": "active", "region": "us-west"},
+    property_sources={"status": episode_id},
+)
+status_history = kg.entity_property_history("device-7", "status")
+```
+
+Unchanged properties do not create new versions. Removing a property closes its
+current version without erasing prior values. Swift exposes the same records
+through `entityPropertyHistory(_:key:)`.
+
+## Rerankers and fact seeds
+
+The native Graphiti-compatible rerankers are exported as `rrf`,
+`maximal_marginal_relevance`, `node_distance_reranker`, and
+`episode_mentions_reranker`. `search_subgraph(..., seed_kind="entity")` preserves
+the original behavior. Use `"fact"` to start from semantic facts, or `"both"` to
+use both entry-point types.
 
 ## Bring your own embedder
 

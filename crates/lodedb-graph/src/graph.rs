@@ -6,6 +6,7 @@
 //! `add_episode` stores (no extraction); `add_fact` is the LLM-free `add_triplet`
 //! analogue and performs invalidation; `search_subgraph` is semantic seeds + k-hop.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +16,8 @@ use serde_json::Value;
 use crate::error::{GraphError, Result};
 use crate::index::SemanticIndex;
 use crate::model::{
-    AsOf, Direction, Embedder, Entity, Episode, Fact, GraphConfig, Subgraph, TimeMs,
+    AsOf, Direction, Embedder, Entity, EntityPropertyVersion, Episode, Fact, GraphConfig, Subgraph,
+    TimeMs,
 };
 use crate::temporal;
 use crate::topology::TopologyStore;
@@ -29,6 +31,12 @@ fn now_ms() -> TimeMs {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as TimeMs)
         .unwrap_or(0)
+}
+
+/// Capture a strict current frame once so SQL, index, and hydration checks share
+/// exactly the same wall-clock instant.
+pub fn now_valid_frame() -> AsOf {
+    AsOf::NowValid(now_ms())
 }
 
 /// A unique id with a kind prefix (`ep`/`ent`/`f`). Includes the process id so two
@@ -51,10 +59,7 @@ pub struct TemporalGraph {
 }
 
 impl TemporalGraph {
-    fn validate_open_config(
-        config: &GraphConfig,
-        embedder: Option<&dyn Embedder>,
-    ) -> Result<()> {
+    fn validate_open_config(config: &GraphConfig, embedder: Option<&dyn Embedder>) -> Result<()> {
         if config.vector_dim == 0 {
             return Err(GraphError::InvalidArgument(
                 "vector_dim must be greater than zero".to_string(),
@@ -134,7 +139,44 @@ impl TemporalGraph {
         properties: Value,
         mentions: &[String],
     ) -> Result<String> {
-        let id = gen_id("ep");
+        self.add_episode_with_id(None, source, body, occurred_at, properties, mentions)
+    }
+
+    /// [`add_episode`] with an optional caller-stable id. Repeating the same id
+    /// and payload is a no-op; reusing it for a different payload fails closed.
+    pub fn add_episode_with_id(
+        &mut self,
+        caller_id: Option<&str>,
+        source: &str,
+        body: &str,
+        occurred_at: TimeMs,
+        properties: Value,
+        mentions: &[String],
+    ) -> Result<String> {
+        if caller_id.is_some_and(|id| id.trim().is_empty()) {
+            return Err(GraphError::InvalidArgument(
+                "episode id must not be blank".to_string(),
+            ));
+        }
+        let id = caller_id
+            .map(str::to_string)
+            .unwrap_or_else(|| gen_id("ep"));
+        if let Some(existing) = self.topology.get_episode(&id)? {
+            let mut expected_mentions: Vec<String> = mentions.to_vec();
+            expected_mentions.sort();
+            expected_mentions.dedup();
+            let same = existing.source == source
+                && existing.body == body
+                && existing.occurred_at == occurred_at
+                && canonical_properties(&existing.properties) == canonical_properties(&properties)
+                && self.topology.episode_mentions(&id)? == expected_mentions;
+            if same {
+                return Ok(id);
+            }
+            return Err(GraphError::InvalidArgument(format!(
+                "episode id {id:?} already exists with a different payload"
+            )));
+        }
         let episode = Episode {
             id: id.clone(),
             source: source.to_string(),
@@ -153,6 +195,14 @@ impl TemporalGraph {
         self.topology.get_episode(id)
     }
 
+    pub fn episodes(&self) -> Result<Vec<Episode>> {
+        self.topology.list_episodes()
+    }
+
+    pub fn facts_by_episode(&self, id: &str) -> Result<Vec<Fact>> {
+        self.topology.facts_by_episode(id)
+    }
+
     // -- entities -----------------------------------------------------------
 
     /// Create or replace an entity (upsert by stable id) and (re)index it.
@@ -166,11 +216,35 @@ impl TemporalGraph {
         valid_at: Option<TimeMs>,
         invalid_at: Option<TimeMs>,
     ) -> Result<String> {
+        self.upsert_entity_with_sources(
+            id,
+            entity_type,
+            label,
+            properties,
+            valid_at,
+            invalid_at,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// [`upsert_entity`] with per-property episode provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_entity_with_sources(
+        &mut self,
+        id: &str,
+        entity_type: &str,
+        label: &str,
+        properties: Value,
+        valid_at: Option<TimeMs>,
+        invalid_at: Option<TimeMs>,
+        property_sources: &BTreeMap<String, String>,
+    ) -> Result<String> {
         if id.trim().is_empty() {
             return Err(GraphError::InvalidArgument("entity id is required".into()));
         }
+        let recorded_at = now_ms();
         let existing = self.topology.get_entity(id)?;
-        let created_at = existing.map(|e| e.created_at).unwrap_or_else(now_ms);
+        let created_at = existing.map(|e| e.created_at).unwrap_or(recorded_at);
         let entity = Entity {
             id: id.to_string(),
             entity_type: entity_type.to_string(),
@@ -192,9 +266,13 @@ impl TemporalGraph {
             let topology = &self.topology;
             let index = &mut self.index;
             let embedder = self.embedder.as_deref();
-            topology.upsert_entity_before_commit(&entity, None, || {
-                index.index_entity(&entity, embedder, None)
-            })
+            topology.upsert_entity_with_lineage_before_commit(
+                &entity,
+                None,
+                property_sources,
+                recorded_at,
+                || index.index_entity(&entity, embedder, None),
+            )
         };
         self.finish_indexed_mutation(result)?;
         Ok(entity.id)
@@ -211,15 +289,41 @@ impl TemporalGraph {
         valid_at: Option<TimeMs>,
         invalid_at: Option<TimeMs>,
     ) -> Result<String> {
+        self.upsert_entity_vec_with_sources(
+            id,
+            entity_type,
+            label,
+            properties,
+            embedding,
+            valid_at,
+            invalid_at,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Vector-in [`upsert_entity_with_sources`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_entity_vec_with_sources(
+        &mut self,
+        id: &str,
+        entity_type: &str,
+        label: &str,
+        properties: Value,
+        embedding: &[f32],
+        valid_at: Option<TimeMs>,
+        invalid_at: Option<TimeMs>,
+        property_sources: &BTreeMap<String, String>,
+    ) -> Result<String> {
         if id.trim().is_empty() {
             return Err(GraphError::InvalidArgument("entity id is required".into()));
         }
         self.index.validate_vector(embedding)?;
+        let recorded_at = now_ms();
         let created_at = self
             .topology
             .get_entity(id)?
             .map(|e| e.created_at)
-            .unwrap_or_else(now_ms);
+            .unwrap_or(recorded_at);
         let entity = Entity {
             id: id.to_string(),
             entity_type: entity_type.to_string(),
@@ -234,9 +338,13 @@ impl TemporalGraph {
         let result = {
             let topology = &self.topology;
             let index = &mut self.index;
-            topology.upsert_entity_before_commit(&entity, Some(embedding), || {
-                index.index_entity(&entity, None, Some(embedding))
-            })
+            topology.upsert_entity_with_lineage_before_commit(
+                &entity,
+                Some(embedding),
+                property_sources,
+                recorded_at,
+                || index.index_entity(&entity, None, Some(embedding)),
+            )
         };
         self.finish_indexed_mutation(result)?;
         Ok(entity.id)
@@ -244,6 +352,14 @@ impl TemporalGraph {
 
     pub fn get_entity(&self, id: &str) -> Result<Option<Entity>> {
         self.topology.get_entity(id)
+    }
+
+    pub fn entity_property_history(
+        &self,
+        id: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<EntityPropertyVersion>> {
+        self.topology.entity_property_history(id, key)
     }
 
     /// Complete-set enumeration by type (nil = all) in a temporal frame.
@@ -270,6 +386,7 @@ impl TemporalGraph {
         invalidates: &[String],
     ) -> Result<String> {
         self.add_fact_inner(
+            None,
             src,
             relation,
             dst,
@@ -299,6 +416,64 @@ impl TemporalGraph {
         fact_embedding: &[f32],
     ) -> Result<String> {
         self.add_fact_inner(
+            None,
+            src,
+            relation,
+            dst,
+            fact_text,
+            properties,
+            episodes,
+            valid_at,
+            invalidates,
+            Some(fact_embedding),
+        )
+    }
+
+    /// [`add_fact`] with an optional caller-stable id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_fact_with_id(
+        &mut self,
+        caller_id: Option<&str>,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        fact_text: &str,
+        properties: Value,
+        episodes: Vec<String>,
+        valid_at: Option<TimeMs>,
+        invalidates: &[String],
+    ) -> Result<String> {
+        self.add_fact_inner(
+            caller_id,
+            src,
+            relation,
+            dst,
+            fact_text,
+            properties,
+            episodes,
+            valid_at,
+            invalidates,
+            None,
+        )
+    }
+
+    /// Vector-in [`add_fact_with_id`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_fact_vec_with_id(
+        &mut self,
+        caller_id: Option<&str>,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        fact_text: &str,
+        properties: Value,
+        episodes: Vec<String>,
+        valid_at: Option<TimeMs>,
+        invalidates: &[String],
+        fact_embedding: &[f32],
+    ) -> Result<String> {
+        self.add_fact_inner(
+            caller_id,
             src,
             relation,
             dst,
@@ -314,6 +489,7 @@ impl TemporalGraph {
     #[allow(clippy::too_many_arguments)]
     fn add_fact_inner(
         &mut self,
+        caller_id: Option<&str>,
         src: &str,
         relation: &str,
         dst: &str,
@@ -324,6 +500,11 @@ impl TemporalGraph {
         invalidates: &[String],
         fact_embedding: Option<&[f32]>,
     ) -> Result<String> {
+        if caller_id.is_some_and(|id| id.trim().is_empty()) {
+            return Err(GraphError::InvalidArgument(
+                "fact id must not be blank".to_string(),
+            ));
+        }
         for (name, value) in [("src", src), ("relation", relation), ("dst", dst)] {
             if value.trim().is_empty() {
                 return Err(GraphError::InvalidArgument(format!(
@@ -352,8 +533,25 @@ impl TemporalGraph {
         } else {
             valid_at
         };
+        let id = caller_id.map(str::to_string).unwrap_or_else(|| gen_id("f"));
+        if let Some(existing) = self.topology.get_fact(&id)? {
+            let same = existing.src == src
+                && existing.relation == relation
+                && existing.dst == dst
+                && existing.fact == fact_text
+                && canonical_properties(&existing.properties) == canonical_properties(&properties)
+                && existing.episodes == episodes
+                && existing.valid_at == valid_at
+                && existing.reference_time == reference_time;
+            if same {
+                return Ok(id);
+            }
+            return Err(GraphError::InvalidArgument(format!(
+                "fact id {id:?} already exists with a different payload"
+            )));
+        }
         let fact = Fact {
-            id: gen_id("f"),
+            id,
             src: src.to_string(),
             relation: relation.to_string(),
             dst: dst.to_string(),
@@ -464,17 +662,60 @@ impl TemporalGraph {
         direction: Direction,
         as_of: AsOf,
     ) -> Result<Subgraph> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut visited: BTreeSet<String> = seeds.iter().cloned().collect();
-        let mut frontier: Vec<String> = seeds.to_vec();
+        self.k_hop_filtered(seeds, k, direction, as_of, None)
+    }
+
+    /// [`k_hop`] with an authorization/support predicate applied to both facts
+    /// and entities before either can influence the next BFS frontier.
+    pub fn k_hop_filtered(
+        &self,
+        seeds: &[String],
+        k: usize,
+        direction: Direction,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+    ) -> Result<Subgraph> {
+        let predicate = predicate.map(validate_property_predicate).transpose()?;
+        let seed_entities = self.topology.get_entities(seeds)?;
+        let mut visited: BTreeSet<String> = seed_entities
+            .into_iter()
+            .filter(|entity| {
+                entity.matches(as_of)
+                    && property_matches(&entity.properties, predicate.as_ref())
+            })
+            .map(|entity| entity.id)
+            .collect();
+        let mut frontier: Vec<String> = visited.iter().cloned().collect();
         let mut facts_by_id: BTreeMap<String, Fact> = BTreeMap::new();
         for _hop in 0..k {
             if frontier.is_empty() {
                 break;
             }
-            let facts = self.topology.facts_for(&frontier, direction, None, as_of)?;
+            let candidates: Vec<Fact> = self
+                .topology
+                .facts_for(&frontier, direction, None, as_of)?
+                .into_iter()
+                .filter(|fact| property_matches(&fact.properties, predicate.as_ref()))
+                .collect();
+            let endpoint_ids: Vec<String> = candidates
+                .iter()
+                .flat_map(|fact| [fact.src.clone(), fact.dst.clone()])
+                .collect();
+            let allowed: BTreeSet<String> = self
+                .topology
+                .get_entities(&endpoint_ids)?
+                .into_iter()
+                .filter(|entity| {
+                    entity.matches(as_of)
+                        && property_matches(&entity.properties, predicate.as_ref())
+                })
+                .map(|entity| entity.id)
+                .collect();
             let mut next: Vec<String> = Vec::new();
-            for f in facts {
+            for f in candidates {
+                if !allowed.contains(&f.src) || !allowed.contains(&f.dst) {
+                    continue;
+                }
                 for endpoint in [&f.src, &f.dst] {
                     if visited.insert(endpoint.clone()) {
                         next.push(endpoint.clone());
@@ -509,13 +750,30 @@ impl TemporalGraph {
         entity_type: Option<&str>,
         as_of: AsOf,
     ) -> Result<Vec<(f32, Entity)>> {
-        let hits = self.index.semantic_entities(
+        self.semantic_entities_filtered(query, embedding, k, entity_type, as_of, None)
+    }
+
+    /// [`semantic_entities`] with an authorization/support predicate pushed into
+    /// the semantic index before candidate generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_entities_filtered(
+        &self,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        k: usize,
+        entity_type: Option<&str>,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<(f32, Entity)>> {
+        let validated = predicate.map(validate_property_predicate).transpose()?;
+        let hits = self.index.semantic_entities_filtered(
             query,
             embedding,
             self.embedder.as_deref(),
             k,
             entity_type,
             as_of,
+            predicate,
         )?;
         let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
         let by_id: std::collections::HashMap<String, Entity> = self
@@ -531,6 +789,7 @@ impl TemporalGraph {
             // (crash between topology commit and index refresh) must not leak an
             // expired entity into a scoped read.
             .filter(|(_score, e)| e.matches(as_of))
+            .filter(|(_score, e)| property_matches(&e.properties, validated.as_ref()))
             .collect())
     }
 
@@ -544,13 +803,30 @@ impl TemporalGraph {
         relation: Option<&str>,
         as_of: AsOf,
     ) -> Result<Vec<(f32, Fact)>> {
-        let hits = self.index.semantic_facts(
+        self.semantic_facts_filtered(query, embedding, k, relation, as_of, None)
+    }
+
+    /// [`semantic_facts`] with an authorization/support predicate pushed into
+    /// the semantic index before candidate generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_facts_filtered(
+        &self,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        k: usize,
+        relation: Option<&str>,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<(f32, Fact)>> {
+        let validated = predicate.map(validate_property_predicate).transpose()?;
+        let hits = self.index.semantic_facts_filtered(
             query,
             embedding,
             self.embedder.as_deref(),
             k,
             relation,
             as_of,
+            predicate,
         )?;
         let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
         let by_id: std::collections::HashMap<String, Fact> = self
@@ -561,15 +837,11 @@ impl TemporalGraph {
             .collect();
         Ok(hits
             .into_iter()
-            .filter_map(|hit| {
-                by_id
-                    .get(&hit.id)
-                    .cloned()
-                    .map(|fact| (hit.score, fact))
-            })
+            .filter_map(|hit| by_id.get(&hit.id).cloned().map(|fact| (hit.score, fact)))
             // Re-check against authoritative rows so a stale derivative cannot
             // leak an expired fact into a scoped read.
             .filter(|(_score, fact)| fact.matches(as_of))
+            .filter(|(_score, fact)| property_matches(&fact.properties, validated.as_ref()))
             .collect())
     }
 
@@ -585,15 +857,104 @@ impl TemporalGraph {
         entity_type: Option<&str>,
         as_of: AsOf,
     ) -> Result<Subgraph> {
-        let seeds = self.semantic_entities(query, embedding, k, entity_type, as_of)?;
-        let seed_ids: Vec<String> = seeds.iter().map(|(_s, e)| e.id.clone()).collect();
-        let mut subgraph = self.k_hop(&seed_ids, hops, direction, as_of)?;
-        for (score, entity) in &seeds {
-            subgraph
-                .entities
-                .entry(entity.id.clone())
-                .or_insert_with(|| entity.clone());
+        self.search_subgraph_filtered(
+            query,
+            embedding,
+            k,
+            hops,
+            direction,
+            entity_type,
+            None,
+            as_of,
+            None,
+            "entity",
+        )
+    }
+
+    /// Search from semantic entity seeds, fact seeds, or both. A property
+    /// predicate is applied before seed ranking and before every traversal hop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_subgraph_filtered(
+        &self,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        k: usize,
+        hops: usize,
+        direction: Direction,
+        entity_type: Option<&str>,
+        relation: Option<&str>,
+        as_of: AsOf,
+        predicate: Option<&Value>,
+        seed_kind: &str,
+    ) -> Result<Subgraph> {
+        if !matches!(seed_kind, "entity" | "fact" | "both") {
+            return Err(GraphError::InvalidArgument(format!(
+                "seed_kind must be entity|fact|both, got {seed_kind:?}"
+            )));
+        }
+        let validated_predicate = predicate.map(validate_property_predicate).transpose()?;
+        let entity_seeds = if matches!(seed_kind, "entity" | "both") {
+            self.semantic_entities_filtered(query, embedding, k, entity_type, as_of, predicate)?
+        } else {
+            Vec::new()
+        };
+        let mut fact_seeds = if matches!(seed_kind, "fact" | "both") {
+            self.semantic_facts_filtered(query, embedding, k, relation, as_of, predicate)?
+        } else {
+            Vec::new()
+        };
+        if !fact_seeds.is_empty() {
+            let endpoint_ids: Vec<String> = fact_seeds
+                .iter()
+                .flat_map(|(_score, fact)| [fact.src.clone(), fact.dst.clone()])
+                .collect();
+            let allowed_endpoints: BTreeSet<String> = self
+                .topology
+                .get_entities(&endpoint_ids)?
+                .into_iter()
+                .filter(|entity| {
+                    entity.matches(as_of)
+                        && property_matches(&entity.properties, validated_predicate.as_ref())
+                })
+                .map(|entity| entity.id)
+                .collect();
+            fact_seeds.retain(|(_score, fact)| {
+                allowed_endpoints.contains(&fact.src) && allowed_endpoints.contains(&fact.dst)
+            });
+        }
+        let mut seed_ids: Vec<String> = entity_seeds
+            .iter()
+            .map(|(_score, entity)| entity.id.clone())
+            .collect();
+        for (_score, fact) in &fact_seeds {
+            seed_ids.push(fact.src.clone());
+            seed_ids.push(fact.dst.clone());
+        }
+        seed_ids.sort();
+        seed_ids.dedup();
+
+        let mut subgraph = self.k_hop_filtered(&seed_ids, hops, direction, as_of, predicate)?;
+        for (score, entity) in &entity_seeds {
+            subgraph.entities.insert(entity.id.clone(), entity.clone());
             subgraph.seeds.push((entity.id.clone(), *score));
+        }
+        let mut existing_fact_ids: BTreeSet<String> =
+            subgraph.facts.iter().map(|fact| fact.id.clone()).collect();
+        for (score, fact) in fact_seeds {
+            if existing_fact_ids.insert(fact.id.clone()) {
+                subgraph.facts.push(fact.clone());
+            }
+            for entity in self
+                .topology
+                .get_entities(&[fact.src.clone(), fact.dst.clone()])?
+                .into_iter()
+                .filter(|entity| {
+                    property_matches(&entity.properties, validated_predicate.as_ref())
+                })
+            {
+                subgraph.entities.insert(entity.id.clone(), entity);
+            }
+            subgraph.seeds.push((format!("fact:{}", fact.id), score));
         }
         Ok(subgraph)
     }
@@ -601,9 +962,20 @@ impl TemporalGraph {
     /// Candidate entities matching `name` for the caller's resolution step
     /// (embedding + lexical); the caller decides the merge.
     pub fn resolve_entity(&self, name: &str, k: usize) -> Result<Vec<(f32, Entity)>> {
-        let hits = self
-            .index
-            .resolve_entity(name, self.embedder.as_deref(), k)?;
+        self.resolve_entity_filtered(name, k, None)
+    }
+
+    /// [`resolve_entity`] with a predicate applied before candidate ranking.
+    pub fn resolve_entity_filtered(
+        &self,
+        name: &str,
+        k: usize,
+        predicate: Option<&Value>,
+    ) -> Result<Vec<(f32, Entity)>> {
+        let validated = predicate.map(validate_property_predicate).transpose()?;
+        let hits =
+            self.index
+                .resolve_entity_filtered(name, self.embedder.as_deref(), k, predicate)?;
         let ids: Vec<String> = hits.iter().map(|hit| hit.id.clone()).collect();
         let by_id: std::collections::HashMap<String, Entity> = self
             .topology
@@ -619,6 +991,7 @@ impl TemporalGraph {
                     .cloned()
                     .map(|entity| (hit.score, entity))
             })
+            .filter(|(_score, entity)| property_matches(&entity.properties, validated.as_ref()))
             .collect())
     }
 
@@ -657,6 +1030,21 @@ impl TemporalGraph {
         self.finish_indexed_mutation(result)
     }
 
+    /// Remove an episode and roll back facts for which it is the originating
+    /// provenance entry. Facts with other primary support remain and only lose
+    /// this episode link.
+    pub fn remove_episode(&mut self, id: &str) -> Result<bool> {
+        self.topology.mark_index_dirty()?;
+        let result = {
+            let topology = &self.topology;
+            let index = &mut self.index;
+            topology.remove_episode_before_commit(id, |removed_fact_ids| {
+                index.remove_facts(removed_fact_ids)
+            })
+        };
+        self.finish_indexed_mutation(result)
+    }
+
     /// Rebuild the semantic index from the topology truth store: drop orphans, then
     /// re-index every entity and fact. Makes the index a throwaway artifact.
     pub fn reindex(&mut self) -> Result<ReindexStats> {
@@ -672,8 +1060,10 @@ impl TemporalGraph {
     fn reindex_internal(&mut self) -> Result<ReindexStats> {
         let entities = self.topology.iter_entity_index_records()?;
         let facts = self.topology.iter_fact_index_records()?;
-        let live_entity_ids: Vec<String> =
-            entities.iter().map(|record| record.entity.id.clone()).collect();
+        let live_entity_ids: Vec<String> = entities
+            .iter()
+            .map(|record| record.entity.id.clone())
+            .collect();
         let live_fact_ids: Vec<String> =
             facts.iter().map(|record| record.fact.id.clone()).collect();
         for record in &entities {
@@ -790,6 +1180,41 @@ impl TemporalGraph {
         self.index.persist()?;
         self.topology.mark_index_clean()
     }
+}
+
+fn validate_property_predicate(predicate: &Value) -> Result<Value> {
+    lodedb_core::filter::coerce_sdk_filter(predicate)
+        .map_err(|error| GraphError::InvalidArgument(error.to_string()))
+}
+
+fn canonical_properties(properties: &Value) -> Value {
+    if properties.is_null() {
+        serde_json::json!({})
+    } else {
+        properties.clone()
+    }
+}
+
+fn property_matches(properties: &Value, predicate: Option<&Value>) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+    let mut metadata = BTreeMap::new();
+    if let Some(object) = properties.as_object() {
+        for (key, value) in object {
+            let encoded = match value {
+                Value::Null => Some(String::new()),
+                Value::String(text) => Some(text.clone()),
+                Value::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_string()),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Array(_) | Value::Object(_) => None,
+            };
+            if let Some(encoded) = encoded {
+                metadata.insert(key.clone(), encoded);
+            }
+        }
+    }
+    lodedb_core::filter::matches_metadata_filter(&metadata, predicate).unwrap_or(false)
 }
 
 /// Counts returned by [`TemporalGraph::reindex`].

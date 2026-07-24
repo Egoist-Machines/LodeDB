@@ -10,10 +10,17 @@ provenance. Uses a tiny deterministic embedder so the suite is offline.
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
-from lodedb.graph import TemporalKnowledgeGraph
+from lodedb.graph import (
+    TemporalKnowledgeGraph,
+    episode_mentions_reranker,
+    maximal_marginal_relevance,
+    node_distance_reranker,
+    rrf,
+)
 
 
 class HashEmbedder:
@@ -195,6 +202,176 @@ def test_index_text_false_opens_and_searches_by_vector():
     g.upsert_entity_vec("a", "Thing", "thing a", v)
     hits = g.semantic_entities(None, k=5, embedding=v)
     assert [e["id"] for _s, e in hits] == ["a"]
+
+
+def test_strict_now_rejects_future_dated_facts():
+    g = graph()
+    g.upsert_entity("a", "Thing", "future source")
+    g.upsert_entity("b", "Thing", "future target")
+    now = int(time.time() * 1000)
+    future = now + 7 * 24 * 60 * 60 * 1000
+    g.add_fact("a", "rel", "b", "future source relation", valid_at=future)
+
+    assert g.neighbors("a"), "the compatibility current view is unchanged"
+    assert g.neighbors("a", as_of="now_valid") == []
+    assert g.semantic_facts("future source relation", as_of="strict") == []
+    assert g.search_subgraph(
+        "future source", hops=1, as_of="now_valid"
+    )["facts"] == []
+
+
+def test_bitemporal_frame_selects_event_and_knowledge_time():
+    g = graph()
+    for id in ("person", "old", "new"):
+        g.upsert_entity(id, "Thing", id)
+    old = g.add_fact("person", "works_at", "old", "old employer", valid_at=1000)
+    time.sleep(0.003)
+    new = g.add_fact(
+        "person",
+        "works_at",
+        "new",
+        "new employer",
+        valid_at=2000,
+        invalidates=[old],
+    )
+    old_row = g.get_fact(old)
+    new_row = g.get_fact(new)
+    learned_at = old_row["expired_at"]
+
+    before = g.neighbors("person", as_of=(2500, learned_at - 1))
+    assert [fact["id"] for fact in before] == [old]
+    before_semantic = g.semantic_facts(
+        "employer", relation="works_at", as_of=(2500, learned_at - 1)
+    )
+    assert [fact["id"] for _score, fact in before_semantic] == [old]
+    after = g.neighbors("person", as_of=(2500, new_row["created_at"]))
+    assert [fact["id"] for fact in after] == [new]
+    after_semantic = g.semantic_facts(
+        "employer", relation="works_at", as_of=(2500, new_row["created_at"])
+    )
+    assert [fact["id"] for _score, fact in after_semantic] == [new]
+
+
+def test_stable_ids_episode_enumeration_and_rollback():
+    g = graph()
+    g.upsert_entity("a", "Thing", "a")
+    g.upsert_entity("b", "Thing", "b")
+    ep1 = g.add_episode("note", "one", 1, id="episode-one")
+    assert g.add_episode("note", "one", 1, id="episode-one") == ep1
+    ep2 = g.add_episode("note", "two", 2, id="episode-two")
+    retained = g.add_fact(
+        "a",
+        "rel",
+        "b",
+        "supported twice",
+        episodes=[ep1, ep2],
+        id="stable-fact",
+    )
+    assert (
+        g.add_fact(
+            "a",
+            "rel",
+            "b",
+            "supported twice",
+            episodes=[ep1, ep2],
+            id="stable-fact",
+        )
+        == retained
+    )
+    removed = g.add_fact("a", "rel2", "b", "episode two", episodes=[ep2])
+
+    assert {episode["id"] for episode in g.episodes()} == {ep1, ep2}
+    assert {fact["id"] for fact in g.facts_by_episode(ep2)} == {retained, removed}
+    assert g.remove_episode(ep2)
+    assert g.get_fact(removed) is None
+    assert g.get_fact(retained)["episodes"] == [ep1]
+
+
+def test_entity_property_lineage_tracks_versions_and_sources():
+    g = graph()
+    g.upsert_entity(
+        "device",
+        "Device",
+        "device",
+        properties={"status": "new", "region": "us"},
+        valid_at=100,
+    )
+    episode = g.add_episode("event", "activated", 200, id="activation")
+    g.upsert_entity(
+        "device",
+        "Device",
+        "device",
+        properties={"status": "active", "region": "us"},
+        valid_at=200,
+        property_sources={"status": episode},
+    )
+
+    status = g.entity_property_history("device", "status")
+    assert [item["value"] for item in status] == ["new", "active"]
+    assert status[0]["expired_at"] is not None
+    assert status[1]["episode_id"] == episode
+    assert len(g.entity_property_history("device", "region")) == 1
+
+
+def test_authorization_predicate_is_applied_before_search_and_expansion():
+    g = graph()
+    for id, owner in (("a", "u1"), ("b", "u1"), ("forbidden", "u2")):
+        g.upsert_entity(
+            id,
+            "Thing",
+            f"shared label {id}",
+            properties={"owner": owner, "allowed": owner == "u1"},
+        )
+    g.add_fact(
+        "a",
+        "rel",
+        "b",
+        "shared allowed fact",
+        properties={"owner": "u1", "allowed": True},
+    )
+    g.add_fact(
+        "forbidden",
+        "rel",
+        "b",
+        "shared forbidden fact",
+        properties={"owner": "u2", "allowed": False},
+    )
+    predicate = {"$and": [{"owner": "u1"}, {"allowed": True}]}
+
+    entities = g.semantic_entities("shared label", k=10, predicate=predicate)
+    assert "forbidden" not in {entity["id"] for _score, entity in entities}
+    facts = g.semantic_facts("shared", k=10, predicate=predicate)
+    assert [fact["src"] for _score, fact in facts] == ["a"]
+    resolved = g.resolve_entity("shared label", k=10, predicate=predicate)
+    assert "forbidden" not in {entity["id"] for _score, entity in resolved}
+    subgraph = g.search_subgraph(
+        "shared allowed fact",
+        k=5,
+        hops=1,
+        relation="rel",
+        seed_kind="fact",
+        predicate=predicate,
+    )
+    assert "forbidden" not in {entity["id"] for entity in subgraph["entities"]}
+    assert all(fact["src"] != "forbidden" for fact in subgraph["facts"])
+
+
+def test_native_rerankers_are_exposed():
+    fused = rrf([["a", "b"], ["a", "c"]])
+    assert fused[0][0] == "a"
+    assert maximal_marginal_relevance(
+        [1.0, 0.0],
+        [("near", [1.0, 0.0]), ("diverse", [0.0, 1.0])],
+        lambda_=1.0,
+    ) == ["near", "diverse"]
+    assert node_distance_reranker(["far", "near"], {"far": 2, "near": 0}) == [
+        "near",
+        "far",
+    ]
+    assert episode_mentions_reranker(["low", "high"], {"low": 1, "high": 3}) == [
+        "high",
+        "low",
+    ]
 
 
 if __name__ == "__main__":

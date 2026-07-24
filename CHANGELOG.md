@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `lodedb-graph` now exposes strict current reads and full bi-temporal reads.
+  `AsOf::NowValid` rejects future-dated facts and checks both clocks.
+  `AsOf::AtKnown` selects event time and transaction time independently. Python
+  accepts `as_of="now_valid"` and `as_of=(valid_at_ms, known_at_ms)`. Swift adds
+  `GraphAsOf.nowValid` and `GraphAsOf.atKnown(validAt:knownAt:)`.
+- Episode enumeration, facts-by-episode lookup, and episode rollback are public in
+  Rust, Python, and Swift. Removing an episode deletes facts it originated and
+  detaches non-primary support from facts that remain.
+- `add_episode` and `add_fact` accept optional caller-stable ids. An identical
+  retry is a no-op, while reuse with a different payload fails closed.
+- Semantic entity, fact, resolution, and subgraph queries accept property
+  predicates that run inside the index before candidate generation and ranking.
+  Subgraph traversal applies the same predicate before each expansion frontier.
+- Entity property changes now create independent lineage records with event time,
+  transaction time, and optional source episode ids. Python exposes
+  `entity_property_history`; Swift exposes `entityPropertyHistory`.
+- The Graphiti-compatible RRF, MMR, node-distance, and episode-mentions rerankers
+  are now exposed in Python. `search_subgraph` can seed from semantic facts or
+  from both entities and facts.
+
+### Changed
+
+- `AsOf::Now` keeps the Graphiti-compatible current-view behavior for backward
+  compatibility. It requires open `invalid_at` and `expired_at` values but does
+  not check `valid_at <= now`. Use the new strict frame for "true now" reads.
+- The native core ABI is version 6 to cover the added graph episode and property
+  lineage verbs.
+- Existing graph semantic indexes rebuild once on open to add the temporal and
+  property metadata required by strict and predicate-scoped reads.
+
 ## [2.0.0] - 2026-07-23
 
 ### Added

@@ -9,9 +9,10 @@
 //! verbs, so the core never calls back across the ABI.
 
 use lodedb_core::{CoreError, CoreErrorCode};
-use lodedb_graph::{AsOf, Direction, GraphConfig, GraphError, TemporalGraph};
+use lodedb_graph::{now_valid_frame, AsOf, Direction, GraphConfig, GraphError, TemporalGraph};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 use crate::{
     ffi_result, read_json_view, require_out, write_owned_json, LodeError, LodeOwnedString,
@@ -39,25 +40,52 @@ fn graph_err(error: GraphError) -> CoreError {
 
 fn graph_mut<'a>(graph: *mut LodeGraph) -> Result<&'a mut TemporalGraph, CoreError> {
     if graph.is_null() {
-        return Err(CoreError::new(CoreErrorCode::InvalidArgument, "graph pointer is null"));
+        return Err(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            "graph pointer is null",
+        ));
     }
     Ok(unsafe { &mut (*graph).graph })
 }
 
 fn graph_ref<'a>(graph: *const LodeGraph) -> Result<&'a TemporalGraph, CoreError> {
     if graph.is_null() {
-        return Err(CoreError::new(CoreErrorCode::InvalidArgument, "graph pointer is null"));
+        return Err(CoreError::new(
+            CoreErrorCode::InvalidArgument,
+            "graph pointer is null",
+        ));
     }
     Ok(unsafe { &(*graph).graph })
 }
 
-fn resolve_as_of(as_of_ms: Option<i64>, all_time: Option<bool>) -> AsOf {
+fn resolve_as_of(
+    as_of_ms: Option<i64>,
+    all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
+) -> Result<AsOf, CoreError> {
     if all_time.unwrap_or(false) {
-        AsOf::All
+        Ok(AsOf::All)
+    } else if strict_now.unwrap_or(false) {
+        if as_of_ms.is_some() || known_at_ms.is_some() {
+            return Err(CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                "strict_now cannot be combined with as_of_ms or known_at_ms",
+            ));
+        }
+        Ok(now_valid_frame())
+    } else if let Some(known_at) = known_at_ms {
+        let valid_at = as_of_ms.ok_or_else(|| {
+            CoreError::new(
+                CoreErrorCode::InvalidArgument,
+                "known_at_ms requires an event-time as_of_ms",
+            )
+        })?;
+        Ok(AsOf::AtKnown { valid_at, known_at })
     } else if let Some(t) = as_of_ms {
-        AsOf::At(t)
+        Ok(AsOf::At(t))
     } else {
-        AsOf::Now
+        Ok(AsOf::Now)
     }
 }
 
@@ -75,6 +103,7 @@ struct OpenReq {
 
 #[derive(Deserialize)]
 struct AddEpisodeReq {
+    id: Option<String>,
     source: String,
     body: String,
     occurred_at: i64,
@@ -92,10 +121,12 @@ struct UpsertEntityVecReq {
     properties: Option<Value>,
     valid_at: Option<i64>,
     invalid_at: Option<i64>,
+    property_sources: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct AddFactVecReq {
+    id: Option<String>,
     src: String,
     relation: String,
     dst: String,
@@ -124,6 +155,8 @@ struct EntitiesReq {
     entity_type: Option<String>,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +166,8 @@ struct NeighborsReq {
     relation: Option<String>,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +177,9 @@ struct KHopReq {
     direction: String,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
+    predicate: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +190,9 @@ struct SemanticEntitiesReq {
     entity_type: Option<String>,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
+    predicate: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +202,9 @@ struct SemanticFactsReq {
     relation: Option<String>,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
+    predicate: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -171,8 +215,19 @@ struct SearchSubgraphReq {
     direction: String,
     #[serde(rename = "type")]
     entity_type: Option<String>,
+    relation: Option<String>,
     as_of_ms: Option<i64>,
     all_time: Option<bool>,
+    strict_now: Option<bool>,
+    known_at_ms: Option<i64>,
+    predicate: Option<Value>,
+    seed_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PropertyHistoryReq {
+    id: String,
+    key: Option<String>,
 }
 
 // -- lifecycle -------------------------------------------------------------
@@ -251,7 +306,8 @@ macro_rules! graph_verb {
 // -- writes ----------------------------------------------------------------
 
 graph_verb!(lodedb_graph_add_episode_json, g, req: AddEpisodeReq, {
-    g.add_episode(
+    g.add_episode_with_id(
+        req.id.as_deref(),
         &req.source,
         &req.body,
         req.occurred_at,
@@ -262,7 +318,7 @@ graph_verb!(lodedb_graph_add_episode_json, g, req: AddEpisodeReq, {
 });
 
 graph_verb!(lodedb_graph_upsert_entity_vec_json, g, req: UpsertEntityVecReq, {
-    g.upsert_entity_vec(
+    g.upsert_entity_vec_with_sources(
         &req.id,
         &req.entity_type,
         &req.label,
@@ -270,12 +326,14 @@ graph_verb!(lodedb_graph_upsert_entity_vec_json, g, req: UpsertEntityVecReq, {
         &req.embedding,
         req.valid_at,
         req.invalid_at,
+        &req.property_sources.unwrap_or_default(),
     )
     .map_err(graph_err)?
 });
 
 graph_verb!(lodedb_graph_add_fact_vec_json, g, req: AddFactVecReq, {
-    g.add_fact_vec(
+    g.add_fact_vec_with_id(
+        req.id.as_deref(),
         &req.src,
         &req.relation,
         &req.dst,
@@ -301,6 +359,10 @@ graph_verb!(lodedb_graph_remove_fact_json, g, req: IdReq, {
     g.remove_fact(&req.id).map_err(graph_err)?
 });
 
+graph_verb!(lodedb_graph_remove_episode_json, g, req: IdReq, {
+    g.remove_episode(&req.id).map_err(graph_err)?
+});
+
 // -- reads -----------------------------------------------------------------
 
 graph_verb!(lodedb_graph_get_entity_json, g, req: IdReq, {
@@ -315,8 +377,29 @@ graph_verb!(lodedb_graph_get_episode_json, g, req: IdReq, {
     g.get_episode(&req.id).map_err(graph_err)?
 });
 
+graph_verb!(lodedb_graph_episodes_json, g, _req: Value, {
+    g.episodes().map_err(graph_err)?
+});
+
+graph_verb!(lodedb_graph_facts_by_episode_json, g, req: IdReq, {
+    g.facts_by_episode(&req.id).map_err(graph_err)?
+});
+
+graph_verb!(lodedb_graph_entity_property_history_json, g, req: PropertyHistoryReq, {
+    g.entity_property_history(&req.id, req.key.as_deref())
+        .map_err(graph_err)?
+});
+
 graph_verb!(lodedb_graph_entities_json, g, req: EntitiesReq, {
-    g.entities(req.entity_type.as_deref(), resolve_as_of(req.as_of_ms, req.all_time))
+    g.entities(
+        req.entity_type.as_deref(),
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+    )
         .map_err(graph_err)?
 });
 
@@ -326,48 +409,89 @@ graph_verb!(lodedb_graph_history_json, g, req: IdReq, {
 
 graph_verb!(lodedb_graph_neighbors_json, g, req: NeighborsReq, {
     let dir = Direction::parse(&req.direction).map_err(graph_err)?;
-    g.neighbors(&req.id, dir, req.relation.as_deref(), resolve_as_of(req.as_of_ms, req.all_time))
+    g.neighbors(
+        &req.id,
+        dir,
+        req.relation.as_deref(),
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+    )
         .map_err(graph_err)?
 });
 
 graph_verb!(lodedb_graph_k_hop_json, g, req: KHopReq, {
     let dir = Direction::parse(&req.direction).map_err(graph_err)?;
-    g.k_hop(&req.seeds, req.k, dir, resolve_as_of(req.as_of_ms, req.all_time))
+    g.k_hop_filtered(
+        &req.seeds,
+        req.k,
+        dir,
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+        req.predicate.as_ref(),
+    )
         .map_err(graph_err)?
 });
 
 graph_verb!(lodedb_graph_semantic_entities_json, g, req: SemanticEntitiesReq, {
-    g.semantic_entities(
+    g.semantic_entities_filtered(
         None,
         Some(req.embedding.as_slice()),
         req.k,
         req.entity_type.as_deref(),
-        resolve_as_of(req.as_of_ms, req.all_time),
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+        req.predicate.as_ref(),
     )
     .map_err(graph_err)?
 });
 
 graph_verb!(lodedb_graph_semantic_facts_json, g, req: SemanticFactsReq, {
-    g.semantic_facts(
+    g.semantic_facts_filtered(
         None,
         Some(req.embedding.as_slice()),
         req.k,
         req.relation.as_deref(),
-        resolve_as_of(req.as_of_ms, req.all_time),
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+        req.predicate.as_ref(),
     )
     .map_err(graph_err)?
 });
 
 graph_verb!(lodedb_graph_search_subgraph_json, g, req: SearchSubgraphReq, {
     let dir = Direction::parse(&req.direction).map_err(graph_err)?;
-    g.search_subgraph(
+    g.search_subgraph_filtered(
         None,
         Some(req.embedding.as_slice()),
         req.k,
         req.hops,
         dir,
         req.entity_type.as_deref(),
-        resolve_as_of(req.as_of_ms, req.all_time),
+        req.relation.as_deref(),
+        resolve_as_of(
+            req.as_of_ms,
+            req.all_time,
+            req.strict_now,
+            req.known_at_ms,
+        )?,
+        req.predicate.as_ref(),
+        req.seed_kind.as_deref().unwrap_or("entity"),
     )
     .map_err(graph_err)?
 });

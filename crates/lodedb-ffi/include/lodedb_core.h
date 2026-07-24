@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 5u
+#define LODEDB_ABI_VERSION 6u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -340,11 +340,19 @@ uint32_t lodedb_graph_remove_entity_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
 uint32_t lodedb_graph_remove_fact_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_remove_episode_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
 uint32_t lodedb_graph_get_entity_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
 uint32_t lodedb_graph_get_fact_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
 uint32_t lodedb_graph_get_episode_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_episodes_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_facts_by_episode_json(
+    LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
+uint32_t lodedb_graph_entity_property_history_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
 uint32_t lodedb_graph_entities_json(
     LodeGraph *graph, LodeStringView request, LodeOwnedString **out, LodeError **error);
