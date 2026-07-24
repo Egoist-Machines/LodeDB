@@ -862,6 +862,38 @@ pub unsafe extern "C" fn lodedb_engine_get_document_texts_json(
     })
 }
 
+/// Returns explicitly requested stored-vector reconstructions as JSON.
+///
+/// Each requested id may be a document id or chunk id. The returned JSON is a
+/// `Vec<CoreStoredVector>` and must be released with
+/// `lodedb_owned_string_free`.
+///
+/// # Safety
+///
+/// `engine`, `index_id`, `ids_json`, and `out` must be valid for the duration of
+/// the call. String views must contain valid UTF-8 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lodedb_engine_get_vectors_json(
+    engine: *const LodeEngine,
+    index_id: LodeStringView,
+    ids_json: LodeStringView,
+    out: *mut *mut LodeOwnedString,
+    error: *mut *mut LodeError,
+) -> u32 {
+    ffi_result(error, || {
+        require_out(out)?;
+        let engine = engine_ref(engine)?;
+        let index_id = read_string(index_id)?;
+        let ids = read_json_view::<Vec<String>>(ids_json)?;
+        let vectors = engine.get_vectors(&index_id, &ids)?;
+        let result = owned_json(&vectors)?;
+        unsafe {
+            *out = Box::into_raw(result);
+        }
+        Ok(())
+    })
+}
+
 /// Lists payload-free document records as a JSON array, with an optional metadata
 /// filter, an `after` id cursor, and a `limit` (each gated by its `has_*` flag).
 ///

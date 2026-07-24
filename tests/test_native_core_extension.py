@@ -124,7 +124,7 @@ def _text_add_search_embed_counts(mode, write_mode, store_dir, monkeypatch):
 
 
 def test_native_core_extension_executes_vector_store_flow() -> None:
-    assert native_core.native_core_abi_version() == 6
+    assert native_core.native_core_abi_version() == 7
     engine = native_core.CoreEngine()
     engine.create_index("default", 8, 4)
     mutation = _loads(
@@ -501,6 +501,11 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     assert _loads(engine.get_document_texts("text", json.dumps(["doc-alpha", "missing"]))) == {
         "doc-alpha": "Alpha launch notes mention error code E-1001."
     }
+    stored_vectors = _loads(engine.get_vectors("text", json.dumps(["doc-alpha", "missing"])))
+    assert len(stored_vectors) == 1
+    assert stored_vectors[0]["document_id"] == "doc-alpha"
+    assert stored_vectors[0]["chunk_id"] == plan["documents"][0]["chunks"][0]["chunk_id"]
+    assert len(stored_vectors[0]["vector"]) == 8
     record = _loads(engine.get_document("text", "doc-alpha"))
     assert record["document_id"] == "doc-alpha"
     assert record["metadata"] == {"topic": "ops"}

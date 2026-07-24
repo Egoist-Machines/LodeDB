@@ -335,6 +335,14 @@ pub struct CoreSearchResults {
     pub total_considered: usize,
 }
 
+/// One explicitly requested vector reconstructed from the compact serving index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreStoredVector {
+    pub document_id: String,
+    pub chunk_id: String,
+    pub vector: Vec<f32>,
+}
+
 /// Flat batch-search arrays for the near-zero-copy PyO3 boundary.
 ///
 /// `scores`, `document_ids`, and `metadata` are flat `[nq * k]` buffers laid out

@@ -126,6 +126,21 @@ class LodeSearchHit:
         return NotImplemented
 
 
+@dataclass(frozen=True, slots=True)
+class LodeStoredVector:
+    """One explicitly requested compact-vector reconstruction.
+
+    ``vector`` is an f32 reconstruction in the caller's original embedding
+    coordinate space. It is suitable for downstream similarity and diversity
+    calculations but may differ slightly from the source embedding because
+    LodeDB stores compact quantized vectors.
+    """
+
+    document_id: str
+    chunk_id: str
+    vector: tuple[float, ...]
+
+
 class ReadOnlyError(RuntimeError):
     """Raised when a mutating call is made on a ``read_only=True`` LodeDB handle."""
 
@@ -1386,6 +1401,37 @@ class LodeDB:
         with self._op_lock:
             return self._native_get_texts(ids)
 
+    def get_vectors(self, ids: list[str]) -> list[LodeStoredVector]:
+        """Returns explicitly requested document or chunk vectors.
+
+        A document id expands to every current chunk in document order. A chunk
+        id selects only that row. Unknown ids are omitted, repeated chunks are
+        returned once, and the result preserves first-request order.
+
+        This verb is intentionally separate from :meth:`get_document` and search
+        hits. Embeddings are derived payloads that can encode information about
+        source content, so callers should protect them like document data. They
+        never enter telemetry and are returned only through this explicit call.
+        """
+
+        if not isinstance(ids, list):
+            raise ValueError("ids must be a list of strings")
+        for value in ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("each id must be a non-empty string")
+        if not ids:
+            return []
+        with self._op_lock:
+            rows = self._native_get_vectors(ids)
+        return [
+            LodeStoredVector(
+                document_id=str(row["document_id"]),
+                chunk_id=str(row["chunk_id"]),
+                vector=tuple(float(value) for value in row["vector"]),
+            )
+            for row in rows
+        ]
+
     def get_document(self, id: str) -> dict[str, Any] | None:
         """Returns one document's redacted record by id, or ``None`` if absent.
 
@@ -2129,6 +2175,15 @@ class LodeDB:
         except Exception as exc:
             self._native_core_fallback_reason = "native_core_get_texts_failed"
             raise RuntimeError("native core document read failed") from exc
+
+    def _native_get_vectors(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Returns explicit stored-vector rows from the native core."""
+
+        try:
+            return self._native_vector_engine.get_vectors(_LOCAL_INDEX_ID, ids)
+        except Exception as exc:
+            self._native_core_fallback_reason = "native_core_get_vectors_failed"
+            raise RuntimeError("native core vector read failed") from exc
 
     def _native_get_document(self, document_id: str) -> dict[str, Any] | None:
         """Returns one native payload-free document record, or ``None`` (fail closed)."""

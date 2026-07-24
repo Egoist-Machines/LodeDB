@@ -406,6 +406,21 @@ public final class LodeDB {
         }
     }
 
+    /// Returns explicitly requested document or chunk vectors.
+    ///
+    /// Document ids expand to all current chunks. Chunk ids select one row.
+    /// Unknown ids are omitted and repeated chunks are returned once. This
+    /// explicit payload-bearing read keeps `getDocument` and search hits
+    /// payload-free; callers should protect embeddings like document data.
+    public func getVectors(_ ids: [String]) throws -> [StoredVector] {
+        try lockedOpen {
+            try decodeJSON(
+                [StoredVectorJSON].self,
+                from: engine.getVectorsJSON(try encodeJSON(ids))
+            ).map(StoredVector.init)
+        }
+    }
+
     /// Returns a payload-free document record, or nil if the document does not exist.
     public func getDocument(_ id: String) throws -> DocumentRecord? {
         try lockedOpen {

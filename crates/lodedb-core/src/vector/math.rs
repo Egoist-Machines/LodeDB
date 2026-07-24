@@ -29,3 +29,31 @@ pub(crate) fn rotate(query: &[f32], rotation: &[f32], dim: usize) -> Vec<f32> {
     }
     out
 }
+
+/// Maps a row from TurboVec's rotated coordinate space back to the caller's
+/// embedding space. The rotation is orthogonal, so its inverse is its transpose:
+/// `out[i] = Σ rotated[o]·R[o·dim+i]`.
+pub(crate) fn unrotate(rotated: &[f32], rotation: &[f32], dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; dim];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (o, &value) in rotated.iter().enumerate().take(dim) {
+            acc += value * rotation[o * dim + i];
+        }
+        *slot = acc;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rotate, unrotate};
+
+    #[test]
+    fn unrotate_inverts_an_orthogonal_rotation() {
+        let swap_axes = [0.0, 1.0, 1.0, 0.0];
+        let source = [0.25, 0.75];
+        let rotated = rotate(&source, &swap_axes, 2);
+        assert_eq!(unrotate(&rotated, &swap_axes, 2), source);
+    }
+}

@@ -20,7 +20,7 @@ from lodedb.engine.route_profiles import (
     client_route_policy_manifest,
     route_policy_for_profile,
 )
-from lodedb.local import LodeDB, LodeSearchHit
+from lodedb.local import LodeDB, LodeSearchHit, LodeStoredVector
 
 
 def _open(tmp_path, dim: int = 384, model: str = "minilm") -> LodeDB:
@@ -61,6 +61,29 @@ def test_add_search_returns_tuple_shaped_hits(tmp_path):
     # metadata is hydrated from the stored document, and is string-valued.
     ids = {h.id for h in hits}
     assert "turtle" in ids
+    db.close()
+
+
+def test_get_vectors_expands_documents_and_accepts_chunk_ids(tmp_path):
+    db = LodeDB(
+        path=tmp_path,
+        _embedding_backend=HashEmbeddingBackend(native_dim=384),
+        chunk_character_limit=12,
+    )
+    db.add("alpha beta gamma delta epsilon", id="doc")
+
+    rows = db.get_vectors(["doc", "missing", "doc"])
+    assert len(rows) > 1
+    assert all(isinstance(row, LodeStoredVector) for row in rows)
+    assert all(row.document_id == "doc" and len(row.vector) == 384 for row in rows)
+    assert len({row.chunk_id for row in rows}) == len(rows)
+
+    selected = db.get_vectors([rows[1].chunk_id, rows[1].chunk_id])
+    assert selected == [rows[1]]
+    assert "vector" not in db.get_document("doc")
+    assert db.get_vectors([]) == []
+    with pytest.raises(ValueError, match="non-empty string"):
+        db.get_vectors([""])
     db.close()
 
 

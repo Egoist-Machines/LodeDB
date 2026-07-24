@@ -112,6 +112,47 @@ fn list_documents_keyset_cursor_pages_in_id_order() {
 }
 
 #[test]
+fn get_vectors_is_explicit_ordered_and_payload_separate() {
+    let engine = seeded_engine();
+    let rows = engine
+        .get_vectors(
+            "default",
+            &[
+                "b".to_string(),
+                "missing".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.document_id.as_str(), row.chunk_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("b", "b"), ("a", "a")]
+    );
+    assert!(rows.iter().all(|row| row.vector.len() == 8));
+
+    for (row, expected_axis) in rows.iter().zip([1, 0]) {
+        let norm = row.vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!(
+            row.vector[expected_axis] / norm > 0.8,
+            "reconstructed vector must remain in the caller's embedding space"
+        );
+    }
+
+    let record = engine.get_document("default", "a").unwrap().unwrap();
+    assert!(
+        !record.as_object().unwrap().contains_key("vector"),
+        "payload-free document reads remain unchanged"
+    );
+    assert!(engine.get_vectors("default", &[]).unwrap().is_empty());
+    assert!(engine
+        .get_vectors("default", &[" ".to_string()])
+        .is_err());
+}
+
+#[test]
 fn payload_update_respects_store_text_privacy() {
     // store_text=false must keep no raw text in memory or in the WAL, including
     // after a payload-only text update (index_text=false, so no tokens either).
