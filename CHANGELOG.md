@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added explicit stored-vector reads for the 2.0.2 release. Python and Rust expose
+  `get_vectors(ids)`, and Swift exposes `getVectors(_:)`. A document id expands to
+  its current chunks, while a chunk id selects one row. Results are f32
+  reconstructions in the original embedding coordinate space.
+- Stored-vector reads remain separate from payload-free document listings and
+  search hits. Embeddings can encode source information, so callers must protect
+  returned vectors like document data. They are never included in telemetry.
+
+### Changed
+
+- The native core ABI is version 7 to cover explicit stored-vector reads.
+
 ## [2.0.1] - 2026-07-24
 
 ### Added

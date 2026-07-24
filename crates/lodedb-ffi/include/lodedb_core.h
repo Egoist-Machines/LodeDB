@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 6u
+#define LODEDB_ABI_VERSION 7u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -218,6 +218,12 @@ uint32_t lodedb_engine_get_document_texts_json(
     const LodeEngine *engine,
     LodeStringView index_id,
     LodeStringView document_ids_json,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_engine_get_vectors_json(
+    const LodeEngine *engine,
+    LodeStringView index_id,
+    LodeStringView ids_json,
     LodeOwnedString **out,
     LodeError **error);
 uint32_t lodedb_engine_list_documents_json(

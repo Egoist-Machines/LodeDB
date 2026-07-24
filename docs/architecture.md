@@ -233,6 +233,13 @@ The durable index stores ids, metadata, compact vectors, and journals. The redac
 are always payload-free: the `.json` snapshot, the `.jsd` journal, the `.tvim`/`.tvd` vector
 sidecars, telemetry, and `audit_persisted_index_snapshots` never carry raw document or query text.
 
+Stored-vector retrieval is a separate, explicit exception to payload-free reads.
+`get_vectors(ids)` reconstructs requested document or chunk rows as f32 vectors
+in the caller's original embedding coordinate space. Search hits,
+`get_document`, and `list_documents` never include vectors. Embeddings can encode
+source information, so callers must protect the returned values like document
+data. They are returned only to the caller and never enter telemetry.
+
 Durable page-content retrieval is **on by default**. `LodeDB(...)` (engine flag
 `EngineSecurityConfig.allow_raw_result_text`, default true) retains the original text passed to
 `add`/`add_many` in a dedicated raw-text store mapping `document_id -> text`: a `g<epoch>.tvtext`

@@ -231,10 +231,18 @@ other is for when you already compute vectors yourself.
 | --- | --- | --- |
 | Add | `add` / `add_many` (text) | `add_vectors` / `add_vectors_many` (vectors) |
 | Search | `search` / `search_many` (text) | `search_by_vector` / `search_many_by_vector` |
+| Explicit stored-vector read | `get_vectors` | `get_vectors` |
 | Hybrid / lexical BM25 | yes (`mode="hybrid"`) | no (no text to rank) |
 | Raw-text retrieval (`get`) | yes (`store_text=True`, default) | no (metadata still returned) |
 | Embedding runtime | bundled (ONNX / PyTorch) | none (you bring vectors) |
 | Calling text verbs on it | works | raises `VectorOnlyIndexError` |
+
+`get_vectors(ids)` is an explicit payload-bearing read. Document ids expand to
+their current chunks, and chunk ids select individual rows. It returns f32
+reconstructions from the compact index in the original embedding coordinate
+space, so quantization can make them differ slightly from the source embeddings.
+Search hits and `get_document` remain vector-free. Embeddings can encode source
+information, so protect returned vectors like document data.
 
 For per-tenant isolation, open one text-in `LodeDB` per tenant at its own path (optionally sharing a
 single loaded model with `embedder=`). GPU setup, the performance knobs, the model-alias table, and

@@ -96,12 +96,19 @@ single-writer lock.
 ```swift
 let record = try db.getDocument("doc-1")          // payload-free: id, metadata, chunkCount
 let text = try db.get("doc-1")                    // retained text (nil if not stored)
+let vectors = try db.getVectors(["doc-1"])        // explicit compact-vector reconstructions
 let page = try db.listDocuments(filter: MetadataFilter(["topic": "ops"]), limit: 50)
 try db.updateDocument(id: "doc-1", metadata: ["topic": "archived"])
 try db.remove("doc-1")
 let stats = try db.stats()                        // documentCount, vectorDimension, model, ...
 let collections = try db.collections()
 ```
+
+`getVectors` is deliberately separate from `getDocument` and search hits.
+Document ids expand to current chunks, while chunk ids select individual rows.
+Returned f32 vectors use the original embedding coordinate space and may differ
+slightly from source embeddings because storage is quantized. Embeddings can
+encode source information, so protect them like document data.
 
 ### Metadata filters
 

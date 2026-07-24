@@ -22,7 +22,8 @@ available when you need full control.
 
 Lower-level `LodeDB` primitives an agent host can expose as tools map cleanly:
 `addText` / `addVector` (save), `search` / `searchMany` (recall), `remove` (forget),
-`get` / `getDocument` / `listDocuments` (inspect), `stats` (metrics).
+`get` / `getDocument` / `listDocuments` (inspect), `getVectors` (explicit
+stored-vector retrieval), `stats` (metrics).
 
 ## Privacy guarantees
 
@@ -31,6 +32,10 @@ Lower-level `LodeDB` primitives an agent host can expose as tools map cleanly:
 - Search results are payload-free. `search` returns ids, scores, and metadata; it does
   not return document text. `LodeMemory.recall` fetches text explicitly per hit via
   `get`, so the only place raw text crosses back is a deliberate fetch.
+- `getVectors` is a separate, explicit payload-bearing read. It returns f32
+  reconstructions from the compact index for requested document or chunk ids.
+  Embeddings can encode source information, so protect them like document data.
+  They never appear in search hits, document listings, or telemetry.
 - Raw text is retained only when `storeText` is on (the default for `LodeMemory` and
   `addText`). With `storeText` off, `get` returns nil and only vectors and metadata are
   kept.

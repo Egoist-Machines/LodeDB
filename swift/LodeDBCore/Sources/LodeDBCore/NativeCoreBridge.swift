@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 6
+let lodeNativeExpectedABIVersion: UInt32 = 7
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -355,6 +355,16 @@ final class NativeEngine {
             withStringView(indexID) { indexView in
                 withStringView(idsJSON) { idsView in
                     lodedb_engine_get_document_texts_json(handle, indexView, idsView, out, error)
+                }
+            }
+        }
+    }
+
+    func getVectorsJSON(_ idsJSON: String) throws -> String {
+        try ownedCall { out, error in
+            withStringView(indexID) { indexView in
+                withStringView(idsJSON) { idsView in
+                    lodedb_engine_get_vectors_json(handle, indexView, idsView, out, error)
                 }
             }
         }

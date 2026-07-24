@@ -1230,6 +1230,16 @@ impl PyCoreEngine {
         )
     }
 
+    fn get_vectors(&self, index_id: &str, ids_json: &str) -> PyResult<String> {
+        let ids = native_from_json::<Vec<String>>(ids_json)?;
+        native_to_json(
+            &self
+                .inner
+                .get_vectors(index_id, &ids)
+                .map_err(native_core_error_to_py)?,
+        )
+    }
+
     fn get_document(&self, index_id: &str, document_id: &str) -> PyResult<String> {
         native_to_json(
             &self

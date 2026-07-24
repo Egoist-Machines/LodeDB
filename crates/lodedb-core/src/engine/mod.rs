@@ -19,8 +19,8 @@ use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreMetadata, CoreMutationResult,
-    CoreOpenOptions, CoreRescoreOptions, CoreSearchHit, CoreSearchResults, CoreVectorDocument,
-    VectorBatchArrays,
+    CoreOpenOptions, CoreRescoreOptions, CoreSearchHit, CoreSearchResults, CoreStoredVector,
+    CoreVectorDocument, VectorBatchArrays,
 };
 use crate::vector::ann::ClusterIndex;
 use crate::vector::index::{CoreVectorChunk, VectorSearchHit};
@@ -1459,6 +1459,61 @@ impl CoreEngine {
             }
         }
         Ok(out)
+    }
+
+    /// Returns explicitly requested compact-vector reconstructions.
+    ///
+    /// Each id may name a document or one of its chunks. A document id expands to
+    /// all current chunks in document order; a chunk id selects only that row.
+    /// Unknown ids are omitted and repeated chunks are returned once. Vectors are
+    /// f32 reconstructions in the caller's original embedding coordinate space.
+    ///
+    /// This is deliberately separate from payload-free document and search reads:
+    /// embeddings can encode source information and must only leave the engine
+    /// through an explicit caller request.
+    pub fn get_vectors(
+        &self,
+        index_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<CoreStoredVector>, CoreError> {
+        let index = self.index(index_id)?;
+        let mut selected_chunk_ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            if id.trim().is_empty() {
+                return invalid("id is required");
+            }
+            if let Some(record) = index.documents.get(id) {
+                for chunk in &record.chunks {
+                    if seen.insert(chunk.chunk_id.clone()) {
+                        selected_chunk_ids.push(chunk.chunk_id.clone());
+                    }
+                }
+            } else if index.chunk_owner_by_id.contains_key(id) && seen.insert(id.clone()) {
+                selected_chunk_ids.push(id.clone());
+            }
+        }
+        if selected_chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let reconstructed = index
+            .turbovec_index()?
+            .reconstruct_chunks(&selected_chunk_ids)?;
+        Ok(reconstructed
+            .into_iter()
+            .filter_map(|(chunk_id, vector)| {
+                index
+                    .chunk_owner_by_id
+                    .get(&chunk_id)
+                    .cloned()
+                    .map(|document_id| CoreStoredVector {
+                        document_id,
+                        chunk_id,
+                        vector,
+                    })
+            })
+            .collect())
     }
 
     /// Returns one payload-free document record.

@@ -13,6 +13,13 @@ import Testing
     #expect(hits.map(\.id) == ["b", "a"])
     #expect(hits.first?.metadata["topic"] == "ml")
 
+    let stored = try db.getVectors(["b", "missing", "a", "b"])
+    #expect(stored.map(\.documentID) == ["b", "a"])
+    #expect(stored.map(\.chunkID) == ["b", "a"])
+    #expect(stored.allSatisfy { $0.vector.count == 8 })
+    let norm = sqrt(stored[0].vector.reduce(0) { $0 + $1 * $1 })
+    #expect(stored[0].vector[1] / norm > 0.8)
+
     let filtered = try db.search(
         vector: [1, 0, 0, 0, 0, 0, 0, 0],
         k: 2,
@@ -108,7 +115,7 @@ import Testing
 }
 
 @Test func nativeEngineExposesABIVersionAndFFITextProtocol() throws {
-    #expect(NativeEngine.abiVersion() == 6)
+    #expect(NativeEngine.abiVersion() == 7)
 
     let engine = try NativeEngine.inMemory(vectorDimension: 8)
     let documentsJSON = """
@@ -134,6 +141,11 @@ import Testing
     let vectorJSON = try engine.queryVectorJSON([1, 0, 0, 0, 0, 0, 0, 0], k: 1, filterJSON: nil)
     #expect(vectorJSON.contains(#""document_id":"doc-text""#))
     #expect(vectorJSON.contains(#""chunk_id":"doc-text:d9041255442c:0000""#))
+
+    let storedVectorsJSON = try engine.getVectorsJSON(#"["doc-text","missing"]"#)
+    #expect(storedVectorsJSON.contains(#""document_id":"doc-text""#))
+    #expect(storedVectorsJSON.contains(#""chunk_id":"doc-text:d9041255442c:0000""#))
+    #expect(storedVectorsJSON.contains(#""vector":["#))
 
     let lexicalPlan = try engine.prepareQueryTextJSON("E-1001", mode: "lexical")
     let lexicalHits = try engine.searchEmbeddedTextJSON(
@@ -186,6 +198,7 @@ import Testing
     #expect(hits.contains { $0.id == "vec-1" })
     #expect(try reopened.get("txt-1") == "durable notes about a blue widget")
     #expect(try reopened.getDocument("vec-1")?.metadata["topic"] == "ops")
+    #expect(try reopened.getVectors(["vec-1"]).first?.documentID == "vec-1")
 }
 
 @Test func crudRemoveGetListUpdateRunNatively() throws {

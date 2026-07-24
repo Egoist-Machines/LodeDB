@@ -103,6 +103,22 @@ public struct DocumentRecord: Sendable, Equatable {
     }
 }
 
+/// One explicitly requested vector reconstructed from the compact serving index.
+///
+/// Vectors are returned in the caller's original embedding coordinate space.
+/// They may differ slightly from source embeddings because storage is quantized.
+public struct StoredVector: Sendable, Equatable {
+    public let documentID: String
+    public let chunkID: String
+    public let vector: [Float]
+
+    init(_ json: StoredVectorJSON) {
+        self.documentID = json.documentID
+        self.chunkID = json.chunkID
+        self.vector = json.vector
+    }
+}
+
 /// How `updateDocument` should treat a document's retained text.
 public enum TextUpdate: Sendable, Equatable {
     /// Leave the stored text unchanged.
@@ -158,6 +174,18 @@ struct DocumentRecordJSON: Decodable {
         case metadata
         case chunkCount = "chunk_count"
         case contentHash = "content_hash"
+    }
+}
+
+struct StoredVectorJSON: Decodable {
+    let documentID: String
+    let chunkID: String
+    let vector: [Float]
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case chunkID = "chunk_id"
+        case vector
     }
 }
 

@@ -907,6 +907,17 @@ class NativeCoreEngineHandle:
             raise RuntimeError("native core returned a non-object text map payload")
         return {str(key): str(text) for key, text in value.items()}
 
+    def get_vectors(self, index_id: str, ids: Iterable[str]) -> list[dict[str, Any]]:
+        value = json.loads(
+            self._engine.get_vectors(
+                str(index_id),
+                _dumps([str(requested_id) for requested_id in ids]),
+            )
+        )
+        if not isinstance(value, list):
+            raise RuntimeError("native core returned a non-list vector payload")
+        return [dict(item) for item in value]
+
     def get_document(self, index_id: str, document_id: str) -> dict[str, Any] | None:
         value = json.loads(self._engine.get_document(str(index_id), str(document_id)))
         if value is None:

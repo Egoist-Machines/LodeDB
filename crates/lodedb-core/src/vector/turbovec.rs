@@ -13,6 +13,7 @@ use crate::storage::tvim_delta::{read_delta_segment, TVIM_DELTA_DIR_SUFFIX};
 use crate::vector::index::{
     CoreVectorChunk, VectorBackendMetadata, VectorIndexWriteMetrics, VectorSearchHit,
 };
+use crate::vector::math::unrotate;
 use crate::vector::stable_id::stable_uint64_ids_for_chunk_ids;
 
 /// Smallest query batch worth the GPU's per-call host/device overhead; smaller
@@ -677,6 +678,69 @@ impl TurboVecNativeIndex {
             }
         }
         (chunk_ids, kept_ids, kept_rows)
+    }
+
+    /// Reconstructs selected live chunks into the caller's original embedding
+    /// coordinate space, preserving first-request order and omitting unknown ids.
+    ///
+    /// TurboVec stores compact rows after an orthogonal rotation. The returned
+    /// values are f32 reconstructions of those compact rows, then inverse-rotated
+    /// so callers can compare them with fresh embeddings from the same model.
+    pub fn reconstruct_chunks(
+        &self,
+        requested_chunk_ids: &[String],
+    ) -> Result<Vec<(String, Vec<f32>)>, CoreError> {
+        let mut seen = BTreeSet::new();
+        let selected = requested_chunk_ids
+            .iter()
+            .filter_map(|chunk_id| {
+                let stable_id = *self.stable_id_by_chunk_id.get(chunk_id)?;
+                seen.insert(stable_id)
+                    .then(|| (chunk_id.clone(), stable_id))
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let stable_ids = selected
+            .iter()
+            .map(|(_chunk_id, stable_id)| *stable_id)
+            .collect::<Vec<_>>();
+        let rows = self
+            .index
+            .reconstruct_rows(&stable_ids)
+            .map_err(core_error)?;
+        let expected_len = selected
+            .len()
+            .checked_mul(self.dim)
+            .ok_or_else(|| CoreError::new(CoreErrorCode::CorruptStore, "vector shape overflow"))?;
+        if rows.len() != expected_len {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec returned an invalid reconstructed vector shape",
+            ));
+        }
+        let rotation = self.index.rotation_matrix().ok_or_else(|| {
+            CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec rotation is unavailable for vector reconstruction",
+            )
+        })?;
+        let expected_rotation_len = self.dim.checked_mul(self.dim).ok_or_else(|| {
+            CoreError::new(CoreErrorCode::CorruptStore, "rotation shape overflow")
+        })?;
+        if rotation.len() != expected_rotation_len {
+            return Err(CoreError::new(
+                CoreErrorCode::CorruptStore,
+                "TurboVec returned an invalid rotation matrix shape",
+            ));
+        }
+        Ok(selected
+            .into_iter()
+            .zip(rows.chunks_exact(self.dim))
+            .map(|((chunk_id, _stable_id), row)| (chunk_id, unrotate(row, &rotation, self.dim)))
+            .collect())
     }
 
     /// The TurboVec rotation matrix (row-major `dim * dim`), or `None` before

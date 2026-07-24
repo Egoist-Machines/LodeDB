@@ -4,6 +4,7 @@ Public surface:
 
 - :class:`LodeDB`: the embedded SDK entrypoint.
 - :class:`LodeSearchHit`: one redacted ``(score, id, metadata)`` result row.
+- :class:`LodeStoredVector`: one explicitly requested vector reconstruction.
 - :class:`LodeLateInteractionIndex`: multi-vector (MaxSim) late-interaction retrieval.
 - :func:`resolve_local_device` / :func:`build_local_embedding_backend`:
   embedding device selection (MPS / CUDA / CPU).
@@ -24,6 +25,7 @@ from lodedb.local.db import (
     ImageEmbeddingUnsupportedError,
     LodeDB,
     LodeSearchHit,
+    LodeStoredVector,
     ReadOnlyError,
     RescoreOptions,
 )
@@ -46,6 +48,7 @@ __all__ = [
     "LodeLateInteractionHit",
     "LodeLateInteractionIndex",
     "LodeSearchHit",
+    "LodeStoredVector",
     "LocalEmbeddingResolution",
     "LocalModelPreset",
     "ReadOnlyError",

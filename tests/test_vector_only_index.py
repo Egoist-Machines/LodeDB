@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from lodedb import LodeDB
+from lodedb import LodeDB, LodeStoredVector
 from lodedb.engine.embedding_backends import HashEmbeddingBackend
 from lodedb.local.db import VectorOnlyIndexError
 
@@ -206,6 +206,24 @@ def test_persist_and_reopen(tmp_path):
     assert reopened.count() == 2
     assert reopened.search_by_vector(_onehot(0), k=1)[0].id == "a"
     assert reopened.get_document("a")["metadata"] == {"label": "kept"}
+
+
+def test_get_vectors_reconstructs_on_readonly_reopen(tmp_path):
+    writer = LodeDB.open_vector_store(tmp_path, vector_dim=DIM)
+    writer.add_vectors(_onehot(0), id="a")
+    writer.add_vectors(_onehot(80), id="b")
+    writer.persist()
+    writer.close()
+
+    reader = LodeDB.open_vector_store(tmp_path, vector_dim=DIM, read_only=True)
+    rows = reader.get_vectors(["b", "missing", "a", "b"])
+    assert [row.document_id for row in rows] == ["b", "a"]
+    assert all(isinstance(row, LodeStoredVector) for row in rows)
+    assert all(len(row.vector) == DIM for row in rows)
+    for row, expected_axis in zip(rows, [80, 0], strict=True):
+        norm = sum(value * value for value in row.vector) ** 0.5
+        assert row.vector[expected_axis] / norm > 0.8
+    reader.close()
 
 
 def test_reopen_at_wrong_dim_is_rejected(tmp_path):

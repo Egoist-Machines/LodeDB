@@ -27,7 +27,9 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// not pair with an older core lacking them.
 /// Bumped to 6 for episode enumeration and rollback plus entity-property lineage
 /// reads on the graph FFI.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 6;
+/// Bumped to 7 for explicit stored-vector reconstruction reads through
+/// `lodedb_engine_get_vectors_json`.
+pub const NATIVE_CORE_ABI_VERSION: u32 = 7;
 
 #[cfg(test)]
 mod tests {
@@ -39,6 +41,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 6);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 7);
     }
 }
