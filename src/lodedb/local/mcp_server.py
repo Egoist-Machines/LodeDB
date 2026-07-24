@@ -51,7 +51,7 @@ def _search(
 
     ``mode`` is forwarded to :meth:`LodeDB.search` (``"vector"``, ``"hybrid"``, or
     ``"lexical"``). With ``include_text`` each row also carries the hit's stored
-    ``text`` (read from the same raw-text store as :meth:`LodeDB.get`), so a caller
+    ``text`` (read from the same raw-text  store as :meth:`LodeDB.get`), so a caller
     can rank and read in one pass. The caller sets ``include_text`` only when text
     retention is on.
     """
@@ -203,7 +203,36 @@ def build_mcp_server(
         """Return redacted store stats (counts, storage bytes), never raw text."""
 
         return _stats(db)
-
+    #Added save function for better and easy understanding 
+    @server.tool()
+    def save(
+        text: str,
+        id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add/Save or replace a memory. Returns its id and count."""
+        return _add(db, text, id=id, metadata=metadata)
+    #Added recall function for better and easy understanding 
+    @server.tool()
+    def recall(
+        query: str,
+        k: int = 10,
+        filter: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search your local memory for anything relevant to a query. Returns each match with its text so you can answer directly"""
+        return _search(db, query, k=k, filter=filter, mode=search_mode, include_text=True)
+    #Added forget function for better and easy understanding 
+    @server.tool()
+    def forget(
+        id: str
+    ) -> dict[str, Any]:
+        """Remove a memory from local memory."""
+        return _remove(db, id) 
+    #Added stats function for better and easy understanding 
+    @server.tool()
+    def stats() -> dict[str, Any]:
+        """Check how much is stored in local memory; Returns counts and storage size."""
+        return _stats(db)
     return server, db
 
 
