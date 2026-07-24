@@ -42,6 +42,15 @@ class HashEmbedder:
         return out
 
 
+class FixedQueryEmbedder:
+    """Return one fixed query vector so vector-in ranking is fully controlled."""
+
+    dimension = 8
+
+    def embed(self, texts, role):
+        return [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _text in texts]
+
+
 def graph() -> TemporalKnowledgeGraph:
     return TemporalKnowledgeGraph(embedder=HashEmbedder())
 
@@ -313,47 +322,189 @@ def test_entity_property_lineage_tracks_versions_and_sources():
     assert len(g.entity_property_history("device", "region")) == 1
 
 
-def test_authorization_predicate_is_applied_before_search_and_expansion():
-    g = graph()
-    for id, owner in (("a", "u1"), ("b", "u1"), ("forbidden", "u2")):
-        g.upsert_entity(
-            id,
-            "Thing",
-            f"shared label {id}",
-            properties={"owner": owner, "allowed": owner == "u1"},
-        )
-    g.add_fact(
-        "a",
-        "rel",
-        "b",
-        "shared allowed fact",
-        properties={"owner": "u1", "allowed": True},
-    )
-    g.add_fact(
-        "forbidden",
-        "rel",
-        "b",
-        "shared forbidden fact",
-        properties={"owner": "u2", "allowed": False},
-    )
+def test_authorization_predicate_crowd_out_preserves_allowed_top_k():
+    g = TemporalKnowledgeGraph(embedder=FixedQueryEmbedder())
+    query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    allowed = [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    other = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     predicate = {"$and": [{"owner": "u1"}, {"allowed": True}]}
 
-    entities = g.semantic_entities("shared label", k=10, predicate=predicate)
-    assert "forbidden" not in {entity["id"] for _score, entity in entities}
-    facts = g.semantic_facts("shared", k=10, predicate=predicate)
-    assert [fact["src"] for _score, fact in facts] == ["a"]
-    resolved = g.resolve_entity("shared label", k=10, predicate=predicate)
-    assert "forbidden" not in {entity["id"] for _score, entity in resolved}
-    subgraph = g.search_subgraph(
-        "shared allowed fact",
-        k=5,
-        hops=1,
+    for entity_id, label, properties, embedding in (
+        (
+            "forbidden-top",
+            "crowd-out query",
+            {"owner": "u2", "allowed": False},
+            query,
+        ),
+        (
+            "allowed-best",
+            "allowed fallback",
+            {"owner": "u1", "allowed": True},
+            allowed,
+        ),
+        (
+            "allowed-other",
+            "other fallback",
+            {"owner": "u1", "allowed": True},
+            other,
+        ),
+    ):
+        g.upsert_entity_vec(
+            entity_id,
+            "Thing",
+            label,
+            embedding,
+            properties=properties,
+        )
+
+    forbidden_fact = g.add_fact_vec(
+        "allowed-best",
+        "rel",
+        "allowed-other",
+        "forbidden top fact",
+        query,
+        properties={"owner": "u2", "allowed": False},
+    )
+    allowed_fact = g.add_fact_vec(
+        "allowed-best",
+        "rel",
+        "allowed-other",
+        "allowed fallback fact",
+        allowed,
+        properties={"owner": "u1", "allowed": True},
+    )
+
+    assert g.semantic_entities(None, embedding=query, k=1)[0][1]["id"] == "forbidden-top"
+    assert g.semantic_facts(None, embedding=query, k=1, relation="rel")[0][1]["id"] == (
+        forbidden_fact
+    )
+    assert g.resolve_entity("crowd-out query", k=1)[0][1]["id"] == "forbidden-top"
+
+    entities = g.semantic_entities(None, embedding=query, k=1, predicate=predicate)
+    assert [entity["id"] for _score, entity in entities] == ["allowed-best"]
+
+    facts = g.semantic_facts(
+        None,
+        embedding=query,
+        k=1,
+        relation="rel",
+        predicate=predicate,
+    )
+    assert [fact["id"] for _score, fact in facts] == [allowed_fact]
+
+    resolved = g.resolve_entity("crowd-out query", k=1, predicate=predicate)
+    assert [entity["id"] for _score, entity in resolved] == ["allowed-best"]
+
+    unfiltered_subgraph = g.search_subgraph(
+        None,
+        embedding=query,
+        k=1,
+        hops=0,
+        relation="rel",
+        seed_kind="fact",
+    )
+    assert [fact["id"] for fact in unfiltered_subgraph["facts"]] == [forbidden_fact]
+
+    filtered_subgraph = g.search_subgraph(
+        None,
+        embedding=query,
+        k=1,
+        hops=0,
         relation="rel",
         seed_kind="fact",
         predicate=predicate,
     )
-    assert "forbidden" not in {entity["id"] for entity in subgraph["entities"]}
-    assert all(fact["src"] != "forbidden" for fact in subgraph["facts"])
+    assert [fact["id"] for fact in filtered_subgraph["facts"]] == [allowed_fact]
+
+
+def test_authorization_predicate_blocks_forbidden_bridge_expansion():
+    g = TemporalKnowledgeGraph(embedder=FixedQueryEmbedder())
+    query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    other = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    allowed_properties = {"owner": "u1", "allowed": True}
+    predicate = {"$and": [{"owner": "u1"}, {"allowed": True}]}
+
+    for entity_id, properties, embedding in (
+        ("allowed-a", allowed_properties, query),
+        ("forbidden-m", {"owner": "u2", "allowed": False}, other),
+        ("allowed-c", allowed_properties, other),
+    ):
+        g.upsert_entity_vec(
+            entity_id,
+            "Thing",
+            entity_id,
+            embedding,
+            properties=properties,
+        )
+    g.add_fact_vec(
+        "allowed-a",
+        "rel",
+        "forbidden-m",
+        "allowed a to forbidden m",
+        other,
+        properties=allowed_properties,
+    )
+    g.add_fact_vec(
+        "forbidden-m",
+        "rel",
+        "allowed-c",
+        "forbidden m to allowed c",
+        other,
+        properties=allowed_properties,
+    )
+
+    unfiltered = g.k_hop("allowed-a", k=2, direction="out")
+    assert "allowed-c" in {entity["id"] for entity in unfiltered["entities"]}
+    assert len(unfiltered["facts"]) == 2
+
+    filtered = g.k_hop(
+        "allowed-a",
+        k=2,
+        direction="out",
+        predicate=predicate,
+    )
+    filtered_ids = {entity["id"] for entity in filtered["entities"]}
+    assert "allowed-a" in filtered_ids
+    assert "forbidden-m" not in filtered_ids
+    assert "allowed-c" not in filtered_ids
+    assert all(
+        fact["src"] != "forbidden-m" and fact["dst"] != "forbidden-m"
+        for fact in filtered["facts"]
+    )
+
+    unfiltered_subgraph = g.search_subgraph(
+        None,
+        embedding=query,
+        k=1,
+        hops=2,
+        direction="out",
+        relation="rel",
+        seed_kind="entity",
+    )
+    assert "allowed-c" in {
+        entity["id"] for entity in unfiltered_subgraph["entities"]
+    }
+
+    filtered_subgraph = g.search_subgraph(
+        None,
+        embedding=query,
+        k=1,
+        hops=2,
+        direction="out",
+        relation="rel",
+        seed_kind="entity",
+        predicate=predicate,
+    )
+    filtered_subgraph_ids = {
+        entity["id"] for entity in filtered_subgraph["entities"]
+    }
+    assert "allowed-a" in filtered_subgraph_ids
+    assert "forbidden-m" not in filtered_subgraph_ids
+    assert "allowed-c" not in filtered_subgraph_ids
+    assert all(
+        fact["src"] != "forbidden-m" and fact["dst"] != "forbidden-m"
+        for fact in filtered_subgraph["facts"]
+    )
 
 
 def test_native_rerankers_are_exposed():
