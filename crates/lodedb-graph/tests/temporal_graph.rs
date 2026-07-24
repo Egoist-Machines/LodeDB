@@ -41,6 +41,21 @@ impl Embedder for HashEmbedder {
     }
 }
 
+struct FixedQueryEmbedder;
+
+impl Embedder for FixedQueryEmbedder {
+    fn dimension(&self) -> usize {
+        8
+    }
+
+    fn embed(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|_| vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .collect())
+    }
+}
+
 struct ToggleEmbedder {
     fail: Arc<AtomicBool>,
 }
@@ -962,78 +977,153 @@ fn entity_properties_have_independent_version_lineage() {
 }
 
 #[test]
-fn authorization_predicates_run_before_semantic_ranking_and_expansion() {
-    let mut g = graph();
-    for (id, owner) in [("allowed-a", "u1"), ("allowed-b", "u1"), ("forbidden", "u2")] {
-        g.upsert_entity(
+fn authorization_predicate_crowd_out_preserves_allowed_top_k() {
+    let config = GraphConfig {
+        vector_dim: 8,
+        ..GraphConfig::default()
+    };
+    let mut g =
+        TemporalGraph::open_in_memory(config, Some(Box::new(FixedQueryEmbedder))).unwrap();
+    let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let allowed = [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let other = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let predicate = json!({"$and": [{"owner": "u1"}, {"allowed": true}]});
+
+    for (id, label, properties, embedding) in [
+        (
+            "forbidden-top",
+            "crowd-out query",
+            json!({"owner": "u2", "allowed": false}),
+            &query,
+        ),
+        (
+            "allowed-best",
+            "allowed fallback",
+            json!({"owner": "u1", "allowed": true}),
+            &allowed,
+        ),
+        (
+            "allowed-other",
+            "other fallback",
+            json!({"owner": "u1", "allowed": true}),
+            &other,
+        ),
+    ] {
+        g.upsert_entity_vec(
             id,
             "Thing",
-            &format!("shared semantic label {id}"),
-            json!({"owner": owner, "allowed": owner == "u1"}),
+            label,
+            properties,
+            embedding,
             None,
             None,
         )
         .unwrap();
     }
-    g.add_fact(
-        "allowed-a",
-        "rel",
-        "allowed-b",
-        "shared semantic allowed fact",
-        json!({"owner": "u1", "allowed": true}),
-        vec![],
-        None,
-        &[],
-    )
-    .unwrap();
-    g.add_fact(
-        "forbidden",
-        "rel",
-        "allowed-b",
-        "shared semantic forbidden fact",
-        json!({"owner": "u2", "allowed": false}),
-        vec![],
-        None,
-        &[],
-    )
-    .unwrap();
-    let predicate = json!({"$and": [{"owner": "u1"}, {"allowed": true}]});
+
+    let forbidden_fact = g
+        .add_fact_vec(
+            "allowed-best",
+            "rel",
+            "allowed-other",
+            "forbidden top fact",
+            json!({"owner": "u2", "allowed": false}),
+            vec![],
+            None,
+            &[],
+            &query,
+        )
+        .unwrap();
+    let allowed_fact = g
+        .add_fact_vec(
+            "allowed-best",
+            "rel",
+            "allowed-other",
+            "allowed fallback fact",
+            json!({"owner": "u1", "allowed": true}),
+            vec![],
+            None,
+            &[],
+            &allowed,
+        )
+        .unwrap();
+
+    assert_eq!(
+        g.semantic_entities(None, Some(&query), 1, None, AsOf::Now)
+            .unwrap()[0]
+            .1
+            .id,
+        "forbidden-top",
+        "the forbidden entity must crowd out the allowed candidates without a predicate"
+    );
+    assert_eq!(
+        g.semantic_facts(None, Some(&query), 1, Some("rel"), AsOf::Now)
+            .unwrap()[0]
+            .1
+            .id,
+        forbidden_fact,
+        "the forbidden fact must rank first without a predicate"
+    );
+    assert_eq!(
+        g.resolve_entity("crowd-out query", 1).unwrap()[0].1.id,
+        "forbidden-top",
+        "the forbidden resolution candidate must rank first without a predicate"
+    );
 
     let entities = g
         .semantic_entities_filtered(
-            Some("shared semantic label"),
             None,
-            10,
+            Some(&query),
+            1,
             None,
             AsOf::Now,
             Some(&predicate),
         )
         .unwrap();
-    assert!(entities.iter().all(|(_score, entity)| entity.id != "forbidden"));
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].1.id, "allowed-best");
+
     let facts = g
         .semantic_facts_filtered(
-            Some("shared semantic"),
             None,
-            10,
-            None,
+            Some(&query),
+            1,
+            Some("rel"),
             AsOf::Now,
             Some(&predicate),
         )
         .unwrap();
     assert_eq!(facts.len(), 1);
-    assert_eq!(facts[0].1.src, "allowed-a");
-    assert!(
-        g.resolve_entity_filtered("shared semantic label", 10, Some(&predicate))
-            .unwrap()
-            .iter()
-            .all(|(_score, entity)| entity.id != "forbidden")
-    );
-    let subgraph = g
+    assert_eq!(facts[0].1.id, allowed_fact);
+
+    let resolved = g
+        .resolve_entity_filtered("crowd-out query", 1, Some(&predicate))
+        .unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].1.id, "allowed-best");
+
+    let unfiltered_subgraph = g
         .search_subgraph_filtered(
-            Some("shared semantic allowed fact"),
             None,
-            5,
+            Some(&query),
             1,
+            0,
+            Direction::Both,
+            None,
+            Some("rel"),
+            AsOf::Now,
+            None,
+            "fact",
+        )
+        .unwrap();
+    assert_eq!(unfiltered_subgraph.facts[0].id, forbidden_fact);
+
+    let filtered_subgraph = g
+        .search_subgraph_filtered(
+            None,
+            Some(&query),
+            1,
+            0,
             Direction::Both,
             None,
             Some("rel"),
@@ -1042,7 +1132,127 @@ fn authorization_predicates_run_before_semantic_ranking_and_expansion() {
             "fact",
         )
         .unwrap();
-    assert!(subgraph.entities.contains_key("allowed-a"));
-    assert!(!subgraph.entities.contains_key("forbidden"));
-    assert!(subgraph.facts.iter().all(|fact| fact.src != "forbidden"));
+    assert_eq!(filtered_subgraph.facts.len(), 1);
+    assert_eq!(filtered_subgraph.facts[0].id, allowed_fact);
+}
+
+#[test]
+fn authorization_predicate_blocks_forbidden_bridge_expansion() {
+    let config = GraphConfig {
+        vector_dim: 8,
+        ..GraphConfig::default()
+    };
+    let mut g =
+        TemporalGraph::open_in_memory(config, Some(Box::new(FixedQueryEmbedder))).unwrap();
+    let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let other = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let allowed_properties = json!({"owner": "u1", "allowed": true});
+    let predicate = json!({"$and": [{"owner": "u1"}, {"allowed": true}]});
+
+    for (id, properties, embedding) in [
+        ("allowed-a", allowed_properties.clone(), &query),
+        (
+            "forbidden-m",
+            json!({"owner": "u2", "allowed": false}),
+            &other,
+        ),
+        ("allowed-c", allowed_properties.clone(), &other),
+    ] {
+        g.upsert_entity_vec(
+            id,
+            "Thing",
+            id,
+            properties,
+            embedding,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    g.add_fact_vec(
+        "allowed-a",
+        "rel",
+        "forbidden-m",
+        "allowed a to forbidden m",
+        allowed_properties.clone(),
+        vec![],
+        None,
+        &[],
+        &other,
+    )
+    .unwrap();
+    g.add_fact_vec(
+        "forbidden-m",
+        "rel",
+        "allowed-c",
+        "forbidden m to allowed c",
+        allowed_properties,
+        vec![],
+        None,
+        &[],
+        &other,
+    )
+    .unwrap();
+
+    let seeds = vec!["allowed-a".to_string()];
+    let unfiltered = g
+        .k_hop(&seeds, 2, Direction::Out, AsOf::Now)
+        .unwrap();
+    assert!(unfiltered.entities.contains_key("allowed-c"));
+    assert_eq!(unfiltered.facts.len(), 2);
+
+    let filtered = g
+        .k_hop_filtered(
+            &seeds,
+            2,
+            Direction::Out,
+            AsOf::Now,
+            Some(&predicate),
+        )
+        .unwrap();
+    assert!(filtered.entities.contains_key("allowed-a"));
+    assert!(!filtered.entities.contains_key("forbidden-m"));
+    assert!(!filtered.entities.contains_key("allowed-c"));
+    assert!(filtered
+        .facts
+        .iter()
+        .all(|fact| fact.src != "forbidden-m" && fact.dst != "forbidden-m"));
+
+    let unfiltered_subgraph = g
+        .search_subgraph_filtered(
+            None,
+            Some(&query),
+            1,
+            2,
+            Direction::Out,
+            None,
+            Some("rel"),
+            AsOf::Now,
+            None,
+            "entity",
+        )
+        .unwrap();
+    assert!(unfiltered_subgraph.entities.contains_key("allowed-c"));
+
+    let filtered_subgraph = g
+        .search_subgraph_filtered(
+            None,
+            Some(&query),
+            1,
+            2,
+            Direction::Out,
+            None,
+            Some("rel"),
+            AsOf::Now,
+            Some(&predicate),
+            "entity",
+        )
+        .unwrap();
+    assert!(filtered_subgraph.entities.contains_key("allowed-a"));
+    assert!(!filtered_subgraph.entities.contains_key("forbidden-m"));
+    assert!(!filtered_subgraph.entities.contains_key("allowed-c"));
+    assert!(filtered_subgraph
+        .facts
+        .iter()
+        .all(|fact| fact.src != "forbidden-m" && fact.dst != "forbidden-m"));
 }
