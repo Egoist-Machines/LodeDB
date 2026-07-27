@@ -159,7 +159,7 @@ class ImageEmbeddingUnsupportedError(RuntimeError):
 
     Image verbs need a backend that embeds images: open with ``model="clip"`` (the
     shared image/text preset), or pass a custom ``embedder=`` that exposes an
-    ``embed_images`` method. A text-only preset (``"minilm"``/``"bge"``) or a
+    ``embed_images`` method. A text-only preset (``"minilm"``/``"bge"``/``"e5-small"``) or a
     vector-only index cannot embed images; for the latter, embed the image with
     your own model and use ``add_vectors`` / ``search_by_vector``.
     """
@@ -326,7 +326,8 @@ class LodeDB:
     ) -> None:
         """Opens (or creates) an on-disk local index, loading any persisted state.
 
-        ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality). Pass
+        ``model`` is a preset (``"minilm"`` fast default, ``"bge"`` quality,
+        ``"e5-small"`` multilingual). Pass
         ``embedder=`` instead to drive the index with your own
         :class:`~lodedb.engine.embedding_backends.EngineEmbeddingBackend` at any
         embedding dimension; ``model`` is then ignored and the index shape is taken
@@ -839,7 +840,7 @@ class LodeDB:
         verbatim without embedding or chunking text. This is how an
         external system (or a graph layer that embeds once) reuses its own
         vectors. The vector must have the index's embedding dimension
-        (``minilm`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
+        (``minilm``/``e5-small`` -> 384, ``bge`` -> 768; see :attr:`preset`). It is
         L2-normalized by default so cosine scores stay comparable with the text
         path and with self-embedded documents in the same index; pass
         ``normalize=False`` if your vectors are already unit-norm.

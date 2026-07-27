@@ -453,6 +453,51 @@ def test_onnx_matches_sentence_transformers_on_minilm() -> None:
 
 
 @_model_only
+def test_onnx_matches_sentence_transformers_on_e5_small() -> None:
+    """ONNX e5-small embeddings match the sentence-transformers reference (cosine ~1.0).
+
+    Also covers the token_type_ids synthesis path with real weights: the
+    multilingual-e5 ONNX export requires the input while its XLM-R tokenizer
+    never emits it.
+    """
+
+    pytest.importorskip("onnxruntime")
+    from lodedb.engine.embedding_backends import SentenceTransformerEmbeddingBackend
+    from lodedb.local.onnx_artifacts import materialize_onnx_model
+
+    preset = resolve_preset("e5-small")
+    artifact = materialize_onnx_model(preset.model_name)
+    onnx_backend = ONNXRuntimeEmbeddingBackend(
+        model_name=preset.model_name,
+        native_dim=preset.native_dim,
+        onnx_model_path=artifact.model_path,
+        tokenizer_name_or_path=str(artifact.tokenizer_dir),
+        pooling=preset.pooling,
+        max_seq_length=256,
+        query_prefix=preset.query_prefix,
+        document_prefix=preset.document_prefix,
+    )
+    torch_backend = SentenceTransformerEmbeddingBackend(
+        model_name=preset.model_name,
+        native_dim=preset.native_dim,
+        device="cpu",
+        max_seq_length=256,
+        query_prefix=preset.query_prefix,
+        document_prefix=preset.document_prefix,
+    )
+
+    texts = ("the quick brown fox", "una tortuga verde y lenta", "vector databases are fast")
+    onnx_vecs = np.asarray(onnx_backend.embed_documents(texts), dtype=np.float32)
+    torch_vecs = np.asarray(torch_backend.embed_documents(texts), dtype=np.float32)
+    cosines = np.sum(onnx_vecs * torch_vecs, axis=1)  # both are L2-normalized
+    assert float(cosines.min()) > 0.99
+
+    onnx_query = np.asarray(onnx_backend.embed_query("donde esta la tortuga"), dtype=np.float32)
+    torch_query = np.asarray(torch_backend.embed_query("donde esta la tortuga"), dtype=np.float32)
+    assert float(np.dot(onnx_query, torch_query)) > 0.99
+
+
+@_model_only
 def test_lodedb_end_to_end_with_onnx_runtime(tmp_path) -> None:
     """A LodeDB opened with the ONNX runtime indexes and searches end to end."""
 

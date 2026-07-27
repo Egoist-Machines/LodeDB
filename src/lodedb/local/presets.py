@@ -4,7 +4,8 @@ The local layer reuses the engine's direct-TurboVec route policies verbatim
 (model id, provider, task, native dim, quantization width, query/document
 prefixes) so the compact storage and ``.tvim``/``.tvd``/``.jsd`` persistence are
 byte-identical to the engine path. ``minilm`` is the fast default; ``bge`` is
-the higher-quality preset.
+the higher-quality preset; ``e5-small`` is the multilingual preset at the same
+384-dim index shape as ``minilm``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,9 @@ from lodedb.engine.route_profiles import (
     BGE_BASE_QUERY_PREFIX,
     BGE_TURBOVEC_ROUTE_PROFILE,
     CLIP_TURBOVEC_ROUTE_PROFILE,
+    E5_DOCUMENT_PREFIX,
+    E5_QUERY_PREFIX,
+    E5_SMALL_TURBOVEC_ROUTE_PROFILE,
     MINILM_TURBOVEC_ROUTE_PROFILE,
     route_policy_for_profile,
 )
@@ -81,6 +85,19 @@ LOCAL_MODEL_PRESETS: dict[str, LocalModelPreset] = {
         document_prefix="",
         description="Quality: BAAI/bge-base-en-v1.5, 768-dim, 4-bit TurboVec.",
         pooling="cls",
+    ),
+    "e5-small": LocalModelPreset(
+        name="e5-small",
+        route_profile=E5_SMALL_TURBOVEC_ROUTE_PROFILE,
+        # E5 is trained asymmetric: queries embed under "query: " and documents
+        # under "passage: ". Both prefixes are required for its scores to hold.
+        query_prefix=E5_QUERY_PREFIX,
+        document_prefix=E5_DOCUMENT_PREFIX,
+        description=(
+            "Multilingual: intfloat/multilingual-e5-small, 384-dim, 4-bit "
+            "TurboVec. Same index shape as minilm."
+        ),
+        pooling="mean",
     ),
     "clip": LocalModelPreset(
         name="clip",

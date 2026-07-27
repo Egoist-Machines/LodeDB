@@ -470,6 +470,26 @@ def test_bge_preset_uses_768_dim_and_query_prefix(tmp_path):
     db.close()
 
 
+def test_e5_small_preset_uses_384_dim_and_asymmetric_prefixes(tmp_path):
+    """The e5-small preset maps to the multilingual 384-dim route with both prefixes."""
+
+    from lodedb.local.presets import resolve_preset
+
+    preset = resolve_preset("e5-small")
+    assert preset.native_dim == 384
+    assert preset.model_name == "intfloat/multilingual-e5-small"
+    assert preset.query_prefix == "query: "
+    assert preset.document_prefix == "passage: "
+    assert preset.pooling == "mean"
+    assert preset.turbovec_bit_width == 4
+    # Construct end-to-end with a matching-dim hash backend.
+    db = _open(tmp_path, dim=384, model="e5-small")
+    db.add("a document for the multilingual preset", id="m")
+    assert db.count() == 1
+    assert db.search("document", k=1)[0].id == "m"
+    db.close()
+
+
 def test_context_manager_closes(tmp_path):
     """LodeDB works as a context manager and persists across the boundary."""
 

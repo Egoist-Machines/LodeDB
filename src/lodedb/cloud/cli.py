@@ -1196,7 +1196,7 @@ def store_create(
     preset: Annotated[
         str | None,
         typer.Option(
-            help="Embedding preset (minilm | bge | clip); cloud_writer "
+            help="Embedding preset (minilm | bge | e5-small | clip); cloud_writer "
             "defaults to minilm unless --vector-dim is given."
         ),
     ] = None,

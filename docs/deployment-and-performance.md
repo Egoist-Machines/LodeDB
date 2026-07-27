@@ -165,6 +165,7 @@ pulled from Hugging Face on first use and cached.
 | --- | --- | --- | --- | --- |
 | `minilm` (default) | `sentence-transformers/all-MiniLM-L6-v2` | 384 | mean | Fast general-purpose default. |
 | `bge` | `BAAI/bge-base-en-v1.5` | 768 | cls | Higher quality, larger vectors; applies a query prefix internally. |
+| `e5-small` | `intfloat/multilingual-e5-small` | 384 | mean | Multilingual (~100 languages) at the same index shape as `minilm`; applies the model's `query: `/`passage: ` prefixes internally. |
 | `clip` | `sentence-transformers/clip-ViT-B-32` | 512 | n/a | Image and text in one shared space. Needs the `[image]` extra and the PyTorch tier. See [multimodal.md](multimodal.md). |
 
 All presets store 4-bit TurboVec codes. For any other model or dimension, pass your own
