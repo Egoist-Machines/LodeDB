@@ -96,12 +96,28 @@ def _default_search_mode(db: LodeDB) -> str:
     return "hybrid" if (db.store_text or db.index_text) else "vector"
 
 
+def _embedding_threads_from_env() -> int | None:
+    """Returns the ``LODEDB_EMBEDDING_THREADS`` override, or ``None`` for auto sizing."""
+
+    raw = os.environ.get("LODEDB_EMBEDDING_THREADS")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LODEDB_EMBEDDING_THREADS must be an integer") from exc
+    if value <= 0:
+        raise ValueError("LODEDB_EMBEDDING_THREADS must be a positive integer")
+    return value
+
+
 def build_mcp_server(
     path: str | Path,
     *,
     model: str = "minilm",
     device: str = "auto",
     embedding_runtime: str = "auto",
+    embedding_threads: int | None = None,
     name: str = "lodedb",
     store_text: bool = True,
     exclude_text: bool = False,
@@ -133,6 +149,7 @@ def build_mcp_server(
         model=model,
         device=device,
         embedding_runtime=embedding_runtime,
+        embedding_threads=embedding_threads,
         store_text=store_text,
         _embedding_backend=_embedding_backend,
     )
@@ -215,6 +232,7 @@ def main() -> None:
         model=os.environ.get("LODEDB_MODEL", "minilm"),
         device=os.environ.get("LODEDB_DEVICE", "auto"),
         embedding_runtime=os.environ.get("LODEDB_EMBEDDING_RUNTIME", "auto"),
+        embedding_threads=_embedding_threads_from_env(),
     )
     server.run(transport="stdio")
 

@@ -24,9 +24,12 @@ import types
 import numpy as np
 import pytest
 
+from lodedb.engine import embedding_backends as embedding_backends_mod
 from lodedb.engine.embedding_backends import (
     ONNXRuntimeEmbeddingBackend,
+    _cgroup_cpu_quota,
     _pool_onnx_output,
+    _resolve_cpu_allotment,
 )
 from lodedb.local import backends as backends_mod
 from lodedb.local import onnx_artifacts as onnx_artifacts_mod
@@ -186,6 +189,188 @@ def test_onnx_backend_rejects_unknown_pooling() -> None:
         )
 
 
+# -- CPU allotment + session options ----------------------------------------
+
+
+def test_cgroup_cpu_quota_rounds_up(tmp_path) -> None:
+    """A fractional cgroup v2 quota rounds up to whole CPUs."""
+
+    cpu_max = tmp_path / "cpu.max"
+    cpu_max.write_text("150000 100000", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) == 2
+    cpu_max.write_text("100000 100000", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) == 1
+    cpu_max.write_text("50000 100000", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) == 1
+
+
+def test_cgroup_cpu_quota_none_when_unlimited_missing_or_malformed(tmp_path) -> None:
+    """Unlimited, absent, and malformed cpu.max files all mean "no quota"."""
+
+    cpu_max = tmp_path / "cpu.max"
+    cpu_max.write_text("max 100000", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) is None
+    cpu_max.write_text("garbage", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) is None
+    cpu_max.write_text("-1 100000", encoding="ascii")
+    assert _cgroup_cpu_quota(cpu_max) is None
+    assert _cgroup_cpu_quota(tmp_path / "absent") is None
+
+
+def test_cpu_allotment_narrow_affinity_mask_is_constrained(monkeypatch) -> None:
+    """An affinity mask narrower than the machine sizes the allotment and flags it."""
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2}, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(embedding_backends_mod, "_cgroup_cpu_quota", lambda: None)
+    assert _resolve_cpu_allotment() == (3, True)
+
+
+def test_cpu_allotment_full_affinity_mask_is_unconstrained(monkeypatch) -> None:
+    """An affinity mask covering every core with no quota means no constraint."""
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(embedding_backends_mod, "_cgroup_cpu_quota", lambda: None)
+    assert _resolve_cpu_allotment() == (8, False)
+
+
+def test_cpu_allotment_capped_by_cgroup_quota(monkeypatch) -> None:
+    """A CFS quota does not narrow the affinity mask, so it caps the count separately."""
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(embedding_backends_mod, "_cgroup_cpu_quota", lambda: 2)
+    assert _resolve_cpu_allotment() == (2, True)
+
+
+def test_cpu_allotment_falls_back_to_cpu_count(monkeypatch) -> None:
+    """Without sched_getaffinity (macOS) or a quota, os.cpu_count() is the source."""
+
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 5)
+    monkeypatch.setattr(embedding_backends_mod, "_cgroup_cpu_quota", lambda: None)
+    assert _resolve_cpu_allotment() == (5, False)
+
+
+def test_cpu_allotment_is_at_least_one(monkeypatch) -> None:
+    """An unknowable core count still yields a usable pool size."""
+
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    monkeypatch.setattr(embedding_backends_mod, "_cgroup_cpu_quota", lambda: None)
+    assert _resolve_cpu_allotment() == (1, False)
+
+
+class _RecordingSessionOptions:
+    """A SessionOptions stand-in that records the fields the backend sets."""
+
+    def __init__(self) -> None:
+        self.intra_op_num_threads = -1
+        self.inter_op_num_threads = -1
+        self.config_entries: dict[str, str] = {}
+
+    def add_session_config_entry(self, key: str, value: str) -> None:
+        """Records one string session config entry."""
+
+        self.config_entries[key] = value
+
+
+def _install_fake_onnxruntime(monkeypatch) -> list[dict]:
+    """Installs a fake onnxruntime module capturing InferenceSession construction."""
+
+    created: list[dict] = []
+
+    def inference_session(path, sess_options=None, providers=None):
+        created.append({"path": path, "sess_options": sess_options, "providers": providers})
+        return _FakeONNXSession()
+
+    fake = types.SimpleNamespace(
+        SessionOptions=_RecordingSessionOptions,
+        InferenceSession=inference_session,
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+    return created
+
+
+def test_load_session_pins_pool_on_constrained_allotment(monkeypatch) -> None:
+    """On a constrained allotment, the session gets pinned, non-spinning options."""
+
+    created = _install_fake_onnxruntime(monkeypatch)
+    monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", lambda: (3, True))
+    backend = ONNXRuntimeEmbeddingBackend(
+        model_name="fake-model",
+        native_dim=4,
+        onnx_model_path="fake.onnx",
+        tokenizer_name_or_path="fake-tokenizer",
+    )
+
+    backend._load_session()
+
+    assert len(created) == 1
+    options = created[0]["sess_options"]
+    assert options.intra_op_num_threads == 3
+    assert options.inter_op_num_threads == 1
+    assert options.config_entries["session.intra_op.allow_spinning"] == "0"
+    assert created[0]["providers"] == ["CPUExecutionProvider"]
+
+
+def test_load_session_keeps_ort_defaults_when_unconstrained(monkeypatch) -> None:
+    """On an unconstrained host with no override, ONNX Runtime keeps its own defaults."""
+
+    created = _install_fake_onnxruntime(monkeypatch)
+    monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", lambda: (8, False))
+    backend = ONNXRuntimeEmbeddingBackend(
+        model_name="fake-model",
+        native_dim=4,
+        onnx_model_path="fake.onnx",
+        tokenizer_name_or_path="fake-tokenizer",
+    )
+
+    backend._load_session()
+
+    assert len(created) == 1
+    assert created[0]["sess_options"] is None
+
+
+def test_load_session_honors_explicit_thread_override(monkeypatch) -> None:
+    """intra_op_threads pins the pool even when the allotment is unconstrained."""
+
+    created = _install_fake_onnxruntime(monkeypatch)
+
+    def fail() -> tuple[int, bool]:
+        raise AssertionError("an explicit override must not probe the allotment")
+
+    monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", fail)
+    backend = ONNXRuntimeEmbeddingBackend(
+        model_name="fake-model",
+        native_dim=4,
+        onnx_model_path="fake.onnx",
+        tokenizer_name_or_path="fake-tokenizer",
+        intra_op_threads=2,
+    )
+
+    backend._load_session()
+
+    options = created[0]["sess_options"]
+    assert options.intra_op_num_threads == 2
+    assert options.inter_op_num_threads == 1
+    assert options.config_entries["session.intra_op.allow_spinning"] == "0"
+
+
+def test_onnx_backend_rejects_nonpositive_threads() -> None:
+    """A zero or negative intra_op_threads is a deterministic constructor error."""
+
+    with pytest.raises(ValueError, match="intra_op_threads"):
+        ONNXRuntimeEmbeddingBackend(
+            model_name="m",
+            native_dim=4,
+            onnx_model_path="m.onnx",
+            tokenizer_name_or_path="t",
+            intra_op_threads=0,
+        )
+
+
 # -- runtime selection ------------------------------------------------------
 
 
@@ -272,6 +457,30 @@ def test_forced_torch_skips_onnx(monkeypatch) -> None:
 
     assert backend.name == "sentence_transformers"
     assert resolution.fallback_used is False
+
+
+def test_embedding_threads_reaches_the_onnx_backend(monkeypatch) -> None:
+    """``embedding_threads`` is plumbed into the ONNX backend; the default stays auto."""
+
+    preset = resolve_preset("minilm")
+
+    def fake_materialize(model_name: str) -> OnnxArtifact:
+        return OnnxArtifact(model_name, "model.onnx", "tok", source="cached")
+
+    _patch_onnx(monkeypatch, available=True, materialize=fake_materialize)
+    pinned, _ = build_local_embedding_backend(preset, device="cpu", embedding_threads=2)
+    auto, _ = build_local_embedding_backend(preset, device="cpu")
+
+    assert pinned.intra_op_threads == 2
+    assert auto.intra_op_threads is None
+
+
+def test_embedding_threads_must_be_positive() -> None:
+    """A zero or negative embedding_threads is rejected before any backend is built."""
+
+    preset = resolve_preset("minilm")
+    with pytest.raises(ValueError, match="embedding_threads"):
+        build_local_embedding_backend(preset, device="cpu", embedding_threads=0)
 
 
 def test_unknown_runtime_is_rejected() -> None:

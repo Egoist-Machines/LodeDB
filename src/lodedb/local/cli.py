@@ -53,6 +53,14 @@ _STORE_TEXT_OPTION = typer.Option(
     help="Retain raw text so `lodedb get ID` can return it (default on; "
     "--no-store-text opts out).",
 )
+_EMBEDDING_THREADS_OPTION = typer.Option(
+    None,
+    "--embedding-threads",
+    envvar="LODEDB_EMBEDDING_THREADS",
+    help="Pin the ONNX Runtime intra-op thread pool. Default: pin only when the "
+    "process's CPU allotment (affinity mask / cgroup quota) is narrower than the "
+    "machine, keeping the runtime defaults otherwise.",
+)
 _EXCLUDE_TEXT_OPTION = typer.Option(
     False,
     "--exclude-text",
@@ -391,6 +399,7 @@ def mcp(
     model: str = _MODEL_OPTION,
     device: str = _DEVICE_OPTION,
     runtime: str = _RUNTIME_OPTION,
+    embedding_threads: int | None = _EMBEDDING_THREADS_OPTION,
     store_text: bool = _STORE_TEXT_OPTION,
     exclude_text: bool = _EXCLUDE_TEXT_OPTION,
 ) -> None:
@@ -417,6 +426,7 @@ def mcp(
         model=model,
         device=device,
         embedding_runtime=runtime,
+        embedding_threads=embedding_threads,
         store_text=store_text,
         exclude_text=exclude_text,
     )
