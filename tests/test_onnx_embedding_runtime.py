@@ -118,6 +118,37 @@ def test_onnx_backend_pools_normalizes_and_validates_shape() -> None:
     assert np.linalg.norm(np.asarray(query, dtype=np.float32)) == pytest.approx(1.0)
 
 
+def test_onnx_backend_synthesizes_missing_token_type_ids() -> None:
+    """A graph requiring token_type_ids gets zeros when the tokenizer emits none.
+
+    XLM-R tokenizers (multilingual-e5) never produce token_type_ids, but the
+    exported graphs still declare the input; the backend must feed the model's
+    single-segment value instead of failing.
+    """
+
+    class _SegmentedSession(_FakeONNXSession):
+        def get_inputs(self) -> list[_FakeONNXInput]:
+            return [
+                _FakeONNXInput("input_ids"),
+                _FakeONNXInput("attention_mask"),
+                _FakeONNXInput("token_type_ids"),
+            ]
+
+        def run(self, output_names: list[str], inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+            token_type_ids = inputs["token_type_ids"]
+            assert token_type_ids.shape == inputs["input_ids"].shape
+            assert not token_type_ids.any()
+            return super().run(output_names, inputs)
+
+    backend = _fake_backend(pooling="mean")
+    backend._session = _SegmentedSession()
+
+    documents = backend.embed_documents(("alpha", "beta"))
+
+    assert len(documents) == 2
+    assert all(len(row) == 4 for row in documents)
+
+
 def test_onnx_backend_validates_native_dim() -> None:
     """A native_dim that disagrees with the model output is a deterministic error."""
 

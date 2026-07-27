@@ -761,6 +761,16 @@ class ONNXRuntimeEmbeddingBackend:
         run_inputs = {key: value for key, value in tokenized.items() if key in input_names}
         if not run_inputs:
             raise ValueError(f"{self.model_name} ONNX graph accepted no tokenizer inputs")
+        if (
+            "token_type_ids" in input_names
+            and "token_type_ids" not in run_inputs
+            and "input_ids" in run_inputs
+        ):
+            # Some exported graphs declare token_type_ids even when the source
+            # tokenizer never emits them (XLM-R models such as multilingual-e5
+            # have a single segment); an all-zeros segment tensor is the value
+            # the source model uses.
+            run_inputs["token_type_ids"] = np.zeros_like(run_inputs["input_ids"])
         output_names = [item.name for item in session.get_outputs()]
         output_values = session.run(output_names, run_inputs)
         return {
