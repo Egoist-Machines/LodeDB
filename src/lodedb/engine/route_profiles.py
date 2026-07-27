@@ -14,7 +14,10 @@ from typing import Any
 from lodedb.engine.core import EngineRoutePolicy
 
 BGE_BASE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+E5_QUERY_PREFIX = "query: "
+E5_DOCUMENT_PREFIX = "passage: "
 BGE_TURBOVEC_ROUTE_PROFILE = "bge-turbovec"
+E5_SMALL_TURBOVEC_ROUTE_PROFILE = "e5-small-turbovec"
 MINILM_TURBOVEC_ROUTE_PROFILE = "minilm-turbovec"
 CLIP_TURBOVEC_ROUTE_PROFILE = "clip-turbovec"
 BGE_TURBOVEC_2BIT_ROUTE_PROFILE = "bge-turbovec-2bit"
@@ -40,6 +43,19 @@ CLIENT_ROUTE_POLICIES: dict[str, EngineRoutePolicy] = {
         label="MiniLM direct TurboVec 4-bit",
         client_note="storage-first direct full-dimensional TurboVec route without PCA or rerank",
         model="sentence-transformers/all-MiniLM-L6-v2",
+        provider="local_open",
+        task="direct-turbovec",
+        native_dim=384,
+        method_template="direct_turbovec_full384_bw4",
+        experimental=False,
+        index_backend="turbovec_direct",
+        turbovec_bit_width=4,
+    ),
+    E5_SMALL_TURBOVEC_ROUTE_PROFILE: EngineRoutePolicy(
+        profile=E5_SMALL_TURBOVEC_ROUTE_PROFILE,
+        label="Multilingual E5-small direct TurboVec 4-bit",
+        client_note="storage-first direct full-dimensional TurboVec route without PCA or rerank",
+        model="intfloat/multilingual-e5-small",
         provider="local_open",
         task="direct-turbovec",
         native_dim=384,
@@ -107,6 +123,7 @@ CLIENT_ROUTE_POLICIES: dict[str, EngineRoutePolicy] = {
 CLIENT_ROUTE_PROFILE_ORDER = (
     MINILM_TURBOVEC_ROUTE_PROFILE,
     BGE_TURBOVEC_ROUTE_PROFILE,
+    E5_SMALL_TURBOVEC_ROUTE_PROFILE,
     CLIP_TURBOVEC_ROUTE_PROFILE,
     MINILM_TURBOVEC_2BIT_ROUTE_PROFILE,
     BGE_TURBOVEC_2BIT_ROUTE_PROFILE,

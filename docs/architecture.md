@@ -95,7 +95,7 @@ src/lodedb/
     db.py                #   LodeDB: add / search / add_image / vector-in / remove / persist
     backends.py            #   embedding runtime + device selection (ONNX / torch; MPS / CUDA / CPU)
     onnx_artifacts.py    #   fetch/export + cache the preset ONNX model on first use
-    presets.py           #   minilm / bge / clip route presets (+ custom embedder=)
+    presets.py           #   minilm / bge / e5-small / clip route presets (+ custom embedder=)
     collection.py        #   LodeCollection: named vector spaces under one root
     cli.py, server.py    #   `lodedb` CLI + loopback/private-network dev server
     mcp_server.py        #   optional stdio MCP server (agent memory)

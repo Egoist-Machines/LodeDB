@@ -109,7 +109,8 @@ class LodeCollection:
         The space lives at ``<root>/<name>/``. Each space has a *kind*, fixed at
         creation and recorded in the manifest:
 
-        - **preset** (default): ``model=`` a preset (``"minilm"``/``"bge"``/``"clip"``).
+        - **preset** (default): ``model=`` a preset
+          (``"minilm"``/``"bge"``/``"e5-small"``/``"clip"``).
         - **vector**: ``vector_dim=`` a bring-your-own-vectors index (no model).
         - **custom**: ``embedder=`` a custom ``EngineEmbeddingBackend``
           (its ``required_model_name`` is recorded as the space's identity).

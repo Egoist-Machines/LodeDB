@@ -11,6 +11,7 @@ from lodedb import LodeDB
 
 def main() -> None:
     # "minilm" (all-MiniLM-L6-v2, fast) | "bge" (BAAI/bge-base-en-v1.5, higher quality)
+    # | "e5-small" (multilingual-e5-small, multilingual)
     db = LodeDB(path="./data", model="minilm")
 
     fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})

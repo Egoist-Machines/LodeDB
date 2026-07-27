@@ -58,7 +58,7 @@ query precomputed embeddings instead. Use it to reuse an external embedding mode
 or for a graph layer that embeds once and reuses the vectors.
 
 ```python
-# add precomputed vectors (must match the index dim: minilm=384, bge=768)
+# add precomputed vectors (must match the index dim: minilm/e5-small=384, bge=768)
 db.add_vectors(my_vector, id="alice", metadata={"kind": "node", "type": "Person"})
 db.add_vectors_many([
     {"vector": v0, "id": "n0", "metadata": {...}},

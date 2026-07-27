@@ -48,9 +48,10 @@ and ignored.
 
 The request's `model` field is echoed back in the response; it does not select the embedding model.
 The preset selected at `lodedb serve --model ...` is authoritative. If `dimensions` is present,
-it must match the preset's native dimension or the request is rejected: `minilm` is 384, `bge` is
-768, and `clip` is 512. The OpenAI wire format has no query/document role, so `minilm` is the
-recommended preset because it is symmetric.
+it must match the preset's native dimension or the request is rejected: `minilm` and `e5-small`
+are 384, `bge` is 768, and `clip` is 512. The OpenAI wire format has no query/document role, so
+`minilm` is the recommended preset because it is symmetric (`bge` and `e5-small` embed queries
+and documents under different prefixes).
 
 For [OpenKnowledge](https://github.com/inkeep/open-knowledge) (`inkeep/open-knowledge`),
 semantic search consumes this API and whitelists `http://localhost`:
@@ -319,7 +320,7 @@ the local-bridge step first.
     database: lodedb        # or PGPT_VECTORSTORE=lodedb
   lodedb:                   # optional; defaults shown
     path: local_data/lodedb
-    model: minilm           # "minilm" (fast) or "bge" (quality)
+    model: minilm           # "minilm" (fast) | "bge" (quality) | "e5-small" (multilingual)
     device: auto            # auto | cpu | mps | cuda
     store_text: true        # keep on for hybrid/lexical retrieval
     index_text: true        # persist the lexical index; omit to follow store_text

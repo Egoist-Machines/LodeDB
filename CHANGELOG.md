@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `e5-small` local preset: `intfloat/multilingual-e5-small` (384-dim, mean
+  pooling, 4-bit TurboVec) with the model's asymmetric `query: ` / `passage: `
+  retrieval prefixes applied internally. First multilingual text preset; it
+  shares the 384-dim index shape with `minilm`, and the Hub repo ships a
+  prebuilt ONNX export, so the default ONNX runtime needs no Optimum export
+  step.
+
 ## [2.0.2] - 2026-07-24
 
 ### Added

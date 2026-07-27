@@ -36,7 +36,7 @@ To actually run it in PrivateGPT (inside a PrivateGPT clone whose environment al
        # optional LodeDB block (defaults shown):
        lodedb:
          path: local_data/lodedb
-         model: minilm        # "minilm" (fast) or "bge" (quality)
+         model: minilm        # "minilm" (fast) | "bge" (quality) | "e5-small" (multilingual)
          device: auto         # auto | cpu | mps | cuda
          store_text: true     # keep on for hybrid/lexical retrieval
          index_text: false

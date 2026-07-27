@@ -169,7 +169,7 @@ Run with `uv run` (e.g. `uv run lodedb doctor`).
 ```python
 from lodedb import LodeDB
 
-with LodeDB(path="./data", model="minilm") as db:   # "minilm" (fast) | "bge" (quality) | "clip" (image+text)
+with LodeDB(path="./data", model="minilm") as db:   # "minilm" (fast) | "bge" (quality) | "e5-small" (multilingual) | "clip" (image+text)
     fox = db.add("the quick brown fox jumps", metadata={"topic": "animals"})
     db.add("a lazy dog sleeps all day", metadata={"topic": "animals"})
 
@@ -194,8 +194,9 @@ with LodeDB(path="./data", model="minilm") as db:   # "minilm" (fast) | "bge" (q
 
 Reopen with `LodeDB(path="./data")`; no migration step. Original text is kept in a
 `.tvtext` sidecar for `db.get`; pass `store_text=False` to keep none. Presets are `minilm`
-(384-dim), `bge` (768-dim), and `clip` (512-dim, image+text), with weights pulled from Hugging
-Face on first use. More in [`examples/`](examples/).
+(384-dim), `bge` (768-dim), `e5-small` (384-dim, multilingual), and `clip` (512-dim,
+image+text), with weights pulled from Hugging Face on first use. More in
+[`examples/`](examples/).
 
 Need to read a store another process is writing to? Open it read-only. It takes no writer
 lock, so it never blocks on (or is blocked by) the writer:

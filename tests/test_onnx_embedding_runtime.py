@@ -118,6 +118,37 @@ def test_onnx_backend_pools_normalizes_and_validates_shape() -> None:
     assert np.linalg.norm(np.asarray(query, dtype=np.float32)) == pytest.approx(1.0)
 
 
+def test_onnx_backend_synthesizes_missing_token_type_ids() -> None:
+    """A graph requiring token_type_ids gets zeros when the tokenizer emits none.
+
+    XLM-R tokenizers (multilingual-e5) never produce token_type_ids, but the
+    exported graphs still declare the input; the backend must feed the model's
+    single-segment value instead of failing.
+    """
+
+    class _SegmentedSession(_FakeONNXSession):
+        def get_inputs(self) -> list[_FakeONNXInput]:
+            return [
+                _FakeONNXInput("input_ids"),
+                _FakeONNXInput("attention_mask"),
+                _FakeONNXInput("token_type_ids"),
+            ]
+
+        def run(self, output_names: list[str], inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+            token_type_ids = inputs["token_type_ids"]
+            assert token_type_ids.shape == inputs["input_ids"].shape
+            assert not token_type_ids.any()
+            return super().run(output_names, inputs)
+
+    backend = _fake_backend(pooling="mean")
+    backend._session = _SegmentedSession()
+
+    documents = backend.embed_documents(("alpha", "beta"))
+
+    assert len(documents) == 2
+    assert all(len(row) == 4 for row in documents)
+
+
 def test_onnx_backend_validates_native_dim() -> None:
     """A native_dim that disagrees with the model output is a deterministic error."""
 
@@ -419,6 +450,51 @@ def test_onnx_matches_sentence_transformers_on_minilm() -> None:
 
     cosines = np.sum(onnx_vecs * torch_vecs, axis=1)  # both are L2-normalized
     assert float(cosines.min()) > 0.99
+
+
+@_model_only
+def test_onnx_matches_sentence_transformers_on_e5_small() -> None:
+    """ONNX e5-small embeddings match the sentence-transformers reference (cosine ~1.0).
+
+    Also covers the token_type_ids synthesis path with real weights: the
+    multilingual-e5 ONNX export requires the input while its XLM-R tokenizer
+    never emits it.
+    """
+
+    pytest.importorskip("onnxruntime")
+    from lodedb.engine.embedding_backends import SentenceTransformerEmbeddingBackend
+    from lodedb.local.onnx_artifacts import materialize_onnx_model
+
+    preset = resolve_preset("e5-small")
+    artifact = materialize_onnx_model(preset.model_name)
+    onnx_backend = ONNXRuntimeEmbeddingBackend(
+        model_name=preset.model_name,
+        native_dim=preset.native_dim,
+        onnx_model_path=artifact.model_path,
+        tokenizer_name_or_path=str(artifact.tokenizer_dir),
+        pooling=preset.pooling,
+        max_seq_length=256,
+        query_prefix=preset.query_prefix,
+        document_prefix=preset.document_prefix,
+    )
+    torch_backend = SentenceTransformerEmbeddingBackend(
+        model_name=preset.model_name,
+        native_dim=preset.native_dim,
+        device="cpu",
+        max_seq_length=256,
+        query_prefix=preset.query_prefix,
+        document_prefix=preset.document_prefix,
+    )
+
+    texts = ("the quick brown fox", "una tortuga verde y lenta", "vector databases are fast")
+    onnx_vecs = np.asarray(onnx_backend.embed_documents(texts), dtype=np.float32)
+    torch_vecs = np.asarray(torch_backend.embed_documents(texts), dtype=np.float32)
+    cosines = np.sum(onnx_vecs * torch_vecs, axis=1)  # both are L2-normalized
+    assert float(cosines.min()) > 0.99
+
+    onnx_query = np.asarray(onnx_backend.embed_query("donde esta la tortuga"), dtype=np.float32)
+    torch_query = np.asarray(torch_backend.embed_query("donde esta la tortuga"), dtype=np.float32)
+    assert float(np.dot(onnx_query, torch_query)) > 0.99
 
 
 @_model_only

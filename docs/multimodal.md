@@ -166,7 +166,7 @@ db = LodeDB("./store", embedder=MyBackend())      # model= is ignored; shape fro
 - Large galleries: `add_images` is one atomic commit per call, so memory grows with the
   call and a late failure loses the whole call. Ingest a big gallery in chunks (one
   `add_images` call per chunk) for bounded memory and natural resume points.
-- `bit_width` is fixed by a preset (`minilm`/`bge`/`clip` are 4-bit); it is only
+- `bit_width` is fixed by a preset (`minilm`/`bge`/`e5-small`/`clip` are 4-bit); it is only
   configurable on a `vector_dim=` or `embedder=` index, where it must be 2 or 4.
 - Audio and video: there is no bundled audio or video encoder. Embed with your own
   model (for example an audio CLAP model or a video encoder) and use the
