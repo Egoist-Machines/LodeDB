@@ -305,6 +305,7 @@ class LodeDB:
         device: str = "auto",
         embedding_runtime: str = "auto",
         embedding_dtype: str = "float32",
+        embedding_threads: int | None = None,
         batch_size: int = 32,
         max_seq_length: int | None = None,
         chunk_character_limit: int = 900,
@@ -354,6 +355,13 @@ class LodeDB:
         (measured cosine ~0.999 on MiniLM) but are recall-preserving, and every
         runtime returns L2-normalized fp32 vectors, so a store built at one dtype
         stays searchable from another.
+        ``embedding_threads`` pins the ONNX Runtime intra-op thread pool. The
+        default (``None``) intervenes only when the process's CPU allotment is
+        constrained (a scheduler affinity mask or cgroup v2 CPU quota below the
+        machine's core count): the pool is then sized to the allotment and
+        spin-waiting is disabled, so an embed inside a container with a CPU
+        limit does not oversubscribe and throttle. On an unconstrained host
+        ONNX Runtime keeps its own defaults. The torch runtimes ignore it.
         ``batch_size`` (default ``32``) is how many texts are embedded per forward
         pass; a larger batch raises embedding throughput on a GPU (and, less so, on
         the CPU) at some memory cost. ``search``/``search_many`` embed their query
@@ -635,6 +643,7 @@ class LodeDB:
                     max_seq_length=seq_len,
                     embedding_runtime=embedding_runtime,
                     embedding_dtype=embedding_dtype,
+                    embedding_threads=embedding_threads,
                 )
             self._embedding_backend = backend
             route_policy = self.preset.route_policy

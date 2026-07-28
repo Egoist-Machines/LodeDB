@@ -637,6 +637,81 @@ def _reject_oversized_image(image: object, limit: int) -> None:
         )
 
 
+# cgroup v2 CPU quota file: "<quota_us> <period_us>" or "max <period_us>".
+_CGROUP_CPU_MAX_PATH = Path("/sys/fs/cgroup/cpu.max")
+
+
+def _cgroup_cpu_quota(path: Path = _CGROUP_CPU_MAX_PATH) -> int | None:
+    """Returns the cgroup v2 CPU quota in whole CPUs (rounded up), or ``None``.
+
+    ``cpu.max`` holds ``"<quota> <period>"`` in microseconds, or ``"max"`` when
+    unlimited. Returns ``None`` when the file is absent (macOS, cgroup v1),
+    unreadable, malformed, or unlimited, so callers fall back to other sources.
+    """
+
+    try:
+        raw = path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    parts = raw.split()
+    if len(parts) != 2 or parts[0] == "max":
+        return None
+    try:
+        quota, period = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return math.ceil(quota / period)
+
+
+def _resolve_cpu_allotment() -> tuple[int, bool]:
+    """Returns the CPUs available to this process and whether that is constrained.
+
+    ``os.cpu_count()`` reports the machine's cores, which oversubscribes a thread
+    pool under a scheduler affinity mask or a container CPU limit. The count base
+    is the affinity mask (``os.sched_getaffinity``, absent on macOS), else
+    ``os.cpu_count()``; a readable cgroup v2 ``cpu.max`` quota then caps it,
+    because a CFS quota does not narrow the affinity mask. The flag is True only
+    when a constraint actually applied: the affinity mask is narrower than the
+    machine's cores, or the quota capped the count. Callers use it to leave ONNX
+    Runtime's own defaults alone on unconstrained hosts.
+    """
+
+    machine = os.cpu_count()
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    affinity = 0
+    if sched_getaffinity is not None:
+        try:
+            affinity = len(sched_getaffinity(0))
+        except OSError:
+            affinity = 0
+    count = affinity if affinity > 0 else (machine or 1)
+    constrained = affinity > 0 and machine is not None and affinity < machine
+    quota = _cgroup_cpu_quota()
+    if quota is not None and quota < count:
+        count = quota
+        constrained = True
+    return max(1, count), constrained
+
+
+def _build_session_options(ort_module: Any, *, intra_op_threads: int) -> object:
+    """Builds ONNX Runtime ``SessionOptions`` pinning the pool and disabling spinning.
+
+    The intra-op pool gets exactly ``intra_op_threads`` workers, inter-op
+    scheduling stays single-threaded (one graph runs at a time per handle, so
+    parallel-op scheduling would only add threads to contend over the same
+    allotment), and intra-op workers yield between ops instead of spin-waiting,
+    which burns CPU quota under a container limit.
+    """
+
+    options = ort_module.SessionOptions()
+    options.intra_op_num_threads = intra_op_threads
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return options
+
+
 class ONNXRuntimeEmbeddingBackend:
     """Embeds text with an ONNX Runtime feature-extraction model.
 
@@ -668,8 +743,15 @@ class ONNXRuntimeEmbeddingBackend:
         pooling: str = "cls",
         normalize: bool = True,
         output_name: str | None = None,
+        intra_op_threads: int | None = None,
     ) -> None:
-        """Stores ONNX Runtime configuration while keeping imports and model load lazy."""
+        """Stores ONNX Runtime configuration while keeping imports and model load lazy.
+
+        ``intra_op_threads`` pins the session's intra-op thread pool; ``None``
+        (default) pins it to the process's CPU allotment only when that allotment
+        is constrained (see :func:`_resolve_cpu_allotment`) and otherwise leaves
+        ONNX Runtime's own defaults.
+        """
 
         if not model_name:
             raise ValueError("model_name is required")
@@ -683,6 +765,8 @@ class ONNXRuntimeEmbeddingBackend:
             raise ValueError("pooling must be cls or mean")
         if not providers:
             raise ValueError("at least one ONNX Runtime execution provider is required")
+        if intra_op_threads is not None and intra_op_threads <= 0:
+            raise ValueError("intra_op_threads must be positive (or None for auto)")
         self.model_name = model_name
         self.required_model_name = model_name
         self.native_dim = native_dim
@@ -696,6 +780,7 @@ class ONNXRuntimeEmbeddingBackend:
         self.pooling = pooling
         self.normalize = normalize
         self.output_name = output_name
+        self.intra_op_threads = intra_op_threads
         self._session: object | None = None
         self._tokenizer: object | None = None
         # Shared across threads in serving tiers; guards both lazy loads.
@@ -779,7 +864,17 @@ class ONNXRuntimeEmbeddingBackend:
         }
 
     def _load_session(self) -> object:
-        """Loads the ONNX Runtime session lazily so a plain import never needs it."""
+        """Loads the ONNX Runtime session lazily so a plain import never needs it.
+
+        With an explicit ``intra_op_threads``, or on a constrained CPU allotment
+        (container quota, affinity mask), the session gets explicit
+        ``SessionOptions``: ONNX Runtime otherwise sizes its intra-op pool from
+        the machine's visible core count and lets the workers spin-wait, which
+        under a container CPU limit turns into throttled spinning threads and
+        inflates a millisecond embed into hundreds of ms. On an unconstrained
+        host the runtime's own defaults (physical-core sizing, thread
+        affinities) are kept.
+        """
 
         if self._session is None:
             with self._load_lock:
@@ -792,8 +887,21 @@ class ONNXRuntimeEmbeddingBackend:
                             "(install it, or use a runtime that falls back to torch)."
                         ) from exc
                     _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
+                    if self.intra_op_threads is not None:
+                        options = _build_session_options(
+                            ort, intra_op_threads=self.intra_op_threads
+                        )
+                    else:
+                        allotment, constrained = _resolve_cpu_allotment()
+                        # None means "keep ONNX Runtime's own defaults".
+                        options = (
+                            _build_session_options(ort, intra_op_threads=allotment)
+                            if constrained
+                            else None
+                        )
                     self._session = ort.InferenceSession(
                         str(self.onnx_model_path),
+                        sess_options=options,
                         providers=list(self.providers),
                     )
         return self._session

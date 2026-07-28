@@ -518,3 +518,36 @@ def test_local_server_rejects_non_private_host(tmp_path):
 
     with pytest.raises(ValueError, match="loopback or private"):
         serve_local(path=tmp_path, host="8.8.8.8", port=9099)
+
+
+def test_cli_mcp_forwards_embedding_threads_flag_and_env(monkeypatch):
+    """`lodedb mcp` passes --embedding-threads (envvar LODEDB_EMBEDDING_THREADS) through."""
+
+    from lodedb.local import mcp_server as mcp_server_mod
+
+    monkeypatch.delenv("LODEDB_EMBEDDING_THREADS", raising=False)
+    calls: list[dict] = []
+
+    class _FakeServer:
+        """Stands in for FastMCP so no stdio transport is stood up."""
+
+        def run(self, transport):
+            assert transport == "stdio"
+
+    def fake_build(path, **kwargs):
+        calls.append(kwargs)
+        return _FakeServer(), None
+
+    monkeypatch.setattr(mcp_server_mod, "build_mcp_server", fake_build)
+
+    result = runner.invoke(app, ["mcp"], env={"LODEDB_EMBEDDING_THREADS": "3"})
+    assert result.exit_code == 0, result.output
+    assert calls[-1]["embedding_threads"] == 3
+
+    result = runner.invoke(app, ["mcp", "--embedding-threads", "2"])
+    assert result.exit_code == 0, result.output
+    assert calls[-1]["embedding_threads"] == 2
+
+    result = runner.invoke(app, ["mcp"])
+    assert result.exit_code == 0, result.output
+    assert calls[-1]["embedding_threads"] is None

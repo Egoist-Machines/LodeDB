@@ -250,6 +250,7 @@ def _onnx_backend(
     providers: tuple[str, ...],
     batch_size: int,
     max_seq_length: int,
+    intra_op_threads: int | None,
 ) -> ONNXRuntimeEmbeddingBackend:
     """Materializes the preset's ONNX model and builds the ONNX Runtime backend.
 
@@ -269,6 +270,7 @@ def _onnx_backend(
         document_prefix=preset.document_prefix,
         pooling=preset.pooling,
         normalize=True,
+        intra_op_threads=intra_op_threads,
     )
 
 
@@ -280,6 +282,7 @@ def build_local_embedding_backend(
     max_seq_length: int = 256,
     embedding_runtime: str = "auto",
     embedding_dtype: str = "float32",
+    embedding_threads: int | None = None,
 ) -> tuple[EngineEmbeddingBackend, LocalEmbeddingResolution]:
     """Builds the embedding backend for a preset, runtime, and device.
 
@@ -288,9 +291,12 @@ def build_local_embedding_backend(
     ``"torch-compile"`` (opt-in ``torch.compile``d encoder for low single-query GPU-serving
     latency; text presets only, biggest win on CUDA). ``embedding_dtype`` (``"float32"`` default,
     ``"float16"``/``"bfloat16"``) is honored only by ``"torch-compile"`` and halves the weights
-    streamed per forward on CUDA; it is rejected for the other runtimes. Returns the backend plus
-    a :class:`LocalEmbeddingResolution` describing the runtime/device actually selected (and any
-    fallback), so the SDK and ``doctor`` can report it.
+    streamed per forward on CUDA; it is rejected for the other runtimes. ``embedding_threads``
+    pins the ONNX Runtime intra-op thread pool; ``None`` (default) pins it to the process's
+    CPU allotment only when an affinity mask or cgroup quota makes that allotment narrower
+    than the machine, keeping ONNX Runtime's defaults otherwise. The torch runtimes ignore it.
+    Returns the backend plus a :class:`LocalEmbeddingResolution` describing the runtime/device
+    actually selected (and any fallback), so the SDK and ``doctor`` can report it.
     """
 
     runtime = (embedding_runtime or "auto").strip().lower()
@@ -309,6 +315,8 @@ def build_local_embedding_backend(
             f"embedding_dtype={dtype!r} is only supported with embedding_runtime='torch-compile' "
             f"(got {runtime!r})"
         )
+    if embedding_threads is not None and embedding_threads <= 0:
+        raise ValueError("embedding_threads must be positive (or None for auto)")
     resolved = resolve_local_device(device)
 
     # Opt-in torch.compile fast path (text presets only). Fuses encoder + pooling + normalize
@@ -394,6 +402,7 @@ def build_local_embedding_backend(
                     providers=providers,
                     batch_size=batch_size,
                     max_seq_length=max_seq_length,
+                    intra_op_threads=embedding_threads,
                 )
                 # Log/warn only now that ONNX is the committed runtime: in "auto" the build above
                 # can still raise and fall back to torch (which may reach the GPU), so warning early

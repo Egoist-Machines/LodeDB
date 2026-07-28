@@ -14,6 +14,7 @@ from lodedb.local.db import LodeDB
 from lodedb.local.mcp_server import (
     _add,
     _default_search_mode,
+    _embedding_threads_from_env,
     _get,
     _remove,
     _search,
@@ -167,3 +168,24 @@ def test_search_helper_runs_hybrid_and_recovers_exact_token(tmp_path):
     assert hits[0]["id"] == "t3"
     assert "E1234" in hits[0]["text"]
     db.close()
+
+
+def test_embedding_threads_env_parsing(monkeypatch):
+    """LODEDB_EMBEDDING_THREADS parses to a positive int, with None for unset/blank."""
+
+    monkeypatch.delenv("LODEDB_EMBEDDING_THREADS", raising=False)
+    assert _embedding_threads_from_env() is None
+
+    monkeypatch.setenv("LODEDB_EMBEDDING_THREADS", "")
+    assert _embedding_threads_from_env() is None
+
+    monkeypatch.setenv("LODEDB_EMBEDDING_THREADS", "4")
+    assert _embedding_threads_from_env() == 4
+
+    monkeypatch.setenv("LODEDB_EMBEDDING_THREADS", "four")
+    with pytest.raises(ValueError, match="integer"):
+        _embedding_threads_from_env()
+
+    monkeypatch.setenv("LODEDB_EMBEDDING_THREADS", "0")
+    with pytest.raises(ValueError, match="positive"):
+        _embedding_threads_from_env()

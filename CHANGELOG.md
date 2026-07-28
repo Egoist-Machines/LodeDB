@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The ONNX embedding runtime pins its session thread pool when the process's
+  CPU allotment is constrained. When a scheduler affinity mask or a cgroup v2
+  CPU quota gives the process fewer CPUs than the machine's core count (a
+  container with a CPU limit), the session is created with explicit
+  `SessionOptions`: the intra-op pool matches the allotment, inter-op threading
+  is off, and intra-op workers yield instead of spin-waiting. Previously the
+  runtime defaults sized the pool from the machine's visible cores there and
+  CPU throttling inflated embed latency by two orders of magnitude.
+  Unconstrained hosts keep ONNX Runtime's own defaults.
+
+### Added
+
+- `embedding_threads` on `LodeDB(...)`, `build_local_embedding_backend(...)`,
+  and `lodedb mcp --embedding-threads` (envvar `LODEDB_EMBEDDING_THREADS`)
+  pins the ONNX Runtime intra-op thread pool explicitly; `None` (the default)
+  pins only on a constrained allotment as above.
+
 ## [2.0.3] - 2026-07-27
 
 ### Added
