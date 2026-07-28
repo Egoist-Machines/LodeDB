@@ -49,9 +49,11 @@ from lodedb.cloud.transfer import CloudClient, CloudError, ManagedRemote
 class CloudSearchHit:
     """One scored hit. Attribute access and tuple unpacking match the
     local `LodeSearchHit`. `text` is set when the search asked for it;
-    `matched` (recall only) names the sub-queries that surfaced the hit."""
+    `chunk_count` is the hit document's chunk count when the plane sends
+    it (None from older planes); `matched` (recall only) names the
+    sub-queries that surfaced the hit."""
 
-    __slots__ = ("score", "id", "metadata", "text", "matched")
+    __slots__ = ("score", "id", "metadata", "text", "chunk_count", "matched")
 
     def __init__(
         self,
@@ -60,11 +62,13 @@ class CloudSearchHit:
         id: str,
         metadata: dict[str, Any],
         text: str | None = None,
+        chunk_count: int | None = None,
     ) -> None:
         self.score = float(score)
         self.id = str(id)
         self.metadata = dict(metadata)
         self.text = text
+        self.chunk_count = int(chunk_count) if chunk_count is not None else None
         self.matched: list[str] = []
 
     def __iter__(self):
@@ -89,7 +93,11 @@ class CloudSearchHit:
 
 def _hit(row: dict) -> CloudSearchHit:
     return CloudSearchHit(
-        score=row["score"], id=row["id"], metadata=row["metadata"], text=row.get("text")
+        score=row["score"],
+        id=row["id"],
+        metadata=row["metadata"],
+        text=row.get("text"),
+        chunk_count=row.get("chunk_count"),
     )
 
 

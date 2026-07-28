@@ -525,3 +525,23 @@ def test_unprovisioned_list_documents_answers_empty():
     flow, not an error (same rule as browse)."""
     store = CloudStore(_UnprovisionedClient(), "acme", "prod", "user-42", owns_client=False)
     assert store.list_documents() == []
+
+
+def test_search_hit_carries_chunk_count_when_the_plane_sends_it():
+    """Hydration-complete planes put chunk_count on each hit; the hit must
+    surface it without breaking the LodeSearchHit tuple/equality parity."""
+    from lodedb.cloud.serving import _hit
+
+    hit = _hit({"score": 0.5, "id": "d1", "metadata": {"k": "v"}, "text": "t", "chunk_count": 3})
+    assert hit.chunk_count == 3
+    assert hit.text == "t"
+    assert tuple(hit) == (0.5, "d1", {"k": "v"})
+
+
+def test_search_hit_tolerates_planes_without_chunk_count():
+    """Older planes omit the field; the hit answers None rather than raising."""
+    from lodedb.cloud.serving import _hit
+
+    hit = _hit({"score": 0.5, "id": "d1", "metadata": {}})
+    assert hit.chunk_count is None
+    assert hit.text is None

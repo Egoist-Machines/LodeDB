@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CloudSearchHit.chunk_count`: managed-plane search hits surface the document's
+  chunk count when the plane sends it (`None` from older planes), so clients
+  hydrating from search alone no longer need a follow-up browse call for it.
+  Tuple unpacking and equality keep their `LodeSearchHit` parity.
+
 ## [2.0.3] - 2026-07-27
 
 ### Added
