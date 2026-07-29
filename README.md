@@ -689,10 +689,41 @@ expires_at = client.unseal_store("user-42", material, ttl_seconds=900)
 client.reseal_store("user-42")
 ```
 
+For a relayed unseal, the process that talks to the control plane does not
+need the plaintext material:
+
+```python
+challenge = client.unseal_challenge("user-42")
+
+# On the device that holds the material:
+from lodedb.cloud._sealing import seal_material
+sealed = seal_material(
+    material,
+    challenge["recipient_public_key"],
+    base64.b64decode(challenge["info"], validate=True),
+)
+
+expires_at = client.unseal_store_sealed(
+    "user-42", sealed, challenge["nonce"], ttl_seconds=900
+)
+```
+
+The holder uses the decoded `info` bytes unchanged as the HPKE context. The
+nonce is single-use and expires quickly, so fetch the challenge only when the
+holder is ready to seal.
+
 `Client.rotate_store_key("user-42", fresh_material)` replaces the caller-held
 material after the store is unsealed. A sealed data-plane read returns
 `CloudError` with status 423 and a `store_sealed:` detail; applications decide
 when to request an unseal grant.
+
+The CLI can rotate to new material while a grant is live:
+
+```sh
+lodedb cloud store unseal user-42 --material-env OLD_MATERIAL
+lodedb cloud store rotate user-42 --material-env NEW_MATERIAL
+lodedb cloud store rotate user-42 --generate-material
+```
 
 ## Concurrency & durability
 

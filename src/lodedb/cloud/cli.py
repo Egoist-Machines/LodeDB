@@ -1403,6 +1403,56 @@ def store_reseal(
     _emit(out, lambda: typer.echo(f"resealed {store}: {out['resealed']}"))
 
 
+@store_app.command("rotate")
+def store_rotate(
+    store: Annotated[str, typer.Argument(help="Store name.")],
+    material_env: Annotated[
+        str | None,
+        typer.Option(
+            "--material-env",
+            help="Environment variable holding standard-base64 new sealed-store material.",
+        ),
+    ] = None,
+    generate_material: Annotated[
+        bool,
+        typer.Option(
+            "--generate-material",
+            help="Generate fresh sealed-store material and print it once to stderr.",
+        ),
+    ] = False,
+    environment: Annotated[str | None, typer.Option(help=_ENVIRONMENT_HELP)] = None,
+    org: Annotated[str | None, typer.Option(help=_ORG_HELP)] = None,
+) -> None:
+    """Rotate a live sealed store to fresh caller-held material."""
+
+    with _client() as client:
+        org, environment = _tenancy(client, org, environment)
+        material = _load_material(material_env, generate_material)
+        challenge = _cloud(lambda: client.store_unseal_challenge(org, environment, store))
+        try:
+            info = base64.b64decode(challenge["info"], validate=True)
+            recipient_public_key = challenge["recipient_public_key"]
+            nonce = challenge["nonce"]
+        except (KeyError, TypeError, ValueError, binascii.Error) as error:
+            raise _fail("unseal challenge returned incomplete or invalid data") from error
+        sealed_material = _seal_material_for_cli(material, recipient_public_key, info)
+        try:
+            client.rotate_store_key(
+                org,
+                environment,
+                store,
+                {"sealed_material": sealed_material, "nonce": nonce},
+            )
+        except CloudError as error:
+            code, hint = _classify(error)
+            if error.status_code == 409:
+                # Rotation re-wraps the DEK, which the server only holds
+                # while a grant is live.
+                hint = "run `lodedb cloud store unseal` first"
+            raise _fail(str(error), code=code, hint=hint) from error
+    _emit({"store": store, "rotated": True}, lambda: typer.echo(f"rotated {store} key"))
+
+
 def _resolve_index_key(
     client: CloudClient, org: str, environment: str, store: str, key: str | None
 ) -> str:

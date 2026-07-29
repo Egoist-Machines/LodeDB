@@ -40,6 +40,15 @@ def _recipient_public_key(private_key, serialization) -> str:
     return base64.b64encode(raw).decode()
 
 
+def _external_seal(material: bytes, recipient_public_key: str, info: bytes, suite, x25519) -> str:
+    """Seal material as a separate holder would."""
+
+    public_key = x25519.X25519PublicKey.from_public_bytes(
+        base64.b64decode(recipient_public_key, validate=True)
+    )
+    return base64.b64encode(suite.encrypt(material, public_key, info)).decode()
+
+
 def test_encrypted_create_fetches_a_recipient_and_seals_bound_material(hpke_suite):
     """Encrypted creation encrypts the exact material under its create context."""
 
@@ -166,6 +175,113 @@ def test_unseal_uses_the_server_info_verbatim_and_returns_an_aware_expiry(hpke_s
     )
 
 
+def test_relayed_unseal_accepts_external_sealed_material_and_validates_expiry(hpke_suite):
+    """A relay can submit material sealed by a separate holder."""
+
+    suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+    nonce = base64.b64encode(b"relay-nonce").decode()
+    challenge_info = b"orecloud/unseal/v1|db=store-id|nonce=cmVsYXktbm9uY2U="
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve a relayed challenge and accept the submitted sealed blob."""
+
+        seen.append(request)
+        if request.url.path.endswith("/challenge"):
+            return httpx.Response(
+                200,
+                json={
+                    "recipient_public_key": recipient_public_key,
+                    "nonce": nonce,
+                    "info": base64.b64encode(challenge_info).decode(),
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"store_id": "store-id", "expires_at": "2026-07-23T12:30:00Z"},
+        )
+
+    material = b"e" * 32
+    with Client(
+        token="ore_sk_test",
+        host="http://testserver",
+        org="acme",
+        environment="prod",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        challenge = client.unseal_challenge("user-42")
+        sealed_material = _external_seal(
+            material,
+            challenge["recipient_public_key"],
+            base64.b64decode(challenge["info"], validate=True),
+            suite,
+            x25519,
+        )
+        expires_at = client.unseal_store_sealed(
+            "user-42", sealed_material, challenge["nonce"], ttl_seconds=120
+        )
+
+    assert expires_at.tzinfo is not None and expires_at.utcoffset() is not None
+    assert [request.method for request in seen] == ["POST", "POST"]
+    body = json.loads(seen[1].content)
+    assert body["nonce"] == nonce
+    assert body["ttl_seconds"] == 120
+    assert (
+        suite.decrypt(
+            base64.b64decode(body["sealed_material"], validate=True), private_key, challenge_info
+        )
+        == material
+    )
+
+    def naive_handler(request: httpx.Request) -> httpx.Response:
+        """Return an invalid naive expiry for a relayed submission."""
+
+        assert request.url.path.endswith("/unseal")
+        return httpx.Response(
+            200,
+            json={"store_id": "store-id", "expires_at": "2026-07-23T12:30:00"},
+        )
+
+    with Client(
+        token="ore_sk_test",
+        host="http://testserver",
+        org="acme",
+        environment="prod",
+        transport=httpx.MockTransport(naive_handler),
+    ) as client:
+        with pytest.raises(ValueError, match="unseal response returned a naive expires_at"):
+            client.unseal_store_sealed("user-42", "sealed", nonce)
+
+
+@pytest.mark.parametrize("missing", ["recipient_public_key", "nonce", "info"])
+def test_unseal_challenge_missing_field_names_it(missing):
+    """A relayed challenge refusal points at the absent field."""
+
+    challenge = {
+        "recipient_public_key": base64.b64encode(b"p" * 32).decode(),
+        "nonce": base64.b64encode(b"nonce").decode(),
+        "info": base64.b64encode(b"info").decode(),
+    }
+    del challenge[missing]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Return one incomplete challenge."""
+
+        return httpx.Response(200, json=challenge)
+
+    with Client(
+        token="ore_sk_test",
+        host="http://testserver",
+        org="acme",
+        environment="prod",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ValueError, match=missing):
+            client.unseal_challenge("user-42")
+
+
 class _ResealStub:
     """Duck-type only the composed client's reseal transport verb."""
 
@@ -242,6 +358,117 @@ def test_reseal_returns_the_server_bool_and_rotate_seals_fresh_material(hpke_sui
         )
         == new_material
     )
+
+
+def test_sealed_store_round_trip_reseal_returns_423_without_retry(hpke_suite):
+    """Create, unseal, query, reseal, then surface one sealed refusal."""
+
+    from lodedb.cloud._sealing import create_info
+
+    suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+    material = b"s" * 32
+    nonce = base64.b64encode(b"round-trip-nonce").decode()
+    challenge_info = b"orecloud/unseal/v1|db=store-id|nonce=cm91bmQtdHJpcC1ub25jZQ=="
+    state = {"created": False, "grant": False, "sealed_searches": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Act like a sealed store through create, grant, read, and reseal."""
+
+        raw_path = request.url.raw_path.decode()
+        if request.method == "GET" and raw_path.endswith("/stores/create-challenge"):
+            return httpx.Response(200, json={"recipient_public_key": recipient_public_key})
+        if request.method == "POST" and raw_path.endswith("/stores"):
+            body = json.loads(request.content)
+            assert (
+                suite.decrypt(
+                    base64.b64decode(body["sealed_material"], validate=True),
+                    private_key,
+                    create_info("acme", "prod", "user-42"),
+                )
+                == material
+            )
+            state["created"] = True
+            return httpx.Response(
+                201,
+                json={
+                    "store": "user-42",
+                    "key": "memory",
+                    "mode": "cloud_writer",
+                    "encrypted": True,
+                },
+            )
+        if raw_path.endswith("/stores/user-42/unseal/challenge"):
+            return httpx.Response(
+                200,
+                json={
+                    "recipient_public_key": recipient_public_key,
+                    "nonce": nonce,
+                    "info": base64.b64encode(challenge_info).decode(),
+                },
+            )
+        if raw_path.endswith("/stores/user-42/unseal"):
+            body = json.loads(request.content)
+            assert body["nonce"] == nonce
+            assert (
+                suite.decrypt(
+                    base64.b64decode(body["sealed_material"], validate=True),
+                    private_key,
+                    challenge_info,
+                )
+                == material
+            )
+            state["grant"] = True
+            return httpx.Response(
+                200,
+                json={"store_id": "store-id", "expires_at": "2026-07-23T12:30:00Z"},
+            )
+        if raw_path.endswith("/stores/search"):
+            body = json.loads(request.content)
+            assert state["created"] is True
+            assert body["store"] == "user-42"
+            if state["grant"]:
+                return httpx.Response(
+                    200,
+                    json={"hits": [{"score": 0.9, "id": "doc-1", "metadata": {}}]},
+                )
+            state["sealed_searches"] += 1
+            return httpx.Response(
+                423,
+                json={
+                    "detail": (
+                        "store_sealed: this encrypted store is sealed; "
+                        "unseal it before querying"
+                    )
+                },
+            )
+        if raw_path.endswith("/stores/user-42/reseal"):
+            state["grant"] = False
+            return httpx.Response(200, json={"store_id": "store-id", "resealed": True})
+        raise AssertionError(f"unexpected request {request.method} {raw_path}")
+
+    with Client(
+        token="ore_sk_test",
+        host="http://testserver",
+        org="acme",
+        environment="prod",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        created = client.create_store(
+            "user-42", encrypted=True, key_material=material, preset="minilm"
+        )
+        assert created["encrypted"] is True
+        client.unseal_store("user-42", material, ttl_seconds=90)
+        store = client.store("user-42")
+        assert store.search("hello")[0].id == "doc-1"
+        assert client.reseal_store("user-42") is True
+        with pytest.raises(CloudError) as caught:
+            store.search("hello")
+
+    assert caught.value.status_code == 423
+    assert caught.value.detail.startswith("store_sealed:")
+    assert state["sealed_searches"] == 1
 
 
 def test_sealed_search_preserves_the_423_refusal_without_a_retry_loop():
@@ -334,4 +561,117 @@ def test_cli_missing_cryptography_is_a_classified_error(monkeypatch):
 
     assert result.exit_code == cli.EXIT_USAGE
     assert "error: sealed-store support requires cryptography" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_rotate_seals_new_material_and_reports_success(monkeypatch, hpke_suite):
+    """The rotate command seals the new material through the SDK facade."""
+
+    suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+    challenge_info = b"orecloud/unseal/v1|db=store-id|nonce=cm90YXRl"
+    nonce = base64.b64encode(b"rotate").decode()
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, org: str, environment: str, store: str) -> dict:
+            captured["challenge"] = (org, environment, store)
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": nonce,
+                "info": base64.b64encode(challenge_info).decode(),
+            }
+
+        def rotate_store_key(self, org: str, environment: str, store: str, payload: dict) -> dict:
+            captured["rotate"] = (org, environment, store, payload)
+            return {"store_id": "store-id"}
+
+    new_material = b"n" * 32
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+    monkeypatch.setenv("NEW_MATERIAL", base64.b64encode(new_material).decode())
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["--no-json", "store", "rotate", "user-42", "--material-env", "NEW_MATERIAL"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "rotated user-42 key" in result.output
+    assert captured["challenge"] == ("acme", "prod", "user-42")
+    org, environment, store, payload = captured["rotate"]
+    assert (org, environment, store) == ("acme", "prod", "user-42")
+    assert payload["nonce"] == nonce
+    assert (
+        suite.decrypt(
+            base64.b64decode(payload["sealed_material"], validate=True),
+            private_key,
+            challenge_info,
+        )
+        == new_material
+    )
+
+
+def test_cli_rotate_requires_material(monkeypatch):
+    """Rotate needs either env-sourced or generated new material."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "rotate", "user-42"])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "sealed stores need --material-env ENVVAR or --generate-material" in result.output
+
+
+def test_cli_rotate_409_hints_to_unseal_first(monkeypatch, hpke_suite):
+    """A rotate without a live grant is a refused command with an unseal hint."""
+
+    _suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, _org: str, _environment: str, _store: str) -> dict:
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": base64.b64encode(b"rotate").decode(),
+                "info": base64.b64encode(b"info").decode(),
+            }
+
+        def rotate_store_key(self, *_args, **_kwargs) -> dict:
+            raise CloudError(409, "store has no live unseal grant")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+    monkeypatch.setenv("NEW_MATERIAL", base64.b64encode(b"n" * 32).decode())
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["store", "rotate", "user-42", "--material-env", "NEW_MATERIAL"],
+    )
+
+    assert result.exit_code == cli.EXIT_REFUSED
+    assert "store has no live unseal grant (HTTP 409)" in result.output
+    assert "hint: run `lodedb cloud store unseal` first" in result.output
     assert "Traceback" not in result.output

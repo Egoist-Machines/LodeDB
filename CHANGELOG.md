@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `lodedb mcp --embedding-threads` (envvar `LODEDB_EMBEDDING_THREADS`)
   pins the ONNX Runtime intra-op thread pool explicitly; `None` (the default)
   pins only on a constrained allotment as above.
+- Sealed cloud stores now expose relayed unseal verbs. `Client.unseal_challenge(...)`
+  returns the single-use HPKE challenge, and `Client.unseal_store_sealed(...)`
+  submits a sealed material response so the relaying process never handles
+  plaintext material. The CLI also adds `lodedb cloud store rotate` for
+  live-grant key rotation.
 
 ## [2.0.3] - 2026-07-27
 
