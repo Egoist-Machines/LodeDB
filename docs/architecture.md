@@ -1,5 +1,7 @@
 # Architecture
 
+_For the optional managed cloud companion, see [cloud-roadmap.md](cloud-roadmap.md)._
+
 ## System overview
 
 ```mermaid
