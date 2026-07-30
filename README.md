@@ -696,7 +696,10 @@ need the plaintext material:
 challenge = client.unseal_challenge("user-42")
 
 # On the device that holds the material:
-from lodedb.cloud._sealing import seal_material
+import base64
+
+from lodedb.cloud import seal_material
+
 sealed = seal_material(
     material,
     challenge["recipient_public_key"],
@@ -710,7 +713,10 @@ expires_at = client.unseal_store_sealed(
 
 The holder uses the decoded `info` bytes unchanged as the HPKE context. The
 nonce is single-use and expires quickly, so fetch the challenge only when the
-holder is ready to seal.
+holder is ready to seal. Sealing keeps the material out of the relay's hands,
+but the challenge itself is not authenticated: a compromised relay could
+substitute its own recipient key and read the material, so the holder must
+receive the challenge over a channel it trusts.
 
 `Client.rotate_store_key("user-42", fresh_material)` replaces the caller-held
 material after the store is unsealed. A sealed data-plane read returns

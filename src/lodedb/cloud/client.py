@@ -308,10 +308,13 @@ class Client:
         """Fetch the single-use challenge for a relayed unseal.
 
         Hand this challenge to the holder of the 32-byte material. The holder
-        seals the material to `recipient_public_key` with the HPKE suite in
-        `lodedb.cloud._sealing`, using the decoded `info` bytes verbatim as
-        the context, then returns the sealed blob for `unseal_store_sealed`.
-        The nonce is single-use and expires quickly.
+        seals the material to `recipient_public_key` with
+        :func:`lodedb.cloud.seal_material`, using the decoded `info` bytes
+        verbatim as the context, then returns the sealed blob for
+        `unseal_store_sealed`. The nonce is single-use and expires quickly.
+        The challenge is not authenticated to the holder, so it must arrive
+        over a channel the holder trusts: a relay that substitutes its own
+        recipient key would read the material.
         """
 
         challenge = self._client.store_unseal_challenge(self.org, self.environment, store)

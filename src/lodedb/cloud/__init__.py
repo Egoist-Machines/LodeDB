@@ -53,6 +53,11 @@ _HTTP_EXPORTS = {
     "CloudClient": "transfer",
     "CloudError": "transfer",
     "SyncConflictError": "transfer",
+    # The sealing helper a relayed-unseal material holder calls (see
+    # Client.unseal_challenge). Unlike its table-mates, _sealing is stdlib at
+    # import; its optional cryptography dependency loads only inside the
+    # call, raising the [cloud-sealed] install hint when absent.
+    "seal_material": "_sealing",
 }
 
 __all__ = sorted(

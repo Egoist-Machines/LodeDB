@@ -675,3 +675,320 @@ def test_cli_rotate_409_hints_to_unseal_first(monkeypatch, hpke_suite):
     assert "store has no live unseal grant (HTTP 409)" in result.output
     assert "hint: run `lodedb cloud store unseal` first" in result.output
     assert "Traceback" not in result.output
+
+
+def test_cli_rotate_json_emits_the_server_row(monkeypatch, hpke_suite):
+    """JSON mode passes the rotate response through, like unseal and reseal."""
+
+    _suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, _org: str, _environment: str, _store: str) -> dict:
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": base64.b64encode(b"rotate").decode(),
+                "info": base64.b64encode(b"info").decode(),
+            }
+
+        def rotate_store_key(self, *_args, **_kwargs) -> dict:
+            return {"store_id": "store-id"}
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+    monkeypatch.setenv("NEW_MATERIAL", base64.b64encode(b"j" * 32).decode())
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["--json", "store", "rotate", "user-42", "--material-env", "NEW_MATERIAL"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"store_id": "store-id"}
+
+
+def test_cli_rotate_generated_material_failure_notes_no_effect(monkeypatch, hpke_suite):
+    """A rotate that fails after printing generated material says so."""
+
+    _suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, _org: str, _environment: str, _store: str) -> dict:
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": base64.b64encode(b"rotate").decode(),
+                "info": base64.b64encode(b"info").decode(),
+            }
+
+        def rotate_store_key(self, *_args, **_kwargs) -> dict:
+            raise CloudError(409, "store has no live unseal grant")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "rotate", "user-42", "--generate-material"])
+
+    assert result.exit_code == cli.EXIT_REFUSED
+    assert "Keep this sealed-store material safe" in result.output
+    assert "the printed material did not take effect" in result.output
+    assert "hint: run `lodedb cloud store unseal` first" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_network_failure_is_a_classified_retry(monkeypatch):
+    """A transport error prints one retryable error line, not a traceback."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def reseal_store(self, *_args, **_kwargs):
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_RETRY
+    assert "error: could not reach the control plane: connection refused" in result.output
+    assert "hint: check the network and ORECLOUD_HOST, then retry" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_network_failure_during_tenancy_is_classified(monkeypatch):
+    """Tenancy resolution reaches the control plane before any verb; an
+    unreachable host there is the same retryable refusal, not a traceback."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def token_self(self):
+            raise httpx.ConnectError("nodename nor servname provided")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_RETRY
+    assert "error: could not reach the control plane" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_ambiguous_transport_failure_is_not_marked_retryable(monkeypatch):
+    """A response lost mid-request may have been applied; no blind-retry hint."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def reseal_store(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_UNEXPECTED
+    assert "error: the control plane connection failed mid-request" in result.output
+    assert "may or may not have been applied" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_rotate_ambiguous_failure_says_keep_generated_material(monkeypatch, hpke_suite):
+    """A lost rotate response must not tell the user to discard the material."""
+
+    _suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, _org: str, _environment: str, _store: str) -> dict:
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": base64.b64encode(b"rotate").decode(),
+                "info": base64.b64encode(b"info").decode(),
+            }
+
+        def rotate_store_key(self, *_args, **_kwargs) -> dict:
+            raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "rotate", "user-42", "--generate-material"])
+
+    assert result.exit_code == cli.EXIT_UNEXPECTED
+    assert "Keep this sealed-store material safe" in result.output
+    assert "the rotation outcome is unknown" in result.output
+    assert "did not take effect" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_interrupted_read_stays_retryable(monkeypatch):
+    """A GET that dies mid-response changed nothing; blind retry is safe."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def token_self(self):
+            raise httpx.ReadTimeout(
+                "timed out", request=httpx.Request("GET", "http://testserver/v1/tokens/self")
+            )
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["whoami"])
+
+    assert result.exit_code == cli.EXIT_RETRY
+    assert "error: could not reach the control plane" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_malformed_host_is_a_usage_error(monkeypatch):
+    """A host without an http(s) scheme fails every retry; classify as usage."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def reseal_store(self, *_args, **_kwargs):
+            raise httpx.UnsupportedProtocol(
+                "Request URL is missing an 'http://' or 'https://' protocol."
+            )
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "error: invalid control-plane host" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_rotate_5xx_failure_says_keep_generated_material(monkeypatch, hpke_suite):
+    """A 5xx rotation answer may follow a committed re-wrap; keep the material."""
+
+    _suite, serialization, x25519 = hpke_suite
+    private_key = x25519.X25519PrivateKey.generate()
+    recipient_public_key = _recipient_public_key(private_key, serialization)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def store_unseal_challenge(self, _org: str, _environment: str, _store: str) -> dict:
+            return {
+                "recipient_public_key": recipient_public_key,
+                "nonce": base64.b64encode(b"rotate").decode(),
+                "info": base64.b64encode(b"info").decode(),
+            }
+
+        def rotate_store_key(self, *_args, **_kwargs) -> dict:
+            raise CloudError(503, "upstream unavailable")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "rotate", "user-42", "--generate-material"])
+
+    assert result.exit_code == cli.EXIT_RETRY
+    assert "Keep this sealed-store material safe" in result.output
+    assert "the rotation outcome is unknown" in result.output
+    assert "did not take effect" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_syntactically_invalid_host_is_a_usage_error(monkeypatch):
+    """httpx.InvalidURL strikes at client construction, outside every verb
+    wrapper; it must still classify instead of printing a traceback."""
+
+    creds = cli._config.Credentials(host="http://example.com:bad", token="ore_pat_x", source="env")
+    monkeypatch.setattr(cli, "_load_credentials", lambda: creds)
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "error: invalid control-plane host" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_proxy_failure_stays_retryable(monkeypatch):
+    """A rejected proxy tunnel precedes submission; blind retry is safe."""
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def reseal_store(self, *_args, **_kwargs):
+            raise httpx.ProxyError("407 Proxy Authentication Required")
+
+    monkeypatch.setattr(cli, "_client", FakeClient)
+    monkeypatch.setattr(cli, "_tenancy", lambda *_args: ("acme", "prod"))
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_RETRY
+    assert "error: could not reach the control plane" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("host", ["http://", "example.com", "ftp://example.com", "http://[::1"])
+def test_cli_authority_less_or_schemeless_host_is_a_usage_error(monkeypatch, host):
+    """httpx accepts a bare `http://` base URL and only fails at the first
+    request; the CLI must classify it as configuration, not transient."""
+
+    creds = cli._config.Credentials(host=host, token="ore_pat_x", source="env")
+    monkeypatch.setattr(cli, "_load_credentials", lambda: creds)
+
+    result = CliRunner().invoke(cli.app, ["store", "reseal", "user-42"])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "error: invalid control-plane host" in result.output
+    assert "Traceback" not in result.output
