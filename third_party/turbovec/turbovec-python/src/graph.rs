@@ -23,7 +23,11 @@ use std::collections::{BTreeMap, HashMap};
 /// Map a `GraphError` onto the closest Python exception.
 fn to_py_err(error: GraphError) -> PyErr {
     match error {
-        GraphError::InvalidArgument(m) => PyValueError::new_err(m),
+        // A policy refusal is a bad argument, so ValueError rather than the RuntimeError
+        // catch-all below.
+        GraphError::InvalidArgument(m) | GraphError::PolicyViolation(m) => {
+            PyValueError::new_err(m)
+        }
         GraphError::NotFound(m) => PyKeyError::new_err(m),
         other => PyRuntimeError::new_err(other.to_string()),
     }

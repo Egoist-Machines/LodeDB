@@ -14,6 +14,9 @@ pub enum GraphError {
     InvalidArgument(String),
     /// A referenced entity, fact, or episode does not exist.
     NotFound(String),
+    /// An installed [`FactPolicy`](crate::FactPolicy) refused the write. Carries the policy's
+    /// own reason verbatim.
+    PolicyViolation(String),
     /// The SQL topology store (source of truth) failed.
     Topology(String),
     /// The `lodedb-core` semantic index failed.
@@ -32,6 +35,7 @@ impl fmt::Display for GraphError {
         match self {
             GraphError::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             GraphError::NotFound(m) => write!(f, "not found: {m}"),
+            GraphError::PolicyViolation(m) => write!(f, "policy violation: {m}"),
             GraphError::Topology(m) => write!(f, "topology store error: {m}"),
             GraphError::Index(m) => write!(f, "semantic index error: {m}"),
             GraphError::Embedding(m) => write!(f, "embedding error: {m}"),

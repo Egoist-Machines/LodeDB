@@ -45,7 +45,8 @@ pub struct Episode {
 
 /// A resolved thing in the world — Graphiti `EntityNode`.
 ///
-/// `entity_type` is a caller-defined vocabulary string (the engine ships none).
+/// `entity_type` is a caller-defined vocabulary string; the engine ships no vocabulary but
+/// can enforce one — see [`Schema`](crate::Schema).
 /// `label` is the text embedded for semantic entry-point search (Graphiti's
 /// `name`/`summary`). Entities that begin and end (a project, an event, a job)
 /// may carry an event-time validity interval; all carry transaction time.

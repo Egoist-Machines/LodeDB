@@ -31,7 +31,11 @@ pub struct LodeGraph {
 
 fn graph_err(error: GraphError) -> CoreError {
     let code = match error {
-        GraphError::InvalidArgument(_) | GraphError::Embedding(_) => CoreErrorCode::InvalidArgument,
+        // A policy refusal is a caller mistake, not an internal fault — without this arm the
+        // `_ => Internal` fallback below would report it as an engine bug.
+        GraphError::InvalidArgument(_)
+        | GraphError::Embedding(_)
+        | GraphError::PolicyViolation(_) => CoreErrorCode::InvalidArgument,
         GraphError::NotFound(_) => CoreErrorCode::NotFound,
         _ => CoreErrorCode::Internal,
     };
