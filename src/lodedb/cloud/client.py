@@ -149,6 +149,29 @@ def _challenge_info(challenge: dict) -> bytes:
         raise ValueError("unseal challenge returned invalid info") from error
 
 
+def _validate_unseal_challenge(challenge: dict) -> dict:
+    """Return a challenge after checking the required relay fields."""
+
+    for field in ("recipient_public_key", "nonce", "info"):
+        try:
+            challenge[field]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"unseal challenge missing {field}") from error
+    return challenge
+
+
+def _unseal_expires_at(response: dict) -> datetime:
+    """Parse the aware expiry returned by an unseal grant response."""
+
+    try:
+        expires_at = datetime.fromisoformat(response["expires_at"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("unseal response returned invalid expires_at") from error
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise ValueError("unseal response returned a naive expires_at")
+    return expires_at
+
+
 class Client:
     """One credential, one control plane, one bound (org, environment).
 
@@ -273,31 +296,51 @@ class Client:
         the store unreadable.
         """
         material = _require_key_material(key_material)
+        challenge = self.unseal_challenge(store)
+        sealed_material = seal_material(
+            material, challenge["recipient_public_key"], _challenge_info(challenge)
+        )
+        return self.unseal_store_sealed(
+            store, sealed_material, challenge["nonce"], ttl_seconds=ttl_seconds
+        )
+
+    def unseal_challenge(self, store: str) -> dict:
+        """Fetch the single-use challenge for a relayed unseal.
+
+        Hand this challenge to the holder of the 32-byte material. The holder
+        seals the material to `recipient_public_key` with
+        :func:`lodedb.cloud.seal_material`, using the decoded `info` bytes
+        verbatim as the context, then returns the sealed blob for
+        `unseal_store_sealed`. The nonce is single-use and expires quickly.
+        The challenge is not authenticated to the holder, so it must arrive
+        over a channel the holder trusts: a relay that substitutes its own
+        recipient key would read the material.
+        """
+
         challenge = self._client.store_unseal_challenge(self.org, self.environment, store)
-        try:
-            recipient_public_key = challenge["recipient_public_key"]
-            nonce = challenge["nonce"]
-        except KeyError as error:
-            raise ValueError("unseal challenge returned incomplete data") from error
+        return _validate_unseal_challenge(challenge)
+
+    def unseal_store_sealed(
+        self,
+        store: str,
+        sealed_material: str,
+        nonce: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> datetime:
+        """Submit relayed sealed material and return the aware grant expiry."""
+
         response = self._client.unseal_store(
             self.org,
             self.environment,
             store,
             {
                 "ttl_seconds": ttl_seconds,
-                "sealed_material": seal_material(
-                    material, recipient_public_key, _challenge_info(challenge)
-                ),
+                "sealed_material": sealed_material,
                 "nonce": nonce,
             },
         )
-        try:
-            expires_at = datetime.fromisoformat(response["expires_at"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("unseal response returned invalid expires_at") from error
-        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-            raise ValueError("unseal response returned a naive expires_at")
-        return expires_at
+        return _unseal_expires_at(response)
 
     def reseal_store(self, store: str) -> bool:
         """Remove the live unseal grant and return whether one was removed."""
@@ -312,21 +355,16 @@ class Client:
         store has not first been unsealed.
         """
         material = _require_key_material(new_key_material)
-        challenge = self._client.store_unseal_challenge(self.org, self.environment, store)
-        try:
-            recipient_public_key = challenge["recipient_public_key"]
-            nonce = challenge["nonce"]
-        except KeyError as error:
-            raise ValueError("unseal challenge returned incomplete data") from error
+        challenge = self.unseal_challenge(store)
         self._client.rotate_store_key(
             self.org,
             self.environment,
             store,
             {
                 "sealed_material": seal_material(
-                    material, recipient_public_key, _challenge_info(challenge)
+                    material, challenge["recipient_public_key"], _challenge_info(challenge)
                 ),
-                "nonce": nonce,
+                "nonce": challenge["nonce"],
             },
         )
 

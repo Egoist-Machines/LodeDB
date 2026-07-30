@@ -30,6 +30,15 @@ def test_http_names_resolve_to_their_submodules():
     assert cloud.CloudIndex is CloudStore  # back-compat alias
 
 
+def test_seal_material_resolves_from_the_sealing_module():
+    """The holder-side sealing helper is public; its module is stdlib at
+    import, so resolution needs no extra (cryptography loads inside the
+    call)."""
+    from lodedb.cloud._sealing import seal_material
+
+    assert cloud.seal_material is seal_material
+
+
 def test_transfer_verbs_resolve_to_the_native_extension():
     for name in ("keys", "pull", "push", "status", "sync", "verify"):
         assert getattr(cloud, name) is getattr(_turbovec.cloud, name)

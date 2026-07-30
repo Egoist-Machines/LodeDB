@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime defaults sized the pool from the machine's visible cores there and
   CPU throttling inflated embed latency by two orders of magnitude.
   Unconstrained hosts keep ONNX Runtime's own defaults.
+- `lodedb cloud` commands print classified `error:` lines for transport
+  failures instead of a traceback: connection failures and interrupted reads
+  are retryable (exit code 6), a write whose response was lost reports an
+  unknown outcome to verify before retrying (exit code 1), and a malformed
+  control-plane host is a usage error (exit code 2).
 
 ### Added
 
@@ -25,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `lodedb mcp --embedding-threads` (envvar `LODEDB_EMBEDDING_THREADS`)
   pins the ONNX Runtime intra-op thread pool explicitly; `None` (the default)
   pins only on a constrained allotment as above.
+- Sealed cloud stores now expose relayed unseal verbs. `Client.unseal_challenge(...)`
+  returns the single-use HPKE challenge, and `Client.unseal_store_sealed(...)`
+  submits a sealed material response so the relaying process never handles
+  plaintext material. `lodedb.cloud.seal_material` is the public holder-side
+  sealing helper. The CLI also adds `lodedb cloud store rotate` for
+  live-grant key rotation.
 
 ## [2.0.3] - 2026-07-27
 

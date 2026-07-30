@@ -33,6 +33,7 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, TypeVar
+from urllib.parse import urlsplit
 
 import typer
 
@@ -321,6 +322,8 @@ import platform  # noqa: E402
 import webbrowser  # noqa: E402
 from datetime import UTC  # noqa: E402
 
+import httpx  # noqa: E402
+
 from lodedb.cloud import _config  # noqa: E402
 from lodedb.cloud.transfer import (  # noqa: E402
     CloudClient,
@@ -402,6 +405,76 @@ def _classify(error: CloudError) -> tuple[int, str | None]:
     return EXIT_UNEXPECTED, None
 
 
+# Transport failures that strike while connecting (proxy negotiation
+# included), before the request is submitted; only these are safe to
+# blind-retry for a write. Anything later (a lost response, a mid-body
+# error) may have been applied server-side.
+_PRE_SUBMISSION_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+)
+
+
+def _read_only_request(error: httpx.HTTPError) -> bool:
+    """True when the failed request could not have changed server state."""
+    try:
+        return error.request.method in ("GET", "HEAD")
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _bad_host_fail(detail: str) -> typer.Exit:
+    """A control-plane host retrying cannot fix: wrong scheme or bad syntax."""
+    return _fail(
+        f"invalid control-plane host: {detail}",
+        code=EXIT_USAGE,
+        hint="the host must be an http(s) URL — check ORECLOUD_HOST or `lodedb cloud login`",
+    )
+
+
+def _network_fail(error: httpx.HTTPError) -> typer.Exit:
+    """Transport failures have no status to classify. A malformed host is a
+    configuration error retrying cannot fix. Connection-phase failures and
+    failed reads never changed the control plane: transient, retry freely. A
+    write submitted without a response leaves the outcome unknown, so the
+    caller must verify state before retrying."""
+    detail = str(error) or type(error).__name__
+    if isinstance(error, httpx.UnsupportedProtocol):
+        return _bad_host_fail(detail)
+    if isinstance(error, _PRE_SUBMISSION_ERRORS) or _read_only_request(error):
+        return _fail(
+            f"could not reach the control plane: {detail}",
+            code=EXIT_RETRY,
+            hint="check the network and ORECLOUD_HOST, then retry",
+        )
+    return _fail(
+        f"the control plane connection failed mid-request: {detail}",
+        code=EXIT_UNEXPECTED,
+        hint="the request may or may not have been applied — verify before retrying",
+    )
+
+
+def _open_client(host: str, token: str | None = None) -> CloudClient:
+    """Construct the transport client, classifying a syntactically invalid
+    host (`httpx.InvalidURL` is not an HTTPError, so no verb wrapper sees
+    it). The scheme and authority are checked up front: httpx accepts a bare
+    `http://` base URL and only fails at the first request, with a
+    ConnectError that would misreport this configuration error as
+    transient."""
+    try:
+        parsed = urlsplit(host)
+    except ValueError as error:
+        raise _bad_host_fail(f"{host!r}: {error}") from error
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise _bad_host_fail(f"{host!r} is not an http(s) URL")
+    try:
+        return CloudClient(host, token)
+    except httpx.InvalidURL as error:
+        raise _bad_host_fail(str(error) or type(error).__name__) from error
+
+
 def _confirm(prompt: str) -> None:
     """`typer.confirm` with an agent guard: when stdin is not a TTY there is
     nobody to answer, so fail immediately, naming `--yes`, instead of hanging
@@ -425,20 +498,23 @@ def _client() -> CloudClient:
     creds = _load_credentials()
     if creds is None:
         raise _fail("not logged in — run `lodedb cloud login`")
-    return CloudClient(creds.host, creds.token)
+    return _open_client(creds.host, creds.token)
 
 
 def _cloud(operation: Callable[[], T]) -> T:
     # The same exception surface as _run(), plus CloudError (itself a
-    # RuntimeError): managed operations interleave HTTP calls with local
-    # Rust-core work (planning, materialisation), and both halves must
-    # print as `error: …` rather than a traceback. Control-plane refusals
-    # additionally classify into per-class exit codes with fix hints.
+    # RuntimeError) and httpx transport errors: managed operations interleave
+    # HTTP calls with local Rust-core work (planning, materialisation), and
+    # both halves must print as `error: …` rather than a traceback.
+    # Control-plane refusals additionally classify into per-class exit codes
+    # with fix hints.
     try:
         return operation()
     except CloudError as error:
         code, hint = _classify(error)
         raise _fail(str(error), code=code, hint=hint) from error
+    except httpx.HTTPError as error:
+        raise _network_fail(error) from error
     except _core.SyncConflictError as error:
         # The native core's refusals (diverged lineage, pending WAL) are the
         # same "resolve with force or checkpoint" class as the managed 409s.
@@ -505,6 +581,17 @@ def _seal_material_for_cli(material: bytes, recipient_public_key: object, info: 
         raise _fail(f"sealed-store challenge is invalid: {error}") from error
 
 
+def _parse_unseal_challenge(challenge: dict) -> tuple[object, object, bytes]:
+    """(recipient_public_key, nonce, decoded info) from one unseal challenge,
+    or the CLI's classified refusal when a field is absent or undecodable."""
+
+    try:
+        info = base64.b64decode(challenge["info"], validate=True)
+        return challenge["recipient_public_key"], challenge["nonce"], info
+    except (KeyError, TypeError, ValueError, binascii.Error) as error:
+        raise _fail("unseal challenge returned incomplete or invalid data") from error
+
+
 # The tenancy flags share one story: the credential knows where it belongs.
 _ORG_HELP = "Org slug; defaults to the token's binding, else your only org."
 _ENVIRONMENT_HELP = (
@@ -549,6 +636,8 @@ def _tenancy(
     except CloudError as error:
         code, _hint = _classify(error)
         raise _fail(str(error), code=code, hint=_TENANCY_HINT) from error
+    except httpx.HTTPError as error:
+        raise _network_fail(error) from error
 
 
 def _managed(local_dir: str, remote: str) -> tuple[CloudClient, ManagedRemote, str] | None:
@@ -575,14 +664,14 @@ def _managed(local_dir: str, remote: str) -> tuple[CloudClient, ManagedRemote, s
                 f"{creds.host} — log in to the linked control plane or re-link"
             )
         target = ManagedRemote(config.org, config.environment, config.store)
-        return CloudClient(creds.host, creds.token), target, creds.host
+        return _open_client(creds.host, creds.token), target, creds.host
     target = _cloud(lambda: ManagedRemote.parse(remote))
     if target is None:
         return None
     creds = _load_credentials()
     if creds is None:
         raise _fail("not logged in — run `lodedb cloud login`")
-    return CloudClient(creds.host, creds.token), target, creds.host
+    return _open_client(creds.host, creds.token), target, creds.host
 
 
 @app.command()
@@ -628,7 +717,7 @@ def login(
 
     # Prove the credential works before persisting it. A typo'd --token must
     # not leave broken state behind.
-    with CloudClient(host, token) as client:
+    with _open_client(host, token) as client:
         me = _cloud(client.me)
     path = _config.save_credentials(host, token)
     _emit(
@@ -644,7 +733,7 @@ def _browser_login(host: str, open_browser: bool = True) -> str:
     code and approval URL to stderr, blocks until a signed-in browser approves,
     and returns the minted token secret (sealed in transit to this process's
     keypair, so it never crosses in the clear)."""
-    with CloudClient(host) as anonymous:
+    with _open_client(host) as anonymous:
         handoff = _cloud(
             lambda: LoginHandoff(
                 anonymous, client_label=f"lodedb cloud CLI on {platform.node() or 'unknown host'}"
@@ -675,7 +764,7 @@ def _ensure_logged_in(host: str | None) -> "_config.Credentials":
     if host is None:
         host = _config.DEFAULT_HOST
     token = _browser_login(host)
-    with CloudClient(host, token) as client:
+    with _open_client(host, token) as client:
         me = _cloud(client.me)
     _config.save_credentials(host, token)
     _note(f"logged in to {host} as {me['user']['email']}")
@@ -821,7 +910,7 @@ def init(
     creds = _ensure_logged_in(host)
     data: dict[str, object] = {}
     notes: list[str] = []
-    with CloudClient(creds.host, creds.token) as client:
+    with _open_client(creds.host, creds.token) as client:
         if environment is None:
             org, environment = _tenancy(client, org, environment)
         else:
@@ -917,6 +1006,8 @@ def whoami() -> None:
                 code, hint = _classify(error)
                 raise _fail(str(error), code=code, hint=hint) from error
             info = None
+        except httpx.HTTPError as error:
+            raise _network_fail(error) from error
         me = _cloud(client.me) if info is None or info["kind"] == "personal" else None
 
     if me is not None:
@@ -1012,7 +1103,7 @@ def tokens_mint(
     creds = _load_credentials()
     if creds is None:
         raise _fail("not logged in — run `lodedb cloud login`")
-    with CloudClient(creds.host, creds.token) as client:
+    with _open_client(creds.host, creds.token) as client:
         if kind != "personal" and (org is None or environment is None):
             org, environment = _tenancy(client, org, environment)
         minted = _cloud(
@@ -1366,12 +1457,7 @@ def store_unseal(
         # the only thing that unseals.
         material = _load_material(material_env, generate_material=False)
         challenge = _cloud(lambda: client.store_unseal_challenge(org, environment, store))
-        try:
-            info = base64.b64decode(challenge["info"], validate=True)
-            recipient_public_key = challenge["recipient_public_key"]
-            nonce = challenge["nonce"]
-        except (KeyError, TypeError, ValueError, binascii.Error) as error:
-            raise _fail("unseal challenge returned incomplete or invalid data") from error
+        recipient_public_key, nonce, info = _parse_unseal_challenge(challenge)
         sealed_material = _seal_material_for_cli(material, recipient_public_key, info)
 
         out = _cloud(
@@ -1401,6 +1487,95 @@ def store_reseal(
         org, environment = _tenancy(client, org, environment)
         out = _cloud(lambda: client.reseal_store(org, environment, store))
     _emit(out, lambda: typer.echo(f"resealed {store}: {out['resealed']}"))
+
+
+def _echo_rotate_unchanged() -> None:
+    """After a refused or never-submitted rotation the store still opens with
+    its previous material; say so next to the freshly printed secret."""
+    typer.secho(
+        "the printed material did not take effect; the store still uses "
+        "its previous material",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
+
+
+def _echo_rotate_unknown() -> None:
+    """A rotation the server may have applied before failing to answer: the
+    printed material could be the only one that now unseals the store."""
+    typer.secho(
+        "the rotation outcome is unknown: keep the printed material until "
+        "you confirm which material unseals the store",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
+
+
+@store_app.command("rotate")
+def store_rotate(
+    store: Annotated[str, typer.Argument(help="Store name.")],
+    material_env: Annotated[
+        str | None,
+        typer.Option(
+            "--material-env",
+            help="Environment variable holding standard-base64 new sealed-store material.",
+        ),
+    ] = None,
+    generate_material: Annotated[
+        bool,
+        typer.Option(
+            "--generate-material",
+            help="Generate fresh sealed-store material and print it once to stderr.",
+        ),
+    ] = False,
+    environment: Annotated[str | None, typer.Option(help=_ENVIRONMENT_HELP)] = None,
+    org: Annotated[str | None, typer.Option(help=_ORG_HELP)] = None,
+) -> None:
+    """Rotate a live sealed store to fresh caller-held material."""
+
+    with _client() as client:
+        org, environment = _tenancy(client, org, environment)
+        material = _load_material(material_env, generate_material)
+        try:
+            challenge = _cloud(lambda: client.store_unseal_challenge(org, environment, store))
+            recipient_public_key, nonce, info = _parse_unseal_challenge(challenge)
+            sealed_material = _seal_material_for_cli(material, recipient_public_key, info)
+        except typer.Exit:
+            # Nothing was submitted yet, so generated material took no effect.
+            if generate_material:
+                _echo_rotate_unchanged()
+            raise
+        try:
+            out = client.rotate_store_key(
+                org,
+                environment,
+                store,
+                {"sealed_material": sealed_material, "nonce": nonce},
+            )
+        except CloudError as error:
+            # A definitive refusal means the store keeps its material; a 5xx
+            # may have re-wrapped the key before failing to answer.
+            if generate_material:
+                if error.status_code < 500:
+                    _echo_rotate_unchanged()
+                else:
+                    _echo_rotate_unknown()
+            code, hint = _classify(error)
+            if error.status_code == 409:
+                # Rotation re-wraps the DEK, which the server only holds
+                # while a grant is live.
+                hint = "run `lodedb cloud store unseal` first"
+            raise _fail(str(error), code=code, hint=hint) from error
+        except httpx.HTTPError as error:
+            # A submitted rotation with a lost response may have committed;
+            # the printed material could be the only one that unseals.
+            if generate_material:
+                if isinstance(error, (*_PRE_SUBMISSION_ERRORS, httpx.UnsupportedProtocol)):
+                    _echo_rotate_unchanged()
+                else:
+                    _echo_rotate_unknown()
+            raise _network_fail(error) from error
+    _emit(out, lambda: typer.echo(f"rotated {store} key"))
 
 
 def _resolve_index_key(
