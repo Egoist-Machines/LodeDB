@@ -174,7 +174,10 @@ pub(crate) fn stage_generation_pinned(
     dest_body: Option<serde_json::Value>,
 ) -> Result<StagedExport> {
     // Redact before inventorying so excluded artifacts are neither listed nor
-    // uploaded, and the published body matches exactly what shipped.
+    // uploaded, and the published body matches exactly what shipped. A body
+    // the policy cannot honestly redact (a text-bearing LodeGraph topology)
+    // refuses here, before a single artifact moves.
+    policy.refuse_unredactable(&raw_body)?;
     let source_body = policy.redact_body(&raw_body);
     let source_inventory = inventory_from_body(index_key, Some(&source_body))?
         .expect("inventory is Some when the body is Some");

@@ -57,14 +57,40 @@ const STORE_KINDS: &[(&str, &str)] = &[
     // {base, deltas} store like tvim: vector payload, never text-gated, and the
     // engine refuses to open a rescore store without it, so it ships always.
     ("tvvf", TVVF_DELTA_DIR_SUFFIX),
+    // LodeGraph (temporal knowledge graph) topology sidecars. A graph store's
+    // authoritative artifact is its topology SQLite truth store; the semantic
+    // index/ beside it is regenerated from the topology on open and never
+    // transfers. Exactly one of the two keys stands for that single sidecar
+    // (they are mutually exclusive; `inventory_from_body` refuses a body
+    // pinning both):
+    // `gtopo` is a content-free episode-anchor topology (ids, timestamps,
+    // mention links; no user text) and `gtopotext` a topology that embeds
+    // user text, gated exactly like a vector store's tvtext. Their
+    // sub-manifests use the journaled {base, deltas} shape, but the base
+    // carries the artifact's real on-disk file name (`topology.sqlite3`),
+    // not a `g<epoch>` derivation; `refs_for_store` special-cases the name
+    // check accordingly. The delta suffix follows the engine's uniform
+    // `<base>.<kind>-delta` derivation (no deltas are recorded today).
+    ("gtopo", ".gtopo-delta"),
+    ("gtopotext", ".gtopotext-delta"),
 ];
+
+/// The LodeGraph topology sidecar keys: native artifacts (real on-disk file
+/// name, no epoch derivation, no engine delta journal), mutually exclusive
+/// within one body. Must match the server's `GRAPH_STORE_KINDS` exactly.
+const GRAPH_STORE_KINDS: &[&str] = &["gtopo", "gtopotext"];
+
+fn is_graph_kind(kind: &str) -> bool {
+    GRAPH_STORE_KINDS.contains(&kind)
+}
 
 /// One artifact (a base or a delta segment) referenced by a committed generation.
 ///
 /// `name` is the store-relative path (e.g. `idx.gen/g7.json`); `kind` is the
-/// owning store (`json`/`tvim`/`tvtext`/`tvlex`/`tvmv`/`tvann`/`tvvf`); `epoch` is the base
-/// epoch the artifact lives under; `is_base` is true for the base snapshot and
-/// false for a delta segment appended onto it.
+/// owning store (`json`/`tvim`/`tvtext`/`tvlex`/`tvmv`/`tvann`/`tvvf`, or a LodeGraph
+/// sidecar `gtopo`/`gtopotext`); `epoch` is the base epoch the artifact lives
+/// under; `is_base` is true for the base snapshot and false for a delta
+/// segment appended onto it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRef {
     pub name: String,
@@ -155,6 +181,24 @@ pub fn inventory_from_body(
                 )));
             }
         }
+    }
+    // The two LodeGraph sidecar keys stand for ONE artifact (the topology
+    // either embeds user text or it does not), so a body pinning both is
+    // malformed: the same text-bearing bytes could also be claimed under the
+    // non-payload graph key. The server refuses such a body at commit;
+    // refusing here too fails a fabricated body at classification instead of
+    // at the remote's gate.
+    let pinned_graph: Vec<&str> = GRAPH_STORE_KINDS
+        .iter()
+        .copied()
+        .filter(|key| body.get(key).is_some_and(|value| !value.is_null()))
+        .collect();
+    if pinned_graph.len() > 1 {
+        return Err(ArtifactStoreError::Integrity(format!(
+            "commit body pins both LodeGraph sidecars ({}); they are mutually exclusive — \
+             a topology either embeds user text or it does not",
+            pinned_graph.join(", ")
+        )));
     }
     let mut artifacts: Vec<ArtifactRef> = Vec::new();
     // Inventory each store whose sub-manifest is non-null, mirroring exactly how the
@@ -313,28 +357,57 @@ fn refs_for_store(
     // Most stores live at `g<base_epoch>.<kind>`; `tvvf` keeps its own epoch
     // counter in the sub-manifest and lives at `vf<vf_epoch>.tvvf`
     // (`tvvf_store::base_path`), so its refs must derive from that epoch. The
-    // generation's base_epoch names a file the engine never writes.
-    let (store_epoch, base_name) = if kind == "tvvf" {
-        let vf_epoch = sub_manifest
-            .get("vf_epoch")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                ArtifactStoreError::Integrity(
-                    "tvvf sub-manifest carries no vf_epoch; cannot derive its base path"
-                        .to_string(),
-                )
-            })?;
-        (vf_epoch, format!("vf{vf_epoch}.tvvf"))
+    // generation's base_epoch names a file the engine never writes. A
+    // LodeGraph sidecar is a native artifact, not a journaled `g<epoch>`
+    // store: its base records the topology's real on-disk file name
+    // (`topology.sqlite3`), which mutates IN PLACE across generations, so a
+    // name-stable transfer layout would collide with the immutable-artifact
+    // invariant the moment a second generation ships changed bytes
+    // (`write_stream_if_absent` refuses same-name/different-content). Blobs
+    // cross the managed wire by digest and nothing opens the transfer-layout
+    // copy under its recorded name, so the layout addresses the sidecar BY
+    // CONTENT: `<sha256>.<kind>` is unique per bytes, repeat transfers stay
+    // idempotent, and no generation can clobber another's artifact. The
+    // recorded name, when present, is still validated as a safe single path
+    // component, exactly the server's walk (absent is tolerated there too).
+    let (store_epoch, base_name) = if is_graph_kind(kind) {
+        match base.get("file_name") {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                let recorded = value.as_str().ok_or_else(|| {
+                    ArtifactStoreError::Integrity(format!(
+                        "{kind} sub-manifest has an unsafe artifact file name {value:?}; \
+                         expected a plain file name"
+                    ))
+                })?;
+                ensure_plain_file_name(kind, recorded)?;
+            }
+        }
+        (base_epoch, format!("{}.{kind}", checked_sha256(kind, base)?))
     } else {
-        (base_epoch, format!("g{base_epoch}.{kind}"))
+        let (epoch, derived) = if kind == "tvvf" {
+            let vf_epoch = sub_manifest
+                .get("vf_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ArtifactStoreError::Integrity(
+                        "tvvf sub-manifest carries no vf_epoch; cannot derive its base path"
+                            .to_string(),
+                    )
+                })?;
+            (vf_epoch, format!("vf{vf_epoch}.tvvf"))
+        } else {
+            (base_epoch, format!("g{base_epoch}.{kind}"))
+        };
+        let recorded = str_field(base, "file_name");
+        if !recorded.is_empty() && recorded != derived {
+            return Err(ArtifactStoreError::Integrity(format!(
+                "{kind} base file_name {recorded:?} does not match the engine-derived name \
+                 {derived:?}"
+            )));
+        }
+        (epoch, derived)
     };
-    let recorded = str_field(base, "file_name");
-    if !recorded.is_empty() && recorded != base_name {
-        return Err(ArtifactStoreError::Integrity(format!(
-            "{kind} base file_name {recorded:?} does not match the engine-derived name \
-             {base_name:?}"
-        )));
-    }
     let mut refs = vec![ArtifactRef {
         name: format!("{gen_dir}/{base_name}"),
         sha256: checked_sha256(kind, base)?,
@@ -384,7 +457,12 @@ fn refs_for_store(
 /// readable but not writable. Restores call this to rebuild every journal
 /// manifest verbatim from the body, so a pulled/hydrated copy behaves
 /// exactly like an engine-authored one. `tvann` is excluded: the ANN sidecar
-/// is base-only and the engine keeps no journal for it.
+/// is base-only and the engine keeps no journal for it. The LodeGraph
+/// topology sidecars are excluded for the same reason: the graph engine
+/// mutates the topology SQLite directly and regenerates its semantic index
+/// from it on open, so it reads no delta-journal manifest, and writing one
+/// would plant a stray `topology.sqlite3.<kind>-delta/` directory in the
+/// restored store.
 pub(crate) fn write_restored_journal_manifests(
     persistence_dir: &Path,
     index_key: &str,
@@ -392,7 +470,7 @@ pub(crate) fn write_restored_journal_manifests(
 ) -> Result<()> {
     let base_epoch = body_u64(body, "base_epoch");
     for (kind, dir_suffix) in STORE_KINDS {
-        if *kind == "tvann" {
+        if *kind == "tvann" || is_graph_kind(kind) {
             continue;
         }
         let Some(sub_manifest) = body.get(*kind).filter(|value| !value.is_null()) else {

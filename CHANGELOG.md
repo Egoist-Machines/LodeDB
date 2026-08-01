@@ -5,6 +5,38 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The cloud transfer client and the native generation inventory know the two
+  LodeGraph topology sidecar keys, matching OreCloud's graph custody contract:
+  `gtopo` (a content-free episode-anchor topology) classifies as the
+  non-payload `graph` wire kind, and `gtopotext` (a topology embedding user
+  text) classifies as `text` and obeys the same read gates as a vector
+  store's stored text. Their sub-manifests carry the topology's real on-disk
+  file name (`topology.sqlite3`), validated as a safe single path component
+  instead of the `g<epoch>` derivation journaled stores use, while the local
+  transfer layout addresses the artifact by content so successive topologies
+  never collide with the immutable-artifact rule; the two keys are mutually
+  exclusive within one body, and genuinely unknown store keys still fail
+  closed. A text-bearing topology cannot be redacted (its text lives inside
+  the single SQLite artifact), so a transfer that has not opted into text
+  refuses it with the opt-in named instead of shipping user text under the
+  redacted-by-default posture. This makes client-side push, pull, status,
+  and verify of a graph store possible.
+
+### Fixed
+
+- The cloud client retries the 409s OreCloud codes as deliberately retryable,
+  bounded with short backoff, instead of surfacing them as terminal.
+  A write refused with `segment_object_missing` (the uploaded segment left
+  object storage before registration acknowledged it) is re-sent whole, which
+  re-uploads the segment bytes and re-registers under the same idempotency
+  key; store creation refused with `empty_head_artifact_missing` re-runs the
+  whole creation, challenge fetch and sealing included for encrypted stores.
+  Every other 409 still surfaces on the first answer.
+
 ## [2.0.4] - 2026-07-30
 
 ### Fixed

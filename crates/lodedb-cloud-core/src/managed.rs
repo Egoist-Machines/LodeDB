@@ -110,7 +110,11 @@ fn managed_side(body: &Value, reference: &SnapRef) -> ManagedSide {
         snapshot_id: reference.snapshot_id.clone(),
         logical_id: reference.logical_id.clone(),
         generation: reference.generation,
-        has_text: body.get("tvtext").is_some_and(|value| !value.is_null()),
+        // Text payload is a vector store's tvtext or a text-bearing LodeGraph
+        // topology (gtopotext), mirroring the server's `body_has_text`.
+        has_text: ["tvtext", "gtopotext"]
+            .iter()
+            .any(|key| body.get(key).is_some_and(|value| !value.is_null())),
         has_lexical: body.get("tvlex").is_some_and(|value| !value.is_null()),
     }
 }

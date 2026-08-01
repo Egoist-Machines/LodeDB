@@ -411,3 +411,104 @@ fn inventory_rejects_a_body_key_mismatch() {
     let err = inventory_from_body("idx", Some(&body)).unwrap_err();
     assert!(matches!(err, ArtifactStoreError::Integrity(_)));
 }
+
+#[test]
+fn inventory_covers_a_content_free_graph_topology_sidecar() {
+    // `gtopo` (the LodeGraph content-free episode-anchor topology) is a native
+    // artifact whose base records the topology's real on-disk file name
+    // (topology.sqlite3), never a `g<base_epoch>.gtopo` derivation (base_epoch
+    // here is deliberately non-zero to prove the derivation is not required).
+    // The topology mutates in place under that fixed name, so the transfer
+    // layout addresses it by content (`<sha256>.gtopo`): a second generation's
+    // changed bytes get a fresh artifact name instead of colliding with the
+    // immutable-artifact rule.
+    let body = json!({
+        "index_key": "idx",
+        "generation": 3,
+        "base_epoch": 2,
+        "document_count": 0,
+        "chunk_count": 0,
+        "json": { "base": { "file_name": "g2.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "gtopo": { "base": { "file_name": "topology.sqlite3", "sha256": hex64(0xb), "file_bytes": 12 }, "deltas": [] },
+    });
+    let inv = inventory_from_body("idx", Some(&body)).unwrap().unwrap();
+    let expected = format!("idx.gen/{}.gtopo", hex64(0xb));
+    assert!(inv.artifacts.iter().any(|artifact| artifact.kind == "gtopo"
+        && artifact.is_base
+        && artifact.name == expected));
+}
+
+#[test]
+fn inventory_covers_a_text_bearing_graph_topology_sidecar() {
+    // `gtopotext` (a topology embedding user text) walks exactly like gtopo at
+    // the inventory layer; the payload distinction is the wire kind's job. An
+    // ABSENT file_name is tolerated, mirroring the server's walk (the name is
+    // metadata; the layout addresses the artifact by content).
+    let body = json!({
+        "index_key": "idx",
+        "generation": 1,
+        "base_epoch": 0,
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "gtopotext": { "base": { "sha256": hex64(0xc), "file_bytes": 34 }, "deltas": [] },
+    });
+    let inv = inventory_from_body("idx", Some(&body)).unwrap().unwrap();
+    let expected = format!("idx.gen/{}.gtopotext", hex64(0xc));
+    assert!(inv.artifacts.iter().any(|artifact| artifact.kind == "gtopotext"
+        && artifact.is_base
+        && artifact.name == expected));
+}
+
+#[test]
+fn inventory_rejects_an_unsafe_graph_sidecar_file_name() {
+    // The recorded graph base name is pusher-controlled metadata; when present
+    // it must be a plain single path component (the server's exact rule), and
+    // anything else fails closed before it can shape a path anywhere.
+    for bad in ["", "../topology.sqlite3", "a/b.sqlite3", "a\\b", ".", ".."] {
+        let body = json!({
+            "index_key": "idx",
+            "generation": 1,
+            "base_epoch": 0,
+            "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+            "gtopo": { "base": { "file_name": bad, "sha256": hex64(0xb), "file_bytes": 1 }, "deltas": [] },
+        });
+        let err = inventory_from_body("idx", Some(&body)).unwrap_err();
+        assert!(matches!(err, ArtifactStoreError::Integrity(_)), "{bad:?}");
+        assert!(err.to_string().contains("file name"), "{bad:?}: {err}");
+    }
+}
+
+#[test]
+fn inventory_rejects_a_body_pinning_both_graph_sidecars() {
+    // The two sidecar keys stand for ONE artifact (the topology either embeds
+    // user text or it does not); a body pinning both could claim text-bearing
+    // bytes under the non-payload graph key. The server refuses it at commit,
+    // and the inventory refuses it at classification.
+    let body = json!({
+        "index_key": "idx",
+        "generation": 1,
+        "base_epoch": 0,
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "gtopo": { "base": { "file_name": "topology.sqlite3", "sha256": hex64(0xb), "file_bytes": 1 }, "deltas": [] },
+        "gtopotext": { "base": { "file_name": "topology.sqlite3", "sha256": hex64(0xc), "file_bytes": 1 }, "deltas": [] },
+    });
+    let err = inventory_from_body("idx", Some(&body)).unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+    assert!(err.to_string().contains("mutually exclusive"), "{err}");
+}
+
+#[test]
+fn inventory_still_rejects_an_unknown_graph_shaped_sidecar() {
+    // Learning gtopo/gtopotext must not loosen the general rule: a store key
+    // this build does not know still fails closed rather than having its
+    // artifacts silently dropped from reachability.
+    let body = json!({
+        "index_key": "idx",
+        "generation": 1,
+        "base_epoch": 0,
+        "json": { "base": { "file_name": "g0.json", "sha256": hex64(0xa), "file_bytes": 0 }, "deltas": [] },
+        "gfuture": { "base": { "file_name": "topology.sqlite3", "sha256": hex64(0xb), "file_bytes": 1 }, "deltas": [] },
+    });
+    let err = inventory_from_body("idx", Some(&body)).unwrap_err();
+    assert!(matches!(err, ArtifactStoreError::Integrity(_)));
+    assert!(err.to_string().contains("gfuture"), "{err}");
+}

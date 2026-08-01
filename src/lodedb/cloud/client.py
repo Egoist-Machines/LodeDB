@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import time
 from datetime import datetime
 from typing import Any
 
@@ -43,6 +44,10 @@ import httpx
 from lodedb.cloud import _config
 from lodedb.cloud._sealing import create_info, seal_material
 from lodedb.cloud.transfer import CloudClient, CloudError, ManagedRemote
+
+# Bounded retries for the coded 409 store creation marks retryable
+# (`empty_head_artifact_missing`); see `Client.create_store`.
+_CREATE_CONFLICT_RETRIES = 2
 
 
 def resolve_credentials(token: str | None, host: str | None) -> tuple[str, str]:
@@ -265,26 +270,55 @@ class Client:
         """
         if key_material is not None and not encrypted:
             raise ValueError("key_material applies only to encrypted stores")
-        if not encrypted:
-            return self._client.create_store(self.org, self.environment, store, key, **options)
-        material = _require_key_material(key_material)
-        challenge = self._client.store_create_challenge(self.org, self.environment)
-        try:
-            recipient_public_key = challenge["recipient_public_key"]
-        except KeyError as error:
-            raise ValueError("store creation challenge returned no recipient public key") from error
-        options.setdefault("mode", "cloud_writer")
-        return self._client.create_store(
-            self.org,
-            self.environment,
-            store,
-            key,
-            encrypted=True,
-            sealed_material=seal_material(
-                material, recipient_public_key, create_info(self.org, self.environment, store)
-            ),
-            **options,
-        )
+        material = _require_key_material(key_material) if encrypted else None
+        if encrypted:
+            options.setdefault("mode", "cloud_writer")
+
+        def create() -> dict:
+            if material is None:
+                return self._client.create_store(
+                    self.org, self.environment, store, key, **options
+                )
+            challenge = self._client.store_create_challenge(self.org, self.environment)
+            try:
+                recipient_public_key = challenge["recipient_public_key"]
+            except KeyError as error:
+                raise ValueError(
+                    "store creation challenge returned no recipient public key"
+                ) from error
+            return self._client.create_store(
+                self.org,
+                self.environment,
+                store,
+                key,
+                encrypted=True,
+                sealed_material=seal_material(
+                    material,
+                    recipient_public_key,
+                    create_info(self.org, self.environment, store),
+                ),
+                **options,
+            )
+
+        # Creation publishes the store's empty head server-side, and the one
+        # 409 that publish codes retryable (`empty_head_artifact_missing`: an
+        # empty-head artifact left object storage mid-publication, the GC
+        # reaper winning a rare race) rolls the whole creation back, so the
+        # remedy is to re-run the whole operation, bounded. The retry
+        # re-fetches the challenge and re-seals for encrypted stores. Any
+        # other refusal (including every other 409, e.g. "store already
+        # registered") is a real answer and surfaces unchanged.
+        conflicts = 0
+        while True:
+            try:
+                return create()
+            except CloudError as error:
+                if error.status_code != 409 or error.code != "empty_head_artifact_missing":
+                    raise
+                conflicts += 1
+                if conflicts > _CREATE_CONFLICT_RETRIES:
+                    raise
+                time.sleep(error.retry_after or 0.25 * conflicts)
 
     def unseal_store(
         self, store: str, key_material: bytes, *, ttl_seconds: int | None = None

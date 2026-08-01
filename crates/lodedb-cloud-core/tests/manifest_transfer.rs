@@ -315,3 +315,94 @@ fn export_excludes_uncommitted_wal_writes() {
         Some(3)
     );
 }
+
+/// Lays down one graph generation in `dir`: the topology bytes at their
+/// content-addressed layout name (`idx.gen/<sha256>.<sidecar>`), a json state
+/// base, and the committed pointer pinning both.
+fn commit_graph_generation(
+    dir: &std::path::Path,
+    generation: u64,
+    sidecar: &str,
+    topology: &[u8],
+) -> Value {
+    use lodedb_core::storage::commit_manifest::{commit_manifest_path, write_commit_manifest};
+
+    let json = store_sub(dir, "idx", "g0.json", b"state", ".json-delta", &[]);
+    let layout_name = format!("{}.{sidecar}", sha_hex(topology));
+    fs::write(dir.join("idx.gen").join(&layout_name), topology).unwrap();
+    let body = json!({
+        "index_key": "idx",
+        "generation": generation,
+        "base_epoch": 0,
+        "document_count": 0,
+        "chunk_count": 0,
+        "json": json,
+        sidecar: {
+            "base": {
+                "file_name": "topology.sqlite3",
+                "sha256": sha_hex(topology),
+                "file_bytes": topology.len(),
+            },
+            "deltas": [],
+        },
+    });
+    write_commit_manifest(&commit_manifest_path(dir, "idx"), &body, false).unwrap();
+    body
+}
+
+#[test]
+fn export_ships_a_graph_topology_generation_and_its_successor() {
+    // A LodeGraph body pins its topology sidecar; the export must inventory
+    // it, checksum-verify it, and land it at the destination. The topology
+    // mutates in place across generations, so the second generation's changed
+    // bytes must transfer cleanly into the SAME destination: the content-
+    // addressed layout name gives them a fresh artifact instead of tripping
+    // the immutable-artifact refusal on a reused name.
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let source = LocalArtifactStore::new(src.path(), false);
+    let dest = LocalArtifactStore::new(dst.path(), false);
+
+    let first = b"sqlite-truth-store-bytes";
+    commit_graph_generation(src.path(), 1, "gtopo", first);
+    let result = export_generation(&source, &dest, "idx", TransferPolicy::full()).unwrap();
+    assert_eq!(result.artifacts_written, 2);
+    assert!(result.pointer_published);
+    let first_name = format!("idx.gen/{}.gtopo", sha_hex(first));
+    assert_eq!(dest.read_bytes(&first_name).unwrap(), first.to_vec());
+
+    let second = b"sqlite-truth-store-bytes-after-more-episodes";
+    commit_graph_generation(src.path(), 2, "gtopo", second);
+    let again = export_generation(&source, &dest, "idx", TransferPolicy::full()).unwrap();
+    assert!(again.pointer_published);
+    let second_name = format!("idx.gen/{}.gtopo", sha_hex(second));
+    assert_eq!(dest.read_bytes(&second_name).unwrap(), second.to_vec());
+    assert_eq!(
+        dest.read_pointer("idx").unwrap(),
+        source.read_pointer("idx").unwrap()
+    );
+}
+
+#[test]
+fn redacted_export_refuses_a_text_bearing_topology() {
+    // A gtopotext topology carries user text inside its single SQLite
+    // artifact, so a text-excluding policy cannot redact it by nulling the
+    // sub-manifest (that would publish a body with no graph store at all).
+    // The transfer refuses before an artifact moves; opting into text ships
+    // the generation verbatim.
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let source = LocalArtifactStore::new(src.path(), false);
+    let dest = LocalArtifactStore::new(dst.path(), false);
+    let topology = b"sqlite-with-user-text";
+    commit_graph_generation(src.path(), 1, "gtopotext", topology);
+
+    let err = export_generation(&source, &dest, "idx", TransferPolicy::redacted()).unwrap_err();
+    assert!(err.to_string().contains("gtopotext"), "{err}");
+    assert!(dest.read_pointer("idx").unwrap().is_none());
+
+    let shipped = export_generation(&source, &dest, "idx", TransferPolicy::full()).unwrap();
+    assert!(shipped.pointer_published);
+    let name = format!("idx.gen/{}.gtopotext", sha_hex(topology));
+    assert_eq!(dest.read_bytes(&name).unwrap(), topology.to_vec());
+}

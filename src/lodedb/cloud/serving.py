@@ -242,6 +242,17 @@ class CloudStore:
     # once or replays the original acceptance.
     _WRITE_TRANSPORT_RETRIES = 2
 
+    # Retries for the one coded 409 the server marks retryable on segment
+    # registration: the uploaded object left storage before registration
+    # acknowledged it (the GC reaper winning a rare race), so the write was
+    # refused, never registered. The remedy is to re-upload the bytes and
+    # re-register, not to repeat registration alone; this client's write
+    # requests carry the segment bytes, so resending the same request (same
+    # idempotency key, same body) is exactly that. Any other 409 is a real
+    # answer and surfaces unchanged.
+    _WRITE_CONFLICT_RETRIES = 2
+    _RETRYABLE_WRITE_CONFLICT = "segment_object_missing"
+
     def _accepted(self, result: dict) -> dict:
         """Records an accepted write's `seq` as this session's
         read-your-writes floor and remembers its `write_id`."""
@@ -258,19 +269,32 @@ class CloudStore:
         response is lost (timeout, dropped connection). A naive resend would
         register a second segment, duplicate documents under fresh ids. The
         key pins the request, so the retry (same key, byte-identical body)
-        gets the original acceptance replayed instead. Only transport-level
-        failures are retried; an HTTP error is a real answer.
+        gets the original acceptance replayed instead. Transport-level
+        failures are retried, as is the one 409 the server codes retryable
+        (`segment_object_missing`, see `_RETRYABLE_WRITE_CONFLICT`); every
+        other HTTP error is a real answer. Both retries resend the whole
+        request, so the coded 409's remedy (re-upload the segment bytes,
+        then re-register) happens by construction, and the shared key keeps
+        a retry racing a late-landing original safe.
         """
         payload["idempotency_key"] = uuid.uuid4().hex
-        attempt = 0
+        transport_failures = 0
+        conflicts = 0
         while True:
             try:
                 return self._accepted(call(self.org, self.environment, payload))
             except httpx.TransportError:
-                attempt += 1
-                if attempt > self._WRITE_TRANSPORT_RETRIES:
+                transport_failures += 1
+                if transport_failures > self._WRITE_TRANSPORT_RETRIES:
                     raise
-                time.sleep(0.25 * attempt)
+                time.sleep(0.25 * transport_failures)
+            except CloudError as error:
+                if error.status_code != 409 or error.code != self._RETRYABLE_WRITE_CONFLICT:
+                    raise
+                conflicts += 1
+                if conflicts > self._WRITE_CONFLICT_RETRIES:
+                    raise
+                time.sleep(error.retry_after or 0.25 * conflicts)
 
     def add(
         self,
