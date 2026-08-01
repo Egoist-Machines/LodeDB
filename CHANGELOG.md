@@ -5,6 +5,21 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `lodedb-graph` can now enforce an entity/relation schema at write time. `Schema` declares
+  entity kinds (with sub-kinds) and the permitted `(domain, relation, range)` rectangles —
+  the information Graphiti carries as `edge_type_map` and this port originally dropped, leaving
+  `Entity::entity_type` and `Fact::relation` as unchecked free strings. Install it with
+  `TemporalGraph::set_fact_policy`; a refused write raises `GraphError::PolicyViolation` and
+  touches neither the topology store nor the semantic index. `FactPolicy` is public so callers
+  can enforce their own constraints (tenant boundaries, cardinality, frozen kinds) through the
+  same seam. Sub-kinds are honoured, so a `Place` range admits a `Land` without restating it.
+  Nothing is persisted, no migration is required, and a graph with no policy installed behaves
+  exactly as before.
+
 ## [2.0.5] - 2026-08-01
 
 ### Added

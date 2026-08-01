@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use lodedb_graph::{
-    AsOf, Direction, EmbedRole, Embedder, GraphConfig, GraphError, Result, TemporalGraph,
+    AsOf, Direction, EmbedRole, Embedder, EntityCandidate, FactCandidate, FactPolicy, GraphConfig,
+    GraphError, KindDef, PolicyRejection, PolicyResult, RelationDef, Result, Schema, SchemaDef,
+    TemporalGraph,
 };
 use serde_json::json;
 
@@ -1255,4 +1257,235 @@ fn authorization_predicate_blocks_forbidden_bridge_expansion() {
         .facts
         .iter()
         .all(|fact| fact.src != "forbidden-m" && fact.dst != "forbidden-m"));
+}
+
+// ---------------------------------------------------------------------------
+// Write-time admission policy (`FactPolicy` / `Schema`).
+//
+// The unit tests in `src/schema.rs` pin `Schema`'s pure vocabulary logic. These pin
+// that enforcement actually fires through the facade, that a refusal leaves the store
+// and the index untouched, and — the compatibility requirement — that a graph with no
+// policy behaves exactly as it did before the feature existed.
+// ---------------------------------------------------------------------------
+
+/// Person / Place / Land(:Place) / Group, with `lives_in: Person -> Place` and
+/// `member_of: Person -> Group`. Land is never named in a range: it qualifies by subsumption.
+fn place_schema() -> Schema {
+    Schema::try_from(
+        SchemaDef::new()
+            .kind(KindDef::root("Person"))
+            .kind(KindDef::root("Place"))
+            .kind(KindDef::sub("Land", ["Place"]))
+            .kind(KindDef::root("Group"))
+            .relation(RelationDef::new("lives_in", ["Person"], ["Place"]))
+            .relation(RelationDef::new("member_of", ["Person"], ["Group"])),
+    )
+    .unwrap()
+}
+
+fn graph_with_schema() -> TemporalGraph {
+    let mut g = graph();
+    g.set_fact_policy(Some(Box::new(place_schema())));
+    g
+}
+
+/// Refuses every fact, to prove the seam is the trait and not `Schema` specifically.
+struct RefuseAll;
+impl FactPolicy for RefuseAll {
+    fn admit_fact(&self, _c: &FactCandidate<'_>) -> PolicyResult {
+        Err(PolicyRejection::new("no facts today"))
+    }
+}
+
+/// Freezes an entity's kind once set — the retype rule the crate deliberately does NOT
+/// impose, written as a caller policy to prove the candidate exposes enough to do it.
+struct FreezeKind;
+impl FactPolicy for FreezeKind {
+    fn admit_fact(&self, _c: &FactCandidate<'_>) -> PolicyResult {
+        Ok(())
+    }
+    fn admit_entity(&self, c: &EntityCandidate<'_>) -> PolicyResult {
+        match c.existing() {
+            Some(prior) if prior.entity_type != c.kind() => Err(PolicyRejection::new(format!(
+                "entity {:?} is a {:?} and may not become a {:?}",
+                c.entity().id,
+                prior.entity_type,
+                c.kind()
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn a_schema_admits_a_well_typed_fact_and_refuses_its_converse() {
+    let mut g = graph_with_schema();
+    g.upsert_entity("p1", "Person", "Nisha Rao", json!({}), None, None).unwrap();
+    g.upsert_entity("c1", "Place", "Christchurch", json!({}), None, None).unwrap();
+
+    g.add_fact("p1", "lives_in", "c1", "Nisha lives in Christchurch", json!({}), vec![], None, &[])
+        .unwrap();
+
+    let err = g
+        .add_fact("c1", "lives_in", "p1", "reversed", json!({}), vec![], None, &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, GraphError::PolicyViolation(ref m) if m.contains("lives_in")),
+        "expected a policy violation naming the relation, got {err:?}"
+    );
+}
+
+#[test]
+fn a_subkind_endpoint_is_admitted_without_being_named_in_the_range() {
+    let mut g = graph_with_schema();
+    g.upsert_entity("p1", "Person", "Nisha Rao", json!({}), None, None).unwrap();
+    g.upsert_entity("l1", "Land", "the Avon", json!({}), None, None).unwrap();
+    // lives_in's range is Place; Land is a Place by declaration, never restated.
+    g.add_fact("p1", "lives_in", "l1", "Nisha lives by the Avon", json!({}), vec![], None, &[])
+        .unwrap();
+}
+
+#[test]
+fn an_undeclared_relation_is_refused_even_between_declared_kinds() {
+    let mut g = graph_with_schema();
+    g.upsert_entity("p1", "Person", "A", json!({}), None, None).unwrap();
+    g.upsert_entity("p2", "Person", "B", json!({}), None, None).unwrap();
+    let err = g
+        .add_fact("p1", "befriends", "p2", "invented verb", json!({}), vec![], None, &[])
+        .unwrap_err();
+    assert!(matches!(err, GraphError::PolicyViolation(_)), "got {err:?}");
+}
+
+#[test]
+fn an_undeclared_entity_kind_is_refused_and_writes_no_row() {
+    let mut g = graph_with_schema();
+    let err = g
+        .upsert_entity("x1", "Sasquatch", "Bigfoot", json!({}), None, None)
+        .unwrap_err();
+    assert!(matches!(err, GraphError::PolicyViolation(_)), "got {err:?}");
+    assert!(g.get_entity("x1").unwrap().is_none(), "a refused upsert must leave no row");
+}
+
+#[test]
+fn a_refused_fact_writes_nothing_and_leaves_the_graph_reindexable() {
+    let mut g = graph_with_schema();
+    g.upsert_entity("p1", "Person", "A", json!({}), None, None).unwrap();
+    g.upsert_entity("g1", "Group", "the choir", json!({}), None, None).unwrap();
+    // Group is not a Place, so lives_in is refused.
+    let err = g
+        .add_fact("p1", "lives_in", "g1", "wrong", json!({}), vec![], None, &[])
+        .unwrap_err();
+    assert!(matches!(err, GraphError::PolicyViolation(_)), "got {err:?}");
+    assert!(
+        g.history("p1").unwrap().is_empty(),
+        "a refused fact must not be stored in any temporal frame"
+    );
+    // The refusal must not have dirtied the index into needing a rebuild to stay correct.
+    let stats = g.reindex().unwrap();
+    assert_eq!(stats.reindexed_facts, 0, "no fact should have reached the index");
+}
+
+#[test]
+fn a_policy_does_not_apply_retroactively_to_rows_already_stored() {
+    let mut g = graph();
+    // Written with no policy: an undeclared kind and an undeclared relation.
+    g.upsert_entity("p1", "Wizard", "Gandalf", json!({}), None, None).unwrap();
+    g.upsert_entity("p2", "Wizard", "Saruman", json!({}), None, None).unwrap();
+    let f = g
+        .add_fact("p1", "rivals", "p2", "they fell out", json!({}), vec![], None, &[])
+        .unwrap();
+
+    g.set_fact_policy(Some(Box::new(place_schema())));
+
+    // The stored rows survive and stay readable — admission is write-time only.
+    assert!(g.get_entity("p1").unwrap().is_some());
+    assert!(g.get_fact(&f).unwrap().is_some());
+    // And a rebuild from truth must not re-run admission, or a tightened schema would
+    // brick a graph that predates it.
+    g.reindex().unwrap();
+    assert!(g.get_fact(&f).unwrap().is_some());
+}
+
+#[test]
+fn clearing_the_policy_restores_unconstrained_writes() {
+    let mut g = graph_with_schema();
+    assert!(g.has_fact_policy());
+    let err = g
+        .upsert_entity("x1", "Sasquatch", "Bigfoot", json!({}), None, None)
+        .unwrap_err();
+    assert!(matches!(err, GraphError::PolicyViolation(_)));
+
+    g.set_fact_policy(None);
+    assert!(!g.has_fact_policy());
+    g.upsert_entity("x1", "Sasquatch", "Bigfoot", json!({}), None, None).unwrap();
+    assert!(g.get_entity("x1").unwrap().is_some());
+}
+
+#[test]
+fn a_custom_policy_is_consulted_through_the_same_seam() {
+    let mut g = graph();
+    g.upsert_entity("p1", "Person", "A", json!({}), None, None).unwrap();
+    g.upsert_entity("p2", "Person", "B", json!({}), None, None).unwrap();
+    g.set_fact_policy(Some(Box::new(RefuseAll)));
+    let err = g
+        .add_fact("p1", "knows", "p2", "anything", json!({}), vec![], None, &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, GraphError::PolicyViolation(ref m) if m == "no facts today"),
+        "the policy's own reason must reach the caller verbatim, got {err:?}"
+    );
+}
+
+#[test]
+fn a_caller_policy_can_freeze_an_entity_kind_the_crate_itself_permits() {
+    let mut g = graph();
+    g.upsert_entity("p1", "Person", "A", json!({}), None, None).unwrap();
+    // Unconstrained, retyping is legal — the store has always allowed it.
+    g.upsert_entity("p1", "Place", "A", json!({}), None, None).unwrap();
+    assert_eq!(g.get_entity("p1").unwrap().unwrap().entity_type, "Place");
+
+    g.set_fact_policy(Some(Box::new(FreezeKind)));
+    let err = g
+        .upsert_entity("p1", "Person", "A", json!({}), None, None)
+        .unwrap_err();
+    assert!(matches!(err, GraphError::PolicyViolation(_)), "got {err:?}");
+    assert_eq!(
+        g.get_entity("p1").unwrap().unwrap().entity_type,
+        "Place",
+        "the refused retype must leave the stored kind alone"
+    );
+}
+
+#[test]
+fn a_stable_id_retry_stays_a_no_op_under_a_policy_tightened_since_the_first_write() {
+    let mut g = graph();
+    g.upsert_entity("p1", "Wizard", "Gandalf", json!({}), None, None).unwrap();
+    g.upsert_entity("p2", "Wizard", "Saruman", json!({}), None, None).unwrap();
+    g.add_fact_with_id(Some("f-1"), "p1", "rivals", "p2", "they fell out", json!({}), vec![], None, &[])
+        .unwrap();
+
+    g.set_fact_policy(Some(Box::new(place_schema())));
+    // The identical retry short-circuits before admission, so an at-least-once writer
+    // replaying its queue is not broken by a schema introduced in between.
+    let again = g
+        .add_fact_with_id(Some("f-1"), "p1", "rivals", "p2", "they fell out", json!({}), vec![], None, &[])
+        .unwrap();
+    assert_eq!(again, "f-1");
+}
+
+#[test]
+fn a_self_loop_resolves_both_endpoints_for_the_policy() {
+    let mut g = graph();
+    g.upsert_entity("p1", "Person", "A", json!({}), None, None).unwrap();
+    let schema = Schema::try_from(
+        SchemaDef::new()
+            .kind(KindDef::root("Person"))
+            .relation(RelationDef::new("knows", ["Person"], ["Person"])),
+    )
+    .unwrap();
+    g.set_fact_policy(Some(Box::new(schema)));
+    // src == dst: the batched endpoint read returns ONE row, which must still resolve
+    // as both src and dst rather than skipping admission.
+    g.add_fact("p1", "knows", "p1", "A knows themself", json!({}), vec![], None, &[])
+        .unwrap();
 }

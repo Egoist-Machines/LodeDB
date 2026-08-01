@@ -19,6 +19,7 @@ use crate::model::{
     AsOf, Direction, Embedder, Entity, EntityPropertyVersion, Episode, Fact, GraphConfig, Subgraph,
     TimeMs,
 };
+use crate::policy::{EntityCandidate, FactCandidate, FactPolicy};
 use crate::temporal;
 use crate::topology::TopologyStore;
 
@@ -54,6 +55,12 @@ pub struct TemporalGraph {
     topology: TopologyStore,
     index: SemanticIndex,
     embedder: Option<Box<dyn Embedder>>,
+    /// The installed write-time admission policy, if any. Held on the handle rather than in
+    /// [`GraphConfig`] for two reasons: `GraphConfig` derives `Debug, Clone` and a
+    /// `Box<dyn FactPolicy>` is neither, and a vocabulary is expected to grow over a database's
+    /// life whereas `GraphConfig` is compared for equality against the stored configuration at
+    /// every open. `None` reproduces the pre-policy behaviour exactly.
+    policy: Option<Box<dyn FactPolicy>>,
     #[allow(dead_code)]
     config: GraphConfig,
 }
@@ -96,6 +103,7 @@ impl TemporalGraph {
         let index = SemanticIndex::open(&path.join("index"), &config)?;
         topology.configure(&config)?;
         let mut graph = TemporalGraph {
+            policy: None,
             topology,
             index,
             embedder,
@@ -120,11 +128,32 @@ impl TemporalGraph {
         topology.configure(&config)?;
         let index = SemanticIndex::open_in_memory(&config)?;
         Ok(TemporalGraph {
+            policy: None,
             topology,
             index,
             embedder,
             config,
         })
+    }
+
+    // -- admission policy ---------------------------------------------------
+
+    /// Install (or clear) the write-time admission policy.
+    ///
+    /// While a policy is installed, every entity upsert and every fact write is offered to it
+    /// first and refused with [`GraphError::PolicyViolation`] if it says no. A refusal writes no
+    /// SQL and leaves the semantic index untouched. Pass `None` to remove the policy.
+    ///
+    /// Installing a policy is **not** retroactive: rows already stored are never re-examined,
+    /// and a later legal retype does not re-check facts already incident to the entity. See
+    /// [`Schema`](crate::Schema) for why.
+    pub fn set_fact_policy(&mut self, policy: Option<Box<dyn FactPolicy>>) {
+        self.policy = policy;
+    }
+
+    /// Whether an admission policy is currently installed.
+    pub fn has_fact_policy(&self) -> bool {
+        self.policy.is_some()
     }
 
     // -- episodes -----------------------------------------------------------
@@ -243,8 +272,10 @@ impl TemporalGraph {
             return Err(GraphError::InvalidArgument("entity id is required".into()));
         }
         let recorded_at = now_ms();
+        // The row is kept, not collapsed to `created_at`: an installed policy is shown the row
+        // this upsert would replace, so a retype can be refused. Costs no extra read.
         let existing = self.topology.get_entity(id)?;
-        let created_at = existing.map(|e| e.created_at).unwrap_or(recorded_at);
+        let created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(recorded_at);
         let entity = Entity {
             id: id.to_string(),
             entity_type: entity_type.to_string(),
@@ -260,6 +291,10 @@ impl TemporalGraph {
                 "upsert_entity needs the graph's embedder; use upsert_entity_vec on a vector-in graph"
                     .into(),
             ));
+        }
+        if let Some(policy) = self.policy.as_deref() {
+            let candidate = EntityCandidate::new(&entity, existing.as_ref(), &self.topology);
+            policy.admit_entity(&candidate)?;
         }
         self.topology.mark_index_dirty()?;
         let result = {
@@ -319,11 +354,9 @@ impl TemporalGraph {
         }
         self.index.validate_vector(embedding)?;
         let recorded_at = now_ms();
-        let created_at = self
-            .topology
-            .get_entity(id)?
-            .map(|e| e.created_at)
-            .unwrap_or(recorded_at);
+        // Split from the chain so the row survives for the policy (see the text-in twin).
+        let existing = self.topology.get_entity(id)?;
+        let created_at = existing.as_ref().map(|e| e.created_at).unwrap_or(recorded_at);
         let entity = Entity {
             id: id.to_string(),
             entity_type: entity_type.to_string(),
@@ -334,6 +367,10 @@ impl TemporalGraph {
             created_at,
             expired_at: None,
         };
+        if let Some(policy) = self.policy.as_deref() {
+            let candidate = EntityCandidate::new(&entity, existing.as_ref(), &self.topology);
+            policy.admit_entity(&candidate)?;
+        }
         self.topology.mark_index_dirty()?;
         let result = {
             let topology = &self.topology;
@@ -564,6 +601,37 @@ impl TemporalGraph {
             expired_at: None,
             reference_time,
         };
+        // Admission, if a policy is installed. Placement is load-bearing in three ways:
+        //
+        //  - AFTER the caller-stable-id no-op branch above, so a retry that writes nothing stays
+        //    a no-op even under a policy tightened since the first write, and the endpoint read
+        //    below does not fire on retries;
+        //  - BEFORE `mark_index_dirty` and `supersede_and_insert_before_commit`, so a refusal
+        //    writes no SQL and leaves the index marker clean;
+        //  - at the facade rather than inside the insert transaction, because a refusal there
+        //    would return through `finish_indexed_mutation`'s error arm, which rebuilds the
+        //    WHOLE index. Refusals are the steady state of an extraction loop, so a full reindex
+        //    per refused triple would be disqualifying.
+        //
+        // The endpoint kinds cost one batched read on the entities primary key, and only while a
+        // policy is installed. A missing endpoint is deliberately not the policy's business: the
+        // insert transaction raises the existing NotFound for that, and short-circuiting here
+        // would change which error a caller sees.
+        if let Some(policy) = self.policy.as_deref() {
+            let rows = self
+                .topology
+                .get_entities(&[fact.src.clone(), fact.dst.clone()])?;
+            // Match by id rather than position: a self-loop's chunked IN returns one row.
+            let src_row = rows.iter().find(|e| e.id == fact.src);
+            let dst_row = rows.iter().find(|e| e.id == fact.dst);
+            if let Some(src_row) = src_row {
+                if let Some(dst_row) = dst_row {
+                    let candidate =
+                        FactCandidate::new(&fact, src_row, dst_row, invalidates, &self.topology);
+                    policy.admit_fact(&candidate)?;
+                }
+            }
+        }
         // Close the superseded priors AND insert the replacement in ONE topology
         // transaction, so a crash can never leave priors closed with no replacement (an
         // event-time validity gap). A prior's event-time end is the new fact's valid_at

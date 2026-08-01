@@ -25,12 +25,21 @@
 //! caller's. It needs only a caller-supplied [`Embedder`] (or precomputed vectors),
 //! mirroring how `lodedb-core` keeps embedding in the binding layer.
 //!
+//! Having no LLM does not mean accepting anything an LLM produces. A [`FactPolicy`] is
+//! consulted at the write boundary and may refuse; [`Schema`] is the one this crate ships,
+//! restoring the edge typing Graphiti expresses as `edge_type_map` and this port originally
+//! dropped. That is a data-integrity constraint of the same kind as the bi-temporal frame — a
+//! policy sees stored rows, never prompts, and calls no model — so it stays on this side of the
+//! line above. A graph with no policy installed behaves exactly as it did before.
+//!
 //! See `docs/temporal-graph.md` for the full design.
 
 mod error;
 mod graph;
 mod index;
 mod model;
+mod policy;
+mod schema;
 mod search;
 mod temporal;
 mod topology;
@@ -42,6 +51,13 @@ pub use model::{
     AsOf, Direction, EmbedRole, Embedder, Entity, EntityPropertyVersion, Episode, Fact,
     GraphConfig, Subgraph, TimeMs,
 };
+// The admission seam. `FactPolicy` and the candidate types are public because the constraints
+// worth enforcing are caller-specific (a tenant boundary, an id namespace, a cardinality rule);
+// `Schema` is the one this crate ships, restoring the edge typing the Graphiti port dropped.
+pub use policy::{
+    EntityCandidate, FactCandidate, FactPolicy, PolicyRejection, PolicyResult,
+};
+pub use schema::{KindDef, RelationDef, Schema, SchemaDef};
 
 // The reranker primitives (ported from Graphiti's search_utils) are public so the
 // bindings and advanced callers can compose custom search pipelines.
