@@ -5,6 +5,18 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The cloud client's serving verbs (search, search-many, document add,
+  remove, browse, recall, context-block, stored text reads, write status,
+  serving stats, memory delete) moved from `/v1/...` to `/v1/data/...`,
+  the data-plane prefix the hosted ingress routes to its dedicated query
+  tier. Requires a server that mounts `/v1/data`; servers keep the old
+  `/v1` paths as an alias, so older clients are unaffected. Control-plane
+  calls (auth, tokens, tenancy, push/pull, lifecycle) are unchanged.
+
 ## [2.0.5] - 2026-08-01
 
 ### Added
