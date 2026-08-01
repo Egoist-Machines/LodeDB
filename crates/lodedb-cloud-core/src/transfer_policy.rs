@@ -16,6 +16,7 @@
 //! remote generation genuinely has no text and a restore of it cannot resurrect
 //! text that was never uploaded.
 
+use crate::error::{ArtifactStoreError, Result};
 use serde_json::Value;
 
 /// Whether a transfer ships the payload-bearing text and lexical stores.
@@ -71,6 +72,34 @@ impl TransferPolicy {
             }
         }
         body
+    }
+
+    /// Refuses a body this policy cannot honestly redact.
+    ///
+    /// A text-bearing LodeGraph topology (`gtopotext`) carries its user text
+    /// INSIDE its single SQLite artifact, so nulling the sub-manifest cannot
+    /// redact it the way nulling `tvtext` redacts a vector store: the result
+    /// would pin no graph store at all, a silent non-backup whose store kind
+    /// flips to vector. A text-excluding policy therefore refuses the
+    /// transfer outright rather than shipping user text without the opt-in
+    /// (the server takes the same stance, gating the artifact on `read:text`
+    /// instead of serving a stripped copy). Opting into text ships the body
+    /// verbatim. The content-free `gtopo` topology carries no text and never
+    /// refuses.
+    pub fn refuse_unredactable(&self, body: &Value) -> Result<()> {
+        if !self.include_text
+            && body
+                .get("gtopotext")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(ArtifactStoreError::Backend(
+                "this generation's LodeGraph topology embeds user text (gtopotext), which \
+                 cannot be redacted out of its single SQLite artifact; re-run with the \
+                 text opt-in (include_text / --include-text) to transfer it verbatim"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

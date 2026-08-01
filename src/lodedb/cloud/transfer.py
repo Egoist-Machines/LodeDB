@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -46,6 +47,18 @@ class CloudError(RuntimeError):
         self.status_code = status_code
         self.detail = detail
         self.retry_after = retry_after
+
+    @property
+    def code(self) -> str | None:
+        """The server's refusal code, when the detail carries one. OreCloud
+        names each deliberately actionable refusal as the first token of
+        `detail` ("segment_object_missing: the uploaded segment ..."), so a
+        client can branch on the code without matching prose. None for an
+        uncoded refusal."""
+        token, sep, _ = self.detail.partition(":")
+        if sep and re.fullmatch(r"[a-z][a-z0-9_]*", token):
+            return token
+        return None
 
 
 def _store_hint(org: str, environment: str, store: object) -> str | None:
@@ -637,6 +650,15 @@ _ENGINE_KIND_TO_WIRE = {
     "tvlex": "lexical",
     "tvann": "vector",
     "tvvf": "vector",
+    # LodeGraph topology sidecars (mutually exclusive; one per graph store):
+    # `gtopo` is a content-free episode-anchor topology (ids, timestamps,
+    # mention links; no user text), the non-payload `graph` kind the server
+    # serves under read:search; `gtopotext` embeds user text (labels, fact
+    # strings, episode bodies) and obeys every read:text / not-publishable
+    # gate exactly as a vector store's tvtext does. Must match the server's
+    # STORE_KINDS in orecloud's control/manifest.py.
+    "gtopo": "graph",
+    "gtopotext": "text",
 }
 
 
@@ -754,12 +776,30 @@ def _push_with_plan(
     host: str,
     head: dict,
     plan: dict,
+    *,
+    include_text: bool = False,
 ) -> dict:
     """The push protocol against an already-classified head: begin (CAS-armed
     with that head), upload, commit, record the sidecar base."""
     local = plan["local"]
     if local is None:
         raise CloudError(404, f"no committed generation to push for index key {key!r}")
+    if not include_text and any(
+        artifact["kind"] == "gtopotext" for artifact in local["artifacts"]
+    ):
+        # A text-bearing LodeGraph topology carries its user text inside its
+        # single SQLite artifact, so redaction cannot null it the way it nulls
+        # tvtext; without the text opt-in the push refuses rather than ship
+        # user text under the redacted-by-default posture. The Rust core
+        # enforces the same rule for directory targets
+        # (TransferPolicy::refuse_unredactable).
+        raise CloudError(
+            422,
+            "this generation's LodeGraph topology embeds user text (gtopotext), "
+            "which cannot be redacted out of its single SQLite artifact; re-run "
+            "with the text opt-in (include_text / --include-text) to push it "
+            "verbatim",
+        )
     identity = remote.identity(host)
     expected_head = head["head"]["snapshot_id"] if head.get("head") else None
 
@@ -847,7 +887,9 @@ def managed_push(
         client, dir, key, remote, host,
         include_text=include_text, include_lexical=include_lexical,
     )
-    return _push_with_plan(client, dir, key, remote, host, head, plan)
+    return _push_with_plan(
+        client, dir, key, remote, host, head, plan, include_text=include_text
+    )
 
 
 def _pull_with_body(
@@ -993,7 +1035,9 @@ def managed_sync(
         sync-level conflict, not a generic refusal. Re-running the sync
         re-classifies against the new head and usually resolves it."""
         try:
-            return _push_with_plan(client, dir, key, remote, host, head, plan)
+            return _push_with_plan(
+                client, dir, key, remote, host, head, plan, include_text=include_text
+            )
         except CloudError as error:
             if error.status_code == 409 and "pointer conflict" in error.detail:
                 raise SyncConflictError(

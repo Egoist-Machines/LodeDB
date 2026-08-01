@@ -234,9 +234,14 @@ def test_engine_kind_wire_map_covers_every_pushable_kind():
     every kind the local inventory can emit must be mapped."""
     from lodedb.cloud.transfer import _ENGINE_KIND_TO_WIRE, CloudError, _wire_kind
 
-    for kind in ("json", "tvim", "tvtext", "tvlex", "tvmv", "tvann", "tvvf"):
+    for kind in ("json", "tvim", "tvtext", "tvlex", "tvmv", "tvann", "tvvf", "gtopo", "gtopotext"):
         assert kind in _ENGINE_KIND_TO_WIRE, kind
     for vector_kind in ("tvim", "tvann", "tvvf"):
         assert _ENGINE_KIND_TO_WIRE[vector_kind] == "vector"
+    # The LodeGraph sidecars, matching the server's manifest walk exactly: the
+    # content-free topology is the non-payload "graph" kind; a text-bearing
+    # topology is "text" payload, gated like a vector store's tvtext.
+    assert _ENGINE_KIND_TO_WIRE["gtopo"] == "graph"
+    assert _ENGINE_KIND_TO_WIRE["gtopotext"] == "text"
     with pytest.raises(CloudError, match="tvfuture"):
         _wire_kind("tvfuture")
