@@ -248,8 +248,13 @@ pub(crate) fn materialize_graph_engine_copy(
         })?;
     let source = crate::paths::resolve_within(dir, &dir.join(&artifact.name))?;
     let file_name = crate::generation_inventory::graph_topology_file_name(body, kind)?;
-    let target = dir.join(&file_name);
-    let scratch = dir.join(format!(".{file_name}.restore-tmp"));
+    // The DESTINATION is confined too, not just the source: the file name is
+    // body-controlled, and `ensure_plain_file_name` alone does not reject a
+    // Windows drive-relative spelling (`C:foo`), which `Path::join` would let
+    // REPLACE the store root. `resolve_within` fails any such escape closed.
+    let target = crate::paths::resolve_within(dir, &dir.join(&file_name))?;
+    let scratch =
+        crate::paths::resolve_within(dir, &dir.join(format!(".{file_name}.restore-tmp")))?;
     std::fs::copy(&source, &scratch)?;
     std::fs::rename(&scratch, &target)?;
     Ok(())

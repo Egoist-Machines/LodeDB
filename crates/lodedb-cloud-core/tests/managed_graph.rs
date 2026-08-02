@@ -243,3 +243,63 @@ fn repeat_materialise_is_idempotent() {
         );
     }
 }
+
+#[test]
+fn a_body_recorded_absolute_file_name_is_refused() {
+    let scratch = tempfile::tempdir().unwrap();
+    let topology = topology_bytes(scratch.path());
+    let mut body = sidecar_graph_body("gtopo", &topology, 1);
+    body["gtopo"]["base"]["file_name"] = json!("/tmp/evil-topology.sqlite3");
+
+    let fresh = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    stage_blob(staging.path(), &topology);
+    let err = managed_materialize(
+        dir_str(fresh.path()),
+        KEY,
+        REMOTE,
+        body,
+        dir_str(staging.path()),
+        false,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("file name"),
+        "unexpected error: {err}"
+    );
+    assert!(!Path::new("/tmp/evil-topology.sqlite3").exists());
+    assert!(!fresh.path().join(format!("{KEY}.commit.json")).exists());
+}
+
+/// `Path::join` on Windows lets a drive-relative spelling (`C:foo`) REPLACE
+/// the joined root, which `ensure_plain_file_name` alone does not reject; the
+/// engine-copy destination is therefore confined with `resolve_within` too.
+/// The spelling is only dangerous on Windows, so the pin is platform-gated.
+#[cfg(windows)]
+#[test]
+fn a_windows_drive_relative_file_name_cannot_escape_the_store_root() {
+    let scratch = tempfile::tempdir().unwrap();
+    let topology = topology_bytes(scratch.path());
+    let mut body = sidecar_graph_body("gtopo", &topology, 1);
+    body["gtopo"]["base"]["file_name"] = json!("C:evil-topology.sqlite3");
+
+    let fresh = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    stage_blob(staging.path(), &topology);
+    let err = managed_materialize(
+        dir_str(fresh.path()),
+        KEY,
+        REMOTE,
+        body,
+        dir_str(staging.path()),
+        false,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("escapes store root") || err.to_string().contains("file name"),
+        "unexpected error: {err}"
+    );
+    assert!(!fresh.path().join(format!("{KEY}.commit.json")).exists());
+}
