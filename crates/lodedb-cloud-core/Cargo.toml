@@ -15,6 +15,11 @@ publish = false
 # dep now that both live in this workspace — engine changes and the transfer
 # plane move together under one suite.
 lodedb-core = { path = "../lodedb-core" }
+# The graph engine's topology verifier: a restored LodeGraph generation is
+# accepted by proving its transferred topology opens read-only (SQLite
+# quick_check + the episodes table), the graph analogue of the vector
+# engine's verify-open. Nothing else of the graph engine is linked here.
+lodedb-graph = { path = "../lodedb-graph" }
 # Object-storage backend (S3/GCS/Azure) behind the same ArtifactStore trait. The
 # `aws` feature adds the S3 builder; the crate's conditional-put API (Create /
 # Update{e_tag}) is what makes the root-pointer compare-and-swap strongly

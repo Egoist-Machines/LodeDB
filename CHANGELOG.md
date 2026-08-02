@@ -5,6 +5,23 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Managed pull and sync can now MATERIALISE a LodeGraph store, not just
+  classify it (#112). Production graph bodies are sidecar-only (the topology
+  sub-manifest plus scalar fields, no `json` state-journal base), and 2.0.5's
+  restore path still demanded a state journal, so `managed_pull` of a graph
+  store failed closed with `CorruptStore`. Restores now recognise a graph
+  body: the acceptance check judges the transferred topology through the
+  graph engine's own read-only verify (SQLite `quick_check` plus the
+  `episodes` table; the vector engine's state-journal open never runs), and
+  the engine-facing `topology.sqlite3` copy is materialised from the
+  content-addressed artifact as a real byte copy, atomically, before the
+  pointer swap. A checksum-consistent blob that is not a healthy topology
+  still fails the pull with the destination untouched.
+
 ## [2.0.5] - 2026-08-01
 
 ### Added

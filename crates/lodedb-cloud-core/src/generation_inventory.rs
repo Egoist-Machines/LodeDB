@@ -84,6 +84,36 @@ fn is_graph_kind(kind: &str) -> bool {
     GRAPH_STORE_KINDS.contains(&kind)
 }
 
+/// The engine-facing file name a graph topology restores under when the body
+/// records none. Matches the graph engine's fixed on-disk name.
+pub(crate) const GRAPH_TOPOLOGY_DEFAULT_NAME: &str = "topology.sqlite3";
+
+/// The graph sidecar kind a body pins, or `None` for a non-graph body.
+///
+/// The inventory walk enforces mutual exclusivity, so at most one of the two
+/// keys is non-null on any body this crate accepts.
+pub(crate) fn body_graph_kind(body: &Value) -> Option<&'static str> {
+    GRAPH_STORE_KINDS.iter().copied().find(|kind| {
+        body.get(*kind)
+            .map(|value| !value.is_null())
+            .unwrap_or(false)
+    })
+}
+
+/// The engine-facing topology file name a graph body records, validated as a
+/// plain path component (the walk validates it too when present; restores
+/// re-check because they JOIN it onto the store root).
+pub(crate) fn graph_topology_file_name(body: &Value, kind: &str) -> Result<String> {
+    let recorded = body
+        .get(kind)
+        .and_then(|sub| sub.get("base"))
+        .and_then(|base| base.get("file_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(GRAPH_TOPOLOGY_DEFAULT_NAME);
+    ensure_plain_file_name(kind, recorded)?;
+    Ok(recorded.to_string())
+}
+
 /// One artifact (a base or a delta segment) referenced by a committed generation.
 ///
 /// `name` is the store-relative path (e.g. `idx.gen/g7.json`); `kind` is the
@@ -383,7 +413,10 @@ fn refs_for_store(
                 ensure_plain_file_name(kind, recorded)?;
             }
         }
-        (base_epoch, format!("{}.{kind}", checked_sha256(kind, base)?))
+        (
+            base_epoch,
+            format!("{}.{kind}", checked_sha256(kind, base)?),
+        )
     } else {
         let (epoch, derived) = if kind == "tvvf" {
             let vf_epoch = sub_manifest
@@ -511,7 +544,6 @@ pub(crate) fn write_restored_journal_manifests(
     }
     Ok(())
 }
-
 
 /// Reads and validates an artifact digest from a manifest entry.
 ///
