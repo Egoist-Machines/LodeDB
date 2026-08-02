@@ -42,6 +42,7 @@ pub use model::{
     AsOf, Direction, EmbedRole, Embedder, Entity, EntityPropertyVersion, Episode, Fact,
     GraphConfig, Subgraph, TimeMs,
 };
+pub use topology::verify_topology_read_only;
 
 // The reranker primitives (ported from Graphiti's search_utils) are public so the
 // bindings and advanced callers can compose custom search pipelines.

@@ -426,6 +426,13 @@ pub fn managed_materialize(
     // moves (the scratch carries its own journal manifests, so the real
     // destination stays untouched until the swap).
     let open = verify_candidate_opens(Path::new(dir), index_key, &staged.source_body)?;
+    // Graph bodies: land the engine-facing topology copy BEFORE the pointer
+    // swap (see the helper's ordering note).
+    crate::client_ops::materialize_graph_engine_copy(
+        Path::new(dir),
+        index_key,
+        &staged.source_body,
+    )?;
     let (transfer, restored) = publish_staged(&local_store, index_key, staged)?;
     if discard_pending_wal {
         lodedb_core::storage::wal::truncate(

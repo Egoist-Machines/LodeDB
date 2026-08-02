@@ -24,8 +24,8 @@ use crate::generation_inventory::{
     inventory_from_body, list_index_keys, write_restored_journal_manifests,
 };
 use crate::manifest_transfer::{
-    export_generation_pinned, export_generation_with_body, publish_staged,
-    stage_generation_pinned, TransferResult,
+    export_generation_pinned, export_generation_with_body, publish_staged, stage_generation_pinned,
+    TransferResult,
 };
 use crate::snapshot_identity::{logical_id, snapshot_id};
 use crate::status::{compare_generations, StatusReport};
@@ -145,13 +145,7 @@ pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
     })?;
     let dest_body = dest.read_pointer(index_key)?;
     let (transfer, open, restored) = restore_staged(
-        &*source,
-        &*dest,
-        dir,
-        index_key,
-        source_raw,
-        dest_body,
-        false,
+        &*source, &*dest, dir, index_key, source_raw, dest_body, false,
     )?;
     record_base(dir, remote, index_key, &restored)?;
     Ok(PullOutcome { transfer, open })
@@ -197,6 +191,7 @@ fn restore_staged(
     // never become the committed destination. (The scratch carries its own
     // journal manifests, so the real destination stays untouched.)
     let open = verify_candidate_opens(Path::new(dir), index_key, &staged.source_body)?;
+    materialize_graph_engine_copy(Path::new(dir), index_key, &staged.source_body)?;
     let (transfer, restored) = publish_staged(dest, index_key, staged)?;
     if discard_wal {
         lodedb_core::storage::wal::truncate(&contained_wal_path(dir, index_key)?, false)?;
@@ -214,6 +209,55 @@ fn restore_staged(
 /// of a local restore.
 fn acquire_writer_lock(dir: &str) -> Result<lodedb_core::engine::DirWriterLock> {
     lodedb_core::engine::acquire_dir_writer_lock(Path::new(dir)).map_err(ArtifactStoreError::Core)
+}
+
+/// Materialises the engine-facing topology file for a restored LodeGraph
+/// generation; a no-op for every other body.
+///
+/// The transfer layout addresses a graph topology BY CONTENT
+/// (`<key>.gen/<sha256>.<kind>`), but the graph engine opens the store
+/// through the body-recorded file name (`topology.sqlite3`) at the store
+/// root and mutates it in place. The engine copy is therefore a REAL byte
+/// copy, never a hardlink (an in-place mutation through a link would corrupt
+/// the immutable content-addressed artifact), written atomically via a
+/// scratch-and-rename.
+///
+/// Ordered BEFORE the pointer swap deliberately: the graph engine reads the
+/// topology directly rather than through the pointer, so a swap must never
+/// publish a generation whose engine copy could still be missing or stale. A
+/// crash after this copy but before the swap self-heals: the retry re-copies
+/// identical bytes and re-attempts the swap.
+pub(crate) fn materialize_graph_engine_copy(
+    dir: &Path,
+    index_key: &str,
+    body: &Value,
+) -> Result<()> {
+    let Some(kind) = crate::generation_inventory::body_graph_kind(body) else {
+        return Ok(());
+    };
+    let inventory = crate::generation_inventory::inventory_from_body(index_key, Some(body))?
+        .expect("inventory is Some when the body is Some");
+    let artifact = inventory
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == kind)
+        .ok_or_else(|| {
+            ArtifactStoreError::Integrity(format!(
+                "graph body pins {kind} but its inventory names no {kind} artifact"
+            ))
+        })?;
+    let source = crate::paths::resolve_within(dir, &dir.join(&artifact.name))?;
+    let file_name = crate::generation_inventory::graph_topology_file_name(body, kind)?;
+    // The DESTINATION is confined too, not just the source: the file name is
+    // body-controlled, and `ensure_plain_file_name` alone does not reject a
+    // Windows drive-relative spelling (`C:foo`), which `Path::join` would let
+    // REPLACE the store root. `resolve_within` fails any such escape closed.
+    let target = crate::paths::resolve_within(dir, &dir.join(&file_name))?;
+    let scratch =
+        crate::paths::resolve_within(dir, &dir.join(format!(".{file_name}.restore-tmp")))?;
+    std::fs::copy(&source, &scratch)?;
+    std::fs::rename(&scratch, &target)?;
+    Ok(())
 }
 
 /// Refuses a restore when the destination WAL still holds acknowledged
