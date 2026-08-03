@@ -19,6 +19,7 @@
 use crate::artifact_store::ArtifactStore;
 use crate::error::Result;
 use crate::generation_inventory::{diff_inventories, inventory_from_body, GenerationInventory};
+use crate::snapshot_identity::redacted_body_matches_remote_head;
 use crate::transfer_policy::TransferPolicy;
 
 /// Metrics-only comparison of a local and a remote committed generation.
@@ -76,11 +77,14 @@ pub fn status_for_push(
     let local = inventory_from_body(index_key, local_body.as_ref())?;
     let remote_body = dest.read_pointer(index_key)?;
     let remote = inventory_from_body(index_key, remote_body.as_ref())?;
-    Ok(compare_generations(
-        index_key,
-        local.as_ref(),
-        remote.as_ref(),
-    ))
+    let mut report = compare_generations(index_key, local.as_ref(), remote.as_ref());
+    if !report.in_sync {
+        if let (Some(local), Some(remote)) = (local.as_ref(), remote.as_ref()) {
+            report.in_sync =
+                redacted_body_matches_remote_head(&local.root_body, &remote.root_body)?;
+        }
+    }
+    Ok(report)
 }
 
 /// Compares `local` against `remote` for a push (local -> remote).

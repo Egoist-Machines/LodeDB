@@ -803,10 +803,18 @@ def _push_with_plan(
     identity = remote.identity(host)
     expected_head = head["head"]["snapshot_id"] if head.get("head") else None
 
-    if expected_head == local["snapshot_id"]:
-        # The remote already holds exactly this snapshot: record the agreed
-        # base and publish nothing.
-        _core.managed_record_base(dir, key, identity, local["body_json"])
+    local_is_fully_redacted = local["snapshot_id"] == local["logical_id"]
+    head_matches_local = expected_head == local["snapshot_id"] or (
+        local_is_fully_redacted and expected_head == local.get("legacy_redacted_id")
+    )
+    if head_matches_local:
+        # A remote may hold the old null-inserting form of this fully-redacted
+        # body. It is converged too; preserve the actual head as the sidecar
+        # base instead of republishing merely to change its identity.
+        agreed_body = (
+            json.dumps(head["body"]) if head.get("body") is not None else local["body_json"]
+        )
+        _core.managed_record_base(dir, key, identity, agreed_body)
         return {
             "index_key": key,
             "generation": local["generation"],

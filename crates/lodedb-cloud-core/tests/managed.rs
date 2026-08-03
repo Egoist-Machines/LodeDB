@@ -9,6 +9,7 @@ use lodedb_cloud_core::{
     managed_materialize, managed_plan, managed_pull_requirements, managed_record_base, snapshot_id,
     ArtifactStore, ArtifactStoreError, TransferPolicy,
 };
+use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
@@ -62,6 +63,56 @@ fn plan_for_a_fresh_local_generation_is_local_ahead_with_full_inventory() {
     assert_eq!(document.get("body").unwrap(), &local_part.body);
     assert!(plan.remote.is_none());
     assert!(plan.base.is_none());
+}
+
+#[test]
+fn plan_treats_a_legacy_redacted_keyless_head_as_in_sync_without_a_sidecar() {
+    // Older clients inserted null payload-store keys while redacting this
+    // otherwise keyless LodeGraph body. A fresh checkout must recognise that
+    // legacy remote shape as the same redacted commit, rather than refusing
+    // sync because it has no trusted sidecar yet.
+    let local = tempfile::tempdir().unwrap();
+    let keyless = json!({
+        "index_key": KEY,
+        "generation": 1,
+        "base_epoch": 1,
+        "gtopo": {
+            "base": {
+                "file_name": "topology.sqlite3",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "file_bytes": 0,
+            },
+            "deltas": [],
+        },
+    });
+    lodedb_core::storage::commit_manifest::write_commit_manifest(
+        &lodedb_core::storage::commit_manifest::commit_manifest_path(local.path(), KEY),
+        &keyless,
+        false,
+    )
+    .unwrap();
+
+    let mut legacy_head = keyless.clone();
+    legacy_head["tvtext"] = Value::Null;
+    legacy_head["tvlex"] = Value::Null;
+
+    let plan = managed_plan(
+        dir_str(local.path()),
+        KEY,
+        REMOTE,
+        Some(legacy_head),
+        TransferPolicy::redacted(),
+    )
+    .unwrap();
+
+    assert!(
+        plan.base.is_none(),
+        "the scenario must have no trusted sidecar"
+    );
+    assert_eq!(plan.report.classification.as_deref(), Some("in_sync"));
+    assert!(plan.report.in_sync, "a compatible push must be a no-op");
+    let local = plan.local.expect("the local generation is present");
+    assert_ne!(local.side.snapshot_id, local.legacy_redacted_id);
 }
 
 #[test]

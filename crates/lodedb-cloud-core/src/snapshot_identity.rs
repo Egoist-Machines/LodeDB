@@ -70,3 +70,44 @@ pub fn snapshot_id(body: &Value) -> Result<String> {
 pub fn logical_id(body: &Value) -> Result<String> {
     snapshot_id(&TransferPolicy::redacted().redact_body(body))
 }
+
+/// Returns the redacted identity older clients produced by inserting null
+/// payload-store keys even when the original body omitted them.
+///
+/// This is a compatibility candidate only. New identities continue to use
+/// [`logical_id`], whose redaction preserves absent keys.
+pub(crate) fn legacy_redacted_id(body: &Value) -> Result<String> {
+    let mut redacted = TransferPolicy::redacted().redact_body(body);
+    if let Some(object) = redacted.as_object_mut() {
+        object.entry("tvtext").or_insert(Value::Null);
+        object.entry("tvlex").or_insert(Value::Null);
+    }
+    snapshot_id(&redacted)
+}
+
+/// Whether `remote_body` is either historical redacted representation of
+/// `local_body`: the current key-preserving shape or the old null-inserting
+/// shape.
+///
+/// Unlike [`logical_id`], this is never persisted as an identity. It exists
+/// only while comparing a local redacted view against a remote head published
+/// by an older client.
+pub(crate) fn redacted_identity_matches_remote_head(
+    local_body: &Value,
+    remote_body: &Value,
+) -> Result<bool> {
+    let remote_id = snapshot_id(remote_body)?;
+    Ok(remote_id == logical_id(local_body)? || remote_id == legacy_redacted_id(local_body)?)
+}
+
+/// Whether two bodies are interchangeable as already-published redacted
+/// heads. The local body itself must be fully redacted; otherwise a full or
+/// partially redacted local body still needs a republish to retain its
+/// payload stores.
+pub(crate) fn redacted_body_matches_remote_head(
+    local_body: &Value,
+    remote_body: &Value,
+) -> Result<bool> {
+    Ok(snapshot_id(local_body)? == logical_id(local_body)?
+        && redacted_identity_matches_remote_head(local_body, remote_body)?)
+}

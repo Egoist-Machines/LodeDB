@@ -4,10 +4,12 @@
 
 mod common;
 
-use common::commit_engine_generation;
-use object_store::memory::InMemory;
+use common::{commit_engine_generation, store_sub};
 use lodedb_cloud_core::client_ops::{status, sync, SyncForce};
 use lodedb_cloud_core::{ArtifactStore, ArtifactStoreError, ObjectArtifactStore, TransferPolicy};
+use lodedb_core::storage::commit_manifest::{commit_manifest_path, write_commit_manifest};
+use object_store::memory::InMemory;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,6 +24,86 @@ fn run_sync(dir: &Path, remote: &Path, force: SyncForce) -> lodedb_cloud_core::S
         force,
     )
     .unwrap()
+}
+
+/// Writes a body that genuinely omits both optional payload-store keys, unlike
+/// the legacy redacted shape that inserted them as nulls.
+fn write_keyless_generation(dir: &Path, generation: u64, bytes: &[u8]) -> Value {
+    let json = store_sub(
+        dir,
+        KEY,
+        &format!("g{generation}.json"),
+        bytes,
+        ".json-delta",
+        &[],
+    );
+    let body = json!({
+        "index_key": KEY,
+        "generation": generation,
+        "base_epoch": generation,
+        "document_count": 0,
+        "chunk_count": 0,
+        "json": json,
+    });
+    write_commit_manifest(&commit_manifest_path(dir, KEY), &body, false).unwrap();
+    body
+}
+
+#[test]
+fn legacy_keyless_head_converges_without_republish_then_a_change_pushes() {
+    let local = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let keyless = write_keyless_generation(local.path(), 1, b"original");
+
+    // The remote has the exact same data and artifact, but its old client
+    // inserted absent payload-store keys during redaction.
+    let remote_json = store_sub(
+        remote.path(),
+        KEY,
+        "g1.json",
+        b"original",
+        ".json-delta",
+        &[],
+    );
+    assert_eq!(remote_json, keyless["json"]);
+    let mut legacy_head = keyless.clone();
+    legacy_head["tvtext"] = Value::Null;
+    legacy_head["tvlex"] = Value::Null;
+    write_commit_manifest(
+        &commit_manifest_path(remote.path(), KEY),
+        &legacy_head,
+        false,
+    )
+    .unwrap();
+
+    // A fresh local checkout has no trusted sidecar, but equivalent redacted
+    // identities still converge and leave the legacy head untouched.
+    let outcome = run_sync(local.path(), remote.path(), SyncForce::None);
+    assert_eq!(
+        (outcome.classification.as_str(), outcome.action.as_str()),
+        ("in_sync", "none")
+    );
+    let remote_store = lodedb_cloud_core::LocalArtifactStore::new(remote.path(), false);
+    assert_eq!(remote_store.read_pointer(KEY).unwrap(), Some(legacy_head));
+
+    // Once the keyless local body actually changes, its legacy candidate no
+    // longer matches the head. The sidecar recorded above supplies ancestry,
+    // so this is an ordinary fast-forward push, not a false no-op.
+    let changed = write_keyless_generation(local.path(), 2, b"changed");
+    let report = status(
+        local.path().to_str().unwrap(),
+        remote.path().to_str().unwrap(),
+        KEY,
+        TransferPolicy::redacted(),
+    )
+    .unwrap();
+    assert_eq!(report.classification.as_deref(), Some("local_ahead"));
+    let outcome = run_sync(local.path(), remote.path(), SyncForce::None);
+    assert_eq!(
+        (outcome.classification.as_str(), outcome.action.as_str()),
+        ("local_ahead", "push")
+    );
+    assert_eq!(remote_store.read_pointer(KEY).unwrap(), Some(changed));
 }
 
 #[test]
