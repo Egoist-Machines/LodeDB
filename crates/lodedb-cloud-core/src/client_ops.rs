@@ -27,10 +27,10 @@ use crate::manifest_transfer::{
     export_generation_pinned, export_generation_with_body, publish_staged, stage_generation_pinned,
     TransferResult,
 };
-use crate::snapshot_identity::{logical_id, snapshot_id};
+use crate::snapshot_identity::{logical_id, redacted_body_matches_remote_head, snapshot_id};
 use crate::status::{compare_generations, StatusReport};
 use crate::store_target::artifact_store_from_target;
-use crate::sync_plan::{classify, SnapRef, SyncClassification};
+use crate::sync_plan::{classify_redacted_local_body, SnapRef, SyncClassification};
 use crate::sync_state::{read_sync_state, write_sync_state, SidecarRead, SyncState};
 use crate::transfer_policy::TransferPolicy;
 use crate::verify::{verify_candidate_opens, verify_generation, OpenReport, VerifyReport};
@@ -330,8 +330,19 @@ pub fn status(
     report.base_generation = base.map(|base| base.generation);
     let local_ref = local_body.as_ref().map(snap_ref).transpose()?;
     let remote_ref = remote_body.as_ref().map(snap_ref).transpose()?;
-    let classification = classify(local_ref.as_ref(), base, remote_ref.as_ref());
+    let classification = classify_redacted_local_body(
+        local_body.as_ref(),
+        local_ref.as_ref(),
+        base,
+        remote_body.as_ref(),
+        remote_ref.as_ref(),
+    )?;
     report.classification = Some(classification.as_str().to_string());
+    if !report.in_sync {
+        if let (Some(local_body), Some(remote_body)) = (&local_body, &remote_body) {
+            report.in_sync = redacted_body_matches_remote_head(local_body, remote_body)?;
+        }
+    }
     Ok(report)
 }
 
@@ -395,7 +406,13 @@ pub fn sync(
     let remote_body = remote_store.read_pointer(index_key)?;
     let local_ref = local_body.as_ref().map(snap_ref).transpose()?;
     let remote_ref = remote_body.as_ref().map(snap_ref).transpose()?;
-    let classification = classify(local_ref.as_ref(), base, remote_ref.as_ref());
+    let classification = classify_redacted_local_body(
+        local_body.as_ref(),
+        local_ref.as_ref(),
+        base,
+        remote_body.as_ref(),
+        remote_ref.as_ref(),
+    )?;
     let had_trusted_base = base.is_some();
 
     let outcome = |action: &str,

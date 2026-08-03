@@ -18,6 +18,10 @@
 //!
 //! [`Unknown`]: SyncClassification::Unknown
 
+use crate::error::Result;
+use crate::snapshot_identity::redacted_identity_matches_remote_head;
+use serde_json::Value;
+
 /// One side's identity: which exact bytes ([`snapshot_id`]), which engine
 /// commit regardless of redaction ([`logical_id`]), the committed generation
 /// number (monotonicity check only), and a per-store identity for each
@@ -222,4 +226,30 @@ pub fn classify(
         // conservative answer for completeness.
         (true, true) => SyncClassification::InSync,
     }
+}
+
+/// Classifies with the compatibility equivalence for a local redacted body
+/// facing a remote head published by an older null-inserting client.
+///
+/// The alternate identity is used only for the local-vs-remote comparison in
+/// this call. The returned or persisted identities remain unchanged, and
+/// sidecar-base comparisons retain their exact historical semantics.
+pub(crate) fn classify_redacted_local_body(
+    local_body: Option<&Value>,
+    local: Option<&SnapRef>,
+    base: Option<&SnapRef>,
+    remote_body: Option<&Value>,
+    remote: Option<&SnapRef>,
+) -> Result<SyncClassification> {
+    let mut local = local.cloned();
+    if let (Some(local_body), Some(local_ref), Some(remote_body), Some(remote_ref)) =
+        (local_body, local.as_mut(), remote_body, remote)
+    {
+        if redacted_identity_matches_remote_head(local_body, remote_body)? {
+            // `classify`'s same-commit branch then still checks payload
+            // inclusion and shared-store identities before declaring a no-op.
+            local_ref.logical_id.clone_from(&remote_ref.logical_id);
+        }
+    }
+    Ok(classify(local.as_ref(), base, remote))
 }

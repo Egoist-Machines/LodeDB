@@ -51,7 +51,7 @@ impl TransferPolicy {
         }
     }
 
-    /// Returns a copy of a committed body with the excluded stores nulled.
+    /// Returns a copy of a committed body with present excluded stores nulled.
     ///
     /// Nulling a top-level store key reproduces exactly what
     /// `build_commit_body` emits for an absent store, and the body checksum is
@@ -65,10 +65,14 @@ impl TransferPolicy {
         let mut body = body.clone();
         if let Some(object) = body.as_object_mut() {
             if !self.include_text {
-                object.insert("tvtext".to_string(), Value::Null);
+                if let Some(entry) = object.get_mut("tvtext") {
+                    *entry = Value::Null;
+                }
             }
             if !self.include_lexical {
-                object.insert("tvlex".to_string(), Value::Null);
+                if let Some(entry) = object.get_mut("tvlex") {
+                    *entry = Value::Null;
+                }
             }
         }
         body
@@ -106,5 +110,72 @@ impl TransferPolicy {
 impl Default for TransferPolicy {
     fn default() -> Self {
         Self::redacted()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransferPolicy;
+    use crate::snapshot_identity::snapshot_id;
+    use lodedb_core::storage::commit_manifest::render_commit_manifest;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn redacts_present_text_and_lexical_stores() {
+        let body = json!({
+            "index_key": "idx",
+            "tvtext": {"base": {"file_name": "g1.tvtext"}, "deltas": []},
+            "tvlex": {"base": {"file_name": "g1.tvlex"}, "deltas": []},
+        });
+
+        let redacted = TransferPolicy::redacted().redact_body(&body);
+
+        assert_eq!(redacted.get("tvtext"), Some(&Value::Null));
+        assert_eq!(redacted.get("tvlex"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn redacting_keyless_graph_body_preserves_canonical_identity_and_serialization() {
+        let body = json!({
+            "index_key": "graph",
+            "generation": 7,
+            "base_epoch": 7,
+            "gtopo": {
+                "base": {
+                    "file_name": "topology.sqlite3",
+                    "sha256": "f2ba8c4a4a2f1b99ee90f6ec66c3b33f",
+                    "file_bytes": 42,
+                },
+                "deltas": [],
+            },
+        });
+
+        let redacted = TransferPolicy::default().redact_body(&body);
+
+        assert_eq!(redacted, body);
+        assert_eq!(
+            redacted.as_object().unwrap().keys().collect::<Vec<_>>(),
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            "redaction must not add absent payload-store keys"
+        );
+        assert_eq!(
+            render_commit_manifest(&redacted).unwrap(),
+            render_commit_manifest(&body).unwrap(),
+            "the engine-canonical serialization must remain byte-identical"
+        );
+        assert_eq!(snapshot_id(&redacted).unwrap(), snapshot_id(&body).unwrap());
+    }
+
+    #[test]
+    fn redacting_text_only_body_does_not_insert_lexical_store() {
+        let body = json!({
+            "index_key": "idx",
+            "tvtext": {"base": {"file_name": "g1.tvtext"}, "deltas": []},
+        });
+
+        let redacted = TransferPolicy::redacted().redact_body(&body);
+
+        assert_eq!(redacted.get("tvtext"), Some(&Value::Null));
+        assert!(redacted.get("tvlex").is_none());
     }
 }
