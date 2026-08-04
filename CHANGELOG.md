@@ -5,6 +5,18 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.9] - 2026-08-04
+
+### Fixed
+
+- `CloudStore.get_texts` completes its by-id exactness pass and the 403
+  text-only fallback through a private single-id read instead of the
+  overridable `get` (#116). A subclass that implements `get` in terms of
+  `get_texts` recursed unboundedly on the first missing id, one browse
+  round trip per cycle, until `RecursionError`; such subclasses now
+  terminate with a bounded number of transport calls. Public behavior is
+  unchanged.
+
 ## [2.0.8] - 2026-08-04
 
 ### Changed
