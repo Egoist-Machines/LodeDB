@@ -285,6 +285,26 @@ class _TextClient:
         return {"id": id, "found": False, "text": None}
 
 
+class _GetViaTextsStore(CloudStore):
+    """Adapter shape that implements the public single-id read through
+    `get_texts`, matching subclasses that rely on the batch verb."""
+
+    def get(self, id: str) -> str | None:
+        """One document's stored raw text through the batch verb."""
+        return self.get_texts([id]).get(str(id))
+
+
+def test_get_texts_exactness_uses_private_get_for_missing_ids():
+    """A subclass overriding `get` through `get_texts` terminates when an
+    id is absent, with one browse and one private text-endpoint read."""
+    client = _TextClient()
+    store = _GetViaTextsStore(client, "acme", "prod", "user-42", owns_client=False)
+
+    assert store.get("missing") is None
+    assert len(client.calls) == 1
+    assert client.text_calls == ["missing"]
+
+
 def test_get_texts_batches_over_the_by_id_browse():
     """get_texts does its bulk work as one by-id browse per hundred ids (not
     one request per id); an id absent from its page is confirmed through the
@@ -303,6 +323,18 @@ def test_get_texts_batches_over_the_by_id_browse():
     assert client.text_calls == ["missing"]  # only the absent id re-confirms
     assert store.get_texts([]) == {}
     assert len(client.calls) == 2  # the empty request made no HTTP call
+
+
+def test_get_texts_mixed_present_and_absent_ids_returns_only_present():
+    """The exactness pass preserves local `get_texts` semantics: present ids
+    are returned and genuinely missing ids are omitted."""
+    client = _TextClient()
+    store = _store(client)
+
+    texts = store.get_texts(["a", "missing", "b"])
+
+    assert texts == {"a": "text-a", "b": "text-b"}
+    assert client.text_calls == ["missing"]
 
 
 def test_get_texts_distrusts_a_plain_page_answer():
@@ -367,6 +399,19 @@ def test_get_texts_falls_back_to_the_text_endpoint_for_text_only_keys():
     failing a previously valid least-privilege call."""
     client = _TextOnlyClient()
     store = _store(client)
+
+    texts = store.get_texts(["a", "missing", "b"])
+
+    assert texts == {"a": "text-a", "b": "text-b"}
+    assert client.browse_calls == 1
+    assert client.text_calls == ["a", "missing", "b"]
+
+
+def test_get_texts_text_only_fallback_uses_private_get_for_overridden_get():
+    """The 403 fallback uses the private single-id read, so an adapter that
+    overrides `get` through `get_texts` still terminates."""
+    client = _TextOnlyClient()
+    store = _GetViaTextsStore(client, "acme", "prod", "user-42", owns_client=False)
 
     texts = store.get_texts(["a", "missing", "b"])
 
