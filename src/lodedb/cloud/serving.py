@@ -521,6 +521,12 @@ class CloudStore:
         """One document's stored raw text by id (None when absent), the
         cloud `db.get(id)`. Requires `read:text` and the store's
         `expose_text` flag."""
+        return self._get_text_by_id(id)
+
+    def _get_text_by_id(self, id: str) -> str | None:
+        """Private single-id text read used by batch reads. `get_texts`
+        must complete its own contract through this private path so a
+        subclass overriding `get` cannot re-enter it (see issue #116)."""
         result = self._empty_if_unprovisioned(
             lambda: self._client.store_text(
                 self.org, self.environment, self.store, id, key=self.key
@@ -572,7 +578,7 @@ class CloudStore:
         # its truncated page left out.
         for id in requested:
             if id not in texts:
-                text = self.get(id)
+                text = self._get_text_by_id(id)
                 if text is not None:
                     texts[id] = text
         return texts
@@ -581,7 +587,7 @@ class CloudStore:
         """The pre-batching shape: one text-endpoint request per id."""
         texts: dict[str, str] = {}
         for id in ids:
-            text = self.get(id)
+            text = self._get_text_by_id(id)
             if text is not None:
                 texts[id] = text
         return texts
