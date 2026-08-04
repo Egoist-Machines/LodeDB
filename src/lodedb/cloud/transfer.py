@@ -440,11 +440,16 @@ class CloudClient:
         )
 
     # ------------------------------------------------------------ serving
+    #
+    # Serving verbs live under /v1/data, the data-plane prefix the hosted
+    # ingress routes to its dedicated query tier. Servers keep the old /v1
+    # paths as an alias for older clients, but this client needs a server
+    # that mounts /v1/data.
 
     def search(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/search",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/search",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -452,7 +457,7 @@ class CloudClient:
     def search_many(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/search-many",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/search-many",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -465,7 +470,7 @@ class CloudClient:
             params["key"] = key
         return self._request(
             "GET",
-            f"/v1/orgs/{org}/environments/{environment}/stores/text",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/text",
             params=params,
             store_hint=_store_hint(org, environment, params.get("store")),
         )
@@ -473,7 +478,7 @@ class CloudClient:
     def add_documents(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/documents",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/documents",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -481,7 +486,7 @@ class CloudClient:
     def remove_documents(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/documents/remove",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/documents/remove",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -489,7 +494,7 @@ class CloudClient:
     def browse_documents(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/documents/browse",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/documents/browse",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -500,7 +505,7 @@ class CloudClient:
         """Non-exact retrieval from raw text (server-side sub-queries + RRF)."""
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/recall",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/recall",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -509,7 +514,7 @@ class CloudClient:
         """A prompt-ready context block from one user's store."""
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/context-block",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/context-block",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -519,7 +524,7 @@ class CloudClient:
         The store row stays; `delete_store` forgets the user entirely."""
         return self._request(
             "POST",
-            f"/v1/orgs/{org}/environments/{environment}/stores/memories/delete",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/memories/delete",
             json=payload,
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
@@ -533,7 +538,7 @@ class CloudClient:
             params["key"] = key
         return self._request(
             "GET",
-            f"/v1/orgs/{org}/environments/{environment}/stores/writes/{write_id}",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/writes/{write_id}",
             params=params,
             store_hint=_store_hint(org, environment, store),
         )
@@ -556,7 +561,7 @@ class CloudClient:
         # and it must land on the same pod the hinted queries will.
         return self._request(
             "GET",
-            f"/v1/orgs/{org}/environments/{environment}/stores/serving-stats",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/serving-stats",
             params=params,
             store_hint=_store_hint(org, environment, store),
         )
