@@ -17,6 +17,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1` paths as an alias, so older clients are unaffected. Control-plane
   calls (auth, tokens, tenancy, push/pull, lifecycle) are unchanged.
 
+## [2.0.7] - 2026-08-03
+
+### Fixed
+
+- `TransferPolicy::redact_body` no longer inserts `tvtext`/`tvlex` null keys
+  into bodies that never carried them (#114). Engine-authored vector bodies
+  always write both keys, so their redacted identity is unchanged; a
+  sidecar-only LodeGraph body now redacts to a byte-identical copy of itself,
+  so a default (redacted) `managed_push` right after a `managed_pull` of an
+  unchanged graph store publishes nothing instead of republishing once with a
+  drifted identity.
+- Cloud sync recognises heads published by older null-inserting clients as
+  converged. Classification, the push no-republish decision, status
+  reporting, and the Python client accept either redacted representation of
+  the same fully redacted body, so a fresh checkout of such a store syncs
+  instead of failing closed with an unknown classification. The legacy
+  identity is a comparison-time candidate only: new identities, published
+  bodies, and sidecar formats are unchanged, and a compatibility no-op
+  records the actual remote head as the sidecar base.
+
+## [2.0.6] - 2026-08-02
+
+### Fixed
+
+- Managed pull and sync can now MATERIALISE a LodeGraph store, not just
+  classify it (#112). Production graph bodies are sidecar-only (the topology
+  sub-manifest plus scalar fields, no `json` state-journal base), and 2.0.5's
+  restore path still demanded a state journal, so `managed_pull` of a graph
+  store failed closed with `CorruptStore`. Restores now recognise a graph
+  body: the acceptance check judges the transferred topology through the
+  graph engine's own read-only verify (SQLite `quick_check` plus the
+  `episodes` table; the vector engine's state-journal open never runs), and
+  the engine-facing `topology.sqlite3` copy is materialised from the
+  content-addressed artifact as a real byte copy, atomically, before the
+  pointer swap. A checksum-consistent blob that is not a healthy topology
+  still fails the pull with the destination untouched.
+
 ## [2.0.5] - 2026-08-01
 
 ### Added

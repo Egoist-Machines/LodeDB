@@ -177,6 +177,56 @@ def test_managed_push_refuses_unredactable_graph_text():
         )
 
 
+def test_managed_push_skips_a_legacy_redacted_keyless_head(monkeypatch):
+    """The Python edge accepts the Rust plan's old null-inserting identity
+    without beginning a replacement publish."""
+    from lodedb.cloud import transfer
+
+    recorded = []
+
+    def record_base(dir, key, identity, body_json):
+        recorded.append((dir, key, identity, body_json))
+
+    monkeypatch.setattr(transfer._core, "managed_record_base", record_base)
+
+    class Client:
+        def begin_push(self, *args, **kwargs):
+            raise AssertionError("a legacy-equivalent head must not be republished")
+
+    remote = transfer.ManagedRemote("acme", "prod", "user-42")
+    legacy_body = {"index_key": "idx", "tvtext": None, "tvlex": None}
+    result = transfer._push_with_plan(
+        Client(),
+        "local-dir",
+        "idx",
+        remote,
+        "https://cloud.test",
+        {"head": {"snapshot_id": "legacy-redacted"}, "body": legacy_body},
+        {
+            "local": {
+                "snapshot_id": "modern-redacted",
+                "logical_id": "modern-redacted",
+                "legacy_redacted_id": "legacy-redacted",
+                "generation": 1,
+                "body_json": '{"index_key":"idx"}',
+                "pointer_document": "{}",
+                "artifacts": [],
+            },
+            "base": None,
+        },
+    )
+
+    assert not result["pointer_published"]
+    assert recorded == [
+        (
+            "local-dir",
+            "idx",
+            remote.identity("https://cloud.test"),
+            '{"index_key": "idx", "tvtext": null, "tvlex": null}',
+        )
+    ]
+
+
 def test_graph_sidecars_are_mutually_exclusive(tmp_path):
     with pytest.raises(RuntimeError, match="mutually exclusive"):
         _pull_requirements(

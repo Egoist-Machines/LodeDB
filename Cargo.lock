@@ -1138,6 +1138,7 @@ dependencies = [
  "bytes",
  "futures",
  "lodedb-core",
+ "lodedb-graph",
  "object_store",
  "serde_json",
  "sha2",

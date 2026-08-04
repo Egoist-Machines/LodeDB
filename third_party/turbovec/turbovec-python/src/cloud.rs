@@ -311,6 +311,7 @@ fn managed_plan<'py>(
             let body_json = serde_json::to_string(&local.body).map_err(|error| {
                 PyRuntimeError::new_err(format!("failed to serialize local body: {error}"))
             })?;
+            local_dict.set_item("legacy_redacted_id", &local.legacy_redacted_id)?;
             local_dict.set_item("body_json", body_json)?;
             local_dict.set_item("pointer_document", &local.pointer_document)?;
             local_dict.set_item("artifacts", artifact_list(py, &local.artifacts)?)?;

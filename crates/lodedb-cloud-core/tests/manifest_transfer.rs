@@ -68,6 +68,45 @@ fn export_is_idempotent() {
 }
 
 #[test]
+fn redacted_export_skips_a_legacy_null_inserting_keyless_head() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let source_json = store_sub(src.path(), "idx", "g1.json", b"state", ".json-delta", &[]);
+    let keyless = json!({
+        "index_key": "idx",
+        "generation": 1,
+        "base_epoch": 1,
+        "json": source_json,
+    });
+    lodedb_core::storage::commit_manifest::write_commit_manifest(
+        &lodedb_core::storage::commit_manifest::commit_manifest_path(src.path(), "idx"),
+        &keyless,
+        false,
+    )
+    .unwrap();
+
+    let remote_json = store_sub(dst.path(), "idx", "g1.json", b"state", ".json-delta", &[]);
+    assert_eq!(remote_json, keyless["json"]);
+    let mut legacy_head = keyless.clone();
+    legacy_head["tvtext"] = Value::Null;
+    legacy_head["tvlex"] = Value::Null;
+    lodedb_core::storage::commit_manifest::write_commit_manifest(
+        &lodedb_core::storage::commit_manifest::commit_manifest_path(dst.path(), "idx"),
+        &legacy_head,
+        false,
+    )
+    .unwrap();
+
+    let source = LocalArtifactStore::new(src.path(), false);
+    let dest = LocalArtifactStore::new(dst.path(), false);
+    let result = export_generation(&source, &dest, "idx", TransferPolicy::redacted()).unwrap();
+
+    assert_eq!(result.artifacts_written, 0);
+    assert!(!result.pointer_published);
+    assert_eq!(dest.read_pointer("idx").unwrap(), Some(legacy_head));
+}
+
+#[test]
 fn export_missing_source_generation_is_not_found() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();

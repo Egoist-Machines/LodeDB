@@ -136,6 +136,38 @@ const FACT_COLS_F: &str = "f.id AS id, f.src AS src, f.relation AS relation, \
      f.expired_at AS expired_at, f.reference_time AS reference_time";
 const EPISODE_COLS: &str = "id, source, body, occurred_at, created_at, properties";
 
+/// Proves `path` holds a healthy topology store WITHOUT writing a byte, and
+/// returns its episode count.
+///
+/// The restore acceptance path calls this on a transferred topology before
+/// any pointer moves. [`TopologyStore::open`] is unsuitable there: it applies
+/// the schema and pragmas, so pointing it at a foreign or corrupt database
+/// would mutate the very artifact the check is supposed to judge. This opens
+/// strictly read-only, runs SQLite's `quick_check`, and requires the
+/// `episodes` table to answer, so a checksum-consistent blob that is not a
+/// LodeGraph topology (or not SQLite at all) fails closed.
+pub fn verify_topology_read_only(path: &Path) -> Result<u64> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let verdict: String = conn.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if verdict != "ok" {
+        return Err(GraphError::Topology(format!(
+            "topology failed SQLite quick_check: {verdict}"
+        )));
+    }
+    let episodes: u64 = conn
+        .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
+        .map_err(|error| {
+            GraphError::Topology(format!(
+                "topology holds no readable episodes table (not a LodeGraph \
+                 topology store?): {error}"
+            ))
+        })?;
+    Ok(episodes)
+}
+
 impl TopologyStore {
     /// Open (creating if needed) the topology database at `path`, applying the
     /// schema, `PRAGMA journal_mode=WAL` and `foreign_keys=ON`.

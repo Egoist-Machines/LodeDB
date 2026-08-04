@@ -146,11 +146,36 @@ pub(crate) fn verify_candidate_opens(
             std::fs::copy(&source, &target)?;
         }
     }
-    crate::generation_inventory::write_restored_journal_manifests(
-        scratch.path(),
-        index_key,
-        body,
-    )?;
+    if let Some(kind) = crate::generation_inventory::body_graph_kind(body) {
+        // A LodeGraph generation has no state journal and never opens through
+        // the vector engine; its acceptance check is the graph engine's own:
+        // the transferred topology opens strictly read-only, passes SQLite's
+        // quick_check, and answers through the episodes table. The check runs
+        // against the scratch hardlink (read-only opens never write), so a
+        // checksum-consistent blob that is not a healthy topology still fails
+        // before the pointer moves.
+        let artifact = inventory
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == kind)
+            .ok_or_else(|| {
+                ArtifactStoreError::Integrity(format!(
+                    "graph body pins {kind} but its inventory names no {kind} artifact"
+                ))
+            })?;
+        let staged = scratch.path().join(&artifact.name);
+        let episodes = lodedb_graph::verify_topology_read_only(&staged).map_err(|error| {
+            ArtifactStoreError::Integrity(format!(
+                "restored graph topology failed verify-open: {error}"
+            ))
+        })?;
+        return Ok(OpenReport {
+            index_key: index_key.to_string(),
+            document_count: usize::try_from(episodes).unwrap_or(usize::MAX),
+            chunk_count: 0,
+        });
+    }
+    crate::generation_inventory::write_restored_journal_manifests(scratch.path(), index_key, body)?;
     write_commit_manifest(
         &commit_manifest_path(scratch.path(), index_key),
         body,

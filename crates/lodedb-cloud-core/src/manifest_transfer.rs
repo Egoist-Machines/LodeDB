@@ -30,6 +30,7 @@
 use crate::artifact_store::ArtifactStore;
 use crate::error::{ArtifactStoreError, Result};
 use crate::generation_inventory::{diff_inventories, inventory_from_body};
+use crate::snapshot_identity::redacted_body_matches_remote_head;
 use crate::transfer_policy::TransferPolicy;
 
 /// Metrics-only summary of one generation transfer.
@@ -213,9 +214,10 @@ pub(crate) fn stage_generation_pinned(
 /// Publishes a staged transfer's pointer, the single commit point.
 ///
 /// Skips the swap only when the destination already holds this exact committed
-/// *body*. It compares the full body, not just the generation integer, because
-/// two independent lineages can share a generation number with different
-/// content. The swap preconditions on the exact body staging read
+/// *body*, or its legacy null-inserting representation of the same fully
+/// redacted body. It compares the full body rather than a generation integer,
+/// because two independent lineages can share a generation number with
+/// different content. The swap preconditions on the exact body staging read
 /// (`dest_body`), so a concurrent change between read and swap is caught as a
 /// PointerConflict.
 pub(crate) fn publish_staged(
@@ -231,10 +233,24 @@ pub(crate) fn publish_staged(
         artifacts_written,
         bytes_written,
     } = staged;
-    let pointer_published = dest_body.as_ref() != Some(&source_body);
+    let pointer_published = match dest_body.as_ref() {
+        None => true,
+        Some(dest_body) => {
+            dest_body != &source_body
+                && !redacted_body_matches_remote_head(&source_body, dest_body)?
+        }
+    };
     if pointer_published {
         dest.compare_and_swap_pointer(index_key, dest_body.as_ref(), &source_body)?;
     }
+
+    // On a compatibility no-op the destination still points at the legacy
+    // body, so callers record that exact body as the sidecar base.
+    let committed_body = if pointer_published {
+        source_body
+    } else {
+        dest_body.unwrap_or(source_body)
+    };
 
     let result = TransferResult {
         index_key: index_key.to_string(),
@@ -244,5 +260,5 @@ pub(crate) fn publish_staged(
         bytes_written,
         pointer_published,
     };
-    Ok((result, source_body))
+    Ok((result, committed_body))
 }

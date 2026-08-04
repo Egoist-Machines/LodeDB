@@ -29,9 +29,11 @@ use crate::generation_inventory::{
 };
 use crate::local_artifact_store::LocalArtifactStore;
 use crate::manifest_transfer::{publish_staged, stage_generation_pinned, TransferResult};
-use crate::snapshot_identity::{identity_from_document, pointer_document};
+use crate::snapshot_identity::{
+    identity_from_document, legacy_redacted_id, pointer_document, redacted_body_matches_remote_head,
+};
 use crate::status::{compare_generations, StatusReport};
-use crate::sync_plan::{classify, SnapRef};
+use crate::sync_plan::{classify_redacted_local_body, SnapRef};
 use crate::sync_state::{read_sync_state, write_sync_state, SyncState};
 use crate::transfer_policy::TransferPolicy;
 use crate::verify::{verify_candidate_opens, OpenReport};
@@ -57,6 +59,10 @@ pub struct ManagedSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedLocal {
     pub side: ManagedSide,
+    /// Compatibility identity older null-inserting redacted clients published.
+    /// This is exposed only for managed push's no-republish decision; it is
+    /// not an identity new clients publish or record in sidecars.
+    pub legacy_redacted_id: String,
     /// The policy-redacted committed body, what a push publishes.
     pub body: Value,
     /// The engine-canonical pointer document for `body` (UTF-8 JSON bytes,
@@ -159,12 +165,23 @@ pub fn managed_plan(
 
     let local_ref = local_body.as_ref().map(snap_ref).transpose()?;
     let remote_ref = remote_body.as_ref().map(snap_ref).transpose()?;
-    let classification = classify(local_ref.as_ref(), base.as_ref(), remote_ref.as_ref());
+    let classification = classify_redacted_local_body(
+        local_body.as_ref(),
+        local_ref.as_ref(),
+        base.as_ref(),
+        remote_body.as_ref(),
+        remote_ref.as_ref(),
+    )?;
 
     report.sidecar_present = base.is_some();
     report.sidecar_corrupt = sidecar.corrupt;
     report.base_generation = base.as_ref().map(|base| base.generation);
     report.classification = Some(classification.as_str().to_string());
+    if !report.in_sync {
+        if let (Some(local_body), Some(remote_body)) = (&local_body, &remote_body) {
+            report.in_sync = redacted_body_matches_remote_head(local_body, remote_body)?;
+        }
+    }
 
     let base_is_current = match (&base, &remote_ref) {
         (Some(base), Some(remote)) => base.snapshot_id == remote.snapshot_id,
@@ -193,6 +210,7 @@ pub fn managed_plan(
             })?;
             Some(ManagedLocal {
                 side: managed_side(&body, &reference),
+                legacy_redacted_id: legacy_redacted_id(&body)?,
                 body,
                 pointer_document: document,
                 artifacts: inventory.artifacts,
@@ -426,6 +444,13 @@ pub fn managed_materialize(
     // moves (the scratch carries its own journal manifests, so the real
     // destination stays untouched until the swap).
     let open = verify_candidate_opens(Path::new(dir), index_key, &staged.source_body)?;
+    // Graph bodies: land the engine-facing topology copy BEFORE the pointer
+    // swap (see the helper's ordering note).
+    crate::client_ops::materialize_graph_engine_copy(
+        Path::new(dir),
+        index_key,
+        &staged.source_body,
+    )?;
     let (transfer, restored) = publish_staged(&local_store, index_key, staged)?;
     if discard_pending_wal {
         lodedb_core::storage::wal::truncate(
