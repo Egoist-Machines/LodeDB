@@ -26,10 +26,12 @@ pub mod generation_inventory;
 pub mod local_artifact_store;
 pub mod managed;
 pub mod manifest_transfer;
+#[cfg(feature = "object-store")]
 pub mod object_artifact_store;
 mod paths;
 pub mod snapshot_identity;
 pub mod status;
+#[cfg(feature = "object-store")]
 pub mod store_target;
 pub mod sync_plan;
 pub mod sync_state;
@@ -38,6 +40,7 @@ pub mod verify;
 
 pub use artifact_store::ArtifactStore;
 pub use blob_layout::{blob_name, parse_blob_name};
+#[cfg(feature = "object-store")]
 pub use client_ops::{PullOutcome, SyncForce, SyncOutcome};
 pub use error::{ArtifactStoreError, Result};
 pub use generation_inventory::{
@@ -50,9 +53,11 @@ pub use managed::{
     ManagedLocal, ManagedPlan, ManagedPullOutcome, ManagedSide,
 };
 pub use manifest_transfer::{export_generation, TransferResult};
+#[cfg(feature = "object-store")]
 pub use object_artifact_store::ObjectArtifactStore;
 pub use snapshot_identity::{logical_id, snapshot_id};
 pub use status::{compare_generations, status_for_push, StatusReport};
+#[cfg(feature = "object-store")]
 pub use store_target::artifact_store_from_target;
 pub use sync_plan::{classify, SnapRef, SyncClassification};
 pub use sync_state::{read_sync_state, write_sync_state, SidecarRead, SyncState};

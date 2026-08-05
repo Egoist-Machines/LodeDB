@@ -18,30 +18,44 @@
 //! here: it constructs its stores once and calls the typed primitives directly,
 //! rather than re-resolving target strings per operation.
 
+#[cfg(feature = "object-store")]
 use crate::artifact_store::ArtifactStore;
 use crate::error::{ArtifactStoreError, Result};
-use crate::generation_inventory::{
-    inventory_from_body, list_index_keys, write_restored_journal_manifests,
-};
+use crate::generation_inventory::list_index_keys;
+#[cfg(feature = "object-store")]
+use crate::generation_inventory::{inventory_from_body, write_restored_journal_manifests};
+#[cfg(feature = "object-store")]
 use crate::manifest_transfer::{
     export_generation_pinned, export_generation_with_body, publish_staged, stage_generation_pinned,
     TransferResult,
 };
-use crate::snapshot_identity::{logical_id, redacted_body_matches_remote_head, snapshot_id};
+use crate::snapshot_identity::{logical_id, snapshot_id};
+#[cfg(feature = "object-store")]
+use crate::snapshot_identity::redacted_body_matches_remote_head;
+#[cfg(feature = "object-store")]
 use crate::status::{compare_generations, StatusReport};
+#[cfg(feature = "object-store")]
 use crate::store_target::artifact_store_from_target;
-use crate::sync_plan::{classify_redacted_local_body, SnapRef, SyncClassification};
+use crate::sync_plan::SnapRef;
+#[cfg(feature = "object-store")]
+use crate::sync_plan::{classify_redacted_local_body, SyncClassification};
+#[cfg(feature = "object-store")]
 use crate::sync_state::{read_sync_state, write_sync_state, SidecarRead, SyncState};
+#[cfg(feature = "object-store")]
 use crate::transfer_policy::TransferPolicy;
+#[cfg(feature = "object-store")]
 use crate::verify::{verify_candidate_opens, verify_generation, OpenReport, VerifyReport};
 use serde_json::Value;
+#[cfg(feature = "object-store")]
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "object-store")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What a completed pull produced: the transfer itself plus the proof that the
 /// restored copy opens through the engine (with its loaded counts).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "object-store")]
 pub struct PullOutcome {
     pub transfer: TransferResult,
     pub open: OpenReport,
@@ -54,6 +68,7 @@ pub struct PullOutcome {
 /// name with different bytes (a same-epoch fork) still fail closed against
 /// plain directory/`s3://` remotes; see [`sync`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "object-store")]
 pub enum SyncForce {
     /// No override: only fast-forwards run; `Diverged`/`Unknown` are errors.
     None,
@@ -74,6 +89,7 @@ pub enum SyncForce {
 /// `sidecar_corrupt` is a warning: a sidecar file was present but failed
 /// validation, so the base was treated as absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "object-store")]
 pub struct SyncOutcome {
     pub index_key: String,
     pub classification: String,
@@ -96,6 +112,7 @@ pub fn keys(dir: &str) -> Result<Vec<String>> {
 /// When `dir` is a directory (not an object-store URL), a successful push also
 /// records the published generation in the sync sidecar, making it the base
 /// for later [`sync`]/[`status`] classification.
+#[cfg(feature = "object-store")]
 pub fn push(
     dir: &str,
     remote: &str,
@@ -118,6 +135,7 @@ pub fn push(
 /// was pushed redacted already omits text, so there is nothing to filter on the
 /// way back. A successful pull records the restored generation in the sync
 /// sidecar (see [`push`]).
+#[cfg(feature = "object-store")]
 pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
     if !is_local_dir(dir) {
         return Err(ArtifactStoreError::Backend(format!(
@@ -168,6 +186,7 @@ pub fn pull(remote: &str, dir: &str, index_key: &str) -> Result<PullOutcome> {
 /// follow-up to this version.
 ///
 /// Caller holds the directory writer lock.
+#[cfg(feature = "object-store")]
 fn restore_staged(
     source: &dyn ArtifactStore,
     dest: &dyn ArtifactStore,
@@ -207,6 +226,7 @@ fn restore_staged(
 
 /// Takes the engine's exclusive single-writer lock on `dir` for the duration
 /// of a local restore.
+#[cfg(feature = "object-store")]
 fn acquire_writer_lock(dir: &str) -> Result<lodedb_core::engine::DirWriterLock> {
     lodedb_core::engine::acquire_dir_writer_lock(Path::new(dir)).map_err(ArtifactStoreError::Core)
 }
@@ -301,6 +321,7 @@ pub fn pending_wal_ops(dir: &str, index_key: &str) -> Result<usize> {
 /// three-pointer classification (`in_sync`/`local_ahead`/`remote_ahead`/
 /// `diverged`/`republish`/`unknown`) a [`sync`] of the same arguments would
 /// act on.
+#[cfg(feature = "object-store")]
 pub fn status(
     dir: &str,
     remote: &str,
@@ -348,6 +369,7 @@ pub fn status(
 
 /// Re-hashes every artifact `index_key`'s committed generation pins in `target`
 /// (a local directory or object-store URL) against the manifest's checksums.
+#[cfg(feature = "object-store")]
 pub fn verify(target: &str, index_key: &str) -> Result<VerifyReport> {
     let store = artifact_store_from_target(target)?;
     verify_generation(&*store, index_key)
@@ -380,6 +402,7 @@ pub fn verify(target: &str, index_key: &str) -> Result<VerifyReport> {
 /// writer* on the same directory is out of contract, exactly as LodeDB's
 /// single-writer model already requires. Any successful transfer records the
 /// new base in the sidecar.
+#[cfg(feature = "object-store")]
 pub fn sync(
     dir: &str,
     remote: &str,
@@ -531,6 +554,7 @@ pub fn sync(
 }
 
 /// Whether a target string names a local directory (no URL scheme).
+#[cfg(feature = "object-store")]
 fn is_local_dir(target: &str) -> bool {
     !target.contains("://")
 }
@@ -596,6 +620,7 @@ pub(crate) fn snap_ref(body: &Value) -> Result<SnapRef> {
 /// of it; rotating keys or fixing a region points at the *same* bucket. A
 /// normalization failure or identity mismatch can only produce a false
 /// *mismatch*, which fails toward force, never toward a wrong fast-forward.
+#[cfg(feature = "object-store")]
 fn remote_identity(remote: &str) -> String {
     if is_local_dir(remote) {
         return crate::paths::canonical_identity(Path::new(remote));
@@ -617,6 +642,7 @@ fn remote_identity(remote: &str) -> String {
 /// The base is a claim about what *this pair of ends* last agreed on; trusting
 /// it against a different remote would classify an unrelated remote's content
 /// as a fast-forward using another remote's history.
+#[cfg(feature = "object-store")]
 fn trusted_base<'a>(sidecar: &'a SidecarRead, remote: &str) -> Option<&'a SnapRef> {
     let identity = remote_identity(remote);
     sidecar
@@ -627,6 +653,7 @@ fn trusted_base<'a>(sidecar: &'a SidecarRead, remote: &str) -> Option<&'a SnapRe
 }
 
 /// Reads the sidecar when the target is a directory; a URL target has none.
+#[cfg(feature = "object-store")]
 fn read_sidecar_if_dir(dir: &str, index_key: &str) -> Result<SidecarRead> {
     if is_local_dir(dir) {
         read_sync_state(Path::new(dir), index_key)
@@ -640,6 +667,7 @@ fn read_sidecar_if_dir(dir: &str, index_key: &str) -> Result<SidecarRead> {
 
 /// Records `body` as the sidecar base after a successful transfer, when the
 /// local end is a directory. URL-addressed local ends carry no sidecar.
+#[cfg(feature = "object-store")]
 fn record_base(dir: &str, remote: &str, index_key: &str, body: &Value) -> Result<()> {
     if !is_local_dir(dir) {
         return Ok(());
@@ -656,7 +684,7 @@ fn record_base(dir: &str, remote: &str, index_key: &str, body: &Value) -> Result
     write_sync_state(Path::new(dir), &state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "object-store"))]
 mod tests {
     use super::remote_identity;
 
