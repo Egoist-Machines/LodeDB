@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define LODEDB_ABI_VERSION 7u
+#define LODEDB_ABI_VERSION 8u
 
 typedef enum LodeStatus {
   LODE_OK = 0,
@@ -319,6 +319,27 @@ void lodedb_checkpointer_free(LodeCheckpointer *checkpointer);
 uint32_t lodedb_checkpointer_checkpoint(
     LodeCheckpointer *checkpointer,
     uint64_t *out_folded,
+    LodeError **error);
+
+/* --- Managed cloud staging (lodedb-cloud-core) --------------------------
+   The app performs HTTP and writes downloaded blobs into staging_dir under
+   their sha256 names. These JSON verbs interpret manifests, hash and verify
+   artifacts, materialize a committed generation, and classify sync state. */
+uint32_t lodedb_cloud_managed_plan_json(
+    LodeStringView request,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_cloud_managed_pull_requirements_json(
+    LodeStringView request,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_cloud_managed_materialize_json(
+    LodeStringView request,
+    LodeOwnedString **out,
+    LodeError **error);
+uint32_t lodedb_cloud_managed_record_base_json(
+    LodeStringView request,
+    LodeOwnedString **out,
     LodeError **error);
 
 /* --- Bi-temporal knowledge graph (lodedb-graph) -------------------------

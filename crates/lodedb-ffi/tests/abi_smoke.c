@@ -29,6 +29,19 @@ int main(void) {
   assert(offsetof(LodeSearchRequest, version) == 4);
 
   LodeError *error = 0;
+
+  // Managed planning is local-only: an empty directory and an absent remote
+  // head return a clean plan without opening a network connection.
+  LodeOwnedString *cloud_plan = 0;
+  assert(lodedb_cloud_managed_plan_json(
+             sv("{\"dir\":\"/tmp\",\"index_key\":\"ffi-cloud-empty-missing\","
+                "\"remote_id\":\"orecloud://abi-smoke\",\"include_text\":false,"
+                "\"include_lexical\":false}"),
+             &cloud_plan, &error) == LODE_OK);
+  assert(cloud_plan != 0);
+  assert(strstr(cloud_plan->data, "\"classification\":\"in_sync\"") != 0);
+  lodedb_owned_string_free(cloud_plan);
+
   LodeEngine *engine = 0;
   assert(lodedb_engine_new_in_memory(&engine, &error) == LODE_OK);
   assert(engine != 0);

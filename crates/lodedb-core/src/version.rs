@@ -29,7 +29,7 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 /// reads on the graph FFI.
 /// Bumped to 7 for explicit stored-vector reconstruction reads through
 /// `lodedb_engine_get_vectors_json`.
-pub const NATIVE_CORE_ABI_VERSION: u32 = 7;
+pub const NATIVE_CORE_ABI_VERSION: u32 = 8;
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +41,6 @@ mod tests {
         // than pinning a literal that goes stale on every release bump.
         assert!(!CORE_VERSION.is_empty());
         assert_eq!(STORAGE_SCHEMA_VERSION, 1);
-        assert_eq!(NATIVE_CORE_ABI_VERSION, 7);
+        assert_eq!(NATIVE_CORE_ABI_VERSION, 8);
     }
 }
