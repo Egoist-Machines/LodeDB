@@ -45,6 +45,7 @@ pub fn resolve_within(root: &Path, candidate: &Path) -> Result<PathBuf> {
 /// failure the raw spelling is returned, which for the sidecar-trust caller can
 /// only produce a false *mismatch* (fails toward force, never toward trusting
 /// the wrong remote).
+#[cfg(feature = "object-store")]
 pub(crate) fn canonical_identity(candidate: &Path) -> String {
     // A bare relative path must anchor to the invocation cwd explicitly, or a
     // fully-nonexistent path would stay relative through the lexical fallback.

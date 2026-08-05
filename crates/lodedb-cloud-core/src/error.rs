@@ -122,6 +122,7 @@ impl From<std::io::Error> for ArtifactStoreError {
         // through `io::Error` to satisfy `Read`; recover the category here so
         // a mid-download S3/network failure stays a `Backend` error (mapped to
         // RuntimeError in Python) rather than masquerading as local I/O.
+        #[cfg(feature = "object-store")]
         if error
             .get_ref()
             .is_some_and(|inner| inner.is::<object_store::Error>())
