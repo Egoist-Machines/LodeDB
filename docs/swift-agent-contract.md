@@ -3,7 +3,7 @@
 This is the contract for using LodeDB as an on-device agent memory from Swift, for
 LLM agents and the developers who wire them. It is the Swift-native equivalent of the
 Python MCP server's tools: the same `save` / `recall` / `forget` verbs, no server and
-no network. The API is `LodeMemory` (in `LodeDBCore`); the lower-level `LodeDB` is
+no network in the local memory path. The API is `LodeMemory` (in `LodeDBCore`); the lower-level `LodeDB` is
 available when you need full control.
 
 ## Operations
@@ -27,8 +27,12 @@ stored-vector retrieval), `stats` (metrics).
 
 ## Privacy guarantees
 
-- On device only. No network calls, no server, no telemetry of content. Data lives in
-  the store you open (in memory, or a file path you control).
+- On device only. The local database makes no network calls, runs no server, and emits no
+  telemetry of content. Data lives in the store you open (in memory, or a file path you control).
+- Managed replication is intentionally split: an app may use `LodeReplica` to have Rust
+  plan, hash, verify, and materialize a generation, while the app itself performs any HTTP
+  control-plane request and blob download. `LodeReplica` has no networking API and never
+  receives credentials; downloaded blobs are verified from the staging directory before use.
 - Search results are payload-free. `search` returns ids, scores, and metadata; it does
   not return document text. `LodeMemory.recall` fetches text explicitly per hit via
   `get`, so the only place raw text crosses back is a deliberate fetch.
