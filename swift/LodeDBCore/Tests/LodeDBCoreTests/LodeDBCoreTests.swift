@@ -115,7 +115,7 @@ import Testing
 }
 
 @Test func nativeEngineExposesABIVersionAndFFITextProtocol() throws {
-    #expect(NativeEngine.abiVersion() == 7)
+    #expect(NativeEngine.abiVersion() == lodeNativeExpectedABIVersion)
 
     let engine = try NativeEngine.inMemory(vectorDimension: 8)
     let documentsJSON = """

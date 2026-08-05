@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 7
+let lodeNativeExpectedABIVersion: UInt32 = 8
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -741,5 +741,40 @@ final class NativeTemporalGraph {
     func persist() throws {
         var error: UnsafeMutablePointer<LodeError>?
         try NativeEngine.check(lodedb_graph_persist(handle, &error), error: error)
+    }
+}
+
+/// Stateless bridge for managed-cloud staging verbs. The app owns HTTP and
+/// blob downloads; this wrapper only hands request JSON to the native verifier.
+final class NativeCloudReplica {
+    private init() {}
+
+    static func open() throws -> NativeCloudReplica {
+        try NativeEngine.requireABI()
+        return NativeCloudReplica()
+    }
+
+    private func ownedCall(
+        _ body: (UnsafeMutablePointer<UnsafeMutablePointer<LodeOwnedString>?>,
+                 UnsafeMutablePointer<UnsafeMutablePointer<LodeError>?>) -> UInt32
+    ) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = body(&out, &error)
+        try NativeEngine.check(status, error: error)
+        return try NativeEngine.copyOwnedString(out)
+    }
+
+    func managedPlan(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_cloud_managed_plan_json($0, o, e) } }
+    }
+    func pullRequirements(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_cloud_managed_pull_requirements_json($0, o, e) } }
+    }
+    func materialize(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_cloud_managed_materialize_json($0, o, e) } }
+    }
+    func recordBase(_ j: String) throws -> String {
+        try ownedCall { o, e in withStringView(j) { lodedb_cloud_managed_record_base_json($0, o, e) } }
     }
 }
