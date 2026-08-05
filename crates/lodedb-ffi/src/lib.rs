@@ -16,6 +16,8 @@ use std::slice;
 // The bi-temporal knowledge-graph C ABI (`lodedb_graph_*`), reusing this module's
 // JSON/error helpers. See src/graph.rs.
 mod graph;
+// The managed cloud pull translator, kept transport-free for Apple targets.
+mod cloud;
 
 const ABI_VERSION: u32 = lodedb_core::NATIVE_CORE_ABI_VERSION;
 
