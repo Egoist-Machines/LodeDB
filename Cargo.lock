@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "lodedb-cloud-core"
-version = "2.0.3"
+version = "2.0.10"
 dependencies = [
  "bytes",
  "futures",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "lodedb-core"
-version = "2.0.3"
+version = "2.0.10"
 dependencies = [
  "lodedb-gpu",
  "rayon",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "lodedb-ffi"
-version = "2.0.3"
+version = "2.0.10"
 dependencies = [
  "lodedb-cloud-core",
  "lodedb-core",
@@ -1173,14 +1173,14 @@ dependencies = [
 
 [[package]]
 name = "lodedb-gpu"
-version = "2.0.3"
+version = "2.0.10"
 dependencies = [
  "cudarc",
 ]
 
 [[package]]
 name = "lodedb-graph"
-version = "2.0.3"
+version = "2.0.10"
 dependencies = [
  "lodedb-core",
  "rusqlite",

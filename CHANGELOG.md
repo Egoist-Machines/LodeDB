@@ -5,6 +5,32 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.10] - 2026-08-05
+
+### Added
+
+- Managed-pull C ABI: `lodedb-ffi` exposes `managed_plan`,
+  `managed_pull_requirements`, `managed_materialize`, and
+  `managed_record_base` as JSON verbs, and the Swift package gains
+  `LodeReplica`, so an app can pull a committed generation doing only
+  HTTP and file staging while manifest interpretation, hashing,
+  verify-on-pull, and materialization stay in the one Rust
+  implementation of the commit format (#118). Sync conflicts and
+  pending WALs surface as `LODE_PLAN_STALE` with the classification in
+  structured JSON; a text-excluding plan refuses text-bearing graph
+  topologies exactly like the Python push wrapper.
+- `lodedb-cloud-core` gains a default-on `object-store` feature;
+  building with `--no-default-features` keeps staging, verification,
+  materialization, and sync classification while dropping the S3/HTTP
+  transport stack, so device binaries linking the FFI carry no
+  reqwest, rustls, ring, or tokio.
+
+### Changed
+
+- The native C ABI version advances to 8 for the new exports; the
+  header macro, Swift expectation, and Python extension pin move in
+  lockstep.
+
 ## [2.0.9] - 2026-08-04
 
 ### Fixed
