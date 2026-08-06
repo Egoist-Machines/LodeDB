@@ -90,6 +90,38 @@ impl FieldIndex {
         docs
     }
 
+    /// Counts documents satisfying an ordered operator without cloning ids.
+    pub fn count_ordered(&self, op: &str, operand: &str) -> usize {
+        let mut count = 0;
+        if let Some(operand_number) = as_number(operand) {
+            self.ensure_ordered();
+            let ordered = self.ordered.borrow();
+            let partitions = ordered
+                .as_ref()
+                .expect("ordered partitions populated by ensure_ordered");
+            for value in partitions.numeric_values_satisfying(op, operand_number) {
+                if let Some(value_docs) = self.value_docs.get(value) {
+                    count += value_docs.len();
+                }
+            }
+            for value in &partitions.nonnumeric_values {
+                if compare_ordered(value, op, operand) {
+                    if let Some(value_docs) = self.value_docs.get(value) {
+                        count += value_docs.len();
+                    }
+                }
+            }
+            return count;
+        }
+
+        for (value, value_docs) in &self.value_docs {
+            if compare_ordered(value, op, operand) {
+                count += value_docs.len();
+            }
+        }
+        count
+    }
+
     /// Drops the cached ordered partition so the next ordered read rebuilds it.
     fn invalidate_ordered(&mut self) {
         *self.ordered.get_mut() = None;

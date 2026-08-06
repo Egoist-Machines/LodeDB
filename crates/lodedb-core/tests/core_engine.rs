@@ -38,6 +38,18 @@ fn doc(id: &str, axis: usize, metadata: BTreeMap<String, String>) -> CoreVectorD
     }
 }
 
+fn scored_doc(id: &str, score: f32, metadata: BTreeMap<String, String>) -> CoreVectorDocument {
+    let mut vector = vec![0.0; 8];
+    vector[0] = score;
+    CoreVectorDocument {
+        document_id: id.to_string(),
+        vector,
+        metadata,
+        text: None,
+        patch_matrix: None,
+    }
+}
+
 fn text_doc(id: &str, text: &str, metadata: BTreeMap<String, String>) -> CoreDocument {
     CoreDocument {
         document_id: id.to_string(),
@@ -357,6 +369,215 @@ fn metadata_and_document_id_filters_match_python_semantics() {
         .unwrap();
     assert_eq!(by_ids.hits[0].document_id, "a");
     assert_eq!(by_ids.total_considered, 1);
+}
+
+#[test]
+fn expiration_filter_overfetches_before_predicate_drop() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                scored_doc("expired", 10.0, metadata(&[("expires", "10")])),
+                scored_doc("future", 9.0, metadata(&[("expires", "30")])),
+                scored_doc("missing-a", 8.0, metadata(&[])),
+                scored_doc("missing-b", 7.0, metadata(&[])),
+            ],
+        )
+        .unwrap();
+
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+    let results = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&filter),
+        )
+        .unwrap();
+
+    assert_eq!(results.total_considered, 3);
+    assert_eq!(
+        results
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect::<Vec<_>>(),
+        ["future", "missing-a", "missing-b"]
+    );
+}
+
+#[test]
+fn document_ids_metadata_filter_matches_metadata_intersection() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                scored_doc("expired", 10.0, metadata(&[("expires", "10")])),
+                scored_doc("future", 9.0, metadata(&[("expires", "30")])),
+                scored_doc("missing", 8.0, metadata(&[])),
+                scored_doc("other", 7.0, metadata(&[])),
+            ],
+        )
+        .unwrap();
+    let metadata_clause = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+    let structured = json!({
+        "document_ids": ["expired", "future", "missing", "absent"],
+        "metadata": metadata_clause,
+    });
+
+    let ids = |rows: Vec<Value>| {
+        rows.into_iter()
+            .map(|row| row["document_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let bounded = ids(
+        engine
+            .list_documents("default", Some(&structured), None, None)
+            .unwrap(),
+    );
+    let metadata_only = ids(
+        engine
+            .list_documents("default", Some(&metadata_clause), None, None)
+            .unwrap(),
+    )
+    .into_iter()
+    .filter(|id| id == "future" || id == "missing")
+    .collect::<Vec<_>>();
+
+    assert_eq!(bounded, metadata_only);
+    assert_eq!(bounded, ["future", "missing"]);
+}
+
+#[test]
+fn metadata_filter_handles_empty_and_all_field_corpora() {
+    let mut empty = CoreEngine::new_in_memory();
+    empty.create_index("default", 8, 4).unwrap();
+    let missing_filter = json!({"expires": {"$exists": false}});
+    assert!(empty
+        .list_documents("default", Some(&missing_filter), None, None)
+        .unwrap()
+        .is_empty());
+
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("a", 0, metadata(&[("expires", "10")])),
+                doc("b", 1, metadata(&[("expires", "20")])),
+                doc("c", 2, metadata(&[("expires", "30")])),
+            ],
+        )
+        .unwrap();
+    let none_missing = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&missing_filter),
+        )
+        .unwrap();
+    assert_eq!(none_missing.total_considered, 0);
+    assert!(none_missing.hits.is_empty());
+
+    let present_filter = json!({"expires": {"$exists": true}});
+    let all_present = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&present_filter),
+        )
+        .unwrap();
+    assert_eq!(all_present.total_considered, 3);
+    assert_eq!(all_present.hits.len(), 3);
+}
+
+#[test]
+fn list_documents_pages_deferred_predicate_in_id_order() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("d000", 0, metadata(&[("expires", "10")])),
+                doc("d001", 1, metadata(&[])),
+                doc("d002", 2, metadata(&[])),
+                doc("d003", 3, metadata(&[("expires", "30")])),
+                doc("d004", 4, metadata(&[("expires", "5")])),
+            ],
+        )
+        .unwrap();
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+
+    let page = engine
+        .list_documents("default", Some(&filter), Some("d001"), Some(2))
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|row| row["document_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["d002", "d003"]
+    );
+}
+
+#[test]
+#[ignore]
+fn expiration_filter_micro_benchmark() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    let docs = (0..10_000)
+        .map(|i| {
+            if i % 1000 == 0 {
+                scored_doc(
+                    &format!("d{i:05}"),
+                    10_000.0 - i as f32,
+                    metadata(&[("expires", "1")]),
+                )
+            } else {
+                scored_doc(&format!("d{i:05}"), 10_000.0 - i as f32, metadata(&[]))
+            }
+        })
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &docs).unwrap();
+    let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "2"}}
+        ]
+    });
+
+    let started = std::time::Instant::now();
+    let _ = engine.query_vector("default", &query, 10, None).unwrap();
+    let unfiltered = started.elapsed();
+    let started = std::time::Instant::now();
+    let _ = engine
+        .query_vector("default", &query, 10, Some(&filter))
+        .unwrap();
+    let filtered = started.elapsed();
+    eprintln!("unfiltered={unfiltered:?} filtered_expiration={filtered:?}");
 }
 
 #[test]
@@ -6089,4 +6310,29 @@ fn readonly_lazy_open_defers_tvann_adoption_to_first_ann_query() {
     drop(writable);
     drop(reader);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescored_query_with_all_matching_filter_keeps_full_scan_capacity() {
+    // Regression: a filter every document passes plans as Unfiltered with an
+    // empty allowlist. The rescore capacity gate used to key off
+    // `filter.is_none()`, clamp the scan to zero candidates, and error.
+    let (documents, query) = rescore_boundary_docs();
+    let documents = documents
+        .into_iter()
+        .map(|mut document| {
+            document
+                .metadata
+                .insert("kind".to_string(), "note".to_string());
+            document
+        })
+        .collect::<Vec<_>>();
+    let engine = rescore_engine(&documents, 2.0);
+    let unfiltered = engine.query_vector("default", &query, 3, None).unwrap();
+    let all_matching = json!({"kind": {"$exists": true}});
+    let filtered = engine
+        .query_vector("default", &query, 3, Some(&all_matching))
+        .unwrap();
+    assert_eq!(hit_keys(&filtered), hit_keys(&unfiltered));
+    assert_eq!(filtered.total_considered, documents.len());
 }

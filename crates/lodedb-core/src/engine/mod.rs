@@ -12,7 +12,10 @@ use turbovec::IdMapIndex;
 
 use crate::error::{CoreError, CoreErrorCode};
 use crate::filter::doc_set::DocSet;
-use crate::filter::{build_field_indexes, coerce_sdk_filter, resolve_filter, FieldIndex};
+use crate::filter::{
+    build_field_indexes, coerce_sdk_filter, estimate_matching_cardinality, matches_metadata_filter,
+    plan_metadata_filter, FieldIndex, MetadataFilterPlan,
+};
 use crate::lexical::rrf::RRF_C;
 use crate::lexical::{tokenize, Bm25Index};
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
@@ -1541,22 +1544,54 @@ impl CoreEngine {
         limit: Option<usize>,
     ) -> Result<Vec<Value>, CoreError> {
         let index = self.index(index_id)?;
-        // resolve_filter returns ids in BTreeSet (stable-id) order, so an `after`
-        // cursor is a forward scan past that id and `limit` caps the page.
-        let document_ids = index.resolve_filter(filter)?;
-        let page = document_ids
-            .into_iter()
-            .filter(|document_id| after.map_or(true, |cursor| document_id.as_str() > cursor))
-            .filter_map(|document_id| {
-                index
-                    .documents
-                    .get(&document_id)
-                    .map(|record| document_resource_payload(&document_id, record))
-            });
-        Ok(match limit {
-            Some(limit) => page.take(limit).collect(),
-            None => page.collect(),
-        })
+        let mut page = Vec::new();
+        match index.plan_filter(filter)? {
+            DocumentFilterPlan::All => {
+                for document_id in &index.all_docs {
+                    if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                        continue;
+                    }
+                    if let Some(record) = index.documents.get(document_id) {
+                        page.push(document_resource_payload(document_id, record));
+                    }
+                    if limit.is_some_and(|limit| page.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+            DocumentFilterPlan::Materialized(document_ids) => {
+                for document_id in document_ids {
+                    if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                        continue;
+                    }
+                    if let Some(record) = index.documents.get(&document_id) {
+                        page.push(document_resource_payload(&document_id, record));
+                    }
+                    if limit.is_some_and(|limit| page.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+            DocumentFilterPlan::Predicate {
+                metadata_filter, ..
+            } => {
+                for document_id in &index.all_docs {
+                    let Some(record) = index.documents.get(document_id) else {
+                        continue;
+                    };
+                    if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                        continue;
+                    }
+                    if matches_metadata_filter(&record.metadata, &metadata_filter)? {
+                        page.push(document_resource_payload(document_id, record));
+                    }
+                    if limit.is_some_and(|limit| page.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(page)
     }
 
     /// Persists every open index through generation-mode storage.
@@ -5008,6 +5043,36 @@ impl ClusterSource {
     }
 }
 
+enum DocumentFilterPlan {
+    All,
+    Materialized(DocSet),
+    Predicate {
+        metadata_filter: Value,
+        matching_count: usize,
+        failing_document_count: usize,
+        failing_document_ids: Option<DocSet>,
+    },
+}
+
+enum QueryFilterPlan {
+    Unfiltered {
+        total_considered: usize,
+    },
+    Empty {
+        total_considered: usize,
+    },
+    Allowlist {
+        total_considered: usize,
+        chunk_ids: Vec<String>,
+    },
+    Predicate {
+        metadata_filter: Value,
+        total_considered: usize,
+        failing_document_count: usize,
+        failing_document_ids: Option<DocSet>,
+    },
+}
+
 struct VectorOnlyIndex {
     index_id: String,
     index_key: String,
@@ -5481,9 +5546,9 @@ impl VectorOnlyIndex {
         }
     }
 
-    fn resolve_filter(&self, filter: Option<&Value>) -> Result<BTreeSet<String>, CoreError> {
+    fn plan_filter(&self, filter: Option<&Value>) -> Result<DocumentFilterPlan, CoreError> {
         let Some(filter) = filter else {
-            return Ok(self.all_docs.clone());
+            return Ok(DocumentFilterPlan::All);
         };
         let object = filter
             .as_object()
@@ -5500,86 +5565,220 @@ impl VectorOnlyIndex {
             (None, Some(filter))
         };
 
-        // Build candidates straight from the constraints rather than cloning the
-        // whole corpus first: a `document_ids` allowlist is bounded by the
-        // requested ids, and a metadata filter already resolves to a subset of
-        // `all_docs` (it uses `all_docs` internally for $ne/$nin/$exists:false).
-        // Cloning `all_docs` up front made every filtered query O(corpus).
         let id_candidates = match document_ids {
-            Some(value) => {
-                let array = value
-                    .as_array()
-                    .ok_or_else(|| invalid_err("document_ids filter must be a list"))?;
-                // Match the SDK's filter normalizer so every binding fails closed
-                // alike: a document_ids filter must be a non-empty list of non-blank
-                // strings rather than silently dropping malformed entries.
-                if array.is_empty() {
-                    return Err(invalid_err("document_ids filter must not be empty"));
-                }
-                let mut ids = BTreeSet::new();
-                for entry in array {
-                    let id = entry.as_str().ok_or_else(|| {
-                        invalid_err("document_ids filter entries must be strings")
-                    })?;
-                    if id.trim().is_empty() {
-                        return Err(invalid_err("document_ids filter entries must be non-blank"));
-                    }
-                    if self.all_docs.contains(id) {
-                        ids.insert(id.to_string());
-                    }
-                }
-                Some(ids)
-            }
-            None => None,
-        };
-        let metadata_docs = match metadata_filter {
-            Some(metadata_filter) => {
-                let coerced = coerce_sdk_filter(metadata_filter)?;
-                Some(resolve_filter(
-                    &coerced,
-                    &self.field_indexes,
-                    &self.all_docs,
-                )?)
-            }
+            Some(value) => Some(self.parse_document_id_filter(value)?),
             None => None,
         };
 
-        Ok(match (id_candidates, metadata_docs) {
-            (Some(ids), Some(metadata)) => ids.intersection(&metadata).cloned().collect(),
-            (Some(ids), None) => ids,
-            (None, Some(metadata)) => metadata,
-            // Unreachable: a structured filter always carries at least one of the
-            // two keys, and a non-structured filter sets `metadata_filter`.
-            (None, None) => self.all_docs.clone(),
+        let Some(metadata_filter) = metadata_filter else {
+            return Ok(match id_candidates {
+                Some(ids) => DocumentFilterPlan::Materialized(ids),
+                None => DocumentFilterPlan::All,
+            });
+        };
+
+        let coerced = coerce_sdk_filter(metadata_filter)?;
+        if let Some(ids) = id_candidates {
+            let matching_cardinality =
+                estimate_matching_cardinality(&coerced, &self.field_indexes, &self.all_docs)?;
+            if ids.len() < matching_cardinality {
+                return Ok(DocumentFilterPlan::Materialized(
+                    self.filter_candidate_ids(ids, &coerced)?,
+                ));
+            }
+            let metadata_plan = self.complete_metadata_filter_plan(
+                coerced.clone(),
+                plan_metadata_filter(&coerced, &self.field_indexes, &self.all_docs)?,
+            )?;
+            return self.intersect_id_candidates(ids, metadata_plan);
+        }
+
+        self.complete_metadata_filter_plan(
+            coerced.clone(),
+            plan_metadata_filter(&coerced, &self.field_indexes, &self.all_docs)?,
+        )
+    }
+
+    fn resolve_filter(&self, filter: Option<&Value>) -> Result<BTreeSet<String>, CoreError> {
+        self.materialize_document_filter(self.plan_filter(filter)?)
+    }
+
+    fn parse_document_id_filter(&self, value: &Value) -> Result<DocSet, CoreError> {
+        let array = value
+            .as_array()
+            .ok_or_else(|| invalid_err("document_ids filter must be a list"))?;
+        // Match the SDK's filter normalizer so every binding fails closed alike.
+        if array.is_empty() {
+            return Err(invalid_err("document_ids filter must not be empty"));
+        }
+        let mut ids = BTreeSet::new();
+        for entry in array {
+            let id = entry
+                .as_str()
+                .ok_or_else(|| invalid_err("document_ids filter entries must be strings"))?;
+            if id.trim().is_empty() {
+                return Err(invalid_err("document_ids filter entries must be non-blank"));
+            }
+            if self.all_docs.contains(id) {
+                ids.insert(id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    fn complete_metadata_filter_plan(
+        &self,
+        metadata_filter: Value,
+        plan: MetadataFilterPlan,
+    ) -> Result<DocumentFilterPlan, CoreError> {
+        match plan {
+            MetadataFilterPlan::Materialized(document_ids) => {
+                Ok(DocumentFilterPlan::Materialized(document_ids))
+            }
+            MetadataFilterPlan::Predicate(predicate) => {
+                let (matching_count, failing_document_count, failing_document_ids) =
+                    if let Some(candidates) = predicate.failing_candidates {
+                        let mut failing = DocSet::new();
+                        for document_id in candidates {
+                            if !self.metadata_matches(&document_id, &metadata_filter)? {
+                                failing.insert(document_id);
+                            }
+                        }
+                        (
+                            self.all_docs.len().saturating_sub(failing.len()),
+                            failing.len(),
+                            Some(failing),
+                        )
+                    } else {
+                        (
+                            predicate.matching_count.ok_or_else(|| {
+                                invalid_err("predicate plan missing matching count")
+                            })?,
+                            predicate.failing_count.ok_or_else(|| {
+                                invalid_err("predicate plan missing failing count")
+                            })?,
+                            None,
+                        )
+                    };
+                if matching_count == 0 {
+                    return Ok(DocumentFilterPlan::Materialized(DocSet::new()));
+                }
+                Ok(DocumentFilterPlan::Predicate {
+                    metadata_filter,
+                    matching_count,
+                    failing_document_count,
+                    failing_document_ids,
+                })
+            }
+        }
+    }
+
+    fn intersect_id_candidates(
+        &self,
+        ids: DocSet,
+        metadata_plan: DocumentFilterPlan,
+    ) -> Result<DocumentFilterPlan, CoreError> {
+        Ok(match metadata_plan {
+            DocumentFilterPlan::All => DocumentFilterPlan::Materialized(ids),
+            DocumentFilterPlan::Materialized(metadata) => {
+                DocumentFilterPlan::Materialized(ids.intersection(&metadata).cloned().collect())
+            }
+            DocumentFilterPlan::Predicate {
+                metadata_filter,
+                matching_count,
+                failing_document_ids,
+                ..
+            } => {
+                if ids.len() < matching_count || failing_document_ids.is_none() {
+                    DocumentFilterPlan::Materialized(
+                        self.filter_candidate_ids(ids, &metadata_filter)?,
+                    )
+                } else {
+                    let denied = failing_document_ids.unwrap_or_default();
+                    DocumentFilterPlan::Materialized(ids.difference(&denied).cloned().collect())
+                }
+            }
         })
     }
 
-    /// Resolves the chunk allowlist and considered-document count for a query.
-    ///
-    /// The unfiltered path must NOT clone `all_docs` (a `BTreeSet` of every
-    /// document id): for a 20k-corpus single-query loop that clone runs once per
-    /// query and dominates the per-call cost once JSON marshalling is removed.
-    /// Unfiltered queries scan the whole index, so the allowlist is empty and the
-    /// considered count is simply `all_docs.len()`.
-    fn query_allowlist(
+    fn materialize_document_filter(
         &self,
-        filter: Option<&Value>,
-    ) -> Result<(usize, Vec<String>, bool), CoreError> {
-        match filter {
-            None => Ok((self.all_docs.len(), Vec::new(), false)),
-            Some(_) => {
-                let candidates = self.resolve_filter(filter)?;
-                let total_considered = candidates.len();
-                if candidates.is_empty() {
-                    return Ok((total_considered, Vec::new(), true));
-                }
-                Ok((
-                    total_considered,
-                    self.chunk_ids_for_documents(&candidates),
-                    false,
-                ))
+        plan: DocumentFilterPlan,
+    ) -> Result<BTreeSet<String>, CoreError> {
+        Ok(match plan {
+            DocumentFilterPlan::All => self.all_docs.clone(),
+            DocumentFilterPlan::Materialized(document_ids) => document_ids,
+            DocumentFilterPlan::Predicate {
+                metadata_filter, ..
+            } => self.filter_candidate_ids(self.all_docs.clone(), &metadata_filter)?,
+        })
+    }
+
+    fn filter_candidate_ids(
+        &self,
+        candidates: DocSet,
+        metadata_filter: &Value,
+    ) -> Result<DocSet, CoreError> {
+        let mut document_ids = DocSet::new();
+        for document_id in candidates {
+            if self.metadata_matches(&document_id, metadata_filter)? {
+                document_ids.insert(document_id);
             }
         }
+        Ok(document_ids)
+    }
+
+    fn metadata_matches(
+        &self,
+        document_id: &str,
+        metadata_filter: &Value,
+    ) -> Result<bool, CoreError> {
+        match self.documents.get(document_id) {
+            Some(record) => matches_metadata_filter(&record.metadata, metadata_filter),
+            None => Ok(false),
+        }
+    }
+
+    fn query_filter_plan(&self, filter: Option<&Value>) -> Result<QueryFilterPlan, CoreError> {
+        Ok(match self.plan_filter(filter)? {
+            DocumentFilterPlan::All => QueryFilterPlan::Unfiltered {
+                total_considered: self.all_docs.len(),
+            },
+            DocumentFilterPlan::Materialized(document_ids) => {
+                let total_considered = document_ids.len();
+                if document_ids.is_empty() {
+                    QueryFilterPlan::Empty { total_considered }
+                } else {
+                    QueryFilterPlan::Allowlist {
+                        total_considered,
+                        chunk_ids: self.chunk_ids_for_documents(&document_ids),
+                    }
+                }
+            }
+            DocumentFilterPlan::Predicate {
+                metadata_filter,
+                matching_count,
+                failing_document_count,
+                failing_document_ids,
+            } => {
+                if matching_count == 0 {
+                    QueryFilterPlan::Empty {
+                        total_considered: 0,
+                    }
+                } else if failing_document_count == 0 {
+                    QueryFilterPlan::Unfiltered {
+                        total_considered: matching_count,
+                    }
+                } else {
+                    QueryFilterPlan::Predicate {
+                        metadata_filter,
+                        total_considered: matching_count,
+                        failing_document_count,
+                        failing_document_ids,
+                    }
+                }
+            }
+        })
     }
 
     fn query_vector_turbovec(
@@ -5592,13 +5791,38 @@ impl VectorOnlyIndex {
         if rescore {
             return self.query_vector_turbovec_rescored(query_vector, top_k, filter);
         }
-        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
-        if empty_filter {
-            return Ok(CoreSearchResults {
-                hits: Vec::new(),
+        let filter_plan = self.query_filter_plan(filter)?;
+        let (total_considered, allowlist) = match filter_plan {
+            QueryFilterPlan::Empty { total_considered } => {
+                return Ok(CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered,
+                });
+            }
+            QueryFilterPlan::Unfiltered { total_considered } => (total_considered, Vec::new()),
+            QueryFilterPlan::Allowlist {
                 total_considered,
-            });
-        }
+                chunk_ids,
+            } => (total_considered, chunk_ids),
+            QueryFilterPlan::Predicate {
+                metadata_filter,
+                total_considered,
+                failing_document_count,
+                failing_document_ids,
+            } => {
+                let candidate_k = self.deferred_candidate_count(
+                    top_k,
+                    failing_document_ids.as_ref(),
+                    failing_document_count,
+                );
+                let index = self.turbovec_index()?;
+                let raw_hits = index.search(query_vector, candidate_k, &[])?;
+                return Ok(CoreSearchResults {
+                    hits: self.assemble_vector_hits_filtered(raw_hits, &metadata_filter, top_k)?,
+                    total_considered,
+                });
+            }
+        };
         // ANN candidate generation applies to unfiltered queries only in v1: a
         // filtered query is already bounded by its allowlist and takes the exact
         // path. The `ann_prunes` gate is config-only (no cluster build), so a
@@ -5633,15 +5857,38 @@ impl VectorOnlyIndex {
         top_k: usize,
         filter: Option<&Value>,
     ) -> Result<CoreSearchResults, CoreError> {
-        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
-        if empty_filter {
-            return Ok(CoreSearchResults {
-                hits: Vec::new(),
+        let filter_plan = self.query_filter_plan(filter)?;
+        let (total_considered, allowlist, predicate, plan_unfiltered) = match filter_plan {
+            QueryFilterPlan::Empty { total_considered } => {
+                return Ok(CoreSearchResults {
+                    hits: Vec::new(),
+                    total_considered,
+                });
+            }
+            QueryFilterPlan::Unfiltered { total_considered } => {
+                (total_considered, Vec::new(), None, true)
+            }
+            QueryFilterPlan::Allowlist {
                 total_considered,
-            });
-        }
+                chunk_ids,
+            } => (total_considered, chunk_ids, None, false),
+            QueryFilterPlan::Predicate {
+                metadata_filter,
+                total_considered,
+                failing_document_count,
+                failing_document_ids,
+            } => (
+                total_considered,
+                Vec::new(),
+                Some((metadata_filter, failing_document_ids, failing_document_count)),
+                false,
+            ),
+        };
         let ann = self.ann_should_prune(filter);
-        let scan_capacity = if ann || filter.is_none() {
+        // Capacity follows the plan shape, not the raw filter: a filter that
+        // matches every document plans as Unfiltered with an empty allowlist,
+        // and gating on `filter.is_none()` would clamp the rescore scan to 0.
+        let scan_capacity = if ann || plan_unfiltered || predicate.is_some() {
             self.live_chunk_count()
         } else {
             allowlist.len()
@@ -5653,6 +5900,19 @@ impl VectorOnlyIndex {
             None
         };
         let index = self.turbovec_index()?;
+        if let Some((metadata_filter, failing_document_ids, failing_document_count)) = predicate {
+            let candidate_k = self.deferred_candidate_count(
+                candidate_k,
+                failing_document_ids.as_ref(),
+                failing_document_count,
+            );
+            let raw_hits = index.search(query_vector, candidate_k, &[])?;
+            let rescored = self.rescore_raw_hits(query_vector, raw_hits, candidate_k);
+            return Ok(CoreSearchResults {
+                hits: self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?,
+                total_considered,
+            });
+        }
         let raw_hits = match &ann_allowlist {
             Some(stable_ids) => {
                 index.search_with_stable_allowlist(query_vector, candidate_k, stable_ids)?
@@ -5805,6 +6065,57 @@ impl VectorOnlyIndex {
                     })
             })
             .collect()
+    }
+
+    fn assemble_vector_hits_filtered(
+        &self,
+        hits: Vec<VectorSearchHit>,
+        metadata_filter: &Value,
+        top_k: usize,
+    ) -> Result<Vec<CoreSearchHit>, CoreError> {
+        let mut filtered = Vec::new();
+        for hit in hits {
+            let Some(record) = self.documents.get(&hit.document_id) else {
+                continue;
+            };
+            if !matches_metadata_filter(&record.metadata, metadata_filter)? {
+                continue;
+            }
+            filtered.push(CoreSearchHit {
+                document_id: hit.document_id,
+                chunk_id: hit.chunk_id,
+                score: hit.score,
+                metadata: record.metadata.clone(),
+            });
+            if filtered.len() == top_k {
+                break;
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn deferred_candidate_count(
+        &self,
+        base_k: usize,
+        failing_document_ids: Option<&DocSet>,
+        failing_document_count: usize,
+    ) -> usize {
+        let failing_chunks = match failing_document_ids {
+            Some(document_ids) => self.chunk_count_for_documents(document_ids),
+            None if failing_document_count == 0 => 0,
+            None => self.live_chunk_count(),
+        };
+        base_k
+            .saturating_add(failing_chunks)
+            .min(self.live_chunk_count())
+    }
+
+    fn chunk_count_for_documents(&self, document_ids: &DocSet) -> usize {
+        document_ids
+            .iter()
+            .filter_map(|document_id| self.documents.get(document_id))
+            .map(|record| record.chunks.len())
+            .sum()
     }
 
     /// ANN candidate stable ids for an unfiltered query, or `None` to fall back to
@@ -6162,17 +6473,53 @@ impl VectorOnlyIndex {
                     .collect();
             }
         }
-        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
-        if empty_filter {
-            return Ok(query_vectors
-                .iter()
-                .map(|_| CoreSearchResults {
-                    hits: Vec::new(),
-                    total_considered,
-                })
-                .collect());
-        }
+        let filter_plan = self.query_filter_plan(filter)?;
+        let (total_considered, allowlist, predicate) = match filter_plan {
+            QueryFilterPlan::Empty { total_considered } => {
+                return Ok(query_vectors
+                    .iter()
+                    .map(|_| CoreSearchResults {
+                        hits: Vec::new(),
+                        total_considered,
+                    })
+                    .collect());
+            }
+            QueryFilterPlan::Unfiltered { total_considered } => {
+                (total_considered, Vec::new(), None)
+            }
+            QueryFilterPlan::Allowlist {
+                total_considered,
+                chunk_ids,
+            } => (total_considered, chunk_ids, None),
+            QueryFilterPlan::Predicate {
+                metadata_filter,
+                total_considered,
+                failing_document_count,
+                failing_document_ids,
+            } => (
+                total_considered,
+                Vec::new(),
+                Some((metadata_filter, failing_document_ids, failing_document_count)),
+            ),
+        };
         let index = self.turbovec_index()?;
+        if let Some((metadata_filter, failing_document_ids, failing_document_count)) = predicate {
+            let candidate_k = self.deferred_candidate_count(
+                top_k,
+                failing_document_ids.as_ref(),
+                failing_document_count,
+            );
+            return index
+                .search_batch(query_vectors, candidate_k, &[])?
+                .into_iter()
+                .map(|row| {
+                    Ok(CoreSearchResults {
+                        hits: self.assemble_vector_hits_filtered(row, &metadata_filter, top_k)?,
+                        total_considered,
+                    })
+                })
+                .collect::<Result<Vec<_>, CoreError>>();
+        }
         Ok(index
             .search_batch(query_vectors, top_k, &allowlist)?
             .into_iter()
@@ -6221,23 +6568,68 @@ impl VectorOnlyIndex {
                     .collect();
             }
         }
-        let (total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
-        if empty_filter {
-            return Ok(query_vectors
-                .iter()
-                .map(|_| CoreSearchResults {
-                    hits: Vec::new(),
-                    total_considered,
-                })
-                .collect());
-        }
-        let scan_capacity = if filter.is_none() {
+        let filter_plan = self.query_filter_plan(filter)?;
+        let (total_considered, allowlist, predicate, plan_unfiltered) = match filter_plan {
+            QueryFilterPlan::Empty { total_considered } => {
+                return Ok(query_vectors
+                    .iter()
+                    .map(|_| CoreSearchResults {
+                        hits: Vec::new(),
+                        total_considered,
+                    })
+                    .collect());
+            }
+            QueryFilterPlan::Unfiltered { total_considered } => {
+                (total_considered, Vec::new(), None, true)
+            }
+            QueryFilterPlan::Allowlist {
+                total_considered,
+                chunk_ids,
+            } => (total_considered, chunk_ids, None, false),
+            QueryFilterPlan::Predicate {
+                metadata_filter,
+                total_considered,
+                failing_document_count,
+                failing_document_ids,
+            } => (
+                total_considered,
+                Vec::new(),
+                Some((metadata_filter, failing_document_ids, failing_document_count)),
+                false,
+            ),
+        };
+        // Same plan-shape gate as the single-query rescore above: an
+        // all-matching filter plans as Unfiltered and must keep full capacity.
+        let scan_capacity = if plan_unfiltered || predicate.is_some() {
             self.live_chunk_count()
         } else {
             allowlist.len()
         };
         let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
         let index = self.turbovec_index()?;
+        if let Some((metadata_filter, failing_document_ids, failing_document_count)) = predicate {
+            let candidate_k = self.deferred_candidate_count(
+                candidate_k,
+                failing_document_ids.as_ref(),
+                failing_document_count,
+            );
+            return index
+                .search_batch(query_vectors, candidate_k, &[])?
+                .into_iter()
+                .zip(query_vectors)
+                .map(|(raw_hits, query)| {
+                    let rescored = self.rescore_raw_hits(query, raw_hits, candidate_k);
+                    Ok(CoreSearchResults {
+                        hits: self.assemble_vector_hits_filtered(
+                            rescored,
+                            &metadata_filter,
+                            top_k,
+                        )?,
+                        total_considered,
+                    })
+                })
+                .collect::<Result<Vec<_>, CoreError>>();
+        }
         Ok(index
             .search_batch(query_vectors, candidate_k, &allowlist)?
             .into_iter()
@@ -6275,16 +6667,28 @@ impl VectorOnlyIndex {
             let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, filter)?;
             return Ok(pack_results_to_arrays(&results, nq));
         }
-        let (_total_considered, allowlist, empty_filter) = self.query_allowlist(filter)?;
-        if empty_filter {
-            return Ok(VectorBatchArrays {
-                nq,
-                k: 0,
-                scores: Vec::new(),
-                document_ids: Vec::new(),
-                metadata: Vec::new(),
-            });
-        }
+        let filter_plan = self.query_filter_plan(filter)?;
+        let allowlist = match filter_plan {
+            QueryFilterPlan::Empty { .. } => {
+                return Ok(VectorBatchArrays {
+                    nq,
+                    k: 0,
+                    scores: Vec::new(),
+                    document_ids: Vec::new(),
+                    metadata: Vec::new(),
+                });
+            }
+            QueryFilterPlan::Unfiltered { .. } => Vec::new(),
+            QueryFilterPlan::Allowlist { chunk_ids, .. } => chunk_ids,
+            QueryFilterPlan::Predicate { .. } => {
+                let dim = self.vector_dim;
+                let query_vectors: Vec<Vec<f32>> = (0..nq)
+                    .map(|i| queries[i * dim..(i + 1) * dim].to_vec())
+                    .collect();
+                let results = self.query_vectors_batch_turbovec(&query_vectors, top_k, filter)?;
+                return Ok(pack_results_to_arrays(&results, nq));
+            }
+        };
         let index = self.turbovec_index()?;
         let (scores, document_ids, k) =
             index.search_batch_arrays(queries, nq, top_k, &allowlist)?;
