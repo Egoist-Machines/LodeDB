@@ -495,6 +495,9 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     )
     assert applied["embedded_chunks"] == 1
     assert applied["embedding_time_ms"] == 1.25
+    stats = _loads(engine.stats("text"))
+    assert stats["document_count"] == 1
+    assert stats["chunk_count"] == 1
     assert _loads(engine.get_document_text("text", "doc-alpha")) == (
         "Alpha launch notes mention error code E-1001."
     )
@@ -511,9 +514,11 @@ def test_native_core_extension_executes_text_prepare_apply_flow() -> None:
     assert record["metadata"] == {"topic": "ops"}
     assert record["chunk_count"] == 1
     assert "text" not in record
-    assert _loads(
+    documents = _loads(
         engine.list_documents("text", json.dumps({"metadata": {"topic": "ops"}}), None, None)
-    )[0]["document_id"] == "doc-alpha"
+    )
+    assert [document["document_id"] for document in documents] == ["doc-alpha"]
+    assert documents[0]["metadata"] == {"topic": "ops"}
 
     query_plan = _loads(engine.prepare_query_text("E-1001", "vector"))
     assert query_plan["requires_embedding"] is True

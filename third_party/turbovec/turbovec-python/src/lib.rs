@@ -1193,13 +1193,10 @@ impl PyCoreEngine {
         native_to_json(&results)
     }
 
-    fn stats(&self, index_id: &str) -> PyResult<String> {
-        native_to_json(
-            &self
-                .inner
-                .stats(index_id)
-                .map_err(native_core_error_to_py)?,
-        )
+    fn stats(&self, py: Python<'_>, index_id: &str) -> PyResult<String> {
+        let index_id = index_id.to_owned();
+        let stats = self.detached(py, move |inner| inner.stats(&index_id))?;
+        native_to_json(&stats)
     }
 
     fn document_token_lists(&self, index_id: &str) -> PyResult<String> {
@@ -1220,14 +1217,18 @@ impl PyCoreEngine {
         )
     }
 
-    fn get_document_texts(&self, index_id: &str, document_ids_json: &str) -> PyResult<String> {
+    fn get_document_texts(
+        &self,
+        py: Python<'_>,
+        index_id: &str,
+        document_ids_json: &str,
+    ) -> PyResult<String> {
         let document_ids = native_from_json::<Vec<String>>(document_ids_json)?;
-        native_to_json(
-            &self
-                .inner
-                .get_document_texts(index_id, &document_ids)
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let texts = self.detached(py, move |inner| {
+            inner.get_document_texts(&index_id, &document_ids)
+        })?;
+        native_to_json(&texts)
     }
 
     fn get_vectors(&self, index_id: &str, ids_json: &str) -> PyResult<String> {
@@ -1251,18 +1252,19 @@ impl PyCoreEngine {
 
     fn list_documents(
         &self,
+        py: Python<'_>,
         index_id: &str,
         filter_json: Option<&str>,
         after: Option<&str>,
         limit: Option<usize>,
     ) -> PyResult<String> {
         let filter = native_optional_value(filter_json)?;
-        native_to_json(
-            &self
-                .inner
-                .list_documents(index_id, filter.as_ref(), after, limit)
-                .map_err(native_core_error_to_py)?,
-        )
+        let index_id = index_id.to_owned();
+        let after = after.map(str::to_owned);
+        let documents = self.detached(py, move |inner| {
+            inner.list_documents(&index_id, filter.as_ref(), after.as_deref(), limit)
+        })?;
+        native_to_json(&documents)
     }
 
     fn persist(&mut self, py: Python<'_>) -> PyResult<()> {
