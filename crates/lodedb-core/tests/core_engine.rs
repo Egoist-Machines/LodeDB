@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lodedb_core::engine::{CoreAppender, CoreCheckpointer, CoreEngine};
+use lodedb_core::filter::{coerce_sdk_filter, matches_metadata_filter};
 use lodedb_core::stable_uint64_ids_for_chunk_ids;
 use lodedb_core::types::{
     CoreAnnOptions, CoreDocument, CoreIndexCreateOptions, CoreOpenOptions, CoreRescoreOptions,
@@ -29,6 +30,18 @@ fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn doc(id: &str, axis: usize, metadata: BTreeMap<String, String>) -> CoreVectorDocument {
     let mut vector = vec![0.0; 8];
     vector[axis] = 1.0;
+    CoreVectorDocument {
+        document_id: id.to_string(),
+        vector,
+        metadata,
+        text: None,
+        patch_matrix: None,
+    }
+}
+
+fn scored_doc(id: &str, score: f32, metadata: BTreeMap<String, String>) -> CoreVectorDocument {
+    let mut vector = vec![0.0; 8];
+    vector[0] = score;
     CoreVectorDocument {
         document_id: id.to_string(),
         vector,
@@ -98,9 +111,13 @@ fn list_documents_keyset_cursor_pages_in_id_order() {
             .collect()
     };
 
-    let page1 = engine.list_documents("default", None, None, Some(4)).unwrap();
+    let page1 = engine
+        .list_documents("default", None, None, Some(4))
+        .unwrap();
     assert_eq!(ids(page1), ["d000", "d001", "d002", "d003"]);
-    let page2 = engine.list_documents("default", None, Some("d003"), Some(4)).unwrap();
+    let page2 = engine
+        .list_documents("default", None, Some("d003"), Some(4))
+        .unwrap();
     assert_eq!(ids(page2), ["d004", "d005"]);
 
     // The cursor composes with a filter (topic=a is d000, d002, d004).
@@ -109,6 +126,20 @@ fn list_documents_keyset_cursor_pages_in_id_order() {
         .list_documents("default", Some(&filter), Some("d000"), Some(2))
         .unwrap();
     assert_eq!(ids(filtered), ["d002", "d004"]);
+
+    // limit=0 is an empty page on every plan shape, with or without a cursor.
+    assert!(engine
+        .list_documents("default", None, None, Some(0))
+        .unwrap()
+        .is_empty());
+    assert!(engine
+        .list_documents("default", Some(&filter), None, Some(0))
+        .unwrap()
+        .is_empty());
+    assert!(engine
+        .list_documents("default", Some(&filter), Some("d000"), Some(0))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -134,7 +165,12 @@ fn get_vectors_is_explicit_ordered_and_payload_separate() {
     assert!(rows.iter().all(|row| row.vector.len() == 8));
 
     for (row, expected_axis) in rows.iter().zip([1, 0]) {
-        let norm = row.vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        let norm = row
+            .vector
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
         assert!(
             row.vector[expected_axis] / norm > 0.8,
             "reconstructed vector must remain in the caller's embedding space"
@@ -147,9 +183,7 @@ fn get_vectors_is_explicit_ordered_and_payload_separate() {
         "payload-free document reads remain unchanged"
     );
     assert!(engine.get_vectors("default", &[]).unwrap().is_empty());
-    assert!(engine
-        .get_vectors("default", &[" ".to_string()])
-        .is_err());
+    assert!(engine.get_vectors("default", &[" ".to_string()]).is_err());
 }
 
 #[test]
@@ -357,6 +391,453 @@ fn metadata_and_document_id_filters_match_python_semantics() {
         .unwrap();
     assert_eq!(by_ids.hits[0].document_id, "a");
     assert_eq!(by_ids.total_considered, 1);
+}
+
+#[test]
+fn expiration_filter_overfetches_before_predicate_drop() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                scored_doc("expired", 10.0, metadata(&[("expires", "10")])),
+                scored_doc("future", 9.0, metadata(&[("expires", "30")])),
+                scored_doc("missing-a", 8.0, metadata(&[])),
+                scored_doc("missing-b", 7.0, metadata(&[])),
+            ],
+        )
+        .unwrap();
+
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+    let results = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&filter),
+        )
+        .unwrap();
+
+    assert_eq!(results.total_considered, 3);
+    assert_eq!(
+        results
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect::<Vec<_>>(),
+        ["future", "missing-a", "missing-b"]
+    );
+}
+
+#[test]
+fn document_ids_metadata_filter_matches_metadata_intersection() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                scored_doc("expired", 10.0, metadata(&[("expires", "10")])),
+                scored_doc("future", 9.0, metadata(&[("expires", "30")])),
+                scored_doc("missing", 8.0, metadata(&[])),
+                scored_doc("other", 7.0, metadata(&[])),
+            ],
+        )
+        .unwrap();
+    let metadata_clause = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+    let structured = json!({
+        "document_ids": ["expired", "future", "missing", "absent"],
+        "metadata": metadata_clause,
+    });
+
+    let ids = |rows: Vec<Value>| {
+        rows.into_iter()
+            .map(|row| row["document_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let bounded = ids(engine
+        .list_documents("default", Some(&structured), None, None)
+        .unwrap());
+    let metadata_only = ids(engine
+        .list_documents("default", Some(&metadata_clause), None, None)
+        .unwrap())
+    .into_iter()
+    .filter(|id| id == "future" || id == "missing")
+    .collect::<Vec<_>>();
+
+    assert_eq!(bounded, metadata_only);
+    assert_eq!(bounded, ["future", "missing"]);
+}
+
+#[test]
+fn metadata_filter_handles_empty_and_all_field_corpora() {
+    let mut empty = CoreEngine::new_in_memory();
+    empty.create_index("default", 8, 4).unwrap();
+    let missing_filter = json!({"expires": {"$exists": false}});
+    assert!(empty
+        .list_documents("default", Some(&missing_filter), None, None)
+        .unwrap()
+        .is_empty());
+
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("a", 0, metadata(&[("expires", "10")])),
+                doc("b", 1, metadata(&[("expires", "20")])),
+                doc("c", 2, metadata(&[("expires", "30")])),
+            ],
+        )
+        .unwrap();
+    let none_missing = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&missing_filter),
+        )
+        .unwrap();
+    assert_eq!(none_missing.total_considered, 0);
+    assert!(none_missing.hits.is_empty());
+
+    let present_filter = json!({"expires": {"$exists": true}});
+    let all_present = engine
+        .query_vector(
+            "default",
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&present_filter),
+        )
+        .unwrap();
+    assert_eq!(all_present.total_considered, 3);
+    assert_eq!(all_present.hits.len(), 3);
+}
+
+#[test]
+fn list_documents_pages_deferred_predicate_in_id_order() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine
+        .upsert_vectors(
+            "default",
+            &[
+                doc("d000", 0, metadata(&[("expires", "10")])),
+                doc("d001", 1, metadata(&[])),
+                doc("d002", 2, metadata(&[])),
+                doc("d003", 3, metadata(&[("expires", "30")])),
+                doc("d004", 4, metadata(&[("expires", "5")])),
+            ],
+        )
+        .unwrap();
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "20"}}
+        ]
+    });
+
+    let page = engine
+        .list_documents("default", Some(&filter), Some("d001"), Some(2))
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|row| row["document_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["d002", "d003"]
+    );
+}
+
+#[test]
+#[ignore]
+fn expiration_filter_micro_benchmark() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    let docs = (0..10_000)
+        .map(|i| {
+            if i % 1000 == 0 {
+                scored_doc(
+                    &format!("d{i:05}"),
+                    10_000.0 - i as f32,
+                    metadata(&[("expires", "1")]),
+                )
+            } else {
+                scored_doc(&format!("d{i:05}"), 10_000.0 - i as f32, metadata(&[]))
+            }
+        })
+        .collect::<Vec<_>>();
+    engine.upsert_vectors("default", &docs).unwrap();
+    let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let filter = json!({
+        "$or": [
+            {"expires": {"$exists": false}},
+            {"expires": {"$gt": "2"}}
+        ]
+    });
+
+    let started = std::time::Instant::now();
+    let _ = engine.query_vector("default", &query, 10, None).unwrap();
+    let unfiltered = started.elapsed();
+    let started = std::time::Instant::now();
+    let _ = engine
+        .query_vector("default", &query, 10, Some(&filter))
+        .unwrap();
+    let filtered = started.elapsed();
+    eprintln!("unfiltered={unfiltered:?} filtered_expiration={filtered:?}");
+}
+
+fn recall_shape_filter() -> Value {
+    json!({
+        "$and": [
+            {"namespace": "main"},
+            {"superseded_by": {"$exists": false}},
+            {"$or": [
+                {"expires": {"$exists": false}},
+                {"expires": {"$gt": "50"}}
+            ]}
+        ]
+    })
+}
+
+fn recall_shape_documents() -> Vec<CoreVectorDocument> {
+    (0..20)
+        .map(|i| {
+            let mut entries = Vec::new();
+            entries.push(("namespace", if i < 19 { "main" } else { "other" }));
+            if matches!(i, 0 | 1) {
+                entries.push(("superseded_by", "newer"));
+            }
+            if i == 2 {
+                entries.push(("expires", "10"));
+            } else if matches!(i, 3 | 4) {
+                entries.push(("expires", "90"));
+            }
+            scored_doc(
+                &format!("d{i:02}"),
+                1.0 - i as f32 * 0.01,
+                metadata(&entries),
+            )
+        })
+        .collect()
+}
+
+fn exact_metadata_filtered_ids(
+    documents: &[CoreVectorDocument],
+    filter: &Value,
+    allowed: Option<&BTreeMap<String, ()>>,
+    top_k: usize,
+) -> Vec<String> {
+    let validated = coerce_sdk_filter(filter).unwrap();
+    let mut hits = documents
+        .iter()
+        .filter(|document| {
+            allowed.is_none_or(|allowed| allowed.contains_key(&document.document_id))
+                && matches_metadata_filter(&document.metadata, &validated).unwrap()
+        })
+        .map(|document| (document.document_id.clone(), document.vector[0]))
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap()
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    hits.truncate(top_k);
+    hits.into_iter()
+        .map(|(document_id, _)| document_id)
+        .collect()
+}
+
+#[test]
+fn recall_shape_search_matches_predicate_ground_truth() {
+    let documents = recall_shape_documents();
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", &documents).unwrap();
+    let filter = recall_shape_filter();
+    let query = axis_query(0);
+
+    let hits = engine
+        .query_vector("default", &query, 6, Some(&filter))
+        .unwrap();
+
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        exact_metadata_filtered_ids(&documents, &filter, None, 6)
+    );
+    assert_eq!(
+        hits.total_considered,
+        exact_metadata_filtered_ids(&documents, &filter, None, documents.len()).len()
+    );
+
+    let mut rescored = CoreEngine::new_in_memory();
+    rescored
+        .create_index_with_options(rescore_options_with_oversample("float32", Some(32.0)))
+        .unwrap();
+    rescored.upsert_vectors("default", &documents).unwrap();
+    let rescored_hits = rescored
+        .query_vector("default", &query, 6, Some(&filter))
+        .unwrap();
+    assert_eq!(
+        rescored_hits
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        exact_metadata_filtered_ids(&documents, &filter, None, 6)
+    );
+    assert_eq!(rescored_hits.total_considered, hits.total_considered);
+}
+
+#[test]
+fn recall_shape_exact_denylist_list_and_count_match_ground_truth() {
+    let documents = recall_shape_documents();
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", &documents).unwrap();
+    let filter = recall_shape_filter();
+    let validated = coerce_sdk_filter(&filter).unwrap();
+    let mut expected = documents
+        .iter()
+        .filter(|document| matches_metadata_filter(&document.metadata, &validated).unwrap())
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    let listed = engine
+        .list_documents("default", Some(&filter), None, None)
+        .unwrap();
+    let listed_ids = listed
+        .iter()
+        .map(|row| row["document_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(listed_ids, expected);
+    assert_eq!(listed.len(), expected.len());
+}
+
+#[test]
+fn document_ids_compose_with_recall_shape_anchor() {
+    let documents = recall_shape_documents();
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    engine.upsert_vectors("default", &documents).unwrap();
+    let metadata_filter = recall_shape_filter();
+    let document_ids = (0..18)
+        .map(|i| format!("d{i:02}"))
+        .chain(["d19".to_string()])
+        .collect::<Vec<_>>();
+    let allowed = document_ids
+        .iter()
+        .map(|document_id| (document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let filter = json!({
+        "metadata": metadata_filter,
+        "document_ids": document_ids,
+    });
+    let query = axis_query(0);
+
+    let hits = engine
+        .query_vector("default", &query, 20, Some(&filter))
+        .unwrap();
+
+    assert_eq!(
+        hits.hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>(),
+        exact_metadata_filtered_ids(&documents, &recall_shape_filter(), Some(&allowed), 20)
+    );
+    assert_eq!(hits.total_considered, 15);
+}
+
+#[test]
+fn deferred_predicate_iterative_deepening_fills_underestimated_window() {
+    let mut engine = CoreEngine::new_in_memory();
+    engine.create_index("default", 8, 4).unwrap();
+    let mut documents = vec![
+        text_doc("fail-a", "abc", metadata(&[])),
+        text_doc("fail-b", "def", metadata(&[])),
+    ];
+    for i in 0..6 {
+        documents.push(text_doc(
+            &format!("pass-{i}"),
+            "x",
+            metadata(&[("flag", "yes")]),
+        ));
+    }
+    let plan = engine
+        .prepare_text_upsert("default", &documents, true, true, 1)
+        .unwrap();
+    let embeddings = plan
+        .chunks_to_embed
+        .iter()
+        .map(|chunk| {
+            let mut vector = vec![0.0; 8];
+            vector[0] = if chunk.document_id.starts_with("fail") {
+                1.0
+            } else {
+                0.5
+            };
+            vector[1] = if chunk.document_id.starts_with("pass-") {
+                1.0
+            } else {
+                0.0
+            };
+            vector
+        })
+        .collect::<Vec<_>>();
+    engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+
+    let filter = json!({"flag": {"$exists": true}});
+    let underfilling_query = axis_query(0);
+    let sibling_query = axis_query(1);
+    let single_underfilled = engine
+        .query_vector("default", &underfilling_query, 3, Some(&filter))
+        .unwrap();
+    assert_eq!(single_underfilled.hits.len(), 3);
+    assert_eq!(single_underfilled.total_considered, 6);
+    assert!(single_underfilled
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("pass-")));
+    let single_sibling = engine
+        .query_vector("default", &sibling_query, 3, Some(&filter))
+        .unwrap();
+    assert_eq!(single_sibling.hits.len(), 3);
+    assert_eq!(single_sibling.total_considered, 6);
+    assert!(single_sibling
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("pass-")));
+
+    let batch = engine
+        .query_vectors_batch(
+            "default",
+            &[underfilling_query, sibling_query],
+            3,
+            Some(&filter),
+        )
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0], single_underfilled);
+    assert_eq!(batch[1], single_sibling);
 }
 
 #[test]
@@ -601,23 +1082,31 @@ fn search_embedded_text_batch_matches_looped_single() {
             .iter()
             .map(|query| engine.prepare_query_text(query, mode).unwrap())
             .collect();
-        let embeds: Option<Vec<Vec<f32>>> =
-            if mode == "lexical" { None } else { Some(embeddings.to_vec()) };
+        let embeds: Option<Vec<Vec<f32>>> = if mode == "lexical" {
+            None
+        } else {
+            Some(embeddings.to_vec())
+        };
         let batch = engine
             .search_embedded_text_batch("text", &plans, embeds.as_deref(), 3, None)
             .unwrap();
         assert_eq!(batch.len(), queries.len());
         for (i, query_plan) in plans.iter().enumerate() {
-            let single_embed: Option<&[f32]> =
-                if mode == "lexical" { None } else { Some(embeddings[i].as_slice()) };
+            let single_embed: Option<&[f32]> = if mode == "lexical" {
+                None
+            } else {
+                Some(embeddings[i].as_slice())
+            };
             let single = engine
                 .search_embedded_text("text", query_plan, single_embed, 3, None)
                 .unwrap();
             let batch_ids: Vec<&String> =
                 batch[i].hits.iter().map(|hit| &hit.document_id).collect();
-            let single_ids: Vec<&String> =
-                single.hits.iter().map(|hit| &hit.document_id).collect();
-            assert_eq!(batch_ids, single_ids, "mode {mode} query {i}: batch != single");
+            let single_ids: Vec<&String> = single.hits.iter().map(|hit| &hit.document_id).collect();
+            assert_eq!(
+                batch_ids, single_ids,
+                "mode {mode} query {i}: batch != single"
+            );
         }
     }
     // Mixed modes in one batch are rejected (search_many applies a single mode).
@@ -1368,7 +1857,9 @@ fn cleared_patch_matrix_does_not_resurrect_on_reload() {
     // path where an omitted clear would let the base matrix survive.
     {
         let mut engine = CoreEngine::open(options.clone()).unwrap();
-        engine.upsert_vectors("default", &[without_matrix()]).unwrap();
+        engine
+            .upsert_vectors("default", &[without_matrix()])
+            .unwrap();
         engine.persist().unwrap();
     }
     // 3. Reopen: the matrix must be gone. query_multivector skips matrix-less
@@ -1567,7 +2058,9 @@ fn refresh_keeps_the_last_good_view_when_a_reload_fails() {
             .append_vectors(&[doc("overlaid", 1, metadata(&[("kind", "wal")]))])
             .expect("append overlaid record");
     }
-    reader.refresh().expect("first refresh overlays the appended record");
+    reader
+        .refresh()
+        .expect("first refresh overlays the appended record");
     assert_eq!(reader.stats("default").unwrap().document_count, 2);
 
     // A record only the Python engine can replay now lands in the WAL. The next
@@ -1752,7 +2245,10 @@ fn read_only_refresh_overlays_wal_tail_for_read_your_writes() {
     let mut reader2 = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
     reader2.refresh().unwrap();
     assert_eq!(
-        reader2.list_documents("default", None, None, None).unwrap().len(),
+        reader2
+            .list_documents("default", None, None, None)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -1864,13 +2360,17 @@ fn pure_no_op_fold_persists_watermark_and_truncates() {
     {
         let mut engine = CoreEngine::open(opts.clone()).unwrap();
         create_vector_only_index(&mut engine);
-        engine.upsert_vectors("default", &[doc("dup", 0, metadata(&[]))]).unwrap();
+        engine
+            .upsert_vectors("default", &[doc("dup", 0, metadata(&[]))])
+            .unwrap();
         engine.persist().unwrap();
     }
     // An appender re-adds the identical document: its fold is a pure no-op.
     let noop_lsn = {
         let appender = CoreAppender::open(opts.clone()).expect("open appender");
-        appender.append_vectors(&[doc("dup", 0, metadata(&[]))]).expect("append")
+        appender
+            .append_vectors(&[doc("dup", 0, metadata(&[]))])
+            .expect("append")
     };
     // A writer opens (folds the no-op, commits the watermark) and closes.
     {
@@ -1881,7 +2381,9 @@ fn pure_no_op_fold_persists_watermark_and_truncates() {
     // (which rejects an unfolded WAL) stays safe.
     let wal = lodedb_core::storage::wal::wal_path(&path, INDEX_KEY);
     assert!(
-        lodedb_core::storage::wal::read_records(&wal).unwrap().is_empty(),
+        lodedb_core::storage::wal::read_records(&wal)
+            .unwrap()
+            .is_empty(),
         "the no-op fold's watermark should be durable, letting the WAL truncate"
     );
     // The watermark-only commit re-seals just the manifest: it must not append a
@@ -1894,7 +2396,12 @@ fn pure_no_op_fold_persists_watermark_and_truncates() {
             && entry.file_name().to_string_lossy().ends_with(".json-delta")
         {
             for segment in fs::read_dir(entry.path()).unwrap() {
-                if segment.unwrap().file_name().to_string_lossy().ends_with(".jsd") {
+                if segment
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".jsd")
+                {
                     delta_segments += 1;
                 }
             }
@@ -1978,7 +2485,10 @@ fn concurrent_appenders_are_folded_by_the_next_writer() {
     // WAL round-trip.
     let mut probe = vec![0.0_f32; 8];
     probe[3] = 1.0;
-    let hits = writer.query_vector("default", &probe, 1, None).unwrap().hits;
+    let hits = writer
+        .query_vector("default", &probe, 1, None)
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 1);
     assert!(hits[0].document_id.starts_with("doc-"));
     drop(writer);
@@ -2056,7 +2566,10 @@ fn appended_text_documents_fold_into_the_next_writer() {
     {
         let engine = CoreEngine::open(writer_opts).unwrap();
         let stats = engine.stats("default").unwrap();
-        assert_eq!(stats.document_count, 2, "appended text documents did not fold");
+        assert_eq!(
+            stats.document_count, 2,
+            "appended text documents did not fold"
+        );
         // The indexed caption tokens survive the fold, so lexical search finds them.
         let query = engine.prepare_query_text("hello", "lexical").unwrap();
         let hits = engine
@@ -2223,8 +2736,8 @@ fn appended_text_without_retention_clears_a_prior_writers_raw_text() {
     opts.acquire_writer_lock = true;
     opts.store_text = true;
     opts.index_text = false; // the lexical index is rebuilt from raw text on load
-    // "a" first (chunk index 0 -> unit(0)) so the appender's single-doc plan embeds
-    // it to the identical vector, keeping the calibration fingerprint unchanged.
+                             // "a" first (chunk index 0 -> unit(0)) so the appender's single-doc plan embeds
+                             // it to the identical vector, keeping the calibration fingerprint unchanged.
     let seed = [
         text_doc("a", "alpha zzzuniquezzz token", metadata(&[])),
         text_doc("b", "second filler document", metadata(&[])),
@@ -2272,7 +2785,9 @@ fn appended_text_without_retention_clears_a_prior_writers_raw_text() {
     // index has no "a" (b..e, untouched by the fold, keep their base text).
     {
         let engine = CoreEngine::open(opts).unwrap();
-        let query = engine.prepare_query_text("zzzuniquezzz", "lexical").unwrap();
+        let query = engine
+            .prepare_query_text("zzzuniquezzz", "lexical")
+            .unwrap();
         let hits = engine
             .search_embedded_text("default", &query, None, 5, None)
             .unwrap();
@@ -2342,7 +2857,9 @@ fn appended_text_without_indexing_clears_a_prior_writers_lexical() {
     // Fresh index_text=true load: "a"'s old tokens must be gone from the `.tvlex` base.
     {
         let engine = CoreEngine::open(opts).unwrap();
-        let query = engine.prepare_query_text("zzzuniquezzz", "lexical").unwrap();
+        let query = engine
+            .prepare_query_text("zzzuniquezzz", "lexical")
+            .unwrap();
         let hits = engine
             .search_embedded_text("default", &query, None, 5, None)
             .unwrap();
@@ -2459,7 +2976,10 @@ fn checkpointer_lease_excludes_a_second_checkpointer() {
     // A second checkpointer cannot take the lease while the first holds it.
     let second = CoreCheckpointer::open(opts);
     std::env::remove_var("LODEDB_PERSIST_LOCK_TIMEOUT");
-    assert!(second.is_err(), "the lease must exclude a second checkpointer");
+    assert!(
+        second.is_err(),
+        "the lease must exclude a second checkpointer"
+    );
     drop(first); // release the lease before deleting the directory
     fs::remove_dir_all(path).unwrap();
 }
@@ -2539,7 +3059,10 @@ fn checkpointer_folds_while_a_long_lived_appender_stays_open() {
         .append_vectors(&[doc("a", 0, metadata(&[]))])
         .unwrap();
     // The checkpointer folds while the appender is STILL open.
-    assert_eq!(checkpointer.checkpoint().expect("fold with appender open"), 1);
+    assert_eq!(
+        checkpointer.checkpoint().expect("fold with appender open"),
+        1
+    );
     // The appender keeps logging after the fold; a second checkpoint folds that too.
     appender
         .append_vectors(&[doc("b", 1, metadata(&[]))])
@@ -2598,7 +3121,9 @@ fn appender_repairs_a_torn_wal_tail() {
             .append(true)
             .open(&wal)
             .expect("open wal for torn write");
-        handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+        handle
+            .write_all(&[0, 0, 0, 5, 1, 2])
+            .expect("write torn frame");
     }
     // The next appender repairs the torn tail, so its record lands after the good
     // one rather than after the torn bytes.
@@ -2837,7 +3362,9 @@ fn appender_repairs_torn_tail_between_appends() {
                 .append(true)
                 .open(&wal)
                 .expect("open wal for torn write");
-            handle.write_all(&[0, 0, 0, 5, 1, 2]).expect("write torn frame");
+            handle
+                .write_all(&[0, 0, 0, 5, 1, 2])
+                .expect("write torn frame");
         }
         appender
             .append_vectors(&[doc("second", 1, metadata(&[("n", "2")]))])
@@ -3014,7 +3541,10 @@ fn appender_open_reseed_does_not_let_a_peer_reuse_an_lsn() {
     let lsn = x
         .append_vectors(&[doc("x-doc", 4, metadata(&[("s", "x")]))])
         .expect("append X");
-    assert!(lsn > 2, "X reused an LSN through the healed counter: got {lsn}");
+    assert!(
+        lsn > 2,
+        "X reused an LSN through the healed counter: got {lsn}"
+    );
     drop(x);
     drop(y);
     let writer = CoreEngine::open(base).unwrap();
@@ -3039,7 +3569,9 @@ fn appender_retains_text_only_under_store_text() {
         let appender = CoreAppender::open(with_text.clone()).expect("open appender (store_text)");
         let mut document = doc("with-text", 0, metadata(&[("kind", "image")]));
         document.text = Some("a red bicycle by the canal".to_string());
-        appender.append_vectors(&[document]).expect("append with text");
+        appender
+            .append_vectors(&[document])
+            .expect("append with text");
     }
     {
         let writer = CoreEngine::open(with_text).unwrap();
@@ -3063,7 +3595,9 @@ fn appender_retains_text_only_under_store_text() {
             CoreAppender::open(private_mode.clone()).expect("open appender (private mode)");
         let mut document = doc("captioned", 1, metadata(&[]));
         document.text = Some("turquoise dragon".to_string());
-        appender.append_vectors(&[document]).expect("append captioned");
+        appender
+            .append_vectors(&[document])
+            .expect("append captioned");
     }
     // Inspect the appended record before a writer folds and truncates the WAL: it
     // carries derived tokens but no raw text.
@@ -3111,7 +3645,10 @@ fn appender_and_writer_log_byte_identical_upsert_vectors() {
         let records = lodedb_core::storage::wal::read_records(&wal).expect("read wal");
         let record = records.last().expect("a logged upsert_vectors record");
         assert_eq!(record.op, "upsert_vectors");
-        assert!(record.payload.get("lsn").is_none(), "lsn is lifted out on read");
+        assert!(
+            record.payload.get("lsn").is_none(),
+            "lsn is lifted out on read"
+        );
         record.payload.clone()
     };
 
@@ -3256,7 +3793,9 @@ fn appender_privacy_mode_tokens_persist_across_reopen() {
         let appender = CoreAppender::open(base.clone()).expect("open appender");
         let mut document = doc("d1", 0, metadata(&[]));
         document.text = Some("turquoise dragon".to_string());
-        appender.append_vectors(&[document]).expect("append caption");
+        appender
+            .append_vectors(&[document])
+            .expect("append caption");
     }
     // A writer replays (upsert no-op + token restore) and checkpoints, truncating
     // the WAL. Applying the token restore must advance the generation epoch so
@@ -3276,7 +3815,11 @@ fn appender_privacy_mode_tokens_persist_across_reopen() {
         let hits = writer
             .search_embedded_text("default", &plan, None, 1, None)
             .unwrap();
-        assert_eq!(hits.hits.len(), 1, "restored caption tokens were dropped at checkpoint");
+        assert_eq!(
+            hits.hits.len(),
+            1,
+            "restored caption tokens were dropped at checkpoint"
+        );
         assert_eq!(hits.hits[0].document_id, "d1");
     }
     fs::remove_dir_all(path).unwrap();
@@ -3363,7 +3906,9 @@ fn replayed_empty_caption_matches_a_live_written_store() {
     }
     {
         let appender = CoreAppender::open(base_replayed.clone()).expect("open appender");
-        appender.append_vectors(&documents()).expect("append vectors");
+        appender
+            .append_vectors(&documents())
+            .expect("append vectors");
     }
 
     let folded = CoreEngine::open(base_replayed).unwrap();
@@ -3408,7 +3953,7 @@ fn cleared_caption_does_not_resurrect_after_reopen() {
         second.text = Some("crimson kraken".to_string());
         engine.upsert_vectors("default", &[first, second]).unwrap();
         engine.persist().unwrap(); // the tvlex base holds both captions
-        // Live clear: replace d1's caption with one that tokenizes to nothing.
+                                   // Live clear: replace d1's caption with one that tokenizes to nothing.
         engine
             .update_document_payload("default", "d1", None, Some(Some("///".to_string())))
             .unwrap();
@@ -3464,7 +4009,10 @@ fn text_only_payload_update_survives_the_checkpoint() {
     {
         let engine = CoreEngine::open(base.clone()).unwrap();
         assert_eq!(
-            engine.get_document_text("default", "d1").unwrap().as_deref(),
+            engine
+                .get_document_text("default", "d1")
+                .unwrap()
+                .as_deref(),
             Some("new caption"),
             "a text-only update was truncated away with the WAL"
         );
@@ -3755,7 +4303,10 @@ fn ann_recovers_exact_top_k_on_separated_clusters() {
     let exact_hits = exact.query_vector("default", &query, 5, None).unwrap();
     let ann_hits = ann.query_vector("default", &query, 5, None).unwrap();
     assert_eq!(hit_keys(&exact_hits), hit_keys(&ann_hits));
-    assert!(ann_hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    assert!(ann_hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
 }
 
 #[test]
@@ -3823,7 +4374,9 @@ fn ann_returns_full_top_k_when_nearest_cluster_is_small() {
         }
     }
     let ann = ann_engine(&docs, 8, 1);
-    let hits = ann.query_vector("default", &axis_query(0), 8, None).unwrap();
+    let hits = ann
+        .query_vector("default", &axis_query(0), 8, None)
+        .unwrap();
     assert_eq!(hits.hits.len(), 8);
 }
 
@@ -3835,10 +4388,16 @@ fn ann_batch_queries_match_looping_singles() {
     let ann = ann_engine(&docs, 4, 1);
     let queries: Vec<Vec<f32>> = [0usize, 2, 4, 6].iter().map(|&a| axis_query(a)).collect();
 
-    let batch = ann.query_vectors_batch("default", &queries, 5, None).unwrap();
+    let batch = ann
+        .query_vectors_batch("default", &queries, 5, None)
+        .unwrap();
     for (i, query) in queries.iter().enumerate() {
         let single = ann.query_vector("default", query, 5, None).unwrap();
-        assert_eq!(hit_keys(&batch[i]), hit_keys(&single), "batch != single at {i}");
+        assert_eq!(
+            hit_keys(&batch[i]),
+            hit_keys(&single),
+            "batch != single at {i}"
+        );
     }
 
     let flat: Vec<f32> = queries.iter().flatten().copied().collect();
@@ -3929,7 +4488,9 @@ fn ann_tiny_corpus_falls_back_to_exact() {
     ann.create_index_with_options(ann_options(4, 1)).unwrap();
     ann.upsert_vectors("default", &[vector_doc("only", axis_query(0))])
         .unwrap();
-    let hits = ann.query_vector("default", &axis_query(0), 3, None).unwrap();
+    let hits = ann
+        .query_vector("default", &axis_query(0), 3, None)
+        .unwrap();
     assert_eq!(hits.hits.len(), 1);
     assert_eq!(hits.hits[0].document_id, "only");
 }
@@ -3943,8 +4504,7 @@ fn rejects_invalid_ann_options() {
     ];
     for (index, (algorithm, clusters, nprobe)) in cases.into_iter().enumerate() {
         let mut engine = CoreEngine::new_in_memory();
-        let mut options =
-            CoreIndexCreateOptions::native_default(format!("idx{index}"), 8, 4);
+        let mut options = CoreIndexCreateOptions::native_default(format!("idx{index}"), 8, 4);
         options.ann = Some(CoreAnnOptions {
             algorithm: algorithm.to_string(),
             clusters,
@@ -3998,7 +4558,10 @@ fn ann_config_persists_and_survives_reopen() {
         .query_vector("default", &axis_query(0), 5, None)
         .unwrap();
     assert_eq!(hits.hits.len(), 5);
-    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
 }
@@ -4167,9 +4730,14 @@ fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
         let mut engine = ann_durable(&path);
         engine.upsert_vectors("default", &blob_docs()).unwrap();
         // Query to build the cluster index, then checkpoint it to a `.tvann` base.
-        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
         engine.persist().unwrap();
-        assert!(has_file_with_ext(&path, "tvann"), "persist must write a .tvann base");
+        assert!(
+            has_file_with_ext(&path, "tvann"),
+            "persist must write a .tvann base"
+        );
         drop(engine);
     }
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
@@ -4183,7 +4751,10 @@ fn ann_cluster_index_persists_and_is_adopted_on_reopen() {
         .query_vector("default", &axis_query(0), 5, None)
         .unwrap();
     assert_eq!(hits.hits.len(), 5);
-    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
 }
@@ -4334,7 +4905,10 @@ fn ingest_only_commit_skips_the_cold_sidecar_build() {
         .query_vector("default", &axis_query(0), 5, None)
         .unwrap();
     assert_eq!(hits.hits.len(), 5);
-    assert!(hits.hits.iter().all(|hit| hit.document_id.starts_with("b0")));
+    assert!(hits
+        .hits
+        .iter()
+        .all(|hit| hit.document_id.starts_with("b0")));
     assert!(reopened.ann_cluster_resident("default").unwrap());
     drop(reopened);
     fs::remove_dir_all(path).unwrap();
@@ -4350,7 +4924,9 @@ fn ann_reopen_reflects_reembedded_vector() {
     {
         let mut engine = ann_durable(&path);
         engine.upsert_vectors("default", &blob_docs()).unwrap();
-        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
         engine.persist().unwrap();
         drop(engine);
     }
@@ -4364,7 +4940,9 @@ fn ann_reopen_reflects_reembedded_vector() {
         drop(engine);
     }
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
-    let hits = reopened.query_vector("default", &axis_query(4), 6, None).unwrap();
+    let hits = reopened
+        .query_vector("default", &axis_query(4), 6, None)
+        .unwrap();
     assert!(
         hits.hits.iter().any(|hit| hit.document_id == "b0c0"),
         "a re-embedded vector must be served at its new location after reopen"
@@ -4482,9 +5060,14 @@ fn exact_store_writes_no_tvann_sidecar() {
     let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     engine.create_index("default", 8, 4).unwrap();
     engine.upsert_vectors("default", &blob_docs()).unwrap();
-    let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+    let _ = engine
+        .query_vector("default", &axis_query(0), 5, None)
+        .unwrap();
     engine.persist().unwrap();
-    assert!(!has_file_with_ext(&path, "tvann"), "an exact store must not write a .tvann");
+    assert!(
+        !has_file_with_ext(&path, "tvann"),
+        "an exact store must not write a .tvann"
+    );
     drop(engine);
     let reopened = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
     assert!(!reopened.ann_cluster_resident("default").unwrap());
@@ -4509,7 +5092,10 @@ fn rescore_options_with_oversample(dtype: &str, oversample: Option<f32>) -> Core
 }
 
 fn fp32_dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(left, right)| left * right).sum()
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
 }
 
 fn exact_fp32_hits(
@@ -4633,8 +5219,12 @@ fn rescore_float16_preserves_originals_across_reopen() {
     let original = rescore_vector("fine", 0.0);
     {
         let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-        engine.create_index_with_options(rescore_options("float16")).unwrap();
-        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine
+            .create_index_with_options(rescore_options("float16"))
+            .unwrap();
+        engine
+            .upsert_vectors("default", std::slice::from_ref(&original))
+            .unwrap();
         engine.persist().unwrap();
     }
     let (manifest, rows) = tvvf_rows(&path, &["fine"]);
@@ -4673,8 +5263,12 @@ fn rescore_float32_and_int8_round_trip() {
         let path = unique_temp_dir(&format!("rescore_{dtype}"));
         let original = rescore_vector("fine", 0.02);
         let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-        engine.create_index_with_options(rescore_options(dtype)).unwrap();
-        engine.upsert_vectors("default", std::slice::from_ref(&original)).unwrap();
+        engine
+            .create_index_with_options(rescore_options(dtype))
+            .unwrap();
+        engine
+            .upsert_vectors("default", std::slice::from_ref(&original))
+            .unwrap();
         engine.persist().unwrap();
         drop(engine);
         let (manifest, rows) = tvvf_rows(&path, &["fine"]);
@@ -4743,6 +5337,177 @@ fn rescore_lifts_four_bit_recall_for_full_and_filtered_queries() {
     for (hit, (_, score)) in filtered.hits.iter().zip(&expected_filtered) {
         assert_eq!(hit.score.to_bits(), score.to_bits());
     }
+}
+
+#[test]
+fn rescored_counts_only_deferral_matches_forced_full_window() {
+    let (mut documents, query) = rescore_boundary_docs();
+    for (index, document) in documents.iter_mut().enumerate() {
+        if index < 14 {
+            document
+                .metadata
+                .insert("flag".to_string(), "yes".to_string());
+        }
+    }
+    let filter = json!({"flag": {"$exists": true}});
+    let allowed = documents
+        .iter()
+        .filter(|document| document.metadata.contains_key("flag"))
+        .map(|document| (document.document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = exact_fp32_hits(&documents, &query, Some(&allowed), 3);
+    let engine = rescore_engine(&documents, 1_000_000.0);
+
+    let deferred = engine
+        .query_vector("default", &query, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vector(
+            "default",
+            &query,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.total_considered, allowed.len());
+    assert_eq!(hit_keys(&deferred), hit_keys(&forced));
+    assert_eq!(
+        deferred
+            .hits
+            .iter()
+            .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(document_id, score)| (document_id.clone(), score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Sixteen one-chunk docs where the five docs failing the filter outrank every
+/// passing one, so a bounded first-stage window sees only failing chunks.
+fn counts_only_crowded_docs() -> (Vec<CoreVectorDocument>, BTreeMap<String, ()>) {
+    let documents = (0..16)
+        .map(|index| {
+            let mut entries = BTreeMap::new();
+            if index >= 5 {
+                entries.insert("flag".to_string(), "yes".to_string());
+            }
+            scored_doc(&format!("doc-{index:02}"), 2.0 - index as f32 * 0.1, entries)
+        })
+        .collect::<Vec<_>>();
+    let allowed = documents
+        .iter()
+        .filter(|document| document.metadata.contains_key("flag"))
+        .map(|document| (document.document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    (documents, allowed)
+}
+
+#[test]
+fn rescored_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    // Eleven of sixteen docs match, so the planner blind-defers with counts
+    // only (no failing ids), and oversample 1.0 makes the first-stage window
+    // exactly top_k rows -- all of them failing. The deferred scan must deepen
+    // past that prefix and return the same page as the materialized
+    // document_ids query.
+    let (documents, allowed) = counts_only_crowded_docs();
+    let query = axis_query(0);
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vector("default", &query, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vector(
+            "default",
+            &query,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.total_considered, allowed.len());
+    assert_eq!(
+        deferred.hits.len(),
+        3,
+        "the deferred scan must deepen past the failing ranked prefix"
+    );
+    assert_eq!(hit_keys(&deferred), hit_keys(&forced));
+}
+
+#[test]
+fn rescored_batch_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    let (documents, allowed) = counts_only_crowded_docs();
+    let queries = vec![axis_query(0), axis_query(0)];
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vectors_batch("default", &queries, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vectors_batch(
+            "default",
+            &queries,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.len(), 2);
+    for (deferred_row, forced_row) in deferred.iter().zip(&forced) {
+        assert_eq!(deferred_row.total_considered, allowed.len());
+        assert_eq!(
+            deferred_row.hits.len(),
+            3,
+            "every batch row must deepen past the failing ranked prefix"
+        );
+        assert_eq!(hit_keys(deferred_row), hit_keys(forced_row));
+    }
+}
+
+#[test]
+fn rescored_arrays_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    let (documents, allowed) = counts_only_crowded_docs();
+    let query = axis_query(0);
+    let flat = [query.clone(), query.clone()].concat();
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vectors_batch_arrays("default", &flat, 8, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vectors_batch_arrays(
+            "default",
+            &flat,
+            8,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.nq, 2);
+    assert_eq!(
+        deferred.k, 3,
+        "every arrays row must deepen past the failing ranked prefix"
+    );
+    assert_eq!(deferred.document_ids, forced.document_ids);
+    assert_eq!(
+        deferred
+            .scores
+            .iter()
+            .map(|score| score.to_bits())
+            .collect::<Vec<_>>(),
+        forced
+            .scores
+            .iter()
+            .map(|score| score.to_bits())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4966,7 +5731,10 @@ fn rescore_off_queries_keep_plain_scores_and_huge_oversample_clamps() {
     let second = exact_engine(&documents)
         .query_vector("default", &query, 3, None)
         .unwrap();
-    assert_eq!(first, second, "a store without rescore keeps the plain scan path");
+    assert_eq!(
+        first, second,
+        "a store without rescore keeps the plain scan path"
+    );
 
     let tiny = &documents[..2];
     let rescored = rescore_engine(tiny, 1_000_000.0)
@@ -5049,7 +5817,10 @@ fn failed_lazy_sidecar_open_latches_and_drops_the_stale_manifest() {
         lodedb_core::storage::LoadOptions::default(),
     )
     .unwrap();
-    assert!(loaded.tvvf_manifest.is_none(), "stale tvvf manifest must not be carried");
+    assert!(
+        loaded.tvvf_manifest.is_none(),
+        "stale tvvf manifest must not be carried"
+    );
     drop(loaded);
     let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
     let results = reopened
@@ -5064,7 +5835,9 @@ fn failed_lazy_sidecar_open_latches_and_drops_the_stale_manifest() {
 fn rescore_delta_replays_latest_rows_and_tombstones() {
     let path = unique_temp_dir("rescore_delta");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     let initial = (0..12)
         .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
         .collect::<Vec<_>>();
@@ -5092,7 +5865,9 @@ fn rescore_delta_replays_latest_rows_and_tombstones() {
 fn rescore_fold_limits_tiny_delta_segments() {
     let path = unique_temp_dir("rescore_segment_limit");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     let initial = (0..512)
         .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
         .collect::<Vec<_>>();
@@ -5120,7 +5895,9 @@ fn rescore_fold_limits_tiny_delta_segments() {
 fn rescore_fold_keeps_live_and_previous_vf_epochs() {
     let path = unique_temp_dir("rescore_fold");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     let initial = (0..8)
         .map(|i| rescore_vector(&format!("doc-{i}"), i as f32 * 0.001))
         .collect::<Vec<_>>();
@@ -5187,12 +5964,8 @@ fn readonly_rescore_snapshot_survives_tvvf_epoch_gc_until_refresh() {
     let snapshot = reader
         .query_vector("default", &query, snapshot_documents.len(), None)
         .unwrap();
-    let expected_snapshot = exact_fp32_hits(
-        &snapshot_documents,
-        &query,
-        None,
-        snapshot_documents.len(),
-    );
+    let expected_snapshot =
+        exact_fp32_hits(&snapshot_documents, &query, None, snapshot_documents.len());
     assert_eq!(
         snapshot
             .hits
@@ -5234,7 +6007,9 @@ fn rescore_wal_replay_captures_caller_originals() {
     let path = unique_temp_dir("rescore_wal");
     {
         let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
-        engine.create_index_with_options(rescore_options("float32")).unwrap();
+        engine
+            .create_index_with_options(rescore_options("float32"))
+            .unwrap();
         engine.persist().unwrap();
     }
     let original = rescore_vector("wal-row", 0.03);
@@ -5255,19 +6030,26 @@ fn rescore_wal_replay_captures_caller_originals() {
 fn rescore_metadata_only_delta_carries_manifest_forward() {
     let path = unique_temp_dir("rescore_metadata");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     let mut original = rescore_vector("row", 0.0);
     engine
         .upsert_vectors("default", std::slice::from_ref(&original))
         .unwrap();
     engine.persist().unwrap();
     let (before, _) = tvvf_rows(&path, &["row"]);
-    original.metadata.insert("tag".to_string(), "updated".to_string());
+    original
+        .metadata
+        .insert("tag".to_string(), "updated".to_string());
     engine.upsert_vectors("default", &[original]).unwrap();
     engine.persist().unwrap();
     drop(engine);
     let (after, _) = tvvf_rows(&path, &["row"]);
-    assert_eq!(after, before, "metadata-only commit must carry tvvf forward");
+    assert_eq!(
+        after, before,
+        "metadata-only commit must carry tvvf forward"
+    );
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -5276,7 +6058,9 @@ fn rescore_off_manifests_and_state_headers_remain_byte_identical() {
     let write = |path: &Path| {
         let mut engine = CoreEngine::open(open_options(path, false, "generation")).unwrap();
         engine.create_index("default", 8, 4).unwrap();
-        engine.upsert_vectors("default", &[rescore_vector("row", 0.0)]).unwrap();
+        engine
+            .upsert_vectors("default", &[rescore_vector("row", 0.0)])
+            .unwrap();
         engine.persist().unwrap();
         drop(engine);
         (
@@ -5302,7 +6086,9 @@ fn rescore_off_manifests_and_state_headers_remain_byte_identical() {
 fn tvvf_orphan_delta_and_corruption_fail_open_without_deletion() {
     let path = unique_temp_dir("rescore_fail_open");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     engine
         .upsert_vectors("default", &[rescore_vector("row", 0.0)])
         .unwrap();
@@ -5353,8 +6139,14 @@ fn tvvf_orphan_delta_and_corruption_fail_open_without_deletion() {
         lodedb_core::storage::LoadOptions::default(),
     )
     .unwrap();
-    assert!(loaded.tvvf_reader.is_none(), "corrupt sidecar disables only rescore");
-    assert!(current_base.exists(), "fail-open must leave corrupt tvvf on disk");
+    assert!(
+        loaded.tvvf_reader.is_none(),
+        "corrupt sidecar disables only rescore"
+    );
+    assert!(
+        current_base.exists(),
+        "fail-open must leave corrupt tvvf on disk"
+    );
     drop(loaded);
     fs::remove_dir_all(path).unwrap();
 }
@@ -5363,7 +6155,9 @@ fn tvvf_orphan_delta_and_corruption_fail_open_without_deletion() {
 fn corrupt_tvvf_is_dropped_before_a_vector_delta_advances_tvim() {
     let path = unique_temp_dir("rescore_stale_manifest_drop");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     engine
         .upsert_vectors("default", &[rescore_vector("row", 0.0)])
         .unwrap();
@@ -5386,9 +6180,15 @@ fn corrupt_tvvf_is_dropped_before_a_vector_delta_advances_tvim() {
         lodedb_core::storage::LoadOptions::default(),
     )
     .unwrap();
-    assert!(loaded.tvvf_manifest.is_none(), "new root must omit stale tvvf");
+    assert!(
+        loaded.tvvf_manifest.is_none(),
+        "new root must omit stale tvvf"
+    );
     assert!(loaded.tvvf_reader.is_none());
-    assert!(sidecar.exists(), "fail-open leaves old sidecar files untouched");
+    assert!(
+        sidecar.exists(),
+        "fail-open leaves old sidecar files untouched"
+    );
     drop(loaded);
 
     let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
@@ -5401,7 +6201,9 @@ fn corrupt_tvvf_is_dropped_before_a_vector_delta_advances_tvim() {
 fn swapped_tvvf_manifest_identity_fails_open_without_touching_files() {
     let path = unique_temp_dir("rescore_manifest_identity");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     engine
         .upsert_vectors("default", &[rescore_vector("row", 0.0)])
         .unwrap();
@@ -5437,7 +6239,10 @@ fn swapped_tvvf_manifest_identity_fails_open_without_touching_files() {
     )
     .unwrap();
     assert!(loaded.tvvf_reader.is_none());
-    assert!(sidecar.exists(), "identity failure must not delete sidecar files");
+    assert!(
+        sidecar.exists(),
+        "identity failure must not delete sidecar files"
+    );
     drop(loaded);
 
     let reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
@@ -5450,7 +6255,9 @@ fn swapped_tvvf_manifest_identity_fails_open_without_touching_files() {
 fn tvim_gc_does_not_remove_tvvf_epochs() {
     let path = unique_temp_dir("rescore_gc_boundary");
     let mut engine = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
-    engine.create_index_with_options(rescore_options("float32")).unwrap();
+    engine
+        .create_index_with_options(rescore_options("float32"))
+        .unwrap();
     engine
         .upsert_vectors("default", &[rescore_vector("row", 0.0)])
         .unwrap();
@@ -5503,7 +6310,11 @@ fn store_free_plan_documents_matches_appender_prepare() {
         engine.persist().unwrap();
     }
     let documents = [
-        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc(
+            "a",
+            "hello world from lodedb",
+            metadata(&[("kind", "note")]),
+        ),
         text_doc("b", "a second appended document", metadata(&[])),
     ];
     let mut appender_opts = open_options(&path, false, "wal");
@@ -5518,7 +6329,10 @@ fn store_free_plan_documents_matches_appender_prepare() {
     assert_eq!(free_plan.chunks_to_embed, appender_plan.chunks_to_embed);
     assert_eq!(free_plan.store_text, appender_plan.store_text);
     assert_eq!(free_plan.index_text, appender_plan.index_text);
-    assert!(plan_documents(&[], true, true, 900).is_err(), "empty plan refused");
+    assert!(
+        plan_documents(&[], true, true, 900).is_err(),
+        "empty plan refused"
+    );
     drop(appender);
     fs::remove_dir_all(path).unwrap();
 }
@@ -5536,7 +6350,11 @@ fn payload_builder_matches_appender_wal_record() {
         engine.persist().unwrap();
     }
     let documents = [
-        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc(
+            "a",
+            "hello world from lodedb",
+            metadata(&[("kind", "note")]),
+        ),
         text_doc("b", "a second appended document", metadata(&[])),
     ];
     let mut appender_opts = open_options(&path, false, "wal");
@@ -5601,7 +6419,11 @@ fn apply_wal_records_folds_a_segment_end_to_end() {
     // apply -> persist -> reopen -> query, then a refold applies nothing.
     let path = generation_store("core_segment_fold_e2e");
     let documents = [
-        text_doc("a", "hello world from lodedb", metadata(&[("kind", "note")])),
+        text_doc(
+            "a",
+            "hello world from lodedb",
+            metadata(&[("kind", "note")]),
+        ),
         text_doc("b", "a second appended document", metadata(&[])),
     ];
     let plan = plan_documents(&documents, true, true, 900).unwrap();
@@ -5629,9 +6451,15 @@ fn apply_wal_records_folds_a_segment_end_to_end() {
     let mut reopened = CoreEngine::open(open_options(&path, false, "generation")).unwrap();
     assert!(reopened.applied_lsn("default").unwrap() >= applied_before + 1);
     let stats = reopened.stats("default").unwrap();
-    assert_eq!(stats.document_count, 2, "folded documents did not survive reopen");
+    assert_eq!(
+        stats.document_count, 2,
+        "folded documents did not survive reopen"
+    );
     let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    let hits = reopened.query_vector("default", &query, 5, None).unwrap().hits;
+    let hits = reopened
+        .query_vector("default", &query, 5, None)
+        .unwrap()
+        .hits;
     assert!(!hits.is_empty(), "folded documents are not searchable");
     // Refold after reopen is equally idempotent.
     assert_eq!(reopened.apply_wal_records("default", &records).unwrap(), 0);
@@ -5658,7 +6486,10 @@ fn apply_wal_records_folds_deletes_and_later_batches() {
         lsn: None,
     }];
     stamp_records(&mut add_records, floor + 1);
-    assert_eq!(engine.apply_wal_records("default", &add_records).unwrap(), 1);
+    assert_eq!(
+        engine.apply_wal_records("default", &add_records).unwrap(),
+        1
+    );
     engine.persist().unwrap();
 
     // A later batch must stamp above the committed watermark, which the
@@ -5670,7 +6501,12 @@ fn apply_wal_records_folds_deletes_and_later_batches() {
         lsn: None,
     }];
     stamp_records(&mut delete_records, floor + 1);
-    assert_eq!(engine.apply_wal_records("default", &delete_records).unwrap(), 1);
+    assert_eq!(
+        engine
+            .apply_wal_records("default", &delete_records)
+            .unwrap(),
+        1
+    );
     engine.persist().unwrap();
     drop(engine);
 
@@ -5725,15 +6561,22 @@ fn apply_wal_records_refuses_invalid_batches_and_handles() {
         floor,
         "a refused batch must not advance the watermark"
     );
-    assert_eq!(engine.stats("default").unwrap().document_count, stats_before.document_count);
+    assert_eq!(
+        engine.stats("default").unwrap().document_count,
+        stats_before.document_count
+    );
     // Unknown index.
-    assert!(engine.apply_wal_records("missing", &[stamped(floor + 1)]).is_err());
+    assert!(engine
+        .apply_wal_records("missing", &[stamped(floor + 1)])
+        .is_err());
     drop(engine);
 
     // Read-only handle.
     let mut read_only =
         CoreEngine::open_readonly(&path, open_options(&path, true, "generation")).unwrap();
-    let error = read_only.apply_wal_records("default", &[stamped(1)]).unwrap_err();
+    let error = read_only
+        .apply_wal_records("default", &[stamped(1)])
+        .unwrap_err();
     assert!(error.to_string().contains("read-only"), "{error}");
     drop(read_only);
     fs::remove_dir_all(&path).unwrap();
@@ -5743,15 +6586,22 @@ fn apply_wal_records_refuses_invalid_batches_and_handles() {
     let mut wal_engine = CoreEngine::open(open_options(&wal_mode_path, false, "wal")).unwrap();
     create_vector_only_index(&mut wal_engine);
     wal_engine.persist().unwrap();
-    let error = wal_engine.apply_wal_records("default", &[stamped(1)]).unwrap_err();
-    assert!(error.to_string().contains("generation commit mode"), "{error}");
+    let error = wal_engine
+        .apply_wal_records("default", &[stamped(1)])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generation commit mode"),
+        "{error}"
+    );
     drop(wal_engine);
     fs::remove_dir_all(&wal_mode_path).unwrap();
 
     // In-memory engine has no durable watermark to fold against.
     let mut in_memory = CoreEngine::new_in_memory();
     in_memory.create_index("default", 8, 4).unwrap();
-    let error = in_memory.apply_wal_records("default", &[stamped(1)]).unwrap_err();
+    let error = in_memory
+        .apply_wal_records("default", &[stamped(1)])
+        .unwrap_err();
     assert!(error.to_string().contains("in-memory"), "{error}");
 }
 
@@ -5770,7 +6620,10 @@ fn apply_wal_records_refuses_malformed_payloads() {
         lsn: Some(floor + 1),
     };
     let cases = vec![
-        (record("delete_documents", json!({})), "missing document_ids"),
+        (
+            record("delete_documents", json!({})),
+            "missing document_ids",
+        ),
         (
             record("delete_documents", json!({"document_ids": ["a", 7]})),
             "must be strings",
@@ -5816,7 +6669,9 @@ fn apply_wal_records_refuses_malformed_payloads() {
         ),
     ];
     for (poisoned, needle) in cases {
-        let error = engine.apply_wal_records("default", &[poisoned]).unwrap_err();
+        let error = engine
+            .apply_wal_records("default", &[poisoned])
+            .unwrap_err();
         assert!(error.to_string().contains(needle), "{error}");
         assert_eq!(
             engine.applied_lsn("default").unwrap(),
@@ -5841,7 +6696,11 @@ fn add_then_remove_within_one_persist_stays_reopenable() {
     // while a COMMITTED row that is replaced or removed in the same window
     // must still record its removal (the resurrection guard).
     let path = generation_store("core_add_remove_one_persist");
-    let seed = [text_doc("seed", "the committed seed document", metadata(&[]))];
+    let seed = [text_doc(
+        "seed",
+        "the committed seed document",
+        metadata(&[]),
+    )];
     let plan = plan_documents(&seed, true, true, 900).unwrap();
     let embeddings = plan_embeddings(&plan);
     let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
@@ -5863,7 +6722,11 @@ fn add_then_remove_within_one_persist_stays_reopenable() {
     let plan = plan_documents(&ephemeral, true, true, 900).unwrap();
     let embeddings = plan_embeddings(&plan);
     let add_x = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
-    let reseed = [text_doc("seed", "the replaced seed document", metadata(&[]))];
+    let reseed = [text_doc(
+        "seed",
+        "the replaced seed document",
+        metadata(&[]),
+    )];
     let plan = plan_documents(&reseed, true, true, 900).unwrap();
     let embeddings = plan_embeddings(&plan);
     let replace_seed = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
@@ -5912,7 +6775,11 @@ fn discard_drops_unpersisted_folds_and_releases_the_writer_lock() {
     // vanish on discard() -- a graceful close() would persist it -- and the
     // writer lock must release immediately so a fresh handle can take over.
     let path = generation_store("core_engine_discard");
-    let documents = [text_doc("committed", "the committed document", metadata(&[]))];
+    let documents = [text_doc(
+        "committed",
+        "the committed document",
+        metadata(&[]),
+    )];
     let plan = plan_documents(&documents, true, true, 900).unwrap();
     let embeddings = plan_embeddings(&plan);
     let payload = build_embedded_documents_payload(&plan, &embeddings, 8).unwrap();
@@ -6032,13 +6899,14 @@ fn readonly_lazy_refresh_folds_wal_adds_and_replacements() {
         let mut query = [0.0f32; 8];
         query[axis] = 1.0;
         let results = reader.query_vector("default", &query, 1, None).unwrap();
-        (
-            results.hits[0].document_id.clone(),
-            results.hits[0].score,
-        )
+        (results.hits[0].document_id.clone(), results.hits[0].score)
     };
     assert_eq!(top_hit(2).0, "c", "appended document must be searchable");
-    assert_eq!(top_hit(3).0, "a", "replacement vector must win its new axis");
+    assert_eq!(
+        top_hit(3).0,
+        "a",
+        "replacement vector must win its new axis"
+    );
     let (stale_doc, stale_score) = top_hit(0);
     assert!(
         stale_doc != "a" || stale_score < 0.5,
@@ -6057,7 +6925,9 @@ fn readonly_lazy_open_defers_tvann_adoption_to_first_ann_query() {
     {
         let mut engine = ann_durable(&path);
         engine.upsert_vectors("default", &blob_docs()).unwrap();
-        let _ = engine.query_vector("default", &axis_query(0), 5, None).unwrap();
+        let _ = engine
+            .query_vector("default", &axis_query(0), 5, None)
+            .unwrap();
         engine.persist().unwrap();
         assert!(has_file_with_ext(&path, "tvann"));
         drop(engine);
@@ -6089,4 +6959,29 @@ fn readonly_lazy_open_defers_tvann_adoption_to_first_ann_query() {
     drop(writable);
     drop(reader);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn rescored_query_with_all_matching_filter_keeps_full_scan_capacity() {
+    // Regression: a filter every document passes plans as Unfiltered with an
+    // empty allowlist. The rescore capacity gate used to key off
+    // `filter.is_none()`, clamp the scan to zero candidates, and error.
+    let (documents, query) = rescore_boundary_docs();
+    let documents = documents
+        .into_iter()
+        .map(|mut document| {
+            document
+                .metadata
+                .insert("kind".to_string(), "note".to_string());
+            document
+        })
+        .collect::<Vec<_>>();
+    let engine = rescore_engine(&documents, 2.0);
+    let unfiltered = engine.query_vector("default", &query, 3, None).unwrap();
+    let all_matching = json!({"kind": {"$exists": true}});
+    let filtered = engine
+        .query_vector("default", &query, 3, Some(&all_matching))
+        .unwrap();
+    assert_eq!(hit_keys(&filtered), hit_keys(&unfiltered));
+    assert_eq!(filtered.total_considered, documents.len());
 }
