@@ -1549,8 +1549,15 @@ impl CoreEngine {
         limit: Option<usize>,
     ) -> Result<Vec<Value>, CoreError> {
         let index = self.index(index_id)?;
+        let plan = index.plan_filter(filter)?;
+        // The plan still runs first so invalid filters keep erroring, but an
+        // explicit zero limit is an empty page (take(0) semantics), never one
+        // pushed document.
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let mut page = Vec::new();
-        match index.plan_filter(filter)? {
+        match plan {
             DocumentFilterPlan::All => {
                 for document_id in &index.all_docs {
                     if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
@@ -6187,15 +6194,34 @@ impl VectorOnlyIndex {
                     first_stage_k = next_deferred_candidate_count(first_stage_k, live_chunk_count);
                 }
             }
-            // Counts-only deferral keeps the original rescore window over
-            // the live corpus; shrinking it changes the fp32 rerank pool.
-            let raw_hits = index.search(query_vector, candidate_k, &[])?;
-            let rescored = self.rescore_raw_hits(query_vector, raw_hits, candidate_k);
-            let hits = self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
-            return Ok(CoreSearchResults {
-                hits,
-                total_considered,
-            });
+            // Counts-only deferral keeps the original rescore window over the
+            // live corpus (shrinking it changes the fp32 rerank pool), but the
+            // pool must hold the first `candidate_k` PASSING chunks -- what a
+            // materialized allowlist of the passing docs would rescore. The
+            // failing ids are unknown here, so refine per candidate in
+            // first-stage order and deepen until the pool fills or the scan is
+            // exhausted; a fixed window returns an under-filled page whenever
+            // failing chunks crowd the top of the ranking.
+            let live_chunk_count = self.live_chunk_count();
+            let mut first_stage_k = candidate_k;
+            loop {
+                let raw_hits = index.search(query_vector, first_stage_k, &[])?;
+                let raw_count = raw_hits.len();
+                let pool = self.passing_prefix_pool(raw_hits, &metadata_filter, candidate_k)?;
+                if pool.len() >= candidate_k
+                    || raw_count < first_stage_k
+                    || first_stage_k >= live_chunk_count
+                {
+                    let rescored = self.rescore_raw_hits(query_vector, pool, candidate_k);
+                    let hits =
+                        self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
+                    return Ok(CoreSearchResults {
+                        hits,
+                        total_considered,
+                    });
+                }
+                first_stage_k = next_deferred_candidate_count(first_stage_k, live_chunk_count);
+            }
         }
         let raw_hits = match &ann_allowlist {
             Some(stable_ids) => {
@@ -6376,6 +6402,26 @@ impl VectorOnlyIndex {
             }
         }
         Ok(filtered)
+    }
+
+    /// The first-stage prefix of candidates that pass the deferred predicate,
+    /// truncated to `cap`. Missing documents fail closed, matching assembly.
+    fn passing_prefix_pool(
+        &self,
+        hits: Vec<VectorSearchHit>,
+        metadata_filter: &Value,
+        cap: usize,
+    ) -> Result<Vec<VectorSearchHit>, CoreError> {
+        let mut pool = Vec::new();
+        for hit in hits {
+            if pool.len() == cap {
+                break;
+            }
+            if self.metadata_matches(&hit.document_id, metadata_filter)? {
+                pool.push(hit);
+            }
+        }
+        Ok(pool)
     }
 
     fn deferred_candidate_count(
@@ -6984,14 +7030,31 @@ impl VectorOnlyIndex {
                     })
                     .collect();
             }
-            // Counts-only deferral keeps the original rescore window over
-            // the live corpus; shrinking it changes the fp32 rerank pool.
+            // Same counts-only pool contract as the single-query rescore
+            // above: per row, refine candidates through the predicate in
+            // first-stage order and deepen until `candidate_k` passing chunks
+            // are pooled or the scan is exhausted. An under-filled row
+            // re-searches alone; siblings keep their prefix-stable pools.
+            let live_chunk_count = self.live_chunk_count();
             let rows = index.search_batch(query_vectors, candidate_k, &[])?;
             return rows
                 .into_iter()
                 .zip(query_vectors)
                 .map(|(raw_hits, query)| {
-                    let rescored = self.rescore_raw_hits(query, raw_hits, candidate_k);
+                    let mut window_k = candidate_k;
+                    let mut raw_count = raw_hits.len();
+                    let mut pool =
+                        self.passing_prefix_pool(raw_hits, &metadata_filter, candidate_k)?;
+                    while pool.len() < candidate_k
+                        && raw_count >= window_k
+                        && window_k < live_chunk_count
+                    {
+                        window_k = next_deferred_candidate_count(window_k, live_chunk_count);
+                        let retry = index.search(query, window_k, &[])?;
+                        raw_count = retry.len();
+                        pool = self.passing_prefix_pool(retry, &metadata_filter, candidate_k)?;
+                    }
+                    let rescored = self.rescore_raw_hits(query, pool, candidate_k);
                     let hits =
                         self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
                     Ok(CoreSearchResults {

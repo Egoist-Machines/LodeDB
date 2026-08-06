@@ -126,6 +126,20 @@ fn list_documents_keyset_cursor_pages_in_id_order() {
         .list_documents("default", Some(&filter), Some("d000"), Some(2))
         .unwrap();
     assert_eq!(ids(filtered), ["d002", "d004"]);
+
+    // limit=0 is an empty page on every plan shape, with or without a cursor.
+    assert!(engine
+        .list_documents("default", None, None, Some(0))
+        .unwrap()
+        .is_empty());
+    assert!(engine
+        .list_documents("default", Some(&filter), None, Some(0))
+        .unwrap()
+        .is_empty());
+    assert!(engine
+        .list_documents("default", Some(&filter), Some("d000"), Some(0))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -5367,6 +5381,131 @@ fn rescored_counts_only_deferral_matches_forced_full_window() {
         expected
             .iter()
             .map(|(document_id, score)| (document_id.clone(), score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Sixteen one-chunk docs where the five docs failing the filter outrank every
+/// passing one, so a bounded first-stage window sees only failing chunks.
+fn counts_only_crowded_docs() -> (Vec<CoreVectorDocument>, BTreeMap<String, ()>) {
+    let documents = (0..16)
+        .map(|index| {
+            let mut entries = BTreeMap::new();
+            if index >= 5 {
+                entries.insert("flag".to_string(), "yes".to_string());
+            }
+            scored_doc(&format!("doc-{index:02}"), 2.0 - index as f32 * 0.1, entries)
+        })
+        .collect::<Vec<_>>();
+    let allowed = documents
+        .iter()
+        .filter(|document| document.metadata.contains_key("flag"))
+        .map(|document| (document.document_id.clone(), ()))
+        .collect::<BTreeMap<_, _>>();
+    (documents, allowed)
+}
+
+#[test]
+fn rescored_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    // Eleven of sixteen docs match, so the planner blind-defers with counts
+    // only (no failing ids), and oversample 1.0 makes the first-stage window
+    // exactly top_k rows -- all of them failing. The deferred scan must deepen
+    // past that prefix and return the same page as the materialized
+    // document_ids query.
+    let (documents, allowed) = counts_only_crowded_docs();
+    let query = axis_query(0);
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vector("default", &query, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vector(
+            "default",
+            &query,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.total_considered, allowed.len());
+    assert_eq!(
+        deferred.hits.len(),
+        3,
+        "the deferred scan must deepen past the failing ranked prefix"
+    );
+    assert_eq!(hit_keys(&deferred), hit_keys(&forced));
+}
+
+#[test]
+fn rescored_batch_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    let (documents, allowed) = counts_only_crowded_docs();
+    let queries = vec![axis_query(0), axis_query(0)];
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vectors_batch("default", &queries, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vectors_batch(
+            "default",
+            &queries,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.len(), 2);
+    for (deferred_row, forced_row) in deferred.iter().zip(&forced) {
+        assert_eq!(deferred_row.total_considered, allowed.len());
+        assert_eq!(
+            deferred_row.hits.len(),
+            3,
+            "every batch row must deepen past the failing ranked prefix"
+        );
+        assert_eq!(hit_keys(deferred_row), hit_keys(forced_row));
+    }
+}
+
+#[test]
+fn rescored_arrays_counts_only_deferral_rides_past_a_failing_ranked_prefix() {
+    let (documents, allowed) = counts_only_crowded_docs();
+    let query = axis_query(0);
+    let flat = [query.clone(), query.clone()].concat();
+    let filter = json!({"flag": {"$exists": true}});
+    let engine = rescore_engine(&documents, 1.0);
+
+    let deferred = engine
+        .query_vectors_batch_arrays("default", &flat, 8, 3, Some(&filter))
+        .unwrap();
+    let forced = engine
+        .query_vectors_batch_arrays(
+            "default",
+            &flat,
+            8,
+            3,
+            Some(&json!({"document_ids": allowed.keys().collect::<Vec<_>>()})),
+        )
+        .unwrap();
+
+    assert_eq!(deferred.nq, 2);
+    assert_eq!(
+        deferred.k, 3,
+        "every arrays row must deepen past the failing ranked prefix"
+    );
+    assert_eq!(deferred.document_ids, forced.document_ids);
+    assert_eq!(
+        deferred
+            .scores
+            .iter()
+            .map(|score| score.to_bits())
+            .collect::<Vec<_>>(),
+        forced
+            .scores
+            .iter()
+            .map(|score| score.to_bits())
             .collect::<Vec<_>>()
     );
 }
