@@ -310,9 +310,7 @@ impl CoreEngine {
                 .as_ref()
                 .is_some_and(|record| record.patch_matrix.is_some());
             if retains_text {
-                index
-                    .pending_raw_text_clears
-                    .remove(&document.document_id);
+                index.pending_raw_text_clears.remove(&document.document_id);
             } else if old_had_text {
                 // A re-add without a retained caption clears the raw text; the
                 // clear must reach the text delta as a delete, or the base's old
@@ -575,7 +573,9 @@ impl CoreEngine {
             } else if had_text {
                 // A cleared raw caption must reach the text delta as a delete, or
                 // the base's old text resurrects on reload.
-                index.pending_raw_text_clears.insert(document_id.to_string());
+                index
+                    .pending_raw_text_clears
+                    .insert(document_id.to_string());
             }
             // The caption changed, so refresh its live lexical postings whenever
             // either lexical source is enabled. Only index_text persists tokens;
@@ -827,9 +827,10 @@ impl CoreEngine {
             // retained would skip the clear and let a prior `.tvlex` entry win over the
             // new raw text on reload. Mirrors the replay path's fold-policy gating.
             let new_has_text = plan.store_text && document.text.is_some();
-            let new_has_tokens =
-                plan.index_text && token_lists.iter().any(|list| !list.is_empty());
-            let old_had_text = old_record.as_ref().is_some_and(|record| record.text.is_some());
+            let new_has_tokens = plan.index_text && token_lists.iter().any(|list| !list.is_empty());
+            let old_had_text = old_record
+                .as_ref()
+                .is_some_and(|record| record.text.is_some());
             let old_had_tokens = old_record
                 .as_ref()
                 .is_some_and(|record| record.token_lists.iter().any(|list| !list.is_empty()));
@@ -842,12 +843,16 @@ impl CoreEngine {
             if new_has_text {
                 index.pending_raw_text_clears.remove(&document.document_id);
             } else if old_had_text {
-                index.pending_raw_text_clears.insert(document.document_id.clone());
+                index
+                    .pending_raw_text_clears
+                    .insert(document.document_id.clone());
             }
             if new_has_tokens {
                 index.pending_lexical_clears.remove(&document.document_id);
             } else if old_had_tokens {
-                index.pending_lexical_clears.insert(document.document_id.clone());
+                index
+                    .pending_lexical_clears
+                    .insert(document.document_id.clone());
             }
             if let Some(old_record) = old_record {
                 // A text re-add carries no patch matrix; if it replaces a
@@ -1572,21 +1577,81 @@ impl CoreEngine {
                     }
                 }
             }
-            DocumentFilterPlan::Predicate {
-                metadata_filter, ..
+            DocumentFilterPlan::CandidateSet {
+                metadata_filter,
+                candidate_ids,
             } => {
-                for document_id in &index.all_docs {
-                    let Some(record) = index.documents.get(document_id) else {
+                for document_id in candidate_ids {
+                    let Some(record) = index.documents.get(&document_id) else {
                         continue;
                     };
                     if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
                         continue;
                     }
                     if matches_metadata_filter(&record.metadata, &metadata_filter)? {
-                        page.push(document_resource_payload(document_id, record));
+                        page.push(document_resource_payload(&document_id, record));
                     }
                     if limit.is_some_and(|limit| page.len() >= limit) {
                         break;
+                    }
+                }
+            }
+            DocumentFilterPlan::AnchoredDenylist {
+                metadata_filter,
+                anchor_ids,
+                failing_candidate_ids,
+            } => {
+                let document_ids = index.materialize_anchor_denylist(
+                    &anchor_ids,
+                    &failing_candidate_ids,
+                    &metadata_filter,
+                )?;
+                for document_id in document_ids {
+                    if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                        continue;
+                    }
+                    if let Some(record) = index.documents.get(&document_id) {
+                        page.push(document_resource_payload(&document_id, record));
+                    }
+                    if limit.is_some_and(|limit| page.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+            DocumentFilterPlan::Predicate {
+                metadata_filter,
+                failing_document_ids,
+                ..
+            } => {
+                if let Some(failing_document_ids) = failing_document_ids {
+                    for document_id in &index.all_docs {
+                        if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                            continue;
+                        }
+                        if failing_document_ids.contains(document_id) {
+                            continue;
+                        }
+                        if let Some(record) = index.documents.get(document_id) {
+                            page.push(document_resource_payload(document_id, record));
+                        }
+                        if limit.is_some_and(|limit| page.len() >= limit) {
+                            break;
+                        }
+                    }
+                } else {
+                    for document_id in &index.all_docs {
+                        let Some(record) = index.documents.get(document_id) else {
+                            continue;
+                        };
+                        if after.is_some_and(|cursor| document_id.as_str() <= cursor) {
+                            continue;
+                        }
+                        if matches_metadata_filter(&record.metadata, &metadata_filter)? {
+                            page.push(document_resource_payload(document_id, record));
+                        }
+                        if limit.is_some_and(|limit| page.len() >= limit) {
+                            break;
+                        }
                     }
                 }
             }
@@ -1758,7 +1823,9 @@ impl CoreEngine {
         records: &[crate::storage::wal::WalRecord],
     ) -> Result<usize, CoreError> {
         let Some(persistence) = &self.persistence else {
-            return invalid("an in-memory engine has no durable watermark to fold external records against");
+            return invalid(
+                "an in-memory engine has no durable watermark to fold external records against",
+            );
         };
         if persistence.read_only {
             return invalid("read-only engine cannot apply external WAL records");
@@ -2218,8 +2285,7 @@ impl CoreEngine {
             // so gate the token side on fold_index_text specifically. Captured before
             // `text` moves into the record.
             let new_has_text = text.is_some();
-            let new_has_tokens =
-                fold_index_text && token_lists.iter().any(|list| !list.is_empty());
+            let new_has_tokens = fold_index_text && token_lists.iter().any(|list| !list.is_empty());
             let old_record = index.documents.insert(
                 document_id.clone(),
                 DocumentRecord {
@@ -2235,7 +2301,9 @@ impl CoreEngine {
                     patch_matrix: None,
                 },
             );
-            let old_had_text = old_record.as_ref().is_some_and(|record| record.text.is_some());
+            let old_had_text = old_record
+                .as_ref()
+                .is_some_and(|record| record.text.is_some());
             let old_had_tokens = old_record
                 .as_ref()
                 .is_some_and(|record| record.token_lists.iter().any(|list| !list.is_empty()));
@@ -2412,12 +2480,11 @@ impl CoreEngine {
                         // (nothing pending). Either way no committed epoch is rewritten
                         // in place.
                         let base_generation = loaded.generation;
-                        let index =
-                            index_from_loaded_store(
-                                loaded,
-                                persistence_chunk_character_limit,
-                                persistence_read_only,
-                            )?;
+                        let index = index_from_loaded_store(
+                            loaded,
+                            persistence_chunk_character_limit,
+                            persistence_read_only,
+                        )?;
                         let index_id = index.index_id.clone();
                         self.indexes.insert(index_id.clone(), index);
                         self.replaying_wal = true;
@@ -2632,7 +2699,9 @@ impl CoreEngine {
                         index_key,
                     ),
                 )?;
-                let token = manifest.map(|manifest| manifest.body_sha256).unwrap_or_default();
+                let token = manifest
+                    .map(|manifest| manifest.body_sha256)
+                    .unwrap_or_default();
                 let wal = crate::storage::wal::wal_path(&persistence.path, index_key);
                 let wal_len = match fs::metadata(&wal) {
                     Ok(meta) => meta.len(),
@@ -2928,7 +2997,10 @@ impl PersistentLock {
             Ok(None) => Err(TryLock::Contended),
             Err(error) => Err(TryLock::Fatal(CoreError::new(
                 CoreErrorCode::InvalidArgument,
-                format!("could not acquire writer lock {}: {error}", lock_path.display()),
+                format!(
+                    "could not acquire writer lock {}: {error}",
+                    lock_path.display()
+                ),
             ))),
         }
     }
@@ -4987,7 +5059,11 @@ fn document_resource_payload(document_id: &str, record: &DocumentRecord) -> Valu
 /// with empty slots to keep the `[nq, k]` shape, matching how the exact arrays
 /// scan pads absent documents.
 fn pack_results_to_arrays(results: &[CoreSearchResults], nq: usize) -> VectorBatchArrays {
-    let k = results.iter().map(|result| result.hits.len()).max().unwrap_or(0);
+    let k = results
+        .iter()
+        .map(|result| result.hits.len())
+        .max()
+        .unwrap_or(0);
     let mut scores = Vec::with_capacity(nq * k);
     let mut document_ids = Vec::with_capacity(nq * k);
     let mut metadata = Vec::with_capacity(nq * k);
@@ -5046,6 +5122,15 @@ impl ClusterSource {
 enum DocumentFilterPlan {
     All,
     Materialized(DocSet),
+    CandidateSet {
+        metadata_filter: Value,
+        candidate_ids: DocSet,
+    },
+    AnchoredDenylist {
+        metadata_filter: Value,
+        anchor_ids: DocSet,
+        failing_candidate_ids: DocSet,
+    },
     Predicate {
         metadata_filter: Value,
         matching_count: usize,
@@ -5071,6 +5156,20 @@ enum QueryFilterPlan {
         failing_document_count: usize,
         failing_document_ids: Option<DocSet>,
     },
+}
+
+fn deferred_scan_needs_deepening(
+    passed_count: usize,
+    raw_count: usize,
+    candidate_k: usize,
+    top_k: usize,
+    live_chunk_count: usize,
+) -> bool {
+    passed_count < top_k && raw_count == candidate_k && candidate_k < live_chunk_count
+}
+
+fn next_deferred_candidate_count(candidate_k: usize, live_chunk_count: usize) -> usize {
+    candidate_k.saturating_mul(2).min(live_chunk_count)
 }
 
 struct VectorOnlyIndex {
@@ -5396,7 +5495,10 @@ impl VectorOnlyIndex {
             let pre_existing: BTreeSet<u64> = if built_now {
                 BTreeSet::new()
             } else {
-                index.stable_ids_for_chunks(&chunk_ids).into_iter().collect()
+                index
+                    .stable_ids_for_chunks(&chunk_ids)
+                    .into_iter()
+                    .collect()
             };
             // A just-built index already contains every current chunk; only an
             // existing index needs the incremental upsert.
@@ -5635,20 +5737,43 @@ impl VectorOnlyIndex {
             MetadataFilterPlan::Materialized(document_ids) => {
                 Ok(DocumentFilterPlan::Materialized(document_ids))
             }
+            MetadataFilterPlan::FilteredCandidates(candidate_ids) => {
+                Ok(DocumentFilterPlan::CandidateSet {
+                    metadata_filter,
+                    candidate_ids,
+                })
+            }
+            MetadataFilterPlan::AnchoredDenylist {
+                anchor,
+                failing_candidates,
+            } => Ok(DocumentFilterPlan::AnchoredDenylist {
+                metadata_filter,
+                anchor_ids: anchor,
+                failing_candidate_ids: failing_candidates,
+            }),
             MetadataFilterPlan::Predicate(predicate) => {
                 let (matching_count, failing_document_count, failing_document_ids) =
                     if let Some(candidates) = predicate.failing_candidates {
-                        let mut failing = DocSet::new();
-                        for document_id in candidates {
-                            if !self.metadata_matches(&document_id, &metadata_filter)? {
-                                failing.insert(document_id);
+                        if predicate.failing_exact {
+                            let failing_count = candidates.len();
+                            (
+                                self.all_docs.len().saturating_sub(failing_count),
+                                failing_count,
+                                Some(candidates),
+                            )
+                        } else {
+                            let mut failing = DocSet::new();
+                            for document_id in candidates {
+                                if !self.metadata_matches(&document_id, &metadata_filter)? {
+                                    failing.insert(document_id);
+                                }
                             }
+                            (
+                                self.all_docs.len().saturating_sub(failing.len()),
+                                failing.len(),
+                                Some(failing),
+                            )
                         }
-                        (
-                            self.all_docs.len().saturating_sub(failing.len()),
-                            failing.len(),
-                            Some(failing),
-                        )
                     } else {
                         (
                             predicate.matching_count.ok_or_else(|| {
@@ -5683,6 +5808,31 @@ impl VectorOnlyIndex {
             DocumentFilterPlan::Materialized(metadata) => {
                 DocumentFilterPlan::Materialized(ids.intersection(&metadata).cloned().collect())
             }
+            DocumentFilterPlan::CandidateSet {
+                metadata_filter,
+                candidate_ids,
+            } => {
+                let bounded = ids.intersection(&candidate_ids).cloned().collect();
+                DocumentFilterPlan::Materialized(
+                    self.filter_candidate_ids(bounded, &metadata_filter)?,
+                )
+            }
+            DocumentFilterPlan::AnchoredDenylist {
+                metadata_filter,
+                anchor_ids,
+                failing_candidate_ids,
+            } => {
+                let bounded_anchor = ids.intersection(&anchor_ids).cloned().collect();
+                let bounded_failures = failing_candidate_ids
+                    .intersection(&bounded_anchor)
+                    .cloned()
+                    .collect();
+                DocumentFilterPlan::Materialized(self.materialize_anchor_denylist(
+                    &bounded_anchor,
+                    &bounded_failures,
+                    &metadata_filter,
+                )?)
+            }
             DocumentFilterPlan::Predicate {
                 metadata_filter,
                 matching_count,
@@ -5708,9 +5858,30 @@ impl VectorOnlyIndex {
         Ok(match plan {
             DocumentFilterPlan::All => self.all_docs.clone(),
             DocumentFilterPlan::Materialized(document_ids) => document_ids,
+            DocumentFilterPlan::CandidateSet {
+                metadata_filter,
+                candidate_ids,
+            } => self.filter_candidate_ids(candidate_ids, &metadata_filter)?,
+            DocumentFilterPlan::AnchoredDenylist {
+                metadata_filter,
+                anchor_ids,
+                failing_candidate_ids,
+            } => self.materialize_anchor_denylist(
+                &anchor_ids,
+                &failing_candidate_ids,
+                &metadata_filter,
+            )?,
             DocumentFilterPlan::Predicate {
-                metadata_filter, ..
-            } => self.filter_candidate_ids(self.all_docs.clone(), &metadata_filter)?,
+                metadata_filter,
+                failing_document_ids,
+                ..
+            } => {
+                if let Some(denied) = failing_document_ids {
+                    self.all_docs.difference(&denied).cloned().collect()
+                } else {
+                    self.filter_candidate_ids(self.all_docs.clone(), &metadata_filter)?
+                }
+            }
         })
     }
 
@@ -5726,6 +5897,23 @@ impl VectorOnlyIndex {
             }
         }
         Ok(document_ids)
+    }
+
+    fn materialize_anchor_denylist(
+        &self,
+        anchor_ids: &DocSet,
+        failing_candidate_ids: &DocSet,
+        metadata_filter: &Value,
+    ) -> Result<DocSet, CoreError> {
+        let mut denied = DocSet::new();
+        for document_id in failing_candidate_ids {
+            if anchor_ids.contains(document_id)
+                && !self.metadata_matches(document_id, metadata_filter)?
+            {
+                denied.insert(document_id.clone());
+            }
+        }
+        Ok(anchor_ids.difference(&denied).cloned().collect())
     }
 
     fn metadata_matches(
@@ -5745,6 +5933,41 @@ impl VectorOnlyIndex {
                 total_considered: self.all_docs.len(),
             },
             DocumentFilterPlan::Materialized(document_ids) => {
+                let total_considered = document_ids.len();
+                if document_ids.is_empty() {
+                    QueryFilterPlan::Empty { total_considered }
+                } else {
+                    QueryFilterPlan::Allowlist {
+                        total_considered,
+                        chunk_ids: self.chunk_ids_for_documents(&document_ids),
+                    }
+                }
+            }
+            DocumentFilterPlan::CandidateSet {
+                metadata_filter,
+                candidate_ids,
+            } => {
+                let document_ids = self.filter_candidate_ids(candidate_ids, &metadata_filter)?;
+                let total_considered = document_ids.len();
+                if document_ids.is_empty() {
+                    QueryFilterPlan::Empty { total_considered }
+                } else {
+                    QueryFilterPlan::Allowlist {
+                        total_considered,
+                        chunk_ids: self.chunk_ids_for_documents(&document_ids),
+                    }
+                }
+            }
+            DocumentFilterPlan::AnchoredDenylist {
+                metadata_filter,
+                anchor_ids,
+                failing_candidate_ids,
+            } => {
+                let document_ids = self.materialize_anchor_denylist(
+                    &anchor_ids,
+                    &failing_candidate_ids,
+                    &metadata_filter,
+                )?;
                 let total_considered = document_ids.len();
                 if document_ids.is_empty() {
                     QueryFilterPlan::Empty { total_considered }
@@ -5810,17 +6033,32 @@ impl VectorOnlyIndex {
                 failing_document_count,
                 failing_document_ids,
             } => {
-                let candidate_k = self.deferred_candidate_count(
+                let mut candidate_k = self.deferred_candidate_count(
                     top_k,
                     failing_document_ids.as_ref(),
                     failing_document_count,
                 );
                 let index = self.turbovec_index()?;
-                let raw_hits = index.search(query_vector, candidate_k, &[])?;
-                return Ok(CoreSearchResults {
-                    hits: self.assemble_vector_hits_filtered(raw_hits, &metadata_filter, top_k)?,
-                    total_considered,
-                });
+                let live_chunk_count = self.live_chunk_count();
+                loop {
+                    let raw_hits = index.search(query_vector, candidate_k, &[])?;
+                    let raw_count = raw_hits.len();
+                    let hits =
+                        self.assemble_vector_hits_filtered(raw_hits, &metadata_filter, top_k)?;
+                    if !deferred_scan_needs_deepening(
+                        hits.len(),
+                        raw_count,
+                        candidate_k,
+                        top_k,
+                        live_chunk_count,
+                    ) {
+                        return Ok(CoreSearchResults {
+                            hits,
+                            total_considered,
+                        });
+                    }
+                    candidate_k = next_deferred_candidate_count(candidate_k, live_chunk_count);
+                }
             }
         };
         // ANN candidate generation applies to unfiltered queries only in v1: a
@@ -5880,7 +6118,11 @@ impl VectorOnlyIndex {
             } => (
                 total_considered,
                 Vec::new(),
-                Some((metadata_filter, failing_document_ids, failing_document_count)),
+                Some((
+                    metadata_filter,
+                    failing_document_ids,
+                    failing_document_count,
+                )),
                 false,
             ),
         };
@@ -5901,15 +6143,57 @@ impl VectorOnlyIndex {
         };
         let index = self.turbovec_index()?;
         if let Some((metadata_filter, failing_document_ids, failing_document_count)) = predicate {
-            let candidate_k = self.deferred_candidate_count(
-                candidate_k,
-                failing_document_ids.as_ref(),
-                failing_document_count,
-            );
+            let _ = failing_document_count;
+            if let Some(failing_document_ids) = failing_document_ids.as_ref() {
+                // The fp32 rerank pool must match what a materialized allowlist
+                // of the passing docs would produce: search wide enough to ride
+                // past every failing chunk, drop failures in first-stage order,
+                // and truncate to the allowlist-equivalent window BEFORE
+                // rescoring. Rescoring the whole widened window would admit
+                // candidates the allowlist path never reranks.
+                let failing_chunks = self.chunk_count_for_documents(failing_document_ids);
+                let live_chunk_count = self.live_chunk_count();
+                let passing_capacity = live_chunk_count.saturating_sub(failing_chunks);
+                let rescore_window = self.rescore_candidate_count(top_k, passing_capacity);
+                // Same optimistic-start deepening as the exact scan: the pool
+                // is the quantized-prefix of passing candidates truncated to
+                // the window, and a prefix is invariant under widening, so any
+                // window that yields a full pool yields THE pool.
+                let mut first_stage_k = rescore_window
+                    .saturating_mul(2)
+                    .saturating_add(16)
+                    .min(rescore_window.saturating_add(failing_chunks))
+                    .min(live_chunk_count);
+                loop {
+                    let raw_hits = index.search(query_vector, first_stage_k, &[])?;
+                    let raw_count = raw_hits.len();
+                    let pool: Vec<_> = raw_hits
+                        .into_iter()
+                        .filter(|hit| !failing_document_ids.contains(&hit.document_id))
+                        .take(rescore_window)
+                        .collect();
+                    if pool.len() >= rescore_window
+                        || raw_count < first_stage_k
+                        || first_stage_k >= live_chunk_count
+                    {
+                        let rescored = self.rescore_raw_hits(query_vector, pool, rescore_window);
+                        let hits = self
+                            .assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
+                        return Ok(CoreSearchResults {
+                            hits,
+                            total_considered,
+                        });
+                    }
+                    first_stage_k = next_deferred_candidate_count(first_stage_k, live_chunk_count);
+                }
+            }
+            // Counts-only deferral keeps the original rescore window over
+            // the live corpus; shrinking it changes the fp32 rerank pool.
             let raw_hits = index.search(query_vector, candidate_k, &[])?;
             let rescored = self.rescore_raw_hits(query_vector, raw_hits, candidate_k);
+            let hits = self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
             return Ok(CoreSearchResults {
-                hits: self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?,
+                hits,
                 total_considered,
             });
         }
@@ -6103,10 +6387,21 @@ impl VectorOnlyIndex {
         let failing_chunks = match failing_document_ids {
             Some(document_ids) => self.chunk_count_for_documents(document_ids),
             None if failing_document_count == 0 => 0,
-            None => self.live_chunk_count(),
+            None => failing_document_count,
         };
+        // base_k + failing_chunks is the proven-sufficient window, but it is a
+        // terrible STARTING window: the scan's top-k selection degrades
+        // sharply at mid-size k (a 15k-candidate request measured ~400 ms
+        // against sub-ms for small ones on a 100k-chunk store), while under
+        // any realistic rank/filter mix a small window fills immediately.
+        // Start optimistic; the deepening loop widens toward the proven bound
+        // (capped by it, so the loop terminates at a window that cannot
+        // under-fill), and results are identical by the ranking's prefix
+        // property.
         base_k
-            .saturating_add(failing_chunks)
+            .saturating_mul(2)
+            .saturating_add(16)
+            .min(base_k.saturating_add(failing_chunks))
             .min(self.live_chunk_count())
     }
 
@@ -6348,7 +6643,12 @@ impl VectorOnlyIndex {
             let Some(cluster) = cluster.as_ref() else {
                 return;
             };
-            cluster.postings().iter().flatten().copied().collect::<Vec<_>>()
+            cluster
+                .postings()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
         };
         let mut live = self.vector_index.borrow_mut();
         let Some(live) = live.as_mut() else {
@@ -6499,7 +6799,11 @@ impl VectorOnlyIndex {
             } => (
                 total_considered,
                 Vec::new(),
-                Some((metadata_filter, failing_document_ids, failing_document_count)),
+                Some((
+                    metadata_filter,
+                    failing_document_ids,
+                    failing_document_count,
+                )),
             ),
         };
         let index = self.turbovec_index()?;
@@ -6509,16 +6813,32 @@ impl VectorOnlyIndex {
                 failing_document_ids.as_ref(),
                 failing_document_count,
             );
-            return index
-                .search_batch(query_vectors, candidate_k, &[])?
-                .into_iter()
-                .map(|row| {
-                    Ok(CoreSearchResults {
-                        hits: self.assemble_vector_hits_filtered(row, &metadata_filter, top_k)?,
-                        total_considered,
-                    })
-                })
-                .collect::<Result<Vec<_>, CoreError>>();
+            let live_chunk_count = self.live_chunk_count();
+            let rows = index.search_batch(query_vectors, candidate_k, &[])?;
+            let mut results = Vec::with_capacity(rows.len());
+            for (query, row) in query_vectors.iter().zip(rows) {
+                let mut row_candidate_k = candidate_k;
+                let mut raw_count = row.len();
+                let mut hits = self.assemble_vector_hits_filtered(row, &metadata_filter, top_k)?;
+                while deferred_scan_needs_deepening(
+                    hits.len(),
+                    raw_count,
+                    row_candidate_k,
+                    top_k,
+                    live_chunk_count,
+                ) {
+                    row_candidate_k =
+                        next_deferred_candidate_count(row_candidate_k, live_chunk_count);
+                    let row = index.search(query, row_candidate_k, &[])?;
+                    raw_count = row.len();
+                    hits = self.assemble_vector_hits_filtered(row, &metadata_filter, top_k)?;
+                }
+                results.push(CoreSearchResults {
+                    hits,
+                    total_considered,
+                });
+            }
+            return Ok(results);
         }
         Ok(index
             .search_batch(query_vectors, top_k, &allowlist)?
@@ -6594,7 +6914,11 @@ impl VectorOnlyIndex {
             } => (
                 total_considered,
                 Vec::new(),
-                Some((metadata_filter, failing_document_ids, failing_document_count)),
+                Some((
+                    metadata_filter,
+                    failing_document_ids,
+                    failing_document_count,
+                )),
                 false,
             ),
         };
@@ -6608,27 +6932,74 @@ impl VectorOnlyIndex {
         let candidate_k = self.rescore_candidate_count(top_k, scan_capacity);
         let index = self.turbovec_index()?;
         if let Some((metadata_filter, failing_document_ids, failing_document_count)) = predicate {
-            let candidate_k = self.deferred_candidate_count(
-                candidate_k,
-                failing_document_ids.as_ref(),
-                failing_document_count,
-            );
-            return index
-                .search_batch(query_vectors, candidate_k, &[])?
+            let _ = failing_document_count;
+            if let Some(failing_document_ids) = failing_document_ids.as_ref() {
+                // Same pool contract as the single-query rescore above: drop
+                // failures in first-stage order and truncate to the
+                // allowlist-equivalent window per row BEFORE rescoring, with
+                // the same optimistic-start deepening. An under-filled row
+                // re-searches alone; siblings keep their prefix-stable pools.
+                let failing_chunks = self.chunk_count_for_documents(failing_document_ids);
+                let live_chunk_count = self.live_chunk_count();
+                let passing_capacity = live_chunk_count.saturating_sub(failing_chunks);
+                let rescore_window = self.rescore_candidate_count(top_k, passing_capacity);
+                let start_k = rescore_window
+                    .saturating_mul(2)
+                    .saturating_add(16)
+                    .min(rescore_window.saturating_add(failing_chunks))
+                    .min(live_chunk_count);
+                let rows = index.search_batch(query_vectors, start_k, &[])?;
+                return rows
+                    .into_iter()
+                    .zip(query_vectors)
+                    .map(|(raw_hits, query)| {
+                        let mut window_k = start_k;
+                        let mut raw_count = raw_hits.len();
+                        let mut pool: Vec<_> = raw_hits
+                            .into_iter()
+                            .filter(|hit| !failing_document_ids.contains(&hit.document_id))
+                            .take(rescore_window)
+                            .collect();
+                        while pool.len() < rescore_window
+                            && raw_count >= window_k
+                            && window_k < live_chunk_count
+                        {
+                            window_k =
+                                next_deferred_candidate_count(window_k, live_chunk_count);
+                            let retry = index.search(query, window_k, &[])?;
+                            raw_count = retry.len();
+                            pool = retry
+                                .into_iter()
+                                .filter(|hit| !failing_document_ids.contains(&hit.document_id))
+                                .take(rescore_window)
+                                .collect();
+                        }
+                        let rescored = self.rescore_raw_hits(query, pool, rescore_window);
+                        let hits =
+                            self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
+                        Ok(CoreSearchResults {
+                            hits,
+                            total_considered,
+                        })
+                    })
+                    .collect();
+            }
+            // Counts-only deferral keeps the original rescore window over
+            // the live corpus; shrinking it changes the fp32 rerank pool.
+            let rows = index.search_batch(query_vectors, candidate_k, &[])?;
+            return rows
                 .into_iter()
                 .zip(query_vectors)
                 .map(|(raw_hits, query)| {
                     let rescored = self.rescore_raw_hits(query, raw_hits, candidate_k);
+                    let hits =
+                        self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
                     Ok(CoreSearchResults {
-                        hits: self.assemble_vector_hits_filtered(
-                            rescored,
-                            &metadata_filter,
-                            top_k,
-                        )?,
+                        hits,
                         total_considered,
                     })
                 })
-                .collect::<Result<Vec<_>, CoreError>>();
+                .collect();
         }
         Ok(index
             .search_batch(query_vectors, candidate_k, &allowlist)?
@@ -7318,7 +7689,10 @@ fn turbovec_error(error: impl std::fmt::Display) -> CoreError {
 
 #[cfg(test)]
 mod tvvf_gc_tests {
-    use super::{flush_tvvf, gc_tvvf_epochs, CoreEngine};
+    use super::{
+        deferred_scan_needs_deepening, flush_tvvf, gc_tvvf_epochs, next_deferred_candidate_count,
+        CoreEngine,
+    };
     use crate::storage;
     use crate::storage::commit_manifest::{
         build_commit_body, commit_manifest_path, generation_dir, write_commit_manifest,
@@ -7410,18 +7784,22 @@ mod tvvf_gc_tests {
     }
 
     #[test]
+    fn deferred_scan_deepens_only_when_window_was_exhausted() {
+        assert!(deferred_scan_needs_deepening(2, 5, 5, 3, 12));
+        assert_eq!(next_deferred_candidate_count(5, 12), 10);
+        assert!(!deferred_scan_needs_deepening(3, 5, 5, 3, 12));
+        assert!(!deferred_scan_needs_deepening(2, 4, 5, 3, 12));
+        assert!(!deferred_scan_needs_deepening(2, 12, 12, 3, 12));
+        assert_eq!(next_deferred_candidate_count(7, 12), 12);
+    }
+
+    #[test]
     fn gc_keeps_durable_root_epoch_when_unpublished_folds_advance() {
         let dir = temp_dir("unpublished-folds");
         let row = [1.0_f32; 8];
-        let manifest = storage::record_tvvf_base(
-            &dir,
-            "index",
-            1,
-            "float32",
-            8,
-            &[(7, row.as_slice())],
-        )
-        .expect("record epoch one");
+        let manifest =
+            storage::record_tvvf_base(&dir, "index", 1, "float32", 8, &[(7, row.as_slice())])
+                .expect("record epoch one");
         publish_tvvf_root(&dir, manifest);
 
         // Simulate two retries after the root-manifest write failed: both folds
@@ -7442,8 +7820,7 @@ mod tvvf_gc_tests {
     #[test]
     fn gc_retains_an_epoch_when_unlink_fails() {
         let dir = temp_dir("unlink-failure");
-        fs::create_dir_all(generation_dir(&dir, "index"))
-            .expect("create generation directory");
+        fs::create_dir_all(generation_dir(&dir, "index")).expect("create generation directory");
         publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
         let retained = storage::tvvf_base_path(&dir, "index", 1);
         // A directory at the base-file path makes remove_file fail on every
@@ -7460,18 +7837,19 @@ mod tvvf_gc_tests {
     #[test]
     fn gc_removes_orphaned_delta_dir_when_the_base_is_already_missing() {
         let dir = temp_dir("orphan-delta-dir");
-        fs::create_dir_all(generation_dir(&dir, "index"))
-            .expect("create generation directory");
+        fs::create_dir_all(generation_dir(&dir, "index")).expect("create generation directory");
         publish_tvvf_root(&dir, json!({"vf_epoch": 3}));
         let orphan_base = storage::tvvf_base_path(&dir, "index", 1);
         let orphan_delta = orphan_base.with_file_name(format!(
             "{}{}",
-            orphan_base.file_name().unwrap_or_default().to_string_lossy(),
+            orphan_base
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
             storage::tvvf_store::TVVF_DELTA_DIR_SUFFIX
         ));
         fs::create_dir_all(&orphan_delta).expect("create orphan delta directory");
-        fs::write(orphan_delta.join("orphan.tvfd"), b"orphan")
-            .expect("write orphan delta segment");
+        fs::write(orphan_delta.join("orphan.tvfd"), b"orphan").expect("write orphan delta segment");
 
         gc_tvvf_epochs(&dir, "index");
 

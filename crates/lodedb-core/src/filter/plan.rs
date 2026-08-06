@@ -10,11 +10,27 @@ use crate::filter::doc_set::DocSet;
 use crate::filter::field_index::FieldIndex;
 use crate::filter::resolve::resolve_filter;
 
+mod and_plan;
+
 /// A planned metadata filter execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataFilterPlan {
     /// The matching document-id set is selective enough to materialize directly.
     Materialized(DocSet),
+    /// A bounded candidate set must be checked against the full predicate.
+    ///
+    /// This is used for selective AND anchors: the planner materializes only the
+    /// cheap anchor posting and lets the engine, which owns document metadata,
+    /// evaluate the remaining conjuncts per candidate.
+    FilteredCandidates(DocSet),
+    /// A matching anchor with a bounded failing-candidate denylist.
+    ///
+    /// The engine refines `failing_candidates` with the full predicate and
+    /// subtracts the confirmed failures from `anchor`. The anchor must be exact.
+    AnchoredDenylist {
+        anchor: DocSet,
+        failing_candidates: DocSet,
+    },
     /// The query path should keep the filter as a per-document predicate.
     Predicate(MetadataPredicatePlan),
 }
@@ -30,6 +46,8 @@ pub struct MetadataPredicatePlan {
     /// predicate against stored metadata, which keeps complement clauses bounded
     /// by the indexed field rather than by the corpus.
     pub failing_candidates: Option<DocSet>,
+    /// True when `failing_candidates` is already the exact failing set.
+    pub failing_exact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +73,12 @@ struct ProbeInfo {
 const REFINE_COST_RATIO: usize = 16;
 const BLIND_DEFER_NUM: usize = 2;
 const BLIND_DEFER_DEN: usize = 3;
+// Complement knockout clones and subtracts the anchor at ~0.39 us/doc
+// (37.8 ms at 95k). A deferred top-(k+F) ranked scan costs ~0.19 us/candidate
+// (18.6 ms at 100k), so the exact-failing denylist wins while F is under ~2x
+// the anchor. Keeping the measured break-even as a strict multiplier leaves a
+// conservative margin for the union/refinement work.
+const KNOCKOUT_VS_DENYLIST: usize = 2;
 
 /// Plans a validated metadata filter without materializing unselective matches.
 pub fn plan_metadata_filter(
@@ -75,7 +99,12 @@ pub fn plan_metadata_filter(
             matching_count: Some(total),
             failing_count: Some(0),
             failing_candidates: Some(DocSet::new()),
+            failing_exact: true,
         }));
+    }
+
+    if let Some(plan) = and_plan::plan_conjunctive_filter(metadata_filter, fields, all_docs)? {
+        return Ok(plan);
     }
 
     // Deferral with failing-side refinement pays only when the failing side
@@ -100,6 +129,7 @@ pub fn plan_metadata_filter(
                     fields,
                     all_docs,
                 )?),
+                failing_exact: false,
             }));
         }
     }
@@ -112,6 +142,7 @@ pub fn plan_metadata_filter(
                 matching_count: Some(count),
                 failing_count: Some(total.saturating_sub(count)),
                 failing_candidates: None,
+                failing_exact: false,
             }));
         }
     }
@@ -944,6 +975,23 @@ mod tests {
         build_field_indexes(&metadata)
     }
 
+    fn indexes_owned(
+        rows: Vec<(String, Vec<(String, String)>)>,
+    ) -> (
+        BTreeMap<String, crate::filter::FieldIndex>,
+        crate::filter::DocSet,
+    ) {
+        let metadata = rows
+            .into_iter()
+            .map(|(id, entries)| (id, entries.into_iter().collect()))
+            .collect();
+        build_field_indexes(&metadata)
+    }
+
+    fn docset(ids: &[&str]) -> crate::filter::DocSet {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     #[test]
     fn complement_or_uses_failing_candidates() {
         let (fields, all_docs) = indexes(&[
@@ -968,7 +1016,7 @@ mod tests {
                     ["a".to_string(), "d".to_string()].into_iter().collect()
                 );
             }
-            MetadataFilterPlan::Materialized(_) => panic!("complement OR should defer"),
+            plan => panic!("complement OR should defer, got {plan:?}"),
         }
     }
 
@@ -1051,6 +1099,7 @@ mod tests {
             MetadataFilterPlan::Predicate(_) => {
                 panic!("sparse $exists:false must materialize, not refine the corpus")
             }
+            plan => panic!("sparse $exists:false should not use AND plan, got {plan:?}"),
         }
     }
 
@@ -1067,5 +1116,142 @@ mod tests {
             estimate_matching_cardinality(&filter, &fields, &all_docs).unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn dedup_and_uses_selective_anchor_candidate_set() {
+        let rows = (0..100)
+            .map(|i| {
+                let mut entries = vec![("namespace".to_string(), "main".to_string())];
+                if i == 42 {
+                    entries.push(("content_sha256".to_string(), "sha-42".to_string()));
+                }
+                (format!("d{i:03}"), entries)
+            })
+            .collect();
+        let (fields, all_docs) = indexes_owned(rows);
+        let filter = validate_metadata_filter(&json!({
+            "namespace": "main",
+            "content_sha256": "sha-42"
+        }))
+        .unwrap();
+
+        match plan_metadata_filter(&filter, &fields, &all_docs).unwrap() {
+            MetadataFilterPlan::FilteredCandidates(candidates) => {
+                assert_eq!(candidates, docset(&["d042"]));
+            }
+            plan => panic!("dedup AND should anchor on the one-doc sha posting, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_and_uses_exact_failing_denylist() {
+        let rows = (0..20)
+            .map(|i| {
+                let mut entries = Vec::new();
+                entries.push((
+                    "namespace".to_string(),
+                    if i < 19 { "main" } else { "other" }.to_string(),
+                ));
+                if matches!(i, 0 | 1) {
+                    entries.push(("superseded_by".to_string(), "newer".to_string()));
+                }
+                if i == 2 {
+                    entries.push(("expires".to_string(), "10".to_string()));
+                } else if matches!(i, 3 | 4) {
+                    entries.push(("expires".to_string(), "90".to_string()));
+                }
+                (format!("d{i:02}"), entries)
+            })
+            .collect();
+        let (fields, all_docs) = indexes_owned(rows);
+        let filter = validate_metadata_filter(&json!({
+            "$and": [
+                {"namespace": "main"},
+                {"superseded_by": {"$exists": false}},
+                {"$or": [
+                    {"expires": {"$exists": false}},
+                    {"expires": {"$gt": "50"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        match plan_metadata_filter(&filter, &fields, &all_docs).unwrap() {
+            MetadataFilterPlan::Predicate(predicate) => {
+                assert!(predicate.failing_exact);
+                assert_eq!(predicate.matching_count, Some(16));
+                assert_eq!(predicate.failing_count, Some(4));
+                assert_eq!(
+                    predicate.failing_candidates.unwrap(),
+                    docset(&["d00", "d01", "d02", "d19"])
+                );
+            }
+            plan => panic!("recall AND should use exact failing denylist, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn all_unselective_and_with_exact_anchor_uses_exact_denylist() {
+        let rows = (0..20)
+            .map(|i| {
+                let mut entries = vec![("namespace".to_string(), "main".to_string())];
+                if matches!(i, 0 | 1) {
+                    entries.push(("superseded_by".to_string(), "newer".to_string()));
+                }
+                if i == 2 {
+                    entries.push(("expires".to_string(), "10".to_string()));
+                } else if matches!(i, 3 | 4) {
+                    entries.push(("expires".to_string(), "90".to_string()));
+                }
+                (format!("d{i:02}"), entries)
+            })
+            .collect();
+        let (fields, all_docs) = indexes_owned(rows);
+        let filter = validate_metadata_filter(&json!({
+            "namespace": "main",
+            "superseded_by": {"$exists": false},
+            "$or": [
+                {"expires": {"$exists": false}},
+                {"expires": {"$gt": "50"}}
+            ]
+        }))
+        .unwrap();
+
+        match plan_metadata_filter(&filter, &fields, &all_docs).unwrap() {
+            MetadataFilterPlan::Predicate(predicate) => {
+                assert!(predicate.failing_exact);
+                assert_eq!(predicate.matching_count, Some(17));
+                assert_eq!(predicate.failing_count, Some(3));
+                assert_eq!(
+                    predicate.failing_candidates.unwrap(),
+                    docset(&["d00", "d01", "d02"])
+                );
+            }
+            plan => panic!("all-unselective AND should use exact denylist, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_or_of_and_keeps_fallback_materialization() {
+        let (fields, all_docs) = indexes(&[
+            ("a", &[("namespace", "main"), ("content_sha256", "sha-a")]),
+            ("b", &[("namespace", "main"), ("content_sha256", "sha-b")]),
+            ("c", &[("kind", "other")]),
+        ]);
+        let filter = validate_metadata_filter(&json!({
+            "$or": [
+                {"$and": [{"namespace": "main"}, {"content_sha256": "sha-a"}]},
+                {"kind": "other"}
+            ]
+        }))
+        .unwrap();
+
+        match plan_metadata_filter(&filter, &fields, &all_docs).unwrap() {
+            MetadataFilterPlan::Materialized(docs) => {
+                assert_eq!(docs, docset(&["a", "c"]));
+            }
+            plan => panic!("nested $or-of-$and should keep fallback, got {plan:?}"),
+        }
     }
 }
