@@ -5,6 +5,24 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-08-06
+
+### Changed
+
+- Metadata filter resolution plans over field-index cardinalities instead
+  of materialising every result as a document-id set (#120). Unselective
+  and complement-shaped clauses (the `{"$or": [{"expires": {"$exists":
+  false}}, {"expires": {"$gt": "<now>"}}]}` expiry idiom hits both) stay
+  per-document predicates with bounded failing-side refinement, id-bounded
+  queries check only the requested ids, and `list_documents` pages with
+  the predicate inline. Rescored deferrals pool the first-stage passing
+  prefix and deepen until the pool fills, keeping parity with a
+  materialised allowlist of the passing documents. On a 100k-doc 384-d
+  store the expiry idiom drops from 37.6 ms to 0.64 ms per filtered
+  search (13.2 ms to 0.14 ms id-bounded, 14.3 ms to 0.06 ms for a 25-doc
+  list) with unchanged filter semantics, validation errors, ordering, and
+  `total_considered`.
+
 ## [2.0.10] - 2026-08-05
 
 ### Added
