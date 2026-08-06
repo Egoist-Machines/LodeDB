@@ -43,6 +43,19 @@ struct ProbeInfo {
     count: usize,
 }
 
+// Both decision constants come from a 100k x 384-d selectivity sweep
+// (2026-08-06). Refining one failing candidate (record lookup, predicate,
+// set insert) measured ~5.1 us against ~0.28 us to materialize one matching
+// doc, so deferral with refinement must find a failing side over an order of
+// magnitude smaller: 16x, rounded from the measured ~18x. A blind deferral
+// (no failing ids) costs a flat full ranked scan (~18.6 ms there) against
+// materialization's linear ~0.28 us per matching doc, crossing near 2/3 of
+// the corpus: materialize won at 60% (17.1 vs 18.7 ms) and lost at 75%
+// (21.3 vs 18.4 ms).
+const REFINE_COST_RATIO: usize = 16;
+const BLIND_DEFER_NUM: usize = 2;
+const BLIND_DEFER_DEN: usize = 3;
+
 /// Plans a validated metadata filter without materializing unselective matches.
 pub fn plan_metadata_filter(
     metadata_filter: &Value,
@@ -65,31 +78,19 @@ pub fn plan_metadata_filter(
         }));
     }
 
-    if let Some(count) = matching_count {
-        if count.saturating_mul(2) > total {
-            if failing_probe.is_some() {
-                return Ok(MetadataFilterPlan::Predicate(MetadataPredicatePlan {
-                    matching_count: None,
-                    failing_count: None,
-                    failing_candidates: Some(materialize_probe(
-                        metadata_filter,
-                        ProbeSide::Failing,
-                        fields,
-                        all_docs,
-                    )?),
-                }));
-            }
-            return Ok(MetadataFilterPlan::Predicate(MetadataPredicatePlan {
-                matching_count: Some(count),
-                failing_count: Some(total.saturating_sub(count)),
-                failing_candidates: None,
-            }));
-        }
-    }
-
+    // Deferral with failing-side refinement pays only when the failing side
+    // is over an order of magnitude smaller than the matching set it saves
+    // materializing: each failing candidate is refined through the full
+    // per-document predicate, which costs ~REFINE_COST_RATIO times a
+    // matching-set insert. The exact matching count bounds the materialize
+    // cost just as well as a probe does; without it, a sparse $exists:false
+    // (field on most of the corpus, few docs matching) would defer and refine
+    // the huge failing side when materializing the small matching set wins.
     if let Some(failing_probe) = failing_probe {
-        let matching_cost = matching_probe.map_or(usize::MAX, |probe| probe.count);
-        if failing_probe.count < matching_cost {
+        let matching_cost = matching_count
+            .or(matching_probe.map(|probe| probe.count))
+            .unwrap_or(usize::MAX);
+        if failing_probe.count.saturating_mul(REFINE_COST_RATIO) < matching_cost {
             return Ok(MetadataFilterPlan::Predicate(MetadataPredicatePlan {
                 matching_count: None,
                 failing_count: None,
@@ -99,6 +100,18 @@ pub fn plan_metadata_filter(
                     fields,
                     all_docs,
                 )?),
+            }));
+        }
+    }
+
+    // Without cheap failing ids, deferral means a full ranked scan at flat
+    // cost; it beats building the matching set only past ~2/3 of the corpus.
+    if let Some(count) = matching_count {
+        if count.saturating_mul(BLIND_DEFER_DEN) > total.saturating_mul(BLIND_DEFER_NUM) {
+            return Ok(MetadataFilterPlan::Predicate(MetadataPredicatePlan {
+                matching_count: Some(count),
+                failing_count: Some(total.saturating_sub(count)),
+                failing_candidates: None,
             }));
         }
     }
@@ -960,10 +973,10 @@ mod tests {
     }
 
     #[test]
-    fn planner_flips_at_half_for_exact_positive_clause() {
+    fn planner_flips_at_two_thirds_for_exact_positive_clause() {
         let rows = (0..10)
             .map(|i| {
-                let entries: &[(&str, &str)] = if i < 5 { &[("flag", "yes")] } else { &[] };
+                let entries: &[(&str, &str)] = if i < 6 { &[("flag", "yes")] } else { &[] };
                 (format!("d{i}"), entries.to_vec())
             })
             .collect::<Vec<_>>();
@@ -992,7 +1005,7 @@ mod tests {
 
         let rows = (0..10)
             .map(|i| {
-                let entries: &[(&str, &str)] = if i < 6 { &[("flag", "yes")] } else { &[] };
+                let entries: &[(&str, &str)] = if i < 7 { &[("flag", "yes")] } else { &[] };
                 (format!("d{i}"), entries.to_vec())
             })
             .collect::<Vec<_>>();
@@ -1017,6 +1030,28 @@ mod tests {
             plan_metadata_filter(&filter, &fields, &all_docs).unwrap(),
             MetadataFilterPlan::Predicate(_)
         ));
+    }
+
+    #[test]
+    fn sparse_exists_false_materializes_the_small_matching_set() {
+        // Field on 3 of 4 docs: only one doc matches $exists:false, and the
+        // failing side (3 docs, each refined through the full predicate) is
+        // not an order of magnitude smaller, so the planner must materialize.
+        let (fields, all_docs) = indexes(&[
+            ("a", &[("flag", "x")]),
+            ("b", &[("flag", "y")]),
+            ("c", &[("flag", "z")]),
+            ("d", &[]),
+        ]);
+        let filter = validate_metadata_filter(&json!({"flag": {"$exists": false}})).unwrap();
+        match plan_metadata_filter(&filter, &fields, &all_docs).unwrap() {
+            MetadataFilterPlan::Materialized(docs) => {
+                assert_eq!(docs, ["d".to_string()].into_iter().collect());
+            }
+            MetadataFilterPlan::Predicate(_) => {
+                panic!("sparse $exists:false must materialize, not refine the corpus")
+            }
+        }
     }
 
     #[test]
