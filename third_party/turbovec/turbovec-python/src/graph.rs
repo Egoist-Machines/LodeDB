@@ -95,7 +95,9 @@ fn props_to_string(value: &Value) -> String {
 }
 
 /// A caller-supplied Python embedder, wrapped as a Rust [`Embedder`]. Holds the
-/// Python object and calls its `embed(texts, role)` under the GIL.
+/// Python object and reattaches to the interpreter to call its
+/// `embed(texts, role)`; the graph verbs run detached, so this is the one place
+/// a native graph call re-enters Python.
 struct PyEmbedder {
     obj: Py<PyAny>,
     dim: usize,
@@ -111,7 +113,7 @@ impl Embedder for PyEmbedder {
             EmbedRole::Document => "document",
             EmbedRole::Query => "query",
         };
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let bound = self.obj.bind(py);
             let result = bound
                 .call_method1("embed", (texts.to_vec(), role_str))
@@ -188,6 +190,48 @@ pub struct PyTemporalGraph {
     inner: TemporalGraph,
 }
 
+impl PyTemporalGraph {
+    /// Runs a read-path native call with the GIL released. Traversal and
+    /// semantic verbs scan SQL tables and the vector index (whose first query
+    /// can trigger a lazy ANN build), which must not starve the host's Python
+    /// threads.
+    fn detached<R: Send>(
+        &self,
+        py: Python<'_>,
+        call: impl FnOnce(&TemporalGraph) -> lodedb_graph::Result<R> + Send,
+    ) -> PyResult<R> {
+        let graph_addr = &self.inner as *const TemporalGraph as usize;
+        py.detach(move || {
+            // SAFETY: `self` outlives this synchronous call, the closure runs on
+            // the graph-owning thread (the pyclass is unsendable, so no other
+            // thread can borrow it), and no Python state is touched while
+            // detached; the embedder callback reattaches on its own.
+            let inner: &TemporalGraph = unsafe { &*(graph_addr as *const TemporalGraph) };
+            call(inner)
+        })
+        .map_err(to_py_err)
+    }
+
+    /// [`Self::detached`] for the mutation verbs, which own the batch-shaped
+    /// work (episode/fact ingest loops, reindex, persist).
+    fn detached_mut<R: Send>(
+        &mut self,
+        py: Python<'_>,
+        call: impl FnOnce(&mut TemporalGraph) -> lodedb_graph::Result<R> + Send,
+    ) -> PyResult<R> {
+        let graph_addr = &mut self.inner as *mut TemporalGraph as usize;
+        py.detach(move || {
+            // SAFETY: as for `detached`, plus exclusivity: the pycell's mutable
+            // borrow stays held across the detached section, so a re-entrant
+            // borrow from the embedder callback raises a Python borrow error
+            // instead of aliasing `inner`.
+            let inner: &mut TemporalGraph = unsafe { &mut *(graph_addr as *mut TemporalGraph) };
+            call(inner)
+        })
+        .map_err(to_py_err)
+    }
+}
+
 #[pymethods]
 impl PyTemporalGraph {
     /// Open (or create) a graph. `path=None` is a fully in-memory graph. `embedder`
@@ -237,8 +281,10 @@ impl PyTemporalGraph {
     // -- episodes -----------------------------------------------------------
 
     #[pyo3(signature = (source, body, occurred_at, properties=None, mentions=Vec::new(), id=None))]
+    #[allow(clippy::too_many_arguments)]
     fn add_episode(
         &mut self,
+        py: Python<'_>,
         source: &str,
         body: &str,
         occurred_at: i64,
@@ -247,22 +293,24 @@ impl PyTemporalGraph {
         id: Option<&str>,
     ) -> PyResult<String> {
         let props = parse_props(properties)?;
-        self.inner
-            .add_episode_with_id(id, source, body, occurred_at, props, &mentions)
-            .map_err(to_py_err)
+        let source = source.to_owned();
+        let body = body.to_owned();
+        let id = id.map(str::to_owned);
+        self.detached_mut(py, move |inner| {
+            inner.add_episode_with_id(id.as_deref(), &source, &body, occurred_at, props, &mentions)
+        })
     }
 
     fn get_episode<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match self.inner.get_episode(id).map_err(to_py_err)? {
+        let id = id.to_owned();
+        match self.detached(py, move |inner| inner.get_episode(&id))? {
             Some(ep) => Ok(Some(episode_dict(py, &ep)?)),
             None => Ok(None),
         }
     }
 
     fn episodes<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        self.inner
-            .episodes()
-            .map_err(to_py_err)?
+        self.detached(py, |inner| inner.episodes())?
             .iter()
             .map(|episode| episode_dict(py, episode))
             .collect()
@@ -273,16 +321,16 @@ impl PyTemporalGraph {
         py: Python<'py>,
         id: &str,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        self.inner
-            .facts_by_episode(id)
-            .map_err(to_py_err)?
+        let id = id.to_owned();
+        self.detached(py, move |inner| inner.facts_by_episode(&id))?
             .iter()
             .map(|fact| fact_dict(py, fact))
             .collect()
     }
 
-    fn remove_episode(&mut self, id: &str) -> PyResult<bool> {
-        self.inner.remove_episode(id).map_err(to_py_err)
+    fn remove_episode(&mut self, py: Python<'_>, id: &str) -> PyResult<bool> {
+        let id = id.to_owned();
+        self.detached_mut(py, move |inner| inner.remove_episode(&id))
     }
 
     // -- entities -----------------------------------------------------------
@@ -290,6 +338,7 @@ impl PyTemporalGraph {
     #[pyo3(signature = (id, entity_type, label, properties=None, valid_at=None, invalid_at=None, property_sources=None))]
     fn upsert_entity(
         &mut self,
+        py: Python<'_>,
         id: &str,
         entity_type: &str,
         label: &str,
@@ -300,22 +349,26 @@ impl PyTemporalGraph {
     ) -> PyResult<String> {
         let props = parse_props(properties)?;
         let sources = parse_property_sources(property_sources)?;
-        self.inner
-            .upsert_entity_with_sources(
-                id,
-                entity_type,
-                label,
+        let id = id.to_owned();
+        let entity_type = entity_type.to_owned();
+        let label = label.to_owned();
+        self.detached_mut(py, move |inner| {
+            inner.upsert_entity_with_sources(
+                &id,
+                &entity_type,
+                &label,
                 props,
                 valid_at,
                 invalid_at,
                 &sources,
             )
-            .map_err(to_py_err)
+        })
     }
 
     #[pyo3(signature = (id, entity_type, label, embedding, properties=None, valid_at=None, invalid_at=None, property_sources=None))]
     fn upsert_entity_vec(
         &mut self,
+        py: Python<'_>,
         id: &str,
         entity_type: &str,
         label: &str,
@@ -327,22 +380,26 @@ impl PyTemporalGraph {
     ) -> PyResult<String> {
         let props = parse_props(properties)?;
         let sources = parse_property_sources(property_sources)?;
-        self.inner
-            .upsert_entity_vec_with_sources(
-                id,
-                entity_type,
-                label,
+        let id = id.to_owned();
+        let entity_type = entity_type.to_owned();
+        let label = label.to_owned();
+        self.detached_mut(py, move |inner| {
+            inner.upsert_entity_vec_with_sources(
+                &id,
+                &entity_type,
+                &label,
                 props,
                 &embedding,
                 valid_at,
                 invalid_at,
                 &sources,
             )
-            .map_err(to_py_err)
+        })
     }
 
     fn get_entity<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match self.inner.get_entity(id).map_err(to_py_err)? {
+        let id = id.to_owned();
+        match self.detached(py, move |inner| inner.get_entity(&id))? {
             Some(e) => Ok(Some(entity_dict(py, &e)?)),
             None => Ok(None),
         }
@@ -355,9 +412,9 @@ impl PyTemporalGraph {
         id: &str,
         key: Option<&str>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        self.inner
-            .entity_property_history(id, key)
-            .map_err(to_py_err)?
+        let id = id.to_owned();
+        let key = key.map(str::to_owned);
+        self.detached(py, move |inner| inner.entity_property_history(&id, key.as_deref()))?
             .iter()
             .map(|version| property_version_dict(py, version))
             .collect()
@@ -373,13 +430,10 @@ impl PyTemporalGraph {
         strict_now: bool,
         known_at_ms: Option<i64>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let out = self
-            .inner
-            .entities(
-                entity_type,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
-            )
-            .map_err(to_py_err)?;
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let entity_type = entity_type.map(str::to_owned);
+        let out =
+            self.detached(py, move |inner| inner.entities(entity_type.as_deref(), as_of))?;
         out.iter().map(|e| entity_dict(py, e)).collect()
     }
 
@@ -389,6 +443,7 @@ impl PyTemporalGraph {
     #[allow(clippy::too_many_arguments)]
     fn add_fact(
         &mut self,
+        py: Python<'_>,
         src: &str,
         relation: &str,
         dst: &str,
@@ -400,25 +455,31 @@ impl PyTemporalGraph {
         id: Option<&str>,
     ) -> PyResult<String> {
         let props = parse_props(properties)?;
-        self.inner
-            .add_fact_with_id(
-                id,
-                src,
-                relation,
-                dst,
-                fact,
+        let src = src.to_owned();
+        let relation = relation.to_owned();
+        let dst = dst.to_owned();
+        let fact = fact.to_owned();
+        let id = id.map(str::to_owned);
+        self.detached_mut(py, move |inner| {
+            inner.add_fact_with_id(
+                id.as_deref(),
+                &src,
+                &relation,
+                &dst,
+                &fact,
                 props,
                 episodes,
                 valid_at,
                 &invalidates,
             )
-            .map_err(to_py_err)
+        })
     }
 
     #[pyo3(signature = (src, relation, dst, fact, embedding, properties=None, episodes=Vec::new(), valid_at=None, invalidates=Vec::new(), id=None))]
     #[allow(clippy::too_many_arguments)]
     fn add_fact_vec(
         &mut self,
+        py: Python<'_>,
         src: &str,
         relation: &str,
         dst: &str,
@@ -431,40 +492,54 @@ impl PyTemporalGraph {
         id: Option<&str>,
     ) -> PyResult<String> {
         let props = parse_props(properties)?;
-        self.inner
-            .add_fact_vec_with_id(
-                id,
-                src,
-                relation,
-                dst,
-                fact,
+        let src = src.to_owned();
+        let relation = relation.to_owned();
+        let dst = dst.to_owned();
+        let fact = fact.to_owned();
+        let id = id.map(str::to_owned);
+        self.detached_mut(py, move |inner| {
+            inner.add_fact_vec_with_id(
+                id.as_deref(),
+                &src,
+                &relation,
+                &dst,
+                &fact,
                 props,
                 episodes,
                 valid_at,
                 &invalidates,
                 &embedding,
             )
-            .map_err(to_py_err)
+        })
     }
 
     #[pyo3(signature = (id, invalid_at=None))]
-    fn invalidate_fact(&mut self, id: &str, invalid_at: Option<i64>) -> PyResult<bool> {
-        self.inner.invalidate_fact(id, invalid_at).map_err(to_py_err)
+    fn invalidate_fact(
+        &mut self,
+        py: Python<'_>,
+        id: &str,
+        invalid_at: Option<i64>,
+    ) -> PyResult<bool> {
+        let id = id.to_owned();
+        self.detached_mut(py, move |inner| inner.invalidate_fact(&id, invalid_at))
     }
 
     fn get_fact<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match self.inner.get_fact(id).map_err(to_py_err)? {
+        let id = id.to_owned();
+        match self.detached(py, move |inner| inner.get_fact(&id))? {
             Some(f) => Ok(Some(fact_dict(py, &f)?)),
             None => Ok(None),
         }
     }
 
-    fn remove_entity(&mut self, id: &str) -> PyResult<bool> {
-        self.inner.remove_entity(id).map_err(to_py_err)
+    fn remove_entity(&mut self, py: Python<'_>, id: &str) -> PyResult<bool> {
+        let id = id.to_owned();
+        self.detached_mut(py, move |inner| inner.remove_entity(&id))
     }
 
-    fn remove_fact(&mut self, id: &str) -> PyResult<bool> {
-        self.inner.remove_fact(id).map_err(to_py_err)
+    fn remove_fact(&mut self, py: Python<'_>, id: &str) -> PyResult<bool> {
+        let id = id.to_owned();
+        self.detached_mut(py, move |inner| inner.remove_fact(&id))
     }
 
     // -- traversal ----------------------------------------------------------
@@ -482,15 +557,12 @@ impl PyTemporalGraph {
         known_at_ms: Option<i64>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let dir = Direction::parse(direction).map_err(to_py_err)?;
-        let facts = self
-            .inner
-            .neighbors(
-                id,
-                dir,
-                relation,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
-            )
-            .map_err(to_py_err)?;
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let id = id.to_owned();
+        let relation = relation.map(str::to_owned);
+        let facts = self.detached(py, move |inner| {
+            inner.neighbors(&id, dir, relation.as_deref(), as_of)
+        })?;
         facts.iter().map(|f| fact_dict(py, f)).collect()
     }
 
@@ -509,16 +581,10 @@ impl PyTemporalGraph {
     ) -> PyResult<Bound<'py, PyDict>> {
         let dir = Direction::parse(direction).map_err(to_py_err)?;
         let predicate = parse_optional_json(predicate, "predicate")?;
-        let sub = self
-            .inner
-            .k_hop_filtered(
-                &seeds,
-                k,
-                dir,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
-                predicate.as_ref(),
-            )
-            .map_err(to_py_err)?;
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let sub = self.detached(py, move |inner| {
+            inner.k_hop_filtered(&seeds, k, dir, as_of, predicate.as_ref())
+        })?;
         subgraph_dict(py, &sub)
     }
 
@@ -539,17 +605,19 @@ impl PyTemporalGraph {
         predicate: Option<&str>,
     ) -> PyResult<Vec<(f32, Bound<'py, PyDict>)>> {
         let predicate = parse_optional_json(predicate, "predicate")?;
-        let hits = self
-            .inner
-            .semantic_entities_filtered(
-                query,
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let query = query.map(str::to_owned);
+        let entity_type = entity_type.map(str::to_owned);
+        let hits = self.detached(py, move |inner| {
+            inner.semantic_entities_filtered(
+                query.as_deref(),
                 embedding.as_deref(),
                 k,
-                entity_type,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
+                entity_type.as_deref(),
+                as_of,
                 predicate.as_ref(),
             )
-            .map_err(to_py_err)?;
+        })?;
         hits.iter()
             .map(|(score, e)| Ok((*score, entity_dict(py, e)?)))
             .collect()
@@ -570,17 +638,19 @@ impl PyTemporalGraph {
         predicate: Option<&str>,
     ) -> PyResult<Vec<(f32, Bound<'py, PyDict>)>> {
         let predicate = parse_optional_json(predicate, "predicate")?;
-        let hits = self
-            .inner
-            .semantic_facts_filtered(
-                query,
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let query = query.map(str::to_owned);
+        let relation = relation.map(str::to_owned);
+        let hits = self.detached(py, move |inner| {
+            inner.semantic_facts_filtered(
+                query.as_deref(),
                 embedding.as_deref(),
                 k,
-                relation,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
+                relation.as_deref(),
+                as_of,
                 predicate.as_ref(),
             )
-            .map_err(to_py_err)?;
+        })?;
         hits.iter()
             .map(|(score, f)| Ok((*score, fact_dict(py, f)?)))
             .collect()
@@ -607,21 +677,25 @@ impl PyTemporalGraph {
     ) -> PyResult<Bound<'py, PyDict>> {
         let dir = Direction::parse(direction).map_err(to_py_err)?;
         let predicate = parse_optional_json(predicate, "predicate")?;
-        let sub = self
-            .inner
-            .search_subgraph_filtered(
-                query,
+        let as_of = resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?;
+        let query = query.map(str::to_owned);
+        let entity_type = entity_type.map(str::to_owned);
+        let relation = relation.map(str::to_owned);
+        let seed_kind = seed_kind.to_owned();
+        let sub = self.detached(py, move |inner| {
+            inner.search_subgraph_filtered(
+                query.as_deref(),
                 embedding.as_deref(),
                 k,
                 hops,
                 dir,
-                entity_type,
-                relation,
-                resolve_as_of(as_of_ms, all_time, strict_now, known_at_ms)?,
+                entity_type.as_deref(),
+                relation.as_deref(),
+                as_of,
                 predicate.as_ref(),
-                seed_kind,
+                &seed_kind,
             )
-            .map_err(to_py_err)?;
+        })?;
         subgraph_dict(py, &sub)
     }
 
@@ -634,24 +708,25 @@ impl PyTemporalGraph {
         predicate: Option<&str>,
     ) -> PyResult<Vec<(f32, Bound<'py, PyDict>)>> {
         let predicate = parse_optional_json(predicate, "predicate")?;
-        let hits = self
-            .inner
-            .resolve_entity_filtered(name, k, predicate.as_ref())
-            .map_err(to_py_err)?;
+        let name = name.to_owned();
+        let hits = self.detached(py, move |inner| {
+            inner.resolve_entity_filtered(&name, k, predicate.as_ref())
+        })?;
         hits.iter()
             .map(|(score, e)| Ok((*score, entity_dict(py, e)?)))
             .collect()
     }
 
     fn history<'py>(&self, py: Python<'py>, entity_id: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let facts = self.inner.history(entity_id).map_err(to_py_err)?;
+        let entity_id = entity_id.to_owned();
+        let facts = self.detached(py, move |inner| inner.history(&entity_id))?;
         facts.iter().map(|f| fact_dict(py, f)).collect()
     }
 
     // -- maintenance --------------------------------------------------------
 
     fn reindex<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = self.inner.reindex().map_err(to_py_err)?;
+        let stats = self.detached_mut(py, |inner| inner.reindex())?;
         let dict = PyDict::new(py);
         dict.set_item("reindexed_entities", stats.reindexed_entities)?;
         dict.set_item("reindexed_facts", stats.reindexed_facts)?;
@@ -660,7 +735,7 @@ impl PyTemporalGraph {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = self.inner.stats().map_err(to_py_err)?;
+        let stats = self.detached(py, |inner| inner.stats())?;
         let dict = PyDict::new(py);
         dict.set_item("entities", stats.entities)?;
         dict.set_item("facts", stats.facts)?;
@@ -668,8 +743,8 @@ impl PyTemporalGraph {
         Ok(dict)
     }
 
-    fn persist(&mut self) -> PyResult<()> {
-        self.inner.persist().map_err(to_py_err)
+    fn persist(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.detached_mut(py, |inner| inner.persist())
     }
 }
 
