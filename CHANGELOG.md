@@ -5,6 +5,23 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-08-12
+
+### Added
+
+- Cloud image verbs for plane-embedded clip stores (#123): `CloudStore`
+  gains `add_image`, `add_images`, and `search_by_image`, riding dedicated
+  data-plane routes (`stores/images`, `stores/search-image`) the plane
+  gates per store preset. The plane embeds via its provisioned image
+  encoder and never retains the pixels; the client caps one image at
+  20 MB before the wire. Cross-modal text-to-image queries need no new
+  verb: `search(text)` on a clip store embeds plane-side.
+
+### Fixed
+
+- The cloud CLI's `--preset` help no longer advertises `e5-small` (never a
+  plane preset) and now names the `org:<name>` registry form.
+
 ## [2.1.0] - 2026-08-06
 
 ### Changed
