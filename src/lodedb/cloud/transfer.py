@@ -483,6 +483,27 @@ class CloudClient:
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
+    def add_images(self, org: str, environment: str, payload: dict) -> dict:
+        """Image writes for plane-embedded clip stores: the server decodes,
+        embeds via its provisioned image encoder, and NEVER retains the
+        pixels. Refused for stores whose preset cannot embed images."""
+        return self._request(
+            "POST",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/images",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
+        )
+
+    def search_image(self, org: str, environment: str, payload: dict) -> dict:
+        """Image-query search for plane-embedded clip stores (the write
+        verb's read sibling; same refusal for non-image presets)."""
+        return self._request(
+            "POST",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/search-image",
+            json=payload,
+            store_hint=_store_hint(org, environment, payload.get("store")),
+        )
+
     def remove_documents(self, org: str, environment: str, payload: dict) -> dict:
         return self._request(
             "POST",

@@ -35,10 +35,14 @@ query then skips the hydration cold start); pass ``warm=False`` to skip.
 
 from __future__ import annotations
 
+import base64
+import io
+import os
 import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -91,6 +95,30 @@ def _hit(row: dict) -> CloudSearchHit:
     return CloudSearchHit(
         score=row["score"], id=row["id"], metadata=row["metadata"], text=row.get("text")
     )
+
+
+# The cloud image cap: pixels ride the request as base64 (about 4/3 the raw
+# size) and the plane re-enforces its own ceiling. Kept deliberately at the
+# passport-programs' 20 MB so a client refusal and a plane refusal agree.
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def _image_b64(image: Any) -> str:
+    """Accepts a path, raw bytes, or a PIL image (duck-typed on `save`),
+    mirroring the local `add_image` inputs; answers the base64 payload."""
+    if isinstance(image, (bytes, bytearray)):
+        data = bytes(image)
+    elif hasattr(image, "save") and not isinstance(image, (str, os.PathLike)):
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data = buffer.getvalue()
+    else:
+        data = Path(image).read_bytes()
+    if not data:
+        raise ValueError("image is empty")
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise ValueError("image exceeds the 20 MB cloud image cap")
+    return base64.b64encode(data).decode("ascii")
 
 
 def _coerced_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
@@ -465,6 +493,89 @@ class CloudStore:
             {"results": [[] for _ in vectors]},
         )
         return [[_hit(row) for row in hits] for hits in result["results"]]
+
+    def add_image(
+        self,
+        image: Any,
+        *,
+        id: str | None = None,
+        text: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        ttl_seconds: int | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Add (or replace) one image document (the cloud `db.add_image`),
+        for stores created with an image-capable preset (`clip`): the PLANE
+        embeds via its provisioned image encoder and never retains the
+        pixels — only the vector, the optional `text` caption, and metadata
+        survive. Accepts a path, raw bytes, or a PIL image. Returns the
+        document id."""
+        (doc_id,) = self.add_images(
+            [{"image": image, "id": id, "text": text, "metadata": metadata}],
+            ttl_seconds=ttl_seconds,
+            agent_id=agent_id,
+            run_id=run_id,
+        )
+        return doc_id
+
+    def add_images(
+        self,
+        documents: list[dict[str, Any]],
+        *,
+        ttl_seconds: int | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[str]:
+        """Add a batch of ``{"image", "id"?, "text"?, "metadata"?}``
+        documents as one accepted write (the cloud `db.add_images`); the
+        image-preset counterpart of `add_many`. Returns the ids in order."""
+        payload: dict[str, Any] = {
+            "store": self.store,
+            "key": self.key,
+            "documents": [
+                {
+                    "image_b64": _image_b64(doc["image"]),
+                    "text": doc.get("text"),
+                    "id": doc.get("id"),
+                    "metadata": _coerced_metadata(doc.get("metadata")),
+                }
+                for doc in documents
+            ],
+        }
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = ttl_seconds
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        if run_id is not None:
+            payload["run_id"] = run_id
+        result = self._written(self._client.add_images, payload)
+        return list(result["ids"])
+
+    def search_by_image(
+        self,
+        image: Any,
+        *,
+        k: int = 10,
+        filter: dict[str, Any] | None = None,
+        include_text: bool = False,
+    ) -> list[CloudSearchHit]:
+        """Top-`k` hits for an image query (the cloud `db.search_by_image`),
+        for image-capable preset stores; the plane embeds the query and
+        discards the pixels. Cross-modal text-to-image queries need no verb:
+        `search(text)` on a clip store embeds the text plane-side."""
+        payload: dict[str, Any] = {
+            "store": self.store,
+            "key": self.key,
+            "query_image_b64": _image_b64(image),
+            "k": k,
+            "filter": filter,
+            "include_text": include_text,
+        }
+        result = self._empty_if_unprovisioned(
+            lambda: self._searched(self._client.search_image, payload), {"hits": []}
+        )
+        return [_hit(row) for row in result["hits"]]
 
     def remove(self, id: str) -> str:
         """Remove one document by id (the cloud `db.remove`), async-first:

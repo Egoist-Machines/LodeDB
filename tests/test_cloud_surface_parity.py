@@ -30,6 +30,9 @@ SHARED_VERBS = [
     "add_many",
     "add_vectors",
     "add_vectors_many",
+    "add_image",
+    "add_images",
+    "search_by_image",
     "search",
     "search_many",
     "search_by_vector",
@@ -57,6 +60,7 @@ CLOUD_ONLY_KEYWORDS = {"ttl_seconds", "agent_id", "run_id", "include_text", "war
 LOCAL_ONLY_KEYWORDS = {
     "add_vectors": {"normalize"},
     "add_vectors_many": {"normalize"},
+    "add_images": {"normalize"},
     "search_by_vector": {"normalize"},
     "search_many_by_vector": {"normalize"},
     "count": {"filter"},
