@@ -88,3 +88,30 @@ def test_count_filter_on_empty_store(tmp_path):
     db = _db(tmp_path)
     assert db.count() == 0
     assert db.count(filter={"topic": "a"}) == 0
+
+
+def test_filter_on_reserved_named_keys(tmp_path):
+    db = _db(tmp_path)
+    db.add("doc 1", id="d1", metadata={"metadata": "header", "document_ids": "primary"})
+    db.add("doc 2", id="d2", metadata={"metadata": "body", "document_ids": "secondary"})
+    db.add("doc 3", id="d3", metadata={"metadata": "footer", "document_ids": "primary"})
+
+    assert {r["id"] for r in db.list_documents(filter={"metadata": "header"})} == {"d1"}
+    assert {r["id"] for r in db.list_documents(filter={"metadata": {"$eq": "body"}})} == {"d2"}
+    assert {
+        r["id"]
+        for r in db.list_documents(filter={"metadata": {"$in": ["header", "footer"]}})
+    } == {"d1", "d3"}
+    assert {r["id"] for r in db.list_documents(filter={"document_ids": "primary"})} == {"d1", "d3"}
+    assert db.count(filter={"metadata": "header"}) == 1
+    assert db.count(filter={"document_ids": "primary"}) == 2
+
+    # search & search_many coverage on reserved keys
+    hits = db.search("doc", filter={"metadata": "header"}, k=5)
+    assert len(hits) == 1
+    assert hits[0].id == "d1"
+
+    batch_hits = db.search_many(["doc", "doc"], filter={"document_ids": "primary"}, k=5)
+    assert len(batch_hits) == 2
+    assert {h.id for h in batch_hits[0]} == {"d1", "d3"}
+    assert {h.id for h in batch_hits[1]} == {"d1", "d3"}
