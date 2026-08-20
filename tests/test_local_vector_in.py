@@ -141,6 +141,41 @@ def test_search_many_by_vector_preserves_order(tmp_path):
     assert [batch[0].id for batch in batches] == ["b", "a"]
 
 
+def test_search_many_by_vector_ragged_batch_drops_padding(tmp_path):
+    db = _db(tmp_path)
+    db.add_vectors(_onehot(0), id="a", metadata={"tag": "x"})
+    db.add_vectors(_onehot(60), id="b", metadata={"tag": "x"})
+    db.add_vectors(_onehot(120), id="c", metadata={"tag": "y"})
+
+    # Ragged filter: only 1 document matches across 2 queries
+    batches = db.search_many_by_vector(
+        [_onehot(120), _onehot(0)], k=5, filter={"tag": "y"}
+    )
+    assert len(batches[0]) == 1
+    assert batches[0][0].id == "c"
+    assert len(batches[1]) == 1
+    assert batches[1][0].id == "c"
+    assert all(hit.id != "" for batch in batches for hit in batch)
+
+    # Filter with zero matches: returns empty hit lists per query
+    empty_batches = db.search_many_by_vector(
+        [_onehot(0), _onehot(60)], k=5, filter={"tag": "nope"}
+    )
+    # k <= 0 is rejected by the public API
+    with pytest.raises(ValueError, match="k must be positive"):
+        db.search_many_by_vector([_onehot(0), _onehot(60)], k=0)
+    assert LodeDB._hits_from_native_arrays([], [], [], k=0, query_count=2) == [[], []]
+
+    # search_many_by_vector_arrays retains rectangular 2D shape by design
+    scores2d, ids2d, meta2d, served_k = db.search_many_by_vector_arrays(
+        [_onehot(120), _onehot(0)], k=5, filter={"tag": "y"}, include_metadata=True
+    )
+    assert served_k == 1
+    assert len(ids2d) == 2
+
+
+
+
 def test_upsert_vector_replaces(tmp_path):
     db = _db(tmp_path)
     db.add_vectors(_onehot(0), id="x")
