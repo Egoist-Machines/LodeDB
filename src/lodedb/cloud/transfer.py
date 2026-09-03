@@ -520,6 +520,28 @@ class CloudClient:
             store_hint=_store_hint(org, environment, payload.get("store")),
         )
 
+    # Cross-store reads: one request over several stores of one environment,
+    # answered per store (`results[i]` for `stores[i]`, a store's own refusal
+    # in its `error` entry). No routing hint: there is no single store to
+    # pin the request to. Distinct from `search_many` (many queries, one
+    # store).
+
+    def browse_across(self, org: str, environment: str, payload: dict) -> dict:
+        """`stores: [{store, key?, min_seq?}]` plus the browse fields."""
+        return self._request(
+            "POST",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/browse-across",
+            json=payload,
+        )
+
+    def search_across(self, org: str, environment: str, payload: dict) -> dict:
+        """`stores: [{store, key?, min_seq?}]` plus one text `query`."""
+        return self._request(
+            "POST",
+            f"/v1/data/orgs/{org}/environments/{environment}/stores/search-across",
+            json=payload,
+        )
+
     # --------------------------------------------------------- memory verbs
 
     def recall(self, org: str, environment: str, payload: dict) -> dict:
