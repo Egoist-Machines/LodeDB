@@ -270,12 +270,32 @@ class CloudClient:
             f"{quote(store, safe='')}/unseal/challenge",
         )
 
+    def store_unseal_challenge_many(
+        self, org: str, environment: str, stores: list[str]
+    ) -> dict:
+        """Fetch single-use HPKE challenges for a batch of stores."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/unseal-many/challenge",
+            json={"stores": stores},
+        )
+
     def unseal_store(self, org: str, environment: str, store: str, payload: dict) -> dict:
         """Submit a sealed material response and request a live unseal grant."""
 
         return self._request(
             "POST",
             f"/v1/orgs/{org}/environments/{environment}/stores/{quote(store, safe='')}/unseal",
+            json=payload,
+        )
+
+    def unseal_stores_many(self, org: str, environment: str, payload: dict) -> dict:
+        """Submit sealed material responses for a batch of stores."""
+
+        return self._request(
+            "POST",
+            f"/v1/orgs/{org}/environments/{environment}/stores/unseal-many",
             json=payload,
         )
 
