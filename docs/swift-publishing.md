@@ -33,10 +33,13 @@ On a `vX.Y.Z` tag, `release.yml`:
 2. `publish` attaches `LodeDBCoreFFI.xcframework.zip` (and its `.checksum`) to the
    GitHub Release, giving it a stable public URL:
    `https://github.com/Egoist-Machines/LodeDB/releases/download/vX.Y.Z/LodeDBCoreFFI.xcframework.zip`.
-3. `swift-package-publish` runs `swift/LodeDBCore/scripts/publish_swift_package.sh` to
-   assemble the package (copy `swift/LodeDBCore/Sources/`, generate a `Package.swift`
-   with that release's binary-target URL + checksum), then commits, tags `vX.Y.Z`, and
-   pushes it to `swift-lodedb`.
+3. `swift-package-publish` runs `swift/LodeDBCore/scripts/release_swift_package.sh`.
+   The script assembles the package through `publish_swift_package.sh`, force-pushes a
+   `release/vX.Y.Z` branch, opens or reuses a pull request, squash-merges it to `main`,
+   and tags the merged commit as `vX.Y.Z`. The pull request is required by the mirror's
+   `main` branch ruleset; tag refs are not covered. Reruns reuse matching content, pull
+   requests, and tags. For an empty mirror, the script pushes the initial `main` directly
+   because there is no base branch for a pull request.
 
 The tests stay in this repo (run by the `swift-binding` CI job); the published package
 ships only the library.
@@ -49,8 +52,9 @@ release:
 1. Create the package repo `Egoist-Machines/swift-lodedb` (it can start empty; the
    first release populates it).
 2. Add a repository secret `SWIFT_PACKAGE_DEPLOY_TOKEN` to the LodeDB repo: a token with
-   push (`contents: write`) access to `swift-lodedb` (a fine-grained PAT scoped to that
-   repo, or a deploy key). The job authenticates the cross-repo push with it.
+   `contents: write` and pull-request read/write access to `swift-lodedb`, such as a
+   fine-grained PAT scoped to that repo. The job uses it for cross-repo Git and GitHub
+   CLI operations.
 
 To target a different repo name, change `PACKAGE_REPO` in the `swift-package-publish`
 job and the URLs in `scripts/publish_swift_package.sh`.

@@ -3,9 +3,8 @@ set -euo pipefail
 
 # Assembles the standalone `swift-lodedb` SwiftPM package into <staging_dir>: the Swift
 # sources from this repo plus a root Package.swift whose binaryTarget points at the
-# released LodeDBCoreFFI.xcframework. The release workflow then commits, tags, and
-# pushes <staging_dir> to the package repo. Kept separate from the git push so the
-# assembly is runnable/inspectable locally.
+# released LodeDBCoreFFI.xcframework. release_swift_package.sh commits, merges, and
+# tags <staging_dir> in the package repo. Assembly stays separately runnable locally.
 #
 # Usage:
 #   publish_swift_package.sh <staging_dir> <version> <xcframework_zip_url> <checksum>
