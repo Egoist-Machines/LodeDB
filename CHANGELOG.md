@@ -5,6 +5,16 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-09-04
+
+### Added
+
+- Batched sealed-store transport: `CloudClient` gains
+  `store_unseal_challenge_many` and `unseal_stores_many` for the
+  `POST /v1/orgs/{org}/environments/{environment}/stores/unseal-many/challenge`
+  and `POST /v1/orgs/{org}/environments/{environment}/stores/unseal-many`
+  control-plane routes.
+
 ## [2.2.0] - 2026-08-12
 
 ### Added
