@@ -282,6 +282,82 @@ def test_unseal_challenge_missing_field_names_it(missing):
             client.unseal_challenge("user-42")
 
 
+def test_batch_unseal_challenge_transport_posts_stores_and_passes_response():
+    """The batch challenge verb posts the store list and returns the plane response."""
+
+    response = {
+        "recipient_public_key": "recipient",
+        "items": [
+            {"store": "user-42", "store_id": "store-1", "nonce": "nonce", "info": "info"}
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == (
+            "/v1/orgs/acme/environments/prod/stores/unseal-many/challenge"
+        )
+        assert json.loads(request.content) == {"stores": ["user-42", "user-43"]}
+        return httpx.Response(200, json=response)
+
+    with CloudClient(
+        "http://testserver", "ore_sk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = client.store_unseal_challenge_many("acme", "prod", ["user-42", "user-43"])
+
+    assert result == response
+
+
+def test_batch_unseal_transport_posts_payload_verbatim_and_passes_response():
+    """The batch grant verb posts its payload unchanged and returns the plane response."""
+
+    payload = {
+        "ttl_seconds": 90,
+        "items": [
+            {"store": "user-42", "sealed_material": "sealed", "nonce": "nonce"}
+        ],
+    }
+    response = {
+        "items": [{"store": "user-42", "store_id": "store-1", "expires_at": "expiry"}]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/orgs/acme/environments/prod/stores/unseal-many"
+        assert json.loads(request.content) == payload
+        return httpx.Response(200, json=response)
+
+    with CloudClient(
+        "http://testserver", "ore_sk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = client.unseal_stores_many("acme", "prod", payload)
+
+    assert result == response
+
+
+@pytest.mark.parametrize(
+    ("verb", "argument", "status", "detail"),
+    [
+        ("store_unseal_challenge_many", ["missing"], 404, "no such store"),
+        ("unseal_stores_many", {"items": []}, 403, "unseal refused"),
+    ],
+)
+def test_batch_unseal_transport_maps_refusals_to_cloud_error(verb, argument, status, detail):
+    """Both batch verbs preserve the plane refusal status and detail."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": detail})
+
+    with CloudClient(
+        "http://testserver", "ore_sk_test", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(CloudError) as caught:
+            getattr(client, verb)("acme", "prod", argument)
+
+    assert caught.value.status_code == status
+    assert caught.value.detail == detail
+
+
 class _ResealStub:
     """Duck-type only the composed client's reseal transport verb."""
 
