@@ -121,7 +121,7 @@ class LodeDBVectorStore(VectorStore):
     ):
         """Opens a LodeDB at ``path`` and indexes ``texts`` (``embedding`` is ignored)."""
 
-        db = LodeDB(path=path, model=model, device=device)
+        db = LodeDB(path=path, model=model, device=device, **kwargs)
         store = cls(db)
         store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
