@@ -44,7 +44,7 @@ from lodedb.engine._commit_manifest import (
     read_commit_manifest,
 )
 from lodedb.engine._filelock import ConcurrentWriterError
-from lodedb.engine._predicate import coerce_sdk_filter
+from lodedb.engine._predicate import COMPARISON_OPERATORS, coerce_sdk_filter
 from lodedb.engine.core import (
     EngineDocument,
     EngineVectorDocument,
@@ -2310,22 +2310,25 @@ class LodeDB:
         all flat and row-major by query, so no per-hit JSON object is parsed.
         """
 
-        if k == 0:
+        if k == 0 or query_count == 0:
             return [[] for _ in range(query_count)]
         scores_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+        doc_ids_len = len(document_ids)
+        scores_len = len(scores_list)
         metadata_len = len(metadata)
         rows: list[list[LodeSearchHit]] = []
         for query_index in range(query_count):
             base = query_index * k
             row = [
                 LodeSearchHit(
-                    score=float(scores_list[base + offset]),
+                    score=float(scores_list[base + offset]) if base + offset < scores_len else 0.0,
                     id=str(document_ids[base + offset]),
                     metadata=dict(metadata[base + offset])
                     if base + offset < metadata_len
                     else {},
                 )
                 for offset in range(k)
+                if base + offset < doc_ids_len and document_ids[base + offset] != ""
             ]
             rows.append(row)
         return rows
@@ -2603,6 +2606,31 @@ def _shutdown_native_engine(
     executor.shutdown(wait=False)
 
 
+def _is_structured_filter(filter: Mapping[str, Any]) -> bool:
+    """Returns True if filter is the structured wrapper (metadata/document_ids)."""
+
+    structured_keys = {"metadata", "document_ids"}
+    if not (set(filter) <= structured_keys and any(key in filter for key in structured_keys)):
+        return False
+    if "document_ids" in filter:
+        doc_ids = filter["document_ids"]
+        if not (
+            isinstance(doc_ids, (list, tuple, set))
+            or (
+                isinstance(doc_ids, Sequence)
+                and not isinstance(doc_ids, (str, bytes, bytearray, memoryview))
+            )
+        ):
+            return False
+    if "metadata" in filter:
+        meta = filter["metadata"]
+        if not isinstance(meta, Mapping):
+            return False
+        if meta and set(meta) <= COMPARISON_OPERATORS:
+            return False
+    return True
+
+
 def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """Normalizes the ergonomic local filter into the engine filter schema.
 
@@ -2620,8 +2648,7 @@ def _normalize_filter(filter: Mapping[str, Any] | None) -> dict[str, Any] | None
         return None
     if not isinstance(filter, Mapping):
         raise ValueError("filter must be a mapping")
-    structured_keys = {"metadata", "document_ids"}
-    if set(filter) <= structured_keys and any(key in filter for key in structured_keys):
+    if _is_structured_filter(filter):
         out: dict[str, Any] = {}
         if "metadata" in filter:
             out["metadata"] = coerce_sdk_filter(filter["metadata"])
