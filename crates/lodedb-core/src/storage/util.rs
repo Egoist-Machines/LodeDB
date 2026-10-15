@@ -223,9 +223,8 @@ pub(crate) fn try_lock_file(path: &Path, exclusive: bool) -> std::io::Result<Opt
 /// canonical body and verify each other's writes across the FFI boundary, so the
 /// two encoders must agree to the byte. ``serde_json::to_string`` emits raw UTF-8
 /// for non-ASCII instead, which silently diverges on real document text.
-fn encode_json_string_ascii(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
+fn encode_json_string_ascii(text: &str, out: &mut impl CanonicalSink) {
+    out.push_char('"');
     for ch in text.chars() {
         match ch {
             '"' => out.push_str("\\\""),
@@ -235,7 +234,7 @@ fn encode_json_string_ascii(text: &str) -> String {
             '\u{0a}' => out.push_str("\\n"),
             '\u{0c}' => out.push_str("\\f"),
             '\u{0d}' => out.push_str("\\r"),
-            ' '..='~' => out.push(ch),
+            ' '..='~' => out.push_char(ch),
             _ => {
                 let cp = ch as u32;
                 if cp <= 0xffff {
@@ -249,8 +248,7 @@ fn encode_json_string_ascii(text: &str) -> String {
             }
         }
     }
-    out.push('"');
-    out
+    out.push_char('"');
 }
 
 /// Encodes a JSON number byte-for-byte identical to CPython's ``json.dumps``.
@@ -341,33 +339,90 @@ fn format_python_float(value: f64) -> String {
     out
 }
 
-pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
-    match value {
-        Value::Null => Ok("null".to_string()),
-        Value::Bool(true) => Ok("true".to_string()),
-        Value::Bool(false) => Ok("false".to_string()),
-        Value::Number(number) => Ok(encode_json_number(number)),
-        Value::String(text) => Ok(encode_json_string_ascii(text)),
-        Value::Array(items) => {
-            let rendered = items
-                .iter()
-                .map(py_canonical_json)
-                .collect::<CoreResult<Vec<_>>>()?;
-            Ok(format!("[{}]", rendered.join(", ")))
-        }
-        Value::Object(object) => {
-            let mut parts = Vec::with_capacity(object.len());
-            for (key, item) in object.iter() {
-                let key_json = encode_json_string_ascii(key);
-                parts.push(format!("{key_json}: {}", py_canonical_json(item)?));
-            }
-            Ok(format!("{{{}}}", parts.join(", ")))
+/// Output of the canonical encoder: a `String`, or a hasher fed in chunks.
+trait CanonicalSink {
+    fn push_str(&mut self, text: &str);
+    fn push_char(&mut self, ch: char) {
+        self.push_str(ch.encode_utf8(&mut [0; 4]));
+    }
+}
+
+impl CanonicalSink for String {
+    fn push_str(&mut self, text: &str) {
+        String::push_str(self, text);
+    }
+    fn push_char(&mut self, ch: char) {
+        self.push(ch);
+    }
+}
+
+/// Hashes the canonical encoding through a small buffer, so checksumming a
+/// large body never materializes its whole JSON text.
+struct HashingSink {
+    hasher: Sha256,
+    buffer: String,
+}
+
+impl CanonicalSink for HashingSink {
+    fn push_str(&mut self, text: &str) {
+        self.buffer.push_str(text);
+        if self.buffer.len() >= 64 * 1024 {
+            self.hasher.update(self.buffer.as_bytes());
+            self.buffer.clear();
         }
     }
 }
 
+fn write_py_canonical_json(value: &Value, out: &mut impl CanonicalSink) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(number) => out.push_str(&encode_json_number(number)),
+        Value::String(text) => encode_json_string_ascii(text, out),
+        Value::Array(items) => {
+            out.push_char('[');
+            for (position, item) in items.iter().enumerate() {
+                if position > 0 {
+                    out.push_str(", ");
+                }
+                write_py_canonical_json(item, out);
+            }
+            out.push_char(']');
+        }
+        Value::Object(object) => {
+            out.push_char('{');
+            for (position, (key, item)) in object.iter().enumerate() {
+                if position > 0 {
+                    out.push_str(", ");
+                }
+                encode_json_string_ascii(key, out);
+                out.push_str(": ");
+                write_py_canonical_json(item, out);
+            }
+            out.push_char('}');
+        }
+    }
+}
+
+/// Renders `value` as CPython's `json.dumps(value, sort_keys=True)` would
+/// (serde_json maps are already key-sorted). Written into one buffer rather
+/// than one string per node: the per-node strings of a large sidecar body
+/// were most of an open's transient allocations.
+pub(crate) fn py_canonical_json(value: &Value) -> CoreResult<String> {
+    let mut out = String::new();
+    write_py_canonical_json(value, &mut out);
+    Ok(out)
+}
+
 pub(crate) fn body_sha256(body: &Value) -> CoreResult<String> {
-    Ok(sha256_bytes_hex(py_canonical_json(body)?.as_bytes()))
+    let mut sink = HashingSink {
+        hasher: Sha256::new(),
+        buffer: String::with_capacity(64 * 1024 + 64),
+    };
+    write_py_canonical_json(body, &mut sink);
+    sink.hasher.update(sink.buffer.as_bytes());
+    Ok(format!("{:x}", sink.hasher.finalize()))
 }
 
 /// Wraps a sidecar `body` in the checksummed base payload every JSON sidecar
@@ -704,5 +759,32 @@ mod canonical_json_tests {
         );
         let parsed: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(written, py_canonical_json(&parsed).unwrap());
+    }
+
+    // body_sha256 hashes the canonical text in 64 KB chunks instead of
+    // rendering it first; the digest must equal hashing the rendered text,
+    // including across chunk boundaries that fall inside multi-byte escapes.
+    #[test]
+    fn streamed_body_sha256_matches_the_rendered_text() {
+        let documents: Map<String, Value> = (0..4000)
+            .map(|i| {
+                (
+                    format!("doc-{i:05}"),
+                    json!([
+                        ["café", "naïve", format!("token{i}"), "\u{1F600}"],
+                        [i, 0.5]
+                    ]),
+                )
+            })
+            .collect();
+        let body = json!({"schema_version": 1, "documents": documents});
+        let rendered = py_canonical_json(&body).unwrap();
+        assert!(rendered.len() > 4 * 64 * 1024);
+        assert_eq!(body_sha256(&body).unwrap(), sha256_bytes_hex(rendered.as_bytes()));
+        let small = json!({"a": "b"});
+        assert_eq!(
+            body_sha256(&small).unwrap(),
+            sha256_bytes_hex(py_canonical_json(&small).unwrap().as_bytes())
+        );
     }
 }
