@@ -127,9 +127,17 @@ fn main() {
             "--no-refresh" => refresh = false,
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--filter" => filter = true,
-            "--k" => top_k = args.next().and_then(|v| v.parse().ok()).expect("--k needs a number"),
+            "--k" => {
+                top_k = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--k needs a number")
+            }
             "--hold" => {
-                hold_secs = args.next().and_then(|v| v.parse().ok()).expect("--hold needs seconds")
+                hold_secs = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--hold needs seconds")
             }
             other if store.is_none() => store = Some(other.to_string()),
             other => panic!("unexpected argument {other}"),

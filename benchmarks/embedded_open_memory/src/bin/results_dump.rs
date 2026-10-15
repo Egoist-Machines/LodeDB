@@ -9,8 +9,9 @@
 //! ```
 //!
 //! `--write` opens the store writable first (WAL commit mode, as the Swift
-//! binding does), upserts one document with text, deletes one, persists and
-//! closes, then dumps through a fresh read-only open. Point it at a copy.
+//! binding does), upserts one document with text, deletes one, dumps through
+//! that handle, persists and closes, then dumps again through a fresh
+//! read-only open. Point it at a copy.
 
 use lodedb_core::engine::CoreEngine;
 use lodedb_core::types::{CoreOpenOptions, CoreVectorDocument};
@@ -62,13 +63,16 @@ fn write_once(path: &str) {
     engine
         .delete_documents(&index_id, &["mem-000002".to_string()])
         .expect("delete");
+    dump(&engine, "writable");
     engine.persist().expect("persist");
     engine.close().expect("close");
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: results-dump <store-dir> [--refresh|--write]");
+    let path = args
+        .next()
+        .expect("usage: results-dump <store-dir> [--refresh|--write]");
     let flag = args.next();
     if flag.as_deref() == Some("--write") {
         write_once(&path);
@@ -77,7 +81,12 @@ fn main() {
     if flag.as_deref() == Some("--refresh") {
         engine.refresh().expect("refresh");
     }
+    dump(&engine, "read-only");
+}
+
+fn dump(engine: &CoreEngine, label: &str) {
     let index_id = engine.index_ids().into_iter().next().expect("index");
+    println!("handle {label}");
     let stats = engine.stats(&index_id).expect("stats");
     println!(
         "stats documents={} chunks={} generation={} dim={} bits={} model={} applied_lsn={}",
@@ -92,10 +101,16 @@ fn main() {
 
     let filters: [(&str, Option<Value>); 5] = [
         ("none", None),
-        ("category-in", Some(json!({"category": {"$in": ["fact", "preference"]}}))),
+        (
+            "category-in",
+            Some(json!({"category": {"$in": ["fact", "preference"]}})),
+        ),
         ("app-eq", Some(json!({"app": "Passport"}))),
         ("date-gte", Some(json!({"date": {"$gte": "2025-07-01"}}))),
-        ("and", Some(json!({"$and": [{"category": "event"}, {"app": {"$ne": "Gmail"}}]}))),
+        (
+            "and",
+            Some(json!({"$and": [{"category": "event"}, {"app": {"$ne": "Gmail"}}]})),
+        ),
     ];
     let texts = [
         "the Lisbon trip window seat",
@@ -109,7 +124,13 @@ fn main() {
             for (name, filter) in &filters {
                 for top_k in [5usize, 60] {
                     let results = engine
-                        .search_embedded_text(&index_id, &plan, Some(&query), top_k, filter.as_ref())
+                        .search_embedded_text(
+                            &index_id,
+                            &plan,
+                            Some(&query),
+                            top_k,
+                            filter.as_ref(),
+                        )
                         .expect("search");
                     let hits = results
                         .hits
@@ -138,7 +159,12 @@ fn main() {
         println!("text {id} {text}");
     }
     let page = engine
-        .list_documents(&index_id, Some(&json!({"category": "project"})), None, Some(7))
+        .list_documents(
+            &index_id,
+            Some(&json!({"category": "project"})),
+            None,
+            Some(7),
+        )
         .expect("list");
     for document in page {
         println!("list {document}");
