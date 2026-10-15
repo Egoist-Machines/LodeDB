@@ -1213,3 +1213,54 @@ mod x86_scalar_fallback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod serial_search_tests {
+    //! Batches of up to four queries run on the calling thread instead of
+    //! the rayon pool. Same kernel, same inputs: the bits must not change.
+    use super::TurboQuantIndex;
+    use crate::search::FORCE_PARALLEL;
+    use std::sync::atomic::Ordering;
+
+    fn vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        (0..n * dim)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn serial_small_batches_match_the_rayon_path() {
+        let dim = 64;
+        let k = 20;
+        for &bits in &[2usize, 3, 4] {
+            let mut index = TurboQuantIndex::new(dim, bits).unwrap();
+            index.add(&vectors(700, dim, 3));
+            let mask: Vec<bool> = (0..700).map(|i| i % 3 != 0).collect();
+            for nq in 1..=4usize {
+                let queries = vectors(nq, dim, 40 + nq as u64);
+                for mask in [None, Some(mask.as_slice())] {
+                    FORCE_PARALLEL.store(false, Ordering::Relaxed);
+                    let serial = index.search_with_mask(&queries, k, mask);
+                    FORCE_PARALLEL.store(true, Ordering::Relaxed);
+                    let parallel = index.search_with_mask(&queries, k, mask);
+                    FORCE_PARALLEL.store(false, Ordering::Relaxed);
+                    assert_eq!(serial.indices, parallel.indices, "bits={bits} nq={nq}");
+                    let bits_of = |scores: &[f32]| {
+                        scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        bits_of(&serial.scores),
+                        bits_of(&parallel.scores),
+                        "bits={bits} nq={nq}"
+                    );
+                }
+            }
+        }
+    }
+}
