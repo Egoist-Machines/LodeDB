@@ -1,7 +1,7 @@
 use crate::storage::util::{
-    body_sha256, checksummed_body_payload, corrupt, get_i64, get_str, read_checksummed_body,
-    read_json, sha256_file_hex, sidecar_base_block, validate_sidecar_manifest, value_object,
-    write_pretty_json_atomic, write_py_json, CoreResult,
+    body_sha256, checksummed_body_from_text, checksummed_body_payload, corrupt, get_i64, get_str,
+    parse_json, read_json, read_text, sha256_file_hex, sidecar_base_block,
+    validate_sidecar_manifest, value_object, write_pretty_json_atomic, write_py_json, CoreResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -28,8 +28,28 @@ pub fn load(
     base_path: &Path,
     manifest: Option<&Value>,
 ) -> CoreResult<BTreeMap<String, TokenLists>> {
+    match read_bytes(base_path, manifest)? {
+        Some(bytes) => bytes.parse(),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// The text of a committed lexical store, base and delta segments, read and
+/// checked against the commit manifest but not parsed. A read-only open keeps
+/// this instead of the token lists (a fraction of their in-memory size) and
+/// parses it the first time something needs the tokens; holding the text
+/// rather than the paths keeps that working after a writer collects the epoch.
+#[derive(Debug, Clone)]
+pub struct LexicalBytes {
+    base: String,
+    segments: Vec<String>,
+}
+
+/// Reads what [`load`] parses, with the same manifest, ordering and segment
+/// checksum checks. `None` when the base file is absent.
+pub fn read_bytes(base_path: &Path, manifest: Option<&Value>) -> CoreResult<Option<LexicalBytes>> {
     if !base_path.is_file() {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     }
     if let Some(manifest) = manifest {
         validate_sidecar_manifest(
@@ -39,7 +59,8 @@ pub fn load(
             "lexical index",
         )?;
     }
-    let mut documents = read_base(base_path)?;
+    let base = read_text(base_path, "lexical index base")?;
+    let mut segments = Vec::new();
     if let Some(manifest) = manifest {
         let manifest = value_object(manifest, "lexical index manifest")?;
         let delta_dir = base_path.with_file_name(format!(
@@ -72,7 +93,18 @@ pub fn load(
                     "lexical index segment failed checksum: {file_name}"
                 )));
             }
-            let body = read_segment_body(&path)?;
+            segments.push(read_text(&path, "lexical index segment")?);
+        }
+    }
+    Ok(Some(LexicalBytes { base, segments }))
+}
+
+impl LexicalBytes {
+    /// Parses the base and replays the segments in manifest order.
+    pub fn parse(&self) -> CoreResult<BTreeMap<String, TokenLists>> {
+        let mut documents = parse_base(&self.base)?;
+        for segment in &self.segments {
+            let body = segment_body(segment)?;
             for deleted in body
                 .get("deleted")
                 .and_then(Value::as_array)
@@ -88,12 +120,12 @@ pub fn load(
                 }
             }
         }
+        Ok(documents)
     }
-    Ok(documents)
 }
 
-fn read_base(path: &Path) -> CoreResult<BTreeMap<String, TokenLists>> {
-    let body = read_checksummed_body(path, LEXICAL_INDEX_SCHEMA_VERSION, "lexical index")?;
+fn parse_base(text: &str) -> CoreResult<BTreeMap<String, TokenLists>> {
+    let body = checksummed_body_from_text(text, LEXICAL_INDEX_SCHEMA_VERSION, "lexical index")?;
     let body_object = value_object(&body, "lexical index base body")?;
     let documents = body_object
         .get("documents")
@@ -204,8 +236,8 @@ pub fn append_delta(
     Ok(manifest)
 }
 
-fn read_segment_body(path: &Path) -> CoreResult<Value> {
-    let segment = read_json(path, "lexical index segment")?;
+fn segment_body(text: &str) -> CoreResult<Value> {
+    let segment = parse_json(text, "lexical index segment")?;
     let segment = value_object(&segment, "lexical index segment")?;
     if get_i64(segment, "schema_version", -1) != LEXICAL_INDEX_SCHEMA_VERSION {
         return Err(corrupt("unsupported lexical index segment schema version"));

@@ -18,6 +18,7 @@ use crate::filter::{
 };
 use crate::lexical::rrf::RRF_C;
 use crate::lexical::{tokenize, Bm25Index};
+use crate::storage::lexical_store::TokenLists;
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
@@ -189,7 +190,12 @@ impl CoreEngine {
                 return invalid("rescore_oversample must be finite and at least 1.0");
             }
         }
-        let index = self.index_mut(index_id)?;
+        // Session tuning is not a document mutation, so it skips index_mut and
+        // leaves deferred token lists unparsed.
+        let index = self
+            .indexes
+            .get_mut(index_id)
+            .ok_or_else(|| invalid_err("index not found"))?;
         index.session_ann_nprobe = ann_nprobe;
         index.session_rescore_oversample = rescore_oversample;
         Ok(())
@@ -1078,6 +1084,7 @@ impl CoreEngine {
             return invalid("top_k must be positive");
         }
         let index = self.index(index_id)?;
+        let lexical_index = index.lexical_index()?;
         let candidates = filter
             .map(|filter| index.resolve_filter(Some(filter)))
             .transpose()?;
@@ -1091,15 +1098,14 @@ impl CoreEngine {
                     continue;
                 };
                 for chunk in &record.chunks {
-                    if let Some(position) = index.lexical_index().position_of(&chunk.chunk_id) {
+                    if let Some(position) = lexical_index.position_of(&chunk.chunk_id) {
                         positions.insert(position);
                     }
                 }
             }
             positions
         });
-        let hits = index
-            .lexical_index()
+        let hits = lexical_index
             .rank(&query_plan.query, Some(top_k), allowed_positions.as_ref())
             .into_iter()
             .filter_map(|(chunk_id, score)| {
@@ -1444,6 +1450,9 @@ impl CoreEngine {
         index_id: &str,
     ) -> Result<BTreeMap<String, Vec<Vec<String>>>, CoreError> {
         let index = self.index(index_id)?;
+        if let Some(deferred) = &index.deferred_token_lists {
+            return deferred.parse(&index.documents);
+        }
         Ok(index
             .documents
             .iter()
@@ -1914,10 +1923,15 @@ impl CoreEngine {
             .ok_or_else(|| invalid_err("index not found"))
     }
 
+    /// The index for a mutation. Parses deferred token lists first, so every
+    /// mutation path sees the same `documents` an eager open would have built.
     fn index_mut(&mut self, index_id: &str) -> Result<&mut VectorOnlyIndex, CoreError> {
-        self.indexes
+        let index = self
+            .indexes
             .get_mut(index_id)
-            .ok_or_else(|| invalid_err("index not found"))
+            .ok_or_else(|| invalid_err("index not found"))?;
+        index.materialize_token_lists()?;
+        Ok(index)
     }
 
     fn require_writable(&self) -> Result<(), CoreError> {
@@ -2443,14 +2457,21 @@ impl CoreEngine {
             }
         }
         for index_key in index_keys {
-            let loaded = crate::storage::load_store(
-                &persistence_path,
-                &index_key,
-                crate::storage::LoadOptions {
-                    read_only: persistence_read_only,
-                    read_wal: false,
-                },
-            )?;
+            let options = crate::storage::LoadOptions {
+                read_only: persistence_read_only,
+                read_wal: false,
+            };
+            // A read-only handle keeps the lexical store unparsed until it needs
+            // the tokens (see `DeferredTokenLists`).
+            let loaded = if persistence_read_only {
+                crate::storage::load_store_deferring_lexical(
+                    &persistence_path,
+                    &index_key,
+                    options,
+                )?
+            } else {
+                crate::storage::load_store(&persistence_path, &index_key, options)?
+            };
             // The text store records the compression it was created with in its
             // manifest. Adopt that persisted value so it wins over the seeded
             // open-option default before any write-back (the WAL-replay
@@ -3604,7 +3625,7 @@ impl CoreCheckpointer {
 fn index_from_loaded_store(
     mut loaded: crate::storage::LoadedStore,
     chunk_character_limit: usize,
-    lazy_vectors: bool,
+    read_only: bool,
 ) -> Result<VectorOnlyIndex, CoreError> {
     let state = loaded
         .state
@@ -3638,7 +3659,7 @@ fn index_from_loaded_store(
     // Stores without a tvim keep the eager path: they need the reconstruct
     // outcome to decide `vectors_seeded` and to rebuild a serving index from
     // documents.
-    let lazy_vectors = lazy_vectors && loaded.tvim_path.is_some() && loaded.chunk_count() > 0;
+    let lazy_vectors = read_only && loaded.tvim_path.is_some() && loaded.chunk_count() > 0;
     let chunk_vectors = if lazy_vectors {
         None
     } else {
@@ -3648,6 +3669,18 @@ fn index_from_loaded_store(
     let (chunk_vectors, query_rotation) = chunk_vectors
         .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
         .unwrap_or_default();
+    // A read-only handle leaves the token lists in the lexical store's text
+    // until something needs them. Any other load parses them here.
+    let defer_token_lists = read_only;
+    if !defer_token_lists {
+        if let Some(bytes) = loaded.lexical_bytes.take() {
+            loaded.lexical_tokens = bytes.parse()?;
+        }
+    }
+    let deferred_token_lists = defer_token_lists.then(|| DeferredTokenLists {
+        bytes: loaded.lexical_bytes.take(),
+        chunk_character_limit,
+    });
     // Move the per-document maps out of the loaded state and payload stores
     // instead of cloning them: the parsed JSON is several times its file size,
     // and a clone held both copies at the open's peak. The state's chunk list
@@ -3693,14 +3726,18 @@ fn index_from_loaded_store(
             })
             .collect();
         let text = loaded.raw_text.remove(&document_id);
-        let token_lists = loaded
-            .lexical_tokens
-            .remove(&document_id)
-            .unwrap_or_else(|| {
-                text.as_deref()
-                    .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
-                    .unwrap_or_default()
-            });
+        let token_lists = if defer_token_lists {
+            Vec::new()
+        } else {
+            loaded
+                .lexical_tokens
+                .remove(&document_id)
+                .unwrap_or_else(|| {
+                    text.as_deref()
+                        .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
+                        .unwrap_or_default()
+                })
+        };
         let patch_matrix = loaded.multivec.remove(&document_id);
         documents.insert(
             document_id,
@@ -3828,6 +3865,7 @@ fn index_from_loaded_store(
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
         lexical_index: OnceCell::new(),
+        deferred_token_lists,
         vector_index: RefCell::new(vector_index),
         ann_options: state
             .get("ann")
@@ -3902,9 +3940,19 @@ fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Ve
         .collect()
 }
 
-fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> Bm25Index {
+/// Builds BM25 over every document's chunks. `token_lists`, when given, holds
+/// each document's lists in place of `DocumentRecord::token_lists` (a handle
+/// whose lists are still deferred).
+fn lexical_index_for_documents(
+    documents: &BTreeMap<String, DocumentRecord>,
+    token_lists: Option<&BTreeMap<String, TokenLists>>,
+) -> Bm25Index {
     let mut lexical_index = Bm25Index::empty();
     for (document_id, record) in documents {
+        let lists = match token_lists {
+            Some(token_lists) => token_lists.get(document_id).map_or(&[][..], Vec::as_slice),
+            None => record.token_lists.as_slice(),
+        };
         let units = record
             .chunks
             .iter()
@@ -3912,13 +3960,54 @@ fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> 
             .map(|(offset, chunk)| {
                 (
                     chunk.chunk_id.clone(),
-                    record.token_lists.get(offset).cloned().unwrap_or_default(),
+                    lists.get(offset).cloned().unwrap_or_default(),
                 )
             })
             .collect::<Vec<_>>();
         lexical_index.replace_group(document_id, &units);
     }
     lexical_index
+}
+
+/// A read-only handle's chunk token lists, still in the committed `.tvlex`
+/// text. They are only needed for BM25, `document_token_lists` and mutations
+/// (a refresh overlaying WAL records), and parsed they take several times the
+/// file's size, so the open leaves every `DocumentRecord::token_lists` empty
+/// and keeps this instead.
+#[derive(Debug, Clone)]
+struct DeferredTokenLists {
+    /// `None` when the store has no lexical store; every document then
+    /// tokenizes its raw text, as the eager loader does.
+    bytes: Option<crate::storage::lexical_store::LexicalBytes>,
+    chunk_character_limit: usize,
+}
+
+impl DeferredTokenLists {
+    /// Every document's token lists exactly as the eager loader fills them:
+    /// the persisted lists, or a tokenization of the raw text when the
+    /// lexical store has none for the document.
+    fn parse(
+        &self,
+        documents: &BTreeMap<String, DocumentRecord>,
+    ) -> Result<BTreeMap<String, TokenLists>, CoreError> {
+        let mut persisted = match &self.bytes {
+            Some(bytes) => bytes.parse()?,
+            None => BTreeMap::new(),
+        };
+        Ok(documents
+            .iter()
+            .map(|(document_id, record)| {
+                let lists = persisted.remove(document_id).unwrap_or_else(|| {
+                    record
+                        .text
+                        .as_deref()
+                        .map(|text| token_lists_from_raw_text(text, self.chunk_character_limit))
+                        .unwrap_or_default()
+                });
+                (document_id.clone(), lists)
+            })
+            .collect())
+    }
 }
 
 fn field_indexes_for_documents(
@@ -5258,6 +5347,9 @@ struct VectorOnlyIndex {
     /// a lexical or hybrid query never pays for it. Mutations build it first
     /// (`lexical_index_mut`), so they see exactly the eager index.
     lexical_index: OnceCell<Bm25Index>,
+    /// Set on a read-only open while `documents` carry no token lists; the
+    /// first mutation parses them in (`materialize_token_lists`).
+    deferred_token_lists: Option<DeferredTokenLists>,
     vector_index: RefCell<Option<TurboVecNativeIndex>>,
     /// Opt-in ANN tuning; `None` keeps the index exact-scan only.
     ann_options: Option<CoreAnnOptions>,
@@ -5447,6 +5539,7 @@ impl VectorOnlyIndex {
             delete_count: 0,
             deleted_chunk_count: 0,
             lexical_index: OnceCell::from(Bm25Index::empty()),
+            deferred_token_lists: None,
             vector_index: RefCell::new(None),
             ann_options: options.ann,
             session_ann_nprobe: None,
@@ -5632,24 +5725,51 @@ impl VectorOnlyIndex {
         self.pending_persisted_ann.get_mut().take();
     }
 
-    fn lexical_index(&self) -> &Bm25Index {
-        self.lexical_index
-            .get_or_init(|| lexical_index_for_documents(&self.documents))
+    fn lexical_index(&self) -> Result<&Bm25Index, CoreError> {
+        if let Some(lexical_index) = self.lexical_index.get() {
+            return Ok(lexical_index);
+        }
+        let built = match &self.deferred_token_lists {
+            Some(deferred) => {
+                let token_lists = deferred.parse(&self.documents)?;
+                lexical_index_for_documents(&self.documents, Some(&token_lists))
+            }
+            None => lexical_index_for_documents(&self.documents, None),
+        };
+        Ok(self.lexical_index.get_or_init(|| built))
     }
 
     /// Builds the lexical index before handing it to a mutation. BM25 ranks
     /// only on the set of (unit id, tokens), with ties broken by unit id, so
     /// a build that already sees part of the mutation in `documents` ends at
-    /// the same index once the mutation's own group update lands.
+    /// the same index once the mutation's own group update lands. Mutations
+    /// reach the index through `CoreEngine::index_mut`, which has already
+    /// parsed any deferred token lists into `documents`.
     fn lexical_index_mut(&mut self) -> &mut Bm25Index {
+        debug_assert!(self.deferred_token_lists.is_none());
         if self.lexical_index.get().is_none() {
             let _ = self
                 .lexical_index
-                .set(lexical_index_for_documents(&self.documents));
+                .set(lexical_index_for_documents(&self.documents, None));
         }
         self.lexical_index
             .get_mut()
             .expect("lexical index was just built")
+    }
+
+    /// Parses deferred token lists into `documents`, leaving the index as an
+    /// eager open would have built it. A no-op once done or when nothing was
+    /// deferred.
+    fn materialize_token_lists(&mut self) -> Result<(), CoreError> {
+        let Some(deferred) = &self.deferred_token_lists else {
+            return Ok(());
+        };
+        let mut token_lists = deferred.parse(&self.documents)?;
+        for (document_id, record) in self.documents.iter_mut() {
+            record.token_lists = token_lists.remove(document_id).unwrap_or_default();
+        }
+        self.deferred_token_lists = None;
+        Ok(())
     }
 
     fn field_indexes(&self) -> &BTreeMap<String, FieldIndex> {
@@ -8254,6 +8374,11 @@ mod lazy_index_tests {
         let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
         assert!(index(&reader).lexical_index.get().is_none());
         assert!(index(&reader).field_indexes.get().is_none());
+        assert!(index(&reader).deferred_token_lists.is_some());
+        assert!(index(&reader)
+            .documents
+            .values()
+            .all(|record| record.token_lists.is_empty()));
 
         let mut query = vec![0.1; 8];
         query[2] = 1.0;
@@ -8272,13 +8397,60 @@ mod lazy_index_tests {
             .search_embedded_text("default", &plan, Some(&query), 5, None)
             .unwrap();
         assert!(index(&reader).lexical_index.get().is_some());
+        // BM25 was built from the parsed text; the documents stay without it.
+        assert!(index(&reader).deferred_token_lists.is_some());
 
-        // A handle that built both at open answers every query the same way.
-        let eager = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
-        index(&eager).lexical_index();
-        index(&eager).field_indexes();
+        // A writable open loads everything eagerly; it must agree on every
+        // query and on the token lists themselves.
         let lazy = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert!(index(&eager).deferred_token_lists.is_none());
         assert_eq!(queries(&lazy), queries(&eager));
+        assert_eq!(
+            lazy.document_token_lists("default").unwrap(),
+            eager.document_token_lists("default").unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_overlay_on_a_deferred_reader_matches_an_eager_replay() {
+        let dir = temp_dir("overlay");
+        seed(&dir);
+        let mut reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        // A WAL-mode writer logs captioned upserts, a payload update and a
+        // delete without checkpointing them.
+        let mut writer = CoreEngine::open(options(&dir, false)).unwrap();
+        writer
+            .upsert_vectors(
+                "default",
+                &[
+                    document("doc-wal", 6, "event", Some("Lisbon dentist on Thursday")),
+                    document("doc-03", 3, "fact", None),
+                ],
+            )
+            .unwrap();
+        writer
+            .update_document_payload("default", "doc-07", None, Some(Some("oat milk".into())))
+            .unwrap();
+        writer
+            .delete_documents("default", &["doc-08".to_string()])
+            .unwrap();
+        writer.discard();
+
+        reader.refresh().unwrap();
+        assert!(index(&reader).deferred_token_lists.is_none());
+        let overlaid = queries(&reader);
+        let overlaid_tokens = reader.document_token_lists("default").unwrap();
+        drop(reader);
+
+        // A writable open replays the same WAL into an eagerly loaded index.
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert_eq!(overlaid, queries(&eager));
+        assert_eq!(
+            overlaid_tokens,
+            eager.document_token_lists("default").unwrap()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8289,7 +8461,7 @@ mod lazy_index_tests {
         seed(&eager_dir);
         seed(&lazy_dir);
         let mut eager = CoreEngine::open(options(&eager_dir, false)).unwrap();
-        index(&eager).lexical_index();
+        index(&eager).lexical_index().unwrap();
         index(&eager).field_indexes();
         let mut lazy = CoreEngine::open(options(&lazy_dir, false)).unwrap();
         assert!(index(&lazy).lexical_index.get().is_none());

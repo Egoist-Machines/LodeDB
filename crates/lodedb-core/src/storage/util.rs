@@ -16,9 +16,16 @@ pub(crate) fn invalid(message: impl Into<String>) -> CoreError {
 }
 
 pub(crate) fn read_json(path: &Path, context: &str) -> CoreResult<Value> {
-    let data = fs::read_to_string(path)
-        .map_err(|error| corrupt(format!("{context} could not be read: {error}")))?;
-    serde_json::from_str(&data).map_err(|error| corrupt(format!("{context} is corrupt: {error}")))
+    parse_json(&read_text(path, context)?, context)
+}
+
+pub(crate) fn read_text(path: &Path, context: &str) -> CoreResult<String> {
+    fs::read_to_string(path)
+        .map_err(|error| corrupt(format!("{context} could not be read: {error}")))
+}
+
+pub(crate) fn parse_json(data: &str, context: &str) -> CoreResult<Value> {
+    serde_json::from_str(data).map_err(|error| corrupt(format!("{context} is corrupt: {error}")))
 }
 
 pub(crate) fn read_json_object(path: &Path, context: &str) -> CoreResult<Map<String, Value>> {
@@ -447,7 +454,17 @@ pub(crate) fn read_checksummed_body(
     schema_version: i64,
     context: &str,
 ) -> CoreResult<Value> {
-    let payload = read_json(base_path, &format!("{context} base"))?;
+    let text = read_text(base_path, &format!("{context} base"))?;
+    checksummed_body_from_text(&text, schema_version, context)
+}
+
+/// [`read_checksummed_body`] over text already read from the base file.
+pub(crate) fn checksummed_body_from_text(
+    text: &str,
+    schema_version: i64,
+    context: &str,
+) -> CoreResult<Value> {
+    let payload = parse_json(text, &format!("{context} base"))?;
     let payload = value_object(&payload, &format!("{context} base"))?;
     if get_i64(payload, "schema_version", -1) != schema_version {
         return Err(corrupt(format!(
@@ -780,7 +797,10 @@ mod canonical_json_tests {
         let body = json!({"schema_version": 1, "documents": documents});
         let rendered = py_canonical_json(&body).unwrap();
         assert!(rendered.len() > 4 * 64 * 1024);
-        assert_eq!(body_sha256(&body).unwrap(), sha256_bytes_hex(rendered.as_bytes()));
+        assert_eq!(
+            body_sha256(&body).unwrap(),
+            sha256_bytes_hex(rendered.as_bytes())
+        );
         let small = json!({"a": "b"});
         assert_eq!(
             body_sha256(&small).unwrap(),
