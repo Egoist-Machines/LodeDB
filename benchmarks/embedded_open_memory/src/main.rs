@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! cargo run --release --manifest-path benchmarks/embedded_open_memory/Cargo.toml -- \
-//!     <store-dir> [--no-refresh] [--mode vector|hybrid|lexical] [--filter] [--k 60]
+//!     <store-dir> [--no-refresh] [--mode vector|hybrid|lexical] [--filter] [--k 60] [--hold 30]
 //! ```
 //!
 //! `run.sh` builds this probe against the working tree and against a base git
@@ -121,12 +121,16 @@ fn main() {
     let mut mode = "vector".to_string();
     let mut filter = false;
     let mut top_k = 60usize;
+    let mut hold_secs = 0u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-refresh" => refresh = false,
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--filter" => filter = true,
             "--k" => top_k = args.next().and_then(|v| v.parse().ok()).expect("--k needs a number"),
+            "--hold" => {
+                hold_secs = args.next().and_then(|v| v.parse().ok()).expect("--hold needs seconds")
+            }
             other if store.is_none() => store = Some(other.to_string()),
             other => panic!("unexpected argument {other}"),
         }
@@ -202,5 +206,10 @@ fn main() {
         first.hits.len(),
         first.total_considered
     );
+    if hold_secs > 0 {
+        // Keep the handle open so vmmap / footprint can inspect the process.
+        println!("pid {}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(hold_secs));
+    }
     drop(engine);
 }
