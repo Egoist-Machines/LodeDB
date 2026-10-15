@@ -158,3 +158,52 @@ fn size_matches_dim_squared() {
         assert_eq!(r.len(), dim * dim);
     }
 }
+
+/// The pre-serial generator: faer's high-level QR on the rayon pool. Kept
+/// here as the reference the single-threaded build must match bit for bit,
+/// since every persisted code was encoded against it.
+fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+    use rand_distr::StandardNormal;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut g = faer::Mat::<f64>::zeros(dim, dim);
+    for j in 0..dim {
+        for i in 0..dim {
+            g.write(i, j, rng.sample(StandardNormal));
+        }
+    }
+    let qr = g.qr();
+    let mut q = qr.compute_thin_q();
+    let r = qr.compute_thin_r();
+    for j in 0..dim {
+        if r.read(j, j) < 0.0 {
+            for i in 0..dim {
+                q.write(i, j, -q.read(i, j));
+            }
+        }
+    }
+    let mut out = vec![0.0f32; dim * dim];
+    for i in 0..dim {
+        for j in 0..dim {
+            out[i * dim + j] = q.read(i, j) as f32;
+        }
+    }
+    out
+}
+
+#[test]
+fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
+    faer::set_global_parallelism(faer::Parallelism::Rayon(4));
+    for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768] {
+        let serial = make_rotation_matrix(dim);
+        let reference = reference_rotation_matrix(dim);
+        let differing = serial
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "dim={dim}: {differing} entries differ");
+    }
+}
