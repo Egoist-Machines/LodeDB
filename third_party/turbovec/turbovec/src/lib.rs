@@ -455,10 +455,9 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        let centroids = self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -528,10 +527,9 @@ impl TurboQuantIndex {
         let Some(dim) = self.dim else { return };
         self.rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -929,10 +927,9 @@ impl TurboQuantIndex {
             .dim
             .expect("reconstruct_row_into on an index with no committed dim");
         debug_assert_eq!(out.len(), dim);
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        let centroids = self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         let (row, scale) = self.export_row(slot);
         let bytes_per_plane = dim / 8;
         let identity_calibration = self.tqplus_scale.is_empty();
