@@ -2128,6 +2128,66 @@ fn refresh_skips_the_reload_when_nothing_changed() {
 }
 
 #[test]
+fn refresh_right_after_a_read_only_open_keeps_the_loaded_view() {
+    // open_readonly followed by refresh() is how replica readers start. With no
+    // WAL tail the refresh would rebuild exactly the view the open just loaded,
+    // while holding both, so the open primes the fast path. Proven like the test
+    // above: the base segments are gone, so a reload would fail.
+    let path = unique_temp_dir("core_refresh_after_open");
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("keep", 0, metadata(&[("kind", "base")]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    fs::remove_dir_all(path.join(format!("{INDEX_KEY}.gen"))).unwrap();
+
+    reader
+        .refresh()
+        .expect("the first refresh after the open must not reload the base");
+    assert_eq!(reader.stats("default").unwrap().document_count, 1);
+    let hits = reader
+        .query_vector("default", &axis_query(0), 1, None)
+        .unwrap();
+    assert_eq!(hits.hits[0].document_id, "keep");
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn refresh_right_after_a_read_only_open_overlays_a_pending_wal_tail() {
+    // The open ignores the WAL, so a tail that is already on disk at open time
+    // must still be folded by the first refresh: the open does not prime the
+    // fast path in that case.
+    let path = unique_temp_dir("core_refresh_after_open_wal");
+    {
+        let mut engine = CoreEngine::open(open_options(&path, false, "wal")).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("base", 0, metadata(&[]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+    let appended_lsn = {
+        let appender = CoreAppender::open(open_options(&path, false, "wal")).unwrap();
+        appender
+            .append_vectors(&[doc("tail", 1, metadata(&[]))])
+            .unwrap()
+    };
+
+    let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal")).unwrap();
+    assert_eq!(reader.stats("default").unwrap().document_count, 1);
+    reader.refresh().unwrap();
+    assert_eq!(reader.stats("default").unwrap().document_count, 2);
+    assert!(reader.applied_lsn("default").unwrap() >= appended_lsn);
+
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn refresh_fast_path_detects_a_counter_only_change() {
     // The fast-path signature must fold in the appender's counter LSN, not just the
     // WAL byte length: a repaired-then-replaced tail can reuse the exact byte length

@@ -111,7 +111,19 @@ impl CoreEngine {
             replaying_wal: false,
             refresh_cache: BTreeMap::new(),
         };
+        // Take the refresh signature before loading, as refresh() does, so a
+        // commit that races the load leaves the cache behind and the next
+        // refresh reloads. When no index has a WAL tail, this view is exactly
+        // what refresh() would rebuild (it overlays nothing), so priming the
+        // cache lets the usual open-then-refresh sequence skip a reload that
+        // would hold a second full copy of every index while it runs.
+        let signature = engine.refresh_signature()?;
         engine.load_persisted_indexes(false)?;
+        if let Some(signature) = signature {
+            if signature.values().all(|(_, wal_len, _)| *wal_len == 0) {
+                engine.refresh_cache = signature;
+            }
+        }
         Ok(engine)
     }
 
