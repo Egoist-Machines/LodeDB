@@ -196,6 +196,12 @@ fn main() {
     let probe = Probe::start();
     let second = search(&engine);
     probe.report("search2");
+
+    // macOS and iOS malloc hand freed memory back to the kernel lazily, so the
+    // footprint right after a stage still counts some of what it freed.
+    let probe = Probe::start();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    probe.report("settled");
     assert_eq!(first, second, "a warm search must repeat the first one");
 
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
