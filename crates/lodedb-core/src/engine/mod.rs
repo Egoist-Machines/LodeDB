@@ -3602,7 +3602,7 @@ impl CoreCheckpointer {
 }
 
 fn index_from_loaded_store(
-    loaded: crate::storage::LoadedStore,
+    mut loaded: crate::storage::LoadedStore,
     chunk_character_limit: usize,
     lazy_vectors: bool,
 ) -> Result<VectorOnlyIndex, CoreError> {
@@ -3631,16 +3631,6 @@ fn index_from_loaded_store(
         .and_then(Value::as_u64)
         .unwrap_or(4) as usize;
     validate_index_shape(vector_dim, bit_width)?;
-    let metadata_by_id = state
-        .get("document_metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let chunk_ids_by_doc = state
-        .get("document_chunk_ids")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     let mut documents = BTreeMap::new();
     // Lazy residency applies only when a committed `.tvim` exists: the serving
     // index loads from it directly, so the open-time full-corpus dequantization
@@ -3658,71 +3648,76 @@ fn index_from_loaded_store(
     let (chunk_vectors, query_rotation) = chunk_vectors
         .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
         .unwrap_or_default();
-    for document_id in state
-        .get("document_hashes")
-        .and_then(Value::as_object)
-        .map(|object| object.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        let metadata = metadata_by_id
-            .get(&document_id)
-            .and_then(Value::as_object)
-            .map(|object| {
-                object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let chunks: Vec<ChunkRecord> = chunk_ids_by_doc
-            .get(&document_id)
-            .and_then(Value::as_array)
+    // Move the per-document maps out of the loaded state and payload stores
+    // instead of cloning them: the parsed JSON is several times its file size,
+    // and a clone held both copies at the open's peak. The state's chunk list
+    // was only needed for the counts above.
+    let state = loaded
+        .state
+        .as_object_mut()
+        .ok_or_else(|| invalid_err("loaded state must be a JSON object"))?;
+    state.remove("chunks");
+    let mut metadata_by_id = take_state_object(state, "document_metadata");
+    let mut chunk_ids_by_doc = take_state_object(state, "document_chunk_ids");
+    let document_hashes = take_state_object(state, "document_hashes");
+    for (document_id, content_hash) in document_hashes {
+        let metadata = match metadata_by_id.remove(&document_id) {
+            Some(Value::Object(object)) => object
+                .into_iter()
+                .map(|(key, value)| (key, json_string_or_empty(value)))
+                .collect(),
+            _ => CoreMetadata::new(),
+        };
+        let chunk_ids = match chunk_ids_by_doc.remove(&document_id) {
+            Some(Value::Array(chunk_ids)) => chunk_ids,
+            _ => Vec::new(),
+        };
+        let chunks: Vec<ChunkRecord> = chunk_ids
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+            .filter_map(|chunk_id| match chunk_id {
+                Value::String(chunk_id) => Some(chunk_id),
+                _ => None,
+            })
             .map(|chunk_id| ChunkRecord {
-                chunk_id: chunk_id.to_string(),
                 // Lazy handles keep the vector empty (non-resident) rather than
                 // zero-filled: an explicit "absent" the guarded consumers refuse,
                 // instead of a plausible-looking all-zeros row.
-                vector: chunk_vectors.get(chunk_id).cloned().unwrap_or_else(|| {
+                vector: chunk_vectors.get(&chunk_id).cloned().unwrap_or_else(|| {
                     if lazy_vectors {
                         Vec::new()
                     } else {
                         vec![0.0; vector_dim]
                     }
                 }),
+                chunk_id,
             })
             .collect();
+        let text = loaded.raw_text.remove(&document_id);
         let token_lists = loaded
             .lexical_tokens
-            .get(&document_id)
-            .cloned()
+            .remove(&document_id)
             .unwrap_or_else(|| {
-                loaded
-                    .raw_text
-                    .get(&document_id)
+                text.as_deref()
                     .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
                     .unwrap_or_default()
             });
+        let patch_matrix = loaded.multivec.remove(&document_id);
         documents.insert(
-            document_id.clone(),
+            document_id,
             DocumentRecord {
-                content_hash: state
-                    .get("document_hashes")
-                    .and_then(Value::as_object)
-                    .and_then(|object| object.get(&document_id))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                content_hash: json_string_or_empty(content_hash),
                 metadata,
-                text: loaded.raw_text.get(&document_id).cloned(),
+                text,
                 token_lists,
                 chunks,
-                patch_matrix: loaded.multivec.get(&document_id).cloned(),
+                patch_matrix,
             },
         );
     }
+    let state = loaded
+        .state
+        .as_object()
+        .ok_or_else(|| invalid_err("loaded state must be a JSON object"))?;
     let all_docs = documents.keys().cloned().collect::<DocSet>();
     let chunk_owner_by_id = chunk_owner_by_id_for_documents(&documents);
     // The load only needs (chunk_id, document_id) pairs -- never embeddings --
@@ -3876,6 +3871,27 @@ fn index_from_loaded_store(
     // first ANN query.
     index.install_persisted_ann(loaded.ann, base_calibration_fingerprint, lazy_vectors);
     Ok(index)
+}
+
+/// Removes `key` from the loaded state, as an object; absent or not an object
+/// reads as empty, like the `get(..).and_then(as_object)` it replaces.
+fn take_state_object(
+    state: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> serde_json::Map<String, Value> {
+    match state.remove(key) {
+        Some(Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// The string inside a JSON value, or "" for any other value (the loader's
+/// `as_str().unwrap_or("")`, without the copy).
+fn json_string_or_empty(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        _ => String::new(),
+    }
 }
 
 fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Vec<String>> {
