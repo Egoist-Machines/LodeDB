@@ -105,7 +105,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run the native-core Rust test suites
-        run: cargo test --workspace
+        # Report every failing test binary, not just the first one.
+        run: cargo test --workspace --no-fail-fast
 
   # Builds the LodeDBCoreFFI XCFramework (host slice) and runs the Swift binding's
   # build + test against the statically-linked native core. This gates the Swift/iOS
