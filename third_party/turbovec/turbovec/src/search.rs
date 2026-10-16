@@ -38,6 +38,20 @@ pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
 pub(crate) static FORCE_PARALLEL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Held by every test that flips a kernel switch above, for its whole body.
+/// The switches are process-global and libtest runs tests on parallel
+/// threads, so a test comparing two searches must not see another test's
+/// setting change between them.
+#[cfg(test)]
+pub(crate) static KERNEL_SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`KERNEL_SWITCHES`], ignoring poison from a test that failed while
+/// holding it.
+#[cfg(test)]
+pub(crate) fn lock_kernel_switches() -> std::sync::MutexGuard<'static, ()> {
+    KERNEL_SWITCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
 pub fn blocks_skipped_by_mask() -> u64 {
     BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)

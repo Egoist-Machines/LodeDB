@@ -1154,7 +1154,7 @@ mod x86_scalar_fallback_tests {
     //! the only place its full scoring path — including the issue-#106
     //! perm0 de-interleave — runs end to end.
     use super::TurboQuantIndex;
-    use crate::search::FORCE_SCALAR_FALLBACK;
+    use crate::search::{lock_kernel_switches, FORCE_SCALAR_FALLBACK};
     use std::sync::atomic::Ordering;
 
     fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
@@ -1184,6 +1184,7 @@ mod x86_scalar_fallback_tests {
 
     #[test]
     fn scalar_fallback_matches_simd_topk() {
+        let _switches = lock_kernel_switches();
         let dim = 64;
         let n = 600;
         let nq = 12;
@@ -1216,7 +1217,7 @@ mod serial_search_tests {
     //! Batches of up to four queries run on the calling thread instead of
     //! the rayon pool. Same kernel, same inputs: the bits must not change.
     use super::TurboQuantIndex;
-    use crate::search::FORCE_PARALLEL;
+    use crate::search::{lock_kernel_switches, FORCE_PARALLEL, FORCE_SCALAR_FALLBACK};
     use std::sync::atomic::Ordering;
 
     fn vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
@@ -1233,6 +1234,10 @@ mod serial_search_tests {
 
     #[test]
     fn serial_small_batches_match_the_rayon_path() {
+        // Both searches must take the same kernel; on x86 the scalar
+        // fallback is not bit-identical to the SIMD kernels.
+        let _switches = lock_kernel_switches();
+        FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
         let dim = 64;
         let k = 20;
         for &bits in &[2usize, 3, 4] {
