@@ -778,6 +778,35 @@ mod canonical_json_tests {
         assert_eq!(written, py_canonical_json(&parsed).unwrap());
     }
 
+    // Regenerate with CPython (default separators and ensure_ascii=True):
+    // python3 -c 'import json, hashlib
+    // body = {
+    //     "z_nested": {"z": [None, True, False, {}, [], {"y": [1, -2, 3], "a": "nested"}],
+    //                  "a": {"b": [], "a": {}}},
+    //     "integers": [0, -1, -9223372036854775808, 9223372036854775807, 18446744073709551615],
+    //     "floats": [0.0, -0.0, 0.5, 1e300, 1e-7, 123456789.123, 1.0, 100.0, 1e16],
+    //     "text": "\"\\\u0000\u001f\b\f\n\r\té日本😀",
+    //     "long": "x" * 70001,
+    // }
+    // print(hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest())'
+    #[test]
+    fn body_sha256_matches_a_fixed_cpython_digest() {
+        let body = json!({
+            "z_nested": {"z": [null, true, false, {}, [], {"y": [1, -2, 3], "a": "nested"}],
+                         "a": {"b": [], "a": {}}},
+            "integers": [0, -1, i64::MIN, i64::MAX, u64::MAX],
+            "floats": [0.0, -0.0, 0.5, 1e300, 1e-7, 123456789.123, 1.0, 100.0, 1e16],
+            "text": "\"\\\u{0000}\u{001f}\u{08}\u{0c}\n\r\té日本\u{1F600}",
+            "long": "x".repeat(70001),
+        });
+        let expected = "1498ebbd5913976c72f738b4146e7bd70e628c96346d0aaf1fe61d40c20701e2";
+        assert_eq!(body_sha256(&body).unwrap(), expected);
+        assert_eq!(
+            sha256_bytes_hex(py_canonical_json(&body).unwrap().as_bytes()),
+            expected
+        );
+    }
+
     // body_sha256 hashes the canonical text in 64 KB chunks instead of
     // rendering it first; the digest must equal hashing the rendered text,
     // including across chunk boundaries that fall inside multi-byte escapes.
