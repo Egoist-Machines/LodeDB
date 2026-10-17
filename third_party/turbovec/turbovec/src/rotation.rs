@@ -24,14 +24,12 @@ use crate::ROTATION_SEED;
 /// Largest dim whose QR runs single-threaded. Up to here the serial QR
 /// equals the pooled one bit for bit (`tests/rotation.rs`) and takes a few
 /// ms. Above it the pool is 2 to 3.5 times faster and uses the fixed split
-/// degree [`POOLED_QR_DEGREE`] to keep the matrix machine-independent.
+/// degree [`POOLED_QR_DEGREE`] to remove dependence on the core count.
 pub const SERIAL_QR_MAX_DIM: usize = 768;
 
-/// Fixed QR split degree for dims above [`SERIAL_QR_MAX_DIM`]. The result
-/// depends on this degree, not the thread count, so pinning it keeps rayon
-/// execution bit-identical on any machine. This preserves the matrix every
-/// machine with four or more cores previously produced. Machines with fewer
-/// than four cores previously computed a different matrix at some large dims.
+/// Fixed QR split degree for dims above [`SERIAL_QR_MAX_DIM`]. Pinning this
+/// degree removes dependence on the core count. Whether different CPU
+/// architectures agree bit for bit is a separate, pre-existing question.
 pub const POOLED_QR_DEGREE: usize = 8;
 
 /// Generate a dim x dim orthogonal matrix (deterministic, seeded).

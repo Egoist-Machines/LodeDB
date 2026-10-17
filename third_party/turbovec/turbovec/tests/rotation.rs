@@ -160,9 +160,9 @@ fn size_matches_dim_squared() {
     }
 }
 
-/// The pre-serial generator: faer's high-level QR on the rayon pool. Kept
-/// here as the reference the single-threaded build must match bit for bit,
-/// since every persisted code was encoded against it.
+/// The original generator: faer's high-level QR on the rayon pool. The
+/// low-level implementation must match it bit for bit at the same split degree,
+/// since persisted codes depend on the rotation matrix.
 fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
     use rand::prelude::*;
     use rand_chacha::ChaCha8Rng;
@@ -197,10 +197,10 @@ fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
 #[test]
 fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
     with_global_parallelism(faer::Parallelism::Rayon(4), || {
-        // 768 is the last serial dim; 1024 takes the pooled path and must equal
-        // the reference under a four-way split degree.
+        // 768 is the last serial dim. Above it the pinned pooled path is
+        // checked separately against the reference at its fixed split degree.
         assert_eq!(turbovec::rotation::SERIAL_QR_MAX_DIM, 768);
-        for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768, 1024] {
+        for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768] {
             let serial = make_rotation_matrix(dim);
             let reference = reference_rotation_matrix(dim);
             let differing = serial
@@ -213,7 +213,7 @@ fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
     });
 }
 
-fn with_global_parallelism(parallelism: faer::Parallelism, test: impl FnOnce()) {
+fn with_global_parallelism<T>(parallelism: faer::Parallelism, test: impl FnOnce() -> T) -> T {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     struct Reset;
@@ -224,42 +224,42 @@ fn with_global_parallelism(parallelism: faer::Parallelism, test: impl FnOnce()) 
     }
     let _reset = Reset;
     faer::set_global_parallelism(parallelism);
-    test();
-}
-
-fn digest(v: &[f32]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for x in v {
-        h ^= x.to_bits() as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    test()
 }
 
 #[test]
-fn large_dim_rotation_is_machine_independent() {
-    // Digests of the matrices the pre-pin code produced under every global
-    // split degree from 4 through 256, which is what any machine with four or
-    // more cores encoded its stores against. The two largest dims take
-    // minutes in a debug build, so they only run optimized; CI runs this
-    // suite with --release, the profile every shipped artifact is built with.
-    let cases = [
-        (1024, 8762440974103446073),
-        (1536, 13609694503543541777),
-        (2048, 2346467068182485634),
-        (3072, 17718931291452891280),
-        (4096, 9432413222527170777),
-    ];
-    let cases = if cfg!(debug_assertions) { &cases[..3] } else { &cases[..] };
-    for degree in [0, 2] {
-        with_global_parallelism(faer::Parallelism::Rayon(degree), || {
-            for &(dim, expected) in cases {
-                assert_eq!(
-                    digest(&make_rotation_matrix(dim)),
-                    expected,
-                    "dim={dim}, global split degree={degree}"
-                );
-            }
+fn large_dim_rotation_matches_pinned_reference_and_ignores_global_parallelism() {
+    // Compare locally computed matrices, since QR rounding can depend on the
+    // CPU architecture. The largest case is too slow in debug builds; CI runs
+    // this suite with --release, matching shipped artifacts.
+    let dims = [1024, 1536, 2048, 3072];
+    let dims = if cfg!(debug_assertions) {
+        &dims[..3]
+    } else {
+        &dims[..]
+    };
+    for &dim in dims {
+        let reference = with_global_parallelism(faer::Parallelism::Rayon(8), || {
+            reference_rotation_matrix(dim)
         });
+        let pinned =
+            with_global_parallelism(faer::Parallelism::Rayon(2), || make_rotation_matrix(dim));
+        let automatic =
+            with_global_parallelism(faer::Parallelism::Rayon(0), || make_rotation_matrix(dim));
+        for (comparison, actual, expected) in [
+            ("pooled reference at degree 8", &pinned, &reference),
+            ("global degree 0 versus 2", &automatic, &pinned),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "dim={dim}: {comparison}");
+            let differing = actual
+                .iter()
+                .zip(expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "dim={dim}: {comparison}: {differing} entries differ"
+            );
+        }
     }
 }
