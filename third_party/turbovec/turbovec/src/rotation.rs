@@ -3,6 +3,13 @@
 //! Generates a deterministic orthogonal matrix via QR decomposition of
 //! a seeded Gaussian random matrix. The rotation makes each coordinate
 //! of a unit vector follow a known Beta distribution.
+//!
+//! Above 768 dimensions the QR split degree is pinned: the result depends
+//! on the split degree, not the thread count. A fixed degree remains
+//! bit-identical on any machine while still using the rayon pool. It keeps
+//! the matrix previously produced on every machine with four or more cores;
+//! machines with fewer than four cores previously computed a different
+//! matrix at some dimensions above 768.
 
 use faer::dyn_stack::{GlobalPodBuffer, PodStack};
 use faer::linalg::householder;
@@ -16,10 +23,16 @@ use crate::ROTATION_SEED;
 
 /// Largest dim whose QR runs single-threaded. Up to here the serial QR
 /// equals the pooled one bit for bit (`tests/rotation.rs`) and takes a few
-/// ms. Above it the pool is 2 to 3.5 times faster, and its result at 1536
-/// and 3072 already depends on the pool size, so larger dims keep the
-/// pooled path unchanged.
+/// ms. Above it the pool is 2 to 3.5 times faster and uses the fixed split
+/// degree [`POOLED_QR_DEGREE`] to keep the matrix machine-independent.
 pub const SERIAL_QR_MAX_DIM: usize = 768;
+
+/// Fixed QR split degree for dims above [`SERIAL_QR_MAX_DIM`]. The result
+/// depends on this degree, not the thread count, so pinning it keeps rayon
+/// execution bit-identical on any machine. This preserves the matrix every
+/// machine with four or more cores previously produced. Machines with fewer
+/// than four cores previously computed a different matrix at some large dims.
+pub const POOLED_QR_DEGREE: usize = 8;
 
 /// Generate a dim x dim orthogonal matrix (deterministic, seeded).
 /// Returns row-major flat Vec<f32> of length dim*dim.
@@ -29,8 +42,18 @@ pub const SERIAL_QR_MAX_DIM: usize = 768;
 /// gives each a GEMM packing slab; for a one-off factorization at embedding
 /// dims that costs more memory than the matrix itself. The blocked
 /// Householder steps split GEMM work by output tile, never along the
-/// reduction, so the result is bit-identical to the pooled QR.
+/// reduction, so at these dims the result is bit-identical to the pooled QR.
+/// Larger dims use [`POOLED_QR_DEGREE`] regardless of the global setting.
 pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
+    let parallelism = if dim <= SERIAL_QR_MAX_DIM {
+        Parallelism::None
+    } else {
+        Parallelism::Rayon(POOLED_QR_DEGREE)
+    };
+    rotation_matrix(dim, parallelism)
+}
+
+fn rotation_matrix(dim: usize, parallelism: Parallelism) -> Vec<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(ROTATION_SEED);
 
     // Generate random Gaussian matrix
@@ -40,10 +63,6 @@ pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
             factors.write(i, j, rng.sample(StandardNormal));
         }
     }
-    if dim > SERIAL_QR_MAX_DIM {
-        return pooled_rotation(&factors);
-    }
-
     // Non-pivoted QR decomposition (deterministic), in place: `factors` ends
     // up holding R on and above the diagonal and the Householder basis below.
     let blocksize = qr::recommended_blocksize::<f64>(dim, dim);
@@ -52,9 +71,9 @@ pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
     qr::qr_in_place(
         factors.as_mut(),
         householder.as_mut(),
-        Parallelism::None,
+        parallelism,
         PodStack::new(&mut GlobalPodBuffer::new(
-            qr::qr_in_place_req::<f64>(dim, dim, blocksize, Parallelism::None, params)
+            qr::qr_in_place_req::<f64>(dim, dim, blocksize, parallelism, params)
                 .expect("QR workspace size overflow"),
         )),
         params,
@@ -68,7 +87,7 @@ pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
         householder.as_ref(),
         Conj::No,
         q.as_mut(),
-        Parallelism::None,
+        parallelism,
         PodStack::new(&mut GlobalPodBuffer::new(
             householder::apply_block_householder_sequence_on_the_left_in_place_req::<f64>(
                 dim, blocksize, dim,
@@ -86,21 +105,6 @@ pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
         }
     }
 
-    row_major(&q)
-}
-
-/// The pre-serial build: faer's high-level QR on the global pool.
-fn pooled_rotation(factors: &Mat<f64>) -> Vec<f32> {
-    let qr = factors.qr();
-    let mut q = qr.compute_thin_q();
-    let r = qr.compute_thin_r();
-    for j in 0..q.ncols() {
-        if !(r.read(j, j) >= 0.0) {
-            for i in 0..q.nrows() {
-                q.write(i, j, -q.read(i, j));
-            }
-        }
-    }
     row_major(&q)
 }
 

@@ -7,6 +7,7 @@
 //! - The matrix is orthogonal: `R^T R = I`.
 //! - Rotation preserves vector L2 norms.
 //! - Generation is deterministic across calls.
+//! - Large dimensions retain the same bits regardless of global parallelism.
 //! - `R^T` recovers the input (round-trip via the transpose).
 //!
 //! Tolerances here are generous enough for f32 + faer QR roundoff.
@@ -195,18 +196,70 @@ fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
 
 #[test]
 fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
-    faer::set_global_parallelism(faer::Parallelism::Rayon(4));
-    // 768 is the last serial dim; 1024 takes the pooled path and must equal
-    // the reference under the same pool.
-    assert_eq!(turbovec::rotation::SERIAL_QR_MAX_DIM, 768);
-    for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768, 1024] {
-        let serial = make_rotation_matrix(dim);
-        let reference = reference_rotation_matrix(dim);
-        let differing = serial
-            .iter()
-            .zip(&reference)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        assert_eq!(differing, 0, "dim={dim}: {differing} entries differ");
+    with_global_parallelism(faer::Parallelism::Rayon(4), || {
+        // 768 is the last serial dim; 1024 takes the pooled path and must equal
+        // the reference under a four-way split degree.
+        assert_eq!(turbovec::rotation::SERIAL_QR_MAX_DIM, 768);
+        for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768, 1024] {
+            let serial = make_rotation_matrix(dim);
+            let reference = reference_rotation_matrix(dim);
+            let differing = serial
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(differing, 0, "dim={dim}: {differing} entries differ");
+        }
+    });
+}
+
+fn with_global_parallelism(parallelism: faer::Parallelism, test: impl FnOnce()) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            faer::set_global_parallelism(faer::Parallelism::Rayon(0));
+        }
+    }
+    let _reset = Reset;
+    faer::set_global_parallelism(parallelism);
+    test();
+}
+
+fn digest(v: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for x in v {
+        h ^= x.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[test]
+fn large_dim_rotation_is_machine_independent() {
+    // Digests of the matrices the pre-pin code produced under every global
+    // split degree from 4 through 256, which is what any machine with four or
+    // more cores encoded its stores against. The two largest dims take
+    // minutes in a debug build, so they only run optimized; CI runs this
+    // suite with --release, the profile every shipped artifact is built with.
+    let cases = [
+        (1024, 8762440974103446073),
+        (1536, 13609694503543541777),
+        (2048, 2346467068182485634),
+        (3072, 17718931291452891280),
+        (4096, 9432413222527170777),
+    ];
+    let cases = if cfg!(debug_assertions) { &cases[..3] } else { &cases[..] };
+    for degree in [0, 2] {
+        with_global_parallelism(faer::Parallelism::Rayon(degree), || {
+            for &(dim, expected) in cases {
+                assert_eq!(
+                    digest(&make_rotation_matrix(dim)),
+                    expected,
+                    "dim={dim}, global split degree={degree}"
+                );
+            }
+        });
     }
 }

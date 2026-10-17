@@ -128,7 +128,9 @@ jobs:
 
       - name: Run the vendored TurboVec Rust test suites
         # Report every failing test binary, not just the first one.
-        run: cargo test --manifest-path third_party/turbovec/turbovec/Cargo.toml --no-fail-fast
+        # Release profile: every shipped artifact is built optimized, and the
+        # large-dim rotation digests take minutes unoptimized.
+        run: cargo test --release --manifest-path third_party/turbovec/turbovec/Cargo.toml --no-fail-fast
 
   # Builds the LodeDBCoreFFI XCFramework (host slice) and runs the Swift binding's
   # build + test against the statically-linked native core. This gates the Swift/iOS
