@@ -370,19 +370,21 @@ impl CoreEngine {
                 &mut changed_filter_fields,
             );
             if caption_tokens.is_empty() {
-                index
-                    .lexical_index_mut()
-                    .remove_group(&document.document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(&document.document_id);
+                }
                 if old_had_tokens {
                     index
                         .pending_lexical_clears
                         .insert(document.document_id.clone());
                 }
             } else {
-                index.lexical_index_mut().replace_group(
-                    &document.document_id,
-                    &[(document.document_id.clone(), caption_tokens)],
-                );
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.replace_group(
+                        &document.document_id,
+                        &[(document.document_id.clone(), caption_tokens)],
+                    );
+                }
                 index.pending_lexical_clears.remove(&document.document_id);
             }
             // Only re-sync the vector when it actually changed; a same-vector
@@ -501,7 +503,9 @@ impl CoreEngine {
                 if record.patch_matrix.is_some() {
                     index.pending_multivec_clears.insert(document_id.clone());
                 }
-                index.lexical_index_mut().remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 let chunk_ids = record
                     .chunks
                     .iter()
@@ -572,10 +576,6 @@ impl CoreEngine {
                 &mut changed_filter_fields,
             );
         }
-        if text.is_some() {
-            // Build it now: the caption update below holds the document record.
-            index.lexical_index_mut();
-        }
         let record = index
             .documents
             .get_mut(document_id)
@@ -583,7 +583,7 @@ impl CoreEngine {
         if let Some(metadata) = metadata {
             record.metadata = metadata;
         }
-        if let Some(text) = text {
+        let lexical_update = if let Some(text) = text {
             record.content_hash = text
                 .as_ref()
                 .map(|text| crate::text::hash::sha256_text(text))
@@ -615,23 +615,28 @@ impl CoreEngine {
             } else {
                 vec![caption_tokens.clone()]
             };
-            let lexical_index = index
-                .lexical_index
-                .get_mut()
-                .expect("lexical index is built before the record is borrowed");
+            Some((had_tokens, caption_tokens))
+        } else {
+            None
+        };
+        let updated_metadata = metadata_changed.then(|| record.metadata.clone());
+        if let Some((had_tokens, caption_tokens)) = lexical_update {
             if caption_tokens.is_empty() {
-                lexical_index.remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 if had_tokens {
                     index.pending_lexical_clears.insert(document_id.to_string());
                 }
             } else {
-                lexical_index
-                    .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical
+                        .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+                }
                 index.pending_lexical_clears.remove(document_id);
             }
         }
-        if metadata_changed {
-            let metadata = record.metadata.clone();
+        if let Some(metadata) = updated_metadata {
             index.add_document_indexes(document_id, &metadata, &chunks, &mut changed_filter_fields);
             index.finalize_filter_fields(&changed_filter_fields);
         } else if text_for_wal.is_some() {
@@ -907,9 +912,9 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            index
-                .lexical_index_mut()
-                .replace_group(&document.document_id, &lexical_units);
+            if let Some(lexical) = index.lexical_index_mut() {
+                lexical.replace_group(&document.document_id, &lexical_units);
+            }
             if append_wal {
                 wal_documents.push(serde_json::json!({
                     "document_id": document.document_id,
@@ -2139,14 +2144,18 @@ impl CoreEngine {
                 // the lexical index instead of lingering as a zero-token unit that
                 // would inflate the BM25 doc count, and the clear is marked for the
                 // delta (the guard above proves the old tokens were non-empty).
-                index.lexical_index_mut().remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 index.pending_lexical_clears.insert(document_id.to_string());
             } else {
                 let units = vec![(
                     document_id.to_string(),
                     token_lists.into_iter().next().unwrap_or_default(),
                 )];
-                index.lexical_index_mut().replace_group(document_id, &units);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.replace_group(document_id, &units);
+                }
                 index.pending_lexical_clears.remove(document_id);
             }
             // A token-only restore (store_text=false, index_text=true) onto an
@@ -2402,9 +2411,9 @@ impl CoreEngine {
                     )
                 })
                 .collect::<Vec<_>>();
-            index
-                .lexical_index_mut()
-                .replace_group(&document_id, &lexical_units);
+            if let Some(lexical) = index.lexical_index_mut() {
+                lexical.replace_group(&document_id, &lexical_units);
+            }
         }
         let removed_chunk_ids_vec = removed_chunk_ids
             .iter()
@@ -3953,6 +3962,11 @@ fn lexical_index_for_documents(
             Some(token_lists) => token_lists.get(document_id).map_or(&[][..], Vec::as_slice),
             None => record.token_lists.as_slice(),
         };
+        // Caption-free documents have no lexical group, matching mutations
+        // that remove the group when a caption is cleared.
+        if lists.is_empty() {
+            continue;
+        }
         let units = record
             .chunks
             .iter()
@@ -5344,8 +5358,8 @@ struct VectorOnlyIndex {
     deleted_chunk_count: usize,
     /// BM25 over the chunk token lists. An index loaded from disk builds it from
     /// `documents` on first use instead of at open, so a handle that never runs
-    /// a lexical or hybrid query never pays for it. Mutations build it first
-    /// (`lexical_index_mut`), so they see exactly the eager index.
+    /// a lexical or hybrid query never pays for it. Mutations update it only
+    /// when already built; otherwise the first query sees the updated documents.
     lexical_index: OnceCell<Bm25Index>,
     /// Set on a read-only open while `documents` carry no token lists; the
     /// first mutation parses them in (`materialize_token_lists`).
@@ -5390,7 +5404,7 @@ struct VectorOnlyIndex {
     /// with `cluster_index` so a stale assignment is never adopted.
     pending_persisted_ann: RefCell<Option<crate::storage::tvann_store::LoadedAnn>>,
     /// Metadata field indexes for the filter planner, built on first use like
-    /// `lexical_index`: the first filtered query or the first mutation.
+    /// `lexical_index`: the first filtered query. Mutations leave it unbuilt.
     field_indexes: OnceCell<BTreeMap<String, FieldIndex>>,
     all_docs: DocSet,
     chunk_owner_by_id: HashMap<String, String>,
@@ -5739,27 +5753,18 @@ impl VectorOnlyIndex {
         Ok(self.lexical_index.get_or_init(|| built))
     }
 
-    /// Builds the lexical index before handing it to a mutation. BM25 ranks
-    /// only on the set of (unit id, tokens), with ties broken by unit id, so
-    /// a build that already sees part of the mutation in `documents` ends at
-    /// the same index once the mutation's own group update lands. Mutations
-    /// reach the index through `CoreEngine::index_mut`, which has already
-    /// parsed any deferred token lists into `documents`.
-    fn lexical_index_mut(&mut self) -> &mut Bm25Index {
+    /// Returns the lexical index only if it is already built. Mutations skip
+    /// incremental updates when absent: the first lexical read builds it from
+    /// the updated `documents`. `CoreEngine::index_mut` has already parsed any
+    /// deferred token lists into `documents` before a mutation reaches here.
+    fn lexical_index_mut(&mut self) -> Option<&mut Bm25Index> {
         debug_assert!(self.deferred_token_lists.is_none());
-        if self.lexical_index.get().is_none() {
-            let _ = self
-                .lexical_index
-                .set(lexical_index_for_documents(&self.documents, None));
-        }
-        self.lexical_index
-            .get_mut()
-            .expect("lexical index was just built")
+        self.lexical_index.get_mut()
     }
 
-    /// Parses deferred token lists into `documents`, leaving the index as an
-    /// eager open would have built it. A no-op once done or when nothing was
-    /// deferred.
+    /// Parses deferred token lists into `documents` so mutations and later
+    /// lazy builds see the same tokens as an eager open. A no-op once done or
+    /// when nothing was deferred.
     fn materialize_token_lists(&mut self) -> Result<(), CoreError> {
         let Some(deferred) = &self.deferred_token_lists else {
             return Ok(());
@@ -5777,18 +5782,11 @@ impl VectorOnlyIndex {
             .get_or_init(|| field_indexes_for_documents(&self.documents))
     }
 
-    /// Same contract as [`Self::lexical_index_mut`]: field indexes are a pure
-    /// function of each document's metadata, and every mutation removes the
-    /// old values and inserts the new ones.
-    fn field_indexes_mut(&mut self) -> &mut BTreeMap<String, FieldIndex> {
-        if self.field_indexes.get().is_none() {
-            let _ = self
-                .field_indexes
-                .set(field_indexes_for_documents(&self.documents));
-        }
-        self.field_indexes
-            .get_mut()
-            .expect("field indexes were just built")
+    /// Returns the field indexes only if already built. As with
+    /// [`Self::lexical_index_mut`], mutations skip incremental updates when
+    /// absent; the first filtered read builds them from updated document metadata.
+    fn field_indexes_mut(&mut self) -> Option<&mut BTreeMap<String, FieldIndex>> {
+        self.field_indexes.get_mut()
     }
 
     fn add_document_indexes(
@@ -5799,10 +5797,12 @@ impl VectorOnlyIndex {
         changed_filter_fields: &mut BTreeSet<String>,
     ) {
         self.all_docs.insert(document_id.to_string());
-        for (key, value) in metadata {
-            let field = self.field_indexes_mut().entry(key.clone()).or_default();
-            field.insert(document_id.to_string(), value.clone());
-            changed_filter_fields.insert(key.clone());
+        if let Some(fields) = self.field_indexes_mut() {
+            for (key, value) in metadata {
+                let field = fields.entry(key.clone()).or_default();
+                field.insert(document_id.to_string(), value.clone());
+                changed_filter_fields.insert(key.clone());
+            }
         }
         for chunk in chunks {
             self.chunk_owner_by_id
@@ -5822,10 +5822,12 @@ impl VectorOnlyIndex {
         changed_filter_fields: &mut BTreeSet<String>,
     ) {
         self.all_docs.remove(document_id);
-        for (key, value) in metadata {
-            if let Some(field) = self.field_indexes_mut().get_mut(key) {
-                field.remove(document_id, value);
-                changed_filter_fields.insert(key.clone());
+        if let Some(fields) = self.field_indexes_mut() {
+            for (key, value) in metadata {
+                if let Some(field) = fields.get_mut(key) {
+                    field.remove(document_id, value);
+                    changed_filter_fields.insert(key.clone());
+                }
             }
         }
         // Track the document-level removal for the next generation delta; the tvim
@@ -5845,13 +5847,11 @@ impl VectorOnlyIndex {
         // Ordered-filter partitions are rebuilt lazily at query time (and invalidated
         // by `FieldIndex::insert`/`remove`), so writes only need to drop fields that
         // became empty. This keeps single-row mutations O(changed), not O(cardinality).
-        for key in changed_filter_fields {
-            if self
-                .field_indexes_mut()
-                .get(key)
-                .is_some_and(FieldIndex::is_empty)
-            {
-                self.field_indexes_mut().remove(key);
+        if let Some(fields) = self.field_indexes_mut() {
+            for key in changed_filter_fields {
+                if fields.get(key).is_some_and(FieldIndex::is_empty) {
+                    fields.remove(key);
+                }
             }
         }
     }
@@ -8418,6 +8418,9 @@ mod lazy_index_tests {
         let dir = temp_dir("overlay");
         seed(&dir);
         let mut reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
+        assert!(index(&reader).deferred_token_lists.is_some());
         // A WAL-mode writer logs captioned upserts, a payload update and a
         // delete without checkpointing them.
         let mut writer = CoreEngine::open(options(&dir, false)).unwrap();
@@ -8440,7 +8443,11 @@ mod lazy_index_tests {
 
         reader.refresh().unwrap();
         assert!(index(&reader).deferred_token_lists.is_none());
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
         let overlaid = queries(&reader);
+        assert!(index(&reader).lexical_index.get().is_some());
+        assert!(index(&reader).field_indexes.get().is_some());
         let overlaid_tokens = reader.document_token_lists("default").unwrap();
         drop(reader);
 
@@ -8465,6 +8472,7 @@ mod lazy_index_tests {
         index(&eager).field_indexes();
         let mut lazy = CoreEngine::open(options(&lazy_dir, false)).unwrap();
         assert!(index(&lazy).lexical_index.get().is_none());
+        assert!(index(&lazy).field_indexes.get().is_none());
 
         for engine in [&mut eager, &mut lazy] {
             // A new captioned document, a captioned document replaced by an
@@ -8495,7 +8503,11 @@ mod lazy_index_tests {
                 .delete_documents("default", &["doc-05".to_string()])
                 .unwrap();
         }
+        assert!(index(&lazy).lexical_index.get().is_none());
+        assert!(index(&lazy).field_indexes.get().is_none());
         assert_eq!(queries(&lazy), queries(&eager));
+        assert!(index(&lazy).lexical_index.get().is_some());
+        assert!(index(&lazy).field_indexes.get().is_some());
 
         eager.close().unwrap();
         lazy.close().unwrap();
