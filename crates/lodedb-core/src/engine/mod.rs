@@ -379,12 +379,7 @@ impl CoreEngine {
                         .insert(document.document_id.clone());
                 }
             } else {
-                if let Some(lexical) = index.lexical_index_mut() {
-                    lexical.replace_group(
-                        &document.document_id,
-                        &[(document.document_id.clone(), caption_tokens)],
-                    );
-                }
+                index.sync_lexical_group(&document.document_id);
                 index.pending_lexical_clears.remove(&document.document_id);
             }
             // Only re-sync the vector when it actually changed; a same-vector
@@ -629,10 +624,7 @@ impl CoreEngine {
                     index.pending_lexical_clears.insert(document_id.to_string());
                 }
             } else {
-                if let Some(lexical) = index.lexical_index_mut() {
-                    lexical
-                        .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
-                }
+                index.sync_lexical_group(document_id);
                 index.pending_lexical_clears.remove(document_id);
             }
         }
@@ -793,11 +785,6 @@ impl CoreEngine {
                 .iter()
                 .map(|chunk| chunk.tokens.clone())
                 .collect::<Vec<_>>();
-            let lexical_units = document
-                .chunks
-                .iter()
-                .map(|chunk| (chunk.chunk_id.clone(), chunk.tokens.clone()))
-                .collect::<Vec<_>>();
             for chunk in &document.chunks {
                 let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
                     chunks_upserted += 1;
@@ -912,9 +899,7 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            if let Some(lexical) = index.lexical_index_mut() {
-                lexical.replace_group(&document.document_id, &lexical_units);
-            }
+            index.sync_lexical_group(&document.document_id);
             if append_wal {
                 wal_documents.push(serde_json::json!({
                     "document_id": document.document_id,
@@ -2095,8 +2080,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Restores per-document lexical token lists for replayed vector upserts.
-    /// Each vector document is a single chunk keyed by its document id.
+    /// Restores lexical token lists for replayed vector upserts and payload updates.
+    /// Payload updates may target text documents with multiple chunks.
     fn restore_wal_vector_tokens(
         &mut self,
         index_id: &str,
@@ -2149,13 +2134,7 @@ impl CoreEngine {
                 }
                 index.pending_lexical_clears.insert(document_id.to_string());
             } else {
-                let units = vec![(
-                    document_id.to_string(),
-                    token_lists.into_iter().next().unwrap_or_default(),
-                )];
-                if let Some(lexical) = index.lexical_index_mut() {
-                    lexical.replace_group(document_id, &units);
-                }
+                index.sync_lexical_group(document_id);
                 index.pending_lexical_clears.remove(document_id);
             }
             // A token-only restore (store_text=false, index_text=true) onto an
@@ -2401,19 +2380,7 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            let lexical_units = chunks
-                .iter()
-                .enumerate()
-                .map(|(offset, chunk)| {
-                    (
-                        chunk.chunk_id.clone(),
-                        token_lists.get(offset).cloned().unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Some(lexical) = index.lexical_index_mut() {
-                lexical.replace_group(&document_id, &lexical_units);
-            }
+            index.sync_lexical_group(&document_id);
         }
         let removed_chunk_ids_vec = removed_chunk_ids
             .iter()
@@ -3949,6 +3916,27 @@ fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Ve
         .collect()
 }
 
+/// Maps retained token lists to stable chunk ids. An absent outer list has no
+/// lexical units; a present empty inner list still contributes a zero-token unit.
+fn lexical_units_for_chunks(
+    chunks: &[ChunkRecord],
+    token_lists: &[Vec<String>],
+) -> Vec<(String, Vec<String>)> {
+    if token_lists.is_empty() {
+        return Vec::new();
+    }
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(offset, chunk)| {
+            (
+                chunk.chunk_id.clone(),
+                token_lists.get(offset).cloned().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 /// Builds BM25 over every document's chunks. `token_lists`, when given, holds
 /// each document's lists in place of `DocumentRecord::token_lists` (a handle
 /// whose lists are still deferred).
@@ -3967,17 +3955,7 @@ fn lexical_index_for_documents(
         if lists.is_empty() {
             continue;
         }
-        let units = record
-            .chunks
-            .iter()
-            .enumerate()
-            .map(|(offset, chunk)| {
-                (
-                    chunk.chunk_id.clone(),
-                    lists.get(offset).cloned().unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let units = lexical_units_for_chunks(&record.chunks, lists);
         lexical_index.replace_group(document_id, &units);
     }
     lexical_index
@@ -5762,6 +5740,23 @@ impl VectorOnlyIndex {
         self.lexical_index.get_mut()
     }
 
+    /// Updates only a built BM25 index, using the same units as a lazy rebuild.
+    fn sync_lexical_group(&mut self, document_id: &str) {
+        debug_assert!(self.deferred_token_lists.is_none());
+        let Some(lexical) = self.lexical_index.get_mut() else {
+            return;
+        };
+        let record = &self.documents[document_id];
+        if record.token_lists.is_empty() {
+            lexical.remove_group(document_id);
+        } else {
+            lexical.replace_group(
+                document_id,
+                &lexical_units_for_chunks(&record.chunks, &record.token_lists),
+            );
+        }
+    }
+
     /// Parses deferred token lists into `documents` so mutations and later
     /// lazy builds see the same tokens as an eager open. A no-op once done or
     /// when nothing was deferred.
@@ -7222,8 +7217,8 @@ impl VectorOnlyIndex {
                                 .collect();
                         }
                         let rescored = self.rescore_raw_hits(query, pool, rescore_window);
-                        let hits =
-                            self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
+                        let hits = self
+                            .assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
                         Ok(CoreSearchResults {
                             hits,
                             total_considered,
@@ -8265,8 +8260,9 @@ mod lock_tests {
 
 #[cfg(test)]
 mod lazy_index_tests {
-    use super::{CoreEngine, VectorOnlyIndex};
-    use crate::types::{CoreOpenOptions, CoreSearchResults, CoreVectorDocument};
+    use super::{lexical_index_for_documents, CoreEngine, VectorOnlyIndex};
+    use crate::storage::wal::WalRecord;
+    use crate::types::{CoreDocument, CoreOpenOptions, CoreSearchResults, CoreVectorDocument};
     use serde_json::{json, Value};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8459,6 +8455,161 @@ mod lazy_index_tests {
             eager.document_token_lists("default").unwrap()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_mutation_parity(eager: &CoreEngine, lazy: &mut CoreEngine) {
+        assert!(index(lazy).lexical_index.get().is_none());
+        let maintained = index(eager).lexical_index.get().unwrap();
+        let rebuilt = lexical_index_for_documents(&index(eager).documents, None);
+        assert_eq!(maintained.unit_ids(), rebuilt.unit_ids());
+        for query in ["Lisbon trip", "oat milk", "desk office Thursday", "absent"] {
+            for limit in [None, Some(10)] {
+                assert_eq!(
+                    maintained.rank(query, limit, None),
+                    rebuilt.rank(query, limit, None),
+                    "query={query}, limit={limit:?}"
+                );
+            }
+        }
+        assert_eq!(
+            eager.document_token_lists("default").unwrap(),
+            lazy.document_token_lists("default").unwrap()
+        );
+        assert_eq!(queries(eager), queries(lazy));
+        // Keep this handle unbuilt before the next mutation, so every stage
+        // compares an incremental update against a fresh first-query build.
+        lazy.index_mut("default").unwrap().lexical_index.take();
+    }
+
+    #[test]
+    fn multi_chunk_payload_mutations_match_a_fresh_lexical_build() {
+        let mut eager = CoreEngine::new_in_memory();
+        let mut lazy = CoreEngine::new_in_memory();
+        for engine in [&mut eager, &mut lazy] {
+            engine.create_index("default", 8, 4).unwrap();
+            engine
+                .upsert_vectors(
+                    "default",
+                    &[document("seed", 0, "fact", Some("Lisbon trip oat milk"))],
+                )
+                .unwrap();
+        }
+        lazy.index_mut("default").unwrap().lexical_index.take();
+        // Warm BM25 through the search API before any text ingestion/mutation.
+        queries(&eager);
+        for engine in [&mut eager, &mut lazy] {
+            let plan = engine
+                .prepare_text_upsert(
+                    "default",
+                    &[CoreDocument {
+                        document_id: "multi".into(),
+                        text: "Lisbon trip. Oat milk. Desk office Thursday.".into(),
+                        metadata: Default::default(),
+                    }],
+                    true,
+                    true,
+                    16,
+                )
+                .unwrap();
+            let embeddings = vec![vec![0.1; 8]; plan.chunks_to_embed.len()];
+            engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+            let record = &index(engine).documents["multi"];
+            assert!(record.chunks.len() > 1);
+            assert!(record.chunks.iter().all(|chunk| chunk.chunk_id != "multi"));
+        }
+        assert_mutation_parity(&eager, &mut lazy);
+
+        for text in [Some("oat milk Thursday".to_string()), None] {
+            for engine in [&mut eager, &mut lazy] {
+                engine
+                    .update_document_payload("default", "multi", None, Some(text.clone()))
+                    .unwrap();
+                assert_eq!(
+                    index(engine).pending_lexical_clears.contains("multi"),
+                    text.is_none()
+                );
+            }
+            if text.is_some() {
+                let plan = eager.prepare_query_text("Thursday", "lexical").unwrap();
+                let hits = eager
+                    .search_embedded_text("default", &plan, None, 10, None)
+                    .unwrap();
+                assert_eq!(hits.hits[0].document_id, "multi");
+            }
+            assert_mutation_parity(&eager, &mut lazy);
+        }
+
+        // A payload WAL record can restore tokens without raw text. It must
+        // retain the text document's chunk ids, then remove them on a clear.
+        for tokens in [json!([["desk", "office", "Thursday"]]), json!([])] {
+            let record = WalRecord {
+                op: "update_document_payload".into(),
+                payload: json!({"document_id": "multi", "text": null, "tokens": tokens}),
+                lsn: None,
+            };
+            for engine in [&mut eager, &mut lazy] {
+                engine.apply_native_wal_record("default", &record).unwrap();
+                assert_eq!(
+                    index(engine).pending_lexical_clears.contains("multi"),
+                    tokens.as_array().unwrap().is_empty()
+                );
+            }
+            assert_mutation_parity(&eager, &mut lazy);
+        }
+    }
+
+    #[test]
+    fn embedded_wal_lexical_units_match_a_fresh_build() {
+        for retains_tokens in [false, true] {
+            let eager_dir = temp_dir("embedded-eager");
+            let lazy_dir = temp_dir("embedded-lazy");
+            seed(&eager_dir);
+            seed(&lazy_dir);
+            let open = |dir: &Path| {
+                let mut opts = options(dir, false);
+                opts.store_text = retains_tokens;
+                opts.index_text = retains_tokens;
+                CoreEngine::open(opts).unwrap()
+            };
+            let mut eager = open(&eager_dir);
+            let mut lazy = open(&lazy_dir);
+            queries(&eager);
+            // Replace an indexed document, then replay a present empty inner
+            // list and an absent outer list. Retention-off folds drop all tokens.
+            for tokens in [json!([["Lisbon", "trip"]]), json!([[]]), json!([])] {
+                let record = WalRecord {
+                    op: "apply_embedded_documents".into(),
+                    payload: json!({
+                        "documents": [{
+                            "document_id": "doc-00",
+                            "content_hash": "replayed",
+                            "metadata": {},
+                            "text": null,
+                            "chunk_ids": ["replayed-a", "replayed-b"],
+                            "tokens": tokens,
+                        }],
+                        "added_chunks": [
+                            {"chunk_id": "replayed-a", "embedding": vec![0.1; 8]},
+                            {"chunk_id": "replayed-b", "embedding": vec![0.2; 8]},
+                        ],
+                        "removed_chunk_ids": [],
+                    }),
+                    lsn: None,
+                };
+                for engine in [&mut eager, &mut lazy] {
+                    engine.apply_native_wal_record("default", &record).unwrap();
+                    if !retains_tokens {
+                        assert!(index(engine).documents["doc-00"].token_lists.is_empty());
+                        assert!(index(engine).pending_lexical_clears.contains("doc-00"));
+                    }
+                }
+                assert_mutation_parity(&eager, &mut lazy);
+            }
+            eager.discard();
+            lazy.discard();
+            fs::remove_dir_all(eager_dir).unwrap();
+            fs::remove_dir_all(lazy_dir).unwrap();
+        }
     }
 
     #[test]
