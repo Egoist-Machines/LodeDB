@@ -196,7 +196,10 @@ fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
 #[test]
 fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
     faer::set_global_parallelism(faer::Parallelism::Rayon(4));
-    for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768] {
+    // 768 is the last serial dim; 1024 takes the pooled path and must equal
+    // the reference under the same pool.
+    assert_eq!(turbovec::rotation::SERIAL_QR_MAX_DIM, 768);
+    for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768, 1024] {
         let serial = make_rotation_matrix(dim);
         let reference = reference_rotation_matrix(dim);
         let differing = serial
