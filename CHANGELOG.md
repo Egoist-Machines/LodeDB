@@ -5,6 +5,32 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-10-18
+
+### Changed
+
+- Read-only open and the first search use far less memory: a read-only open
+  primes the refresh cache so the usual open-then-refresh sequence no longer
+  loads every index twice, BM25 and metadata field indexes are built on first
+  use instead of at open, a read-only open keeps the `.tvlex` text unparsed
+  until the tokens are needed, loaded documents move into the index instead of
+  being cloned, and the canonical JSON checksum is streamed instead of rendered
+  per node. On a 10k-document 384-dim store, open plus first vector search
+  peaks at 53 MiB instead of 191 MiB and the first refresh after open drops
+  from about 190 ms to 0.3 ms.
+- Mutations no longer build an absent BM25 or field index; the next query
+  builds it from the updated documents.
+- BM25 units are derived from each document's chunk records by one helper for
+  both the lazy build and incremental updates. A document with no token lists
+  no longer enters BM25 as zero-token units on reload, so document counts on
+  reopen match the writing session, and a text update on a multi-chunk text
+  document indexes under its chunk ids so its lexical hits resolve.
+- turbovec: the rotation matrix QR runs single-threaded up to 768 dims and
+  with a fixed split degree above that, searches of up to four queries stay on
+  the calling thread, and the Lloyd-Max centroids for common dims come from a
+  table checked bit for bit against the iteration.
+- CI runs the vendored turbovec test suite on Linux, macOS and Windows.
+
 ## [2.3.0] - 2026-09-04
 
 ### Added
