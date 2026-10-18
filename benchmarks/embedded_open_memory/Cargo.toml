@@ -1,0 +1,19 @@
+[package]
+name = "embedded-open-memory"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Memory probe for a read-only open, refresh and first search (macOS)"
+
+# Standalone on purpose: the probe reads the Mach task ledger and counts heap
+# bytes through a global allocator, both of which need unsafe code the
+# workspace forbids.
+[workspace]
+
+[dependencies]
+lodedb-core = { path = "../../crates/lodedb-core" }
+libc = "0.2"
+serde_json = "1.0"
+
+[profile.release]
+debug = 1

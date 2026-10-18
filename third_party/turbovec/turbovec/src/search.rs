@@ -32,6 +32,26 @@ pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only switch that sends every batch through rayon, so tests can check
+/// that the serial small-batch path in [`search`] returns the same bits.
+#[cfg(test)]
+pub(crate) static FORCE_PARALLEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Held by every test that flips a kernel switch above, for its whole body.
+/// The switches are process-global and libtest runs tests on parallel
+/// threads, so a test comparing two searches must not see another test's
+/// setting change between them.
+#[cfg(test)]
+pub(crate) static KERNEL_SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`KERNEL_SWITCHES`], ignoring poison from a test that failed while
+/// holding it.
+#[cfg(test)]
+pub(crate) fn lock_kernel_switches() -> std::sync::MutexGuard<'static, ()> {
+    KERNEL_SWITCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
 pub fn blocks_skipped_by_mask() -> u64 {
     BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
@@ -1443,6 +1463,19 @@ fn score_query_into_heap(
     }
 }
 
+/// Whether a search over `nq` queries stays on the calling thread. Up to one
+/// 4-query scoring batch there is nothing to split across rayon workers, and
+/// touching rayon at all would spawn its global pool (one thread per core)
+/// for a single query. Results are identical either way: every query is
+/// scored by the same kernel, only on a different thread.
+fn runs_serially(nq: usize) -> bool {
+    #[cfg(test)]
+    if FORCE_PARALLEL.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    nq <= 4
+}
+
 /// Apply TQ+ per-coord (shift, scale) calibration to a batch of rotated
 /// queries. Returns the calibrated queries and a per-query bias correction
 /// (the search kernel folds this into the per-query bias). When the index
@@ -1465,19 +1498,28 @@ fn calibrate_queries(
     let mut q_calib = vec![0.0f32; nq * dim];
     let mut bias_corrs = vec![0.0f32; nq];
 
-    q_calib
-        .par_chunks_mut(dim)
-        .zip(bias_corrs.par_iter_mut())
-        .enumerate()
-        .for_each(|(qi, (calib_row, bias))| {
-            let q_row = &q_rot[qi * dim..(qi + 1) * dim];
-            let mut bc = 0.0f64;
-            for d in 0..dim {
-                calib_row[d] = q_row[d] / tqplus_scale[d];
-                bc -= (q_row[d] as f64) * (tqplus_shift[d] as f64);
-            }
-            *bias = bc as f32;
-        });
+    let calibrate = |(qi, (calib_row, bias)): (usize, (&mut [f32], &mut f32))| {
+        let q_row = &q_rot[qi * dim..(qi + 1) * dim];
+        let mut bc = 0.0f64;
+        for d in 0..dim {
+            calib_row[d] = q_row[d] / tqplus_scale[d];
+            bc -= (q_row[d] as f64) * (tqplus_shift[d] as f64);
+        }
+        *bias = bc as f32;
+    };
+    if runs_serially(nq) {
+        q_calib
+            .chunks_mut(dim)
+            .zip(bias_corrs.iter_mut())
+            .enumerate()
+            .for_each(calibrate);
+    } else {
+        q_calib
+            .par_chunks_mut(dim)
+            .zip(bias_corrs.par_iter_mut())
+            .enumerate()
+            .for_each(calibrate);
+    }
 
     (q_calib, bias_corrs)
 }
@@ -1530,7 +1572,13 @@ pub fn search(
             r_ref.transpose(),
             None,
             1.0_f32,
-            faer::Parallelism::Rayon(0),
+            // Bit-identical either way: the GEMM splits work by output tile,
+            // never along the reduction.
+            if runs_serially(nq) {
+                faer::Parallelism::None
+            } else {
+                faer::Parallelism::Rayon(0)
+            },
         );
     }
 
@@ -1546,132 +1594,118 @@ pub fn search(
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
-    let query_luts: Vec<QueryNeonLut> = (0..nq)
-        .into_par_iter()
-        .map(|qi| {
-            let row = &q_for_lut[qi * dim..(qi + 1) * dim];
-            let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
-            lut.bias += bias_corrs[qi];
-            lut
-        })
-        .collect();
+    let build_lut = |qi: usize| {
+        let row = &q_for_lut[qi * dim..(qi + 1) * dim];
+        let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
+        lut.bias += bias_corrs[qi];
+        lut
+    };
+    let query_luts: Vec<QueryNeonLut> = if runs_serially(nq) {
+        (0..nq).map(build_lut).collect()
+    } else {
+        (0..nq).into_par_iter().map(build_lut).collect()
+    };
 
     // Platform-specific scoring + top-k
     #[cfg(target_arch = "aarch64")]
     let results = {
         // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
         const QBS: usize = 4;
-        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
-            .step_by(QBS)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|qi_start| {
-                let qi_end = (qi_start + QBS).min(nq);
-                let batch_size = qi_end - qi_start;
+        let score_batch = |qi_start: usize| {
+            let qi_end = (qi_start + QBS).min(nq);
+            let batch_size = qi_end - qi_start;
 
-                // Materialize per-query scores rows so the 4-query kernel can
-                // write directly with offset = base_vec.
-                let mut scores_flat = vec![f32::NEG_INFINITY; QBS * n_vectors];
-                let rows: [*mut f32; QBS] = unsafe {
-                    let p = scores_flat.as_mut_ptr();
-                    [p, p.add(n_vectors), p.add(2 * n_vectors), p.add(3 * n_vectors)]
-                };
+            // Materialize per-query scores rows so the 4-query kernel can
+            // write directly with offset = base_vec.
+            let mut scores_flat = vec![f32::NEG_INFINITY; QBS * n_vectors];
+            let rows: [*mut f32; QBS] = unsafe {
+                let p = scores_flat.as_mut_ptr();
+                [p, p.add(n_vectors), p.add(2 * n_vectors), p.add(3 * n_vectors)]
+            };
 
-                if batch_size == QBS {
-                    // Fast path: 4-query fused kernel
-                    let lut_refs: [&[u8]; QBS] = [
-                        &query_luts[qi_start].uint8_luts,
-                        &query_luts[qi_start + 1].uint8_luts,
-                        &query_luts[qi_start + 2].uint8_luts,
-                        &query_luts[qi_start + 3].uint8_luts,
-                    ];
-                    let scales: [f32; QBS] = [
-                        query_luts[qi_start].scale,
-                        query_luts[qi_start + 1].scale,
-                        query_luts[qi_start + 2].scale,
-                        query_luts[qi_start + 3].scale,
-                    ];
-                    let biases: [f32; QBS] = [
-                        query_luts[qi_start].bias,
-                        query_luts[qi_start + 1].bias,
-                        query_luts[qi_start + 2].bias,
-                        query_luts[qi_start + 3].bias,
-                    ];
+            if batch_size == QBS {
+                // Fast path: 4-query fused kernel
+                let lut_refs: [&[u8]; QBS] = [
+                    &query_luts[qi_start].uint8_luts,
+                    &query_luts[qi_start + 1].uint8_luts,
+                    &query_luts[qi_start + 2].uint8_luts,
+                    &query_luts[qi_start + 3].uint8_luts,
+                ];
+                let scales: [f32; QBS] = [
+                    query_luts[qi_start].scale,
+                    query_luts[qi_start + 1].scale,
+                    query_luts[qi_start + 2].scale,
+                    query_luts[qi_start + 3].scale,
+                ];
+                let biases: [f32; QBS] = [
+                    query_luts[qi_start].bias,
+                    query_luts[qi_start + 1].bias,
+                    query_luts[qi_start + 2].bias,
+                    query_luts[qi_start + 3].bias,
+                ];
+                for block_idx in 0..n_blocks {
+                    let base_vec = block_idx * BLOCK;
+                    if !block_has_allowed(mask, base_vec) {
+                        // Mask leaves `scores_flat` at NEG_INFINITY for these
+                        // slots, so the per-query top-k scan below ignores them
+                        // and the skip is correctness-preserving for all 4
+                        // queries in the batch.
+                        continue;
+                    }
+                    let block_offset = block_idx * n_byte_groups * BLOCK;
+                    unsafe {
+                        score_4query_block_neon(
+                            blocked_codes, lut_refs, block_offset, n_byte_groups,
+                            scales, biases, vec_scales, base_vec, n_vectors, rows,
+                        );
+                    }
+                }
+            } else {
+                // Tail path (batch_size < 4): single-query kernel per query
+                for qi_off in 0..batch_size {
+                    let qi = qi_start + qi_off;
+                    let qlut = &query_luts[qi];
+                    let row_ptr = rows[qi_off];
                     for block_idx in 0..n_blocks {
                         let base_vec = block_idx * BLOCK;
                         if !block_has_allowed(mask, base_vec) {
-                            // Mask leaves `scores_flat` at NEG_INFINITY for these
-                            // slots, so the per-query top-k scan below ignores them
-                            // and the skip is correctness-preserving for all 4
-                            // queries in the batch.
                             continue;
                         }
                         let block_offset = block_idx * n_byte_groups * BLOCK;
+                        let end = (base_vec + BLOCK).min(n_vectors);
+                        let mut block_out = [0.0f32; BLOCK];
                         unsafe {
-                            score_4query_block_neon(
-                                blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, vec_scales, base_vec, n_vectors, rows,
+                            score_4bit_block_neon(
+                                blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
                             );
-                        }
-                    }
-                } else {
-                    // Tail path (batch_size < 4): single-query kernel per query
-                    for qi_off in 0..batch_size {
-                        let qi = qi_start + qi_off;
-                        let qlut = &query_luts[qi];
-                        let row_ptr = rows[qi_off];
-                        for block_idx in 0..n_blocks {
-                            let base_vec = block_idx * BLOCK;
-                            if !block_has_allowed(mask, base_vec) {
-                                continue;
-                            }
-                            let block_offset = block_idx * n_byte_groups * BLOCK;
-                            let end = (base_vec + BLOCK).min(n_vectors);
-                            let mut block_out = [0.0f32; BLOCK];
-                            unsafe {
-                                score_4bit_block_neon(
-                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                    qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
-                                );
-                                for lane in 0..(end - base_vec) {
-                                    *row_ptr.add(base_vec + lane) = block_out[lane];
-                                }
+                            for lane in 0..(end - base_vec) {
+                                *row_ptr.add(base_vec + lane) = block_out[lane];
                             }
                         }
                     }
                 }
+            }
 
-                // Per-query top-k scan over the materialized scores row.
-                (0..batch_size)
-                    .map(|qi_off| {
-                        let row_start = qi_off * n_vectors;
-                        let row = &scores_flat[row_start..row_start + n_vectors];
-                        let mut heap_s = vec![f32::NEG_INFINITY; k];
-                        let mut heap_i = vec![0u32; k];
-                        let mut heap_sz = 0usize;
-                        let mut heap_min = f32::NEG_INFINITY;
-                        let mut heap_mi = 0usize;
-                        for (i, &s) in row.iter().enumerate() {
-                            if let Some(m) = mask {
-                                if !mask_allows(m, i) { continue; }
-                            }
-                            if heap_sz < k {
-                                heap_s[heap_sz] = s;
-                                heap_i[heap_sz] = i as u32;
-                                heap_sz += 1;
-                                if heap_sz == k {
-                                    heap_min = heap_s[0];
-                                    heap_mi = 0;
-                                    for h in 1..k {
-                                        if heap_s[h] < heap_min {
-                                            heap_min = heap_s[h];
-                                            heap_mi = h;
-                                        }
-                                    }
-                                }
-                            } else if s > heap_min {
-                                heap_s[heap_mi] = s;
-                                heap_i[heap_mi] = i as u32;
+            // Per-query top-k scan over the materialized scores row.
+            (0..batch_size)
+                .map(|qi_off| {
+                    let row_start = qi_off * n_vectors;
+                    let row = &scores_flat[row_start..row_start + n_vectors];
+                    let mut heap_s = vec![f32::NEG_INFINITY; k];
+                    let mut heap_i = vec![0u32; k];
+                    let mut heap_sz = 0usize;
+                    let mut heap_min = f32::NEG_INFINITY;
+                    let mut heap_mi = 0usize;
+                    for (i, &s) in row.iter().enumerate() {
+                        if let Some(m) = mask {
+                            if !mask_allows(m, i) { continue; }
+                        }
+                        if heap_sz < k {
+                            heap_s[heap_sz] = s;
+                            heap_i[heap_sz] = i as u32;
+                            heap_sz += 1;
+                            if heap_sz == k {
                                 heap_min = heap_s[0];
                                 heap_mi = 0;
                                 for h in 1..k {
@@ -1681,165 +1715,183 @@ pub fn search(
                                     }
                                 }
                             }
+                        } else if s > heap_min {
+                            heap_s[heap_mi] = s;
+                            heap_i[heap_mi] = i as u32;
+                            heap_min = heap_s[0];
+                            heap_mi = 0;
+                            for h in 1..k {
+                                if heap_s[h] < heap_min {
+                                    heap_min = heap_s[h];
+                                    heap_mi = h;
+                                }
+                            }
                         }
-                        let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
-                            .zip(heap_i[..heap_sz].iter())
-                            .map(|(&s, &i)| (s, i)).collect();
-                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                        let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                        let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                        (s, i)
-                    })
-                    .collect()
-            })
-            .collect();
+                    }
+                    let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                        .zip(heap_i[..heap_sz].iter())
+                        .map(|(&s, &i)| (s, i)).collect();
+                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                    let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                    (s, i)
+                })
+                .collect::<Vec<_>>()
+        };
+        let batches = (0..nq).step_by(QBS).collect::<Vec<_>>();
+        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = if runs_serially(nq) {
+            batches.into_iter().map(score_batch).collect()
+        } else {
+            batches.into_par_iter().map(score_batch).collect()
+        };
         results.into_iter().flatten().collect::<Vec<_>>()
     };
 
     #[cfg(target_arch = "x86_64")]
     let results = {
         const NQ_BATCH: usize = 4;
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
-            .step_by(NQ_BATCH)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .flat_map(|qi_start| {
-                let qi_end = (qi_start + NQ_BATCH).min(nq);
-                let batch_nq = qi_end - qi_start;
-                let pad_qi = qi_end - 1;
-                let lut_refs: Vec<&[u8]> = (0..NQ_BATCH)
-                    .map(|i| {
-                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].uint8_luts.as_slice()
-                    }).collect();
-                let scale_vals: Vec<f32> = (0..NQ_BATCH)
-                    .map(|i| {
-                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].scale
-                    }).collect();
-                let bias_vals: Vec<f32> = (0..NQ_BATCH)
-                    .map(|i| {
-                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].bias
-                    }).collect();
+        let score_batch = |qi_start: usize| {
+            let qi_end = (qi_start + NQ_BATCH).min(nq);
+            let batch_nq = qi_end - qi_start;
+            let pad_qi = qi_end - 1;
+            let lut_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                .map(|i| {
+                    let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                    query_luts[qi].uint8_luts.as_slice()
+                }).collect();
+            let scale_vals: Vec<f32> = (0..NQ_BATCH)
+                .map(|i| {
+                    let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                    query_luts[qi].scale
+                }).collect();
+            let bias_vals: Vec<f32> = (0..NQ_BATCH)
+                .map(|i| {
+                    let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                    query_luts[qi].bias
+                }).collect();
 
-                let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
-                    .map(|_| vec![f32::NEG_INFINITY; k]).collect();
-                let mut heap_indices: Vec<Vec<u32>> = (0..batch_nq)
-                    .map(|_| vec![0u32; k]).collect();
-                let mut heap_sizes = vec![0usize; batch_nq];
-                let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
-                let mut heap_min_idxs = vec![0usize; batch_nq];
+            let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
+                .map(|_| vec![f32::NEG_INFINITY; k]).collect();
+            let mut heap_indices: Vec<Vec<u32>> = (0..batch_nq)
+                .map(|_| vec![0u32; k]).collect();
+            let mut heap_sizes = vec![0usize; batch_nq];
+            let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
+            let mut heap_min_idxs = vec![0usize; batch_nq];
 
-                #[cfg(test)]
-                let force_scalar =
-                    FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
-                #[cfg(not(test))]
-                let force_scalar = false;
+            #[cfg(test)]
+            let force_scalar =
+                FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let force_scalar = false;
 
-                unsafe {
-                    if !force_scalar
-                        && is_x86_feature_detected!("avx512bw")
-                        && is_x86_feature_detected!("avx512f")
-                    {
-                        search_multi_query_avx512bw(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+            unsafe {
+                if !force_scalar
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512f")
+                {
+                    search_multi_query_avx512bw(
+                        blocked_codes, &lut_refs, &scale_vals, &bias_vals,
+                        n_byte_groups, vec_scales, n_vectors,
+                        batch_nq, k, mask,
+                        &mut heap_scores, &mut heap_indices,
+                        &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                    );
+                } else if !force_scalar && is_x86_feature_detected!("avx2") {
+                    search_multi_query_avx2(
+                        blocked_codes, &lut_refs, &scale_vals, &bias_vals,
+                        n_byte_groups, vec_scales, n_vectors,
+                        batch_nq, k, mask,
+                        &mut heap_scores, &mut heap_indices,
+                        &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                    );
+                } else {
+                    // Neither AVX-512 BW nor AVX2 detected at runtime on
+                    // this x86_64 CPU. Previously this fell through to
+                    // an empty `unsafe { }` block and `heap_sizes` stayed
+                    // at 0 — `search` then returned empty top-k results
+                    // for every query with no error signal. Fall back to
+                    // per-query scalar scoring instead.
+                    for qo in 0..batch_nq {
+                        score_query_into_heap(
+                            lut_refs[qo],
+                            scale_vals[qo],
+                            bias_vals[qo],
+                            blocked_codes,
+                            vec_scales,
+                            n_byte_groups,
+                            n_vectors,
+                            n_blocks,
+                            mask,
+                            k,
+                            &mut heap_scores[qo],
+                            &mut heap_indices[qo],
+                            &mut heap_sizes[qo],
+                            &mut heap_mins[qo],
+                            &mut heap_min_idxs[qo],
                         );
-                    } else if !force_scalar && is_x86_feature_detected!("avx2") {
-                        search_multi_query_avx2(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
-                    } else {
-                        // Neither AVX-512 BW nor AVX2 detected at runtime on
-                        // this x86_64 CPU. Previously this fell through to
-                        // an empty `unsafe { }` block and `heap_sizes` stayed
-                        // at 0 — `search` then returned empty top-k results
-                        // for every query with no error signal. Fall back to
-                        // per-query scalar scoring instead.
-                        for qo in 0..batch_nq {
-                            score_query_into_heap(
-                                lut_refs[qo],
-                                scale_vals[qo],
-                                bias_vals[qo],
-                                blocked_codes,
-                                vec_scales,
-                                n_byte_groups,
-                                n_vectors,
-                                n_blocks,
-                                mask,
-                                k,
-                                &mut heap_scores[qo],
-                                &mut heap_indices[qo],
-                                &mut heap_sizes[qo],
-                                &mut heap_mins[qo],
-                                &mut heap_min_idxs[qo],
-                            );
-                        }
                     }
                 }
+            }
 
-                let mut batch_results = Vec::with_capacity(batch_nq);
-                for qo in 0..batch_nq {
-                    let sz = heap_sizes[qo];
-                    let mut pairs: Vec<(f32, u32)> = heap_scores[qo][..sz].iter()
-                        .zip(heap_indices[qo][..sz].iter())
-                        .map(|(&s, &i)| (s, i)).collect();
-                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                    batch_results.push((
-                        pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
-                        pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
-                    ));
-                }
-                batch_results
-            })
-            .collect();
-        results
+            let mut batch_results = Vec::with_capacity(batch_nq);
+            for qo in 0..batch_nq {
+                let sz = heap_sizes[qo];
+                let mut pairs: Vec<(f32, u32)> = heap_scores[qo][..sz].iter()
+                    .zip(heap_indices[qo][..sz].iter())
+                    .map(|(&s, &i)| (s, i)).collect();
+                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                batch_results.push((
+                    pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
+                    pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
+                ));
+            }
+            batch_results
+        };
+        let batches = (0..nq).step_by(NQ_BATCH).collect::<Vec<_>>();
+        if runs_serially(nq) {
+            batches.into_iter().flat_map(score_batch).collect::<Vec<_>>()
+        } else {
+            batches.into_par_iter().flat_map(score_batch).collect::<Vec<_>>()
+        }
     };
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let results = {
         // Scalar fallback for architectures without a SIMD kernel.
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let qlut = &query_luts[qi];
-                let mut heap_s = vec![f32::NEG_INFINITY; k];
-                let mut heap_i = vec![0u32; k];
-                let mut heap_sz = 0usize;
-                let mut heap_min = f32::NEG_INFINITY;
-                let mut heap_mi = 0usize;
-                score_query_into_heap(
-                    &qlut.uint8_luts,
-                    qlut.scale,
-                    qlut.bias,
-                    blocked_codes,
-                    vec_scales,
-                    n_byte_groups,
-                    n_vectors,
-                    n_blocks,
-                    mask,
-                    k,
-                    &mut heap_s,
-                    &mut heap_i,
-                    &mut heap_sz,
-                    &mut heap_min,
-                    &mut heap_mi,
-                );
-                let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
-                    .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
-                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
-            })
-            .collect();
-        results
+        let score_query = |qi: usize| -> (Vec<f32>, Vec<i64>) {
+            let qlut = &query_luts[qi];
+            let mut heap_s = vec![f32::NEG_INFINITY; k];
+            let mut heap_i = vec![0u32; k];
+            let mut heap_sz = 0usize;
+            let mut heap_min = f32::NEG_INFINITY;
+            let mut heap_mi = 0usize;
+            score_query_into_heap(
+                &qlut.uint8_luts,
+                qlut.scale,
+                qlut.bias,
+                blocked_codes,
+                vec_scales,
+                n_byte_groups,
+                n_vectors,
+                n_blocks,
+                mask,
+                k,
+                &mut heap_s,
+                &mut heap_i,
+                &mut heap_sz,
+                &mut heap_min,
+                &mut heap_mi,
+            );
+            let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
+        };
+        if runs_serially(nq) {
+            (0..nq).map(score_query).collect::<Vec<(Vec<f32>, Vec<i64>)>>()
+        } else {
+            (0..nq).into_par_iter().map(score_query).collect::<Vec<(Vec<f32>, Vec<i64>)>>()
+        }
     };
 
     // Flatten into (scores, indices)

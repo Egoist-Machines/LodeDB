@@ -7,6 +7,7 @@
 //! - The matrix is orthogonal: `R^T R = I`.
 //! - Rotation preserves vector L2 norms.
 //! - Generation is deterministic across calls.
+//! - Large dimensions retain the same bits regardless of global parallelism.
 //! - `R^T` recovers the input (round-trip via the transpose).
 //!
 //! Tolerances here are generous enough for f32 + faer QR roundoff.
@@ -156,5 +157,109 @@ fn size_matches_dim_squared() {
     for &dim in &[16usize, 64, 256] {
         let r = make_rotation_matrix(dim);
         assert_eq!(r.len(), dim * dim);
+    }
+}
+
+/// The original generator: faer's high-level QR on the rayon pool. The
+/// low-level implementation must match it bit for bit at the same split degree,
+/// since persisted codes depend on the rotation matrix.
+fn reference_rotation_matrix(dim: usize) -> Vec<f32> {
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+    use rand_distr::StandardNormal;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut g = faer::Mat::<f64>::zeros(dim, dim);
+    for j in 0..dim {
+        for i in 0..dim {
+            g.write(i, j, rng.sample(StandardNormal));
+        }
+    }
+    let qr = g.qr();
+    let mut q = qr.compute_thin_q();
+    let r = qr.compute_thin_r();
+    for j in 0..dim {
+        if r.read(j, j) < 0.0 {
+            for i in 0..dim {
+                q.write(i, j, -q.read(i, j));
+            }
+        }
+    }
+    let mut out = vec![0.0f32; dim * dim];
+    for i in 0..dim {
+        for j in 0..dim {
+            out[i * dim + j] = q.read(i, j) as f32;
+        }
+    }
+    out
+}
+
+#[test]
+fn serial_qr_matches_the_parallel_reference_bit_for_bit() {
+    with_global_parallelism(faer::Parallelism::Rayon(4), || {
+        // 768 is the last serial dim. Above it the pinned pooled path is
+        // checked separately against the reference at its fixed split degree.
+        assert_eq!(turbovec::rotation::SERIAL_QR_MAX_DIM, 768);
+        for &dim in &[8usize, 16, 24, 48, 64, 128, 200, 256, 384, 512, 768] {
+            let serial = make_rotation_matrix(dim);
+            let reference = reference_rotation_matrix(dim);
+            let differing = serial
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(differing, 0, "dim={dim}: {differing} entries differ");
+        }
+    });
+}
+
+fn with_global_parallelism<T>(parallelism: faer::Parallelism, test: impl FnOnce() -> T) -> T {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            faer::set_global_parallelism(faer::Parallelism::Rayon(0));
+        }
+    }
+    let _reset = Reset;
+    faer::set_global_parallelism(parallelism);
+    test()
+}
+
+#[test]
+fn large_dim_rotation_matches_pinned_reference_and_ignores_global_parallelism() {
+    // Compare locally computed matrices, since QR rounding can depend on the
+    // CPU architecture. The largest case is too slow in debug builds; CI runs
+    // this suite with --release, matching shipped artifacts.
+    let dims = [1024, 1536, 2048, 3072];
+    let dims = if cfg!(debug_assertions) {
+        &dims[..3]
+    } else {
+        &dims[..]
+    };
+    for &dim in dims {
+        let reference = with_global_parallelism(faer::Parallelism::Rayon(8), || {
+            reference_rotation_matrix(dim)
+        });
+        let pinned =
+            with_global_parallelism(faer::Parallelism::Rayon(2), || make_rotation_matrix(dim));
+        let automatic =
+            with_global_parallelism(faer::Parallelism::Rayon(0), || make_rotation_matrix(dim));
+        for (comparison, actual, expected) in [
+            ("pooled reference at degree 8", &pinned, &reference),
+            ("global degree 0 versus 2", &automatic, &pinned),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "dim={dim}: {comparison}");
+            let differing = actual
+                .iter()
+                .zip(expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "dim={dim}: {comparison}: {differing} entries differ"
+            );
+        }
     }
 }

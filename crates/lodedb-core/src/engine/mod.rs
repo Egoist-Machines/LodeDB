@@ -1,6 +1,6 @@
 //! Native core engine.
 
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use crate::filter::{
 };
 use crate::lexical::rrf::RRF_C;
 use crate::lexical::{tokenize, Bm25Index};
+use crate::storage::lexical_store::TokenLists;
 use crate::text::chunk::{chunk_id_for_hash, chunk_text};
 use crate::text::hash::normalized_chunk_hash;
 use crate::types::{
@@ -111,7 +112,19 @@ impl CoreEngine {
             replaying_wal: false,
             refresh_cache: BTreeMap::new(),
         };
+        // Take the refresh signature before loading, as refresh() does, so a
+        // commit that races the load leaves the cache behind and the next
+        // refresh reloads. When no index has a WAL tail, this view is exactly
+        // what refresh() would rebuild (it overlays nothing), so priming the
+        // cache lets the usual open-then-refresh sequence skip a reload that
+        // would hold a second full copy of every index while it runs.
+        let signature = engine.refresh_signature()?;
         engine.load_persisted_indexes(false)?;
+        if let Some(signature) = signature {
+            if signature.values().all(|(_, wal_len, _)| *wal_len == 0) {
+                engine.refresh_cache = signature;
+            }
+        }
         Ok(engine)
     }
 
@@ -177,7 +190,12 @@ impl CoreEngine {
                 return invalid("rescore_oversample must be finite and at least 1.0");
             }
         }
-        let index = self.index_mut(index_id)?;
+        // Session tuning is not a document mutation, so it skips index_mut and
+        // leaves deferred token lists unparsed.
+        let index = self
+            .indexes
+            .get_mut(index_id)
+            .ok_or_else(|| invalid_err("index not found"))?;
         index.session_ann_nprobe = ann_nprobe;
         index.session_rescore_oversample = rescore_oversample;
         Ok(())
@@ -352,17 +370,16 @@ impl CoreEngine {
                 &mut changed_filter_fields,
             );
             if caption_tokens.is_empty() {
-                index.lexical_index.remove_group(&document.document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(&document.document_id);
+                }
                 if old_had_tokens {
                     index
                         .pending_lexical_clears
                         .insert(document.document_id.clone());
                 }
             } else {
-                index.lexical_index.replace_group(
-                    &document.document_id,
-                    &[(document.document_id.clone(), caption_tokens)],
-                );
+                index.sync_lexical_group(&document.document_id);
                 index.pending_lexical_clears.remove(&document.document_id);
             }
             // Only re-sync the vector when it actually changed; a same-vector
@@ -481,7 +498,9 @@ impl CoreEngine {
                 if record.patch_matrix.is_some() {
                     index.pending_multivec_clears.insert(document_id.clone());
                 }
-                index.lexical_index.remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 let chunk_ids = record
                     .chunks
                     .iter()
@@ -559,7 +578,7 @@ impl CoreEngine {
         if let Some(metadata) = metadata {
             record.metadata = metadata;
         }
-        if let Some(text) = text {
+        let lexical_update = if let Some(text) = text {
             record.content_hash = text
                 .as_ref()
                 .map(|text| crate::text::hash::sha256_text(text))
@@ -591,20 +610,25 @@ impl CoreEngine {
             } else {
                 vec![caption_tokens.clone()]
             };
+            Some((had_tokens, caption_tokens))
+        } else {
+            None
+        };
+        let updated_metadata = metadata_changed.then(|| record.metadata.clone());
+        if let Some((had_tokens, caption_tokens)) = lexical_update {
             if caption_tokens.is_empty() {
-                index.lexical_index.remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 if had_tokens {
                     index.pending_lexical_clears.insert(document_id.to_string());
                 }
             } else {
-                index
-                    .lexical_index
-                    .replace_group(document_id, &[(document_id.to_string(), caption_tokens)]);
+                index.sync_lexical_group(document_id);
                 index.pending_lexical_clears.remove(document_id);
             }
         }
-        if metadata_changed {
-            let metadata = record.metadata.clone();
+        if let Some(metadata) = updated_metadata {
             index.add_document_indexes(document_id, &metadata, &chunks, &mut changed_filter_fields);
             index.finalize_filter_fields(&changed_filter_fields);
         } else if text_for_wal.is_some() {
@@ -761,11 +785,6 @@ impl CoreEngine {
                 .iter()
                 .map(|chunk| chunk.tokens.clone())
                 .collect::<Vec<_>>();
-            let lexical_units = document
-                .chunks
-                .iter()
-                .map(|chunk| (chunk.chunk_id.clone(), chunk.tokens.clone()))
-                .collect::<Vec<_>>();
             for chunk in &document.chunks {
                 let vector = if let Some(embedding) = new_embeddings.remove(&chunk.chunk_id) {
                     chunks_upserted += 1;
@@ -880,9 +899,7 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            index
-                .lexical_index
-                .replace_group(&document.document_id, &lexical_units);
+            index.sync_lexical_group(&document.document_id);
             if append_wal {
                 wal_documents.push(serde_json::json!({
                     "document_id": document.document_id,
@@ -1057,6 +1074,7 @@ impl CoreEngine {
             return invalid("top_k must be positive");
         }
         let index = self.index(index_id)?;
+        let lexical_index = index.lexical_index()?;
         let candidates = filter
             .map(|filter| index.resolve_filter(Some(filter)))
             .transpose()?;
@@ -1070,15 +1088,14 @@ impl CoreEngine {
                     continue;
                 };
                 for chunk in &record.chunks {
-                    if let Some(position) = index.lexical_index.position_of(&chunk.chunk_id) {
+                    if let Some(position) = lexical_index.position_of(&chunk.chunk_id) {
                         positions.insert(position);
                     }
                 }
             }
             positions
         });
-        let hits = index
-            .lexical_index
+        let hits = lexical_index
             .rank(&query_plan.query, Some(top_k), allowed_positions.as_ref())
             .into_iter()
             .filter_map(|(chunk_id, score)| {
@@ -1423,6 +1440,9 @@ impl CoreEngine {
         index_id: &str,
     ) -> Result<BTreeMap<String, Vec<Vec<String>>>, CoreError> {
         let index = self.index(index_id)?;
+        if let Some(deferred) = &index.deferred_token_lists {
+            return deferred.parse(&index.documents);
+        }
         Ok(index
             .documents
             .iter()
@@ -1893,10 +1913,15 @@ impl CoreEngine {
             .ok_or_else(|| invalid_err("index not found"))
     }
 
+    /// The index for a mutation. Parses deferred token lists first, so every
+    /// mutation path sees the same `documents` an eager open would have built.
     fn index_mut(&mut self, index_id: &str) -> Result<&mut VectorOnlyIndex, CoreError> {
-        self.indexes
+        let index = self
+            .indexes
             .get_mut(index_id)
-            .ok_or_else(|| invalid_err("index not found"))
+            .ok_or_else(|| invalid_err("index not found"))?;
+        index.materialize_token_lists()?;
+        Ok(index)
     }
 
     fn require_writable(&self) -> Result<(), CoreError> {
@@ -2055,8 +2080,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Restores per-document lexical token lists for replayed vector upserts.
-    /// Each vector document is a single chunk keyed by its document id.
+    /// Restores lexical token lists for replayed vector upserts and payload updates.
+    /// Payload updates may target text documents with multiple chunks.
     fn restore_wal_vector_tokens(
         &mut self,
         index_id: &str,
@@ -2104,14 +2129,12 @@ impl CoreEngine {
                 // the lexical index instead of lingering as a zero-token unit that
                 // would inflate the BM25 doc count, and the clear is marked for the
                 // delta (the guard above proves the old tokens were non-empty).
-                index.lexical_index.remove_group(document_id);
+                if let Some(lexical) = index.lexical_index_mut() {
+                    lexical.remove_group(document_id);
+                }
                 index.pending_lexical_clears.insert(document_id.to_string());
             } else {
-                let units = vec![(
-                    document_id.to_string(),
-                    token_lists.into_iter().next().unwrap_or_default(),
-                )];
-                index.lexical_index.replace_group(document_id, &units);
+                index.sync_lexical_group(document_id);
                 index.pending_lexical_clears.remove(document_id);
             }
             // A token-only restore (store_text=false, index_text=true) onto an
@@ -2357,19 +2380,7 @@ impl CoreEngine {
                 &chunks,
                 &mut changed_filter_fields,
             );
-            let lexical_units = chunks
-                .iter()
-                .enumerate()
-                .map(|(offset, chunk)| {
-                    (
-                        chunk.chunk_id.clone(),
-                        token_lists.get(offset).cloned().unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            index
-                .lexical_index
-                .replace_group(&document_id, &lexical_units);
+            index.sync_lexical_group(&document_id);
         }
         let removed_chunk_ids_vec = removed_chunk_ids
             .iter()
@@ -2422,14 +2433,21 @@ impl CoreEngine {
             }
         }
         for index_key in index_keys {
-            let loaded = crate::storage::load_store(
-                &persistence_path,
-                &index_key,
-                crate::storage::LoadOptions {
-                    read_only: persistence_read_only,
-                    read_wal: false,
-                },
-            )?;
+            let options = crate::storage::LoadOptions {
+                read_only: persistence_read_only,
+                read_wal: false,
+            };
+            // A read-only handle keeps the lexical store unparsed until it needs
+            // the tokens (see `DeferredTokenLists`).
+            let loaded = if persistence_read_only {
+                crate::storage::load_store_deferring_lexical(
+                    &persistence_path,
+                    &index_key,
+                    options,
+                )?
+            } else {
+                crate::storage::load_store(&persistence_path, &index_key, options)?
+            };
             // The text store records the compression it was created with in its
             // manifest. Adopt that persisted value so it wins over the seeded
             // open-option default before any write-back (the WAL-replay
@@ -3581,9 +3599,9 @@ impl CoreCheckpointer {
 }
 
 fn index_from_loaded_store(
-    loaded: crate::storage::LoadedStore,
+    mut loaded: crate::storage::LoadedStore,
     chunk_character_limit: usize,
-    lazy_vectors: bool,
+    read_only: bool,
 ) -> Result<VectorOnlyIndex, CoreError> {
     let state = loaded
         .state
@@ -3610,16 +3628,6 @@ fn index_from_loaded_store(
         .and_then(Value::as_u64)
         .unwrap_or(4) as usize;
     validate_index_shape(vector_dim, bit_width)?;
-    let metadata_by_id = state
-        .get("document_metadata")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let chunk_ids_by_doc = state
-        .get("document_chunk_ids")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     let mut documents = BTreeMap::new();
     // Lazy residency applies only when a committed `.tvim` exists: the serving
     // index loads from it directly, so the open-time full-corpus dequantization
@@ -3627,7 +3635,7 @@ fn index_from_loaded_store(
     // Stores without a tvim keep the eager path: they need the reconstruct
     // outcome to decide `vectors_seeded` and to rebuild a serving index from
     // documents.
-    let lazy_vectors = lazy_vectors && loaded.tvim_path.is_some() && loaded.chunk_count() > 0;
+    let lazy_vectors = read_only && loaded.tvim_path.is_some() && loaded.chunk_count() > 0;
     let chunk_vectors = if lazy_vectors {
         None
     } else {
@@ -3637,73 +3645,93 @@ fn index_from_loaded_store(
     let (chunk_vectors, query_rotation) = chunk_vectors
         .map(|reconstructed| (reconstructed.vectors, reconstructed.query_rotation))
         .unwrap_or_default();
-    for document_id in state
-        .get("document_hashes")
-        .and_then(Value::as_object)
-        .map(|object| object.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        let metadata = metadata_by_id
-            .get(&document_id)
-            .and_then(Value::as_object)
-            .map(|object| {
-                object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let chunks: Vec<ChunkRecord> = chunk_ids_by_doc
-            .get(&document_id)
-            .and_then(Value::as_array)
+    // A read-only handle leaves the token lists in the lexical store's text
+    // until something needs them. Any other load parses them here.
+    let defer_token_lists = read_only;
+    if !defer_token_lists {
+        if let Some(bytes) = loaded.lexical_bytes.take() {
+            loaded.lexical_tokens = bytes.parse()?;
+        }
+    }
+    let deferred_token_lists = defer_token_lists.then(|| DeferredTokenLists {
+        bytes: loaded.lexical_bytes.take(),
+        chunk_character_limit,
+    });
+    // Move the per-document maps out of the loaded state and payload stores
+    // instead of cloning them: the parsed JSON is several times its file size,
+    // and a clone held both copies at the open's peak. The state's chunk list
+    // was only needed for the counts above.
+    let state = loaded
+        .state
+        .as_object_mut()
+        .ok_or_else(|| invalid_err("loaded state must be a JSON object"))?;
+    state.remove("chunks");
+    let mut metadata_by_id = take_state_object(state, "document_metadata");
+    let mut chunk_ids_by_doc = take_state_object(state, "document_chunk_ids");
+    let document_hashes = take_state_object(state, "document_hashes");
+    for (document_id, content_hash) in document_hashes {
+        let metadata = match metadata_by_id.remove(&document_id) {
+            Some(Value::Object(object)) => object
+                .into_iter()
+                .map(|(key, value)| (key, json_string_or_empty(value)))
+                .collect(),
+            _ => CoreMetadata::new(),
+        };
+        let chunk_ids = match chunk_ids_by_doc.remove(&document_id) {
+            Some(Value::Array(chunk_ids)) => chunk_ids,
+            _ => Vec::new(),
+        };
+        let chunks: Vec<ChunkRecord> = chunk_ids
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+            .filter_map(|chunk_id| match chunk_id {
+                Value::String(chunk_id) => Some(chunk_id),
+                _ => None,
+            })
             .map(|chunk_id| ChunkRecord {
-                chunk_id: chunk_id.to_string(),
                 // Lazy handles keep the vector empty (non-resident) rather than
                 // zero-filled: an explicit "absent" the guarded consumers refuse,
                 // instead of a plausible-looking all-zeros row.
-                vector: chunk_vectors.get(chunk_id).cloned().unwrap_or_else(|| {
+                vector: chunk_vectors.get(&chunk_id).cloned().unwrap_or_else(|| {
                     if lazy_vectors {
                         Vec::new()
                     } else {
                         vec![0.0; vector_dim]
                     }
                 }),
+                chunk_id,
             })
             .collect();
-        let token_lists = loaded
-            .lexical_tokens
-            .get(&document_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                loaded
-                    .raw_text
-                    .get(&document_id)
-                    .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
-                    .unwrap_or_default()
-            });
+        let text = loaded.raw_text.remove(&document_id);
+        let token_lists = if defer_token_lists {
+            Vec::new()
+        } else {
+            loaded
+                .lexical_tokens
+                .remove(&document_id)
+                .unwrap_or_else(|| {
+                    text.as_deref()
+                        .map(|text| token_lists_from_raw_text(text, chunk_character_limit))
+                        .unwrap_or_default()
+                })
+        };
+        let patch_matrix = loaded.multivec.remove(&document_id);
         documents.insert(
-            document_id.clone(),
+            document_id,
             DocumentRecord {
-                content_hash: state
-                    .get("document_hashes")
-                    .and_then(Value::as_object)
-                    .and_then(|object| object.get(&document_id))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                content_hash: json_string_or_empty(content_hash),
                 metadata,
-                text: loaded.raw_text.get(&document_id).cloned(),
+                text,
                 token_lists,
                 chunks,
-                patch_matrix: loaded.multivec.get(&document_id).cloned(),
+                patch_matrix,
             },
         );
     }
-    let lexical_index = lexical_index_for_documents(&documents);
-    let (field_indexes, all_docs) = filter_indexes_for_documents(&documents);
+    let state = loaded
+        .state
+        .as_object()
+        .ok_or_else(|| invalid_err("loaded state must be a JSON object"))?;
+    let all_docs = documents.keys().cloned().collect::<DocSet>();
     let chunk_owner_by_id = chunk_owner_by_id_for_documents(&documents);
     // The load only needs (chunk_id, document_id) pairs -- never embeddings --
     // so both open modes skip cloning the per-chunk vectors here.
@@ -3812,7 +3840,8 @@ fn index_from_loaded_store(
             .get("deleted_chunk_count")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
-        lexical_index,
+        lexical_index: OnceCell::new(),
+        deferred_token_lists,
         vector_index: RefCell::new(vector_index),
         ann_options: state
             .get("ann")
@@ -3832,7 +3861,7 @@ fn index_from_loaded_store(
         force_base_rewrite: false,
         cluster_index: RefCell::new(None),
         pending_persisted_ann: RefCell::new(None),
-        field_indexes,
+        field_indexes: OnceCell::new(),
         all_docs,
         chunk_owner_by_id,
         base_epoch,
@@ -3858,6 +3887,27 @@ fn index_from_loaded_store(
     Ok(index)
 }
 
+/// Removes `key` from the loaded state, as an object; absent or not an object
+/// reads as empty, like the `get(..).and_then(as_object)` it replaces.
+fn take_state_object(
+    state: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> serde_json::Map<String, Value> {
+    match state.remove(key) {
+        Some(Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// The string inside a JSON value, or "" for any other value (the loader's
+/// `as_str().unwrap_or("")`, without the copy).
+fn json_string_or_empty(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        _ => String::new(),
+    }
+}
+
 fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Vec<String>> {
     chunk_text(text, chunk_character_limit)
         .unwrap_or_default()
@@ -3866,33 +3916,100 @@ fn token_lists_from_raw_text(text: &str, chunk_character_limit: usize) -> Vec<Ve
         .collect()
 }
 
-fn lexical_index_for_documents(documents: &BTreeMap<String, DocumentRecord>) -> Bm25Index {
+/// Maps retained token lists to stable chunk ids. An absent outer list has no
+/// lexical units; a present empty inner list still contributes a zero-token unit.
+fn lexical_units_for_chunks(
+    chunks: &[ChunkRecord],
+    token_lists: &[Vec<String>],
+) -> Vec<(String, Vec<String>)> {
+    if token_lists.is_empty() {
+        return Vec::new();
+    }
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(offset, chunk)| {
+            (
+                chunk.chunk_id.clone(),
+                token_lists.get(offset).cloned().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Builds BM25 over every document's chunks. `token_lists`, when given, holds
+/// each document's lists in place of `DocumentRecord::token_lists` (a handle
+/// whose lists are still deferred).
+fn lexical_index_for_documents(
+    documents: &BTreeMap<String, DocumentRecord>,
+    token_lists: Option<&BTreeMap<String, TokenLists>>,
+) -> Bm25Index {
     let mut lexical_index = Bm25Index::empty();
     for (document_id, record) in documents {
-        let units = record
-            .chunks
-            .iter()
-            .enumerate()
-            .map(|(offset, chunk)| {
-                (
-                    chunk.chunk_id.clone(),
-                    record.token_lists.get(offset).cloned().unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let lists = match token_lists {
+            Some(token_lists) => token_lists.get(document_id).map_or(&[][..], Vec::as_slice),
+            None => record.token_lists.as_slice(),
+        };
+        // Caption-free documents have no lexical group, matching mutations
+        // that remove the group when a caption is cleared.
+        if lists.is_empty() {
+            continue;
+        }
+        let units = lexical_units_for_chunks(&record.chunks, lists);
         lexical_index.replace_group(document_id, &units);
     }
     lexical_index
 }
 
-fn filter_indexes_for_documents(
+/// A read-only handle's chunk token lists, still in the committed `.tvlex`
+/// text. They are only needed for BM25, `document_token_lists` and mutations
+/// (a refresh overlaying WAL records), and parsed they take several times the
+/// file's size, so the open leaves every `DocumentRecord::token_lists` empty
+/// and keeps this instead.
+#[derive(Debug, Clone)]
+struct DeferredTokenLists {
+    /// `None` when the store has no lexical store; every document then
+    /// tokenizes its raw text, as the eager loader does.
+    bytes: Option<crate::storage::lexical_store::LexicalBytes>,
+    chunk_character_limit: usize,
+}
+
+impl DeferredTokenLists {
+    /// Every document's token lists exactly as the eager loader fills them:
+    /// the persisted lists, or a tokenization of the raw text when the
+    /// lexical store has none for the document.
+    fn parse(
+        &self,
+        documents: &BTreeMap<String, DocumentRecord>,
+    ) -> Result<BTreeMap<String, TokenLists>, CoreError> {
+        let mut persisted = match &self.bytes {
+            Some(bytes) => bytes.parse()?,
+            None => BTreeMap::new(),
+        };
+        Ok(documents
+            .iter()
+            .map(|(document_id, record)| {
+                let lists = persisted.remove(document_id).unwrap_or_else(|| {
+                    record
+                        .text
+                        .as_deref()
+                        .map(|text| token_lists_from_raw_text(text, self.chunk_character_limit))
+                        .unwrap_or_default()
+                });
+                (document_id.clone(), lists)
+            })
+            .collect())
+    }
+}
+
+fn field_indexes_for_documents(
     documents: &BTreeMap<String, DocumentRecord>,
-) -> (BTreeMap<String, FieldIndex>, DocSet) {
+) -> BTreeMap<String, FieldIndex> {
     let metadata_by_id = documents
         .iter()
         .map(|(document_id, record)| (document_id.clone(), record.metadata.clone()))
         .collect::<BTreeMap<_, _>>();
-    build_field_indexes(&metadata_by_id)
+    build_field_indexes(&metadata_by_id).0
 }
 
 fn chunk_owner_by_id_for_documents(
@@ -5217,7 +5334,14 @@ struct VectorOnlyIndex {
     query_rotation: Option<Vec<f32>>,
     delete_count: usize,
     deleted_chunk_count: usize,
-    lexical_index: Bm25Index,
+    /// BM25 over the chunk token lists. An index loaded from disk builds it from
+    /// `documents` on first use instead of at open, so a handle that never runs
+    /// a lexical or hybrid query never pays for it. Mutations update it only
+    /// when already built; otherwise the first query sees the updated documents.
+    lexical_index: OnceCell<Bm25Index>,
+    /// Set on a read-only open while `documents` carry no token lists; the
+    /// first mutation parses them in (`materialize_token_lists`).
+    deferred_token_lists: Option<DeferredTokenLists>,
     vector_index: RefCell<Option<TurboVecNativeIndex>>,
     /// Opt-in ANN tuning; `None` keeps the index exact-scan only.
     ann_options: Option<CoreAnnOptions>,
@@ -5257,7 +5381,9 @@ struct VectorOnlyIndex {
     /// ANN query or `ann_warm` adopts it; any vector mutation clears it together
     /// with `cluster_index` so a stale assignment is never adopted.
     pending_persisted_ann: RefCell<Option<crate::storage::tvann_store::LoadedAnn>>,
-    field_indexes: BTreeMap<String, FieldIndex>,
+    /// Metadata field indexes for the filter planner, built on first use like
+    /// `lexical_index`: the first filtered query. Mutations leave it unbuilt.
+    field_indexes: OnceCell<BTreeMap<String, FieldIndex>>,
     all_docs: DocSet,
     chunk_owner_by_id: HashMap<String, String>,
     /// Epoch of the current on-disk base; 0 until the first base is persisted.
@@ -5404,7 +5530,8 @@ impl VectorOnlyIndex {
             query_rotation: None,
             delete_count: 0,
             deleted_chunk_count: 0,
-            lexical_index: Bm25Index::empty(),
+            lexical_index: OnceCell::from(Bm25Index::empty()),
+            deferred_token_lists: None,
             vector_index: RefCell::new(None),
             ann_options: options.ann,
             session_ann_nprobe: None,
@@ -5418,7 +5545,7 @@ impl VectorOnlyIndex {
             force_base_rewrite: false,
             cluster_index: RefCell::new(None),
             pending_persisted_ann: RefCell::new(None),
-            field_indexes: BTreeMap::new(),
+            field_indexes: OnceCell::from(BTreeMap::new()),
             all_docs: DocSet::new(),
             chunk_owner_by_id: HashMap::new(),
             base_epoch: 0,
@@ -5590,6 +5717,73 @@ impl VectorOnlyIndex {
         self.pending_persisted_ann.get_mut().take();
     }
 
+    fn lexical_index(&self) -> Result<&Bm25Index, CoreError> {
+        if let Some(lexical_index) = self.lexical_index.get() {
+            return Ok(lexical_index);
+        }
+        let built = match &self.deferred_token_lists {
+            Some(deferred) => {
+                let token_lists = deferred.parse(&self.documents)?;
+                lexical_index_for_documents(&self.documents, Some(&token_lists))
+            }
+            None => lexical_index_for_documents(&self.documents, None),
+        };
+        Ok(self.lexical_index.get_or_init(|| built))
+    }
+
+    /// Returns the lexical index only if it is already built. Mutations skip
+    /// incremental updates when absent: the first lexical read builds it from
+    /// the updated `documents`. `CoreEngine::index_mut` has already parsed any
+    /// deferred token lists into `documents` before a mutation reaches here.
+    fn lexical_index_mut(&mut self) -> Option<&mut Bm25Index> {
+        debug_assert!(self.deferred_token_lists.is_none());
+        self.lexical_index.get_mut()
+    }
+
+    /// Updates only a built BM25 index, using the same units as a lazy rebuild.
+    fn sync_lexical_group(&mut self, document_id: &str) {
+        debug_assert!(self.deferred_token_lists.is_none());
+        let Some(lexical) = self.lexical_index.get_mut() else {
+            return;
+        };
+        let record = &self.documents[document_id];
+        if record.token_lists.is_empty() {
+            lexical.remove_group(document_id);
+        } else {
+            lexical.replace_group(
+                document_id,
+                &lexical_units_for_chunks(&record.chunks, &record.token_lists),
+            );
+        }
+    }
+
+    /// Parses deferred token lists into `documents` so mutations and later
+    /// lazy builds see the same tokens as an eager open. A no-op once done or
+    /// when nothing was deferred.
+    fn materialize_token_lists(&mut self) -> Result<(), CoreError> {
+        let Some(deferred) = &self.deferred_token_lists else {
+            return Ok(());
+        };
+        let mut token_lists = deferred.parse(&self.documents)?;
+        for (document_id, record) in self.documents.iter_mut() {
+            record.token_lists = token_lists.remove(document_id).unwrap_or_default();
+        }
+        self.deferred_token_lists = None;
+        Ok(())
+    }
+
+    fn field_indexes(&self) -> &BTreeMap<String, FieldIndex> {
+        self.field_indexes
+            .get_or_init(|| field_indexes_for_documents(&self.documents))
+    }
+
+    /// Returns the field indexes only if already built. As with
+    /// [`Self::lexical_index_mut`], mutations skip incremental updates when
+    /// absent; the first filtered read builds them from updated document metadata.
+    fn field_indexes_mut(&mut self) -> Option<&mut BTreeMap<String, FieldIndex>> {
+        self.field_indexes.get_mut()
+    }
+
     fn add_document_indexes(
         &mut self,
         document_id: &str,
@@ -5598,10 +5792,12 @@ impl VectorOnlyIndex {
         changed_filter_fields: &mut BTreeSet<String>,
     ) {
         self.all_docs.insert(document_id.to_string());
-        for (key, value) in metadata {
-            let field = self.field_indexes.entry(key.clone()).or_default();
-            field.insert(document_id.to_string(), value.clone());
-            changed_filter_fields.insert(key.clone());
+        if let Some(fields) = self.field_indexes_mut() {
+            for (key, value) in metadata {
+                let field = fields.entry(key.clone()).or_default();
+                field.insert(document_id.to_string(), value.clone());
+                changed_filter_fields.insert(key.clone());
+            }
         }
         for chunk in chunks {
             self.chunk_owner_by_id
@@ -5621,10 +5817,12 @@ impl VectorOnlyIndex {
         changed_filter_fields: &mut BTreeSet<String>,
     ) {
         self.all_docs.remove(document_id);
-        for (key, value) in metadata {
-            if let Some(field) = self.field_indexes.get_mut(key) {
-                field.remove(document_id, value);
-                changed_filter_fields.insert(key.clone());
+        if let Some(fields) = self.field_indexes_mut() {
+            for (key, value) in metadata {
+                if let Some(field) = fields.get_mut(key) {
+                    field.remove(document_id, value);
+                    changed_filter_fields.insert(key.clone());
+                }
             }
         }
         // Track the document-level removal for the next generation delta; the tvim
@@ -5644,13 +5842,11 @@ impl VectorOnlyIndex {
         // Ordered-filter partitions are rebuilt lazily at query time (and invalidated
         // by `FieldIndex::insert`/`remove`), so writes only need to drop fields that
         // became empty. This keeps single-row mutations O(changed), not O(cardinality).
-        for key in changed_filter_fields {
-            if self
-                .field_indexes
-                .get(key)
-                .is_some_and(FieldIndex::is_empty)
-            {
-                self.field_indexes.remove(key);
+        if let Some(fields) = self.field_indexes_mut() {
+            for key in changed_filter_fields {
+                if fields.get(key).is_some_and(FieldIndex::is_empty) {
+                    fields.remove(key);
+                }
             }
         }
     }
@@ -5689,7 +5885,7 @@ impl VectorOnlyIndex {
         let coerced = coerce_sdk_filter(metadata_filter)?;
         if let Some(ids) = id_candidates {
             let matching_cardinality =
-                estimate_matching_cardinality(&coerced, &self.field_indexes, &self.all_docs)?;
+                estimate_matching_cardinality(&coerced, self.field_indexes(), &self.all_docs)?;
             if ids.len() < matching_cardinality {
                 return Ok(DocumentFilterPlan::Materialized(
                     self.filter_candidate_ids(ids, &coerced)?,
@@ -5697,14 +5893,14 @@ impl VectorOnlyIndex {
             }
             let metadata_plan = self.complete_metadata_filter_plan(
                 coerced.clone(),
-                plan_metadata_filter(&coerced, &self.field_indexes, &self.all_docs)?,
+                plan_metadata_filter(&coerced, self.field_indexes(), &self.all_docs)?,
             )?;
             return self.intersect_id_candidates(ids, metadata_plan);
         }
 
         self.complete_metadata_filter_plan(
             coerced.clone(),
-            plan_metadata_filter(&coerced, &self.field_indexes, &self.all_docs)?,
+            plan_metadata_filter(&coerced, self.field_indexes(), &self.all_docs)?,
         )
     }
 
@@ -7021,8 +7217,8 @@ impl VectorOnlyIndex {
                                 .collect();
                         }
                         let rescored = self.rescore_raw_hits(query, pool, rescore_window);
-                        let hits =
-                            self.assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
+                        let hits = self
+                            .assemble_vector_hits_filtered(rescored, &metadata_filter, top_k)?;
                         Ok(CoreSearchResults {
                             hits,
                             total_considered,
@@ -8059,5 +8255,417 @@ mod lock_tests {
         );
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod lazy_index_tests {
+    use super::{lexical_index_for_documents, CoreEngine, VectorOnlyIndex};
+    use crate::storage::wal::WalRecord;
+    use crate::types::{CoreDocument, CoreOpenOptions, CoreSearchResults, CoreVectorDocument};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lodedb-lazy-index-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn options(dir: &Path, read_only: bool) -> CoreOpenOptions {
+        CoreOpenOptions {
+            path: dir.to_string_lossy().to_string(),
+            read_only,
+            durability: "relaxed".to_string(),
+            commit_mode: "wal".to_string(),
+            store_text: true,
+            index_text: true,
+            compress_text: true,
+            chunk_character_limit: 900,
+            acquire_writer_lock: false,
+        }
+    }
+
+    fn document(id: &str, axis: usize, kind: &str, text: Option<&str>) -> CoreVectorDocument {
+        let mut vector = vec![0.05; 8];
+        vector[axis % 8] = 1.0;
+        CoreVectorDocument {
+            document_id: id.to_string(),
+            vector,
+            metadata: [
+                ("kind".to_string(), kind.to_string()),
+                ("rank".to_string(), (axis * 7 % 10).to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            text: text.map(str::to_string),
+            patch_matrix: None,
+        }
+    }
+
+    const TEXTS: [&str; 6] = [
+        "window seat on morning flights to Lisbon",
+        "oat milk flat white every weekday",
+        "dentist on Thursday at 7:30 pm",
+        "standing desk from IKEA for the home office",
+        "Lisbon trip booked for the anniversary",
+        "invoices go out on the first business day",
+    ];
+
+    fn seed(dir: &Path) {
+        let mut engine = CoreEngine::open(options(dir, false)).unwrap();
+        engine.create_index("default", 8, 4).unwrap();
+        let documents = (0..24)
+            .map(|i| {
+                let kind = ["fact", "event", "preference"][i % 3];
+                let text = (i % 5 != 4).then_some(TEXTS[i % TEXTS.len()]);
+                document(&format!("doc-{i:02}"), i, kind, text)
+            })
+            .collect::<Vec<_>>();
+        engine.upsert_vectors("default", &documents).unwrap();
+        engine.persist().unwrap();
+    }
+
+    fn index(engine: &CoreEngine) -> &VectorOnlyIndex {
+        engine.indexes.get("default").unwrap()
+    }
+
+    fn queries(engine: &CoreEngine) -> Vec<CoreSearchResults> {
+        let filters: [Option<Value>; 3] = [
+            None,
+            Some(json!({"kind": {"$in": ["fact", "event"]}})),
+            Some(json!({"rank": {"$gte": "4"}})),
+        ];
+        let mut out = Vec::new();
+        for text in ["Lisbon trip", "oat milk", "desk office Thursday"] {
+            let mut query = vec![0.1; 8];
+            query[text.len() % 8] = 1.0;
+            for mode in ["vector", "lexical", "hybrid"] {
+                let plan = engine.prepare_query_text(text, mode).unwrap();
+                for filter in &filters {
+                    let filter = filter.as_ref();
+                    out.push(
+                        engine
+                            .search_embedded_text("default", &plan, Some(&query), 10, filter)
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn read_only_open_builds_lexical_and_field_indexes_on_first_use() {
+        let dir = temp_dir("first-use");
+        seed(&dir);
+        let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
+        assert!(index(&reader).deferred_token_lists.is_some());
+        assert!(index(&reader)
+            .documents
+            .values()
+            .all(|record| record.token_lists.is_empty()));
+
+        let mut query = vec![0.1; 8];
+        query[2] = 1.0;
+        reader.query_vector("default", &query, 5, None).unwrap();
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
+
+        reader
+            .query_vector("default", &query, 5, Some(&json!({"kind": "fact"})))
+            .unwrap();
+        assert!(index(&reader).field_indexes.get().is_some());
+        assert!(index(&reader).lexical_index.get().is_none());
+
+        let plan = reader.prepare_query_text("Lisbon", "hybrid").unwrap();
+        reader
+            .search_embedded_text("default", &plan, Some(&query), 5, None)
+            .unwrap();
+        assert!(index(&reader).lexical_index.get().is_some());
+        // BM25 was built from the parsed text; the documents stay without it.
+        assert!(index(&reader).deferred_token_lists.is_some());
+
+        // A writable open loads everything eagerly; it must agree on every
+        // query and on the token lists themselves.
+        let lazy = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert!(index(&eager).deferred_token_lists.is_none());
+        assert_eq!(queries(&lazy), queries(&eager));
+        assert_eq!(
+            lazy.document_token_lists("default").unwrap(),
+            eager.document_token_lists("default").unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_overlay_on_a_deferred_reader_matches_an_eager_replay() {
+        let dir = temp_dir("overlay");
+        seed(&dir);
+        let mut reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
+        assert!(index(&reader).deferred_token_lists.is_some());
+        // A WAL-mode writer logs captioned upserts, a payload update and a
+        // delete without checkpointing them.
+        let mut writer = CoreEngine::open(options(&dir, false)).unwrap();
+        writer
+            .upsert_vectors(
+                "default",
+                &[
+                    document("doc-wal", 6, "event", Some("Lisbon dentist on Thursday")),
+                    document("doc-03", 3, "fact", None),
+                ],
+            )
+            .unwrap();
+        writer
+            .update_document_payload("default", "doc-07", None, Some(Some("oat milk".into())))
+            .unwrap();
+        writer
+            .delete_documents("default", &["doc-08".to_string()])
+            .unwrap();
+        writer.discard();
+
+        reader.refresh().unwrap();
+        assert!(index(&reader).deferred_token_lists.is_none());
+        assert!(index(&reader).lexical_index.get().is_none());
+        assert!(index(&reader).field_indexes.get().is_none());
+        let overlaid = queries(&reader);
+        assert!(index(&reader).lexical_index.get().is_some());
+        assert!(index(&reader).field_indexes.get().is_some());
+        let overlaid_tokens = reader.document_token_lists("default").unwrap();
+        drop(reader);
+
+        // A writable open replays the same WAL into an eagerly loaded index.
+        let eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert_eq!(overlaid, queries(&eager));
+        assert_eq!(
+            overlaid_tokens,
+            eager.document_token_lists("default").unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_mutation_parity(eager: &CoreEngine, lazy: &mut CoreEngine) {
+        assert!(index(lazy).lexical_index.get().is_none());
+        let maintained = index(eager).lexical_index.get().unwrap();
+        let rebuilt = lexical_index_for_documents(&index(eager).documents, None);
+        assert_eq!(maintained.unit_ids(), rebuilt.unit_ids());
+        for query in ["Lisbon trip", "oat milk", "desk office Thursday", "absent"] {
+            for limit in [None, Some(10)] {
+                assert_eq!(
+                    maintained.rank(query, limit, None),
+                    rebuilt.rank(query, limit, None),
+                    "query={query}, limit={limit:?}"
+                );
+            }
+        }
+        assert_eq!(
+            eager.document_token_lists("default").unwrap(),
+            lazy.document_token_lists("default").unwrap()
+        );
+        assert_eq!(queries(eager), queries(lazy));
+        // Keep this handle unbuilt before the next mutation, so every stage
+        // compares an incremental update against a fresh first-query build.
+        lazy.index_mut("default").unwrap().lexical_index.take();
+    }
+
+    #[test]
+    fn multi_chunk_payload_mutations_match_a_fresh_lexical_build() {
+        let mut eager = CoreEngine::new_in_memory();
+        let mut lazy = CoreEngine::new_in_memory();
+        for engine in [&mut eager, &mut lazy] {
+            engine.create_index("default", 8, 4).unwrap();
+            engine
+                .upsert_vectors(
+                    "default",
+                    &[document("seed", 0, "fact", Some("Lisbon trip oat milk"))],
+                )
+                .unwrap();
+        }
+        lazy.index_mut("default").unwrap().lexical_index.take();
+        // Warm BM25 through the search API before any text ingestion/mutation.
+        queries(&eager);
+        for engine in [&mut eager, &mut lazy] {
+            let plan = engine
+                .prepare_text_upsert(
+                    "default",
+                    &[CoreDocument {
+                        document_id: "multi".into(),
+                        text: "Lisbon trip. Oat milk. Desk office Thursday.".into(),
+                        metadata: Default::default(),
+                    }],
+                    true,
+                    true,
+                    16,
+                )
+                .unwrap();
+            let embeddings = vec![vec![0.1; 8]; plan.chunks_to_embed.len()];
+            engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+            let record = &index(engine).documents["multi"];
+            assert!(record.chunks.len() > 1);
+            assert!(record.chunks.iter().all(|chunk| chunk.chunk_id != "multi"));
+        }
+        assert_mutation_parity(&eager, &mut lazy);
+
+        for text in [Some("oat milk Thursday".to_string()), None] {
+            for engine in [&mut eager, &mut lazy] {
+                engine
+                    .update_document_payload("default", "multi", None, Some(text.clone()))
+                    .unwrap();
+                assert_eq!(
+                    index(engine).pending_lexical_clears.contains("multi"),
+                    text.is_none()
+                );
+            }
+            if text.is_some() {
+                let plan = eager.prepare_query_text("Thursday", "lexical").unwrap();
+                let hits = eager
+                    .search_embedded_text("default", &plan, None, 10, None)
+                    .unwrap();
+                assert_eq!(hits.hits[0].document_id, "multi");
+            }
+            assert_mutation_parity(&eager, &mut lazy);
+        }
+
+        // A payload WAL record can restore tokens without raw text. It must
+        // retain the text document's chunk ids, then remove them on a clear.
+        for tokens in [json!([["desk", "office", "Thursday"]]), json!([])] {
+            let record = WalRecord {
+                op: "update_document_payload".into(),
+                payload: json!({"document_id": "multi", "text": null, "tokens": tokens}),
+                lsn: None,
+            };
+            for engine in [&mut eager, &mut lazy] {
+                engine.apply_native_wal_record("default", &record).unwrap();
+                assert_eq!(
+                    index(engine).pending_lexical_clears.contains("multi"),
+                    tokens.as_array().unwrap().is_empty()
+                );
+            }
+            assert_mutation_parity(&eager, &mut lazy);
+        }
+    }
+
+    #[test]
+    fn embedded_wal_lexical_units_match_a_fresh_build() {
+        for retains_tokens in [false, true] {
+            let eager_dir = temp_dir("embedded-eager");
+            let lazy_dir = temp_dir("embedded-lazy");
+            seed(&eager_dir);
+            seed(&lazy_dir);
+            let open = |dir: &Path| {
+                let mut opts = options(dir, false);
+                opts.store_text = retains_tokens;
+                opts.index_text = retains_tokens;
+                CoreEngine::open(opts).unwrap()
+            };
+            let mut eager = open(&eager_dir);
+            let mut lazy = open(&lazy_dir);
+            queries(&eager);
+            // Replace an indexed document, then replay a present empty inner
+            // list and an absent outer list. Retention-off folds drop all tokens.
+            for tokens in [json!([["Lisbon", "trip"]]), json!([[]]), json!([])] {
+                let record = WalRecord {
+                    op: "apply_embedded_documents".into(),
+                    payload: json!({
+                        "documents": [{
+                            "document_id": "doc-00",
+                            "content_hash": "replayed",
+                            "metadata": {},
+                            "text": null,
+                            "chunk_ids": ["replayed-a", "replayed-b"],
+                            "tokens": tokens,
+                        }],
+                        "added_chunks": [
+                            {"chunk_id": "replayed-a", "embedding": vec![0.1; 8]},
+                            {"chunk_id": "replayed-b", "embedding": vec![0.2; 8]},
+                        ],
+                        "removed_chunk_ids": [],
+                    }),
+                    lsn: None,
+                };
+                for engine in [&mut eager, &mut lazy] {
+                    engine.apply_native_wal_record("default", &record).unwrap();
+                    if !retains_tokens {
+                        assert!(index(engine).documents["doc-00"].token_lists.is_empty());
+                        assert!(index(engine).pending_lexical_clears.contains("doc-00"));
+                    }
+                }
+                assert_mutation_parity(&eager, &mut lazy);
+            }
+            eager.discard();
+            lazy.discard();
+            fs::remove_dir_all(eager_dir).unwrap();
+            fs::remove_dir_all(lazy_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn mutations_on_unbuilt_indexes_match_the_eager_indexes() {
+        let eager_dir = temp_dir("mutate-eager");
+        let lazy_dir = temp_dir("mutate-lazy");
+        seed(&eager_dir);
+        seed(&lazy_dir);
+        let mut eager = CoreEngine::open(options(&eager_dir, false)).unwrap();
+        index(&eager).lexical_index().unwrap();
+        index(&eager).field_indexes();
+        let mut lazy = CoreEngine::open(options(&lazy_dir, false)).unwrap();
+        assert!(index(&lazy).lexical_index.get().is_none());
+        assert!(index(&lazy).field_indexes.get().is_none());
+
+        for engine in [&mut eager, &mut lazy] {
+            // A new captioned document, a captioned document replaced by an
+            // uncaptioned one, a payload update and a delete: every lexical
+            // and field-index mutation path.
+            engine
+                .upsert_vectors(
+                    "default",
+                    &[
+                        document("doc-new", 3, "fact", Some("Lisbon flights booked again")),
+                        document("doc-01", 1, "event", None),
+                    ],
+                )
+                .unwrap();
+            engine
+                .update_document_payload(
+                    "default",
+                    "doc-02",
+                    Some(
+                        [("kind".to_string(), "fact".to_string())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    Some(Some("oat milk, Lisbon, Thursday".to_string())),
+                )
+                .unwrap();
+            engine
+                .delete_documents("default", &["doc-05".to_string()])
+                .unwrap();
+        }
+        assert!(index(&lazy).lexical_index.get().is_none());
+        assert!(index(&lazy).field_indexes.get().is_none());
+        assert_eq!(queries(&lazy), queries(&eager));
+        assert!(index(&lazy).lexical_index.get().is_some());
+        assert!(index(&lazy).field_indexes.get().is_some());
+
+        eager.close().unwrap();
+        lazy.close().unwrap();
+        let eager = CoreEngine::open_readonly(&eager_dir, options(&eager_dir, true)).unwrap();
+        let lazy = CoreEngine::open_readonly(&lazy_dir, options(&lazy_dir, true)).unwrap();
+        assert_eq!(queries(&lazy), queries(&eager));
+        fs::remove_dir_all(eager_dir).unwrap();
+        fs::remove_dir_all(lazy_dir).unwrap();
     }
 }

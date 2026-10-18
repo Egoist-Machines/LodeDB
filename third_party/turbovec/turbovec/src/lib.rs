@@ -455,10 +455,9 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        let centroids = self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -528,10 +527,9 @@ impl TurboQuantIndex {
         let Some(dim) = self.dim else { return };
         self.rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -929,10 +927,9 @@ impl TurboQuantIndex {
             .dim
             .expect("reconstruct_row_into on an index with no committed dim");
         debug_assert_eq!(out.len(), dim);
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        let centroids = self
+            .centroids
+            .get_or_init(|| codebook::centroids(self.bit_width, dim));
         let (row, scale) = self.export_row(slot);
         let bytes_per_plane = dim / 8;
         let identity_calibration = self.tqplus_scale.is_empty();
@@ -1157,7 +1154,7 @@ mod x86_scalar_fallback_tests {
     //! the only place its full scoring path — including the issue-#106
     //! perm0 de-interleave — runs end to end.
     use super::TurboQuantIndex;
-    use crate::search::FORCE_SCALAR_FALLBACK;
+    use crate::search::{lock_kernel_switches, FORCE_SCALAR_FALLBACK};
     use std::sync::atomic::Ordering;
 
     fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
@@ -1187,6 +1184,7 @@ mod x86_scalar_fallback_tests {
 
     #[test]
     fn scalar_fallback_matches_simd_topk() {
+        let _switches = lock_kernel_switches();
         let dim = 64;
         let n = 600;
         let nq = 12;
@@ -1210,6 +1208,61 @@ mod x86_scalar_fallback_tests {
                 topk_sets(&scalar.indices, nq, scalar.k),
                 "bits={bits}: scalar fallback returned a different top-k than SIMD",
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod serial_search_tests {
+    //! Batches of up to four queries run on the calling thread instead of
+    //! the rayon pool. Same kernel, same inputs: the bits must not change.
+    use super::TurboQuantIndex;
+    use crate::search::{lock_kernel_switches, FORCE_PARALLEL, FORCE_SCALAR_FALLBACK};
+    use std::sync::atomic::Ordering;
+
+    fn vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        (0..n * dim)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn serial_small_batches_match_the_rayon_path() {
+        // Both searches must take the same kernel; on x86 the scalar
+        // fallback is not bit-identical to the SIMD kernels.
+        let _switches = lock_kernel_switches();
+        FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
+        let dim = 64;
+        let k = 20;
+        for &bits in &[2usize, 3, 4] {
+            let mut index = TurboQuantIndex::new(dim, bits).unwrap();
+            index.add(&vectors(700, dim, 3));
+            let mask: Vec<bool> = (0..700).map(|i| i % 3 != 0).collect();
+            for nq in 1..=4usize {
+                let queries = vectors(nq, dim, 40 + nq as u64);
+                for mask in [None, Some(mask.as_slice())] {
+                    FORCE_PARALLEL.store(false, Ordering::Relaxed);
+                    let serial = index.search_with_mask(&queries, k, mask);
+                    FORCE_PARALLEL.store(true, Ordering::Relaxed);
+                    let parallel = index.search_with_mask(&queries, k, mask);
+                    FORCE_PARALLEL.store(false, Ordering::Relaxed);
+                    assert_eq!(serial.indices, parallel.indices, "bits={bits} nq={nq}");
+                    let bits_of = |scores: &[f32]| {
+                        scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        bits_of(&serial.scores),
+                        bits_of(&parallel.scores),
+                        "bits={bits} nq={nq}"
+                    );
+                }
+            }
         }
     }
 }

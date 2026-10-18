@@ -56,6 +56,9 @@ pub struct LoadedStore {
     pub tvim_manifest: Option<Value>,
     pub raw_text: BTreeMap<String, String>,
     pub lexical_tokens: BTreeMap<String, TokenLists>,
+    /// Set instead of `lexical_tokens` by [`load_store_deferring_lexical`]: the
+    /// checked `.tvlex` text, left for the reader to parse when it needs it.
+    pub lexical_bytes: Option<lexical_store::LexicalBytes>,
     pub multivec: MultiVecMap,
     /// The persisted ANN cluster partition, if a valid `.tvann` sidecar was
     /// found. The engine still validates it against the live calibration
@@ -105,11 +108,29 @@ pub fn load_store(
     index_key: &str,
     options: LoadOptions,
 ) -> Result<LoadedStore, CoreError> {
-    let persistence_dir = persistence_dir.as_ref();
+    load_store_impl(persistence_dir.as_ref(), index_key, options, false)
+}
+
+/// [`load_store`] that reads and checks the committed `.tvlex` but leaves it
+/// unparsed in [`LoadedStore::lexical_bytes`], with `lexical_tokens` empty.
+pub fn load_store_deferring_lexical(
+    persistence_dir: impl AsRef<Path>,
+    index_key: &str,
+    options: LoadOptions,
+) -> Result<LoadedStore, CoreError> {
+    load_store_impl(persistence_dir.as_ref(), index_key, options, true)
+}
+
+fn load_store_impl(
+    persistence_dir: &Path,
+    index_key: &str,
+    options: LoadOptions,
+    defer_lexical: bool,
+) -> Result<LoadedStore, CoreError> {
     if let Some(manifest) =
         commit_manifest::read_commit_manifest(&commit_manifest_path(persistence_dir, index_key))?
     {
-        return load_generation_store(persistence_dir, manifest, options);
+        return load_generation_store_impl(persistence_dir, manifest, options, defer_lexical);
     }
     let legacy_path = persistence_dir.join(format!("{index_key}.json"));
     if legacy_path.is_file() {
@@ -125,6 +146,7 @@ pub fn load_store(
             tvim_manifest: None,
             raw_text: legacy.raw_text,
             lexical_tokens: BTreeMap::new(),
+            lexical_bytes: None,
             multivec: MultiVecMap::new(),
             ann: None,
             tvvf_manifest: None,
@@ -141,6 +163,15 @@ pub fn load_generation_store(
     persistence_dir: &Path,
     manifest: CommitManifest,
     options: LoadOptions,
+) -> CoreResult<LoadedStore> {
+    load_generation_store_impl(persistence_dir, manifest, options, false)
+}
+
+fn load_generation_store_impl(
+    persistence_dir: &Path,
+    manifest: CommitManifest,
+    options: LoadOptions,
+    defer_lexical: bool,
 ) -> CoreResult<LoadedStore> {
     let body = value_object(&manifest.body, "commit manifest body")?;
     let index_key = get_str(body, "index_key").to_string();
@@ -185,12 +216,16 @@ pub fn load_generation_store(
         }
         None => BTreeMap::new(),
     };
-    let lexical_tokens = match manifest.store_manifest("tvlex") {
-        Some(tvlex_manifest) => lexical_store::load(
+    let lexical_bytes = match manifest.store_manifest("tvlex") {
+        Some(tvlex_manifest) => lexical_store::read_bytes(
             &base_tvlex_path(persistence_dir, &index_key, base_epoch),
             Some(tvlex_manifest),
         )?,
-        None => BTreeMap::new(),
+        None => None,
+    };
+    let (lexical_tokens, lexical_bytes) = match lexical_bytes {
+        Some(bytes) if !defer_lexical => (bytes.parse()?, None),
+        bytes => (BTreeMap::new(), bytes),
     };
     let multivec = match manifest.store_manifest("tvmv") {
         Some(tvmv_manifest) => multivec_store::load(
@@ -254,6 +289,7 @@ pub fn load_generation_store(
         tvim_manifest: tvim_manifest.cloned(),
         raw_text,
         lexical_tokens,
+        lexical_bytes,
         multivec,
         ann,
         tvvf_manifest,
