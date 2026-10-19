@@ -1,0 +1,155 @@
+{
+  "config": {
+    "corpus_revision": "71d23f81e3479361befc94564e2b955860c03164",
+    "cpu_count": 24,
+    "docs_flag": 300,
+    "docs_selected": 300,
+    "document_batch_chars": 96000,
+    "document_batch_count": 30,
+    "document_batch_size": 96,
+    "provider_flag": "both",
+    "queries_flag": 50,
+    "queries_selected": 50
+  },
+  "corpus": {
+    "chunk_chars": {
+      "max": 8000,
+      "p50": 6113.5,
+      "p95": 7999.0
+    },
+    "chunks": 490,
+    "docs": 300,
+    "docs_with_more_than_one_chunk": 147,
+    "total_chars": 2658713
+  },
+  "providers": {
+    "lodedb": {
+      "cold_start_seconds": 3.277098,
+      "cost_scope": "document and query workload only; warmup is excluded",
+      "cost_usd": 0.0,
+      "dimensions": 384,
+      "documents": {
+        "batch_count": 30,
+        "batch_latency_ms": {
+          "max": 1066.366488,
+          "p50": 910.105389,
+          "p95": 1048.901096
+        },
+        "chunks": 490,
+        "chunks_per_second": 18.125954,
+        "documents": 300,
+        "documents_per_second": 11.097523,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 683529,
+        "retry_count": 0,
+        "wall_seconds": 27.03306
+      },
+      "egress": {
+        "external_request_response_body_bytes": 0,
+        "loopback_request_response_body_bytes": 7382070,
+        "request_body_bytes": 2795771,
+        "request_response_body_bytes": 7382070,
+        "response_body_bytes": 4586299
+      },
+      "model": "minilm",
+      "queries": {
+        "latency_ms": {
+          "max": 10.304891,
+          "p50": 5.569571,
+          "p95": 8.662564
+        },
+        "query_count": 50,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 460,
+        "retry_count": 0,
+        "wall_seconds": 0.302266
+      },
+      "requested_dimensions": 384,
+      "token_usage": {
+        "document_reported_usage_total_tokens": 683529,
+        "label": "LodeDB server estimate from character count",
+        "query_reported_usage_total_tokens": 460,
+        "workload_reported_usage_total_tokens": 683989
+      },
+      "warmup": {
+        "http_body_traffic": {
+          "external_request_response_body_bytes": 0,
+          "loopback_request_response_body_bytes": 283675,
+          "request_body_bytes": 97014,
+          "request_response_body_bytes": 283675,
+          "response_body_bytes": 186661
+        },
+        "input_count": 22,
+        "latency_ms": 3151.348862,
+        "performed": true,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 23761,
+        "retry_count": 0
+      }
+    },
+    "openai": {
+      "cold_start_seconds": null,
+      "cost_scope": "document and query workload only; warmup is excluded",
+      "cost_usd": 0.01274128,
+      "dimensions": 1536,
+      "documents": {
+        "batch_count": 30,
+        "batch_latency_ms": {
+          "max": 904.928219,
+          "p50": 312.712834,
+          "p95": 663.50281
+        },
+        "chunks": 490,
+        "chunks_per_second": 44.143612,
+        "documents": 300,
+        "documents_per_second": 27.026701,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 636674,
+        "retry_count": 0,
+        "wall_seconds": 11.100134
+      },
+      "egress": {
+        "external_request_response_body_bytes": 18736627,
+        "loopback_request_response_body_bytes": 0,
+        "request_body_bytes": 2795691,
+        "request_response_body_bytes": 18736627,
+        "response_body_bytes": 15940936
+      },
+      "model": "text-embedding-3-small",
+      "queries": {
+        "latency_ms": {
+          "max": 399.068839,
+          "p50": 138.903222,
+          "p95": 259.934613
+        },
+        "query_count": 50,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 390,
+        "retry_count": 0,
+        "wall_seconds": 7.720582
+      },
+      "requested_dimensions": null,
+      "token_usage": {
+        "document_reported_usage_total_tokens": 636674,
+        "label": "OpenAI provider-reported token total",
+        "query_reported_usage_total_tokens": 390,
+        "workload_reported_usage_total_tokens": 637064
+      },
+      "warmup": {
+        "http_body_traffic": {
+          "external_request_response_body_bytes": 745930,
+          "loopback_request_response_body_bytes": 0,
+          "request_body_bytes": 97013,
+          "request_response_body_bytes": 745930,
+          "response_body_bytes": 648917
+        },
+        "input_count": 22,
+        "latency_ms": 1248.072161,
+        "performed": true,
+        "reconnects": 0,
+        "reported_usage_total_tokens": 23035,
+        "retry_count": 0
+      }
+    }
+  }
+}
