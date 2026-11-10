@@ -3,7 +3,7 @@ name = "embedded-open-memory"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Memory probe for a read-only open, refresh and first search (macOS)"
+description = "Memory probe for a read-only open, refresh and first search (macOS/Linux)"
 
 # Standalone on purpose: the probe reads the Mach task ledger and counts heap
 # bytes through a global allocator, both of which need unsafe code the

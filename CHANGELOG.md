@@ -5,6 +5,16 @@ All notable changes to LodeDB are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Read-only lexical and hybrid queries build BM25 from bounded per-document
+  `.tvlex` parsing with an interned vocabulary and compact postings, avoiding
+  the full parsed token tree. Readers retain only the MaxScore serving snapshot
+  and its id mappings; writable handles keep incremental BM25 updates. A WAL
+  refresh invalidates the reader's snapshot before replay.
+
 ## [2.3.1] - 2026-10-18
 
 ### Changed

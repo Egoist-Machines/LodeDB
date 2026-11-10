@@ -13,7 +13,7 @@
 //! ```
 //!
 //! `run.sh` builds this probe against the working tree and against a base git
-//! revision and runs both over the same stores. macOS only.
+//! revision and runs both over the same stores. macOS and Linux.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,6 +69,7 @@ fn grow(size: usize) {
 static ALLOCATOR: Counting = Counting;
 
 /// (phys_footprint, lifetime max phys_footprint) in bytes.
+#[cfg(target_os = "macos")]
 fn footprint() -> (u64, u64) {
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
     let status = unsafe {
@@ -82,6 +83,25 @@ fn footprint() -> (u64, u64) {
         return (0, 0);
     }
     (info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint)
+}
+
+/// Linux reports current RSS and the kernel's lifetime RSS high-water mark.
+#[cfg(target_os = "linux")]
+fn footprint() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+    let kb = |name: &str| -> u64 {
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(name)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("RSS field")
+    };
+    (kb("VmRSS:") * 1024, kb("VmHWM:") * 1024)
 }
 
 fn mib(bytes: u64) -> f64 {
