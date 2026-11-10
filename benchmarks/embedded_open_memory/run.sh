@@ -4,24 +4,26 @@
 # read-only open, refresh, first and warm search, and checks that both builds
 # return identical results (read-only, and after a writable open on a copy).
 #
-#   benchmarks/embedded_open_memory/run.sh [--base <rev>] [--runs N] <store-dir>...
+#   benchmarks/embedded_open_memory/run.sh [--base <rev> | --probe-dir <dir>] [--runs N] <store-dir>...
 #
-# Stores are never modified; the writable check runs on copies. macOS only.
+# Stores are never modified; the writable check runs on copies. macOS and Linux.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 base=""
+probe_dir=""
 runs=1
 stores=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base=$2; shift 2 ;;
+    --probe-dir) probe_dir=$2; shift 2 ;;
     --runs) runs=$2; shift 2 ;;
     *) stores+=("$1"); shift ;;
   esac
 done
-[ ${#stores[@]} -gt 0 ] || { echo "usage: $0 [--base <rev>] [--runs N] <store-dir>..." >&2; exit 2; }
+[ ${#stores[@]} -gt 0 ] || { echo "usage: $0 [--base <rev> | --probe-dir <dir>] [--runs N] <store-dir>..." >&2; exit 2; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -32,19 +34,31 @@ build() { # <source-root> <target-dir>
 }
 
 builds=(head)
-build "$repo" "$repo/target/embedded-open-memory/head"
-if [ -n "$base" ]; then
-  mkdir -p "$work/base/benchmarks"
-  git -C "$repo" archive "$base" Cargo.toml crates third_party | tar -x -C "$work/base"
-  cp -R "$here" "$work/base/benchmarks/"
-  rm -f "$work/base/benchmarks/embedded_open_memory/Cargo.lock"
-  build "$work/base" "$repo/target/embedded-open-memory/base"
-  builds=(base head)
+if [ -n "$probe_dir" ]; then
+  [ -z "$base" ] || { echo "--probe-dir and --base are mutually exclusive" >&2; exit 2; }
+  probe_dir=$(cd "$probe_dir" && pwd)
+  builds=(saved)
+else
+  build "$repo" "$repo/target/embedded-open-memory/head"
+  if [ -n "$base" ]; then
+    mkdir -p "$work/base/benchmarks"
+    git -C "$repo" archive "$base" Cargo.toml crates third_party | tar -x -C "$work/base"
+    cp -R "$here" "$work/base/benchmarks/"
+    rm -f "$work/base/benchmarks/embedded_open_memory/Cargo.lock"
+    build "$work/base" "$repo/target/embedded-open-memory/base"
+    builds=(base head)
+  fi
 fi
-bin() { echo "$repo/target/embedded-open-memory/$1/release/$2"; }
+bin() {
+  if [ -n "$probe_dir" ]; then
+    echo "$probe_dir/$2"
+  else
+    echo "$repo/target/embedded-open-memory/$1/release/$2"
+  fi
+}
 
 for store in "${stores[@]}"; do
-  for scenario in "" "--no-refresh" "--mode hybrid --filter"; do
+  for scenario in "" "--no-refresh" "--mode lexical" "--mode hybrid" "--mode hybrid --filter"; do
     for build_name in "${builds[@]}"; do
       for _ in $(seq "$runs"); do
         echo "== $(basename "$store") [$build_name] ${scenario:-refresh + vector}"

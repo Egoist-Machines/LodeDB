@@ -1921,6 +1921,11 @@ impl CoreEngine {
             .get_mut(index_id)
             .ok_or_else(|| invalid_err("index not found"))?;
         index.materialize_token_lists()?;
+        // WAL refresh may mutate a read-only view. Its serving-only BM25 has
+        // no incremental maps: invalidate it, then rebuild lazily after replay.
+        if index.read_only {
+            index.lexical_index.take();
+        }
         Ok(index)
     }
 
@@ -3782,6 +3787,7 @@ fn index_from_loaded_store(
         None
     };
     let index = VectorOnlyIndex {
+        read_only,
         index_id,
         index_key,
         client_id_hash,
@@ -3922,19 +3928,31 @@ fn lexical_units_for_chunks(
     chunks: &[ChunkRecord],
     token_lists: &[Vec<String>],
 ) -> Vec<(String, Vec<String>)> {
-    if token_lists.is_empty() {
-        return Vec::new();
-    }
+    lexical_unit_tokens(chunks, token_lists)
+        .map(|(id, tokens)| (id.to_string(), tokens.to_vec()))
+        .collect()
+}
+
+/// Borrowed units let the compact builder intern tokens without copying them;
+/// mutable updates and lazy builds share the same empty/missing-chunk rules.
+fn lexical_unit_tokens<'a>(
+    chunks: &'a [ChunkRecord],
+    token_lists: &'a [Vec<String>],
+) -> impl Iterator<Item = (&'a str, &'a [String])> {
     chunks
         .iter()
         .enumerate()
-        .map(|(offset, chunk)| {
+        .take(if token_lists.is_empty() {
+            0
+        } else {
+            chunks.len()
+        })
+        .map(move |(offset, chunk)| {
             (
-                chunk.chunk_id.clone(),
-                token_lists.get(offset).cloned().unwrap_or_default(),
+                chunk.chunk_id.as_str(),
+                token_lists.get(offset).map_or(&[][..], Vec::as_slice),
             )
         })
-        .collect()
 }
 
 /// Builds BM25 over every document's chunks. `token_lists`, when given, holds
@@ -3975,6 +3993,42 @@ struct DeferredTokenLists {
 }
 
 impl DeferredTokenLists {
+    /// Builds from one document at a time, interning terms directly into compact
+    /// postings. Absent persisted entries still fall back to retained raw text;
+    /// present empty lists deliberately suppress that fallback.
+    fn build_bm25(
+        &self,
+        documents: &BTreeMap<String, DocumentRecord>,
+    ) -> Result<Bm25Index, CoreError> {
+        use crate::lexical::bm25::CompactBm25Builder;
+        let mut builder = CompactBm25Builder::default();
+        let mut seen = BTreeSet::new();
+        let mut add = |record: &DocumentRecord, lists: TokenLists| {
+            for (id, tokens) in lexical_unit_tokens(&record.chunks, &lists) {
+                builder.add_unit(id, tokens);
+            }
+        };
+        if let Some(bytes) = &self.bytes {
+            bytes.visit_documents(|id, lists| {
+                if let Some(record) = documents.get(id) {
+                    seen.insert(id.to_string());
+                    add(record, lists);
+                }
+            })?;
+        }
+        for (id, record) in documents {
+            if !seen.contains(id) {
+                let lists = record
+                    .text
+                    .as_deref()
+                    .map(|text| token_lists_from_raw_text(text, self.chunk_character_limit))
+                    .unwrap_or_default();
+                add(record, lists);
+            }
+        }
+        Ok(builder.finish())
+    }
+
     /// Every document's token lists exactly as the eager loader fills them:
     /// the persisted lists, or a tokenization of the raw text when the
     /// lexical store has none for the document.
@@ -5297,6 +5351,7 @@ fn next_deferred_candidate_count(candidate_k: usize, live_chunk_count: usize) ->
 }
 
 struct VectorOnlyIndex {
+    read_only: bool,
     index_id: String,
     index_key: String,
     client_id_hash: String,
@@ -5510,6 +5565,7 @@ impl VectorOnlyIndex {
 
     fn new(options: CoreIndexCreateOptions) -> Self {
         Self {
+            read_only: false,
             index_id: options.index_id,
             index_key: options.index_key,
             client_id_hash: options.client_id_hash,
@@ -5722,9 +5778,16 @@ impl VectorOnlyIndex {
             return Ok(lexical_index);
         }
         let built = match &self.deferred_token_lists {
-            Some(deferred) => {
-                let token_lists = deferred.parse(&self.documents)?;
-                lexical_index_for_documents(&self.documents, Some(&token_lists))
+            Some(deferred) => deferred.build_bm25(&self.documents)?,
+            None if self.read_only => {
+                use crate::lexical::bm25::CompactBm25Builder;
+                let mut builder = CompactBm25Builder::default();
+                for record in self.documents.values() {
+                    for (id, tokens) in lexical_unit_tokens(&record.chunks, &record.token_lists) {
+                        builder.add_unit(id, tokens);
+                    }
+                }
+                builder.finish()
             }
             None => lexical_index_for_documents(&self.documents, None),
         };
@@ -8406,6 +8469,96 @@ mod lazy_index_tests {
             lazy.document_token_lists("default").unwrap(),
             eager.document_token_lists("default").unwrap()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compact_read_only_queries_match_eager_fixed_seed_corpus() {
+        let dir = temp_dir("compact-fixed-seed");
+        let mut writer = CoreEngine::open(options(&dir, false)).unwrap();
+        writer.create_index("default", 8, 4).unwrap();
+        let mut seed = 134_u64;
+        let mut docs = Vec::new();
+        for i in 0..257 {
+            let mut text = String::new();
+            for _ in 0..(i % 47) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push_str(TEXTS[((seed >> 32) as usize) % TEXTS.len()]);
+                text.push(' ');
+            }
+            docs.push(document(
+                &format!("d{i:03}"),
+                i,
+                ["fact", "event", "preference"][i % 3],
+                Some(&text),
+            ));
+        }
+        writer.upsert_vectors("default", &docs).unwrap();
+        let plan = writer
+            .prepare_text_upsert(
+                "default",
+                &[CoreDocument {
+                    document_id: "multi".into(),
+                    text: "Lisbon trip. Oat milk. Desk office Thursday.".repeat(5),
+                    metadata: Default::default(),
+                }],
+                true,
+                true,
+                32,
+            )
+            .unwrap();
+        assert!(plan.chunks_to_embed.len() > 1);
+        let embeddings = vec![vec![0.1; 8]; plan.chunks_to_embed.len()];
+        writer.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+        writer.persist().unwrap();
+        // Force lexical delta upserts and deletes after the base generation.
+        writer
+            .update_document_payload(
+                "default",
+                "d007",
+                None,
+                Some(Some("Lisbon oat milk".into())),
+            )
+            .unwrap();
+        writer
+            .delete_documents("default", &["d003".into()])
+            .unwrap();
+        writer.persist().unwrap();
+        drop(writer);
+        let mut reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let mut eager = CoreEngine::open(options(&dir, false)).unwrap();
+        assert_eq!(queries(&reader), queries(&eager));
+        index(&reader)
+            .lexical_index()
+            .unwrap()
+            .assert_serving_only();
+        // Warm the compact snapshot, then overlay a WAL mutation. The reader
+        // must invalidate it before replay and rebuild from the updated tokens.
+        eager
+            .update_document_payload("default", "d007", None, Some(Some("desk Thursday".into())))
+            .unwrap();
+        let expected = queries(&eager);
+        eager.discard();
+        reader.refresh().unwrap();
+        assert_eq!(queries(&reader), expected);
+        index(&reader)
+            .lexical_index()
+            .unwrap()
+            .assert_serving_only();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn read_only_bm25_keeps_only_the_serving_snapshot() {
+        let dir = temp_dir("serving-only");
+        seed(&dir);
+        let reader = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        let expected = queries(&reader);
+        index(&reader)
+            .lexical_index()
+            .unwrap()
+            .assert_serving_only();
+        let writer = CoreEngine::open(options(&dir, false)).unwrap();
+        assert_eq!(expected, queries(&writer));
         fs::remove_dir_all(dir).unwrap();
     }
 

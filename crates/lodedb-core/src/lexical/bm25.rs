@@ -14,6 +14,98 @@ pub const BM25_K1: f64 = 1.2;
 /// Classic Okapi BM25 document-length normalization constant.
 pub const BM25_B: f64 = 0.75;
 
+/// A one-pass builder: each vocabulary string is owned once, each unit keeps
+/// only its length, and postings are append-only pairs rather than hash maps.
+/// Common postings use two u32s. A sparse wide overflow map preserves arbitrary
+/// usize positions/frequencies without saturating or rejecting large units.
+#[derive(Default)]
+pub(crate) struct CompactBm25Builder {
+    vocabulary: HashMap<String, usize>,
+    postings: Vec<Vec<(u32, u32)>>,
+    wide_postings: HashMap<usize, Vec<(usize, usize)>>,
+    unit_ids: Vec<String>,
+    lengths: Vec<usize>,
+}
+
+impl CompactBm25Builder {
+    pub(crate) fn add_unit(&mut self, id: &str, tokens: &[String]) {
+        let pos = self.unit_ids.len();
+        self.unit_ids.push(id.to_string());
+        self.lengths.push(tokens.len());
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for token in tokens {
+            let term = if let Some(term) = self.vocabulary.get(token) {
+                *term
+            } else {
+                let term = self.postings.len();
+                self.vocabulary.insert(token.clone(), term);
+                self.postings.push(Vec::new());
+                term
+            };
+            *counts.entry(term).or_default() += 1;
+        }
+        for (term, frequency) in counts {
+            if let (Ok(pos), Ok(frequency)) = (u32::try_from(pos), u32::try_from(frequency)) {
+                self.postings[term].push((pos, frequency));
+            } else {
+                self.wide_postings
+                    .entry(term)
+                    .or_default()
+                    .push((pos, frequency));
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Bm25Index {
+        let mut index = Bm25Index::empty();
+        index.n = self.unit_ids.len();
+        index.next_pos = index.n;
+        index.total_len = self.lengths.iter().sum();
+        for (pos, id) in self.unit_ids.into_iter().enumerate() {
+            index.unit_id_by_pos.insert(pos, id.clone());
+            index.pos_by_unit_id.insert(id, pos);
+        }
+        let avgdl = index.avgdl();
+        let mut terms = HashMap::with_capacity(self.vocabulary.len());
+        for (term, offset) in self.vocabulary {
+            // Release each builder posting as it is converted, rather than
+            // holding both complete representations at the high-water mark.
+            let posting = std::mem::take(&mut self.postings[offset]);
+            let wide = self.wide_postings.remove(&offset).unwrap_or_default();
+            let needs_sort = !wide.is_empty();
+            let df = (posting.len() + wide.len()) as f64;
+            let idf = (1.0 + (index.n as f64 - df + 0.5) / (df + 0.5)).ln();
+            let mut max_score = 0.0_f64;
+            let mut entries: Vec<_> = posting
+                .into_iter()
+                .map(|(pos, frequency)| (pos as usize, frequency as usize))
+                .chain(wide)
+                .map(|(pos, frequency)| {
+                    let length = self.lengths[pos] as f64;
+                    let frequency = frequency as f64;
+                    let denominator =
+                        frequency + index.k1 * (1.0 - index.b + index.b * (length / avgdl));
+                    let score = idf * (frequency * (index.k1 + 1.0)) / denominator;
+                    max_score = max_score.max(score);
+                    ServingPosting { pos, score }
+                })
+                .collect();
+            if needs_sort {
+                entries.sort_by_key(|posting| posting.pos);
+            }
+            terms.insert(
+                term,
+                ServingTerm {
+                    postings: entries,
+                    max_score,
+                },
+            );
+        }
+        index.serving = RefCell::new(Some(ServingIndex { terms }));
+        index.serving_only = true;
+        index
+    }
+}
 /// In-memory Okapi BM25 index over a unit/chunk id space.
 ///
 /// Mutation keeps the `postings`/`doc_freq`/`doc_len` maps as the authoritative
@@ -41,9 +133,27 @@ pub struct Bm25Index {
     /// Compact scoring snapshot; `None` means "dirty, rebuild on next query".
     /// Interior mutability keeps `rank(&self, ...)` read-only for the engine.
     serving: RefCell<Option<ServingIndex>>,
+    serving_only: bool,
 }
 
 impl Bm25Index {
+    #[cfg(test)]
+    pub(crate) fn assert_serving_only(&self) {
+        assert!(
+            self.serving.borrow().is_some(),
+            "reader must keep a serving snapshot"
+        );
+        assert!(
+            self.postings.is_empty(),
+            "reader must drop mutable postings"
+        );
+        assert!(self.doc_freq.is_empty());
+        assert!(self.doc_len.is_empty());
+        assert!(self.terms_by_pos.is_empty());
+        assert!(self.group_by_pos.is_empty());
+        assert!(self.positions_by_group.is_empty());
+    }
+
     /// Builds a BM25 index from raw unit texts.
     pub fn from_texts(
         unit_ids: &[String],
@@ -96,6 +206,7 @@ impl Bm25Index {
             k1: BM25_K1,
             b: BM25_B,
             serving: RefCell::new(None),
+            serving_only: false,
         }
     }
 
@@ -171,6 +282,7 @@ impl Bm25Index {
     ) -> Vec<(String, f64)> {
         match limit {
             // No bound: nothing to prune against, so score exhaustively.
+            None if self.serving_only => self.rank_maxscore(query, self.n, allowed_indices),
             None => self.rank_reference(query, None, allowed_indices),
             // A zero-length request is empty, matching `truncate(0)`.
             Some(0) => Vec::new(),
@@ -426,6 +538,10 @@ impl Bm25Index {
 
     /// Drops the compact serving snapshot; the next query rebuilds it.
     fn invalidate_serving(&mut self) {
+        assert!(
+            !self.serving_only,
+            "cannot mutate a serving-only BM25 snapshot"
+        );
         self.serving.get_mut().take();
     }
 
@@ -785,6 +901,45 @@ mod maxscore_parity {
             .collect()
     }
 
+    #[test]
+    fn compact_builder_matches_original_ranker_fixed_seed() {
+        use super::CompactBm25Builder;
+        for seed in [134, 0, 1, 0xdead_beef] {
+            let mut rng = Rng::new(seed);
+            let ids: Vec<_> = (0..257).map(|i| format!("u{i:03}")).collect();
+            let mut tokens: Vec<_> = ids.iter().map(|_| random_tokens(&mut rng)).collect();
+            // A u16 frequency must not truncate a long retained unit.
+            tokens[0] = vec!["alpha".to_string(); 65_537];
+            tokens[1] = vec![];
+            let original = Bm25Index::from_token_lists(&ids, &tokens, None).unwrap();
+            let mut builder = CompactBm25Builder::default();
+            for (id, tokens) in ids.iter().zip(&tokens) {
+                builder.add_unit(id, tokens);
+            }
+            let compact = builder.finish();
+            let allowed = (0..ids.len())
+                .filter(|i| i % 3 == 0)
+                .collect::<BTreeSet<_>>();
+            for query in [
+                "alpha beta",
+                "common the rare",
+                "absent",
+                "",
+                "abc-123 e1234",
+                "alpha alpha",
+            ] {
+                for filter in [None, Some(&allowed)] {
+                    for k in [None, Some(0), Some(1), Some(10), Some(300)] {
+                        assert_eq!(
+                            bits(&compact.rank(query, k, filter)),
+                            bits(&original.rank(query, k, filter)),
+                            "seed={seed} query={query} k={k:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     /// Builds a random corpus, then folds in a random mutation script so the
     /// serving snapshot is repeatedly invalidated and rebuilt against the delta.
     fn random_index(rng: &mut Rng) -> Bm25Index {

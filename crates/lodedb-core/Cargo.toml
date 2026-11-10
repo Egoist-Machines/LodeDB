@@ -17,7 +17,7 @@ lodedb-gpu = { path = "../lodedb-gpu" }
 # lodedb-core keeps unsafe_code = forbid.
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 sha2 = "0.10"
 turbovec = { path = "../../third_party/turbovec/turbovec" }
 # Compresses the retained document-text base/segments (e.g. mem0 full payloads),
