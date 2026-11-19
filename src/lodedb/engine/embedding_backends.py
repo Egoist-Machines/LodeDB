@@ -695,20 +695,29 @@ def _resolve_cpu_allotment() -> tuple[int, bool]:
     return max(1, count), constrained
 
 
-def _build_session_options(ort_module: Any, *, intra_op_threads: int) -> object:
-    """Builds ONNX Runtime ``SessionOptions`` pinning the pool and disabling spinning.
+def _build_session_options(ort_module: Any, *, intra_op_threads: int | None) -> object:
+    """Builds ONNX Runtime ``SessionOptions`` without the CPU memory arena.
 
-    The intra-op pool gets exactly ``intra_op_threads`` workers, inter-op
-    scheduling stays single-threaded (one graph runs at a time per handle, so
-    parallel-op scheduling would only add threads to contend over the same
-    allotment), and intra-op workers yield between ops instead of spin-waiting,
-    which burns CPU quota under a container limit.
+    The arena keeps every buffer a run ever needed for the life of the
+    session: one 32 x 256-token MiniLM batch grows it by about 527 MiB that
+    no later run gives back. Without it each run allocates and frees its own
+    buffers, which measured no slower (query and batch latency within noise),
+    since the model's compute dwarfs the allocation.
+
+    With ``intra_op_threads`` the intra-op pool gets exactly that many
+    workers, inter-op scheduling stays single-threaded (one graph runs at a
+    time per handle, so parallel-op scheduling would only add threads to
+    contend over the same allotment), and intra-op workers yield between ops
+    instead of spin-waiting, which burns CPU quota under a container limit.
+    ``None`` keeps ONNX Runtime's own thread defaults.
     """
 
     options = ort_module.SessionOptions()
-    options.intra_op_num_threads = intra_op_threads
-    options.inter_op_num_threads = 1
-    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.enable_cpu_mem_arena = False
+    if intra_op_threads is not None:
+        options.intra_op_num_threads = intra_op_threads
+        options.inter_op_num_threads = 1
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
     return options
 
 
@@ -888,17 +897,12 @@ class ONNXRuntimeEmbeddingBackend:
                         ) from exc
                     _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
                     if self.intra_op_threads is not None:
-                        options = _build_session_options(
-                            ort, intra_op_threads=self.intra_op_threads
-                        )
+                        threads: int | None = self.intra_op_threads
                     else:
                         allotment, constrained = _resolve_cpu_allotment()
-                        # None means "keep ONNX Runtime's own defaults".
-                        options = (
-                            _build_session_options(ort, intra_op_threads=allotment)
-                            if constrained
-                            else None
-                        )
+                        # None keeps ONNX Runtime's own thread defaults.
+                        threads = allotment if constrained else None
+                    options = _build_session_options(ort, intra_op_threads=threads)
                     self._session = ort.InferenceSession(
                         str(self.onnx_model_path),
                         sess_options=options,

@@ -268,6 +268,7 @@ class _RecordingSessionOptions:
     def __init__(self) -> None:
         self.intra_op_num_threads = -1
         self.inter_op_num_threads = -1
+        self.enable_cpu_mem_arena = True
         self.config_entries: dict[str, str] = {}
 
     def add_session_config_entry(self, key: str, value: str) -> None:
@@ -312,11 +313,13 @@ def test_load_session_pins_pool_on_constrained_allotment(monkeypatch) -> None:
     assert options.intra_op_num_threads == 3
     assert options.inter_op_num_threads == 1
     assert options.config_entries["session.intra_op.allow_spinning"] == "0"
+    assert options.enable_cpu_mem_arena is False
     assert created[0]["providers"] == ["CPUExecutionProvider"]
 
 
-def test_load_session_keeps_ort_defaults_when_unconstrained(monkeypatch) -> None:
-    """On an unconstrained host with no override, ONNX Runtime keeps its own defaults."""
+def test_load_session_keeps_ort_thread_defaults_when_unconstrained(monkeypatch) -> None:
+    """On an unconstrained host with no override, ONNX Runtime keeps its own thread
+    defaults, and the session still runs without the CPU memory arena."""
 
     created = _install_fake_onnxruntime(monkeypatch)
     monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", lambda: (8, False))
@@ -330,7 +333,11 @@ def test_load_session_keeps_ort_defaults_when_unconstrained(monkeypatch) -> None
     backend._load_session()
 
     assert len(created) == 1
-    assert created[0]["sess_options"] is None
+    options = created[0]["sess_options"]
+    assert options.enable_cpu_mem_arena is False
+    assert options.intra_op_num_threads == -1
+    assert options.inter_op_num_threads == -1
+    assert options.config_entries == {}
 
 
 def test_load_session_honors_explicit_thread_override(monkeypatch) -> None:
@@ -356,6 +363,7 @@ def test_load_session_honors_explicit_thread_override(monkeypatch) -> None:
     assert options.intra_op_num_threads == 2
     assert options.inter_op_num_threads == 1
     assert options.config_entries["session.intra_op.allow_spinning"] == "0"
+    assert options.enable_cpu_mem_arena is False
 
 
 def test_onnx_backend_rejects_nonpositive_threads() -> None:
