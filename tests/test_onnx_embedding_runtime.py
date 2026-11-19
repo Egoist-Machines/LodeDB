@@ -268,7 +268,6 @@ class _RecordingSessionOptions:
     def __init__(self) -> None:
         self.intra_op_num_threads = -1
         self.inter_op_num_threads = -1
-        self.enable_cpu_mem_arena = True
         self.config_entries: dict[str, str] = {}
 
     def add_session_config_entry(self, key: str, value: str) -> None:
@@ -313,13 +312,11 @@ def test_load_session_pins_pool_on_constrained_allotment(monkeypatch) -> None:
     assert options.intra_op_num_threads == 3
     assert options.inter_op_num_threads == 1
     assert options.config_entries["session.intra_op.allow_spinning"] == "0"
-    assert options.enable_cpu_mem_arena is False
     assert created[0]["providers"] == ["CPUExecutionProvider"]
 
 
-def test_load_session_keeps_ort_thread_defaults_when_unconstrained(monkeypatch) -> None:
-    """On an unconstrained host with no override, ONNX Runtime keeps its own thread
-    defaults, and the session still runs without the CPU memory arena."""
+def test_load_session_keeps_ort_defaults_when_unconstrained(monkeypatch) -> None:
+    """On an unconstrained host with no override, ONNX Runtime keeps its own defaults."""
 
     created = _install_fake_onnxruntime(monkeypatch)
     monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", lambda: (8, False))
@@ -333,11 +330,7 @@ def test_load_session_keeps_ort_thread_defaults_when_unconstrained(monkeypatch) 
     backend._load_session()
 
     assert len(created) == 1
-    options = created[0]["sess_options"]
-    assert options.enable_cpu_mem_arena is False
-    assert options.intra_op_num_threads == -1
-    assert options.inter_op_num_threads == -1
-    assert options.config_entries == {}
+    assert created[0]["sess_options"] is None
 
 
 def test_load_session_honors_explicit_thread_override(monkeypatch) -> None:
@@ -363,7 +356,80 @@ def test_load_session_honors_explicit_thread_override(monkeypatch) -> None:
     assert options.intra_op_num_threads == 2
     assert options.inter_op_num_threads == 1
     assert options.config_entries["session.intra_op.allow_spinning"] == "0"
-    assert options.enable_cpu_mem_arena is False
+
+
+class _RecordingRunOptions:
+    """A RunOptions stand-in that records its run config entries."""
+
+    def __init__(self) -> None:
+        self.config_entries: dict[str, str] = {}
+
+    def add_run_config_entry(self, key: str, value: str) -> None:
+        """Records one string run config entry."""
+
+        self.config_entries[key] = value
+
+
+class _RunOptionsRecordingSession(_FakeONNXSession):
+    """A fake session with a CPU arena setting that records each run's options."""
+
+    def __init__(self, *, arena: bool) -> None:
+        self.arena = arena
+        self.run_options: list[object | None] = []
+
+    def get_session_options(self) -> types.SimpleNamespace:
+        return types.SimpleNamespace(enable_cpu_mem_arena=self.arena)
+
+    def run(self, output_names, inputs, run_options=None):
+        self.run_options.append(run_options)
+        return super().run(output_names, inputs)
+
+
+def _backend_over(monkeypatch, session: _RunOptionsRecordingSession) -> ONNXRuntimeEmbeddingBackend:
+    """A backend whose lazily loaded session is `session`, on a fake onnxruntime."""
+
+    fake = types.SimpleNamespace(
+        SessionOptions=_RecordingSessionOptions,
+        RunOptions=_RecordingRunOptions,
+        InferenceSession=lambda path, sess_options=None, providers=None: session,
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+    monkeypatch.setattr(embedding_backends_mod, "_resolve_cpu_allotment", lambda: (8, False))
+    return ONNXRuntimeEmbeddingBackend(
+        model_name="fake-model",
+        native_dim=4,
+        onnx_model_path="fake.onnx",
+        tokenizer_name_or_path="fake-tokenizer",
+    )
+
+
+def test_batch_runs_shrink_the_cpu_arena_and_single_rows_keep_it(monkeypatch) -> None:
+    """A multi-row run hands its CPU arena regions back when it ends; a single-row
+    run (a query embed) keeps the warm arena that concurrent callers reuse."""
+
+    session = _RunOptionsRecordingSession(arena=True)
+    backend = _backend_over(monkeypatch, session)
+    ids = np.ones((2, 5), dtype=np.int64)
+
+    backend._session_run({"input_ids": ids, "attention_mask": ids})
+    backend._session_run({"input_ids": ids[:1], "attention_mask": ids[:1]})
+
+    batch_options, query_options = session.run_options
+    assert batch_options.config_entries == {"memory.enable_memory_arena_shrinkage": "cpu:0"}
+    assert query_options is None
+
+
+def test_batch_runs_skip_the_shrink_without_a_cpu_arena(monkeypatch) -> None:
+    """ONNX Runtime fails a run that asks to shrink a non-arena allocator, so a
+    session without the CPU arena never gets the shrink option."""
+
+    session = _RunOptionsRecordingSession(arena=False)
+    backend = _backend_over(monkeypatch, session)
+    ids = np.ones((2, 5), dtype=np.int64)
+
+    backend._session_run({"input_ids": ids, "attention_mask": ids})
+
+    assert session.run_options == [None]
 
 
 def test_onnx_backend_rejects_nonpositive_threads() -> None:

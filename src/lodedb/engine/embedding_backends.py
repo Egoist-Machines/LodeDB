@@ -695,29 +695,44 @@ def _resolve_cpu_allotment() -> tuple[int, bool]:
     return max(1, count), constrained
 
 
-def _build_session_options(ort_module: Any, *, intra_op_threads: int | None) -> object:
-    """Builds ONNX Runtime ``SessionOptions`` without the CPU memory arena.
+def _build_session_options(ort_module: Any, *, intra_op_threads: int) -> object:
+    """Builds ONNX Runtime ``SessionOptions`` pinning the pool and disabling spinning.
 
-    The arena keeps every buffer a run ever needed for the life of the
-    session: one 32 x 256-token MiniLM batch grows it by about 527 MiB that
-    no later run gives back. Without it each run allocates and frees its own
-    buffers, which measured no slower (query and batch latency within noise),
-    since the model's compute dwarfs the allocation.
-
-    With ``intra_op_threads`` the intra-op pool gets exactly that many
-    workers, inter-op scheduling stays single-threaded (one graph runs at a
-    time per handle, so parallel-op scheduling would only add threads to
-    contend over the same allotment), and intra-op workers yield between ops
-    instead of spin-waiting, which burns CPU quota under a container limit.
-    ``None`` keeps ONNX Runtime's own thread defaults.
+    The intra-op pool gets exactly ``intra_op_threads`` workers, inter-op
+    scheduling stays single-threaded (one graph runs at a time per handle, so
+    parallel-op scheduling would only add threads to contend over the same
+    allotment), and intra-op workers yield between ops instead of spin-waiting,
+    which burns CPU quota under a container limit.
     """
 
     options = ort_module.SessionOptions()
-    options.enable_cpu_mem_arena = False
-    if intra_op_threads is not None:
-        options.intra_op_num_threads = intra_op_threads
-        options.inter_op_num_threads = 1
-        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.intra_op_num_threads = intra_op_threads
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return options
+
+
+def _batch_run_options(ort_module: Any, session: Any) -> object | None:
+    """Returns ``RunOptions`` that shrink the CPU arena after a run, or None
+    when the session has no CPU arena to shrink.
+
+    The arena keeps every region a run grew for the life of the session: one
+    32 x 256-token MiniLM batch leaves about 527 MiB behind. Multi-row runs use
+    these options and hand that back when they finish. Single-row runs (query
+    embeds) keep the warm arena, which concurrent callers rely on: with the
+    arena off, 32 concurrent query callers on 4 threads lost 6-8% throughput.
+    ONNX Runtime fails a run that asks to shrink a non-arena allocator, hence
+    the check.
+    """
+
+    try:
+        arena = bool(session.get_session_options().enable_cpu_mem_arena)
+    except AttributeError:
+        return None
+    if not arena:
+        return None
+    options = ort_module.RunOptions()
+    options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
     return options
 
 
@@ -791,6 +806,7 @@ class ONNXRuntimeEmbeddingBackend:
         self.output_name = output_name
         self.intra_op_threads = intra_op_threads
         self._session: object | None = None
+        self._batch_run_options: object | None = None
         self._tokenizer: object | None = None
         # Shared across threads in serving tiers; guards both lazy loads.
         self._load_lock = threading.Lock()
@@ -848,7 +864,11 @@ class ONNXRuntimeEmbeddingBackend:
         return {key: np.asarray(value) for key, value in dict(tokenized).items()}
 
     def _session_run(self, tokenized: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Runs the ONNX session with only the inputs the graph declares."""
+        """Runs the ONNX session with only the inputs the graph declares.
+
+        A multi-row run shrinks the CPU arena when it finishes (see
+        :func:`_batch_run_options`); a single-row run leaves it warm.
+        """
 
         session = self._load_session()
         input_names = {item.name for item in session.get_inputs()}
@@ -866,7 +886,11 @@ class ONNXRuntimeEmbeddingBackend:
             # the source model uses.
             run_inputs["token_type_ids"] = np.zeros_like(run_inputs["input_ids"])
         output_names = [item.name for item in session.get_outputs()]
-        output_values = session.run(output_names, run_inputs)
+        rows = next(iter(run_inputs.values())).shape[0]
+        if self._batch_run_options is not None and rows > 1:
+            output_values = session.run(output_names, run_inputs, self._batch_run_options)
+        else:
+            output_values = session.run(output_names, run_inputs)
         return {
             name: np.asarray(value, dtype=np.float32)
             for name, value in zip(output_names, output_values, strict=True)
@@ -897,17 +921,24 @@ class ONNXRuntimeEmbeddingBackend:
                         ) from exc
                     _preload_cuda_execution_provider_dependencies(ort, providers=self.providers)
                     if self.intra_op_threads is not None:
-                        threads: int | None = self.intra_op_threads
+                        options = _build_session_options(
+                            ort, intra_op_threads=self.intra_op_threads
+                        )
                     else:
                         allotment, constrained = _resolve_cpu_allotment()
-                        # None keeps ONNX Runtime's own thread defaults.
-                        threads = allotment if constrained else None
-                    options = _build_session_options(ort, intra_op_threads=threads)
-                    self._session = ort.InferenceSession(
+                        # None means "keep ONNX Runtime's own defaults".
+                        options = (
+                            _build_session_options(ort, intra_op_threads=allotment)
+                            if constrained
+                            else None
+                        )
+                    session = ort.InferenceSession(
                         str(self.onnx_model_path),
                         sess_options=options,
                         providers=list(self.providers),
                     )
+                    self._batch_run_options = _batch_run_options(ort, session)
+                    self._session = session
         return self._session
 
     def _load_tokenizer(self) -> object:
