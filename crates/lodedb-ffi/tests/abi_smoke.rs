@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
@@ -18,7 +18,6 @@ fn c_abi_smoke_compiles_and_runs_with_sanitizers() {
 fn run_c_abi_smoke(sanitized: bool) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir.join("../..");
-    let target_dir = workspace.join("target/debug/deps");
     let source = manifest_dir.join("tests/abi_smoke.c");
     let suffix = if sanitized { "sanitized" } else { "plain" };
     let temp_dir =
@@ -31,6 +30,7 @@ fn run_c_abi_smoke(sanitized: bool) {
     } else {
         "liblodedb_ffi.so"
     };
+    let target_dir = ffi_dylib_dir(&workspace.join("target/debug"), dylib_name);
     std::fs::copy(target_dir.join(dylib_name), temp_dir.join(dylib_name))
         .expect("copy ffi dylib beside smoke binary");
     let mut command = Command::new("cc");
@@ -85,4 +85,24 @@ fn run_c_abi_smoke(sanitized: bool) {
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// The directory holding the newest build of the ffi dylib. Cargo through
+/// 1.99 wrote it to `target/debug/deps`; from 1.100 each unit builds under
+/// `target/debug/build/<package>/<hash>/out`. Both are searched, plus the
+/// uplifted `target/debug` copy a `cargo build` leaves.
+fn ffi_dylib_dir(debug_dir: &Path, dylib_name: &str) -> PathBuf {
+    let mut candidates = vec![debug_dir.to_path_buf(), debug_dir.join("deps")];
+    if let Ok(units) = std::fs::read_dir(debug_dir.join("build/lodedb-ffi")) {
+        candidates.extend(units.flatten().map(|unit| unit.path().join("out")));
+    }
+    candidates
+        .into_iter()
+        .filter_map(|dir| {
+            let modified = dir.join(dylib_name).metadata().ok()?.modified().ok()?;
+            Some((modified, dir))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, dir)| dir)
+        .unwrap_or_else(|| panic!("no {dylib_name} under {}", debug_dir.display()))
 }
