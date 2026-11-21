@@ -229,3 +229,60 @@ def test_compile_metadata_filter_is_reusable_and_agrees_with_oneshot():
         matches_metadata_filter(doc, validated) for doc in docs
     ]
     assert [predicate(doc) for doc in docs] == [True, True, False, False, False]
+
+
+def test_normalize_filter_shapes():
+    from collections import UserList
+
+    from lodedb.local.db import _normalize_filter
+
+    assert _normalize_filter(None) is None
+    assert _normalize_filter({"topic": "news"}) == {"metadata": {"topic": "news"}}
+    assert _normalize_filter({"year": 2020}) == {"metadata": {"year": "2020"}}
+    assert _normalize_filter({"metadata": "header"}) == {"metadata": {"metadata": "header"}}
+    assert _normalize_filter({"metadata": {"$eq": "header"}}) == {
+        "metadata": {"metadata": {"$eq": "header"}}
+    }
+    assert _normalize_filter({"metadata": {"$in": ["a", "b"]}}) == {
+        "metadata": {"metadata": {"$in": ("a", "b")}}
+    }
+    assert _normalize_filter({"metadata": {"$exists": True}}) == {
+        "metadata": {"metadata": {"$exists": True}}
+    }
+    assert _normalize_filter({"metadata": {"$exists": False}}) == {
+        "metadata": {"metadata": {"$exists": False}}
+    }
+    assert _normalize_filter({"document_ids": "doc1"}) == {
+        "metadata": {"document_ids": "doc1"}
+    }
+    # byte-like sequences are treated as flat metadata fields and fail scalar validation
+    with pytest.raises(ValueError, match="filter operand must be a string"):
+        _normalize_filter({"document_ids": b"doc1"})
+    with pytest.raises(ValueError, match="filter operand must be a string"):
+        _normalize_filter({"document_ids": bytearray(b"doc1")})
+    with pytest.raises(ValueError, match="filter operand must be a string"):
+        _normalize_filter({"document_ids": memoryview(b"doc1")})
+
+    assert _normalize_filter({"document_ids": []}) == {"document_ids": []}
+    assert _normalize_filter({"document_ids": ["doc1", "doc2"]}) == {
+        "document_ids": ["doc1", "doc2"]
+    }
+    assert _normalize_filter({"document_ids": ("doc1", "doc2")}) == {
+        "document_ids": ["doc1", "doc2"]
+    }
+    assert _normalize_filter({"document_ids": {"doc1", "doc2"}})["document_ids"] in (
+        ["doc1", "doc2"],
+        ["doc2", "doc1"],
+    )
+    assert _normalize_filter({"document_ids": UserList(["doc1", "doc2"])}) == {
+        "document_ids": ["doc1", "doc2"]
+    }
+    assert _normalize_filter(
+        {"metadata": {"author": "alice"}, "document_ids": ["doc1"]}
+    ) == {"metadata": {"author": "alice"}, "document_ids": ["doc1"]}
+    assert _normalize_filter({"metadata": {"author": "alice"}}) == {
+        "metadata": {"author": "alice"}
+    }
+    assert _normalize_filter({"$and": [{"topic": "news"}, {"year": 2020}]}) == {
+        "metadata": {"$and": [{"topic": "news"}, {"year": "2020"}]}
+    }
