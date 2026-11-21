@@ -4249,6 +4249,36 @@ fn state_journal_document_entry(document_id: &str, record: &DocumentRecord) -> V
     })
 }
 
+/// Streams the full state base for `index` to `path`: the same bytes as the
+/// canonical JSON of [`state_payload_for_index`], without building that tree.
+fn write_state_base_for_index(
+    index: &VectorOnlyIndex,
+    path: &Path,
+    fsync: bool,
+) -> Result<crate::storage::state_base::StateBaseSummary, CoreError> {
+    use crate::storage::state_base::{write_state_base, StateDocument};
+    write_state_base(
+        path,
+        &state_header_for_index(index),
+        || {
+            index
+                .documents
+                .iter()
+                .map(|(document_id, record)| StateDocument {
+                    document_id,
+                    content_hash: &record.content_hash,
+                    metadata: &record.metadata,
+                    chunk_ids: record.chunks.iter().map(|chunk| chunk.chunk_id.as_str()),
+                })
+        },
+        fsync,
+    )
+}
+
+/// The full state base as a tree. Production writes stream it instead (see
+/// [`write_state_base_for_index`]); this stays as the reference the streamed
+/// bytes are tested against.
+#[cfg(test)]
 fn state_payload_for_index(index: &VectorOnlyIndex) -> Value {
     let mut chunks = Vec::new();
     let mut document_hashes = serde_json::Map::new();
@@ -4751,7 +4781,9 @@ fn write_index_base(
 ) -> Result<(), CoreError> {
     let tvvf_manifest = flush_tvvf(index, dir, fsync, generation)?;
     let tvim_base = tvim_base_for_index(index)?;
-    let state = state_payload_for_index(index);
+    // Only the scalar header is built as a tree; the document collections are
+    // streamed from the records by `write_state` below.
+    let state = Value::Object(state_header_for_index(index));
     let raw_text = if store_text {
         raw_text_for_documents(index, index.documents.keys().map(String::as_str))
     } else {
@@ -4793,7 +4825,8 @@ fn write_index_base(
                 .map_or(0, |tvim| tvim.calibration_fingerprint),
             postings,
         });
-    crate::storage::write_generation_commit(
+    let write_state = |path: &Path, fsync: bool| write_state_base_for_index(index, path, fsync);
+    crate::storage::write_generation_commit_streamed(
         dir,
         crate::storage::GenerationCommitInput {
             index_key: &index.index_key,
@@ -4815,6 +4848,7 @@ fn write_index_base(
             tvvf_manifest,
             compress_text,
         },
+        &write_state,
         crate::storage::GenerationWriteOptions {
             fsync,
             retained_epochs: 4,
@@ -8610,6 +8644,57 @@ mod lazy_index_tests {
             fs::remove_dir_all(eager_dir).unwrap();
             fs::remove_dir_all(lazy_dir).unwrap();
         }
+    }
+
+    #[test]
+    fn streamed_state_base_matches_the_tree_rendering_and_reopens() {
+        let dir = temp_dir("streamed-state-base");
+        let mut engine = CoreEngine::open(options(&dir, false)).unwrap();
+        engine.create_index("default", 8, 4).unwrap();
+        let mut documents = vec![
+            document("plain", 0, "fact", Some("Lisbon trip oat milk")),
+            document("quote\"and\\slash", 1, "caf\u{e9} \u{1f600}", None),
+            document("control\u{01}\n", 2, "line\u{2028}sep", Some("desk")),
+        ];
+        documents[1]
+            .metadata
+            .insert("k\u{fc}".to_string(), "v\"\t".to_string());
+        engine.upsert_vectors("default", &documents).unwrap();
+        let plan = engine
+            .prepare_text_upsert(
+                "default",
+                &[CoreDocument {
+                    document_id: "multi".into(),
+                    text: "Lisbon trip. Oat milk. Desk office Thursday.".into(),
+                    metadata: Default::default(),
+                }],
+                true,
+                true,
+                16,
+            )
+            .unwrap();
+        let embeddings = vec![vec![0.1; 8]; plan.chunks_to_embed.len()];
+        engine.apply_text_upsert(&plan, &embeddings, 0.0).unwrap();
+        assert!(index(&engine).documents["multi"].chunks.len() > 1);
+        engine.persist().unwrap();
+
+        let live = index(&engine);
+        let base = crate::storage::commit_manifest::base_json_path(
+            &dir,
+            &live.index_key,
+            live.base_epoch,
+        );
+        let written = fs::read(&base).unwrap();
+        let expected =
+            crate::storage::util::py_canonical_json(&super::state_payload_for_index(live)).unwrap();
+        assert!(written == expected.as_bytes(), "streamed state base differs");
+        drop(engine);
+
+        // The manifest digest came from the streaming writer; a reopen verifies
+        // the base against it.
+        let reopened = CoreEngine::open_readonly(&dir, options(&dir, true)).unwrap();
+        assert_eq!(index(&reopened).documents.len(), 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

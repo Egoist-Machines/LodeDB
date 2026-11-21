@@ -3,6 +3,7 @@ pub mod legacy;
 pub mod lexical_store;
 pub mod lsn;
 pub mod multivec_store;
+pub mod state_base;
 pub mod state_journal;
 pub mod text_store;
 pub mod tvann_store;
@@ -25,6 +26,7 @@ use crate::storage::commit_manifest::{
 };
 use crate::storage::lexical_store::TokenLists;
 use crate::storage::multivec_store::MultiVecMap;
+use crate::storage::state_base::StateBaseSummary;
 use crate::storage::state_journal::StateJournalDeltaInput;
 use crate::storage::tvann_store::{AnnBaseInput, LoadedAnn};
 use crate::storage::tvim_delta::{TvimDeltaAppendInput, TvimDeltaArray};
@@ -405,7 +407,32 @@ pub fn write_generation_commit(
     input: GenerationCommitInput<'_>,
     options: GenerationWriteOptions,
 ) -> CoreResult<Value> {
-    let persistence_dir = persistence_dir.as_ref();
+    write_generation_commit_impl(persistence_dir.as_ref(), input, None, options)
+}
+
+/// Writes the state base to the given path (with the given fsync policy) and
+/// reports what it wrote. See [`state_base::write_state_base`].
+pub type StateBaseWriter<'a> = dyn Fn(&Path, bool) -> CoreResult<StateBaseSummary> + 'a;
+
+/// [`write_generation_commit`] for a state base streamed by `write_state` rather
+/// than rendered from a payload tree. `input.state` then carries only the scalar
+/// state header; the document collections come from the writer, which also
+/// supplies the base's digest so the file is not read back to checksum it.
+pub fn write_generation_commit_streamed(
+    persistence_dir: impl AsRef<Path>,
+    input: GenerationCommitInput<'_>,
+    write_state: &StateBaseWriter<'_>,
+    options: GenerationWriteOptions,
+) -> CoreResult<Value> {
+    write_generation_commit_impl(persistence_dir.as_ref(), input, Some(write_state), options)
+}
+
+fn write_generation_commit_impl(
+    persistence_dir: &Path,
+    input: GenerationCommitInput<'_>,
+    write_state: Option<&StateBaseWriter<'_>>,
+    options: GenerationWriteOptions,
+) -> CoreResult<Value> {
     fs::create_dir_all(generation_dir(persistence_dir, input.index_key)).map_err(|error| {
         corrupt(format!(
             "generation directory could not be created for {}: {error}",
@@ -414,19 +441,40 @@ pub fn write_generation_commit(
     })?;
 
     let state_path = base_json_path(persistence_dir, input.index_key, input.base_epoch);
-    state_journal::write_base_json(&state_path, input.state, options.fsync)?;
-    let document_count = input
-        .state
-        .get("document_hashes")
-        .and_then(Value::as_object)
-        .map_or(0, |documents| documents.len());
-    let chunk_count = input
-        .state
-        .get("chunks")
-        .and_then(Value::as_array)
-        .map_or(0, |chunks| chunks.len());
-    let json_manifest =
-        state_journal::record_base(&state_path, document_count, chunk_count, options.fsync)?;
+    let (document_count, chunk_count, json_manifest) = match write_state {
+        Some(write_state) => {
+            let summary = write_state(&state_path, options.fsync)?;
+            let manifest = state_journal::record_base_with_digest(
+                &state_path,
+                summary.document_count,
+                summary.chunk_count,
+                &summary.sha256,
+                summary.file_bytes,
+                options.fsync,
+            )?;
+            (summary.document_count, summary.chunk_count, manifest)
+        }
+        None => {
+            state_journal::write_base_json(&state_path, input.state, options.fsync)?;
+            let document_count = input
+                .state
+                .get("document_hashes")
+                .and_then(Value::as_object)
+                .map_or(0, |documents| documents.len());
+            let chunk_count = input
+                .state
+                .get("chunks")
+                .and_then(Value::as_array)
+                .map_or(0, |chunks| chunks.len());
+            let manifest = state_journal::record_base(
+                &state_path,
+                document_count,
+                chunk_count,
+                options.fsync,
+            )?;
+            (document_count, chunk_count, manifest)
+        }
+    };
 
     let tvim_manifest = match input.tvim {
         Some(tvim) => Some(tvim_delta::persist_base_bytes(
