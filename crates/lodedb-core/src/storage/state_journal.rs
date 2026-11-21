@@ -301,6 +301,31 @@ pub fn record_base(
     if !base_path.is_file() {
         return Err(corrupt("state journal base snapshot is missing"));
     }
+    let sha256 = sha256_file_hex(base_path)?;
+    let file_bytes = base_path
+        .metadata()
+        .map_err(|error| corrupt(format!("state base metadata failed: {error}")))?
+        .len();
+    record_base_with_digest(
+        base_path,
+        document_count,
+        chunk_count,
+        &sha256,
+        file_bytes,
+        fsync,
+    )
+}
+
+/// [`record_base`] for a base whose digest and size the writer already has (it
+/// hashed the bytes as it wrote them), so the base is not read back.
+pub fn record_base_with_digest(
+    base_path: &Path,
+    document_count: usize,
+    chunk_count: usize,
+    sha256: &str,
+    file_bytes: u64,
+    fsync: bool,
+) -> CoreResult<Value> {
     let path = manifest_path(base_path);
     let previous = read_manifest_optional(base_path)?;
     let next_seq = previous
@@ -321,8 +346,8 @@ pub fn record_base(
         "schema_version": STATE_JOURNAL_SCHEMA_VERSION,
         "base": {
             "file_name": base_path.file_name().unwrap_or_default().to_string_lossy(),
-            "sha256": sha256_file_hex(base_path)?,
-            "file_bytes": base_path.metadata().map_err(|error| corrupt(format!("state base metadata failed: {error}")))?.len(),
+            "sha256": sha256,
+            "file_bytes": file_bytes,
             "document_count": document_count,
             "chunk_count": chunk_count,
         },

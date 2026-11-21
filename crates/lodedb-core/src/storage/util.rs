@@ -230,9 +230,25 @@ pub(crate) fn try_lock_file(path: &Path, exclusive: bool) -> std::io::Result<Opt
 /// canonical body and verify each other's writes across the FFI boundary, so the
 /// two encoders must agree to the byte. ``serde_json::to_string`` emits raw UTF-8
 /// for non-ASCII instead, which silently diverges on real document text.
-fn encode_json_string_ascii(text: &str, out: &mut impl CanonicalSink) {
+pub(crate) fn encode_json_string_ascii(text: &str, out: &mut impl CanonicalSink) {
     out.push_char('"');
-    for ch in text.chars() {
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Copy the leading run of bytes that pass through unescaped in one push;
+        // ids, hashes, and most metadata are nothing else. The run is ASCII, so
+        // it ends on a char boundary.
+        let plain = rest
+            .bytes()
+            .position(|byte| !(b' '..=b'~').contains(&byte) || byte == b'"' || byte == b'\\')
+            .unwrap_or(rest.len());
+        if plain > 0 {
+            out.push_str(&rest[..plain]);
+            rest = &rest[plain..];
+            continue;
+        }
+        let mut chars = rest.chars();
+        let Some(ch) = chars.next() else { break };
+        rest = chars.as_str();
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -347,7 +363,7 @@ fn format_python_float(value: f64) -> String {
 }
 
 /// Output of the canonical encoder: a `String`, or a hasher fed in chunks.
-trait CanonicalSink {
+pub(crate) trait CanonicalSink {
     fn push_str(&mut self, text: &str);
     fn push_char(&mut self, ch: char) {
         self.push_str(ch.encode_utf8(&mut [0; 4]));
@@ -380,7 +396,7 @@ impl CanonicalSink for HashingSink {
     }
 }
 
-fn write_py_canonical_json(value: &Value, out: &mut impl CanonicalSink) {
+pub(crate) fn write_py_canonical_json(value: &Value, out: &mut impl CanonicalSink) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
