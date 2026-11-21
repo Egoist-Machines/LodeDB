@@ -81,7 +81,8 @@ stays **sub-millisecond even at 1M vectors**.
 
 > 🏢 **Enterprise** The LodeDB core is Apache-2.0 and free to use. Enterprise licensing is
 > available for commercial support, managed and at-scale serving, and on-prem / BYOC
-> deployment. Contact [sales@egoistmachines.com](mailto:sales@egoistmachines.com).
+> deployment. Contact [sales@egoistmachines.com](mailto:sales@egoistmachines.com). The
+> direction for a managed cloud companion is mapped in [docs/cloud-roadmap.md](docs/cloud-roadmap.md).
 
 ## Install
 
