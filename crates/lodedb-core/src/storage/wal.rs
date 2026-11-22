@@ -47,11 +47,13 @@ pub fn append_record(
     fsync: bool,
 ) -> CoreResult<WalAppend> {
     let frame = encode_frame(op, payload, Some(lsn))?;
-    let first_write = !path.exists();
-    if first_write {
+    if !path.exists() {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| corrupt(format!("WAL directory could not be created: {error}")))?;
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    corrupt(format!("WAL directory could not be created: {error}"))
+                })?;
+            }
         }
     }
     let mut handle = OpenOptions::new()
@@ -59,16 +61,35 @@ pub fn append_record(
         .append(true)
         .open(path)
         .map_err(|error| corrupt(format!("WAL could not be opened for append: {error}")))?;
-    if first_write {
-        handle
-            .write_all(WAL_MAGIC)
-            .and_then(|_| handle.write_all(&WAL_SCHEMA_VERSION.to_be_bytes()))
-            .map_err(|error| corrupt(format!("WAL header could not be written: {error}")))?;
+    let existing_len = handle
+        .metadata()
+        .map_err(|error| corrupt(format!("WAL metadata could not be read: {error}")))?
+        .len();
+    if existing_len > 0 && existing_len < WAL_HEADER_LEN as u64 {
+        return Err(corrupt(format!(
+            "WAL has a truncated header ({existing_len} bytes); repair before appending"
+        )));
     }
-    handle
-        .write_all(&frame)
-        .and_then(|_| handle.flush())
-        .map_err(|error| corrupt(format!("WAL record could not be written: {error}")))?;
+    let first_write = existing_len == 0;
+    if first_write {
+        // Write header and first frame together so a crash has a smaller window
+        // to leave a partial header on disk.
+        let mut buf = Vec::with_capacity(WAL_HEADER_LEN + frame.len());
+        buf.extend_from_slice(WAL_MAGIC);
+        buf.extend_from_slice(&WAL_SCHEMA_VERSION.to_be_bytes());
+        buf.extend_from_slice(&frame);
+        handle
+            .write_all(&buf)
+            .and_then(|_| handle.flush())
+            .map_err(|error| {
+                corrupt(format!("WAL header and record could not be written: {error}"))
+            })?;
+    } else {
+        handle
+            .write_all(&frame)
+            .and_then(|_| handle.flush())
+            .map_err(|error| corrupt(format!("WAL record could not be written: {error}")))?;
+    }
     if fsync {
         handle
             .sync_all()
@@ -190,14 +211,18 @@ fn scan_records(data: &[u8]) -> CoreResult<WalScan> {
     let mut offset = WAL_HEADER_LEN;
     let total = data.len();
     while offset < total {
-        if offset + 4 > total {
+        if total - offset < 4 {
             break;
         }
         let mut len = [0_u8; 4];
         len.copy_from_slice(&data[offset..offset + 4]);
         let body_len = u32::from_be_bytes(len) as usize;
-        let frame_end = offset + 4 + body_len;
-        let crc_end = frame_end + 4;
+        let Some(frame_end) = offset.checked_add(4).and_then(|v| v.checked_add(body_len)) else {
+            break;
+        };
+        let Some(crc_end) = frame_end.checked_add(4) else {
+            break;
+        };
         if crc_end > total {
             break;
         }
@@ -262,13 +287,17 @@ pub fn decode_wal_segment(data: &[u8]) -> CoreResult<Vec<WalRecord>> {
 
 /// Truncates the WAL to `valid_len`, dropping a torn trailing frame left by a
 /// crash mid-append so the next append lands after the last complete record.
-pub fn truncate_to(path: &Path, valid_len: u64) -> CoreResult<()> {
+pub fn truncate_to(path: &Path, valid_len: u64, fsync: bool) -> CoreResult<()> {
     let file = OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(|error| corrupt(format!("WAL could not be opened to repair: {error}")))?;
     file.set_len(valid_len)
         .map_err(|error| corrupt(format!("WAL torn tail could not be repaired: {error}")))?;
+    if fsync {
+        file.sync_all()
+            .map_err(|error| corrupt(format!("WAL repair could not be fsynced: {error}")))?;
+    }
     Ok(())
 }
 
@@ -1156,5 +1185,44 @@ mod tests {
             loaded.raw_text.get("alpha").map(String::as_str),
             Some("Alpha text.")
         );
+    }
+
+    #[test]
+    fn append_record_writes_header_into_existing_zero_byte_wal() {
+        let dir = temp_dir("zero_byte_append");
+        let wal = wal_path(&dir, "default");
+        fs::File::create(&wal).expect("create zero-byte wal");
+
+        append_record(&wal, 1, "upsert_documents", json!({"documents": []}), false)
+            .expect("append onto zero-byte wal");
+
+        let records = read_records(&wal).expect("read records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].lsn, Some(1));
+    }
+
+    #[test]
+    fn append_record_rejects_partial_header_instead_of_poisoning_wal() {
+        let dir = temp_dir("partial_header_append");
+        let wal = wal_path(&dir, "default");
+        fs::write(&wal, b"EELWA").expect("write partial header");
+
+        let error = append_record(&wal, 1, "upsert_documents", json!({"documents": []}), false)
+            .expect_err("partial header must fail closed");
+        assert!(error.to_string().contains("truncated header"));
+        assert_eq!(fs::read(&wal).expect("read wal"), b"EELWA");
+    }
+
+    #[test]
+    fn scan_records_handles_u32_max_trailing_frame_length() {
+        let mut data = Vec::new();
+        data.extend_from_slice(WAL_MAGIC);
+        data.extend_from_slice(&WAL_SCHEMA_VERSION.to_be_bytes());
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let scan = scan_records(&data).expect("scan torn max-len frame");
+        assert!(scan.records.is_empty());
+        assert_eq!(scan.valid_len, WAL_HEADER_LEN as u64);
+        assert_eq!(scan.total_len, data.len() as u64);
     }
 }

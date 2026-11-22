@@ -3228,6 +3228,179 @@ fn appender_repairs_a_zero_byte_wal() {
 }
 
 #[test]
+fn writer_repairs_zero_byte_and_torn_first_frame_wals_on_open() {
+    let mut torn_large_len = Vec::new();
+    torn_large_len.extend_from_slice(b"EELWAL01");
+    torn_large_len.extend_from_slice(&1_u32.to_be_bytes());
+    torn_large_len.extend_from_slice(&1000_u32.to_be_bytes());
+    torn_large_len.extend_from_slice(b"xxxx");
+
+    let mut torn_bad_crc = Vec::new();
+    torn_bad_crc.extend_from_slice(b"EELWAL01");
+    torn_bad_crc.extend_from_slice(&1_u32.to_be_bytes());
+    torn_bad_crc.extend_from_slice(&4_u32.to_be_bytes());
+    torn_bad_crc.extend_from_slice(b"xxxx");
+    torn_bad_crc.extend_from_slice(&[0_u8; 4]);
+
+    let cases: [(&str, &[u8]); 4] = [
+        ("zero_byte", b""),
+        ("partial_header", b"EELWA"),
+        ("torn_large_len", &torn_large_len),
+        ("torn_bad_crc", &torn_bad_crc),
+    ];
+
+    for (label, wal_bytes) in cases {
+        let path = unique_temp_dir(&format!("core_writer_torn_{label}"));
+        let mut base = open_options(&path, false, "wal");
+        base.acquire_writer_lock = true;
+        {
+            let mut engine = CoreEngine::open(base.clone()).unwrap();
+            create_vector_only_index(&mut engine);
+            engine
+                .upsert_vectors("default", &[doc("seed", 0, metadata(&[("kind", "a")]))])
+                .unwrap();
+            engine.persist().unwrap();
+        }
+
+        let wal = path.join(format!("{INDEX_KEY}.wal"));
+        fs::write(&wal, wal_bytes).expect("seed torn wal");
+
+        {
+            let mut writer = CoreEngine::open(base.clone()).expect("open writer over torn wal");
+            writer
+                .upsert_vectors(
+                    "default",
+                    &[doc("after-crash", 1, metadata(&[("kind", "b")]))],
+                )
+                .expect("write after repair");
+
+            let mut reader = CoreEngine::open_readonly(&path, open_options(&path, true, "wal"))
+                .expect("open readonly reader");
+            reader.refresh().expect("refresh readonly reader");
+            assert_eq!(
+                reader.stats("default").unwrap().document_count,
+                2,
+                "readonly refresh missed write for case {label}"
+            );
+            assert!(
+                wal.exists(),
+                "wal should still be uncheckpointed before crash for case {label}"
+            );
+            // Drop writer without persist() to simulate a crash before checkpoint.
+            writer.discard();
+        }
+
+        let reopened = CoreEngine::open(base).expect("reopen after simulated crash");
+        assert_eq!(
+            reopened.stats("default").unwrap().document_count,
+            2,
+            "reopen lost write for case {label}"
+        );
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn writer_cleans_zero_valid_record_wal_on_generation_open() {
+    let path = unique_temp_dir("core_writer_gen_torn_wal");
+    let mut wal_opts = open_options(&path, false, "wal");
+    wal_opts.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(wal_opts).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("seed", 0, metadata(&[("kind", "a")]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    fs::write(&wal, b"EELWA").expect("seed partial header wal");
+
+    let mut gen_opts = open_options(&path, false, "generation");
+    gen_opts.acquire_writer_lock = true;
+    let writer = CoreEngine::open(gen_opts).expect("open generation writer over torn wal");
+    assert!(!wal.exists(), "torn zero-record wal should be removed");
+    assert_eq!(writer.stats("default").unwrap().document_count, 1);
+    drop(writer);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn fold_wal_tail_repairs_torn_wal_with_no_pending_records() {
+    let path = unique_temp_dir("core_fold_torn_wal");
+    let mut base = open_options(&path, false, "wal");
+    base.acquire_writer_lock = true;
+    {
+        let mut engine = CoreEngine::open(base.clone()).unwrap();
+        create_vector_only_index(&mut engine);
+        engine
+            .upsert_vectors("default", &[doc("seed", 0, metadata(&[("kind", "a")]))])
+            .unwrap();
+        engine.persist().unwrap();
+    }
+
+    let wal = path.join(format!("{INDEX_KEY}.wal"));
+    let mut writer = CoreEngine::open(base.clone()).unwrap();
+
+    // Case 1: header + torn first frame (0 valid records) -> fold_wal_tail removes it.
+    let mut torn = Vec::new();
+    torn.extend_from_slice(b"EELWAL01");
+    torn.extend_from_slice(&1_u32.to_be_bytes());
+    torn.extend_from_slice(&500_u32.to_be_bytes());
+    torn.extend_from_slice(b"zz");
+    fs::write(&wal, &torn).expect("seed torn wal");
+
+    assert_eq!(writer.fold_wal_tail().expect("fold torn wal"), 0);
+    assert!(!wal.exists(), "torn zero-record wal should be removed");
+
+    // Case 2: already-applied record (lsn <= applied) plus trailing torn bytes
+    // must truncate only the torn tail while keeping the valid prefix intact.
+    lodedb_core::storage::wal::append_record(
+        &wal,
+        1,
+        "delete_documents",
+        json!({"document_ids": []}),
+        false,
+    )
+    .expect("write already-applied wal record");
+    let valid_len = fs::metadata(&wal).expect("wal metadata").len();
+    {
+        use std::io::Write;
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .expect("open wal for torn tail");
+        handle
+            .write_all(&[0, 0, 0, 50, 1, 2])
+            .expect("write torn trailing bytes");
+    }
+    assert!(fs::metadata(&wal).expect("wal metadata").len() > valid_len);
+
+    assert_eq!(writer.fold_wal_tail().expect("fold torn tail wal"), 0);
+    assert!(wal.exists(), "valid prefix wal should remain after tail repair");
+    assert_eq!(
+        fs::metadata(&wal).expect("repaired wal metadata").len(),
+        valid_len
+    );
+
+    // Subsequent write + simulated crash must recover cleanly.
+    writer
+        .upsert_vectors(
+            "default",
+            &[doc("after-fold", 1, metadata(&[("kind", "b")]))],
+        )
+        .unwrap();
+    writer.discard();
+
+    let reopened = CoreEngine::open(base).expect("reopen after fold repair");
+    assert_eq!(reopened.stats("default").unwrap().document_count, 2);
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn append_after_a_crashed_peer_tail_never_reuses_its_lsn() {
     // A crashed peer can leave a complete-but-unacknowledged frame past the
     // counter's watermark. refresh() overlays every CRC-valid frame, so a reader can

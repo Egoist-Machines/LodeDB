@@ -1762,6 +1762,7 @@ impl CoreEngine {
             return invalid("folding a WAL tail requires wal commit mode");
         }
         let path = persistence.path.clone();
+        let fsync = persistence.fsync;
         let index_ids: Vec<String> = self.indexes.keys().cloned().collect();
         let mut folded = 0usize;
         for index_id in index_ids {
@@ -1770,15 +1771,23 @@ impl CoreEngine {
                 None => continue,
             };
             let wal = crate::storage::wal::wal_path(&path, &index_key);
-            let records = crate::storage::wal::read_records(&wal)?;
+            let scan = crate::storage::wal::read_records_with_valid_len(&wal)?;
             // Records at or below the applied watermark were already folded. In steady
             // state the WAL was truncated after the last fold, so every record is new;
             // the filter keeps the fold idempotent if a stale record ever lingers.
-            let pending_records: Vec<&crate::storage::wal::WalRecord> = records
+            let pending_records: Vec<&crate::storage::wal::WalRecord> = scan
+                .records
                 .iter()
                 .filter(|record| record.lsn.map_or(true, |lsn| lsn > applied))
                 .collect();
             if pending_records.is_empty() {
+                // Clean up a zero-byte, partial-header, or torn-tail WAL left by a
+                // crash so later appends do not land behind torn bytes.
+                if scan.records.is_empty() && wal.is_file() {
+                    crate::storage::wal::truncate(&wal, fsync)?;
+                } else if scan.total_len > scan.valid_len {
+                    crate::storage::wal::truncate_to(&wal, scan.valid_len, fsync)?;
+                }
                 continue;
             }
             if pending_records
@@ -2417,6 +2426,7 @@ impl CoreEngine {
         };
         let persistence_path = persistence.path.clone();
         let persistence_read_only = persistence.read_only;
+        let persistence_fsync = persistence.fsync;
         let persistence_chunk_character_limit = persistence.chunk_character_limit;
         if !persistence_path.is_dir() {
             return Ok(());
@@ -2478,12 +2488,15 @@ impl CoreEngine {
                          to fold them before a generation-mode writable open",
                     );
                 }
+                if wal.is_file() {
+                    // Drop a zero-byte, partial-header, or torn-first-frame WAL
+                    // with zero valid records so it does not linger across commits.
+                    crate::storage::wal::truncate(&wal, persistence_fsync)?;
+                }
             }
             if replay_wal && !persistence_read_only {
-                let records = crate::storage::wal::read_records(&crate::storage::wal::wal_path(
-                    &persistence_path,
-                    &index_key,
-                ))?;
+                let wal = crate::storage::wal::wal_path(&persistence_path, &index_key);
+                let records = crate::storage::wal::read_records(&wal)?;
                 if !records.is_empty() {
                     if records.iter().all(is_native_replayable_wal_record) {
                         // Replay only records the loaded generation has not already
@@ -2568,6 +2581,11 @@ impl CoreEngine {
                              engine first",
                         ));
                     }
+                } else if wal.is_file() {
+                    // Drop a zero-byte, partial-header, or torn-first-frame WAL
+                    // with zero valid records so the next WAL append starts cleanly
+                    // with a header instead of landing behind torn bytes.
+                    crate::storage::wal::truncate(&wal, persistence_fsync)?;
                 }
             }
             let index = index_from_loaded_store(
@@ -3154,7 +3172,7 @@ impl CoreAppender {
         let fsync = options.durability == "fsync";
         crate::storage::lsn::with_lock(&path, &index_key, |file| {
             let scan = crate::storage::wal::read_records_with_valid_len(&wal_path)?;
-            Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len)?;
+            Self::repair_torn_tail(&wal_path, scan.valid_len, scan.total_len, fsync)?;
             // Refuse if the WAL already holds records only the Python engine can
             // replay (e.g. a text `upsert_documents` tail): a native writer fails on
             // that prefix in `load_persisted_indexes` before it reaches anything we
@@ -3442,7 +3460,7 @@ impl CoreAppender {
             // once this appender acks its frame the intact-tail arm above takes over.
             _ => {
                 let scan = crate::storage::wal::read_records_with_valid_len(wal)?;
-                Self::repair_torn_tail(wal, scan.valid_len, scan.total_len)?;
+                Self::repair_torn_tail(wal, scan.valid_len, scan.total_len, self.fsync)?;
                 let wal_max = scan.records.iter().filter_map(|record| record.lsn).max();
                 Ok((
                     counter_lsn.max(generation).max(wal_max.unwrap_or(0)),
@@ -3455,7 +3473,12 @@ impl CoreAppender {
     /// Drops a torn or headerless WAL tail so the next append lands after complete
     /// records. The caller must hold the counter lock (via `with_lock`) so no
     /// concurrent append is mid-write.
-    fn repair_torn_tail(wal: &Path, valid_len: u64, total_len: u64) -> Result<(), CoreError> {
+    fn repair_torn_tail(
+        wal: &Path,
+        valid_len: u64,
+        total_len: u64,
+        fsync: bool,
+    ) -> Result<(), CoreError> {
         if !wal.is_file() {
             return Ok(());
         }
@@ -3463,10 +3486,10 @@ impl CoreAppender {
             // No valid header at all (a zero-byte file, a sub-header fragment, or a
             // torn header): drop it so the next append writes a fresh header rather
             // than a headerless bad-magic frame the next writer cannot replay.
-            std::fs::remove_file(wal).map_err(core_io_error)?;
+            crate::storage::wal::truncate(wal, fsync)?;
         } else if total_len > valid_len {
             // A torn trailing frame from a crash mid-append: drop it.
-            crate::storage::wal::truncate_to(wal, valid_len)?;
+            crate::storage::wal::truncate_to(wal, valid_len, fsync)?;
         }
         Ok(())
     }
